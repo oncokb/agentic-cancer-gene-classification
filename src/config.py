@@ -9,8 +9,10 @@ class Settings(BaseSettings):
     ncbi_api_key: str = ""
 
     synthesis_model: str = "claude-opus-4-7"
-    pubmed_max_results: int = 20
+    selection_model: str = "claude-haiku-4-5-20251001"
+    pubmed_max_results: int = 50
     min_papers_for_strong_association: int = 4
+    max_papers_for_synthesis: int = 8
 
     log_level: str = "INFO"
 

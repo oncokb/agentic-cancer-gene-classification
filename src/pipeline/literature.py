@@ -110,23 +110,62 @@ async def _search_and_fetch(
 
 
 # ---------------------------------------------------------------------------
-# Tier 1: direct structured query
+# Tier 1: parallel multi-query retrieval
 # ---------------------------------------------------------------------------
 
-async def _tier1_retrieve(gene: str) -> List[LiteratureRecord]:
+def _fusion_partners(gene: str, fusions: List[str]) -> List[str]:
+    """Extract partner symbols from fusion strings, excluding the gene itself."""
+    partners: List[str] = []
+    for fusion in fusions:
+        for sep in ("::", "--", "/"):
+            if sep in fusion:
+                for part in fusion.split(sep):
+                    part = part.strip()
+                    if part and part != gene:
+                        partners.append(part)
+                break
+    return list(dict.fromkeys(partners))
+
+
+async def _tier1_retrieve(
+    gene: str,
+    fusions: Optional[List[str]] = None,
+) -> List[LiteratureRecord]:
     """
-    Primary retrieval: one structured PubMed query for the gene in a cancer context.
-    Fast and cheap — handles the majority of well-characterised genes.
+    Primary retrieval: runs multiple PubMed queries in parallel to maximise
+    coverage before falling through to the agentic Tier 2.
+
+    Queries run concurrently:
+      1. Gene Name MeSH field query (high precision)
+      2. Free-text broadening query (catches alias spellings)
+      3. Co-query with each fusion partner (catches fusion-specific papers)
+
+    Results are deduplicated by PMID, capped at pubmed_max_results, then fetched.
     """
-    query = f'"{gene}"[Gene Name] AND cancer[MeSH Terms]'
+    queries = [
+        f'"{gene}"[Gene Name] AND cancer[MeSH Terms]',
+        f'"{gene}" AND (cancer OR tumor OR oncology OR carcinoma)',
+    ]
+    for partner in _fusion_partners(gene, fusions or [])[:2]:
+        queries.append(f'"{gene}" AND "{partner}"')
+
     async with httpx.AsyncClient() as client:
-        pmids = await _esearch(query, settings.pubmed_max_results, client)
-        if not pmids:
-            # Broaden if MeSH term yields nothing
-            query = f'"{gene}" AND (cancer OR tumor OR oncology OR carcinoma)'
-            pmids = await _esearch(query, settings.pubmed_max_results, client)
-        records = await _efetch(pmids, client)
-    logger.info("Tier 1: %d abstracts for %s", len(records), gene)
+        pmid_lists = await asyncio.gather(
+            *[_esearch(q, settings.pubmed_max_results, client) for q in queries]
+        )
+        seen: Set[str] = set()
+        merged: List[str] = []
+        for pmids in pmid_lists:
+            for pmid in pmids:
+                if pmid not in seen:
+                    seen.add(pmid)
+                    merged.append(pmid)
+        records = await _efetch(merged[:settings.pubmed_max_results], client)
+
+    logger.info(
+        "Tier 1: %d abstracts for %s (%d queries, %d unique PMIDs before cap)",
+        len(records), gene, len(queries), len(merged),
+    )
     return records
 
 
@@ -318,7 +357,7 @@ async def retrieve_literature(
     Returns (records, tier) where tier is 1 or 2.
     """
     try:
-        records = await _tier1_retrieve(gene)
+        records = await _tier1_retrieve(gene, fusions)
     except httpx.HTTPError as exc:
         logger.error("Tier 1 NCBI call failed for %s: %s", gene, exc)
         records = []
