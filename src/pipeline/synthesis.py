@@ -9,18 +9,14 @@ Enforces three invariants:
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Dict, List, Optional, Set
 
-import anthropic
-
 from src.config import settings
 from src.models.schema import GeneAnnotation, LiteratureRecord
+from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
-
-_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 SYSTEM_PROMPT = """\
 You are a cancer genomics expert filling structured annotation rows for the OncoKB MSK TARGET Gene Triaging database.
@@ -66,7 +62,7 @@ End the `gene_summary` with one parenthetical sentence noting the retrieval tier
   "(Literature sourced via Tier 2 Claude agentic retrieval — sparse initial results required expanded search.)"
 """
 
-ANNOTATE_TOOL: anthropic.types.ToolParam = {
+ANNOTATE_TOOL: dict = {
     "name": "annotate_gene",
     "description": (
         "Produce a structured cancer gene annotation grounded in the retrieved literature. "
@@ -169,7 +165,7 @@ def _build_user_prompt(
     else:
         for rec in records:
             lines += [
-                f"---",
+                "---",
                 f"PMID: {rec.pmid}",
                 f"Title: {rec.title}",
                 f"Abstract: {rec.abstract}",
@@ -204,6 +200,8 @@ async def synthesize_gene_annotation(
     cancer_type_prevalence: Optional[str],
     records: List[LiteratureRecord],
     retrieval_tier: int = 1,
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
 ) -> Dict:
     """
     Call Claude to produce a structured annotation. Returns raw tool-use input dict.
@@ -212,30 +210,18 @@ async def synthesize_gene_annotation(
     user_prompt = _build_user_prompt(gene, fusions, in_oncokb, cancer_type_prevalence, records, retrieval_tier)
     retrieved_pmids: Set[str] = {r.pmid for r in records}
 
-    response = await _client.messages.create(
+    tool_input = await complete_with_tool(
         model=settings.synthesis_model,
+        system=SYSTEM_PROMPT,
+        user=user_prompt,
+        tool=ANNOTATE_TOOL,
         max_tokens=2048,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},  # prompt caching
-            }
-        ],
-        tools=[ANNOTATE_TOOL],
-        tool_choice={"type": "tool", "name": "annotate_gene"},
-        messages=[{"role": "user", "content": user_prompt}],
+        local_mode=local_mode,
+        local_backend=local_backend,
     )
 
-    # Extract tool_use block
-    tool_input: dict = {}
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "annotate_gene":
-            tool_input = block.input
-            break
-
     if not tool_input:
-        logger.error("No tool_use block returned by model for gene %s", gene)
+        logger.error("No annotation returned for gene %s", gene)
         return {"insufficient_evidence": True, "cancer_associated": None, "confidence": 0.0}
 
     # PMID verification — reject any citation not in retrieved set

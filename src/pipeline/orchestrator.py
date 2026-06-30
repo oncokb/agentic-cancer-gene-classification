@@ -10,12 +10,13 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from src.config import settings
 from src.models.schema import AnnotationResult, GeneAnnotation
 from src.pipeline.db_lookups import check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import retrieve_literature
+from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import normalize_fusions
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
@@ -28,6 +29,8 @@ async def _annotate_gene(
     fusions: List[str],
     resolved: bool,
     unresolvable: bool,
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
 ) -> GeneAnnotation:
     """Run the full annotation pipeline for a single gene."""
     if unresolvable:
@@ -45,7 +48,7 @@ async def _annotate_gene(
     # Run DB lookup and literature retrieval concurrently
     oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
         check_oncokb_membership(gene),
-        retrieve_literature(gene, fusions),
+        retrieve_literature(gene, fusions, local_mode=local_mode, local_backend=local_backend),
     )
 
     prevalence = get_msk_genie_prevalence(gene)
@@ -54,7 +57,11 @@ async def _annotate_gene(
     # most directly relevant papers before synthesis to improve precision
     # without shrinking the recall pool.
     selected_records = await select_papers_for_synthesis(
-        gene, records, settings.max_papers_for_synthesis
+        gene,
+        records,
+        settings.max_papers_for_synthesis,
+        local_mode=local_mode,
+        local_backend=local_backend,
     )
 
     try:
@@ -65,6 +72,8 @@ async def _annotate_gene(
             cancer_type_prevalence=prevalence,
             records=selected_records,
             retrieval_tier=retrieval_tier,
+            local_mode=local_mode,
+            local_backend=local_backend,
         )
     except Exception as e:
         logger.error("Synthesis failed for gene %s: %s", gene, e)
@@ -88,13 +97,19 @@ async def _annotate_gene(
     )
 
 
-async def run_pipeline(fusions: List[str]) -> AnnotationResult:
+async def run_pipeline(
+    fusions: List[str],
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
+) -> AnnotationResult:
     """
     Main entry point: accepts a list of fusion strings and returns
     a structured AnnotationResult with one GeneAnnotation per gene.
     """
     run_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
+    local_backend = resolve_local_backend(local_mode=local_mode, local_backend=local_backend)
+    local_mode = local_backend is not None
     logger.info("Pipeline run %s started — %d fusions", run_id, len(fusions))
 
     gene_map = await normalize_fusions(fusions)
@@ -109,6 +124,8 @@ async def run_pipeline(fusions: List[str]) -> AnnotationResult:
             fusions=gene_fusions,
             resolved=resolved_gene.resolved,
             unresolvable=resolved_gene.unresolvable,
+            local_mode=local_mode,
+            local_backend=local_backend,
         )
         annotations.append(annotation)
         logger.info(

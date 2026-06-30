@@ -30,7 +30,6 @@ import argparse
 import asyncio
 import json
 import logging
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -62,9 +61,9 @@ def _get_fusions_from_holdout(holdout: List[Dict]) -> List[str]:
     return fusions
 
 
-async def _run_pipeline(fusions: List[str]) -> Dict:
+async def _run_pipeline(fusions: List[str], local_backend: Optional[str] = None) -> Dict:
     from src.pipeline.orchestrator import run_pipeline
-    result = await run_pipeline(fusions)
+    result = await run_pipeline(fusions, local_backend=local_backend)
     return result.model_dump()
 
 
@@ -99,37 +98,37 @@ def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
     print(f"{'='*60}")
 
     ca = metrics["cancer_associated"]
-    print(f"\n--- cancer_associated ---")
+    print("\n--- cancer_associated ---")
     print(f"  Accuracy:     {ca['accuracy']:.3f}")
     print(f"  Cohen's κ:    {ca['cohen_kappa']:.3f}  (>0.6 = substantial, >0.8 = near-perfect)")
 
     tier = metrics["cancer_tier"]
-    print(f"\n--- cancer_associated_gene_tier ---")
+    print("\n--- cancer_associated_gene_tier ---")
     print(f"  Macro F1:     {tier['macro_f1']:.3f}")
     for cls, f1 in sorted(tier["per_class"].items()):
         print(f"    {cls:<35} F1={f1:.3f}")
 
     ogtsg = metrics["og_or_tsg"]
-    print(f"\n--- og_or_tsg ---")
+    print("\n--- og_or_tsg ---")
     print(f"  Macro F1:     {ogtsg['macro_f1']:.3f}")
     for cls, f1 in sorted(ogtsg["per_class"].items()):
         print(f"    {cls:<10} F1={f1:.3f}")
 
     cites = metrics["citations"]
-    print(f"\n--- citations (set-based) ---")
+    print("\n--- citations (set-based) ---")
     print(f"  Precision:    {cites['precision']:.3f}")
     print(f"  Recall:       {cites['recall']:.3f}")
     print(f"  F1:           {cites['f1']:.3f}")
 
     if judge_results:
         agg = judge_results["aggregate"]
-        print(f"\n--- gene_summary (LLM-as-a-judge, 0–4 scale) ---")
+        print("\n--- gene_summary (LLM-as-a-judge, 0–4 scale) ---")
         if agg.get("mean_score") is not None:
             print(f"  Mean score:   {agg['mean_score']:.2f}/4.0  ({agg['mean_pct']:.1f}%)")
             print(f"  Excellent (≥3): {agg['excellent_pct']:.1f}%")
             print(f"  Acceptable (≥2): {agg['acceptable_pct']:.1f}%")
             print(f"  N evaluated:  {agg['n_evaluated']}")
-            print(f"\n  Per-gene scores:")
+            print("\n  Per-gene scores:")
             for pg in judge_results["per_gene"]:
                 score_str = str(pg["score"]) if pg["score"] >= 0 else "ERR"
                 print(f"    {pg['gene']:<15} {score_str}/4  — {pg['rationale']}")
@@ -140,6 +139,8 @@ def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
 
 
 def main() -> None:
+    from src.pipeline.llm_client import DEFAULT_LOCAL_BACKEND, LOCAL_BACKENDS
+
     parser = argparse.ArgumentParser(description="M0 Benchmark — validate against Nicole's holdout")
     parser.add_argument(
         "--holdout",
@@ -164,6 +165,19 @@ def main() -> None:
         action="store_true",
         help="Skip the LLM-as-a-judge step (no API calls for summary scoring)",
     )
+    parser.add_argument(
+        "--local",
+        nargs="?",
+        const=DEFAULT_LOCAL_BACKEND,
+        choices=LOCAL_BACKENDS,
+        metavar="BACKEND",
+        help=(
+            "Route pipeline LLM calls through a local agent CLI instead of the Anthropic SDK. "
+            f"Choices: {', '.join(LOCAL_BACKENDS)}. Defaults to {DEFAULT_LOCAL_BACKEND} "
+            "when --local is provided without a backend. Pair with --no-judge to avoid "
+            "benchmark judge API calls."
+        ),
+    )
     args = parser.parse_args()
 
     # --- Load holdout ---
@@ -179,7 +193,7 @@ def main() -> None:
     else:
         fusions = _get_fusions_from_holdout(holdout)
         logger.info("Running pipeline on %d fusions from holdout...", len(fusions))
-        pipeline_result = asyncio.run(_run_pipeline(fusions))
+        pipeline_result = asyncio.run(_run_pipeline(fusions, local_backend=args.local))
 
     # --- Align ---
     aligned_pred, aligned_gold = _align_predictions(holdout, pipeline_result)

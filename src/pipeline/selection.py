@@ -12,18 +12,15 @@ This separates "retrieve broadly" (recall) from "synthesise narrowly"
 from __future__ import annotations
 
 import logging
-from typing import List
-
-import anthropic
+from typing import List, Optional
 
 from src.config import settings
 from src.models.schema import LiteratureRecord
+from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
 
-_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
-_SELECT_TOOL: anthropic.types.ToolParam = {
+_SELECT_TOOL: dict = {
     "name": "select_papers",
     "description": (
         "Return the PMIDs of the abstracts that most directly establish "
@@ -67,6 +64,8 @@ async def select_papers_for_synthesis(
     gene: str,
     records: List[LiteratureRecord],
     max_papers: int,
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
 ) -> List[LiteratureRecord]:
     """
     Filter retrieved records to the most directly cancer-relevant subset.
@@ -89,26 +88,17 @@ async def select_papers_for_synthesis(
     )
 
     try:
-        response = await _client.messages.create(
+        result = await complete_with_tool(
             model=settings.selection_model,
+            system=_SELECT_SYSTEM,
+            user=prompt,
+            tool=_SELECT_TOOL,
             max_tokens=512,
-            system=[
-                {
-                    "type": "text",
-                    "text": _SELECT_SYSTEM,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            tools=[_SELECT_TOOL],
-            tool_choice={"type": "tool", "name": "select_papers"},
-            messages=[{"role": "user", "content": prompt}],
+            local_mode=local_mode,
+            local_backend=local_backend,
         )
 
-        selected_pmids: set = set()
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "select_papers":
-                selected_pmids = set(block.input.get("selected_pmids", []))
-                break
+        selected_pmids = set(result.get("selected_pmids", []))
 
         if not selected_pmids:
             logger.warning("Selection pass returned no PMIDs for %s — using top %d", gene, max_papers)
