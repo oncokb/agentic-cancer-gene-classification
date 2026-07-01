@@ -3,7 +3,6 @@
 from benchmarks.metrics import (
     cohen_kappa_binary,
     citation_scores,
-    mean_citation_scores,
     per_class_f1,
     compute_categorical_metrics,
 )
