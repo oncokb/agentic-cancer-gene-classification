@@ -13,6 +13,7 @@ CancerTier = Literal[
 ]
 
 OgTsg = Literal["OG", "TSG", "OG, TSG"]
+LocalBackend = Literal["claude-code", "codex", "antigravity"]
 
 
 class ResolvedGene(BaseModel):
@@ -62,6 +63,12 @@ class AnnotateRequest(BaseModel):
         ...,
         description="Gene fusions in GENE1::GENE2 or GENE1--GENE2 format",
         min_length=1,
+    )
+    local_backend: Optional[LocalBackend] = Field(
+        default=None,
+        description=(
+            "Optional local agent backend for LLM calls. When unset, the Anthropic SDK path is used."
+        ),
     )
 
 

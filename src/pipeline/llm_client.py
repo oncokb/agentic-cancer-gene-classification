@@ -189,6 +189,7 @@ async def _run_codex(prompt: str, tool_name: str) -> str:
             "exec",
             "--sandbox",
             "read-only",
+            "--skip-git-repo-check",
             "--ephemeral",
             "--color",
             "never",

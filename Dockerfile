@@ -7,6 +7,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Optional local-agent CLIs for development-only local backend mode.
+# Build with: docker build --build-arg INSTALL_LOCAL_AGENTS=true ...
+ARG INSTALL_LOCAL_AGENTS=false
+RUN if [ "$INSTALL_LOCAL_AGENTS" = "true" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends nodejs npm && \
+        npm install -g @openai/codex @anthropic-ai/claude-code && \
+        npm cache clean --force && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Copy dependency spec first for layer caching
 COPY pyproject.toml ./
 

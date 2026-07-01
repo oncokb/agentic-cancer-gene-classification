@@ -4,6 +4,7 @@ import pytest
 
 from benchmarks.run_benchmark import _run_pipeline
 from src.cli import parse_args
+from src.models.schema import AnnotateRequest
 from src.pipeline.llm_client import DEFAULT_LOCAL_BACKEND, resolve_local_backend
 
 
@@ -36,6 +37,11 @@ def test_cli_local_accepts_codex(monkeypatch):
     )
     args = parse_args()
     assert args.local == "codex"
+
+
+def test_annotate_request_accepts_local_backend():
+    request = AnnotateRequest(fusions=["TP53::BRAF"], local_backend="codex")
+    assert request.local_backend == "codex"
 
 
 async def test_benchmark_run_pipeline_passes_local_backend(monkeypatch):

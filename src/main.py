@@ -48,7 +48,7 @@ async def annotate(request: AnnotateRequest) -> AnnotationResult:
     the MSK TARGET Gene Triaging schema.
     """
     try:
-        result = await run_pipeline(request.fusions)
+        result = await run_pipeline(request.fusions, local_backend=request.local_backend)
         return result
     except Exception as e:
         logger.exception("Pipeline error")
