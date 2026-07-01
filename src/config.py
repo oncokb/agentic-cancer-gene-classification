@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     pubmed_max_results: int = 50
     min_papers_for_strong_association: int = 4
     max_papers_for_synthesis: int = 8
+    max_citations_per_annotation: int = 4
 
     log_level: str = "INFO"
 

@@ -30,9 +30,10 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 
 ## Hard constraints — never violate these:
 - Every claim in `gene_summary` must be directly traceable to one of the retrieved abstracts.
-- `citations` must ONLY contain PMIDs that appear in the provided retrieved abstracts list.
+- `citations` must ONLY contain the strongest PMIDs that appear in the provided retrieved abstracts list.
 - Do NOT invent, guess, or recall PMIDs from memory. If a fact cannot be grounded in the retrieved set, omit it.
 - A fabricated PMID will cause patient safety errors. Treat citation fabrication as the most critical failure mode.
+- Prefer citation precision over citation volume. Do not cite loosely related background papers just because they were retrieved.
 - If the retrieved evidence is insufficient to make a determination, set `insufficient_evidence: true` and leave classification fields null. This is a valid, preferred output over hallucination.
 - If `cancer_associated` is false OR `insufficient_evidence` is true, you MUST leave `cancer_associated_gene_tier` and `og_or_tsg` null. Do not fill these fields for non-cancer genes or genes with insufficient evidence.
 
@@ -120,8 +121,9 @@ ANNOTATE_TOOL: dict = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "List of PMIDs supporting this annotation. "
-                    "MUST be a subset of the retrieved abstracts provided. No extras."
+                    f"List of up to {settings.max_citations_per_annotation} strongest PMIDs "
+                    "supporting this annotation. MUST be a subset of the retrieved abstracts provided. "
+                    "No extras."
                 ),
             },
             "confidence": {
@@ -177,18 +179,29 @@ def _build_user_prompt(
 def _verify_citations(
     citations: List[str],
     retrieved_pmids: Set[str],
+    max_citations: int,
 ) -> List[str]:
     """
     Remove any PMID from the LLM's citation list that was not in the retrieved set.
     An identifier that was not retrieved is a rejection, not a warning.
     """
-    verified = [pmid for pmid in citations if pmid in retrieved_pmids]
+    verified = [
+        pmid
+        for pmid in dict.fromkeys(citations)
+        if isinstance(pmid, str) and pmid in retrieved_pmids
+    ][:max_citations]
     rejected = set(citations) - retrieved_pmids
     if rejected:
         logger.warning(
             "Rejected %d unverified PMIDs from LLM output: %s",
             len(rejected),
             rejected,
+        )
+    if len(citations) > len(verified):
+        logger.info(
+            "Kept %d/%d emitted citations after PMID verification and precision cap",
+            len(verified),
+            len(citations),
         )
     return verified
 
@@ -226,7 +239,11 @@ async def synthesize_gene_annotation(
 
     # PMID verification — reject any citation not in retrieved set
     if "citations" in tool_input:
-        tool_input["citations"] = _verify_citations(tool_input["citations"], retrieved_pmids)
+        tool_input["citations"] = _verify_citations(
+            tool_input["citations"],
+            retrieved_pmids,
+            settings.max_citations_per_annotation,
+        )
 
     return tool_input
 

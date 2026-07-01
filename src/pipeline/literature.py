@@ -396,7 +396,7 @@ async def _tier2_local_retrieve(
     async with httpx.AsyncClient() as http_client:
         for i, query in enumerate(queries, start=1):
             logger.info(
-                "Claude Code suggested PubMed query [%d/%d] for %s: %s",
+                "Local agent suggested PubMed query [%d/%d] for %s: %s",
                 i,
                 len(queries),
                 gene,

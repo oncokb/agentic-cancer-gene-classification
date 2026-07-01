@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from src.pipeline.db_lookups import (
-    ONCOKB_GENES_URL,
+    ONCOKB_CURATED_GENES_URL,
     OncoKBConfigurationError,
     OncoKBGeneLookup,
 )
@@ -16,7 +16,7 @@ async def test_oncokb_lookup_caches_genes_per_instance():
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        assert str(request.url) == ONCOKB_GENES_URL
+        assert str(request.url) == ONCOKB_CURATED_GENES_URL
         assert request.headers["authorization"] == "Bearer token"
         return httpx.Response(
             200,

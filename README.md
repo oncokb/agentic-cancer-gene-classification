@@ -16,6 +16,11 @@ Optional services:
 - `ONCOKB_API_TOKEN`: enables OncoKB membership lookups.
 - `NCBI_API_KEY`: raises NCBI E-utilities rate limits.
 
+Citation precision knobs:
+
+- `MAX_PAPERS_FOR_SYNTHESIS`: selected PubMed records passed to synthesis.
+- `MAX_CITATIONS_PER_ANNOTATION`: verified PMIDs retained in final output.
+
 ## Run With Anthropic API Key
 
 Set `ANTHROPIC_API_KEY` in `.env`:

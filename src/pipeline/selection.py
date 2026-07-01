@@ -55,8 +55,8 @@ Deprioritize abstracts that:
 - Focus on non-cancer biology with only tangential cancer relevance
 - Duplicate the finding of another selected abstract
 
-Return between 1 and the requested maximum. If fewer than the maximum are truly directly relevant,
-return only those — do not pad with loosely related papers.
+Return up to the requested maximum. If no papers are truly directly relevant, return an empty
+list — do not pad with loosely related papers.
 """
 
 
@@ -98,13 +98,18 @@ async def select_papers_for_synthesis(
             local_backend=local_backend,
         )
 
-        selected_pmids = set(result.get("selected_pmids", []))
+        selected_pmids = [
+            pmid
+            for pmid in dict.fromkeys(result.get("selected_pmids", []))
+            if isinstance(pmid, str)
+        ][:max_papers]
 
         if not selected_pmids:
-            logger.warning("Selection pass returned no PMIDs for %s — using top %d", gene, max_papers)
-            return records[:max_papers]
+            logger.info("Selection pass returned no relevant PMIDs for %s", gene)
+            return []
 
-        selected = [r for r in records if r.pmid in selected_pmids]
+        records_by_pmid = {r.pmid: r for r in records}
+        selected = [records_by_pmid[pmid] for pmid in selected_pmids if pmid in records_by_pmid]
         logger.info("Selection pass for %s: %d → %d papers", gene, len(records), len(selected))
         return selected if selected else records[:max_papers]
 
