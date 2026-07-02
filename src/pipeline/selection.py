@@ -48,11 +48,14 @@ Prefer abstracts that:
   overexpression models, recurrent somatic mutations in patient cohorts)
 - Provide clinical evidence linking the gene to cancer survival, treatment response, or incidence
 - Are focused primarily on this gene (not papers where it appears in a large gene list)
+- Match the provided HGNC identity for this gene, including full name and locus type
 
 Deprioritize abstracts that:
 - Mention the gene only in passing or as one of dozens of hits in a multi-gene screen
 - Are prognostic signature studies with no mechanistic follow-up on this gene specifically
 - Focus on non-cancer biology with only tangential cancer relevance
+- Use the same symbol for a different entity, such as an lncRNA/circRNA/transcript name
+  that does not match the provided HGNC identity
 - Duplicate the finding of another selected abstract
 
 Return up to the requested maximum. If no papers are truly directly relevant, return an empty
@@ -64,6 +67,7 @@ async def select_papers_for_synthesis(
     gene: str,
     records: List[LiteratureRecord],
     max_papers: int,
+    gene_identity: Optional[str] = None,
     local_mode: bool = False,
     local_backend: Optional[str] = None,
 ) -> List[LiteratureRecord]:
@@ -82,6 +86,7 @@ async def select_papers_for_synthesis(
     )
     prompt = (
         f"Gene: {gene}\n"
+        f"Gene identity: {gene_identity or 'canonical symbol only'}\n"
         f"Select up to {max_papers} of the following {len(records)} abstracts "
         f"that most directly establish {gene}'s role in cancer.\n\n"
         f"{abstracts_text}"

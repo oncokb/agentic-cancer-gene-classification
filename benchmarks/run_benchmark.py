@@ -91,6 +91,47 @@ def _align_predictions(
     return aligned_pred, aligned_gold
 
 
+def build_per_gene_report(
+    predictions: List[Dict],
+    ground_truth: List[Dict],
+) -> List[Dict]:
+    """Build per-gene deltas to debug citation and tier tradeoffs."""
+    from benchmarks.metrics import citation_scores
+
+    rows = []
+    for pred, gold in zip(predictions, ground_truth):
+        pred_citations = set(pred.get("citations", []))
+        gold_citations = set(gold.get("citations", []))
+        precision, recall, f1 = citation_scores(
+            list(pred_citations),
+            list(gold_citations),
+        )
+        rows.append(
+            {
+                "gene": gold["gene"],
+                "in_oncokb": pred.get("in_oncokb"),
+                "retrieval_count": pred.get("retrieval_count", 0),
+                "pred_cancer_associated": pred.get("cancer_associated"),
+                "gold_cancer_associated": gold.get("cancer_associated"),
+                "pred_tier": pred.get("cancer_associated_gene_tier"),
+                "gold_tier": gold.get("cancer_associated_gene_tier"),
+                "tier_match": pred.get("cancer_associated_gene_tier")
+                == gold.get("cancer_associated_gene_tier"),
+                "pred_og_or_tsg": pred.get("og_or_tsg"),
+                "gold_og_or_tsg": gold.get("og_or_tsg"),
+                "citation_precision": round(precision, 4),
+                "citation_recall": round(recall, 4),
+                "citation_f1": round(f1, 4),
+                "citation_tp": sorted(pred_citations & gold_citations),
+                "citation_fp": sorted(pred_citations - gold_citations),
+                "citation_fn": sorted(gold_citations - pred_citations),
+                "pred_citations": sorted(pred_citations),
+                "gold_citations": sorted(gold_citations),
+            }
+        )
+    return rows
+
+
 def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
     n = metrics["n"]
     print(f"\n{'='*60}")
@@ -136,6 +177,34 @@ def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
             print("  No summaries evaluated.")
 
     print(f"\n{'='*60}\n")
+
+
+def print_per_gene_debug(per_gene_report: List[Dict]) -> None:
+    """Print compact debug rows for the largest citation/tier misses."""
+    citation_misses = [
+        row
+        for row in per_gene_report
+        if row["citation_fp"] or row["citation_fn"] or not row["tier_match"]
+    ]
+    if not citation_misses:
+        return
+
+    citation_misses.sort(
+        key=lambda row: (
+            len(row["citation_fp"]) + len(row["citation_fn"]),
+            not row["tier_match"],
+        ),
+        reverse=True,
+    )
+    print("--- per-gene debug (top citation/tier deltas) ---")
+    for row in citation_misses[:8]:
+        print(
+            f"  {row['gene']:<12} tier {row['pred_tier']!r} vs {row['gold_tier']!r}; "
+            f"cite P/R/F1={row['citation_precision']:.2f}/"
+            f"{row['citation_recall']:.2f}/{row['citation_f1']:.2f}; "
+            f"FP={row['citation_fp']} FN={row['citation_fn']}"
+        )
+    print()
 
 
 def main() -> None:
@@ -201,6 +270,7 @@ def main() -> None:
     # --- Categorical metrics ---
     from benchmarks.metrics import compute_categorical_metrics
     metrics = compute_categorical_metrics(aligned_pred, aligned_gold)
+    per_gene_report = build_per_gene_report(aligned_pred, aligned_gold)
 
     # --- LLM judge ---
     judge_results = None
@@ -214,6 +284,7 @@ def main() -> None:
 
     # --- Report ---
     print_report(metrics, judge_results)
+    print_per_gene_debug(per_gene_report)
 
     # --- Optional JSON output ---
     if args.output:
@@ -221,6 +292,7 @@ def main() -> None:
             "holdout_path": str(args.holdout),
             "n_genes": len(holdout),
             "categorical_metrics": metrics,
+            "per_gene_report": per_gene_report,
             "judge": judge_results,
             "pipeline_result": pipeline_result,
         }

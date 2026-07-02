@@ -21,6 +21,9 @@ class ResolvedGene(BaseModel):
     input_symbol: str
     canonical_symbol: Optional[str] = None
     hgnc_id: Optional[str] = None
+    name: Optional[str] = None
+    alias_symbols: List[str] = Field(default_factory=list)
+    locus_type: Optional[str] = None
     resolved: bool
     unresolvable: bool = False  # bare Ensembl ID or unannotated locus
 

@@ -141,7 +141,8 @@ async def _tier1_retrieve(
       2. Free-text broadening query (catches alias spellings)
       3. Co-query with each fusion partner (catches fusion-specific papers)
 
-    Results are deduplicated by PMID, capped at pubmed_max_results, then fetched.
+    Results are deduplicated by PMID and fetched across query families before
+    the downstream selection pass narrows the synthesis context.
     """
     queries = [
         f'"{gene}"[Gene Name] AND cancer[MeSH Terms]',
@@ -161,7 +162,8 @@ async def _tier1_retrieve(
                 if pmid not in seen:
                     seen.add(pmid)
                     merged.append(pmid)
-        records = await _efetch(merged[:settings.pubmed_max_results], client)
+        fetch_cap = settings.pubmed_max_results * len(queries)
+        records = await _efetch(merged[:fetch_cap], client)
 
     logger.info(
         "Tier 1: %d abstracts for %s (%d queries, %d unique PMIDs before cap)",
