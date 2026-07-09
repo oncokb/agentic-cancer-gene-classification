@@ -18,48 +18,69 @@ logger = logging.getLogger(__name__)
 
 ONCOKB_GENES_URL = "https://www.oncokb.org/api/v1/genes"
 
-_oncokb_gene_cache: Optional[Set[str]] = None
+
+class OncoKBConfigurationError(RuntimeError):
+    """Raised when OncoKB lookups are requested without required configuration."""
 
 
-async def _load_oncokb_genes(client: httpx.AsyncClient) -> Set[str]:
-    global _oncokb_gene_cache
-    if _oncokb_gene_cache is not None:
-        return _oncokb_gene_cache
+class OncoKBGeneLookup:
+    """OncoKB gene membership lookup with an explicit per-instance cache."""
 
-    if not settings.oncokb_api_token:
-        logger.warning("ONCOKB_API_TOKEN not set; in_oncokb will be None for all genes")
-        _oncokb_gene_cache = set()
-        return _oncokb_gene_cache
+    def __init__(self, api_token: Optional[str] = None) -> None:
+        self.api_token = api_token if api_token is not None else settings.oncokb_api_token
+        self._gene_cache: Optional[Set[str]] = None
 
-    headers = {
-        "Authorization": f"Bearer {settings.oncokb_api_token}",
-        "Accept": "application/json",
-    }
-    try:
-        resp = await client.get(ONCOKB_GENES_URL, headers=headers, timeout=15.0)
-        resp.raise_for_status()
-        genes = resp.json()
-        _oncokb_gene_cache = {g["hugoSymbol"] for g in genes if "hugoSymbol" in g}
-        logger.info("Loaded %d OncoKB genes", len(_oncokb_gene_cache))
-    except httpx.HTTPError as e:
-        logger.error("Failed to load OncoKB genes: %s", e)
-        _oncokb_gene_cache = set()
+    async def load_genes(self, client: httpx.AsyncClient) -> Set[str]:
+        if self._gene_cache is not None:
+            return self._gene_cache
 
-    return _oncokb_gene_cache
+        if not self.api_token:
+            raise OncoKBConfigurationError(
+                "ONCOKB_API_TOKEN is required for OncoKB membership lookup"
+            )
+
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Accept": "application/json",
+        }
+        try:
+            resp = await client.get(ONCOKB_GENES_URL, headers=headers, timeout=15.0)
+            resp.raise_for_status()
+            genes = resp.json()
+            self._gene_cache = {g["hugoSymbol"] for g in genes if "hugoSymbol" in g}
+            logger.info("Loaded %d OncoKB genes", len(self._gene_cache))
+            return self._gene_cache
+        except httpx.HTTPError as e:
+            logger.error("Failed to load OncoKB genes: %s", e)
+            raise
+
+    async def contains(
+        self,
+        gene_symbol: str,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> bool:
+        if client is not None:
+            genes = await self.load_genes(client)
+            return gene_symbol in genes
+
+        async with httpx.AsyncClient() as owned_client:
+            genes = await self.load_genes(owned_client)
+        return gene_symbol in genes
 
 
-async def check_oncokb_membership(gene_symbol: str) -> Optional[bool]:
+async def check_oncokb_membership(
+    gene_symbol: str,
+    lookup: Optional[OncoKBGeneLookup] = None,
+) -> bool:
     """
-    Returns True if in OncoKB, False if confirmed absent, None if unknown
-    (no API token configured or lookup failed).
+    Returns True if in OncoKB and False if confirmed absent.
+
+    Raises OncoKBConfigurationError if ONCOKB_API_TOKEN is not configured.
+    Pass a shared OncoKBGeneLookup instance when checking multiple genes to
+    reuse the cached gene list without relying on module-level global state.
     """
-    async with httpx.AsyncClient() as client:
-        genes = await _load_oncokb_genes(client)
-
-    if not genes and not settings.oncokb_api_token:
-        return None
-
-    return gene_symbol in genes
+    lookup = lookup or OncoKBGeneLookup()
+    return await lookup.contains(gene_symbol)
 
 
 def get_msk_genie_prevalence(gene_symbol: str) -> Optional[str]:
