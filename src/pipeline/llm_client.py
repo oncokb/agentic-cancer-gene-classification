@@ -24,22 +24,17 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Lazy-initialised — only created if SDK mode is actually used.
-_sdk_client: anthropic.AsyncAnthropic | None = None
 DEFAULT_LOCAL_BACKEND = "claude-code"
 LOCAL_BACKENDS = ("claude-code", "codex", "antigravity")
 
 
-def _get_sdk_client() -> anthropic.AsyncAnthropic:
-    global _sdk_client
-    if _sdk_client is None:
-        if not settings.anthropic_api_key:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set. "
-                "Either add it to .env or run with --local to use a local agent CLI."
-            )
-        _sdk_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    return _sdk_client
+def _make_sdk_client() -> anthropic.AsyncAnthropic:
+    if not settings.anthropic_api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. "
+            "Either add it to .env or run with --local to use a local agent CLI."
+        )
+    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 
 def resolve_local_backend(local_mode: bool = False, local_backend: Optional[str] = None) -> Optional[str]:
@@ -88,7 +83,7 @@ async def _complete_sdk(
     tool: Dict[str, Any],
     max_tokens: int,
 ) -> Dict[str, Any]:
-    client = _get_sdk_client()
+    client = _make_sdk_client()
     response = await client.messages.create(
         model=model,
         max_tokens=max_tokens,
