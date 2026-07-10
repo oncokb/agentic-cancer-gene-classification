@@ -10,12 +10,13 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from src.config import settings
-from src.models.schema import AnnotationResult, GeneAnnotation
+from src.models.schema import AnnotationResult, GeneAnnotation, ResolvedGene
 from src.pipeline.db_lookups import check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import retrieve_literature
+from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import normalize_fusions
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
@@ -23,11 +24,31 @@ from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annota
 logger = logging.getLogger(__name__)
 
 
+def _format_gene_identity(resolved_gene: ResolvedGene) -> Optional[str]:
+    """Return concise HGNC identity context for retrieval-grounded LLM prompts."""
+    if not resolved_gene.resolved:
+        return None
+
+    parts = []
+    if resolved_gene.name:
+        parts.append(f"HGNC name: {resolved_gene.name}")
+    if resolved_gene.hgnc_id:
+        parts.append(f"HGNC ID: {resolved_gene.hgnc_id}")
+    if resolved_gene.locus_type:
+        parts.append(f"Locus type: {resolved_gene.locus_type}")
+    if resolved_gene.alias_symbols:
+        aliases = ", ".join(resolved_gene.alias_symbols[:8])
+        parts.append(f"Accepted aliases: {aliases}")
+    return "; ".join(parts) if parts else None
+
+
 async def _annotate_gene(
     gene: str,
     fusions: List[str],
-    resolved: bool,
+    resolved_gene: ResolvedGene,
     unresolvable: bool,
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
 ) -> GeneAnnotation:
     """Run the full annotation pipeline for a single gene."""
     if unresolvable:
@@ -45,16 +66,22 @@ async def _annotate_gene(
     # Run DB lookup and literature retrieval concurrently
     oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
         check_oncokb_membership(gene),
-        retrieve_literature(gene, fusions),
+        retrieve_literature(gene, fusions, local_mode=local_mode, local_backend=local_backend),
     )
 
     prevalence = get_msk_genie_prevalence(gene)
+    gene_identity = _format_gene_identity(resolved_gene)
 
     # Citation selection pass: filter broad retrieval corpus down to the
     # most directly relevant papers before synthesis to improve precision
     # without shrinking the recall pool.
     selected_records = await select_papers_for_synthesis(
-        gene, records, settings.max_papers_for_synthesis
+        gene,
+        records,
+        settings.max_papers_for_synthesis,
+        gene_identity=gene_identity,
+        local_mode=local_mode,
+        local_backend=local_backend,
     )
 
     try:
@@ -65,6 +92,9 @@ async def _annotate_gene(
             cancer_type_prevalence=prevalence,
             records=selected_records,
             retrieval_tier=retrieval_tier,
+            gene_identity=gene_identity,
+            local_mode=local_mode,
+            local_backend=local_backend,
         )
     except Exception as e:
         logger.error("Synthesis failed for gene %s: %s", gene, e)
@@ -88,13 +118,19 @@ async def _annotate_gene(
     )
 
 
-async def run_pipeline(fusions: List[str]) -> AnnotationResult:
+async def run_pipeline(
+    fusions: List[str],
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
+) -> AnnotationResult:
     """
     Main entry point: accepts a list of fusion strings and returns
     a structured AnnotationResult with one GeneAnnotation per gene.
     """
     run_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
+    local_backend = resolve_local_backend(local_mode=local_mode, local_backend=local_backend)
+    local_mode = local_backend is not None
     logger.info("Pipeline run %s started — %d fusions", run_id, len(fusions))
 
     gene_map = await normalize_fusions(fusions)
@@ -107,8 +143,10 @@ async def run_pipeline(fusions: List[str]) -> AnnotationResult:
         annotation = await _annotate_gene(
             gene=canonical,
             fusions=gene_fusions,
-            resolved=resolved_gene.resolved,
+            resolved_gene=resolved_gene,
             unresolvable=resolved_gene.unresolvable,
+            local_mode=local_mode,
+            local_backend=local_backend,
         )
         annotations.append(annotation)
         logger.info(

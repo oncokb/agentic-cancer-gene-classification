@@ -120,6 +120,7 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
 
     url = HGNC_FETCH_URL.format(symbol=symbol)
     headers = {"Accept": "application/json"}
+    lookup_failed = False
 
     try:
         resp = await client.get(url, headers=headers, timeout=HGNC_TIMEOUT_SECONDS)
@@ -132,10 +133,13 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
                 input_symbol=symbol,
                 canonical_symbol=doc.get("symbol", symbol),
                 hgnc_id=doc.get("hgnc_id"),
+                name=doc.get("name"),
+                alias_symbols=doc.get("alias_symbol", []) or [],
+                locus_type=doc.get("locus_type"),
                 resolved=True,
             )
     except httpx.HTTPError:
-        pass
+        lookup_failed = True
 
     # Try search as fallback (handles minor capitalisation differences)
     try:
@@ -150,10 +154,22 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
                 input_symbol=symbol,
                 canonical_symbol=doc.get("symbol", symbol),
                 hgnc_id=doc.get("hgnc_id"),
+                name=doc.get("name"),
+                alias_symbols=doc.get("alias_symbol", []) or [],
+                locus_type=doc.get("locus_type"),
                 resolved=True,
             )
     except httpx.HTTPError:
-        pass
+        lookup_failed = True
+
+    if lookup_failed:
+        return ResolvedGene(
+            input_symbol=symbol,
+            canonical_symbol=symbol,
+            hgnc_id=None,
+            resolved=False,
+            unresolvable=False,
+        )
 
     # Could not resolve — treat as unknown locus (insufficient evidence)
     return _unresolvable_gene(symbol)

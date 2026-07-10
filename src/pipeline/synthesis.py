@@ -9,34 +9,34 @@ Enforces three invariants:
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Dict, List, Optional, Set
-
-import anthropic
+from typing import Dict, List, Optional
 
 from src.config import settings
 from src.models.schema import GeneAnnotation, LiteratureRecord
+from src.pipeline.citation_precision import filter_and_rank_citations
+from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
-
-_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 SYSTEM_PROMPT = """\
 You are a cancer genomics expert filling structured annotation rows for the OncoKB MSK TARGET Gene Triaging database.
 
 You will receive:
 1. A gene name and its associated fusion partners.
-2. Deterministic facts from authoritative databases (OncoKB membership, prevalence).
+2. Deterministic facts from authoritative databases (HGNC identity, OncoKB membership, prevalence).
 3. Retrieved PubMed abstracts (each with its PMID).
 
 Your task is to call the `annotate_gene` tool with a structured annotation.
 
 ## Hard constraints — never violate these:
 - Every claim in `gene_summary` must be directly traceable to one of the retrieved abstracts.
-- `citations` must ONLY contain PMIDs that appear in the provided retrieved abstracts list.
+- `citations` must ONLY contain the strongest PMIDs that appear in the provided retrieved abstracts list.
 - Do NOT invent, guess, or recall PMIDs from memory. If a fact cannot be grounded in the retrieved set, omit it.
 - A fabricated PMID will cause patient safety errors. Treat citation fabrication as the most critical failure mode.
+- Prefer citation precision over citation volume. Do not cite loosely related background papers just because they were retrieved.
+- Use the HGNC identity to avoid same-symbol ambiguity. Do not cite papers that use the same symbol
+  for a different entity, such as an lncRNA/circRNA/transcript name unrelated to the HGNC gene.
 - If the retrieved evidence is insufficient to make a determination, set `insufficient_evidence: true` and leave classification fields null. This is a valid, preferred output over hallucination.
 - If `cancer_associated` is false OR `insufficient_evidence` is true, you MUST leave `cancer_associated_gene_tier` and `og_or_tsg` null. Do not fill these fields for non-cancer genes or genes with insufficient evidence.
 
@@ -66,7 +66,7 @@ End the `gene_summary` with one parenthetical sentence noting the retrieval tier
   "(Literature sourced via Tier 2 Claude agentic retrieval — sparse initial results required expanded search.)"
 """
 
-ANNOTATE_TOOL: anthropic.types.ToolParam = {
+ANNOTATE_TOOL: dict = {
     "name": "annotate_gene",
     "description": (
         "Produce a structured cancer gene annotation grounded in the retrieved literature. "
@@ -124,8 +124,9 @@ ANNOTATE_TOOL: anthropic.types.ToolParam = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "List of PMIDs supporting this annotation. "
-                    "MUST be a subset of the retrieved abstracts provided. No extras."
+                    f"List of up to {settings.max_citations_per_annotation} strongest PMIDs "
+                    "supporting this annotation. MUST be a subset of the retrieved abstracts provided. "
+                    "No extras."
                 ),
             },
             "confidence": {
@@ -146,6 +147,7 @@ def _build_user_prompt(
     cancer_type_prevalence: Optional[str],
     records: List[LiteratureRecord],
     retrieval_tier: int,
+    gene_identity: Optional[str] = None,
 ) -> str:
     tier_label = (
         "Tier 1 (direct NCBI structured query — abundant indexed literature)"
@@ -158,6 +160,7 @@ def _build_user_prompt(
         f"Retrieval tier: {tier_label}",
         "",
         "### Deterministic database facts (do not contradict or regenerate):",
+        f"- HGNC identity: {gene_identity or 'not available'}",
         f"- In OncoKB: {'Yes' if in_oncokb else ('No' if in_oncokb is False else 'Unknown (token not configured)')}",
         f"- Cancer-type prevalence (MSK/GENIE): {cancer_type_prevalence or 'not available'}",
         "",
@@ -169,7 +172,7 @@ def _build_user_prompt(
     else:
         for rec in records:
             lines += [
-                f"---",
+                "---",
                 f"PMID: {rec.pmid}",
                 f"Title: {rec.title}",
                 f"Abstract: {rec.abstract}",
@@ -179,20 +182,37 @@ def _build_user_prompt(
 
 
 def _verify_citations(
+    gene: str,
     citations: List[str],
-    retrieved_pmids: Set[str],
+    records: List[LiteratureRecord],
+    max_citations: int,
+    gene_identity: Optional[str] = None,
 ) -> List[str]:
     """
-    Remove any PMID from the LLM's citation list that was not in the retrieved set.
+    Remove ambiguous or unretrieved PMIDs from the LLM's citation list, then rank.
     An identifier that was not retrieved is a rejection, not a warning.
     """
-    verified = [pmid for pmid in citations if pmid in retrieved_pmids]
+    retrieved_pmids = {record.pmid for record in records}
+    verified = filter_and_rank_citations(
+        gene=gene,
+        emitted_citations=citations,
+        records=records,
+        max_citations=max_citations,
+        gene_identity=gene_identity,
+        min_score=-99,
+    )
     rejected = set(citations) - retrieved_pmids
     if rejected:
         logger.warning(
             "Rejected %d unverified PMIDs from LLM output: %s",
             len(rejected),
             rejected,
+        )
+    if len(citations) > len(verified):
+        logger.info(
+            "Kept %d/%d emitted citations after PMID verification, identity filtering, and precision cap",
+            len(verified),
+            len(citations),
         )
     return verified
 
@@ -204,43 +224,46 @@ async def synthesize_gene_annotation(
     cancer_type_prevalence: Optional[str],
     records: List[LiteratureRecord],
     retrieval_tier: int = 1,
+    gene_identity: Optional[str] = None,
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
 ) -> Dict:
     """
     Call Claude to produce a structured annotation. Returns raw tool-use input dict.
     Raises on API error.
     """
-    user_prompt = _build_user_prompt(gene, fusions, in_oncokb, cancer_type_prevalence, records, retrieval_tier)
-    retrieved_pmids: Set[str] = {r.pmid for r in records}
-
-    response = await _client.messages.create(
+    user_prompt = _build_user_prompt(
+        gene,
+        fusions,
+        in_oncokb,
+        cancer_type_prevalence,
+        records,
+        retrieval_tier,
+        gene_identity,
+    )
+    tool_input = await complete_with_tool(
         model=settings.synthesis_model,
+        system=SYSTEM_PROMPT,
+        user=user_prompt,
+        tool=ANNOTATE_TOOL,
         max_tokens=2048,
-        system=[
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},  # prompt caching
-            }
-        ],
-        tools=[ANNOTATE_TOOL],
-        tool_choice={"type": "tool", "name": "annotate_gene"},
-        messages=[{"role": "user", "content": user_prompt}],
+        local_mode=local_mode,
+        local_backend=local_backend,
     )
 
-    # Extract tool_use block
-    tool_input: dict = {}
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "annotate_gene":
-            tool_input = block.input
-            break
-
     if not tool_input:
-        logger.error("No tool_use block returned by model for gene %s", gene)
+        logger.error("No annotation returned for gene %s", gene)
         return {"insufficient_evidence": True, "cancer_associated": None, "confidence": 0.0}
 
     # PMID verification — reject any citation not in retrieved set
     if "citations" in tool_input:
-        tool_input["citations"] = _verify_citations(tool_input["citations"], retrieved_pmids)
+        tool_input["citations"] = _verify_citations(
+            gene,
+            tool_input["citations"],
+            records,
+            settings.max_citations_per_annotation,
+            gene_identity,
+        )
 
     return tool_input
 
@@ -254,20 +277,35 @@ def build_gene_annotation(
     synthesis_result: Dict,
 ) -> GeneAnnotation:
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
+    tier = synthesis_result.get("cancer_associated_gene_tier")
+    og_or_tsg = synthesis_result.get("og_or_tsg")
+    cancer_associated = synthesis_result.get("cancer_associated")
+    insufficient_evidence = synthesis_result.get("insufficient_evidence", False)
+
+    if cancer_associated is False or insufficient_evidence:
+        tier = None
+        og_or_tsg = None
+    elif in_oncokb is False and tier == "Class I - Driver":
+        logger.info(
+            "Downgrading non-OncoKB Class I call for %s to Class II pending stronger curation",
+            gene,
+        )
+        tier = "Class II - Likely Driver"
+
     return GeneAnnotation(
         gene=gene,
         fusions=list(dict.fromkeys(fusions)),  # deduplicate, preserve order
         in_oncokb=in_oncokb,
-        cancer_associated=synthesis_result.get("cancer_associated"),
+        cancer_associated=cancer_associated,
         cancer_association_rationale=synthesis_result.get("cancer_association_rationale"),
-        cancer_associated_gene_tier=synthesis_result.get("cancer_associated_gene_tier"),
-        og_or_tsg=synthesis_result.get("og_or_tsg"),
+        cancer_associated_gene_tier=tier,
+        og_or_tsg=og_or_tsg,
         cancer_type_prevalence=cancer_type_prevalence,
         gene_class=synthesis_result.get("gene_class"),
         signaling_pathways=synthesis_result.get("signaling_pathways"),
         gene_summary=synthesis_result.get("gene_summary"),
         citations=synthesis_result.get("citations", []),
         retrieval_count=len(records),
-        insufficient_evidence=synthesis_result.get("insufficient_evidence", False),
+        insufficient_evidence=insufficient_evidence,
         confidence=synthesis_result.get("confidence", 0.0),
     )

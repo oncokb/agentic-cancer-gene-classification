@@ -115,3 +115,17 @@ async def test_resolve_gene_uses_hgnc_search_after_fetch_miss():
 
     assert resolved.canonical_symbol == "NEW"
     assert resolved.hgnc_id == "HGNC:1"
+
+
+@pytest.mark.asyncio
+async def test_resolve_gene_continues_when_hgnc_lookup_fails():
+    class FailingClient:
+        async def get(self, *args, **kwargs):
+            raise httpx.ConnectError("temporary HGNC outage")
+
+    resolved = await resolve_gene("ACACB", FailingClient())
+
+    assert resolved.input_symbol == "ACACB"
+    assert resolved.canonical_symbol == "ACACB"
+    assert resolved.resolved is False
+    assert resolved.unresolvable is False

@@ -12,18 +12,15 @@ This separates "retrieve broadly" (recall) from "synthesise narrowly"
 from __future__ import annotations
 
 import logging
-from typing import List
-
-import anthropic
+from typing import List, Optional
 
 from src.config import settings
 from src.models.schema import LiteratureRecord
+from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
 
-_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
-_SELECT_TOOL: anthropic.types.ToolParam = {
+_SELECT_TOOL: dict = {
     "name": "select_papers",
     "description": (
         "Return the PMIDs of the abstracts that most directly establish "
@@ -51,15 +48,18 @@ Prefer abstracts that:
   overexpression models, recurrent somatic mutations in patient cohorts)
 - Provide clinical evidence linking the gene to cancer survival, treatment response, or incidence
 - Are focused primarily on this gene (not papers where it appears in a large gene list)
+- Match the provided HGNC identity for this gene, including full name and locus type
 
 Deprioritize abstracts that:
 - Mention the gene only in passing or as one of dozens of hits in a multi-gene screen
 - Are prognostic signature studies with no mechanistic follow-up on this gene specifically
 - Focus on non-cancer biology with only tangential cancer relevance
+- Use the same symbol for a different entity, such as an lncRNA/circRNA/transcript name
+  that does not match the provided HGNC identity
 - Duplicate the finding of another selected abstract
 
-Return between 1 and the requested maximum. If fewer than the maximum are truly directly relevant,
-return only those — do not pad with loosely related papers.
+Return up to the requested maximum. If no papers are truly directly relevant, return an empty
+list — do not pad with loosely related papers.
 """
 
 
@@ -67,6 +67,9 @@ async def select_papers_for_synthesis(
     gene: str,
     records: List[LiteratureRecord],
     max_papers: int,
+    gene_identity: Optional[str] = None,
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
 ) -> List[LiteratureRecord]:
     """
     Filter retrieved records to the most directly cancer-relevant subset.
@@ -83,38 +86,35 @@ async def select_papers_for_synthesis(
     )
     prompt = (
         f"Gene: {gene}\n"
+        f"Gene identity: {gene_identity or 'canonical symbol only'}\n"
         f"Select up to {max_papers} of the following {len(records)} abstracts "
         f"that most directly establish {gene}'s role in cancer.\n\n"
         f"{abstracts_text}"
     )
 
     try:
-        response = await _client.messages.create(
+        result = await complete_with_tool(
             model=settings.selection_model,
+            system=_SELECT_SYSTEM,
+            user=prompt,
+            tool=_SELECT_TOOL,
             max_tokens=512,
-            system=[
-                {
-                    "type": "text",
-                    "text": _SELECT_SYSTEM,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            tools=[_SELECT_TOOL],
-            tool_choice={"type": "tool", "name": "select_papers"},
-            messages=[{"role": "user", "content": prompt}],
+            local_mode=local_mode,
+            local_backend=local_backend,
         )
 
-        selected_pmids: set = set()
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "select_papers":
-                selected_pmids = set(block.input.get("selected_pmids", []))
-                break
+        selected_pmids = [
+            pmid
+            for pmid in dict.fromkeys(result.get("selected_pmids", []))
+            if isinstance(pmid, str)
+        ][:max_papers]
 
         if not selected_pmids:
-            logger.warning("Selection pass returned no PMIDs for %s — using top %d", gene, max_papers)
-            return records[:max_papers]
+            logger.info("Selection pass returned no relevant PMIDs for %s", gene)
+            return []
 
-        selected = [r for r in records if r.pmid in selected_pmids]
+        records_by_pmid = {r.pmid: r for r in records}
+        selected = [records_by_pmid[pmid] for pmid in selected_pmids if pmid in records_by_pmid]
         logger.info("Selection pass for %s: %d → %d papers", gene, len(records), len(selected))
         return selected if selected else records[:max_papers]
 

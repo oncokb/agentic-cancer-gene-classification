@@ -14,3 +14,29 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  annotation-service-local:
+    profiles: ["local"]
+    build:
+      context: .
+      args:
+        INSTALL_LOCAL_AGENTS: "true"
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=INFO
+      - HOME=/home/appuser
+      - CODEX_HOME=/home/appuser/.codex
+    volumes:
+      - ${HOME}/.codex:/home/appuser/.codex
+      - ${HOME}/.claude:/home/appuser/.claude
+      - ${HOME}/.claude.json:/home/appuser/.claude.json
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

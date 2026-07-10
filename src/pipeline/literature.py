@@ -27,6 +27,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
 from src.models.schema import LiteratureRecord
+from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,8 @@ async def _tier1_retrieve(
       2. Free-text broadening query (catches alias spellings)
       3. Co-query with each fusion partner (catches fusion-specific papers)
 
-    Results are deduplicated by PMID, capped at pubmed_max_results, then fetched.
+    Results are deduplicated by PMID and fetched across query families before
+    the downstream selection pass narrows the synthesis context.
     """
     queries = [
         f'"{gene}"[Gene Name] AND cancer[MeSH Terms]',
@@ -160,7 +162,8 @@ async def _tier1_retrieve(
                 if pmid not in seen:
                     seen.add(pmid)
                     merged.append(pmid)
-        records = await _efetch(merged[:settings.pubmed_max_results], client)
+        fetch_cap = settings.pubmed_max_results * len(queries)
+        records = await _efetch(merged[:fetch_cap], client)
 
     logger.info(
         "Tier 1: %d abstracts for %s (%d queries, %d unique PMIDs before cap)",
@@ -206,6 +209,24 @@ _DONE_TOOL: anthropic.types.ToolParam = {
     "name": "done",
     "description": "Signal that you have retrieved sufficient literature and are ready for synthesis.",
     "input_schema": {"type": "object", "properties": {}},
+}
+
+_SUGGEST_QUERIES_TOOL: dict = {
+    "name": "suggest_pubmed_queries",
+    "description": (
+        "Return PubMed queries that are likely to find cancer-relevant evidence for this gene."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["queries"],
+        "properties": {
+            "queries": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "PubMed query strings, ordered from most to least promising.",
+            }
+        },
+    },
 }
 
 _AGENTIC_SYSTEM = """\
@@ -338,6 +359,70 @@ async def _tier2_agentic_retrieve(
     return list(accumulated.values())
 
 
+async def _tier2_local_retrieve(
+    gene: str,
+    fusions: List[str],
+    initial_records: List[LiteratureRecord],
+    local_backend: Optional[str],
+) -> List[LiteratureRecord]:
+    """
+    Local fallback retrieval for Claude Code mode.
+
+    Claude Code cannot participate in Anthropic SDK tool-use loops, so ask it for
+    concrete PubMed query strings, then execute those queries locally.
+    """
+    accumulated: Dict[str, LiteratureRecord] = {r.pmid: r for r in initial_records}
+    fusion_context = f"Associated fusions: {', '.join(fusions)}" if fusions else "Associated fusions: none"
+    initial_summary = _format_initial_records(initial_records)
+    user_prompt = (
+        f"Gene: {gene}\n"
+        f"{fusion_context}\n\n"
+        f"{initial_summary}\n\n"
+        "Suggest up to 6 PubMed queries to find direct cancer-relevant evidence for this gene. "
+        "Include aliases, fusion partner context, pathway or protein-family terms when useful. "
+        "Return only queries that should be run against PubMed."
+    )
+
+    result = await complete_with_tool(
+        model=settings.synthesis_model,
+        system=_AGENTIC_SYSTEM,
+        user=user_prompt,
+        tool=_SUGGEST_QUERIES_TOOL,
+        max_tokens=1024,
+        local_mode=True,
+        local_backend=local_backend,
+    )
+    queries = [q for q in result.get("queries", []) if isinstance(q, str) and q.strip()]
+    queries = list(dict.fromkeys(q.strip() for q in queries))[:MAX_AGENTIC_TOOL_CALLS]
+
+    async with httpx.AsyncClient() as http_client:
+        for i, query in enumerate(queries, start=1):
+            logger.info(
+                "Local agent suggested PubMed query [%d/%d] for %s: %s",
+                i,
+                len(queries),
+                gene,
+                query,
+            )
+            try:
+                new_records = await _search_and_fetch(
+                    query, 20, http_client, set(accumulated.keys())
+                )
+            except httpx.HTTPError as exc:
+                logger.warning("Local Tier 2 PubMed query failed for %s: %s", gene, exc)
+                continue
+            for record in new_records:
+                accumulated[record.pmid] = record
+
+    logger.info(
+        "Local Tier 2 complete for %s: %d total abstracts (%d from suggested queries)",
+        gene,
+        len(accumulated),
+        len(accumulated) - len(initial_records),
+    )
+    return list(accumulated.values())
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -345,6 +430,8 @@ async def _tier2_agentic_retrieve(
 async def retrieve_literature(
     gene: str,
     fusions: Optional[List[str]] = None,
+    local_mode: bool = False,
+    local_backend: Optional[str] = None,
 ) -> tuple:
     """
     Two-tier retrieval with automatic fallthrough.
@@ -373,5 +460,8 @@ async def retrieve_literature(
         "Tier 1 insufficient for %s (%d < %d papers) — falling through to Claude",
         gene, len(records), settings.min_papers_for_strong_association,
     )
-    records = await _tier2_agentic_retrieve(gene, fusions or [], records)
+    if local_mode:
+        records = await _tier2_local_retrieve(gene, fusions or [], records, local_backend)
+    else:
+        records = await _tier2_agentic_retrieve(gene, fusions or [], records)
     return records, 2

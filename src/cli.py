@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
 
 from src.pipeline.orchestrator import run_pipeline
+from src.pipeline.llm_client import DEFAULT_LOCAL_BACKEND, LOCAL_BACKENDS
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +40,18 @@ def parse_args() -> argparse.Namespace:
         default="-",
         help="Output JSON file path. Use '-' for stdout (default).",
     )
+    parser.add_argument(
+        "--local",
+        nargs="?",
+        const=DEFAULT_LOCAL_BACKEND,
+        choices=LOCAL_BACKENDS,
+        metavar="BACKEND",
+        help=(
+            "Route LLM calls through a local agent CLI instead of the Anthropic SDK. "
+            f"Choices: {', '.join(LOCAL_BACKENDS)}. Defaults to {DEFAULT_LOCAL_BACKEND} "
+            "when --local is provided without a backend."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -56,7 +68,13 @@ def main() -> None:
         print("No fusions provided.", file=sys.stderr)
         sys.exit(1)
 
-    result = asyncio.run(run_pipeline(fusions))
+    if args.local:
+        print(
+            f"Local mode: LLM calls routed through `{args.local}` (no API key required).",
+            file=sys.stderr,
+        )
+
+    result = asyncio.run(run_pipeline(fusions, local_backend=args.local))
     output = result.model_dump_json(indent=2)
 
     if args.output == "-":

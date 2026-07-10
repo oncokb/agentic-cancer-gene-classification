@@ -16,7 +16,7 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-ONCOKB_GENES_URL = "https://www.oncokb.org/api/v1/genes"
+ONCOKB_CURATED_GENES_URL = "https://www.oncokb.org/api/v1/utils/allCuratedGenes"
 
 
 class OncoKBConfigurationError(RuntimeError):
@@ -44,7 +44,7 @@ class OncoKBGeneLookup:
             "Accept": "application/json",
         }
         try:
-            resp = await client.get(ONCOKB_GENES_URL, headers=headers, timeout=15.0)
+            resp = await client.get(ONCOKB_CURATED_GENES_URL, headers=headers, timeout=15.0)
             resp.raise_for_status()
             genes = resp.json()
             self._gene_cache = {g["hugoSymbol"] for g in genes if "hugoSymbol" in g}
