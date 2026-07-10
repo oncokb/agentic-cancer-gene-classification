@@ -12,10 +12,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import List
 
+from src.config import settings
 from src.models.schema import AnnotationResult, GeneAnnotation
 from src.pipeline.db_lookups import check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import retrieve_literature
 from src.pipeline.normalization import normalize_fusions
+from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
 
 logger = logging.getLogger(__name__)
@@ -48,13 +50,20 @@ async def _annotate_gene(
 
     prevalence = get_msk_genie_prevalence(gene)
 
+    # Citation selection pass: filter broad retrieval corpus down to the
+    # most directly relevant papers before synthesis to improve precision
+    # without shrinking the recall pool.
+    selected_records = await select_papers_for_synthesis(
+        gene, records, settings.max_papers_for_synthesis
+    )
+
     try:
         synthesis = await synthesize_gene_annotation(
             gene=gene,
             fusions=fusions,
             in_oncokb=oncokb_membership,
             cancer_type_prevalence=prevalence,
-            records=records,
+            records=selected_records,
             retrieval_tier=retrieval_tier,
         )
     except Exception as e:
@@ -74,7 +83,7 @@ async def _annotate_gene(
         fusions=fusions,
         in_oncokb=oncokb_membership,
         cancer_type_prevalence=prevalence,
-        records=records,
+        records=records,       # full count for retrieval_count field
         synthesis_result=synthesis,
     )
 
