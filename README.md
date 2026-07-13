@@ -180,6 +180,23 @@ python -m benchmarks.run_benchmark --local codex --no-judge --output benchmark_r
 
 `--no-judge` is required for a fully credit-free benchmark run because `benchmarks/judge.py` still uses the Anthropic SDK for LLM-as-judge summary scoring.
 
+Include kinase curation CSV diagnostics in the benchmark report:
+
+```bash
+python -m benchmarks.run_benchmark \
+  --local codex \
+  --no-judge \
+  --output benchmark_report.json \
+  --kinase-curation-csv kinase_fusions.csv \
+  --kinase-truth-csv google_sheet_export.csv \
+  --kinase-comparison-csv kinase_fusions.comparison.csv
+```
+
+`--kinase-truth-csv` is read-only and can point to a CSV export of the Google Sheet.
+The benchmark JSON includes a `kinase_curation` section with generated kinase rows
+and, when a truth CSV is provided, the same fusion/kinase and PMID comparison metrics
+used by the CLI export path.
+
 ## Tests
 
 ```bash
