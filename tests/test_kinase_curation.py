@@ -53,7 +53,8 @@ def test_build_kinase_curation_rows_targets_functional_kinase_partner():
     assert "gene_class: Receptor tyrosine kinase" in row.biologic_characterization_specs
     assert "tier: Class I - Driver" in row.biologic_characterization_specs
     assert row.publication_link == (
-        "https://pubmed.ncbi.nlm.nih.gov/222/; https://pubmed.ncbi.nlm.nih.gov/333/"
+        "PMID 222: https://pubmed.ncbi.nlm.nih.gov/222/; "
+        "PMID 333: https://pubmed.ncbi.nlm.nih.gov/333/"
     )
 
 
@@ -109,6 +110,6 @@ def test_write_kinase_curation_csv_uses_requested_headers(tmp_path):
                 "ABL1: gene_class: Tyrosine kinase; rationale: "
                 "Fusion-driven kinase activation"
             ),
-            "publication link": "https://pubmed.ncbi.nlm.nih.gov/12345/",
+            "publication link": "PMID 12345: https://pubmed.ncbi.nlm.nih.gov/12345/",
         }
     ]

@@ -49,7 +49,9 @@ def _format_fusion_metadata(fusion: str) -> str:
 
 
 def _publication_links(citations: Iterable[str]) -> str:
-    return "; ".join(f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" for pmid in citations)
+    return "; ".join(
+        f"PMID {pmid}: https://pubmed.ncbi.nlm.nih.gov/{pmid}/" for pmid in citations
+    )
 
 
 def _biologic_specs(annotation: GeneAnnotation) -> str:
