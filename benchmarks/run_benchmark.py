@@ -230,6 +230,12 @@ def main() -> None:
         help="Write full benchmark report to this JSON file",
     )
     parser.add_argument(
+        "--results-csv",
+        type=Path,
+        default=None,
+        help="Write full pipeline annotation results to this CSV file",
+    )
+    parser.add_argument(
         "--no-judge",
         action="store_true",
         help="Skip the LLM-as-a-judge step (no API calls for summary scoring)",
@@ -263,6 +269,16 @@ def main() -> None:
         fusions = _get_fusions_from_holdout(holdout)
         logger.info("Running pipeline on %d fusions from holdout...", len(fusions))
         pipeline_result = asyncio.run(_run_pipeline(fusions, local_backend=args.local))
+
+    if args.results_csv:
+        from src.models.schema import AnnotationResult
+        from src.pipeline.results_export import write_annotation_results_csv
+
+        write_annotation_results_csv(
+            AnnotationResult.model_validate(pipeline_result),
+            args.results_csv,
+        )
+        logger.info("Pipeline results CSV written to %s", args.results_csv)
 
     # --- Align ---
     aligned_pred, aligned_gold = _align_predictions(holdout, pipeline_result)
