@@ -35,6 +35,27 @@ Then run the CLI:
 python -m src.cli --fusions "TP53::BRAF" --output results.json
 ```
 
+To produce the first-priority kinase fusion curation spreadsheet:
+
+```bash
+python -m src.cli \
+  --fusions "ETV6::NTRK3" "BCR::ABL1" \
+  --output results.json \
+  --kinase-curation-csv kinase_fusions.csv
+```
+
+The CSV is fusion-level and includes:
+
+- `Fusion detected`
+- `Fusion meta data (gene transcripts/ genomic/transcriptiomic breakpoints exons incl etc)`
+- `Kinase included in fusion`
+- `Biologic characterization specs`
+- `publication link`
+
+The current CLI input accepts fusion strings only, so transcript IDs, genomic breakpoints,
+transcriptomic breakpoints, and exon coordinates are marked as not provided unless those
+details are included in a future structured fusion input format.
+
 Or run the API:
 
 ```bash

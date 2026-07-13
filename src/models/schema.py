@@ -61,6 +61,16 @@ class GeneAnnotation(BaseModel):
     error: Optional[str] = None
 
 
+class KinaseFusionCurationRow(BaseModel):
+    """Fusion-level spreadsheet row for literature-curated kinase fusion review."""
+
+    fusion_detected: str
+    fusion_metadata: str
+    kinase_included_in_fusion: str
+    biologic_characterization_specs: str
+    publication_link: str
+
+
 class AnnotateRequest(BaseModel):
     fusions: List[str] = Field(
         ...,

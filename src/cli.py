@@ -14,8 +14,12 @@ import argparse
 import asyncio
 import sys
 
-from src.pipeline.orchestrator import run_pipeline
+from src.pipeline.kinase_curation import (
+    build_kinase_fusion_curation_rows,
+    write_kinase_fusion_curation_csv,
+)
 from src.pipeline.llm_client import DEFAULT_LOCAL_BACKEND, LOCAL_BACKENDS
+from src.pipeline.orchestrator import run_pipeline
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +43,13 @@ def parse_args() -> argparse.Namespace:
         metavar="FILE",
         default="-",
         help="Output JSON file path. Use '-' for stdout (default).",
+    )
+    parser.add_argument(
+        "--kinase-curation-csv",
+        metavar="FILE",
+        help=(
+            "Write a fusion-level CSV focused on literature-curated functional kinase fusions."
+        ),
     )
     parser.add_argument(
         "--local",
@@ -76,6 +87,15 @@ def main() -> None:
 
     result = asyncio.run(run_pipeline(fusions, local_backend=args.local))
     output = result.model_dump_json(indent=2)
+
+    if args.kinase_curation_csv:
+        rows = build_kinase_fusion_curation_rows(result)
+        write_kinase_fusion_curation_csv(rows, args.kinase_curation_csv)
+        print(
+            f"Kinase fusion curation CSV written to {args.kinase_curation_csv} "
+            f"({len(rows)} rows)",
+            file=sys.stderr,
+        )
 
     if args.output == "-":
         print(output)
