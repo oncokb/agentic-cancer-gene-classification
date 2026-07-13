@@ -39,6 +39,24 @@ def test_cli_local_accepts_codex(monkeypatch):
     assert args.local == "codex"
 
 
+def test_cli_accepts_output_csv(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--fusions",
+            "TP53::BRAF",
+            "--output",
+            "results.json",
+            "--output-csv",
+            "results.csv",
+        ],
+    )
+    args = parse_args()
+    assert args.output == "results.json"
+    assert args.output_csv == "results.csv"
+
+
 def test_annotate_request_accepts_local_backend():
     request = AnnotateRequest(fusions=["TP53::BRAF"], local_backend="codex")
     assert request.local_backend == "codex"

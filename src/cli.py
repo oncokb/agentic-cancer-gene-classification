@@ -14,8 +14,9 @@ import argparse
 import asyncio
 import sys
 
-from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.llm_client import DEFAULT_LOCAL_BACKEND, LOCAL_BACKENDS
+from src.pipeline.orchestrator import run_pipeline
+from src.pipeline.results_export import write_annotation_results_csv
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +40,11 @@ def parse_args() -> argparse.Namespace:
         metavar="FILE",
         default="-",
         help="Output JSON file path. Use '-' for stdout (default).",
+    )
+    parser.add_argument(
+        "--output-csv",
+        metavar="FILE",
+        help="Write full gene-level annotation results as a CSV for spreadsheet import.",
     )
     parser.add_argument(
         "--local",
@@ -76,6 +82,10 @@ def main() -> None:
 
     result = asyncio.run(run_pipeline(fusions, local_backend=args.local))
     output = result.model_dump_json(indent=2)
+
+    if args.output_csv:
+        write_annotation_results_csv(result, args.output_csv)
+        print(f"Results CSV written to {args.output_csv}", file=sys.stderr)
 
     if args.output == "-":
         print(output)
