@@ -39,6 +39,27 @@ def test_cli_local_accepts_codex(monkeypatch):
     assert args.local == "codex"
 
 
+def test_cli_accepts_kinase_truth_comparison_args(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--fusions",
+            "ETV6::NTRK3",
+            "--kinase-curation-csv",
+            "kinase.csv",
+            "--kinase-truth-csv",
+            "truth.csv",
+            "--kinase-comparison-csv",
+            "comparison.csv",
+        ],
+    )
+    args = parse_args()
+    assert args.kinase_curation_csv == "kinase.csv"
+    assert args.kinase_truth_csv == "truth.csv"
+    assert args.kinase_comparison_csv == "comparison.csv"
+
+
 def test_annotate_request_accepts_local_backend():
     request = AnnotateRequest(fusions=["TP53::BRAF"], local_backend="codex")
     assert request.local_backend == "codex"

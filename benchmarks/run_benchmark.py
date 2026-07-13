@@ -33,6 +33,15 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from src.models.schema import AnnotationResult
+from src.pipeline.kinase_curation import (
+    build_kinase_fusion_curation_rows,
+    compare_kinase_curation_rows,
+    read_kinase_fusion_curation_csv,
+    write_kinase_curation_comparison_csv,
+    write_kinase_fusion_curation_csv,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -91,6 +100,15 @@ def _align_predictions(
     return aligned_pred, aligned_gold
 
 
+def _load_pipeline_result(path: Path) -> Dict:
+    """Load either raw pipeline JSON or a full benchmark report containing pipeline_result."""
+    with open(path) as f:
+        data = json.load(f)
+    if "pipeline_result" in data and "annotations" not in data:
+        return data["pipeline_result"]
+    return data
+
+
 def build_per_gene_report(
     predictions: List[Dict],
     ground_truth: List[Dict],
@@ -130,6 +148,28 @@ def build_per_gene_report(
             }
         )
     return rows
+
+
+def build_kinase_curation_benchmark_report(
+    pipeline_result: Dict,
+    truth_csv: Optional[Path] = None,
+) -> Dict:
+    """Build kinase CSV export/comparison diagnostics from the benchmark pipeline result."""
+    annotation_result = AnnotationResult.model_validate(pipeline_result)
+    generated_rows = build_kinase_fusion_curation_rows(annotation_result)
+    report = {
+        "generated_rows": len(generated_rows),
+        "generated_fusions": sorted({row.fusion_detected for row in generated_rows}),
+        "rows": [row.model_dump() for row in generated_rows],
+        "truth_csv": str(truth_csv) if truth_csv else None,
+        "comparison": None,
+    }
+
+    if truth_csv:
+        truth_rows = read_kinase_fusion_curation_csv(truth_csv)
+        report["comparison"] = compare_kinase_curation_rows(generated_rows, truth_rows)
+
+    return report
 
 
 def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
@@ -177,6 +217,24 @@ def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
             print("  No summaries evaluated.")
 
     print(f"\n{'='*60}\n")
+
+
+def print_kinase_curation_report(report: Dict) -> None:
+    print("--- kinase curation CSV ---")
+    print(f"  Generated rows: {report['generated_rows']}")
+    if report["generated_fusions"]:
+        print(f"  Generated fusions: {', '.join(report['generated_fusions'])}")
+
+    comparison = report.get("comparison")
+    if comparison:
+        summary = comparison["summary"]
+        print("  Sheet comparison:")
+        print(f"    matched:       {summary['matched_keys']}")
+        print(f"    pipeline_only: {summary['pipeline_only_keys']}")
+        print(f"    truth_only:    {summary['truth_only_keys']}")
+        print(f"    fusion/kinase F1: {summary['fusion_kinase_f1']:.3f}")
+        print(f"    matched PMID F1:  {summary['matched_citation_f1']:.3f}")
+    print()
 
 
 def print_per_gene_debug(per_gene_report: List[Dict]) -> None:
@@ -230,6 +288,27 @@ def main() -> None:
         help="Write full benchmark report to this JSON file",
     )
     parser.add_argument(
+        "--kinase-curation-csv",
+        type=Path,
+        default=None,
+        help="Write generated kinase fusion curation rows to this CSV file",
+    )
+    parser.add_argument(
+        "--kinase-truth-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Read-only CSV export of the Google Sheet source of truth to compare "
+            "against generated kinase curation rows"
+        ),
+    )
+    parser.add_argument(
+        "--kinase-comparison-csv",
+        type=Path,
+        default=None,
+        help="Write per-row kinase curation comparison CSV when --kinase-truth-csv is set",
+    )
+    parser.add_argument(
         "--no-judge",
         action="store_true",
         help="Skip the LLM-as-a-judge step (no API calls for summary scoring)",
@@ -257,8 +336,7 @@ def main() -> None:
     # --- Run or load pipeline ---
     if args.results:
         logger.info("Loading existing pipeline results from %s", args.results)
-        with open(args.results) as f:
-            pipeline_result = json.load(f)
+        pipeline_result = _load_pipeline_result(args.results)
     else:
         fusions = _get_fusions_from_holdout(holdout)
         logger.info("Running pipeline on %d fusions from holdout...", len(fusions))
@@ -272,6 +350,25 @@ def main() -> None:
     metrics = compute_categorical_metrics(aligned_pred, aligned_gold)
     per_gene_report = build_per_gene_report(aligned_pred, aligned_gold)
 
+    # --- Kinase curation CSV diagnostics ---
+    kinase_report = build_kinase_curation_benchmark_report(
+        pipeline_result,
+        truth_csv=args.kinase_truth_csv,
+    )
+    if args.kinase_curation_csv:
+        annotation_result = AnnotationResult.model_validate(pipeline_result)
+        write_kinase_fusion_curation_csv(
+            build_kinase_fusion_curation_rows(annotation_result),
+            args.kinase_curation_csv,
+        )
+        logger.info("Kinase curation CSV written to %s", args.kinase_curation_csv)
+    if args.kinase_comparison_csv and kinase_report["comparison"]:
+        write_kinase_curation_comparison_csv(
+            kinase_report["comparison"],
+            args.kinase_comparison_csv,
+        )
+        logger.info("Kinase curation comparison CSV written to %s", args.kinase_comparison_csv)
+
     # --- LLM judge ---
     judge_results = None
     if not args.no_judge:
@@ -284,6 +381,7 @@ def main() -> None:
 
     # --- Report ---
     print_report(metrics, judge_results)
+    print_kinase_curation_report(kinase_report)
     print_per_gene_debug(per_gene_report)
 
     # --- Optional JSON output ---
@@ -293,6 +391,7 @@ def main() -> None:
             "n_genes": len(holdout),
             "categorical_metrics": metrics,
             "per_gene_report": per_gene_report,
+            "kinase_curation": kinase_report,
             "judge": judge_results,
             "pipeline_result": pipeline_result,
         }
