@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import csv
+import json
 
 from src.models.schema import AnnotationResult, GeneAnnotation
+from src.pipeline import google_sheets_export
+from src.pipeline.google_sheets_export import (
+    annotation_result_sheet_values,
+    google_sheets_config_status,
+    save_service_account_credentials,
+)
 from src.pipeline.results_export import (
     ANNOTATION_RESULTS_CSV_HEADERS,
     build_annotation_results_csv_rows,
@@ -39,6 +46,7 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             citations=["12345", "67890", "12345"],
             date_annotated="7/13/26",
             retrieval_count=12,
+            retrieved_pmids=["12345", "67890", "99999", "12345"],
             insufficient_evidence=False,
             confidence=0.91,
         )
@@ -59,13 +67,14 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             "gene_class": "Serine/threonine kinase",
             "signaling_pathways": "MAPK",
             "gene_summary": "BRAF is a cancer-associated kinase.",
-            "citations": "12345; 67890",
-            "publication_links": (
+            "supporting_citation_pmids": "12345; 67890",
+            "supporting_citation_publication_links": (
                 "https://pubmed.ncbi.nlm.nih.gov/12345/; "
                 "https://pubmed.ncbi.nlm.nih.gov/67890/"
             ),
             "date_annotated": "7/13/26",
             "retrieval_count": "12",
+            "retrieved_pmids": "12345; 67890; 99999",
             "insufficient_evidence": "FALSE",
             "confidence": "0.91",
             "error": "",
@@ -98,7 +107,50 @@ def test_write_annotation_results_csv_preserves_headers_and_blank_unknowns(tmp_p
     assert rows[0]["gene"] == "UNKNOWN"
     assert rows[0]["in_oncokb"] == ""
     assert rows[0]["cancer_associated"] == ""
-    assert rows[0]["citations"] == ""
-    assert rows[0]["publication_links"] == ""
+    assert rows[0]["supporting_citation_pmids"] == ""
+    assert rows[0]["supporting_citation_publication_links"] == ""
+    assert rows[0]["retrieved_pmids"] == ""
     assert rows[0]["insufficient_evidence"] == "TRUE"
     assert rows[0]["error"] == "unresolvable"
+
+
+def test_annotation_result_sheet_values_matches_csv_shape():
+    result = _result(
+        GeneAnnotation(
+            gene="BRAF",
+            fusions=["TP53::BRAF"],
+            cancer_associated=True,
+            citations=["12345"],
+            retrieval_count=2,
+            retrieved_pmids=["12345", "67890"],
+            date_annotated="7/13/26",
+        )
+    )
+
+    values = annotation_result_sheet_values(result)
+
+    assert values[0] == ANNOTATION_RESULTS_CSV_HEADERS
+    assert values[1][0] == "BRAF"
+    assert values[1][11] == "12345"
+    assert values[1][12] == "https://pubmed.ncbi.nlm.nih.gov/12345/"
+    assert values[1][15] == "12345; 67890"
+
+
+def test_save_service_account_credentials_configures_local_export(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGCG_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(google_sheets_export.settings, "google_service_account_json", "")
+    service_account = {
+        "type": "service_account",
+        "client_email": "sheet-writer@example.iam.gserviceaccount.com",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
+    }
+
+    response = save_service_account_credentials(json.dumps(service_account))
+    status = google_sheets_config_status()
+
+    assert response.configured is True
+    assert response.service_account_email == service_account["client_email"]
+    assert (tmp_path / "google-service-account.json").exists()
+    assert status.configured is True
+    assert status.source == "local_upload"
+    assert status.service_account_email == service_account["client_email"]

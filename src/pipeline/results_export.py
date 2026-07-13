@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import io
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -21,10 +22,11 @@ ANNOTATION_RESULTS_CSV_HEADERS = [
     "gene_class",
     "signaling_pathways",
     "gene_summary",
-    "citations",
-    "publication_links",
+    "supporting_citation_pmids",
+    "supporting_citation_publication_links",
     "date_annotated",
     "retrieval_count",
+    "retrieved_pmids",
     "insufficient_evidence",
     "confidence",
     "error",
@@ -96,10 +98,11 @@ def annotation_to_csv_row(
         "gene_class": _format_optional_text(annotation.gene_class),
         "signaling_pathways": _format_optional_text(annotation.signaling_pathways),
         "gene_summary": _format_optional_text(annotation.gene_summary),
-        "citations": "; ".join(pmids),
-        "publication_links": "; ".join(_publication_links(pmids)),
+        "supporting_citation_pmids": "; ".join(pmids),
+        "supporting_citation_publication_links": "; ".join(_publication_links(pmids)),
         "date_annotated": annotation.date_annotated,
         "retrieval_count": str(annotation.retrieval_count),
+        "retrieved_pmids": "; ".join(_unique(annotation.retrieved_pmids)),
         "insufficient_evidence": _format_bool(annotation.insufficient_evidence),
         "confidence": str(annotation.confidence),
         "error": _format_optional_text(annotation.error),
@@ -108,8 +111,16 @@ def annotation_to_csv_row(
 
 def write_annotation_results_csv(result: AnnotationResult, path: str | Path) -> None:
     """Write full annotation results as one CSV row per gene."""
-    rows = build_annotation_results_csv_rows(result)
+    csv_text = annotation_results_csv_text(result)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=ANNOTATION_RESULTS_CSV_HEADERS)
-        writer.writeheader()
-        writer.writerows(rows)
+        f.write(csv_text)
+
+
+def annotation_results_csv_text(result: AnnotationResult) -> str:
+    """Return full annotation results as CSV text."""
+    rows = build_annotation_results_csv_rows(result)
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=ANNOTATION_RESULTS_CSV_HEADERS)
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()

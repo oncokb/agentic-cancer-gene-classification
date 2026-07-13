@@ -7,16 +7,24 @@ Currently implements:
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timedelta, timezone
+import json
 import logging
+from pathlib import Path
 from typing import Optional, Set
 
 import httpx
 
 from src.config import settings
+from src.models.schema import OncoKBConfigStatus, OncoKBTokenConfigResponse
+from src.pipeline.local_config import app_config_dir, write_secret_file
 
 logger = logging.getLogger(__name__)
 
 ONCOKB_CURATED_GENES_URL = "https://www.oncokb.org/api/v1/utils/allCuratedGenes"
+ONCOKB_TOKEN_FILENAME = "oncokb-api-token.txt"
+ONCOKB_GENE_CACHE_FILENAME = "oncokb-curated-genes.json"
 
 
 class OncoKBConfigurationError(RuntimeError):
@@ -27,32 +35,44 @@ class OncoKBGeneLookup:
     """OncoKB gene membership lookup with an explicit per-instance cache."""
 
     def __init__(self, api_token: Optional[str] = None) -> None:
-        self.api_token = api_token if api_token is not None else settings.oncokb_api_token
+        self.api_token = api_token if api_token is not None else configured_oncokb_api_token()
         self._gene_cache: Optional[Set[str]] = None
+        self._load_lock = asyncio.Lock()
 
     async def load_genes(self, client: httpx.AsyncClient) -> Set[str]:
         if self._gene_cache is not None:
             return self._gene_cache
 
-        if not self.api_token:
-            raise OncoKBConfigurationError(
-                "ONCOKB_API_TOKEN is required for OncoKB membership lookup"
-            )
+        async with self._load_lock:
+            if self._gene_cache is not None:
+                return self._gene_cache
 
-        headers = {
-            "Authorization": f"Bearer {self.api_token}",
-            "Accept": "application/json",
-        }
-        try:
-            resp = await client.get(ONCOKB_CURATED_GENES_URL, headers=headers, timeout=15.0)
-            resp.raise_for_status()
-            genes = resp.json()
-            self._gene_cache = {g["hugoSymbol"] for g in genes if "hugoSymbol" in g}
-            logger.info("Loaded %d OncoKB genes", len(self._gene_cache))
-            return self._gene_cache
-        except httpx.HTTPError as e:
-            logger.error("Failed to load OncoKB genes: %s", e)
-            raise
+            if not self.api_token:
+                raise OncoKBConfigurationError(
+                    "ONCOKB_API_TOKEN is required for OncoKB membership lookup"
+                )
+
+            cached_genes = load_cached_oncokb_genes()
+            if cached_genes is not None:
+                self._gene_cache = cached_genes
+                logger.info("Loaded %d OncoKB genes from local cache", len(cached_genes))
+                return cached_genes
+
+            headers = {
+                "Authorization": f"Bearer {self.api_token}",
+                "Accept": "application/json",
+            }
+            try:
+                resp = await client.get(ONCOKB_CURATED_GENES_URL, headers=headers, timeout=15.0)
+                resp.raise_for_status()
+                genes = resp.json()
+                self._gene_cache = {g["hugoSymbol"] for g in genes if "hugoSymbol" in g}
+                save_cached_oncokb_genes(self._gene_cache)
+                logger.info("Loaded %d OncoKB genes", len(self._gene_cache))
+                return self._gene_cache
+            except httpx.HTTPError as e:
+                logger.error("Failed to load OncoKB genes: %s", e)
+                raise
 
     async def contains(
         self,
@@ -81,6 +101,89 @@ async def check_oncokb_membership(
     """
     lookup = lookup or OncoKBGeneLookup()
     return await lookup.contains(gene_symbol)
+
+
+def configured_oncokb_api_token() -> str:
+    if settings.oncokb_api_token:
+        return settings.oncokb_api_token
+    path = default_oncokb_token_path()
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return ""
+
+
+def oncokb_config_status() -> OncoKBConfigStatus:
+    if settings.oncokb_api_token:
+        return OncoKBConfigStatus(configured=True, source="environment")
+    token = configured_oncokb_api_token()
+    if token:
+        return OncoKBConfigStatus(configured=True, source="local_upload")
+    return OncoKBConfigStatus(configured=False)
+
+
+def save_oncokb_api_token(api_token: str) -> OncoKBTokenConfigResponse:
+    token = api_token.strip()
+    if not token:
+        raise OncoKBConfigurationError("OncoKB API token cannot be blank.")
+    write_secret_file(default_oncokb_token_path(), token + "\n")
+    return OncoKBTokenConfigResponse(
+        configured=True,
+        source="local_upload",
+        message="OncoKB API token is configured for this computer.",
+    )
+
+
+def default_oncokb_token_path() -> Path:
+    return app_config_dir() / ONCOKB_TOKEN_FILENAME
+
+
+def default_oncokb_gene_cache_path() -> Path:
+    return app_config_dir() / ONCOKB_GENE_CACHE_FILENAME
+
+
+def load_cached_oncokb_genes() -> Optional[Set[str]]:
+    if settings.oncokb_gene_cache_ttl_hours <= 0:
+        return None
+
+    path = default_oncokb_gene_cache_path()
+    if not path.exists():
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        fetched_at_raw = payload.get("fetched_at")
+        genes_raw = payload.get("genes")
+        if not isinstance(fetched_at_raw, str) or not isinstance(genes_raw, list):
+            return None
+
+        fetched_at = datetime.fromisoformat(fetched_at_raw)
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        expires_at = fetched_at + timedelta(hours=settings.oncokb_gene_cache_ttl_hours)
+        if datetime.now(timezone.utc) >= expires_at:
+            return None
+
+        genes = {gene for gene in genes_raw if isinstance(gene, str) and gene}
+        return genes or None
+    except (OSError, ValueError, TypeError):
+        logger.warning("Ignoring unreadable OncoKB gene cache at %s", path)
+        return None
+
+
+def save_cached_oncokb_genes(genes: Set[str]) -> None:
+    path = default_oncokb_gene_cache_path()
+    payload = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "genes": sorted(genes),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not write OncoKB gene cache at %s: %s", path, exc)
 
 
 def get_msk_genie_prevalence(gene_symbol: str) -> Optional[str]:
