@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
+from src.evaluation.metrics import citation_scores, mean_citation_scores
 from src.models.schema import AnnotationResult, GeneAnnotation, KinaseFusionCurationRow
 from src.pipeline.normalization import split_fusion
 
@@ -117,27 +118,6 @@ def _extract_pmids(value: str) -> List[str]:
             seen.add(pmid)
             pmids.append(pmid)
     return pmids
-
-
-def _safe_div(num: float, den: float) -> float:
-    return num / den if den else 0.0
-
-
-def _citation_scores(predicted: Sequence[str], truth: Sequence[str]) -> tuple[float, float, float]:
-    pred_set = set(predicted)
-    truth_set = set(truth)
-    if not pred_set and not truth_set:
-        return 1.0, 1.0, 1.0
-    if not pred_set:
-        return 0.0, 0.0, 0.0
-    if not truth_set:
-        return 0.0, 1.0, 0.0
-
-    true_positive = len(pred_set & truth_set)
-    precision = _safe_div(true_positive, len(pred_set))
-    recall = _safe_div(true_positive, len(truth_set))
-    f1 = _safe_div(2 * precision * recall, precision + recall)
-    return precision, recall, f1
 
 
 def _biologic_specs(annotation: GeneAnnotation) -> str:
@@ -308,7 +288,7 @@ def compare_kinase_curation_rows(
         truth_row = truth_index.get(key)
         pipeline_pmids = _extract_pmids(pipeline_row.publication_link) if pipeline_row else []
         truth_pmids = _extract_pmids(truth_row.publication_link) if truth_row else []
-        precision, recall, f1 = _citation_scores(pipeline_pmids, truth_pmids)
+        precision, recall, f1 = citation_scores(pipeline_pmids, truth_pmids)
 
         if pipeline_row and truth_row:
             status = "matched"
@@ -343,25 +323,21 @@ def compare_kinase_curation_rows(
             }
         )
 
-    matched_rows = [row for row in per_row if row["comparison_status"] == "matched"]
-    mean_precision = (
-        sum(row["citation_precision"] for row in matched_rows) / len(matched_rows)
-        if matched_rows
-        else 0.0
+    matched_pairs = [
+        (
+            _extract_pmids(pipeline_index[key].publication_link),
+            _extract_pmids(truth_index[key].publication_link),
+        )
+        for key in sorted(matched_keys)
+    ]
+    mean_citations = mean_citation_scores(
+        [pipeline_pmids for pipeline_pmids, _ in matched_pairs],
+        [truth_pmids for _, truth_pmids in matched_pairs],
     )
-    mean_recall = (
-        sum(row["citation_recall"] for row in matched_rows) / len(matched_rows)
-        if matched_rows
-        else 0.0
+    key_precision, key_recall, key_f1 = citation_scores(
+        [f"{fusion}:{kinase}" for fusion, kinase in pipeline_keys],
+        [f"{fusion}:{kinase}" for fusion, kinase in truth_keys],
     )
-    mean_f1 = (
-        sum(row["citation_f1"] for row in matched_rows) / len(matched_rows)
-        if matched_rows
-        else 0.0
-    )
-    key_precision = _safe_div(len(matched_keys), len(pipeline_keys))
-    key_recall = _safe_div(len(matched_keys), len(truth_keys))
-    key_f1 = _safe_div(2 * key_precision * key_recall, key_precision + key_recall)
 
     return {
         "summary": {
@@ -373,9 +349,9 @@ def compare_kinase_curation_rows(
             "fusion_kinase_precision": round(key_precision, 4),
             "fusion_kinase_recall": round(key_recall, 4),
             "fusion_kinase_f1": round(key_f1, 4),
-            "matched_citation_precision": round(mean_precision, 4),
-            "matched_citation_recall": round(mean_recall, 4),
-            "matched_citation_f1": round(mean_f1, 4),
+            "matched_citation_precision": round(mean_citations["precision"], 4),
+            "matched_citation_recall": round(mean_citations["recall"], 4),
+            "matched_citation_f1": round(mean_citations["f1"], 4),
         },
         "per_row": per_row,
     }
