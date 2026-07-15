@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Set
 
@@ -26,16 +27,23 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
-from src.models.schema import LiteratureRecord
+from src.models.schema import (
+    LiteratureRecord,
+    NCBIAPIKeyConfigResponse,
+    NCBIConfigStatus,
+)
+from src.pipeline.local_config import app_config_dir, write_secret_file
 from src.pipeline.llm_client import complete_with_tool
+from src.pipeline.selection import strongest_selection_score
 
 logger = logging.getLogger(__name__)
 
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-_RATE_LIMIT_DELAY = 0.34 if not settings.ncbi_api_key else 0.11
-_request_semaphore = asyncio.Semaphore(3 if not settings.ncbi_api_key else 10)
+NCBI_API_KEY_FILENAME = "ncbi-api-key.txt"
+_request_semaphore_without_key = asyncio.Semaphore(3)
+_request_semaphore_with_key = asyncio.Semaphore(10)
 
 MAX_AGENTIC_TOOL_CALLS = 6  # cap Claude's search budget per gene
 
@@ -45,9 +53,16 @@ MAX_AGENTIC_TOOL_CALLS = 6  # cap Claude's search budget per gene
 
 def _ncbi_params(extra: dict) -> dict:
     params = {"retmode": "json", **extra}
-    if settings.ncbi_api_key:
-        params["api_key"] = settings.ncbi_api_key
+    api_key = configured_ncbi_api_key()
+    if api_key:
+        params["api_key"] = api_key
     return params
+
+
+def _ncbi_rate_limit(api_key: str) -> tuple[float, asyncio.Semaphore]:
+    if api_key:
+        return 0.11, _request_semaphore_with_key
+    return 0.34, _request_semaphore_without_key
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
@@ -56,8 +71,9 @@ async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> L
     params = _ncbi_params(
         {"db": "pubmed", "term": query, "retmax": max_results, "sort": "relevance"}
     )
-    async with _request_semaphore:
-        await asyncio.sleep(_RATE_LIMIT_DELAY)
+    delay, semaphore = _ncbi_rate_limit(params.get("api_key", ""))
+    async with semaphore:
+        await asyncio.sleep(delay)
         resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
         resp.raise_for_status()
     return resp.json().get("esearchresult", {}).get("idlist", [])
@@ -68,12 +84,13 @@ async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[Literatur
     """Fetch abstracts for a list of PMIDs."""
     if not pmids:
         return []
-    params = {"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml"}
-    if settings.ncbi_api_key:
-        params["api_key"] = settings.ncbi_api_key
+    params = _ncbi_params(
+        {"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml"}
+    )
+    delay, semaphore = _ncbi_rate_limit(params.get("api_key", ""))
 
-    async with _request_semaphore:
-        await asyncio.sleep(_RATE_LIMIT_DELAY)
+    async with semaphore:
+        await asyncio.sleep(delay)
         resp = await client.get(EFETCH_URL, params=params, timeout=30.0)
         resp.raise_for_status()
 
@@ -94,6 +111,43 @@ async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[Literatur
     except ET.ParseError as exc:
         logger.warning("XML parse error in efetch: %s", exc)
     return records
+
+
+def configured_ncbi_api_key() -> str:
+    if settings.ncbi_api_key:
+        return settings.ncbi_api_key
+    path = default_ncbi_api_key_path()
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return ""
+
+
+def ncbi_config_status() -> NCBIConfigStatus:
+    if settings.ncbi_api_key:
+        return NCBIConfigStatus(configured=True, source="environment")
+    api_key = configured_ncbi_api_key()
+    if api_key:
+        return NCBIConfigStatus(configured=True, source="local_upload")
+    return NCBIConfigStatus(configured=False)
+
+
+def save_ncbi_api_key(api_key: str) -> NCBIAPIKeyConfigResponse:
+    key = api_key.strip()
+    if not key:
+        raise ValueError("NCBI API key cannot be blank.")
+    write_secret_file(default_ncbi_api_key_path(), key + "\n")
+    return NCBIAPIKeyConfigResponse(
+        configured=True,
+        source="local_upload",
+        message="NCBI API key is configured for this computer.",
+    )
+
+
+def default_ncbi_api_key_path() -> Path:
+    return app_config_dir() / NCBI_API_KEY_FILENAME
 
 
 async def _search_and_fetch(
@@ -460,6 +514,17 @@ async def retrieve_literature(
         "Tier 1 insufficient for %s (%d < %d papers) — falling through to Claude",
         gene, len(records), settings.min_papers_for_strong_association,
     )
+    if local_mode:
+        strongest_score = strongest_selection_score(gene, records)
+        if strongest_score < settings.local_tier2_min_prefilter_score:
+            logger.info(
+                "Skipping local Tier 2 for %s: strongest deterministic relevance score %d < %d",
+                gene,
+                strongest_score,
+                settings.local_tier2_min_prefilter_score,
+            )
+            return records, 1
+
     if local_mode:
         records = await _tier2_local_retrieve(gene, fusions or [], records, local_backend)
     else:

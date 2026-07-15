@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -13,7 +13,9 @@ CancerTier = Literal[
 ]
 
 OgTsg = Literal["OG", "TSG", "OG, TSG"]
-LocalBackend = Literal["claude-code", "codex", "antigravity"]
+LocalBackend = Literal["claude-code", "codex", "copilot", "antigravity"]
+InstallableLocalBackend = Literal["claude-code", "codex", "copilot", "antigravity"]
+LoginableLocalBackend = Literal["copilot"]
 
 
 class ResolvedGene(BaseModel):
@@ -49,13 +51,14 @@ class GeneAnnotation(BaseModel):
     gene_class: Optional[str] = None
     signaling_pathways: Optional[str] = None
     gene_summary: Optional[str] = None
-    citations: List[str] = Field(default_factory=list)  # verified PMIDs only
+    citations: List[str] = Field(default_factory=list)  # verified supporting PMIDs only
     date_annotated: str = Field(
         default_factory=lambda: date.today().strftime("%-m/%-d/%y")
     )
 
     # Internal quality metadata (not exported to Nicole's sheet)
     retrieval_count: int = 0
+    retrieved_pmids: List[str] = Field(default_factory=list)
     insufficient_evidence: bool = False
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     error: Optional[str] = None
@@ -75,9 +78,153 @@ class AnnotateRequest(BaseModel):
     )
 
 
+class LocalBackendStatus(BaseModel):
+    backend: LocalBackend
+    command: str
+    installed: bool
+    version: Optional[str] = None
+    path: Optional[str] = None
+    error: Optional[str] = None
+
+
+class LocalBackendsStatusResponse(BaseModel):
+    backends: List[LocalBackendStatus]
+    setup_required: bool
+    minimum_setup_complete: bool
+    anthropic_sdk_configured: bool
+    local_backend_configured: bool
+    oncokb_configured: bool
+    setup_messages: List[str] = Field(default_factory=list)
+    operating_system: str
+
+
+class LocalBackendInstallRequest(BaseModel):
+    backend: InstallableLocalBackend
+
+
+class LocalBackendInstallerInfo(BaseModel):
+    backend: InstallableLocalBackend
+    supported: bool
+    command: List[str]
+    display_command: str
+    setup_url: Optional[str] = None
+    post_install_steps: List[str] = Field(default_factory=list)
+
+
+class LocalBackendInstallResponse(BaseModel):
+    backend: InstallableLocalBackend
+    installed: bool
+    return_code: int
+    command: str
+    stdout: str = ""
+    stderr: str = ""
+    next_steps: List[str] = Field(default_factory=list)
+
+
+class LocalBackendLoginRequest(BaseModel):
+    backend: LoginableLocalBackend
+
+
+class LocalBackendLoginResponse(BaseModel):
+    backend: LoginableLocalBackend
+    return_code: int
+    command: str
+    stdout: str = ""
+    stderr: str = ""
+    next_steps: List[str] = Field(default_factory=list)
+
+
+class BenchmarkRequest(BaseModel):
+    local_backend: Optional[LocalBackend] = Field(
+        default=None,
+        description="Optional local backend for benchmark pipeline calls.",
+    )
+    no_judge: bool = Field(
+        default=True,
+        description="Skip LLM-as-a-judge summary scoring.",
+    )
+
+
 class AnnotationResult(BaseModel):
     run_id: str
     timestamp: str
     fusions_processed: int
     genes_annotated: int
     annotations: List[GeneAnnotation]
+    run_error: Optional[str] = None
+
+
+class GoogleSheetExportRequest(BaseModel):
+    result: AnnotationResult
+    spreadsheet_id: str = Field(..., min_length=1)
+    sheet_name: str = Field(default="Annotation Results", min_length=1)
+
+
+class GoogleSheetExportResponse(BaseModel):
+    spreadsheet_id: str
+    sheet_name: str
+    updated_range: str
+    updated_rows: int
+    updated_columns: int
+    spreadsheet_url: str
+
+
+GoogleSheetsCredentialsSource = Literal["environment", "local_upload"]
+OncoKBTokenSource = Literal["environment", "local_upload"]
+NCBIAPIKeySource = Literal["environment", "local_upload"]
+
+
+class GoogleSheetsConfigStatus(BaseModel):
+    configured: bool
+    source: Optional[GoogleSheetsCredentialsSource] = None
+    service_account_email: Optional[str] = None
+    credentials_path: Optional[str] = None
+
+
+class GoogleSheetsServiceAccountConfigRequest(BaseModel):
+    service_account_json: str = Field(..., min_length=1)
+
+
+class GoogleSheetsServiceAccountConfigResponse(BaseModel):
+    configured: bool
+    service_account_email: str
+    credentials_path: str
+    message: str
+
+
+class OncoKBConfigStatus(BaseModel):
+    configured: bool
+    source: Optional[OncoKBTokenSource] = None
+
+
+class OncoKBTokenConfigRequest(BaseModel):
+    api_token: str = Field(..., min_length=1)
+
+
+class OncoKBTokenConfigResponse(BaseModel):
+    configured: bool
+    source: OncoKBTokenSource
+    message: str
+
+
+class NCBIConfigStatus(BaseModel):
+    configured: bool
+    source: Optional[NCBIAPIKeySource] = None
+
+
+class NCBIAPIKeyConfigRequest(BaseModel):
+    api_key: str = Field(..., min_length=1)
+
+
+class NCBIAPIKeyConfigResponse(BaseModel):
+    configured: bool
+    source: NCBIAPIKeySource
+    message: str
+
+
+class BenchmarkResult(BaseModel):
+    n_genes: int
+    categorical_metrics: Dict
+    per_gene_report: List[Dict]
+    judge: Optional[Dict] = None
+    pipeline_result: AnnotationResult

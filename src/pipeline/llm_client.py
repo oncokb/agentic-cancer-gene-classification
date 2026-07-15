@@ -25,7 +25,7 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOCAL_BACKEND = "claude-code"
-LOCAL_BACKENDS = ("claude-code", "codex", "antigravity")
+LOCAL_BACKENDS = ("claude-code", "codex", "copilot", "antigravity")
 
 
 def _make_sdk_client() -> anthropic.AsyncAnthropic:
@@ -129,6 +129,8 @@ async def _complete_local(
         raw = await _run_claude_code(full_prompt, tool["name"])
     elif backend == "codex":
         raw = await _run_codex(full_prompt, tool["name"])
+    elif backend == "copilot":
+        raw = await _run_copilot(full_prompt, tool["name"])
     elif backend == "antigravity":
         raw = await _run_antigravity(full_prompt, tool["name"])
     else:
@@ -204,6 +206,15 @@ async def _run_codex(prompt: str, tool_name: str) -> str:
             os.unlink(output_path)
         except OSError:
             pass
+
+
+async def _run_copilot(prompt: str, tool_name: str) -> str:
+    stdout, _ = await _communicate(
+        ["copilot", "-p", prompt, "-s", "--no-ask-user"],
+        tool_name=tool_name,
+        timeout=240,
+    )
+    return stdout
 
 
 async def _run_antigravity(prompt: str, tool_name: str) -> str:

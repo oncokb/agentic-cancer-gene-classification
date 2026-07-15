@@ -139,6 +139,118 @@ ANNOTATE_TOOL: dict = {
     },
 }
 
+EXTRACT_EVIDENCE_TOOL: dict = {
+    "name": "extract_paper_evidence",
+    "description": (
+        "Extract compact cancer-gene evidence from one PubMed abstract. "
+        "Only summarize facts present in this abstract."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["relevance", "key_findings"],
+        "properties": {
+            "relevance": {
+                "type": "string",
+                "enum": ["direct", "indirect", "none", "ambiguous"],
+                "description": "How directly this paper supports cancer relevance for the HGNC gene.",
+            },
+            "evidence_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Evidence types present, such as mutation, fusion, expression, functional assay, clinical association.",
+            },
+            "key_findings": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Up to 4 concise findings from the abstract relevant to cancer annotation.",
+            },
+            "cancer_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Cancer types mentioned in the abstract.",
+            },
+            "caveats": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Reasons to downweight the paper, including broad screen, review article, symbol ambiguity, or indirect evidence.",
+            },
+        },
+    },
+}
+
+_EVIDENCE_SYSTEM = """\
+You extract concise evidence from one PubMed abstract for cancer gene curation.
+
+Read the full abstract and return only information stated in the abstract. Do not infer beyond it.
+Use the HGNC identity to identify same-symbol ambiguity. If the abstract is about a different entity
+or only mentions the gene in passing, mark relevance as "ambiguous", "indirect", or "none".
+"""
+
+
+async def _extract_paper_evidence(
+    gene: str,
+    record: LiteratureRecord,
+    gene_identity: Optional[str],
+    local_mode: bool,
+    local_backend: Optional[str],
+) -> Dict:
+    prompt = (
+        f"Gene: {gene}\n"
+        f"Gene identity: {gene_identity or 'canonical symbol only'}\n"
+        f"PMID: {record.pmid}\n"
+        f"Title: {record.title}\n"
+        f"Abstract:\n{record.abstract}"
+    )
+    return await complete_with_tool(
+        model=settings.selection_model,
+        system=_EVIDENCE_SYSTEM,
+        user=prompt,
+        tool=EXTRACT_EVIDENCE_TOOL,
+        max_tokens=512,
+        local_mode=local_mode,
+        local_backend=local_backend,
+    )
+
+
+def _fallback_evidence_packet(record: LiteratureRecord) -> Dict:
+    return {
+        "relevance": "ambiguous",
+        "evidence_types": [],
+        "key_findings": [record.abstract[: settings.synthesis_evidence_max_chars]],
+        "cancer_types": [],
+        "caveats": ["Evidence extraction failed; compact abstract context shown."],
+    }
+
+
+def _evidence_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item is not None]
+
+
+async def _extract_evidence_packets(
+    gene: str,
+    records: List[LiteratureRecord],
+    gene_identity: Optional[str],
+    local_mode: bool,
+    local_backend: Optional[str],
+) -> List[Dict]:
+    packets = []
+    for record in records:
+        try:
+            evidence = await _extract_paper_evidence(
+                gene,
+                record,
+                gene_identity,
+                local_mode,
+                local_backend,
+            )
+        except Exception as exc:
+            logger.warning("Evidence extraction failed for %s PMID %s: %s", gene, record.pmid, exc)
+            evidence = _fallback_evidence_packet(record)
+        packets.append({"record": record, "evidence": evidence})
+    return packets
+
 
 def _build_user_prompt(
     gene: str,
@@ -148,6 +260,7 @@ def _build_user_prompt(
     records: List[LiteratureRecord],
     retrieval_tier: int,
     gene_identity: Optional[str] = None,
+    evidence_packets: Optional[List[Dict]] = None,
 ) -> str:
     tier_label = (
         "Tier 1 (direct NCBI structured query — abundant indexed literature)"
@@ -164,18 +277,37 @@ def _build_user_prompt(
         f"- In OncoKB: {'Yes' if in_oncokb else ('No' if in_oncokb is False else 'Unknown (token not configured)')}",
         f"- Cancer-type prevalence (MSK/GENIE): {cancer_type_prevalence or 'not available'}",
         "",
-        f"### Retrieved PubMed abstracts ({len(records)} papers):",
+        f"### Retrieved PubMed evidence packets ({len(records)} papers):",
+        "Each packet was extracted from the full PubMed abstract for that PMID.",
     ]
 
     if not records:
         lines.append("No abstracts retrieved. Set insufficient_evidence: true.")
     else:
+        packets_by_pmid = {
+            packet["record"].pmid: packet["evidence"]
+            for packet in evidence_packets or []
+            if packet.get("record")
+        }
         for rec in records:
+            evidence = packets_by_pmid.get(rec.pmid) or _fallback_evidence_packet(rec)
             lines += [
                 "---",
                 f"PMID: {rec.pmid}",
                 f"Title: {rec.title}",
-                f"Abstract: {rec.abstract}",
+                f"Relevance: {evidence.get('relevance', 'ambiguous')}",
+                f"Evidence types: {', '.join(_evidence_list(evidence.get('evidence_types'))) or 'none'}",
+                f"Cancer types: {', '.join(_evidence_list(evidence.get('cancer_types'))) or 'none'}",
+                "Key findings:",
+                *[
+                    f"- {finding}"
+                    for finding in _evidence_list(evidence.get("key_findings"))[:4]
+                ],
+                "Caveats:",
+                *[
+                    f"- {caveat}"
+                    for caveat in _evidence_list(evidence.get("caveats"))[:3]
+                ],
             ]
 
     return "\n".join(lines)
@@ -232,6 +364,13 @@ async def synthesize_gene_annotation(
     Call Claude to produce a structured annotation. Returns raw tool-use input dict.
     Raises on API error.
     """
+    evidence_packets = await _extract_evidence_packets(
+        gene,
+        records,
+        gene_identity,
+        local_mode,
+        local_backend,
+    )
     user_prompt = _build_user_prompt(
         gene,
         fusions,
@@ -240,6 +379,7 @@ async def synthesize_gene_annotation(
         records,
         retrieval_tier,
         gene_identity,
+        evidence_packets,
     )
     tool_input = await complete_with_tool(
         model=settings.synthesis_model,
@@ -292,6 +432,8 @@ def build_gene_annotation(
         )
         tier = "Class II - Likely Driver"
 
+    retrieved_pmids = list(dict.fromkeys(record.pmid for record in records if record.pmid))
+
     return GeneAnnotation(
         gene=gene,
         fusions=list(dict.fromkeys(fusions)),  # deduplicate, preserve order
@@ -306,6 +448,7 @@ def build_gene_annotation(
         gene_summary=synthesis_result.get("gene_summary"),
         citations=synthesis_result.get("citations", []),
         retrieval_count=len(records),
+        retrieved_pmids=retrieved_pmids,
         insufficient_evidence=insufficient_evidence,
         confidence=synthesis_result.get("confidence", 0.0),
     )

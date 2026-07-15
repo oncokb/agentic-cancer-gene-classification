@@ -15,6 +15,8 @@ dependencies = [
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
     "python-dotenv>=1.0.0",
+    "google-auth>=2.0.0",
+    "requests>=2.31.0",
     "tenacity>=8.2.0",
 ]
 
@@ -25,9 +27,13 @@ dev = [
     "pytest-httpx>=0.30.0",
     "ruff>=0.4.0",
 ]
+desktop = [
+    "pyinstaller>=6.0.0",
+]
 
 [project.scripts]
 annotate = "src.cli:main"
+annotation-ui = "src.ui_launcher:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

@@ -21,6 +21,29 @@ Citation precision knobs:
 - `MAX_PAPERS_FOR_SYNTHESIS`: selected PubMed records passed to synthesis.
 - `MAX_CITATIONS_PER_ANNOTATION`: verified PMIDs retained in final output.
 
+Context budget knobs:
+
+- `SELECTION_PREFILTER_LIMIT`: deterministic top records retained before LLM
+  relevance selection. Defaults to `24`.
+- `SELECTION_CHUNK_SIZE`: number of candidate papers sent per relevance-selection
+  call. Defaults to `10`.
+- `SELECTION_CHUNK_KEEP`: PMIDs retained from each selection chunk before the
+  final merge. Defaults to `3`.
+- `SYNTHESIS_EVIDENCE_MAX_CHARS`: fallback compact evidence text per paper when
+  per-paper evidence extraction fails. Defaults to `900`.
+- `LOCAL_TIER2_MIN_PREFILTER_SCORE`: in local mode, skip Tier 2 exploratory
+  retrieval when Tier 1 records have weaker deterministic relevance than this
+  threshold. Defaults to `2`.
+
+Latency knob:
+
+- `MAX_GENE_ANNOTATION_CONCURRENCY`: number of genes annotated concurrently.
+  Defaults to `3`. Higher values can reduce batch latency, but they also create
+  more simultaneous SDK calls or local-agent processes.
+- `ONCOKB_GENE_CACHE_TTL_HOURS`: hours to reuse the local OncoKB curated-gene
+  cache before refreshing. Defaults to `24`; set to `0` to disable persistent
+  OncoKB gene-list caching.
+
 ## API Keys
 
 Copy `.env.example` to `.env` and add only the keys you need for the mode you are
@@ -31,14 +54,22 @@ running.
   https://platform.claude.com/settings/keys.
 - `ONCOKB_API_TOKEN`: optional, but recommended for OncoKB membership lookups.
   OncoKB requires an account and data-access approval/license. After approval,
-  the token is available in account settings:
-  https://www.oncokb.org/account/settings. OncoKB API documentation:
-  https://api.oncokb.org/oncokb-website/api.
+  the token is available in account settings. Non-technical users can paste this
+  token in the UI setup screen. Engineers can also set this value in `.env`.
+  OncoKB account settings: https://www.oncokb.org/account/settings. OncoKB API
+  documentation: https://api.oncokb.org/oncokb-website/api.
 - `NCBI_API_KEY`: optional. PubMed E-utilities work without it, but NCBI raises
   the limit from 3 requests/second to 10 requests/second when a key is supplied.
-  Sign in to NCBI, open account settings, and create a key under API Key
-  Management:
+  Non-technical users can paste this key in the UI setup screen. Engineers can
+  also set this value in `.env`. Sign in to NCBI, open account settings, and
+  create a key under API Key Management:
   https://support.nlm.nih.gov/kbArticle/?pn=KA-05317.
+- `GOOGLE_SERVICE_ACCOUNT_JSON`: optional. Enables direct Google Sheets export
+  from the browser UI. Create a Google Cloud service account, enable the Google
+  Sheets API, and download the service account JSON key. Non-technical users can
+  upload that JSON from the UI setup screen. Engineers can also set this value to
+  a local JSON file path in `.env`. Share the target spreadsheet with the service
+  account email before exporting.
 
 Do not commit `.env` or paste real keys into tracked files.
 
@@ -103,16 +134,168 @@ This path uses the Anthropic SDK for selection, synthesis, and Tier 2 agentic re
 - `--output-csv results.csv`: curator-facing spreadsheet export with one row per
   gene. This file is intended for direct Google Sheets import.
 
-The CSV keeps the core annotation fields from the JSON and adds
-`publication_links`, a semicolon-separated list of PubMed URLs derived from the
-verified PMID citations. Multi-value fields such as `fusions`, `citations`, and
-`publication_links` are semicolon-separated so they stay in one spreadsheet cell.
-Unknown optional values are left blank.
+The CSV keeps the core annotation fields from the JSON and separates supporting
+citations from the broader retrieval set. `supporting_citation_pmids` and
+`supporting_citation_publication_links` are the capped PMIDs/links actually used
+as evidence in the generated annotation. `retrieved_pmids`, which appears after
+`retrieval_count`, lists every PMID retrieved before selection/synthesis so a
+curator can perform additional due diligence. Multi-value fields such as
+`fusions`, `supporting_citation_pmids`, and `retrieved_pmids` are
+semicolon-separated so they stay in one spreadsheet cell. Unknown optional values
+are left blank.
 
 To import into Google Sheets, create or open a sheet, use **File > Import**,
 upload `results.csv`, and choose whether to insert it as a new sheet or append it
 to an existing sheet. Treat this CSV as a review artifact; it does not write back
 to the project source-of-truth sheet.
+
+The browser UI can also export reviewed results directly to Google Sheets. Open
+the setup screen, upload a Google service account JSON key, share the target
+spreadsheet with the service account email shown by the UI, then use **Export
+Google Sheet** after reviewing results. Engineers may alternatively set
+`GOOGLE_SERVICE_ACCOUNT_JSON` in `.env`. The app asks for the spreadsheet ID or
+URL and a tab name. It creates the tab if needed, then replaces that tab's
+contents with the same columns used by the CSV export. Use a dedicated review
+spreadsheet or review tab rather than the source-of-truth sheet unless the team
+explicitly approves overwriting that tab.
+
+Google account OAuth is possible, but it requires a separate OAuth client,
+consent screen, local token storage, and potentially app verification for Sheets
+scopes. For this local desktop workflow, the service account path is simpler and
+keeps write access limited to spreadsheets explicitly shared with that service
+account.
+
+## Browser UI
+
+The preferred non-terminal workflow is to use the packaged executable for your
+operating system. When launched, it starts the local UI server on an available
+localhost port and opens the browser automatically.
+
+For development, the same launcher can be run from the installed Python
+environment:
+
+```bash
+annotation-ui
+```
+
+To build a distributable executable on the current OS:
+
+```bash
+pip install -e ".[desktop]"
+python scripts/build_desktop_app.py
+```
+
+The artifact is written under `dist/`:
+
+- macOS/Linux: `dist/GeneFusionAnnotator`
+- Windows: `dist/GeneFusionAnnotator.exe`
+
+Builds must be produced on the target OS, so a macOS build creates a macOS
+executable, a Windows build creates a Windows `.exe`, and a Linux build creates
+a Linux executable. Add `--windowed` to hide the console window where supported:
+
+```bash
+python scripts/build_desktop_app.py --windowed
+```
+
+The FastAPI service can still be run directly for API development:
+
+```bash
+uvicorn src.main:app --host 0.0.0.0 --port 8000
+```
+
+Open http://127.0.0.1:8000 in a browser.
+
+The UI supports:
+
+- Showing a first-time guide that explains the workflow and why each token or
+  local agent setup is used.
+- Pasting one or more fusions into a text area, one per line.
+- Choosing Anthropic SDK mode, local Codex, local Claude Code, local
+  GitHub Copilot, or local Antigravity.
+- Reading a short mode description that distinguishes new annotation runs from
+  holdout benchmark runs.
+- Running the annotation pipeline and reviewing one editable card per gene as
+  each gene finishes.
+- Showing model/local-agent token, quota, or usage-limit errors in the UI while
+  preserving any completed gene cards for review/export.
+- Exporting the proofread result as JSON, CSV, or directly to a Google Sheet.
+- Pasting an OncoKB API token in setup so annotation runs can perform OncoKB
+  membership lookups without editing `.env`.
+- Pasting an NCBI API key in setup so PubMed retrieval uses higher E-utilities
+  rate limits without editing `.env`.
+- Running the benchmark from the same page, with an option to skip LLM judge
+  scoring for local/credit-free runs.
+
+On first load, the UI opens Settings with a tutorial that explains the overall
+workflow, execution options, OncoKB token, NCBI key, and export flow. It also
+checks whether `codex`, `claude`, `copilot`, or `antigravity` is available on
+the server running FastAPI. If no supported local backend is detected, Settings
+shows links and commands for Codex, Claude Code, GitHub Copilot, and
+Antigravity. The setup panel remains available from the sidebar.
+
+The UI opens Settings automatically until the minimum setup is complete. A user
+needs one execution path, either `ANTHROPIC_API_KEY` for Anthropic SDK mode or an
+installed local agent, plus an OncoKB API token for membership lookup.
+
+The OncoKB curated-gene list is cached locally after the first successful token
+authenticated lookup. Subsequent app runs reuse that cache until
+`ONCOKB_GENE_CACHE_TTL_HOURS` expires, which avoids repeatedly downloading the
+same gene list during normal local testing.
+
+When at least one local backend is installed, the execution dropdown defaults to
+the first detected local backend instead of Anthropic SDK. Users can still select
+Anthropic SDK explicitly when they want to run with `ANTHROPIC_API_KEY`. The Run
+panel does not list every missing local agent; if a user selects a local backend
+that is not installed, the UI shows a targeted message and points them to
+Settings.
+
+For non-technical users, the setup screen also includes install buttons for
+Codex, Claude Code, and GitHub Copilot on supported operating systems. These
+buttons run only the official, allowlisted installer for the selected backend:
+
+- Codex on macOS/Linux:
+  `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`
+- Codex on Windows PowerShell:
+  `$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex`
+- Claude Code on macOS/Linux:
+  `curl -fsSL https://claude.ai/install.sh | bash`
+- Claude Code on Windows PowerShell:
+  `irm https://claude.ai/install.ps1 | iex`
+- GitHub Copilot on macOS/Linux:
+  `curl -fsSL https://gh.io/copilot-install | bash`
+- GitHub Copilot on Windows:
+  `winget install GitHub.Copilot`
+
+The install endpoint is restricted to localhost clients. Installation does not
+complete account authentication; after installing, the user still needs to sign
+in with `codex login` or by running `claude` and following the provider's browser
+prompts. For GitHub Copilot, the setup screen can invoke `copilot login` from
+the local machine. Copilot login uses GitHub's browser/device auth flow, so any
+organization SSO requirement is handled by GitHub rather than by this app.
+
+Antigravity is also available as a local execution path. Because there is no
+documented stable headless installer/login command in the public setup surface,
+the setup screen opens the official Antigravity setup page instead of running an
+installer. After Antigravity is installed and signed in, the app detects the
+`antigravity` command and can route runs through `--local antigravity`.
+
+Local setup references:
+
+- Codex CLI: https://learn.chatgpt.com/docs/codex/cli. Sign in with
+  `codex login`, or use API-key auth with
+  `printenv OPENAI_API_KEY | codex login --with-api-key`.
+- Claude Code: https://code.claude.com/docs/en/setup. Install with the native
+  installer or package manager, then run `claude` to authenticate and
+  `claude --version` to verify.
+- GitHub Copilot CLI:
+  https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli.
+  Install the CLI, then run `copilot login` or use the UI login button. Copilot
+  requires an active Copilot plan and may require organization policy approval.
+  It can also use `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, or an
+  authenticated GitHub CLI session.
+- Antigravity: https://antigravity.google/. Install and sign in through the
+  official app flow, then refresh local backend status in this UI.
 
 ## Run Locally Without Anthropic API Credits
 
@@ -122,9 +305,14 @@ Supported backends:
 
 - `codex`
 - `claude-code`
+- `copilot`
 - `antigravity`
 
 Bare `--local` defaults to `claude-code`.
+
+When a run contains multiple unique genes, the pipeline annotates genes in
+parallel up to `MAX_GENE_ANNOTATION_CONCURRENCY`. In local mode this means
+multiple local agent CLI invocations may run at once.
 
 Examples:
 
@@ -143,6 +331,12 @@ python -m src.cli \
 
 python -m src.cli \
   --fusions "TP53::BRAF" \
+  --local copilot \
+  --output results.json \
+  --output-csv results.csv
+
+python -m src.cli \
+  --fusions "TP53::BRAF" \
   --local antigravity \
   --output results.json \
   --output-csv results.csv
@@ -153,6 +347,7 @@ For local mode, make sure the selected tool is installed and logged in on the ho
 ```bash
 codex --version
 claude --version
+copilot version
 ```
 
 Antigravity defaults to:

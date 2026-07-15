@@ -14,6 +14,11 @@ def test_resolve_local_backend_defaults_for_legacy_bool():
 
 def test_resolve_local_backend_prefers_explicit_backend():
     assert resolve_local_backend(local_mode=False, local_backend="codex") == "codex"
+    assert resolve_local_backend(local_mode=False, local_backend="copilot") == "copilot"
+    assert (
+        resolve_local_backend(local_mode=False, local_backend="antigravity")
+        == "antigravity"
+    )
 
 
 def test_resolve_local_backend_rejects_unknown_backend():
@@ -39,6 +44,24 @@ def test_cli_local_accepts_codex(monkeypatch):
     assert args.local == "codex"
 
 
+def test_cli_local_accepts_copilot(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "--fusions", "TP53::BRAF", "--local", "copilot"],
+    )
+    args = parse_args()
+    assert args.local == "copilot"
+
+
+def test_cli_local_accepts_antigravity(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "--fusions", "TP53::BRAF", "--local", "antigravity"],
+    )
+    args = parse_args()
+    assert args.local == "antigravity"
+
+
 def test_cli_accepts_output_csv(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
@@ -60,6 +83,12 @@ def test_cli_accepts_output_csv(monkeypatch):
 def test_annotate_request_accepts_local_backend():
     request = AnnotateRequest(fusions=["TP53::BRAF"], local_backend="codex")
     assert request.local_backend == "codex"
+
+    request = AnnotateRequest(fusions=["TP53::BRAF"], local_backend="copilot")
+    assert request.local_backend == "copilot"
+
+    request = AnnotateRequest(fusions=["TP53::BRAF"], local_backend="antigravity")
+    assert request.local_backend == "antigravity"
 
 
 async def test_benchmark_run_pipeline_passes_local_backend(monkeypatch):

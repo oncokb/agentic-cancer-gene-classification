@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agentic Cancer Gene Classification</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <h1>Gene Fusion Annotation</h1>
+          <p>Run, review, and export curation-ready results.</p>
+        </div>
+
+        <section class="panel">
+          <div class="section-heading">
+            <h2>Run</h2>
+          </div>
+
+          <div class="segmented" role="tablist" aria-label="Run mode">
+            <button class="segment active" data-mode="annotate" type="button">
+              Annotate
+            </button>
+            <button class="segment" data-mode="benchmark" type="button">
+              Benchmark
+            </button>
+          </div>
+
+          <div class="mode-description" id="mode-description">
+            <strong>Annotation</strong>
+            <p>Run new gene fusion annotations, review each gene result, then export JSON or CSV.</p>
+          </div>
+
+          <label class="field" id="fusion-input-field">
+            <span>Fusions</span>
+            <textarea
+              id="fusion-input"
+              rows="9"
+              spellcheck="false"
+              placeholder="TP53::BRAF&#10;ETV6::NTRK3&#10;BCR::ABL1"
+            ></textarea>
+          </label>
+
+          <div class="field benchmark-options hidden" id="benchmark-options">
+            <span>Benchmark options</span>
+            <label class="checkbox-row">
+              <input id="no-judge" type="checkbox" checked />
+              <span>Skip LLM judge scoring</span>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Execution</span>
+            <select id="backend-select">
+              <option value="">Anthropic SDK</option>
+              <option value="codex">Local Codex</option>
+              <option value="claude-code">Local Claude Code</option>
+              <option value="copilot">Local GitHub Copilot</option>
+              <option value="antigravity">Local Antigravity</option>
+            </select>
+          </label>
+
+          <div class="backend-status" id="backend-status"></div>
+
+          <button class="primary-action" id="run-button" type="button" disabled>
+            Run
+          </button>
+        </section>
+
+        <section class="panel compact">
+          <div class="section-heading inline">
+            <h2>Settings</h2>
+            <button class="text-button" id="open-setup" type="button">
+              View
+            </button>
+          </div>
+          <p id="setup-summary">Checking local backend availability...</p>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header">
+          <div>
+            <h2>Results</h2>
+            <p id="run-summary">Run annotations to populate this review area.</p>
+          </div>
+          <div class="actions">
+            <button id="export-json" type="button" disabled>Export JSON</button>
+            <button id="export-csv" type="button" disabled>Export CSV</button>
+            <button id="export-google-sheet" type="button" disabled>Export Google Sheet</button>
+          </div>
+        </header>
+
+        <section class="status-box hidden" id="message-box"></section>
+
+        <section class="metrics-grid hidden" id="metrics-grid"></section>
+
+        <section class="results-window" id="results-window">
+          <div class="empty-state">
+            <h3>No results yet</h3>
+            <p>Paste fusions, choose how to run, then review results here.</p>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="modal-backdrop hidden" id="setup-modal" role="presentation">
+      <section
+        class="setup-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="setup-title"
+      >
+        <div class="modal-header">
+          <div>
+            <h2 id="setup-title">Settings</h2>
+            <p>Install and sign in to a supported local agent for local runs.</p>
+          </div>
+          <button class="icon-button" id="close-setup" type="button" aria-label="Close">
+            x
+          </button>
+        </div>
+
+        <section class="tutorial-panel" id="tutorial-panel">
+          <h3>First-time guide</h3>
+          <p>
+            This app annotates gene fusions, lets you proofread the generated
+            gene-level results, then exports reviewed data as JSON, CSV, or a
+            Google Sheet.
+          </p>
+          <div class="tutorial-grid">
+            <div class="tutorial-item">
+              <strong>1. Choose how the model runs</strong>
+              <p>Use Anthropic SDK with an API key, or install a local agent such as Codex, Claude Code, Copilot, or Antigravity.</p>
+            </div>
+            <div class="tutorial-item">
+              <strong>2. Add required curation access</strong>
+              <p>Paste an OncoKB API token so the pipeline can check whether each gene is already curated in OncoKB.</p>
+            </div>
+            <div class="tutorial-item">
+              <strong>3. Improve PubMed throughput</strong>
+              <p>Add an NCBI API key to raise PubMed request limits during literature retrieval.</p>
+            </div>
+            <div class="tutorial-item">
+              <strong>4. Review and export</strong>
+              <p>Run annotations, proofread each gene card, then export to CSV or a Google Sheet for curator review.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="minimum-setup-panel" id="minimum-setup-panel">
+          <h3>Required before running</h3>
+          <ul id="minimum-setup-list">
+            <li>Checking setup requirements...</li>
+          </ul>
+        </section>
+
+        <div class="setup-grid">
+          <article class="setup-card">
+            <div class="setup-card-header">
+              <h3>Codex</h3>
+              <span class="status-pill" id="codex-pill">Checking</span>
+            </div>
+            <ol>
+              <li>Install the Codex CLI from the official setup flow.</li>
+              <li>Run <code>codex login</code> and complete browser sign-in.</li>
+              <li>Confirm with <code>codex --version</code>.</li>
+            </ol>
+            <p>
+              Codex CLI also supports API-key login with
+              <code>printenv OPENAI_API_KEY | codex login --with-api-key</code>.
+            </p>
+            <div class="installer-box">
+              <span>Installer</span>
+              <code id="codex-install-command">Checking installer...</code>
+              <button
+                class="install-button"
+                id="install-codex"
+                data-backend="codex"
+                type="button"
+              >
+                Install Codex
+              </button>
+            </div>
+            <a href="https://learn.chatgpt.com/docs/codex/cli" target="_blank" rel="noreferrer">
+              Codex CLI setup
+            </a>
+          </article>
+
+          <article class="setup-card">
+            <div class="setup-card-header">
+              <h3>Claude Code</h3>
+              <span class="status-pill" id="claude-pill">Checking</span>
+            </div>
+            <ol>
+              <li>Install Claude Code with the official installer or package manager.</li>
+              <li>Run <code>claude</code> and complete browser sign-in.</li>
+              <li>Confirm with <code>claude --version</code>.</li>
+            </ol>
+            <p>
+              Claude Code requires a Claude account with Claude Code access.
+            </p>
+            <div class="installer-box">
+              <span>Installer</span>
+              <code id="claude-install-command">Checking installer...</code>
+              <button
+                class="install-button"
+                id="install-claude"
+                data-backend="claude-code"
+                type="button"
+              >
+                Install Claude Code
+              </button>
+            </div>
+            <a href="https://code.claude.com/docs/en/setup" target="_blank" rel="noreferrer">
+              Claude Code setup
+            </a>
+          </article>
+
+          <article class="setup-card">
+            <div class="setup-card-header">
+              <h3>GitHub Copilot</h3>
+              <span class="status-pill" id="copilot-pill">Checking</span>
+            </div>
+            <ol>
+              <li>Install GitHub Copilot CLI with the official installer.</li>
+              <li>Run <code>copilot login</code> or use the login button below.</li>
+              <li>Complete the GitHub browser/SSO flow, then confirm with <code>copilot version</code>.</li>
+            </ol>
+            <p>
+              Copilot requires an active Copilot plan and organization policy access.
+            </p>
+            <div class="installer-box">
+              <span>Installer</span>
+              <code id="copilot-install-command">Checking installer...</code>
+              <button
+                class="install-button"
+                id="install-copilot"
+                data-backend="copilot"
+                type="button"
+              >
+                Install GitHub Copilot
+              </button>
+              <button
+                class="login-button"
+                data-backend="copilot"
+                type="button"
+              >
+                Log in to Copilot
+              </button>
+            </div>
+            <a
+              href="https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli"
+              target="_blank"
+              rel="noreferrer"
+            >
+              GitHub Copilot CLI setup
+            </a>
+          </article>
+
+          <article class="setup-card">
+            <div class="setup-card-header">
+              <h3>Antigravity</h3>
+              <span class="status-pill" id="antigravity-pill">Checking</span>
+            </div>
+            <ol>
+              <li>Install Antigravity from the official setup page.</li>
+              <li>Sign in through the Antigravity app.</li>
+              <li>Confirm the <code>antigravity</code> command is available to this app.</li>
+            </ol>
+            <p>
+              Antigravity local mode uses the detected <code>antigravity</code> command.
+            </p>
+            <div class="installer-box">
+              <span>Setup</span>
+              <code id="antigravity-install-command">Checking setup path...</code>
+              <button
+                class="install-button"
+                id="install-antigravity"
+                data-backend="antigravity"
+                type="button"
+              >
+                Open Antigravity Setup
+              </button>
+            </div>
+            <a href="https://antigravity.google/" target="_blank" rel="noreferrer">
+              Antigravity setup
+            </a>
+          </article>
+        </div>
+
+        <section class="integration-panel">
+          <div class="setup-card-header">
+            <div>
+              <h3>OncoKB API token</h3>
+              <p id="oncokb-status">Checking OncoKB configuration...</p>
+            </div>
+            <span class="status-pill" id="oncokb-pill">Checking</span>
+          </div>
+          <p>
+            Paste your OncoKB API token to enable OncoKB membership lookup during
+            annotation runs.
+          </p>
+          <div class="installer-box">
+            <span>API token</span>
+            <input
+              id="oncokb-token-input"
+              type="password"
+              autocomplete="off"
+              placeholder="Paste OncoKB API token"
+            />
+            <button id="save-oncokb-token" type="button">
+              Save OncoKB Token
+            </button>
+          </div>
+          <a href="https://www.oncokb.org/account/settings" target="_blank" rel="noreferrer">
+            OncoKB account settings
+          </a>
+        </section>
+
+        <section class="integration-panel">
+          <div class="setup-card-header">
+            <div>
+              <h3>NCBI API key</h3>
+              <p id="ncbi-status">Checking NCBI configuration...</p>
+            </div>
+            <span class="status-pill" id="ncbi-pill">Checking</span>
+          </div>
+          <p>
+            Paste an NCBI API key to raise PubMed E-utilities limits during literature retrieval.
+          </p>
+          <div class="installer-box">
+            <span>API key</span>
+            <input
+              id="ncbi-api-key-input"
+              type="password"
+              autocomplete="off"
+              placeholder="Paste NCBI API key"
+            />
+            <button id="save-ncbi-api-key" type="button">
+              Save NCBI API Key
+            </button>
+          </div>
+          <a href="https://support.nlm.nih.gov/kbArticle/?pn=KA-05317" target="_blank" rel="noreferrer">
+            NCBI API key setup
+          </a>
+        </section>
+
+        <section class="integration-panel">
+          <div class="setup-card-header">
+            <div>
+              <h3>Google Sheets export</h3>
+              <p id="google-sheets-status">Checking Google Sheets configuration...</p>
+            </div>
+            <span class="status-pill" id="google-sheets-pill">Checking</span>
+          </div>
+          <p>
+            Upload a Google service account JSON key, then share the target spreadsheet
+            with the service account email before exporting.
+          </p>
+          <div class="installer-box">
+            <span>Credentials</span>
+            <input id="google-service-account-file" type="file" accept="application/json,.json" />
+            <button id="save-google-service-account" type="button">
+              Save Google Sheets Credentials
+            </button>
+          </div>
+          <a
+            href="https://developers.google.com/identity/protocols/oauth2/service-account"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Google service account setup
+          </a>
+        </section>
+
+        <section class="install-output hidden" id="install-output"></section>
+
+        <div class="modal-footer">
+          <button id="refresh-backends" type="button">Refresh status</button>
+          <button class="primary-action" id="dismiss-setup" type="button">
+            Done
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
