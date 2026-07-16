@@ -198,6 +198,24 @@ a Linux executable. Add `--windowed` to hide the console window where supported:
 python scripts/build_desktop_app.py --windowed
 ```
 
+For macOS end-user testing, build a drag-and-drop disk image instead of sending
+the raw executable:
+
+```bash
+python scripts/build_desktop_app.py --format dmg
+```
+
+This writes a file like `dist/GeneFusionAnnotator-darwin-arm64.dmg`. Upload that
+DMG to Google Drive, GitHub Releases, or another internal file host, then send
+users the link. The DMG contains `GeneFusionAnnotator.app`, an Applications
+shortcut, and a short README. API keys are not bundled into the artifact; users
+configure tokens from the setup screen after launching the app.
+
+The current DMG is unsigned. For internal beta testing, users may need to
+right-click the installed app and choose **Open** the first time. For broader
+distribution, sign and notarize the app with an Apple Developer ID before
+sharing it with nontechnical users.
+
 The FastAPI service can still be run directly for API development:
 
 ```bash
