@@ -54,6 +54,7 @@ const elements = {
   oncokbStatus: document.querySelector("#oncokb-status"),
   oncokbTokenInput: document.querySelector("#oncokb-token-input"),
   openSetup: document.querySelector("#open-setup"),
+  prepareLocalPaths: document.querySelector("#prepare-local-paths"),
   refreshBackends: document.querySelector("#refresh-backends"),
   resultsWindow: document.querySelector("#results-window"),
   runButton: document.querySelector("#run-button"),
@@ -536,6 +537,34 @@ async function loginBackend(backend) {
   } catch (error) {
     setInstallOutput(`${label} login failed`, error.message, "error");
     renderInstallers();
+  }
+}
+
+async function prepareLocalPaths() {
+  elements.prepareLocalPaths.disabled = true;
+  setInstallOutput(
+    "Preparing local agent paths",
+    "The app is checking standard install locations and saving detected paths.",
+  );
+
+  try {
+    const response = await fetch("/v1/local-backends/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const payload = await readJsonResponse(response);
+    const labels = Object.keys(payload.configured_paths || {})
+      .map((backend) => backendLabel(backend))
+      .join(", ");
+    const detail = labels
+      ? `${payload.message} Detected: ${labels}.`
+      : "No local agent executables were detected yet. Install or log in to a local agent, then run this again.";
+    setInstallOutput("Local app setup complete", detail);
+    await fetchBackendStatus({ forceModal: true });
+  } catch (error) {
+    setInstallOutput("Local app setup failed", error.message, "error");
+  } finally {
+    elements.prepareLocalPaths.disabled = false;
   }
 }
 
@@ -1105,6 +1134,7 @@ function bindEvents() {
   elements.closeSetup.addEventListener("click", () => hideSetupModal());
   elements.dismissSetup.addEventListener("click", () => hideSetupModal({ remember: true }));
   elements.refreshBackends.addEventListener("click", () => fetchBackendStatus({ forceModal: true }));
+  elements.prepareLocalPaths.addEventListener("click", prepareLocalPaths);
   elements.saveGoogleServiceAccount.addEventListener("click", saveGoogleServiceAccount);
   elements.saveNcbiApiKey.addEventListener("click", saveNCBIApiKey);
   elements.saveOncokbToken.addEventListener("click", saveOncoKBToken);

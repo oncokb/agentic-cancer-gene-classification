@@ -121,6 +121,13 @@ class LocalBackendInstallResponse(BaseModel):
     next_steps: List[str] = Field(default_factory=list)
 
 
+class LocalBackendPrepareResponse(BaseModel):
+    configured_count: int
+    configured_paths: Dict[LocalBackend, str] = Field(default_factory=dict)
+    config_path: str
+    message: str
+
+
 class LocalBackendLoginRequest(BaseModel):
     backend: LoginableLocalBackend
 

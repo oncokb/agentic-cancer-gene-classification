@@ -33,6 +33,7 @@ from src.models.schema import (
     LocalBackendInstallerInfo,
     LocalBackendLoginRequest,
     LocalBackendLoginResponse,
+    LocalBackendPrepareResponse,
     LocalBackendsStatusResponse,
     LocalBackendStatus,
     NCBIAPIKeyConfigRequest,
@@ -56,6 +57,7 @@ from src.pipeline.google_sheets_export import (
 from src.pipeline.local_agents import (
     LOCAL_BACKEND_COMMANDS,
     LOCAL_BACKEND_VERSION_ARGS,
+    prepare_local_agent_paths,
     resolve_local_agent_path,
 )
 from src.pipeline.llm_client import LOCAL_BACKENDS
@@ -383,6 +385,27 @@ async def install_local_backend(
         stdout=_truncate_output(completed.stdout or ""),
         stderr=_truncate_output(completed.stderr or ""),
         next_steps=installer.post_install_steps,
+    )
+
+
+@app.post("/v1/local-backends/prepare", response_model=LocalBackendPrepareResponse)
+async def prepare_local_backend_paths(request: Request) -> LocalBackendPrepareResponse:
+    _require_local_request(request)
+    configured, config_path = prepare_local_agent_paths()
+    backend_paths = {
+        backend: configured[command]
+        for backend, command in LOCAL_BACKEND_COMMANDS.items()
+        if command in configured
+    }
+    configured_count = len(backend_paths)
+    return LocalBackendPrepareResponse(
+        configured_count=configured_count,
+        configured_paths=backend_paths,
+        config_path=str(config_path),
+        message=(
+            f"Prepared {configured_count} local agent path"
+            f"{'' if configured_count == 1 else 's'} for this app."
+        ),
     )
 
 

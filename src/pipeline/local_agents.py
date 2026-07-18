@@ -9,6 +9,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from src.pipeline.local_config import app_config_dir
+
 LOCAL_BACKEND_COMMANDS = {
     "claude-code": "claude",
     "codex": "codex",
@@ -30,6 +32,58 @@ COMMAND_PATH_OVERRIDES = {
 }
 
 
+def local_agent_paths_config_path() -> Path:
+    return app_config_dir() / "local-agent-paths.json"
+
+
+def load_configured_local_agent_paths() -> dict[str, str]:
+    path = local_agent_paths_config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        import json
+
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(command): str(value)
+        for command, value in payload.items()
+        if isinstance(command, str) and isinstance(value, str) and value
+    }
+
+
+def save_configured_local_agent_paths(paths: dict[str, str]) -> Path:
+    import json
+
+    path = local_agent_paths_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(paths, indent=2, sort_keys=True), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
+
+
+def prepare_local_agent_paths() -> tuple[dict[str, str], Path]:
+    """Resolve and persist currently detectable local agent executable paths."""
+    configured = {
+        command: path
+        for command, path in load_configured_local_agent_paths().items()
+        if Path(path).exists()
+    }
+    for command in LOCAL_BACKEND_COMMANDS.values():
+        path = resolve_local_agent_path(command, include_configured=False)
+        if path:
+            configured[command] = path
+    return configured, save_configured_local_agent_paths(configured)
+
+
 def local_agent_subprocess_env() -> dict[str, str]:
     """Return an env with common CLI install locations visible to child agents."""
     env = os.environ.copy()
@@ -37,13 +91,18 @@ def local_agent_subprocess_env() -> dict[str, str]:
     return env
 
 
-def resolve_local_agent_path(command: str) -> Optional[str]:
+def resolve_local_agent_path(command: str, *, include_configured: bool = True) -> Optional[str]:
     """Find a local agent executable even when launched from a macOS .app."""
     override_name = COMMAND_PATH_OVERRIDES.get(command)
     if override_name:
         override = os.environ.get(override_name)
         if override:
             return override
+
+    if include_configured:
+        configured_path = load_configured_local_agent_paths().get(command)
+        if configured_path and Path(configured_path).exists():
+            return configured_path
 
     path = shutil.which(command, path=_augmented_path())
     if path:
