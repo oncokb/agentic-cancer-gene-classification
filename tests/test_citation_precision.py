@@ -7,6 +7,8 @@ from src.pipeline.selection import (
     select_papers_for_synthesis,
 )
 from src.pipeline.synthesis import (
+    ANNOTATE_TOOL,
+    SYSTEM_PROMPT,
     _verify_citations,
     build_gene_annotation,
     synthesize_gene_annotation,
@@ -247,6 +249,20 @@ def test_build_gene_annotation_records_all_retrieved_pmids():
 
     assert annotation.retrieval_count == 3
     assert annotation.retrieved_pmids == ["111", "222"]
+
+
+def test_synthesis_contract_requests_concise_curator_text():
+    rationale_description = ANNOTATE_TOOL["input_schema"]["properties"][
+        "cancer_association_rationale"
+    ]["description"]
+    summary_description = ANNOTATE_TOOL["input_schema"]["properties"]["gene_summary"][
+        "description"
+    ]
+
+    assert "one concise sentence" in SYSTEM_PROMPT
+    assert "Do not enumerate every retrieved paper" in rationale_description
+    assert "Curator-facing scan text" in summary_description
+    assert "60–90 words" in summary_description
 
 
 async def test_synthesis_uses_evidence_packets_instead_of_full_abstract(monkeypatch):
