@@ -42,14 +42,19 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 
 ## Field guidance:
 - `cancer_associated`: true if there is credible peer-reviewed evidence linking this gene to cancer biology.
-- `cancer_association_rationale`: list the evidence types (structural-variant, expression, mutation, methylation, copy-number) with a brief justification.
+- `cancer_association_rationale`: one concise sentence, ideally 25–40 words. Name only the strongest evidence types
+  (structural-variant, expression, mutation, methylation, copy-number) and the cancer context. Do not enumerate every paper.
 - `cancer_associated_gene_tier`: ONLY set this when `cancer_associated` is true. Use the most conservative tier supported by the evidence — do not promote a gene's tier beyond what the retrieved abstracts directly demonstrate:
     - "Class I - Driver": high bar — requires recurrent somatic mutations with direct functional validation (e.g., murine models, CRISPR knockouts demonstrating tumour initiation), OR recurrent oncogenic fusions with demonstrated transforming activity. Expression/correlation data alone does NOT qualify.
     - "Class II - Likely Driver": expression upregulation, copy-number alteration, or functional knockdown/overexpression in cancer cell lines or xenografts with a plausible mechanistic hypothesis. No requirement for in vivo murine tumour initiation models.
     - "Class III - Cancer Relevant": indirect or contextual association only — prognostic signature membership, immune microenvironment role, metabolic co-dependency, or single-study correlation without mechanistic follow-up. When in doubt between Class II and Class III, choose Class III.
 - `og_or_tsg`: ONLY set this when `cancer_associated` is true AND `cancer_associated_gene_tier` is "Class I - Driver" or "Class II - Likely Driver". Leave null for "Class III - Cancer Relevant" genes — contextual or indirect associations do not warrant a directional OG/TSG call. "OG" (promotes growth/survival), "TSG" (suppresses growth), "OG, TSG" (context-dependent dual role with evidence for both in the retrieved abstracts).
-- `gene_class`: molecular/functional class (e.g., "Serine/threonine kinase", "RNA-binding protein", "Transcription factor").
-- `signaling_pathways`: comma-separated canonical pathways (e.g., "PI3K/AKT", "RAS/MAPK", "WNT/β-catenin").
+- `gene_class`: molecular/functional class (e.g., "Serine/threonine kinase", "RNA-binding protein", "Transcription factor"). Keep this to a short phrase.
+- `signaling_pathways`: comma-separated canonical pathways (e.g., "PI3K/AKT", "RAS/MAPK", "WNT/β-catenin"). Include only major pathways directly supported by retrieved evidence.
+- `gene_summary`: curator-facing scan text, not a literature review. Write 2 short evidence sentences plus the required
+  retrieval-provenance parenthetical sentence. Aim for 60–90 words total. Prioritize the classification-relevant
+  conclusion, the strongest mechanism/cancer context, and one caveat if needed. Avoid long lists of cancers, pathways,
+  or PMIDs; cite only the strongest 1–3 PMIDs inline.
 - `confidence`: 0.0–1.0 reflecting how well the retrieved evidence supports the annotation.
   - >4 papers with direct functional evidence → 0.8–1.0
   - 2–4 papers with functional/expression data → 0.5–0.8
@@ -90,9 +95,10 @@ ANNOTATE_TOOL: dict = {
             "cancer_association_rationale": {
                 "type": "string",
                 "description": (
-                    "Brief rationale covering evidence types observed "
-                    "(structural-variant, expression, mutation, methylation, copy-number) "
-                    "and which cancer types."
+                    "One concise sentence, ideally 25–40 words, covering only the strongest "
+                    "evidence types observed (structural-variant, expression, mutation, "
+                    "methylation, copy-number) and the key cancer context. Do not enumerate "
+                    "every retrieved paper."
                 ),
             },
             "cancer_associated_gene_tier": {
@@ -107,17 +113,19 @@ ANNOTATE_TOOL: dict = {
             },
             "gene_class": {
                 "type": "string",
-                "description": "Molecular/functional class of the gene product.",
+                "description": "Short molecular/functional class phrase for the gene product.",
             },
             "signaling_pathways": {
                 "type": "string",
-                "description": "Comma-separated associated signaling pathways.",
+                "description": "Comma-separated major pathways directly supported by retrieved evidence.",
             },
             "gene_summary": {
                 "type": "string",
                 "description": (
-                    "2–5 sentence prose summary of cancer relevance grounded in retrieved abstracts. "
-                    "Cite PMIDs inline as (PMID XXXXXXXX). Only cite retrieved PMIDs."
+                    "Curator-facing scan text, not a literature review: 2 short evidence "
+                    "sentences plus the required retrieval-provenance parenthetical sentence, "
+                    "aiming for 60–90 words total. Ground every claim in retrieved abstracts. "
+                    "Cite only the strongest 1–3 retrieved PMIDs inline as (PMID XXXXXXXX)."
                 ),
             },
             "citations": {
