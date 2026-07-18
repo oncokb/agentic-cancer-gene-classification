@@ -224,6 +224,35 @@ def test_install_local_backend_rejects_non_local_clients():
     assert response.status_code == 403
 
 
+def test_prepare_local_backend_paths_persists_detected_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.main.prepare_local_agent_paths",
+        lambda: (
+            {"codex": "/Users/person/.local/bin/codex", "claude": "/Users/person/.local/bin/claude"},
+            tmp_path / "local-agent-paths.json",
+        ),
+    )
+
+    response = client.post("/v1/local-backends/prepare")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["configured_count"] == 2
+    assert payload["configured_paths"] == {
+        "codex": "/Users/person/.local/bin/codex",
+        "claude-code": "/Users/person/.local/bin/claude",
+    }
+    assert payload["config_path"] == str(tmp_path / "local-agent-paths.json")
+
+
+def test_prepare_local_backend_paths_rejects_non_local_clients():
+    remote_client = TestClient(app, client=("192.0.2.1", 5000))
+
+    response = remote_client.post("/v1/local-backends/prepare")
+
+    assert response.status_code == 403
+
+
 def test_export_annotation_results_csv_endpoint_returns_download():
     result = AnnotationResult(
         run_id="run-1",

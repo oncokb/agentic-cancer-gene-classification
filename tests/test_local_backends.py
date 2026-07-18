@@ -1,11 +1,25 @@
 """Unit tests for local LLM backend selection."""
 
+from pathlib import Path
+
 import pytest
 
 from benchmarks.run_benchmark import _run_pipeline
 from src.cli import parse_args
 from src.models.schema import AnnotateRequest
-from src.pipeline.llm_client import DEFAULT_LOCAL_BACKEND, resolve_local_backend
+from src.pipeline.local_agents import (
+    load_configured_local_agent_paths,
+    local_agent_subprocess_env,
+    local_agent_paths_config_path,
+    resolve_local_agent_path,
+    save_configured_local_agent_paths,
+)
+from src.pipeline.llm_client import (
+    DEFAULT_LOCAL_BACKEND,
+    _run_claude_code,
+    _run_codex,
+    resolve_local_backend,
+)
 
 
 def test_resolve_local_backend_defaults_for_legacy_bool():
@@ -110,3 +124,92 @@ async def test_benchmark_run_pipeline_passes_local_backend(monkeypatch):
 
     assert result == {"annotations": []}
     assert seen == {"fusions": ["TP53::BRAF"], "local_backend": "codex"}
+
+
+def test_local_agent_resolver_finds_hidden_user_bin_for_claude_and_codex(
+    tmp_path,
+    monkeypatch,
+):
+    claude_path = tmp_path / ".local" / "bin" / "claude"
+    codex_path = tmp_path / ".local" / "bin" / "codex"
+    claude_path.parent.mkdir(parents=True)
+    claude_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    codex_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    claude_path.chmod(0o755)
+    codex_path.chmod(0o755)
+
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("src.pipeline.local_agents.shutil.which", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.pipeline.local_agents._command_from_login_shell", lambda command: None)
+    monkeypatch.setattr("src.pipeline.local_agents._login_shell_path_dirs", lambda: [])
+
+    assert resolve_local_agent_path("claude") == str(claude_path)
+    assert resolve_local_agent_path("codex") == str(codex_path)
+    assert str(tmp_path / ".local" / "bin") in local_agent_subprocess_env()["PATH"]
+
+
+async def test_claude_code_uses_resolved_absolute_path(monkeypatch):
+    seen = {}
+
+    async def fake_communicate(args, *, tool_name, input_text=None, timeout=180):
+        seen["args"] = args
+        seen["tool_name"] = tool_name
+        return '{"ok": true}', ""
+
+    monkeypatch.setattr(
+        "src.pipeline.llm_client.resolve_local_agent_path",
+        lambda command: "/Users/person/.local/bin/claude" if command == "claude" else None,
+    )
+    monkeypatch.setattr("src.pipeline.llm_client._communicate", fake_communicate)
+
+    result = await _run_claude_code("prompt", "curate_gene")
+
+    assert result == '{"ok": true}'
+    assert seen["args"] == ["/Users/person/.local/bin/claude", "-p", "prompt"]
+    assert seen["tool_name"] == "curate_gene"
+
+
+async def test_codex_uses_resolved_absolute_path(monkeypatch):
+    seen = {}
+
+    async def fake_communicate(args, *, tool_name, input_text=None, timeout=180):
+        seen["args"] = args
+        seen["tool_name"] = tool_name
+        seen["input_text"] = input_text
+        output_path = args[args.index("--output-last-message") + 1]
+        Path(output_path).write_text('{"ok": true}', encoding="utf-8")
+        return "", ""
+
+    monkeypatch.setattr(
+        "src.pipeline.llm_client.resolve_local_agent_path",
+        lambda command: "/Users/person/.local/bin/codex" if command == "codex" else None,
+    )
+    monkeypatch.setattr("src.pipeline.llm_client._communicate", fake_communicate)
+
+    result = await _run_codex("prompt", "curate_gene")
+
+    assert result == '{"ok": true}'
+    assert seen["args"][:2] == ["/Users/person/.local/bin/codex", "exec"]
+    assert "--output-last-message" in seen["args"]
+    assert seen["input_text"] == "prompt"
+    assert seen["tool_name"] == "curate_gene"
+
+
+def test_local_agent_resolver_uses_persisted_path(tmp_path, monkeypatch):
+    codex_path = tmp_path / "custom" / "codex"
+    codex_path.parent.mkdir()
+    codex_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    codex_path.chmod(0o755)
+
+    monkeypatch.setenv("AGCG_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr("src.pipeline.local_agents.shutil.which", lambda *args, **kwargs: None)
+    monkeypatch.setattr("src.pipeline.local_agents._command_from_login_shell", lambda command: None)
+    monkeypatch.setattr("src.pipeline.local_agents._login_shell_path_dirs", lambda: [])
+
+    config_path = save_configured_local_agent_paths({"codex": str(codex_path)})
+
+    assert config_path == local_agent_paths_config_path()
+    assert load_configured_local_agent_paths() == {"codex": str(codex_path)}
+    assert resolve_local_agent_path("codex") == str(codex_path)
