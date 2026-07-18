@@ -29,6 +29,16 @@ def test_ui_root_serves_static_app():
     assert "Gene Fusion Annotation" in response.text
 
 
+def test_static_ui_softens_class_ii_tier_for_review_badges():
+    app_js = client.get("/static/app.js").text
+    styles = client.get("/static/styles.css").text
+
+    assert "Functional cancer evidence" in app_js
+    assert "Equivalent raw tier: Class II - Likely Driver." in app_js
+    assert "Moderate priority" in app_js
+    assert ".review-badge.medium" in styles
+
+
 def test_local_backend_status_reports_installed_codex(monkeypatch):
     def fake_find_command(command):
         return "/usr/local/bin/codex" if command == "codex" else None

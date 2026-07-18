@@ -882,6 +882,128 @@ async function readJsonResponse(response) {
   return payload;
 }
 
+function reviewPriority(annotation) {
+  if (annotation.insufficient_evidence) {
+    return {
+      label: "Low priority",
+      tone: "low",
+      title: "Retrieved evidence was insufficient for a confident cancer annotation.",
+    };
+  }
+  if (annotation.cancer_associated === false) {
+    return {
+      label: "Low priority",
+      tone: "low",
+      title: "Current evidence does not support a cancer association.",
+    };
+  }
+  if (annotation.in_oncokb) {
+    return {
+      label: "High priority",
+      tone: "high",
+      title: "This gene is already represented in OncoKB and may need curator attention.",
+    };
+  }
+  if (annotation.cancer_associated_gene_tier === "Class I - Driver") {
+    return {
+      label: "High priority",
+      tone: "high",
+      title: "Classification indicates strong driver-level evidence.",
+    };
+  }
+  if (annotation.cancer_associated_gene_tier === "Class II - Likely Driver") {
+    return {
+      label: "Moderate priority",
+      tone: "medium",
+      title: "Classification indicates functional cancer evidence, but not established driver-level evidence.",
+    };
+  }
+  if (annotation.cancer_associated_gene_tier === "Class III - Cancer Relevant") {
+    return {
+      label: "Context only",
+      tone: "context",
+      title: "Classification indicates contextual or indirect cancer relevance.",
+    };
+  }
+  return {
+    label: "Review",
+    tone: "neutral",
+    title: "Review this result before export.",
+  };
+}
+
+function evidenceSignal(annotation) {
+  if (annotation.insufficient_evidence) {
+    return {
+      label: "Insufficient evidence",
+      tone: "low",
+      title: "The model did not find enough grounded evidence to classify this gene.",
+    };
+  }
+  if (annotation.cancer_associated === false) {
+    return {
+      label: "No cancer evidence",
+      tone: "low",
+      title: "Current retrieved evidence does not support a cancer association.",
+    };
+  }
+  if (annotation.cancer_associated_gene_tier === "Class I - Driver") {
+    return {
+      label: "Driver-level evidence",
+      tone: "high",
+      title: "Equivalent raw tier: Class I - Driver.",
+    };
+  }
+  if (annotation.cancer_associated_gene_tier === "Class II - Likely Driver") {
+    return {
+      label: "Functional cancer evidence",
+      tone: "medium",
+      title: "Equivalent raw tier: Class II - Likely Driver.",
+    };
+  }
+  if (annotation.cancer_associated_gene_tier === "Class III - Cancer Relevant") {
+    return {
+      label: "Contextual cancer evidence",
+      tone: "context",
+      title: "Equivalent raw tier: Class III - Cancer Relevant.",
+    };
+  }
+  if (annotation.cancer_associated === true) {
+    return {
+      label: "Cancer associated",
+      tone: "neutral",
+      title: "Cancer-associated result without a tier assignment.",
+    };
+  }
+  return null;
+}
+
+function compactBadges(annotation) {
+  return [
+    reviewPriority(annotation),
+    evidenceSignal(annotation),
+    annotation.in_oncokb
+      ? {
+          label: "OncoKB",
+          tone: "high",
+          title: "OncoKB membership lookup returned true.",
+        }
+      : null,
+  ].filter(Boolean);
+}
+
+function renderCompactBadges(annotation) {
+  return compactBadges(annotation)
+    .map(
+      (badge) => `
+        <span class="review-badge ${escapeHtml(badge.tone)}" title="${escapeHtml(badge.title)}">
+          ${escapeHtml(badge.label)}
+        </span>
+      `,
+    )
+    .join("");
+}
+
 function renderAnnotationResult(result) {
   const annotations = result.annotations || [];
   const hasAnnotations = annotations.length > 0;
@@ -919,6 +1041,7 @@ function renderAnnotationResult(result) {
         <div>
           <h3>${escapeHtml(annotation.gene)}</h3>
           <div class="subtle">${escapeHtml(formatList(annotation.fusions))}</div>
+          <div class="review-badges">${renderCompactBadges(annotation)}</div>
         </div>
         <span class="status-pill">${escapeHtml(annotation.date_annotated || "")}</span>
       </header>

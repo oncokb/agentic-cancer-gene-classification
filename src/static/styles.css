@@ -397,6 +397,52 @@ textarea {
   font-size: 13px;
 }
 
+.review-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.review-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: var(--surface-strong);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.review-badge.high {
+  border-color: #b8dec9;
+  background: #dff3e8;
+  color: var(--ok);
+}
+
+.review-badge.medium {
+  border-color: #d4c39b;
+  background: #fff6db;
+  color: #7c5a00;
+}
+
+.review-badge.context {
+  border-color: #b9d9d5;
+  background: #eef9f7;
+  color: var(--accent-strong);
+}
+
+.review-badge.low {
+  border-color: #d6dce1;
+  background: #f2f5f7;
+  color: var(--muted);
+}
+
 .annotation-fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(220px, 1fr));
