@@ -32,6 +32,8 @@ class LiteratureRecord(BaseModel):
     pmid: str
     title: str
     abstract: str
+    journal: str = ""
+    publication_types: list[str] = []
 
 
 class GeneAnnotation(BaseModel):
