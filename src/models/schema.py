@@ -6,13 +6,6 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-CancerTier = Literal[
-    "Class I - Driver",
-    "Class II - Likely Driver",
-    "Class III - Cancer Relevant",
-]
-
-OgTsg = Literal["OG", "TSG", "OG, TSG"]
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
 
 
@@ -45,8 +38,6 @@ class GeneAnnotation(BaseModel):
 
     cancer_associated: Optional[bool] = None
     cancer_association_rationale: Optional[str] = None
-    cancer_associated_gene_tier: Optional[CancerTier] = None
-    og_or_tsg: Optional[OgTsg] = None
     cancer_type_prevalence: Optional[str] = None
     gene_class: Optional[str] = None
     signaling_pathways: Optional[str] = None
