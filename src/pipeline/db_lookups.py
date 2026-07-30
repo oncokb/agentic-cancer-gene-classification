@@ -13,6 +13,7 @@ from typing import Optional, Set
 import httpx
 
 from src.config import settings
+from src.pipeline.cache import cached_call
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,14 @@ class OncoKBGeneLookup:
             "Authorization": f"Bearer {self.api_token}",
             "Accept": "application/json",
         }
-        try:
+
+        async def _fetch() -> list:
             resp = await client.get(ONCOKB_CURATED_GENES_URL, headers=headers, timeout=15.0)
             resp.raise_for_status()
-            genes = resp.json()
+            return resp.json()
+
+        try:
+            genes = await cached_call("oncokb:curated_genes", _fetch)
             self._gene_cache = {g["hugoSymbol"] for g in genes if "hugoSymbol" in g}
             logger.info("Loaded %d OncoKB genes", len(self._gene_cache))
             return self._gene_cache

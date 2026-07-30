@@ -29,6 +29,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
 from src.models.schema import LiteratureRecord
+from src.pipeline.cache import cached_call
 from src.pipeline.llm_client import complete_with_tool, make_async_sdk_client, resolve_sdk_model
 
 logger = logging.getLogger(__name__)
@@ -229,14 +230,18 @@ def _ncbi_params(extra: dict) -> dict:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
 async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> List[str]:
     """Return PMIDs matching a PubMed query string."""
-    params = _ncbi_params(
-        {"db": "pubmed", "term": query, "retmax": max_results, "sort": "relevance"}
-    )
-    async with _request_semaphore:
-        await asyncio.sleep(_RATE_LIMIT_DELAY)
-        resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
-        resp.raise_for_status()
-    return resp.json().get("esearchresult", {}).get("idlist", [])
+
+    async def _fetch() -> List[str]:
+        params = _ncbi_params(
+            {"db": "pubmed", "term": query, "retmax": max_results, "sort": "relevance"}
+        )
+        async with _request_semaphore:
+            await asyncio.sleep(_RATE_LIMIT_DELAY)
+            resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
+            resp.raise_for_status()
+        return resp.json().get("esearchresult", {}).get("idlist", [])
+
+    return await cached_call(f"pubmed:esearch:{query}:{max_results}", _fetch)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
@@ -310,42 +315,48 @@ async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[Literatur
     """Fetch abstracts for a list of PMIDs, including journal and publication type metadata."""
     if not pmids:
         return []
-    params = {"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml"}
-    if settings.ncbi_api_key:
-        params["api_key"] = settings.ncbi_api_key
 
-    async with _request_semaphore:
-        await asyncio.sleep(_RATE_LIMIT_DELAY)
-        resp = await client.get(EFETCH_URL, params=params, timeout=30.0)
-        resp.raise_for_status()
+    async def _fetch() -> List[dict]:
+        params = {"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml"}
+        if settings.ncbi_api_key:
+            params["api_key"] = settings.ncbi_api_key
 
-    records: List[LiteratureRecord] = []
-    try:
-        root = ET.fromstring(resp.text)
-        for article in root.findall(".//PubmedArticle"):
-            pmid_el = article.find(".//PMID")
-            pmid = pmid_el.text if pmid_el is not None else None
-            title_el = article.find(".//ArticleTitle")
-            title = (title_el.text or "").strip() if title_el is not None else ""
-            abstract_parts = article.findall(".//AbstractText")
-            abstract = " ".join(
-                (el.text or "").strip() for el in abstract_parts if el.text
-            ).strip()
-            journal_el = article.find(".//MedlineTA")
-            journal = journal_el.text.strip() if journal_el is not None and journal_el.text else ""
-            pub_types = [
-                el.text.strip()
-                for el in article.findall(".//PublicationType")
-                if el.text
-            ]
-            if pmid and abstract:
-                records.append(LiteratureRecord(
-                    pmid=pmid, title=title, abstract=abstract,
-                    journal=journal, publication_types=pub_types,
-                ))
-    except ET.ParseError as exc:
-        logger.warning("XML parse error in efetch: %s", exc)
-    return records
+        async with _request_semaphore:
+            await asyncio.sleep(_RATE_LIMIT_DELAY)
+            resp = await client.get(EFETCH_URL, params=params, timeout=30.0)
+            resp.raise_for_status()
+
+        records: List[dict] = []
+        try:
+            root = ET.fromstring(resp.text)
+            for article in root.findall(".//PubmedArticle"):
+                pmid_el = article.find(".//PMID")
+                pmid = pmid_el.text if pmid_el is not None else None
+                title_el = article.find(".//ArticleTitle")
+                title = (title_el.text or "").strip() if title_el is not None else ""
+                abstract_parts = article.findall(".//AbstractText")
+                abstract = " ".join(
+                    (el.text or "").strip() for el in abstract_parts if el.text
+                ).strip()
+                journal_el = article.find(".//MedlineTA")
+                journal = journal_el.text.strip() if journal_el is not None and journal_el.text else ""
+                pub_types = [
+                    el.text.strip()
+                    for el in article.findall(".//PublicationType")
+                    if el.text
+                ]
+                if pmid and abstract:
+                    records.append({
+                        "pmid": pmid, "title": title, "abstract": abstract,
+                        "journal": journal, "publication_types": pub_types,
+                    })
+        except ET.ParseError as exc:
+            logger.warning("XML parse error in efetch: %s", exc)
+        return records
+
+    cache_key = f"pubmed:efetch:{','.join(sorted(pmids))}"
+    records = await cached_call(cache_key, _fetch)
+    return [LiteratureRecord(**r) for r in records]
 
 
 async def _search_and_fetch(

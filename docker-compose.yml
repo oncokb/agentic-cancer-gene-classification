@@ -1,4 +1,17 @@
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - agcg-redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   mysql:
     image: mysql:8
     environment:
@@ -26,12 +39,15 @@ services:
     environment:
       - LOG_LEVEL=INFO
       - DD_TRACE_ENABLED=false
+      - REDIS_URL=redis://redis:6379/0
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
       - MYSQL_USER=${MYSQL_USER:-agcg}
       - MYSQL_PASSWORD=${MYSQL_PASSWORD:-agcg}
       - MYSQL_DATABASE=${MYSQL_DATABASE:-agcg}
     depends_on:
+      redis:
+        condition: service_healthy
       mysql:
         condition: service_healthy
     restart: unless-stopped
@@ -63,6 +79,7 @@ services:
       - DD_TRACE_ENABLED=false
       - HOME=/home/appuser
       - CODEX_HOME=/home/appuser/.codex
+      - REDIS_URL=redis://redis:6379/0
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
       - MYSQL_USER=${MYSQL_USER:-agcg}
@@ -73,6 +90,8 @@ services:
       - ${HOME}/.claude:/home/appuser/.claude
       - ${HOME}/.claude.json:/home/appuser/.claude.json
     depends_on:
+      redis:
+        condition: service_healthy
       mysql:
         condition: service_healthy
     restart: unless-stopped
@@ -90,4 +109,5 @@ services:
       start_period: 10s
 
 volumes:
+  agcg-redis-data:
   agcg-mysql-data:
