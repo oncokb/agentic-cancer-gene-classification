@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.models.schema import AnnotateRequest, AnnotationResult
 from src.pipeline.orchestrator import run_pipeline
@@ -30,6 +33,17 @@ app = FastAPI(
     version="0.1.0",
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
+_STATIC_DIR = Path(__file__).parent / "static"
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
 
 @app.get("/health")
 async def health() -> dict:
@@ -41,11 +55,12 @@ async def annotate(request: AnnotateRequest) -> AnnotationResult:
     """
     Annotate a list of candidate gene fusions.
 
-    Input: `{ "fusions": ["GENE1::GENE2", "GENE3::GENE4"] }`
-
     Each fusion is split into its partner genes. The unit of annotation
     is the gene. Returns one annotation row per unique gene, matching
     the MSK TARGET Gene Triaging schema.
+
+    Input supports plain strings or structured objects with optional tumor_type and breakpoint fields:
+    `{ "fusions": [{"fusion": "GENE1::GENE2", "tumor_type": "LUAD"}] }`
     """
     try:
         result = await run_pipeline(request.fusions, local_backend=request.local_backend)
