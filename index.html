@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agentic Cancer Gene Classification</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <h1>Gene Fusion Annotation</h1>
+          <p>Run, review, and export curation-ready results.</p>
+        </div>
+
+        <section class="panel">
+          <div class="section-heading">
+            <h2>Annotate</h2>
+          </div>
+
+          <label class="field" id="fusion-input-field">
+            <span>Fusions</span>
+            <textarea
+              id="fusion-input"
+              rows="9"
+              spellcheck="false"
+              placeholder="TP53::BRAF&#10;ETV6::NTRK3&#10;BCR::ABL1&#10;&#10;Or paste TSV with columns:&#10;fusion&#9;tumor_type&#9;five_exon&#9;three_exon&#9;five_genomic&#9;three_genomic&#9;five_transcript&#9;three_transcript"
+            ></textarea>
+            <span class="field-hint" id="tsv-hint"></span>
+          </label>
+
+          <div class="api-url-row">
+            <span class="field-label">Backend URL</span>
+            <input
+              id="api-base-url-input"
+              type="text"
+              placeholder="https://your-server.example.com (leave blank for same-host)"
+              autocomplete="off"
+            />
+            <button class="text-button" id="save-api-url" type="button">Save</button>
+          </div>
+
+          <button class="primary-action" id="run-button" type="button">Run</button>
+        </section>
+
+        <section class="panel compact">
+          <div class="section-heading inline">
+            <h2>Settings</h2>
+            <button class="text-button" id="open-setup" type="button">View</button>
+          </div>
+          <p id="setup-summary">Configure API tokens and backend URL.</p>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header">
+          <div>
+            <h2>Results</h2>
+            <p id="run-summary">Run annotations to populate this review area.</p>
+          </div>
+          <div class="actions">
+            <button id="export-json" type="button" disabled>Export JSON</button>
+            <button id="export-csv" type="button" disabled>Export CSV</button>
+          </div>
+        </header>
+
+        <section class="status-box hidden" id="message-box"></section>
+
+        <div class="results-layout">
+          <nav class="gene-index" id="gene-index" aria-label="Gene index"></nav>
+          <section class="results-window" id="results-window">
+            <div class="empty-state">
+              <h3>No results yet</h3>
+              <p>Paste fusions, then click Run to annotate.</p>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <div class="modal-backdrop hidden" id="setup-modal" role="presentation">
+      <section
+        class="setup-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="setup-title"
+      >
+        <div class="modal-header">
+          <div>
+            <h2 id="setup-title">Settings</h2>
+            <p>Configure API keys and backend connection.</p>
+          </div>
+          <button class="icon-button" id="close-setup" type="button" aria-label="Close">x</button>
+        </div>
+
+        <section class="integration-panel">
+          <div class="setup-card-header">
+            <div>
+              <h3>Backend API URL</h3>
+              <p id="api-url-status">Configure the annotation server URL for GitHub Pages hosting.</p>
+            </div>
+          </div>
+          <p>
+            When running this app from GitHub Pages, point it at your deployed
+            AGCG API server. Leave blank when serving from the same host as the API.
+          </p>
+          <div class="installer-box">
+            <span>Server URL</span>
+            <input
+              id="api-base-url-modal"
+              type="text"
+              autocomplete="off"
+              placeholder="https://your-server.example.com"
+            />
+            <button id="save-api-url-modal" type="button">Save Backend URL</button>
+          </div>
+        </section>
+
+        <section class="integration-panel">
+          <div class="setup-card-header">
+            <div>
+              <h3>OncoKB API token</h3>
+              <p id="oncokb-status">Configure OncoKB membership lookup.</p>
+            </div>
+          </div>
+          <p>
+            Paste your OncoKB API token to enable membership lookup during annotation.
+            The token is sent with each API request.
+          </p>
+          <div class="installer-box">
+            <span>API token</span>
+            <input
+              id="oncokb-token-input"
+              type="password"
+              autocomplete="off"
+              placeholder="Paste OncoKB API token"
+            />
+            <button id="save-oncokb-token" type="button">Save OncoKB Token</button>
+          </div>
+          <a href="https://www.oncokb.org/account/settings" target="_blank" rel="noreferrer">
+            OncoKB account settings
+          </a>
+        </section>
+
+        <section class="integration-panel">
+          <div class="setup-card-header">
+            <div>
+              <h3>NCBI API key</h3>
+              <p id="ncbi-status">Improves PubMed retrieval throughput.</p>
+            </div>
+          </div>
+          <p>
+            Add an NCBI API key to raise PubMed E-utilities limits during literature retrieval.
+          </p>
+          <div class="installer-box">
+            <span>API key</span>
+            <input
+              id="ncbi-api-key-input"
+              type="password"
+              autocomplete="off"
+              placeholder="Paste NCBI API key"
+            />
+            <button id="save-ncbi-api-key" type="button">Save NCBI API Key</button>
+          </div>
+          <a href="https://support.nlm.nih.gov/kbArticle/?pn=KA-05317" target="_blank" rel="noreferrer">
+            NCBI API key setup
+          </a>
+        </section>
+
+        <section class="install-output hidden" id="install-output"></section>
+
+        <div class="modal-footer">
+          <button class="primary-action" id="dismiss-setup" type="button">Done</button>
+        </div>
+      </section>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
