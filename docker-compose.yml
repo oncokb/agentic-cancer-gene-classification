@@ -1,4 +1,22 @@
 services:
+  mysql:
+    image: mysql:8
+    environment:
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-agcg}
+      - MYSQL_USER=${MYSQL_USER:-agcg}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-agcg}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD:-agcg}
+    ports:
+      - "3306:3306"
+    volumes:
+      - agcg-mysql-data:/var/lib/mysql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   annotation-service:
     build: .
     ports:
@@ -7,6 +25,14 @@ services:
       - .env
     environment:
       - LOG_LEVEL=INFO
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER:-agcg}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-agcg}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-agcg}
+    depends_on:
+      mysql:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test:
@@ -35,10 +61,18 @@ services:
       - LOG_LEVEL=INFO
       - HOME=/home/appuser
       - CODEX_HOME=/home/appuser/.codex
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=${MYSQL_USER:-agcg}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-agcg}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-agcg}
     volumes:
       - ${HOME}/.codex:/home/appuser/.codex
       - ${HOME}/.claude:/home/appuser/.claude
       - ${HOME}/.claude.json:/home/appuser/.claude.json
+    depends_on:
+      mysql:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test:
@@ -52,3 +86,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  agcg-mysql-data:

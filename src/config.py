@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     max_papers_for_synthesis: int = 8
     max_citations_per_annotation: int = 4
 
+    mysql_host: str = "localhost"
+    mysql_port: int = 3306
+    mysql_user: str = "agcg"
+    mysql_password: str = ""
+    mysql_database: str = "agcg"
+
     log_level: str = "INFO"
 
 
