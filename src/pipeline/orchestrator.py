@@ -10,10 +10,10 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional, Union
 
 from src.config import settings
-from src.models.schema import AnnotationResult, GeneAnnotation, ResolvedGene
+from src.models.schema import AnnotationResult, FusionInput, GeneAnnotation, ResolvedGene
 from src.pipeline.db_lookups import check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import retrieve_literature
 from src.pipeline.llm_client import resolve_local_backend
@@ -47,6 +47,7 @@ async def _annotate_gene(
     fusions: List[str],
     resolved_gene: ResolvedGene,
     unresolvable: bool,
+    tumor_type: Optional[str] = None,
     local_mode: bool = False,
     local_backend: Optional[str] = None,
 ) -> GeneAnnotation:
@@ -66,7 +67,12 @@ async def _annotate_gene(
     # Run DB lookup and literature retrieval concurrently
     oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
         check_oncokb_membership(gene),
-        retrieve_literature(gene, fusions, local_mode=local_mode, local_backend=local_backend),
+        retrieve_literature(
+            gene, fusions,
+            tumor_type=tumor_type,
+            local_mode=local_mode,
+            local_backend=local_backend,
+        ),
     )
 
     prevalence = get_msk_genie_prevalence(gene)
@@ -118,23 +124,55 @@ async def _annotate_gene(
     )
 
 
+def _normalize_fusion_inputs(
+    fusions: Union[List[str], List[FusionInput]],
+) -> tuple[List[str], Dict[str, str]]:
+    """
+    Accept either plain strings or FusionInput objects.
+    Returns (fusion_strings, tumor_type_by_fusion_string).
+    """
+    fusion_strings: List[str] = []
+    tumor_type_map: Dict[str, str] = {}
+
+    for item in fusions:
+        if isinstance(item, str):
+            fusion_strings.append(item)
+        else:
+            fusion_strings.append(item.fusion)
+            if item.tumor_type:
+                tumor_type_map[item.fusion] = item.tumor_type
+
+    return fusion_strings, tumor_type_map
+
+
 async def run_pipeline(
-    fusions: List[str],
+    fusions: Union[List[str], List[FusionInput]],
     local_mode: bool = False,
     local_backend: Optional[str] = None,
 ) -> AnnotationResult:
     """
-    Main entry point: accepts a list of fusion strings and returns
+    Main entry point: accepts a list of fusion strings (or FusionInput objects) and returns
     a structured AnnotationResult with one GeneAnnotation per gene.
     """
     run_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
     local_backend = resolve_local_backend(local_mode=local_mode, local_backend=local_backend)
     local_mode = local_backend is not None
-    logger.info("Pipeline run %s started — %d fusions", run_id, len(fusions))
 
-    gene_map = await normalize_fusions(fusions)
-    logger.info("Resolved %d unique genes from %d fusions", len(gene_map), len(fusions))
+    fusion_strings, tumor_type_by_fusion = _normalize_fusion_inputs(fusions)
+    logger.info("Pipeline run %s started — %d fusions", run_id, len(fusion_strings))
+
+    gene_map = await normalize_fusions(fusion_strings)
+    logger.info("Resolved %d unique genes from %d fusions", len(gene_map), len(fusion_strings))
+
+    # Build per-gene tumor_type: first non-null tumor_type from the gene's fusions
+    gene_tumor_type: Dict[str, Optional[str]] = {}
+    for canonical, (_, gene_fusions) in gene_map.items():
+        for f in gene_fusions:
+            tt = tumor_type_by_fusion.get(f)
+            if tt:
+                gene_tumor_type[canonical] = tt
+                break
 
     # Annotate all genes; run sequentially to respect rate limits
     # (PubMed: 3 req/s without key; LLM calls are already async within each gene)
@@ -145,6 +183,7 @@ async def run_pipeline(
             fusions=gene_fusions,
             resolved_gene=resolved_gene,
             unresolvable=resolved_gene.unresolvable,
+            tumor_type=gene_tumor_type.get(canonical),
             local_mode=local_mode,
             local_backend=local_backend,
         )
@@ -162,7 +201,7 @@ async def run_pipeline(
     return AnnotationResult(
         run_id=run_id,
         timestamp=timestamp,
-        fusions_processed=len(fusions),
+        fusions_processed=len(fusion_strings),
         genes_annotated=len(annotations),
         annotations=annotations,
     )

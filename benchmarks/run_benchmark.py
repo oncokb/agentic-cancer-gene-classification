@@ -113,12 +113,6 @@ def build_per_gene_report(
                 "retrieval_count": pred.get("retrieval_count", 0),
                 "pred_cancer_associated": pred.get("cancer_associated"),
                 "gold_cancer_associated": gold.get("cancer_associated"),
-                "pred_tier": pred.get("cancer_associated_gene_tier"),
-                "gold_tier": gold.get("cancer_associated_gene_tier"),
-                "tier_match": pred.get("cancer_associated_gene_tier")
-                == gold.get("cancer_associated_gene_tier"),
-                "pred_og_or_tsg": pred.get("og_or_tsg"),
-                "gold_og_or_tsg": gold.get("og_or_tsg"),
                 "citation_precision": round(precision, 4),
                 "citation_recall": round(recall, 4),
                 "citation_f1": round(f1, 4),
@@ -142,18 +136,6 @@ def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
     print("\n--- cancer_associated ---")
     print(f"  Accuracy:     {ca['accuracy']:.3f}")
     print(f"  Cohen's κ:    {ca['cohen_kappa']:.3f}  (>0.6 = substantial, >0.8 = near-perfect)")
-
-    tier = metrics["cancer_tier"]
-    print("\n--- cancer_associated_gene_tier ---")
-    print(f"  Macro F1:     {tier['macro_f1']:.3f}")
-    for cls, f1 in sorted(tier["per_class"].items()):
-        print(f"    {cls:<35} F1={f1:.3f}")
-
-    ogtsg = metrics["og_or_tsg"]
-    print("\n--- og_or_tsg ---")
-    print(f"  Macro F1:     {ogtsg['macro_f1']:.3f}")
-    for cls, f1 in sorted(ogtsg["per_class"].items()):
-        print(f"    {cls:<10} F1={f1:.3f}")
 
     cites = metrics["citations"]
     print("\n--- citations (set-based) ---")
@@ -180,26 +162,23 @@ def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
 
 
 def print_per_gene_debug(per_gene_report: List[Dict]) -> None:
-    """Print compact debug rows for the largest citation/tier misses."""
+    """Print compact debug rows for the largest citation misses."""
     citation_misses = [
         row
         for row in per_gene_report
-        if row["citation_fp"] or row["citation_fn"] or not row["tier_match"]
+        if row["citation_fp"] or row["citation_fn"]
     ]
     if not citation_misses:
         return
 
     citation_misses.sort(
-        key=lambda row: (
-            len(row["citation_fp"]) + len(row["citation_fn"]),
-            not row["tier_match"],
-        ),
+        key=lambda row: len(row["citation_fp"]) + len(row["citation_fn"]),
         reverse=True,
     )
-    print("--- per-gene debug (top citation/tier deltas) ---")
+    print("--- per-gene debug (top citation deltas) ---")
     for row in citation_misses[:8]:
         print(
-            f"  {row['gene']:<12} tier {row['pred_tier']!r} vs {row['gold_tier']!r}; "
+            f"  {row['gene']:<12} "
             f"cite P/R/F1={row['citation_precision']:.2f}/"
             f"{row['citation_recall']:.2f}/{row['citation_f1']:.2f}; "
             f"FP={row['citation_fp']} FN={row['citation_fn']}"

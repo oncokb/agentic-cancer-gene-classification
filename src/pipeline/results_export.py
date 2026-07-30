@@ -15,8 +15,6 @@ ANNOTATION_RESULTS_CSV_HEADERS = [
     "in_oncokb",
     "cancer_associated",
     "cancer_association_rationale",
-    "cancer_associated_gene_tier",
-    "og_or_tsg",
     "cancer_type_prevalence",
     "gene_class",
     "signaling_pathways",
@@ -86,10 +84,6 @@ def annotation_to_csv_row(
         "cancer_association_rationale": _format_optional_text(
             annotation.cancer_association_rationale
         ),
-        "cancer_associated_gene_tier": _format_optional_text(
-            annotation.cancer_associated_gene_tier
-        ),
-        "og_or_tsg": _format_optional_text(annotation.og_or_tsg),
         "cancer_type_prevalence": _format_optional_text(
             annotation.cancer_type_prevalence
         ),

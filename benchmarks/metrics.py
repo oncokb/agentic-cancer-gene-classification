@@ -139,23 +139,15 @@ def compute_categorical_metrics(
 ) -> Dict:
     """
     Compare predicted GeneAnnotation dicts against ground-truth holdout dicts.
-    Returns a metrics dict covering cancer_associated, tier, og_or_tsg, citations.
+    Returns a metrics dict covering cancer_associated and citations.
     """
     pred_cancer = [p.get("cancer_associated") for p in predictions]
     gold_cancer = [g.get("cancer_associated") for g in ground_truth]
-
-    pred_tier = [p.get("cancer_associated_gene_tier") for p in predictions]
-    gold_tier = [g.get("cancer_associated_gene_tier") for g in ground_truth]
-
-    pred_ogtsg = [p.get("og_or_tsg") for p in predictions]
-    gold_ogtsg = [g.get("og_or_tsg") for g in ground_truth]
 
     pred_cites = [p.get("citations", []) for p in predictions]
     gold_cites = [g.get("citations", []) for g in ground_truth]
 
     ca_accuracy, ca_kappa = cohen_kappa_binary(pred_cancer, gold_cancer)
-    tier_per_class, tier_macro = per_class_f1(pred_tier, gold_tier)
-    ogtsg_per_class, ogtsg_macro = per_class_f1(pred_ogtsg, gold_ogtsg)
     cite_scores = mean_citation_scores(pred_cites, gold_cites)
 
     return {
@@ -163,14 +155,6 @@ def compute_categorical_metrics(
         "cancer_associated": {
             "accuracy": round(ca_accuracy, 4),
             "cohen_kappa": round(ca_kappa, 4),
-        },
-        "cancer_tier": {
-            "macro_f1": round(tier_macro, 4),
-            "per_class": {k: round(v, 4) for k, v in tier_per_class.items()},
-        },
-        "og_or_tsg": {
-            "macro_f1": round(ogtsg_macro, 4),
-            "per_class": {k: round(v, 4) for k, v in ogtsg_per_class.items()},
         },
         "citations": {k: round(v, 4) for k, v in cite_scores.items()},
     }

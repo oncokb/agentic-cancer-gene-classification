@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 from src.config import settings
 from src.models.schema import GeneAnnotation, LiteratureRecord
 from src.pipeline.citation_precision import filter_and_rank_citations
+from src.pipeline.literature import _HIGH_IMPACT_JOURNALS
 from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
@@ -38,23 +39,21 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 - Use the HGNC identity to avoid same-symbol ambiguity. Do not cite papers that use the same symbol
   for a different entity, such as an lncRNA/circRNA/transcript name unrelated to the HGNC gene.
 - If the retrieved evidence is insufficient to make a determination, set `insufficient_evidence: true` and leave classification fields null. This is a valid, preferred output over hallucination.
-- If `cancer_associated` is false OR `insufficient_evidence` is true, you MUST leave `cancer_associated_gene_tier` and `og_or_tsg` null. Do not fill these fields for non-cancer genes or genes with insufficient evidence.
 
 ## Field guidance:
 - `cancer_associated`: true if there is credible peer-reviewed evidence linking this gene to cancer biology.
 - `cancer_association_rationale`: list the evidence types (structural-variant, expression, mutation, methylation, copy-number) with a brief justification.
-- `cancer_associated_gene_tier`: ONLY set this when `cancer_associated` is true. Use the most conservative tier supported by the evidence — do not promote a gene's tier beyond what the retrieved abstracts directly demonstrate:
-    - "Class I - Driver": high bar — requires recurrent somatic mutations with direct functional validation (e.g., murine models, CRISPR knockouts demonstrating tumour initiation), OR recurrent oncogenic fusions with demonstrated transforming activity. Expression/correlation data alone does NOT qualify.
-    - "Class II - Likely Driver": expression upregulation, copy-number alteration, or functional knockdown/overexpression in cancer cell lines or xenografts with a plausible mechanistic hypothesis. No requirement for in vivo murine tumour initiation models.
-    - "Class III - Cancer Relevant": indirect or contextual association only — prognostic signature membership, immune microenvironment role, metabolic co-dependency, or single-study correlation without mechanistic follow-up. When in doubt between Class II and Class III, choose Class III.
-- `og_or_tsg`: ONLY set this when `cancer_associated` is true AND `cancer_associated_gene_tier` is "Class I - Driver" or "Class II - Likely Driver". Leave null for "Class III - Cancer Relevant" genes — contextual or indirect associations do not warrant a directional OG/TSG call. "OG" (promotes growth/survival), "TSG" (suppresses growth), "OG, TSG" (context-dependent dual role with evidence for both in the retrieved abstracts).
 - `gene_class`: molecular/functional class (e.g., "Serine/threonine kinase", "RNA-binding protein", "Transcription factor").
-- `signaling_pathways`: comma-separated canonical pathways (e.g., "PI3K/AKT", "RAS/MAPK", "WNT/β-catenin").
+- `signaling_pathways`: comma-separated associated signaling pathways (e.g., "PI3K/AKT", "RAS/MAPK", "WNT/β-catenin").
 - `confidence`: 0.0–1.0 reflecting how well the retrieved evidence supports the annotation.
   - >4 papers with direct functional evidence → 0.8–1.0
   - 2–4 papers with functional/expression data → 0.5–0.8
   - <2 papers or only indirect evidence → 0.2–0.5
   - 0 papers → set insufficient_evidence: true, confidence: 0.0
+
+## Literature quality signals:
+- Abstracts marked ★ are from high-impact journals (NEJM, Lancet, Nature, Cell, JCO, Cancer Cell, etc.).
+  Weight these more heavily when the evidence they provide is directly relevant to the gene's cancer role.
 
 ## Retrieval provenance:
 The context will tell you which retrieval tier sourced the literature:
@@ -94,16 +93,6 @@ ANNOTATE_TOOL: dict = {
                     "(structural-variant, expression, mutation, methylation, copy-number) "
                     "and which cancer types."
                 ),
-            },
-            "cancer_associated_gene_tier": {
-                "type": "string",
-                "enum": ["Class I - Driver", "Class II - Likely Driver", "Class III - Cancer Relevant"],
-                "description": "Driver tier based on strength of functional evidence.",
-            },
-            "og_or_tsg": {
-                "type": "string",
-                "enum": ["OG", "TSG", "OG, TSG"],
-                "description": "Oncogene, tumor suppressor, or context-dependent dual role.",
             },
             "gene_class": {
                 "type": "string",
@@ -171,9 +160,11 @@ def _build_user_prompt(
         lines.append("No abstracts retrieved. Set insufficient_evidence: true.")
     else:
         for rec in records:
+            journal_tag = f" [{rec.journal}]" if rec.journal else ""
+            impact_tag = " ★" if rec.journal in _HIGH_IMPACT_JOURNALS else ""
             lines += [
                 "---",
-                f"PMID: {rec.pmid}",
+                f"PMID: {rec.pmid}{journal_tag}{impact_tag}",
                 f"Title: {rec.title}",
                 f"Abstract: {rec.abstract}",
             ]
@@ -277,35 +268,18 @@ def build_gene_annotation(
     synthesis_result: Dict,
 ) -> GeneAnnotation:
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
-    tier = synthesis_result.get("cancer_associated_gene_tier")
-    og_or_tsg = synthesis_result.get("og_or_tsg")
-    cancer_associated = synthesis_result.get("cancer_associated")
-    insufficient_evidence = synthesis_result.get("insufficient_evidence", False)
-
-    if cancer_associated is False or insufficient_evidence:
-        tier = None
-        og_or_tsg = None
-    elif in_oncokb is False and tier == "Class I - Driver":
-        logger.info(
-            "Downgrading non-OncoKB Class I call for %s to Class II pending stronger curation",
-            gene,
-        )
-        tier = "Class II - Likely Driver"
-
     return GeneAnnotation(
         gene=gene,
         fusions=list(dict.fromkeys(fusions)),  # deduplicate, preserve order
         in_oncokb=in_oncokb,
-        cancer_associated=cancer_associated,
+        cancer_associated=synthesis_result.get("cancer_associated"),
         cancer_association_rationale=synthesis_result.get("cancer_association_rationale"),
-        cancer_associated_gene_tier=tier,
-        og_or_tsg=og_or_tsg,
         cancer_type_prevalence=cancer_type_prevalence,
         gene_class=synthesis_result.get("gene_class"),
         signaling_pathways=synthesis_result.get("signaling_pathways"),
         gene_summary=synthesis_result.get("gene_summary"),
         citations=synthesis_result.get("citations", []),
         retrieval_count=len(records),
-        insufficient_evidence=insufficient_evidence,
+        insufficient_evidence=synthesis_result.get("insufficient_evidence", False),
         confidence=synthesis_result.get("confidence", 0.0),
     )
