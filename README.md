@@ -204,9 +204,21 @@ docker compose up --build annotation-service
 curl http://127.0.0.1:8000/health
 ```
 
-The default Docker service uses the Anthropic SDK path. Provide either
-`ANTHROPIC_API_KEY` for direct Anthropic calls or `ANTHROPIC_SDK_PROVIDER=bedrock`
-plus AWS Bedrock env vars in `.env` for annotation calls.
+Build a registry-ready image for IT:
+
+```bash
+docker build -t cbioportal/agentic-cancer-gene-classification:latest .
+```
+
+Use a release-specific tag when handing an image to IT, for example
+`cbioportal/agentic-cancer-gene-classification:2026-07-30`.
+
+The default Docker service uses the Anthropic SDK path. Provide
+`ANTHROPIC_API_KEY` in a local `.env` for direct Anthropic Compose-based
+annotation calls, or set `ANTHROPIC_SDK_PROVIDER=bedrock` plus AWS Bedrock env
+vars for Bedrock calls. For Kubernetes or Argo CD deployments, keep `.env` out
+of git and provide runtime configuration through Kubernetes Secrets, External
+Secrets, or the cluster's approved secret-management path.
 
 Dockerized local Codex:
 
