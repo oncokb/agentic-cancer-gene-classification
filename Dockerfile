@@ -25,7 +25,8 @@ RUN pip install --no-cache-dir hatchling && \
     pydantic \
     pydantic-settings \
     python-dotenv \
-    tenacity
+    tenacity \
+    redis
 
 COPY src/ ./src/
 COPY benchmarks/ ./benchmarks/

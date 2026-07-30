@@ -3,8 +3,10 @@
 import httpx
 import pytest
 
+from src.pipeline import cache as cache_module
 from src.pipeline.normalization import (
     ENSEMBL_LOOKUP_URL,
+    HGNC_FETCH_URL,
     HGNC_SEARCH_URL,
     _is_ensembl_id,
     _resolve_ensembl_ids,
@@ -115,6 +117,32 @@ async def test_resolve_gene_uses_hgnc_search_after_fetch_miss():
 
     assert resolved.canonical_symbol == "NEW"
     assert resolved.hgnc_id == "HGNC:1"
+
+
+@pytest.mark.asyncio
+async def test_resolve_gene_caches_hgnc_fetch_across_calls():
+    try:
+        await cache_module._get_client().ping()
+    except Exception as exc:
+        pytest.skip(f"Redis not reachable: {exc}")
+
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert str(request.url).startswith(HGNC_FETCH_URL.format(symbol="TP53"))
+        return httpx.Response(
+            200,
+            json={"response": {"docs": [{"symbol": "TP53", "hgnc_id": "HGNC:11998"}]}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        first = await resolve_gene("TP53", client)
+        second = await resolve_gene("TP53", client)
+
+    assert first.hgnc_id == "HGNC:11998"
+    assert second.hgnc_id == "HGNC:11998"
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio

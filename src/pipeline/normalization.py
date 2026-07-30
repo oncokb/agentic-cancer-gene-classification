@@ -14,6 +14,7 @@ from typing import Dict, Iterable, Optional, Set, Tuple
 import httpx
 
 from src.models.schema import ResolvedGene
+from src.pipeline.cache import cached_call
 
 HGNC_FETCH_URL = "https://rest.genenames.org/fetch/symbol/{symbol}"
 HGNC_SEARCH_URL = "https://rest.genenames.org/search/symbol/{symbol}"
@@ -123,10 +124,12 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
     lookup_failed = False
 
     try:
-        resp = await client.get(url, headers=headers, timeout=HGNC_TIMEOUT_SECONDS)
-        resp.raise_for_status()
-        data = resp.json()
-        docs = data.get("response", {}).get("docs", [])
+        async def _fetch_primary() -> list:
+            resp = await client.get(url, headers=headers, timeout=HGNC_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            return resp.json().get("response", {}).get("docs", [])
+
+        docs = await cached_call(f"hgnc:fetch:{symbol}", _fetch_primary)
         if docs:
             doc = docs[0]
             return ResolvedGene(
@@ -144,10 +147,13 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
     # Try search as fallback (handles minor capitalisation differences)
     try:
         search_url = HGNC_SEARCH_URL.format(symbol=symbol)
-        resp = await client.get(search_url, headers=headers, timeout=HGNC_TIMEOUT_SECONDS)
-        resp.raise_for_status()
-        data = resp.json()
-        docs = data.get("response", {}).get("docs", [])
+
+        async def _fetch_search() -> list:
+            resp = await client.get(search_url, headers=headers, timeout=HGNC_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            return resp.json().get("response", {}).get("docs", [])
+
+        docs = await cached_call(f"hgnc:search:{symbol}", _fetch_search)
         if docs:
             doc = docs[0]
             return ResolvedGene(

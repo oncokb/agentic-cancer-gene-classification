@@ -1,4 +1,17 @@
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - agcg-redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   annotation-service:
     build: .
     ports:
@@ -7,6 +20,10 @@ services:
       - .env
     environment:
       - LOG_LEVEL=INFO
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test:
@@ -35,10 +52,14 @@ services:
       - LOG_LEVEL=INFO
       - HOME=/home/appuser
       - CODEX_HOME=/home/appuser/.codex
+      - REDIS_URL=redis://redis:6379/0
     volumes:
       - ${HOME}/.codex:/home/appuser/.codex
       - ${HOME}/.claude:/home/appuser/.claude
       - ${HOME}/.claude.json:/home/appuser/.claude.json
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test:
@@ -52,3 +73,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  agcg-redis-data:

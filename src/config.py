@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     max_papers_for_synthesis: int = 8
     max_citations_per_annotation: int = 4
 
+    redis_url: str = "redis://localhost:6379/0"
+    redis_cache_ttl_seconds: int = 86400
+
     log_level: str = "INFO"
 
 
