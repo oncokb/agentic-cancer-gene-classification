@@ -1,6 +1,7 @@
 const API_BASE_URL_KEY = "agcg.apiBaseUrl";
 const ONCOKB_TOKEN_KEY = "agcg.oncokbToken";
 const NCBI_KEY_KEY = "agcg.ncbiApiKey";
+const LAST_RESULT_KEY = "agcg.lastResult";
 
 const GRID_COLUMNS = [
   { key: "fusion",           label: "Fusion",        required: true,  type: "text",   width: 140 },
@@ -42,6 +43,7 @@ const elements = {
   dismissSetup: document.querySelector("#dismiss-setup"),
   exportCsv: document.querySelector("#export-csv"),
   exportJson: document.querySelector("#export-json"),
+  shareRun: document.querySelector("#share-run"),
   geneIndex: document.querySelector("#gene-index"),
   installOutput: document.querySelector("#install-output"),
   messageBox: document.querySelector("#message-box"),
@@ -148,7 +150,9 @@ function switchView(view) {
   elements.benchmarkPanel.classList.toggle("hidden", !isBenchmark);
   elements.workspaceTitle.textContent = isBenchmark ? "Benchmark" : "Results";
   elements.exportCsv.classList.toggle("hidden", isBenchmark);
+  elements.shareRun.classList.toggle("hidden", isBenchmark);
   elements.exportJson.disabled = isBenchmark ? !state.currentBenchmark : !state.currentResult;
+  elements.shareRun.disabled = isBenchmark || !state.currentResult?.run_id;
 
   if (isBenchmark) {
     renderBenchmarkResult(state.currentBenchmark);
@@ -609,6 +613,7 @@ async function runAnnotation() {
     const result = await response.json();
     state.currentResult = result;
     renderAnnotationResult(result);
+    saveLastResult(result);
     setMessage("Annotation complete. Review fields before exporting.", "info");
   } catch (error) {
     setMessage(formatRunError(error.message), "error");
@@ -622,6 +627,69 @@ function formatRunError(message) {
     return "OncoKB API token is required. Open Settings and configure your OncoKB token.";
   }
   return message;
+}
+
+// ---------------------------------------------------------------------------
+// Sharing a run by link
+// ---------------------------------------------------------------------------
+
+function saveLastResult(result) {
+  try {
+    localStorage.setItem(LAST_RESULT_KEY, JSON.stringify(result));
+  } catch {
+    // Storage full/unavailable — the run already rendered successfully, so
+    // this is purely a "resume after an accidental reload" nicety. Skip it.
+  }
+}
+
+async function copyShareLink() {
+  const runId = state.currentResult?.run_id;
+  if (!runId) return;
+
+  const url = `${location.origin}${location.pathname}?run=${encodeURIComponent(runId)}`;
+  try {
+    await navigator.clipboard.writeText(url);
+    setMessage(
+      "Share link copied. It only works for peers who can reach the same Backend URL as you.",
+      "info",
+    );
+  } catch {
+    setMessage(`Couldn't copy automatically — copy this link: ${url}`, "error");
+  }
+}
+
+async function loadSharedRunOrRestoreLast() {
+  const sharedRunId = new URLSearchParams(location.search).get("run");
+  if (sharedRunId) {
+    try {
+      const response = await fetch(apiUrl(`/v1/annotate/${encodeURIComponent(sharedRunId)}`));
+      if (!response.ok) {
+        throw new Error(
+          response.status === 404
+            ? "This shared run wasn't found on the configured Backend URL."
+            : response.statusText,
+        );
+      }
+      const result = await response.json();
+      state.currentResult = result;
+      renderAnnotationResult(result);
+      saveLastResult(result);
+      setMessage("Loaded shared run.", "info");
+    } catch (error) {
+      setMessage(formatRunError(error.message), "error");
+    }
+    return;
+  }
+
+  const saved = localStorage.getItem(LAST_RESULT_KEY);
+  if (!saved) return;
+  try {
+    const result = JSON.parse(saved);
+    state.currentResult = result;
+    renderAnnotationResult(result);
+  } catch {
+    localStorage.removeItem(LAST_RESULT_KEY);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +807,7 @@ function renderAnnotationResult(result) {
   const hasAnnotations = annotations.length > 0;
   elements.exportCsv.disabled = !hasAnnotations;
   elements.exportJson.disabled = !hasAnnotations;
+  elements.shareRun.disabled = !result.run_id;
 
   const total = result.genes_annotated;
   elements.runSummary.textContent =
@@ -1210,6 +1279,7 @@ function bindEvents() {
   elements.saveOncokbToken.addEventListener("click", saveOncoKBToken);
   elements.saveNcbiApiKey.addEventListener("click", saveNCBIApiKey);
 
+  elements.shareRun.addEventListener("click", copyShareLink);
   elements.exportJson.addEventListener("click", exportJson);
   elements.exportCsv.addEventListener("click", async () => {
     try {
@@ -1224,3 +1294,4 @@ bindEvents();
 renderGrid();
 loadSettings();
 loadDevStatus();
+loadSharedRunOrRestoreLast();
