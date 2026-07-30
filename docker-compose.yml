@@ -38,6 +38,7 @@ services:
       - .env
     environment:
       - LOG_LEVEL=INFO
+      - DD_TRACE_ENABLED=false
       - REDIS_URL=redis://redis:6379/0
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
@@ -75,6 +76,7 @@ services:
       - .env
     environment:
       - LOG_LEVEL=INFO
+      - DD_TRACE_ENABLED=false
       - HOME=/home/appuser
       - CODEX_HOME=/home/appuser/.codex
       - REDIS_URL=redis://redis:6379/0

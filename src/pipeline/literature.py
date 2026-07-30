@@ -676,6 +676,7 @@ async def _tier2_local_retrieve(
         max_tokens=1024,
         local_mode=True,
         local_backend=local_backend,
+        model_purpose="synthesis",
     )
     queries = [q for q in result.get("queries", []) if isinstance(q, str) and q.strip()]
     queries = list(dict.fromkeys(q.strip() for q in queries))[:MAX_AGENTIC_TOOL_CALLS]
