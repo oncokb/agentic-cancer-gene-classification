@@ -8,15 +8,12 @@ from typing import Iterable, Optional
 
 from src.models.schema import AnnotationResult, GeneAnnotation
 
-
 ANNOTATION_RESULTS_CSV_HEADERS = [
     "gene",
     "fusions",
     "in_oncokb",
     "cancer_associated",
     "cancer_association_rationale",
-    "cancer_associated_gene_tier",
-    "og_or_tsg",
     "cancer_type_prevalence",
     "gene_class",
     "signaling_pathways",
@@ -26,7 +23,12 @@ ANNOTATION_RESULTS_CSV_HEADERS = [
     "date_annotated",
     "retrieval_count",
     "insufficient_evidence",
-    "confidence",
+    "evidence_support_score",
+    "evidence_support_explanation",
+    "cache_status",
+    "cache_reason",
+    "cached_at",
+    "last_pubmed_checked_at",
     "error",
 ]
 
@@ -86,10 +88,6 @@ def annotation_to_csv_row(
         "cancer_association_rationale": _format_optional_text(
             annotation.cancer_association_rationale
         ),
-        "cancer_associated_gene_tier": _format_optional_text(
-            annotation.cancer_associated_gene_tier
-        ),
-        "og_or_tsg": _format_optional_text(annotation.og_or_tsg),
         "cancer_type_prevalence": _format_optional_text(
             annotation.cancer_type_prevalence
         ),
@@ -101,7 +99,12 @@ def annotation_to_csv_row(
         "date_annotated": annotation.date_annotated,
         "retrieval_count": str(annotation.retrieval_count),
         "insufficient_evidence": _format_bool(annotation.insufficient_evidence),
-        "confidence": str(annotation.confidence),
+        "evidence_support_score": str(annotation.evidence_support_score),
+        "evidence_support_explanation": annotation.evidence_support_explanation,
+        "cache_status": _format_optional_text(annotation.cache_status),
+        "cache_reason": _format_optional_text(annotation.cache_reason),
+        "cached_at": _format_optional_text(annotation.cached_at),
+        "last_pubmed_checked_at": _format_optional_text(annotation.last_pubmed_checked_at),
         "error": _format_optional_text(annotation.error),
     }
 

@@ -30,8 +30,6 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             in_oncokb=True,
             cancer_associated=True,
             cancer_association_rationale="Known driver kinase.",
-            cancer_associated_gene_tier="Class I - Driver",
-            og_or_tsg="OG",
             cancer_type_prevalence="Melanoma",
             gene_class="Serine/threonine kinase",
             signaling_pathways="MAPK",
@@ -40,7 +38,12 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             date_annotated="7/13/26",
             retrieval_count=12,
             insufficient_evidence=False,
-            confidence=0.91,
+            evidence_support_score=0.91,
+            evidence_support_explanation="Strong support from verified citations.",
+            cache_status="reused",
+            cache_reason="fresh_high_evidence_support",
+            cached_at="2026-07-13T00:00:00+00:00",
+            last_pubmed_checked_at="2026-07-20T00:00:00+00:00",
         )
     )
 
@@ -53,8 +56,6 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             "in_oncokb": "TRUE",
             "cancer_associated": "TRUE",
             "cancer_association_rationale": "Known driver kinase.",
-            "cancer_associated_gene_tier": "Class I - Driver",
-            "og_or_tsg": "OG",
             "cancer_type_prevalence": "Melanoma",
             "gene_class": "Serine/threonine kinase",
             "signaling_pathways": "MAPK",
@@ -67,7 +68,12 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             "date_annotated": "7/13/26",
             "retrieval_count": "12",
             "insufficient_evidence": "FALSE",
-            "confidence": "0.91",
+            "evidence_support_score": "0.91",
+            "evidence_support_explanation": "Strong support from verified citations.",
+            "cache_status": "reused",
+            "cache_reason": "fresh_high_evidence_support",
+            "cached_at": "2026-07-13T00:00:00+00:00",
+            "last_pubmed_checked_at": "2026-07-20T00:00:00+00:00",
             "error": "",
         }
     ]

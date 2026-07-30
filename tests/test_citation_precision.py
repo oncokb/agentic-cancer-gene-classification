@@ -105,7 +105,7 @@ def test_filter_and_rank_citations_prefers_direct_cancer_support():
     assert citations == ["strong"]
 
 
-def test_build_gene_annotation_downgrades_non_oncokb_class_i_call():
+def test_build_gene_annotation_sets_cancer_associated_from_synthesis():
     annotation = build_gene_annotation(
         gene="RFX7",
         fusions=["RFX7::LMTK2"],
@@ -115,17 +115,16 @@ def test_build_gene_annotation_downgrades_non_oncokb_class_i_call():
         synthesis_result={
             "cancer_associated": True,
             "insufficient_evidence": False,
-            "cancer_associated_gene_tier": "Class I - Driver",
-            "og_or_tsg": "TSG",
-            "confidence": 0.9,
+            "cancer_association_rationale": "Recurrent somatic mutations in lymphoma.",
         },
     )
 
-    assert annotation.cancer_associated_gene_tier == "Class II - Likely Driver"
-    assert annotation.og_or_tsg == "TSG"
+    assert annotation.cancer_associated is True
+    assert annotation.cancer_association_rationale == "Recurrent somatic mutations in lymphoma."
+    assert annotation.insufficient_evidence is False
 
 
-def test_build_gene_annotation_clears_classification_when_insufficient():
+def test_build_gene_annotation_propagates_insufficient_evidence():
     annotation = build_gene_annotation(
         gene="RP1",
         fusions=["RP1::SPIDR"],
@@ -135,11 +134,8 @@ def test_build_gene_annotation_clears_classification_when_insufficient():
         synthesis_result={
             "cancer_associated": False,
             "insufficient_evidence": True,
-            "cancer_associated_gene_tier": "Class II - Likely Driver",
-            "og_or_tsg": "OG",
-            "confidence": 0.0,
         },
     )
 
-    assert annotation.cancer_associated_gene_tier is None
-    assert annotation.og_or_tsg is None
+    assert annotation.cancer_associated is False
+    assert annotation.insufficient_evidence is True
