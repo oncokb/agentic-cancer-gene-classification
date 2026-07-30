@@ -6,16 +6,22 @@ from __future__ import annotations
 
 import logging
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-from src.models.schema import AnnotateRequest, AnnotationResult
+from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
+from src.config import settings
+from src.models.schema import AnnotateRequest, AnnotationResult, LocalBackend
 from src.pipeline.orchestrator import run_pipeline
+from src.pipeline.run_store import RunStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,6 +30,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.run_store = await RunStore.create()
+    yield
+    await app.state.run_store.close()
+
+
 app = FastAPI(
     title="Agentic Cancer Gene Classification",
     description=(
@@ -31,6 +45,7 @@ app = FastAPI(
         "Automates Nicole's MSK TARGET Gene Triaging workflow."
     ),
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -45,13 +60,48 @@ if _STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
+class DevStatusResponse(BaseModel):
+    enabled: bool
+
+
+class BenchmarkRequest(BaseModel):
+    no_judge: bool = Field(
+        default=True,
+        description="Skip the LLM-as-a-judge summary scoring step.",
+    )
+    max_genes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Optional number of holdout genes to run for a quick smoke benchmark.",
+    )
+    local_backend: Optional[LocalBackend] = Field(
+        default=None,
+        description="Optional local agent backend for benchmark pipeline calls.",
+    )
+
+
+def require_dev_mode() -> None:
+    if not settings.agcg_dev_mode:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+@app.get("/")
+async def root() -> RedirectResponse:
+    return RedirectResponse(url="/static/index.html")
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/v1/dev/status", response_model=DevStatusResponse)
+async def dev_status() -> DevStatusResponse:
+    return DevStatusResponse(enabled=settings.agcg_dev_mode)
+
+
 @app.post("/v1/annotate", response_model=AnnotationResult)
-async def annotate(request: AnnotateRequest) -> AnnotationResult:
+async def annotate(request: AnnotateRequest, http_request: Request) -> AnnotationResult:
     """
     Annotate a list of candidate gene fusions.
 
@@ -63,10 +113,49 @@ async def annotate(request: AnnotateRequest) -> AnnotationResult:
     `{ "fusions": [{"fusion": "GENE1::GENE2", "tumor_type": "LUAD"}] }`
     """
     try:
-        result = await run_pipeline(request.fusions, local_backend=request.local_backend)
-        return result
+        result = await run_pipeline(
+            request.fusions,
+            local_backend=request.local_backend,
+            run_store=http_request.app.state.run_store,
+            force_refresh=request.force_refresh,
+        )
     except Exception as e:
         logger.exception("Pipeline error")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    try:
+        await http_request.app.state.run_store.save_run(
+            result.run_id, result.timestamp, request.model_dump(), result.model_dump()
+        )
+    except Exception:
+        # A run's own result always returns even if it can't be persisted for
+        # later sharing — the run store isn't on the critical path for the caller.
+        logger.exception("Failed to persist run %s", result.run_id)
+
+    return result
+
+
+@app.get("/v1/annotate/{run_id}", response_model=AnnotationResult)
+async def get_annotation_run(run_id: str, http_request: Request) -> AnnotationResult:
+    """Fetch a previously-computed annotation run by ID, without recomputing it."""
+    stored = await http_request.app.state.run_store.get_run(run_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return AnnotationResult(**stored)
+
+
+@app.post("/v1/dev/benchmark")
+async def benchmark(request: BenchmarkRequest) -> dict:
+    require_dev_mode()
+    try:
+        return await run_benchmark(
+            holdout_path=DEFAULT_HOLDOUT,
+            no_judge=request.no_judge,
+            local_backend=request.local_backend,
+            max_genes=request.max_genes,
+        )
+    except Exception as e:
+        logger.exception("Benchmark error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

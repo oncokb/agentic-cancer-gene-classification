@@ -115,7 +115,6 @@ def test_build_gene_annotation_sets_cancer_associated_from_synthesis():
         synthesis_result={
             "cancer_associated": True,
             "insufficient_evidence": False,
-            "confidence": 0.9,
             "cancer_association_rationale": "Recurrent somatic mutations in lymphoma.",
         },
     )
@@ -135,7 +134,6 @@ def test_build_gene_annotation_propagates_insufficient_evidence():
         synthesis_result={
             "cancer_associated": False,
             "insufficient_evidence": True,
-            "confidence": 0.0,
         },
     )
 

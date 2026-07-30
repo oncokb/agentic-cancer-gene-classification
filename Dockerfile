@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir hatchling && \
     pydantic-settings \
     python-dotenv \
     tenacity \
+    aiomysql \
     redis
 
 COPY src/ ./src/
