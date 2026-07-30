@@ -84,6 +84,9 @@ const elements = {
   batchGridBody: document.querySelector("#batch-grid-body"),
   addRowBtn: document.querySelector("#add-row-btn"),
   batchHint: document.querySelector("#batch-hint"),
+  // dev-mode annotation backend
+  annotateBackendField: document.querySelector("#annotate-backend-field"),
+  annotateLocalBackend: document.querySelector("#annotate-local-backend"),
 };
 
 const editableFields = [
@@ -95,10 +98,7 @@ const editableFields = [
   ["signaling_pathways", "Signaling pathways", "text"],
   ["gene_summary", "Gene summary", "long"],
   ["citations", "Supporting citation PMIDs", "list"],
-  ["retrieval_count", "Retrieval count", "number"],
   ["insufficient_evidence", "Insufficient evidence", "booleanRequired"],
-  ["confidence", "Confidence", "number"],
-  ["error", "Error", "text"],
 ];
 
 // ---------------------------------------------------------------------------
@@ -123,14 +123,17 @@ async function loadDevStatus() {
     const response = await fetch(apiUrl("/v1/dev/status"));
     if (!response.ok) {
       elements.navBenchmark.classList.add("hidden");
+      elements.annotateBackendField.classList.add("hidden");
       if (state.currentView === "benchmark") switchView("annotate");
       return;
     }
     const payload = await response.json();
     elements.navBenchmark.classList.toggle("hidden", !payload.enabled);
+    elements.annotateBackendField.classList.toggle("hidden", !payload.enabled);
     if (!payload.enabled && state.currentView === "benchmark") switchView("annotate");
   } catch {
     elements.navBenchmark.classList.add("hidden");
+    elements.annotateBackendField.classList.add("hidden");
     if (state.currentView === "benchmark") switchView("annotate");
   }
 }
@@ -582,10 +585,13 @@ async function runAnnotation() {
   setMessage(`Submitting ${fusionInputs.length} fusion${fusionInputs.length === 1 ? "" : "s"} for annotation…`, "info");
 
   try {
+    const localBackend = elements.annotateLocalBackend.value || undefined;
+    const body = { fusions: fusionInputs };
+    if (localBackend) body.local_backend = localBackend;
     const response = await fetch(apiUrl("/v1/annotate"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fusions: fusionInputs }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok) {
@@ -770,11 +776,105 @@ function renderAnnotationResult(result) {
     for (const [field, label, type] of editableFields) {
       fields.appendChild(renderEditableField(annotation, index, field, label, type));
     }
+
+    const evidence = renderSupportingEvidence(annotation);
+    if (evidence) card.appendChild(evidence);
+
     list.appendChild(card);
   });
 
   elements.resultsWindow.replaceChildren(list);
   rebuildGeneIndex(annotations);
+}
+
+function makePubMedLink(pmid) {
+  const a = document.createElement("a");
+  a.href = `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/`;
+  a.target = "_blank";
+  a.rel = "noreferrer";
+  a.className = "citation-link";
+  a.textContent = pmid;
+  return a;
+}
+
+function renderSupportingEvidence(annotation) {
+  const quotes = annotation.supporting_quotes || [];
+  const citations = annotation.citations || [];
+  const allRetrieved = annotation.retrieved_pmids || [];
+  const count = annotation.retrieval_count ?? allRetrieved.length;
+
+  if (!quotes.length && !citations.length && !count) return null;
+
+  const section = document.createElement("div");
+  section.className = "supporting-evidence";
+
+  const heading = document.createElement("h4");
+  heading.className = "supporting-evidence-heading";
+  heading.textContent = "Supporting Evidence";
+  section.appendChild(heading);
+
+  // Total retrieved PMIDs — collapsible
+  if (count > 0) {
+    const details = document.createElement("details");
+    details.className = "retrieval-details";
+    const summary = document.createElement("summary");
+    summary.className = "retrieval-summary";
+    summary.innerHTML = `
+      <span class="retrieval-count-label">
+        ${count} total retrieved PMID${count === 1 ? "" : "s"}
+      </span>
+      <span class="retrieval-info-icon" title="Total number of PubMed abstracts fetched during literature retrieval for this gene. A subset of these was selected for synthesis; the PMIDs used in the final annotation appear in the Supporting Citation PMIDs field above.">ⓘ</span>
+    `;
+    details.appendChild(summary);
+
+    if (allRetrieved.length) {
+      const pmidGrid = document.createElement("div");
+      pmidGrid.className = "citation-link-list retrieval-pmid-grid";
+      allRetrieved.forEach((pmid) => pmidGrid.appendChild(makePubMedLink(pmid)));
+      details.appendChild(pmidGrid);
+    }
+    section.appendChild(details);
+  }
+
+  // Cited PMIDs as PubMed links
+  if (citations.length) {
+    const citBlock = document.createElement("div");
+    citBlock.className = "citation-links";
+    const label = document.createElement("span");
+    label.className = "field-label";
+    label.textContent = "Cited on PubMed";
+    citBlock.appendChild(label);
+    const linkRow = document.createElement("div");
+    linkRow.className = "citation-link-list";
+    citations.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
+    citBlock.appendChild(linkRow);
+    section.appendChild(citBlock);
+  }
+
+  // Grounding quotes
+  if (quotes.length) {
+    const quoteList = document.createElement("div");
+    quoteList.className = "quote-list";
+    quotes.forEach((q) => {
+      const blockquote = document.createElement("blockquote");
+      blockquote.className = "supporting-quote";
+      const p = document.createElement("p");
+      p.textContent = q.quote;
+      const cite = document.createElement("cite");
+      const a = document.createElement("a");
+      a.href = `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(q.pmid)}/`;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.textContent = `PMID ${q.pmid}`;
+      cite.appendChild(a);
+      blockquote.appendChild(p);
+      blockquote.appendChild(cite);
+      quoteList.appendChild(blockquote);
+    });
+    section.appendChild(quoteList);
+  }
+
+  return section;
 }
 
 function renderBenchmarkResult(result) {

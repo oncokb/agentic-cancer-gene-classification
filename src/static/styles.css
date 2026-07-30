@@ -920,6 +920,124 @@ body.batch-active .app-shell {
   font-size: 11px;
 }
 
+/* Supporting evidence section */
+
+.supporting-evidence {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.supporting-evidence-heading {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.retrieval-details {
+  margin-bottom: 8px;
+}
+
+.retrieval-summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.retrieval-summary::-webkit-details-marker {
+  display: none;
+}
+
+.retrieval-count-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.retrieval-info-icon {
+  font-size: 13px;
+  color: var(--muted);
+  cursor: help;
+  line-height: 1;
+}
+
+.retrieval-pmid-grid {
+  margin-top: 7px;
+}
+
+.citation-links {
+  margin-bottom: 10px;
+}
+
+.citation-link-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 5px;
+}
+
+.citation-link {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 2px 8px;
+  background: var(--surface-strong);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.citation-link:hover {
+  background: #eef9f7;
+  border-color: var(--accent);
+}
+
+.quote-list {
+  display: grid;
+  gap: 7px;
+}
+
+.supporting-quote {
+  margin: 0;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0;
+  padding: 8px 12px;
+  background: var(--surface-strong);
+}
+
+.supporting-quote p {
+  margin: 0 0 4px;
+  font-size: 13px;
+  line-height: 1.5;
+  font-style: italic;
+  color: var(--text);
+}
+
+.supporting-quote cite {
+  font-size: 11px;
+  font-weight: 700;
+  font-style: normal;
+  color: var(--muted);
+}
+
+.supporting-quote cite a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.supporting-quote cite a:hover {
+  text-decoration: underline;
+}
+
 .hidden {
   display: none !important;
 }
