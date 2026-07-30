@@ -99,6 +99,13 @@ const editableFields = [
   ["gene_summary", "Gene summary", "long"],
   ["citations", "Supporting citation PMIDs", "list"],
   ["insufficient_evidence", "Insufficient evidence", "booleanRequired"],
+  ["evidence_support_score", "Evidence support score", "number"],
+  ["evidence_support_explanation", "Evidence support explanation", "long"],
+  ["cache_status", "Cache status", "text"],
+  ["cache_reason", "Cache reason", "text"],
+  ["cached_at", "Cached at", "text"],
+  ["last_pubmed_checked_at", "Last PubMed checked", "text"],
+  ["error", "Error", "text"],
 ];
 
 // ---------------------------------------------------------------------------
@@ -1052,7 +1059,7 @@ function renderEditableField(annotation, index, field, label, type) {
   } else {
     control = document.createElement("input");
     control.type = type === "number" ? "number" : "text";
-    if (field === "confidence") {
+    if (field === "evidence_support_score") {
       control.step = "0.01";
       control.min = "0";
       control.max = "1";
