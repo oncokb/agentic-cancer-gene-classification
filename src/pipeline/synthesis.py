@@ -240,6 +240,7 @@ async def synthesize_gene_annotation(
         max_tokens=2048,
         local_mode=local_mode,
         local_backend=local_backend,
+        model_purpose="synthesis",
     )
 
     if not tool_input:
