@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
+CacheStatus = Literal["miss", "reused", "refreshed", "bypassed"]
 
 
 class ResolvedGene(BaseModel):
@@ -29,6 +29,11 @@ class LiteratureRecord(BaseModel):
     publication_types: list[str] = []
 
 
+class SupportingQuote(BaseModel):
+    pmid: str
+    quote: str
+
+
 class GeneAnnotation(BaseModel):
     """One row in Nicole's spreadsheet, keyed by gene."""
 
@@ -43,14 +48,37 @@ class GeneAnnotation(BaseModel):
     signaling_pathways: Optional[str] = None
     gene_summary: Optional[str] = None
     citations: List[str] = Field(default_factory=list)  # verified PMIDs only
+    supporting_quotes: List[SupportingQuote] = Field(default_factory=list)
     date_annotated: str = Field(
         default_factory=lambda: date.today().strftime("%-m/%-d/%y")
     )
 
     # Internal quality metadata (not exported to Nicole's sheet)
     retrieval_count: int = 0
+    retrieved_pmids: List[str] = Field(default_factory=list)
     insufficient_evidence: bool = False
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_support_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Deterministic evidence support score. This estimates how strongly the "
+            "generated annotation is supported by retrieved literature and verified "
+            "PMID citations; it is not a calibrated probability of biological truth "
+            "or clinical actionability."
+        ),
+    )
+    evidence_support_explanation: str = Field(
+        default=(
+            "Evidence support score estimates how well the generated annotation is "
+            "grounded in retrieved literature and verified PMIDs; it is not a "
+            "probability of biological truth or clinical actionability."
+        ),
+    )
+    cache_status: Optional[CacheStatus] = None
+    cache_reason: Optional[str] = None
+    cached_at: Optional[str] = None
+    last_pubmed_checked_at: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -77,6 +105,10 @@ class AnnotateRequest(BaseModel):
         description=(
             "Optional local agent backend for LLM calls. When unset, the Anthropic SDK path is used."
         ),
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="Bypass stored gene annotations and recompute results.",
     )
 
     @model_validator(mode="before")

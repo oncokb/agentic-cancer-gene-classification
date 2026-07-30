@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 from src.config import settings
 from src.models.schema import GeneAnnotation, LiteratureRecord
 from src.pipeline.citation_precision import filter_and_rank_citations
-from src.pipeline.literature import _HIGH_IMPACT_JOURNALS
+from src.pipeline.literature import _HIGH_IMPACT_JOURNALS, _publication_evidence_rank
 from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
@@ -43,13 +43,11 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 ## Field guidance:
 - `cancer_associated`: true if there is credible peer-reviewed evidence linking this gene to cancer biology.
 - `cancer_association_rationale`: list the evidence types (structural-variant, expression, mutation, methylation, copy-number) with a brief justification.
+- `cancer_type_prevalence`: cancer types and alteration contexts observed for this gene (e.g., "Lung adenocarcinoma (fusion), breast cancer (amplification)"). The deterministic facts above provide MSK/GENIE prevalence when available — use that value unchanged. When it is "not available", infer from the retrieved literature: list the cancer types explicitly mentioned in the abstracts along with the alteration type.
 - `gene_class`: molecular/functional class (e.g., "Serine/threonine kinase", "RNA-binding protein", "Transcription factor").
 - `signaling_pathways`: comma-separated associated signaling pathways (e.g., "PI3K/AKT", "RAS/MAPK", "WNT/β-catenin").
-- `confidence`: 0.0–1.0 reflecting how well the retrieved evidence supports the annotation.
-  - >4 papers with direct functional evidence → 0.8–1.0
-  - 2–4 papers with functional/expression data → 0.5–0.8
-  - <2 papers or only indirect evidence → 0.2–0.5
-  - 0 papers → set insufficient_evidence: true, confidence: 0.0
+- Do not assign a generic certainty/probability score. The application calculates
+  an evidence support score after PMID verification.
 
 ## Literature quality signals:
 - Abstracts marked ★ are from high-impact journals (NEJM, Lancet, Nature, Cell, JCO, Cancer Cell, etc.).
@@ -73,7 +71,7 @@ ANNOTATE_TOOL: dict = {
     ),
     "input_schema": {
         "type": "object",
-        "required": ["cancer_associated", "insufficient_evidence", "confidence"],
+        "required": ["cancer_associated", "insufficient_evidence"],
         "properties": {
             "cancer_associated": {
                 "type": "boolean",
@@ -83,7 +81,7 @@ ANNOTATE_TOOL: dict = {
                 "type": "boolean",
                 "description": (
                     "True when the retrieved literature is too sparse to make a confident determination. "
-                    "Prefer this over a low-confidence guess."
+                    "Prefer this over a weakly supported guess."
                 ),
             },
             "cancer_association_rationale": {
@@ -92,6 +90,14 @@ ANNOTATE_TOOL: dict = {
                     "Brief rationale covering evidence types observed "
                     "(structural-variant, expression, mutation, methylation, copy-number) "
                     "and which cancer types."
+                ),
+            },
+            "cancer_type_prevalence": {
+                "type": "string",
+                "description": (
+                    "Cancer types and alteration contexts for this gene. "
+                    "Use the MSK/GENIE value from deterministic facts if available; "
+                    "otherwise infer from retrieved literature."
                 ),
             },
             "gene_class": {
@@ -118,11 +124,31 @@ ANNOTATE_TOOL: dict = {
                     "No extras."
                 ),
             },
-            "confidence": {
-                "type": "number",
-                "minimum": 0.0,
-                "maximum": 1.0,
-                "description": "Confidence score 0–1 reflecting evidence quality and quantity.",
+            "supporting_quotes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["pmid", "quote"],
+                    "properties": {
+                        "pmid": {
+                            "type": "string",
+                            "description": "PMID of the source abstract.",
+                        },
+                        "quote": {
+                            "type": "string",
+                            "description": (
+                                "1–2 sentence verbatim or near-verbatim passage from the abstract "
+                                "that directly supports the cancer_association_rationale. "
+                                "Must be traceable to the retrieved text — do not paraphrase or invent."
+                            ),
+                        },
+                    },
+                },
+                "description": (
+                    "1–3 direct quotes from retrieved abstracts grounding the rationale. "
+                    "Only include quotes from PMIDs that appear in the citations list. "
+                    "Omit entirely if insufficient_evidence is true."
+                ),
             },
         },
     },
@@ -208,6 +234,65 @@ def _verify_citations(
     return verified
 
 
+def _evidence_support(
+    citations: List[str],
+    records: List[LiteratureRecord],
+    insufficient_evidence: bool,
+    cancer_association_rationale: Optional[str],
+    gene_summary: Optional[str],
+) -> tuple[float, str]:
+    """Calculate an explainable evidence-support score for curator-facing output."""
+    cited_records = [record for record in records if record.pmid in set(citations)]
+    evidence_records = cited_records or records
+    score = 0.0
+    reasons = []
+
+    citation_count = len(citations)
+    if citation_count >= 1:
+        score += 0.20
+        reasons.append(f"{citation_count} verified PMID citation(s)")
+    if citation_count >= 3:
+        score += 0.20
+        reasons.append("3+ verified PMIDs")
+    if citation_count >= 5:
+        score += 0.10
+        reasons.append("5+ verified PMIDs")
+
+    if any(_publication_evidence_rank(record) == 0 for record in evidence_records):
+        score += 0.20
+        reasons.append("human clinical evidence signal")
+    if any(record.journal in _HIGH_IMPACT_JOURNALS for record in evidence_records):
+        score += 0.10
+        reasons.append("high-impact journal signal")
+    if citations and cancer_association_rationale and gene_summary and not insufficient_evidence:
+        score += 0.10
+        reasons.append("summary, rationale, and citations are all present")
+
+    if insufficient_evidence:
+        score -= 0.30
+        reasons.append("insufficient-evidence flag")
+    if not citations:
+        score -= 0.20
+        reasons.append("no verified citations")
+    if len(records) < 2:
+        score -= 0.10
+        reasons.append("sparse retrieval corpus")
+
+    score = round(min(1.0, max(0.0, score)), 2)
+    if reasons:
+        explanation = (
+            f"Evidence support score {score:.2f}: "
+            + "; ".join(reasons)
+            + ". This score estimates literature grounding, not biological truth or clinical actionability."
+        )
+    else:
+        explanation = (
+            f"Evidence support score {score:.2f}: no strong support signals were detected. "
+            "This score estimates literature grounding, not biological truth or clinical actionability."
+        )
+    return score, explanation
+
+
 async def synthesize_gene_annotation(
     gene: str,
     fusions: List[str],
@@ -240,11 +325,12 @@ async def synthesize_gene_annotation(
         max_tokens=2048,
         local_mode=local_mode,
         local_backend=local_backend,
+        model_purpose="synthesis",
     )
 
     if not tool_input:
         logger.error("No annotation returned for gene %s", gene)
-        return {"insufficient_evidence": True, "cancer_associated": None, "confidence": 0.0}
+        return {"insufficient_evidence": True, "cancer_associated": None}
 
     # PMID verification — reject any citation not in retrieved set
     if "citations" in tool_input:
@@ -268,18 +354,40 @@ def build_gene_annotation(
     synthesis_result: Dict,
 ) -> GeneAnnotation:
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
+    citations = synthesis_result.get("citations", [])
+    insufficient_evidence = synthesis_result.get("insufficient_evidence", False)
+    verified_pmids = set(citations)
+    raw_quotes = synthesis_result.get("supporting_quotes", []) or []
+    verified_quotes = [
+        quote
+        for quote in raw_quotes
+        if isinstance(quote, dict) and quote.get("pmid") in verified_pmids
+    ]
+    effective_prevalence = cancer_type_prevalence or synthesis_result.get("cancer_type_prevalence")
+    evidence_support_score, evidence_support_explanation = _evidence_support(
+        citations=citations,
+        records=records,
+        insufficient_evidence=insufficient_evidence,
+        cancer_association_rationale=synthesis_result.get("cancer_association_rationale"),
+        gene_summary=synthesis_result.get("gene_summary"),
+    )
     return GeneAnnotation(
         gene=gene,
         fusions=list(dict.fromkeys(fusions)),  # deduplicate, preserve order
         in_oncokb=in_oncokb,
         cancer_associated=synthesis_result.get("cancer_associated"),
         cancer_association_rationale=synthesis_result.get("cancer_association_rationale"),
-        cancer_type_prevalence=cancer_type_prevalence,
+        cancer_type_prevalence=effective_prevalence,
         gene_class=synthesis_result.get("gene_class"),
         signaling_pathways=synthesis_result.get("signaling_pathways"),
         gene_summary=synthesis_result.get("gene_summary"),
-        citations=synthesis_result.get("citations", []),
+        citations=citations,
+        supporting_quotes=verified_quotes,
         retrieval_count=len(records),
-        insufficient_evidence=synthesis_result.get("insufficient_evidence", False),
-        confidence=synthesis_result.get("confidence", 0.0),
+        retrieved_pmids=[record.pmid for record in records],
+        insufficient_evidence=insufficient_evidence,
+        evidence_support_score=evidence_support_score,
+        evidence_support_explanation=evidence_support_explanation,
+        cache_status="refreshed",
+        cache_reason="computed_new_annotation",
     )

@@ -20,6 +20,7 @@ import asyncio
 import logging
 import re
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
 
 import anthropic
@@ -28,7 +29,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
 from src.models.schema import LiteratureRecord
-from src.pipeline.llm_client import complete_with_tool
+from src.pipeline.llm_client import complete_with_tool, make_async_sdk_client, resolve_sdk_model
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,72 @@ async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> L
         resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
         resp.raise_for_status()
     return resp.json().get("esearchresult", {}).get("idlist", [])
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+async def _esearch_since(
+    query: str,
+    since: datetime,
+    max_results: int,
+    client: httpx.AsyncClient,
+) -> List[str]:
+    """Return PMIDs published since a UTC timestamp for lightweight cache freshness checks."""
+    since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+    params = _ncbi_params(
+        {
+            "db": "pubmed",
+            "term": query,
+            "retmax": max_results,
+            "sort": "pub date",
+            "datetype": "pdat",
+            "mindate": since_utc.strftime("%Y/%m/%d"),
+        }
+    )
+    async with _request_semaphore:
+        await asyncio.sleep(_RATE_LIMIT_DELAY)
+        resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
+        resp.raise_for_status()
+    return resp.json().get("esearchresult", {}).get("idlist", [])
+
+
+async def search_recent_pubmed_pmids(
+    gene: str,
+    fusions: Optional[List[str]],
+    since: datetime,
+    tumor_type: Optional[str] = None,
+) -> List[str]:
+    """
+    Cheap PubMed freshness probe for cached gene annotations.
+
+    This intentionally returns PMIDs only. A non-empty result means the cache may
+    need full retrieval/synthesis; an empty result lets us reuse stale-but-checked
+    annotations without spending LLM tokens.
+    """
+    queries = [f'"{gene}" AND (cancer OR tumor OR oncology OR carcinoma)']
+    if tumor_type:
+        queries.append(f'"{gene}" AND {_tumor_type_query_fragment(tumor_type)}')
+    for partner in _fusion_partners(gene, fusions or [])[:2]:
+        queries.append(f'"{gene}" AND "{partner}"')
+        if tumor_type:
+            queries.append(f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}')
+    queries = list(dict.fromkeys(queries))
+
+    async with httpx.AsyncClient() as client:
+        pmid_lists = await asyncio.gather(
+            *[
+                _esearch_since(query, since, settings.gene_cache_freshness_pmids, client)
+                for query in queries
+            ]
+        )
+
+    seen: Set[str] = set()
+    recent_pmids: List[str] = []
+    for pmids in pmid_lists:
+        for pmid in pmids:
+            if pmid not in seen:
+                seen.add(pmid)
+                recent_pmids.append(pmid)
+    return recent_pmids
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
@@ -483,12 +550,12 @@ async def _tier2_agentic_retrieve(
 
     messages = [{"role": "user", "content": user_message}]
     tool_calls_made = 0
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = make_async_sdk_client()
 
     async with httpx.AsyncClient() as http_client:
         while tool_calls_made < MAX_AGENTIC_TOOL_CALLS:
             response = await client.messages.create(
-                model=settings.synthesis_model,
+                model=resolve_sdk_model(settings.synthesis_model, "synthesis"),
                 max_tokens=1024,
                 system=_AGENTIC_SYSTEM,
                 tools=[_SEARCH_PUBMED_TOOL, _DONE_TOOL],
@@ -598,6 +665,7 @@ async def _tier2_local_retrieve(
         max_tokens=1024,
         local_mode=True,
         local_backend=local_backend,
+        model_purpose="synthesis",
     )
     queries = [q for q in result.get("queries", []) if isinstance(q, str) and q.strip()]
     queries = list(dict.fromkeys(q.strip() for q in queries))[:MAX_AGENTIC_TOOL_CALLS]
