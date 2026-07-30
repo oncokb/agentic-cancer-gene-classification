@@ -43,6 +43,7 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 ## Field guidance:
 - `cancer_associated`: true if there is credible peer-reviewed evidence linking this gene to cancer biology.
 - `cancer_association_rationale`: list the evidence types (structural-variant, expression, mutation, methylation, copy-number) with a brief justification.
+- `cancer_type_prevalence`: cancer types and alteration contexts observed for this gene (e.g., "Lung adenocarcinoma (fusion), breast cancer (amplification)"). The deterministic facts above provide MSK/GENIE prevalence when available — use that value unchanged. When it is "not available", infer from the retrieved literature: list the cancer types explicitly mentioned in the abstracts along with the alteration type.
 - `gene_class`: molecular/functional class (e.g., "Serine/threonine kinase", "RNA-binding protein", "Transcription factor").
 - `signaling_pathways`: comma-separated associated signaling pathways (e.g., "PI3K/AKT", "RAS/MAPK", "WNT/β-catenin").
 - Do not assign a generic certainty/probability score. The application calculates
@@ -91,6 +92,14 @@ ANNOTATE_TOOL: dict = {
                     "and which cancer types."
                 ),
             },
+            "cancer_type_prevalence": {
+                "type": "string",
+                "description": (
+                    "Cancer types and alteration contexts for this gene. "
+                    "Use the MSK/GENIE value from deterministic facts if available; "
+                    "otherwise infer from retrieved literature."
+                ),
+            },
             "gene_class": {
                 "type": "string",
                 "description": "Molecular/functional class of the gene product.",
@@ -113,6 +122,32 @@ ANNOTATE_TOOL: dict = {
                     f"List of up to {settings.max_citations_per_annotation} strongest PMIDs "
                     "supporting this annotation. MUST be a subset of the retrieved abstracts provided. "
                     "No extras."
+                ),
+            },
+            "supporting_quotes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["pmid", "quote"],
+                    "properties": {
+                        "pmid": {
+                            "type": "string",
+                            "description": "PMID of the source abstract.",
+                        },
+                        "quote": {
+                            "type": "string",
+                            "description": (
+                                "1–2 sentence verbatim or near-verbatim passage from the abstract "
+                                "that directly supports the cancer_association_rationale. "
+                                "Must be traceable to the retrieved text — do not paraphrase or invent."
+                            ),
+                        },
+                    },
+                },
+                "description": (
+                    "1–3 direct quotes from retrieved abstracts grounding the rationale. "
+                    "Only include quotes from PMIDs that appear in the citations list. "
+                    "Omit entirely if insufficient_evidence is true."
                 ),
             },
         },
@@ -290,6 +325,7 @@ async def synthesize_gene_annotation(
         max_tokens=2048,
         local_mode=local_mode,
         local_backend=local_backend,
+        model_purpose="synthesis",
     )
 
     if not tool_input:
@@ -320,6 +356,14 @@ def build_gene_annotation(
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
     citations = synthesis_result.get("citations", [])
     insufficient_evidence = synthesis_result.get("insufficient_evidence", False)
+    verified_pmids = set(citations)
+    raw_quotes = synthesis_result.get("supporting_quotes", []) or []
+    verified_quotes = [
+        quote
+        for quote in raw_quotes
+        if isinstance(quote, dict) and quote.get("pmid") in verified_pmids
+    ]
+    effective_prevalence = cancer_type_prevalence or synthesis_result.get("cancer_type_prevalence")
     evidence_support_score, evidence_support_explanation = _evidence_support(
         citations=citations,
         records=records,
@@ -333,12 +377,14 @@ def build_gene_annotation(
         in_oncokb=in_oncokb,
         cancer_associated=synthesis_result.get("cancer_associated"),
         cancer_association_rationale=synthesis_result.get("cancer_association_rationale"),
-        cancer_type_prevalence=cancer_type_prevalence,
+        cancer_type_prevalence=effective_prevalence,
         gene_class=synthesis_result.get("gene_class"),
         signaling_pathways=synthesis_result.get("signaling_pathways"),
         gene_summary=synthesis_result.get("gene_summary"),
         citations=citations,
+        supporting_quotes=verified_quotes,
         retrieval_count=len(records),
+        retrieved_pmids=[record.pmid for record in records],
         insufficient_evidence=insufficient_evidence,
         evidence_support_score=evidence_support_score,
         evidence_support_explanation=evidence_support_explanation,
