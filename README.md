@@ -225,6 +225,41 @@ vars for Bedrock calls. For Kubernetes or Argo CD deployments, keep `.env` out
 of git and provide runtime configuration through Kubernetes Secrets, External
 Secrets, or the cluster's approved secret-management path.
 
+The Docker image includes Datadog Python tracing, starts the API with
+`ddtrace-run`, and includes Datadog correlation fields in stdout logs. In Argo
+CD/Kubernetes, follow the existing cBioPortal/OncoKB Datadog convention by
+enabling the Datadog admission controller on the pod and setting service
+tags/env vars at deploy time:
+
+```yaml
+metadata:
+  labels:
+    tags.datadoghq.com/env: <cluster-env>
+    tags.datadoghq.com/service: agentic-cancer-gene-classification
+    tags.datadoghq.com/version: <image-tag-or-git-sha>
+    admission.datadoghq.com/enabled: "true"
+```
+
+```yaml
+env:
+  - name: DD_ENV
+    value: <cluster-env>
+  - name: DD_SERVICE
+    value: agentic-cancer-gene-classification
+  - name: DD_VERSION
+    value: <image-tag-or-git-sha>
+  - name: DD_LOGS_INJECTION
+    value: "true"
+  - name: DD_TRACE_ENABLED
+    value: "true"
+  - name: DD_APM_ENABLED
+    value: "true"
+```
+
+Local Docker Compose sets `DD_TRACE_ENABLED=false` so development containers do
+not attempt to send traces to a missing local Datadog Agent. Override that env
+var if you are testing with a local Agent.
+
 Dockerized local Codex:
 
 ```bash

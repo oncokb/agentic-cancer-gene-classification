@@ -25,6 +25,7 @@ services:
       - .env
     environment:
       - LOG_LEVEL=INFO
+      - DD_TRACE_ENABLED=false
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
       - MYSQL_USER=${MYSQL_USER:-agcg}
@@ -59,6 +60,7 @@ services:
       - .env
     environment:
       - LOG_LEVEL=INFO
+      - DD_TRACE_ENABLED=false
       - HOME=/home/appuser
       - CODEX_HOME=/home/appuser/.codex
       - MYSQL_HOST=mysql
