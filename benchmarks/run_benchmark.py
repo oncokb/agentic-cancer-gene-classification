@@ -113,12 +113,6 @@ def build_per_gene_report(
                 "retrieval_count": pred.get("retrieval_count", 0),
                 "pred_cancer_associated": pred.get("cancer_associated"),
                 "gold_cancer_associated": gold.get("cancer_associated"),
-                "pred_tier": pred.get("cancer_associated_gene_tier"),
-                "gold_tier": gold.get("cancer_associated_gene_tier"),
-                "tier_match": pred.get("cancer_associated_gene_tier")
-                == gold.get("cancer_associated_gene_tier"),
-                "pred_og_or_tsg": pred.get("og_or_tsg"),
-                "gold_og_or_tsg": gold.get("og_or_tsg"),
                 "citation_precision": round(precision, 4),
                 "citation_recall": round(recall, 4),
                 "citation_f1": round(f1, 4),
@@ -142,18 +136,6 @@ def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
     print("\n--- cancer_associated ---")
     print(f"  Accuracy:     {ca['accuracy']:.3f}")
     print(f"  Cohen's κ:    {ca['cohen_kappa']:.3f}  (>0.6 = substantial, >0.8 = near-perfect)")
-
-    tier = metrics["cancer_tier"]
-    print("\n--- cancer_associated_gene_tier ---")
-    print(f"  Macro F1:     {tier['macro_f1']:.3f}")
-    for cls, f1 in sorted(tier["per_class"].items()):
-        print(f"    {cls:<35} F1={f1:.3f}")
-
-    ogtsg = metrics["og_or_tsg"]
-    print("\n--- og_or_tsg ---")
-    print(f"  Macro F1:     {ogtsg['macro_f1']:.3f}")
-    for cls, f1 in sorted(ogtsg["per_class"].items()):
-        print(f"    {cls:<10} F1={f1:.3f}")
 
     cites = metrics["citations"]
     print("\n--- citations (set-based) ---")
@@ -180,31 +162,82 @@ def print_report(metrics: Dict, judge_results: Optional[Dict] = None) -> None:
 
 
 def print_per_gene_debug(per_gene_report: List[Dict]) -> None:
-    """Print compact debug rows for the largest citation/tier misses."""
+    """Print compact debug rows for the largest citation misses."""
     citation_misses = [
         row
         for row in per_gene_report
-        if row["citation_fp"] or row["citation_fn"] or not row["tier_match"]
+        if row["citation_fp"] or row["citation_fn"]
     ]
     if not citation_misses:
         return
 
     citation_misses.sort(
-        key=lambda row: (
-            len(row["citation_fp"]) + len(row["citation_fn"]),
-            not row["tier_match"],
-        ),
+        key=lambda row: len(row["citation_fp"]) + len(row["citation_fn"]),
         reverse=True,
     )
-    print("--- per-gene debug (top citation/tier deltas) ---")
+    print("--- per-gene debug (top citation deltas) ---")
     for row in citation_misses[:8]:
         print(
-            f"  {row['gene']:<12} tier {row['pred_tier']!r} vs {row['gold_tier']!r}; "
+            f"  {row['gene']:<12} "
             f"cite P/R/F1={row['citation_precision']:.2f}/"
             f"{row['citation_recall']:.2f}/{row['citation_f1']:.2f}; "
             f"FP={row['citation_fp']} FN={row['citation_fn']}"
         )
     print()
+
+
+async def run_benchmark(
+    *,
+    holdout_path: Path = DEFAULT_HOLDOUT,
+    results_path: Optional[Path] = None,
+    no_judge: bool = False,
+    local_backend: Optional[str] = None,
+    max_genes: Optional[int] = None,
+) -> Dict:
+    """Run or score the holdout benchmark and return the full report."""
+    # --- Load holdout ---
+    logger.info("Loading holdout from %s", holdout_path)
+    holdout = load_holdout(holdout_path)
+    if max_genes is not None:
+        holdout = holdout[:max_genes]
+    logger.info("Holdout: %d genes", len(holdout))
+
+    # --- Run or load pipeline ---
+    if results_path:
+        logger.info("Loading existing pipeline results from %s", results_path)
+        with open(results_path) as f:
+            pipeline_result = json.load(f)
+    else:
+        fusions = _get_fusions_from_holdout(holdout)
+        logger.info("Running pipeline on %d fusions from holdout...", len(fusions))
+        pipeline_result = await _run_pipeline(fusions, local_backend=local_backend)
+
+    # --- Align ---
+    aligned_pred, aligned_gold = _align_predictions(holdout, pipeline_result)
+
+    # --- Categorical metrics ---
+    from benchmarks.metrics import compute_categorical_metrics
+    metrics = compute_categorical_metrics(aligned_pred, aligned_gold)
+    per_gene_report = build_per_gene_report(aligned_pred, aligned_gold)
+
+    # --- LLM judge ---
+    judge_results = None
+    if not no_judge:
+        from benchmarks.judge import run_judge
+        genes = [g["gene"] for g in aligned_gold]
+        pred_summaries = [p.get("gene_summary") for p in aligned_pred]
+        gold_summaries = [g.get("gene_summary") for g in aligned_gold]
+        logger.info("Running LLM-as-a-judge on %d gene summaries...", len(genes))
+        judge_results = run_judge(genes, pred_summaries, gold_summaries)
+
+    return {
+        "holdout_path": str(holdout_path),
+        "n_genes": len(holdout),
+        "categorical_metrics": metrics,
+        "per_gene_report": per_gene_report,
+        "judge": judge_results,
+        "pipeline_result": pipeline_result,
+    }
 
 
 def main() -> None:
@@ -255,63 +288,31 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # --- Load holdout ---
-    logger.info("Loading holdout from %s", args.holdout)
-    holdout = load_holdout(args.holdout)
-    logger.info("Holdout: %d genes", len(holdout))
-
-    # --- Run or load pipeline ---
-    if args.results:
-        logger.info("Loading existing pipeline results from %s", args.results)
-        with open(args.results) as f:
-            pipeline_result = json.load(f)
-    else:
-        fusions = _get_fusions_from_holdout(holdout)
-        logger.info("Running pipeline on %d fusions from holdout...", len(fusions))
-        pipeline_result = asyncio.run(_run_pipeline(fusions, local_backend=args.local))
+    full_report = asyncio.run(
+        run_benchmark(
+            holdout_path=args.holdout,
+            results_path=args.results,
+            no_judge=args.no_judge,
+            local_backend=args.local,
+        )
+    )
 
     if args.results_csv:
         from src.models.schema import AnnotationResult
         from src.pipeline.results_export import write_annotation_results_csv
 
         write_annotation_results_csv(
-            AnnotationResult.model_validate(pipeline_result),
+            AnnotationResult.model_validate(full_report["pipeline_result"]),
             args.results_csv,
         )
         logger.info("Pipeline results CSV written to %s", args.results_csv)
 
-    # --- Align ---
-    aligned_pred, aligned_gold = _align_predictions(holdout, pipeline_result)
-
-    # --- Categorical metrics ---
-    from benchmarks.metrics import compute_categorical_metrics
-    metrics = compute_categorical_metrics(aligned_pred, aligned_gold)
-    per_gene_report = build_per_gene_report(aligned_pred, aligned_gold)
-
-    # --- LLM judge ---
-    judge_results = None
-    if not args.no_judge:
-        from benchmarks.judge import run_judge
-        genes = [g["gene"] for g in aligned_gold]
-        pred_summaries = [p.get("gene_summary") for p in aligned_pred]
-        gold_summaries = [g.get("gene_summary") for g in aligned_gold]
-        logger.info("Running LLM-as-a-judge on %d gene summaries...", len(genes))
-        judge_results = run_judge(genes, pred_summaries, gold_summaries)
-
     # --- Report ---
-    print_report(metrics, judge_results)
-    print_per_gene_debug(per_gene_report)
+    print_report(full_report["categorical_metrics"], full_report["judge"])
+    print_per_gene_debug(full_report["per_gene_report"])
 
     # --- Optional JSON output ---
     if args.output:
-        full_report = {
-            "holdout_path": str(args.holdout),
-            "n_genes": len(holdout),
-            "categorical_metrics": metrics,
-            "per_gene_report": per_gene_report,
-            "judge": judge_results,
-            "pipeline_result": pipeline_result,
-        }
         with open(args.output, "w") as f:
             json.dump(full_report, f, indent=2)
         logger.info("Full report written to %s", args.output)

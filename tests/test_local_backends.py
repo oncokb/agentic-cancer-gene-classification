@@ -137,7 +137,7 @@ def test_annotate_request_accepts_local_backend():
 async def test_benchmark_run_pipeline_passes_local_backend(monkeypatch):
     seen = {}
 
-    async def fake_run_pipeline(fusions, local_backend=None):
+    async def fake_run_pipeline(fusions, local_backend=None, run_store=None, force_refresh=False):
         seen["fusions"] = fusions
         seen["local_backend"] = local_backend
 

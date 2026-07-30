@@ -78,16 +78,12 @@ def test_per_class_f1_perfect():
 
 def test_compute_categorical_metrics_smoke():
     predictions = [
-        {"cancer_associated": True, "cancer_associated_gene_tier": "Class II - Likely Driver",
-         "og_or_tsg": "OG", "citations": ["111", "222"]},
-        {"cancer_associated": False, "cancer_associated_gene_tier": None,
-         "og_or_tsg": None, "citations": []},
+        {"cancer_associated": True, "citations": ["111", "222"]},
+        {"cancer_associated": False, "citations": []},
     ]
     ground_truth = [
-        {"cancer_associated": True, "cancer_associated_gene_tier": "Class II - Likely Driver",
-         "og_or_tsg": "OG", "citations": ["111", "222", "333"]},
-        {"cancer_associated": False, "cancer_associated_gene_tier": None,
-         "og_or_tsg": None, "citations": []},
+        {"cancer_associated": True, "citations": ["111", "222", "333"]},
+        {"cancer_associated": False, "citations": []},
     ]
     metrics = compute_categorical_metrics(predictions, ground_truth)
     assert metrics["n"] == 2

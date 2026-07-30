@@ -22,10 +22,26 @@ class Settings(BaseSettings):
     aws_region: str = ""
     aws_default_region: str = ""
     aws_profile: str = ""
+    agcg_dev_mode: bool = False
     pubmed_max_results: int = 50
     min_papers_for_strong_association: int = 4
     max_papers_for_synthesis: int = 8
     max_citations_per_annotation: int = 4
+
+    gene_cache_enabled: bool = True
+    gene_cache_oncokb_check_days: int = 90
+    gene_cache_high_support_days: int = 60
+    gene_cache_medium_support_days: int = 30
+    gene_cache_low_support_days: int = 14
+    gene_cache_high_support_threshold: float = 0.8
+    gene_cache_medium_support_threshold: float = 0.5
+    gene_cache_freshness_pmids: int = 20
+
+    mysql_host: str = "localhost"
+    mysql_port: int = 3306
+    mysql_user: str = "agcg"
+    mysql_password: str = ""
+    mysql_database: str = "agcg"
 
     log_level: str = "INFO"
 
