@@ -5,6 +5,7 @@ FastAPI application — manually invokable, Docker/K8s-ready.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -17,9 +18,32 @@ from fastapi.staticfiles import StaticFiles
 from src.models.schema import AnnotateRequest, AnnotationResult
 from src.pipeline.orchestrator import run_pipeline
 
+_log_record_factory = logging.getLogRecordFactory()
+
+
+def _datadog_log_record_factory(*args, **kwargs):
+    record = _log_record_factory(*args, **kwargs)
+    defaults = {
+        "dd.service": os.getenv("DD_SERVICE", "agentic-cancer-gene-classification"),
+        "dd.env": os.getenv("DD_ENV", ""),
+        "dd.version": os.getenv("DD_VERSION", ""),
+        "dd.trace_id": "0",
+        "dd.span_id": "0",
+    }
+    for key, value in defaults.items():
+        if key not in record.__dict__:
+            setattr(record, key, value)
+    return record
+
+
+logging.setLogRecordFactory(_datadog_log_record_factory)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    format=(
+        "%(asctime)s %(levelname)s %(name)s "
+        "[dd.service=%(dd.service)s dd.env=%(dd.env)s dd.version=%(dd.version)s "
+        "dd.trace_id=%(dd.trace_id)s dd.span_id=%(dd.span_id)s] — %(message)s"
+    ),
     stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
