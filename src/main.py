@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import logging
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +21,7 @@ from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
 from src.config import settings
 from src.models.schema import AnnotateRequest, AnnotationResult, LocalBackend
 from src.pipeline.orchestrator import run_pipeline
+from src.pipeline.run_store import RunStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +30,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.run_store = await RunStore.create()
+    yield
+    await app.state.run_store.close()
+
+
 app = FastAPI(
     title="Agentic Cancer Gene Classification",
     description=(
@@ -35,6 +45,7 @@ app = FastAPI(
         "Automates Nicole's MSK TARGET Gene Triaging workflow."
     ),
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -90,7 +101,7 @@ async def dev_status() -> DevStatusResponse:
 
 
 @app.post("/v1/annotate", response_model=AnnotationResult)
-async def annotate(request: AnnotateRequest) -> AnnotationResult:
+async def annotate(request: AnnotateRequest, http_request: Request) -> AnnotationResult:
     """
     Annotate a list of candidate gene fusions.
 
@@ -102,11 +113,35 @@ async def annotate(request: AnnotateRequest) -> AnnotationResult:
     `{ "fusions": [{"fusion": "GENE1::GENE2", "tumor_type": "LUAD"}] }`
     """
     try:
-        result = await run_pipeline(request.fusions, local_backend=request.local_backend)
-        return result
+        result = await run_pipeline(
+            request.fusions,
+            local_backend=request.local_backend,
+            run_store=http_request.app.state.run_store,
+            force_refresh=request.force_refresh,
+        )
     except Exception as e:
         logger.exception("Pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+    try:
+        await http_request.app.state.run_store.save_run(
+            result.run_id, result.timestamp, request.model_dump(), result.model_dump()
+        )
+    except Exception:
+        # A run's own result always returns even if it can't be persisted for
+        # later sharing — the run store isn't on the critical path for the caller.
+        logger.exception("Failed to persist run %s", result.run_id)
+
+    return result
+
+
+@app.get("/v1/annotate/{run_id}", response_model=AnnotationResult)
+async def get_annotation_run(run_id: str, http_request: Request) -> AnnotationResult:
+    """Fetch a previously-computed annotation run by ID, without recomputing it."""
+    stored = await http_request.app.state.run_store.get_run(run_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return AnnotationResult(**stored)
 
 
 @app.post("/v1/dev/benchmark")
