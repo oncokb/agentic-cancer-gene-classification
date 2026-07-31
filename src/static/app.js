@@ -1146,6 +1146,64 @@ function formatFieldValue(value, type) {
   return value === null || value === undefined || value === "" ? "—" : String(value);
 }
 
+// cancer_type_prevalence is a "- entry per line" string (see synthesis
+// prompt) — parsed into chips for display so it doesn't read as a raw
+// text dump next to the rest of the redesigned card. Editing still
+// works on the same underlying string; only the at-rest display differs.
+function parseCancerTypeEntries(value) {
+  if (!value) return [];
+  return String(value)
+    .split("\n")
+    .map((line) => line.replace(/^[\s•-]+/, "").trim())
+    .filter(Boolean);
+}
+
+function renderCancerTypeChips(value) {
+  const entries = parseCancerTypeEntries(value);
+  if (!entries.length) return null;
+
+  const wrap = document.createElement("div");
+  wrap.className = "cancer-type-chips";
+
+  entries.forEach((entry) => {
+    const match = entry.match(/^(.*?)\s*(\([^)]*\))?$/);
+    const main = (match ? match[1] : entry).trim();
+    const context = match && match[2] ? match[2] : "";
+
+    const chip = document.createElement("span");
+    chip.className = "cancer-type-chip";
+
+    const mainSpan = document.createElement("span");
+    mainSpan.className = "cancer-type-chip-main";
+    mainSpan.textContent = main;
+    chip.appendChild(mainSpan);
+
+    if (context) {
+      const contextSpan = document.createElement("span");
+      contextSpan.className = "cancer-type-chip-context";
+      contextSpan.textContent = ` ${context}`;
+      chip.appendChild(contextSpan);
+    }
+
+    wrap.appendChild(chip);
+  });
+
+  return wrap;
+}
+
+// Populates a field-row-value display element — chips for
+// cancer_type_prevalence, plain text (via formatFieldValue) otherwise.
+function populateFieldDisplay(display, annotation, field, type) {
+  if (field === "cancer_type_prevalence") {
+    const chips = renderCancerTypeChips(annotation[field]);
+    if (chips) {
+      display.replaceChildren(chips);
+      return;
+    }
+  }
+  display.textContent = formatFieldValue(annotation[field], type);
+}
+
 function buildFieldControl(annotation, index, field, type) {
   let control;
   if (type === "boolean" || type === "booleanRequired") {
@@ -1192,7 +1250,7 @@ function renderField(annotation, index, field, label, type) {
   display.className = "field-row-value";
   display.tabIndex = 0;
   display.title = "Click to edit";
-  display.textContent = formatFieldValue(annotation[field], type);
+  populateFieldDisplay(display, annotation, field, type);
 
   const activate = () => {
     const control = buildFieldControl(annotation, index, field, type);
@@ -1202,7 +1260,7 @@ function renderField(annotation, index, field, label, type) {
 
     const commit = () => {
       handleAnnotationEdit({ target: control });
-      display.textContent = formatFieldValue(annotation[field], type);
+      populateFieldDisplay(display, annotation, field, type);
       wrapper.replaceChild(display, control);
     };
 
