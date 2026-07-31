@@ -513,6 +513,33 @@ textarea {
   line-height: 1.5;
 }
 
+/* Rationale is the primary signal on the card — same accent-border
+   callout treatment already used for supporting-quote blocks, so it
+   reads as "the important one" using a pattern already established
+   elsewhere in this app rather than a new visual language. */
+.field-row-highlight {
+  border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0;
+  background: var(--surface-strong);
+  padding: 10px 14px;
+}
+
+.field-row-highlight .field-row-label {
+  color: var(--accent-strong);
+}
+
+.field-row-highlight .field-row-value {
+  font-size: 15px;
+  font-weight: 500;
+  margin: 0;
+  padding: 0;
+}
+
+.field-row-highlight .field-row-value:hover,
+.field-row-highlight .field-row-value:focus-visible {
+  background: rgba(15, 118, 110, 0.08);
+}
+
 .benchmark-report {
   display: grid;
   gap: 14px;

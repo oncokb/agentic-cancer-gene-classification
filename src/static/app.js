@@ -860,7 +860,9 @@ function renderAnnotationResult(result) {
     const fields = card.querySelector(".annotation-fields");
     for (const [field, label, type] of editableFields) {
       if (field === "error" && !annotation.error) continue;
-      fields.appendChild(renderField(annotation, index, field, label, type));
+      const row = renderField(annotation, index, field, label, type);
+      if (field === "cancer_association_rationale") row.classList.add("field-row-highlight");
+      fields.appendChild(row);
     }
 
     const evidence = renderSupportingEvidence(annotation);
@@ -909,7 +911,7 @@ function renderSupportingEvidence(annotation) {
       <span class="retrieval-count-label">
         ${count} total retrieved PMID${count === 1 ? "" : "s"}
       </span>
-      <span class="retrieval-info-icon" title="Total number of PubMed abstracts fetched during literature retrieval for this gene. A subset of these was selected for synthesis; the PMIDs used in the final annotation appear in the Cited on PubMed list below.">ⓘ</span>
+      <span class="retrieval-info-icon" title="Click to expand and see every PMID retrieved during literature search for this gene. A subset of these was selected for synthesis; the PMIDs actually used in the final annotation appear in the Cited on PubMed list below.">ⓘ</span>
     `;
     details.appendChild(summary);
 
