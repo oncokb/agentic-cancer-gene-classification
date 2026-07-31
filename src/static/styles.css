@@ -435,14 +435,82 @@ textarea {
   white-space: nowrap;
 }
 
-.annotation-fields {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
-  gap: 12px;
+.status-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 8px;
 }
 
-.annotation-fields .wide {
-  grid-column: 1 / -1;
+.status-value {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  border-radius: 4px;
+  padding: 1px 2px;
+}
+
+.status-value:hover,
+.status-value:focus-visible {
+  background: var(--surface-strong);
+}
+
+.status-yes {
+  color: var(--ok);
+}
+
+.status-no {
+  color: var(--muted);
+}
+
+.status-unknown {
+  color: var(--muted);
+}
+
+.status-control {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 1px 4px;
+  width: auto;
+}
+
+.annotation-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.field-row-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.field-row-value {
+  cursor: pointer;
+  white-space: pre-wrap;
+  line-height: 1.5;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+}
+
+.field-row-value:hover,
+.field-row-value:focus-visible {
+  background: var(--surface-strong);
+}
+
+.field-row-control {
+  font-size: 14px;
+  line-height: 1.5;
 }
 
 .benchmark-report {

@@ -91,10 +91,13 @@ const elements = {
   annotateLocalBackend: document.querySelector("#annotate-local-backend"),
 };
 
+const statusFields = [
+  ["cancer_associated", "Cancer associated"],
+  ["in_oncokb", "In OncoKB"],
+];
+
 const editableFields = [
-  ["cancer_associated", "Cancer associated", "boolean"],
   ["cancer_association_rationale", "Rationale", "long"],
-  ["in_oncokb", "In OncoKB", "boolean"],
   ["cancer_type_prevalence", "Cancer type prevalence", "long"],
   ["gene_class", "Gene class", "text"],
   ["signaling_pathways", "Signaling pathways", "long"],
@@ -845,15 +848,19 @@ function renderAnnotationResult(result) {
           <h3>${escapeHtml(annotation.gene)}</h3>
           <div class="subtle">${escapeHtml(formatList(annotation.fusions))}</div>
           <div class="review-badges">${renderCompactBadges(annotation)}</div>
+          <div class="status-line-slot"></div>
         </div>
         <span class="status-pill">${escapeHtml(annotation.date_annotated || "")}</span>
       </header>
       <div class="annotation-fields"></div>
     `;
 
+    card.querySelector(".status-line-slot").appendChild(renderStatusLine(annotation, index));
+
     const fields = card.querySelector(".annotation-fields");
     for (const [field, label, type] of editableFields) {
-      fields.appendChild(renderEditableField(annotation, index, field, label, type));
+      if (field === "error" && !annotation.error) continue;
+      fields.appendChild(renderField(annotation, index, field, label, type));
     }
 
     const evidence = renderSupportingEvidence(annotation);
@@ -1104,13 +1111,19 @@ function renderCompactBadges(annotation) {
     .join("");
 }
 
-function renderEditableField(annotation, index, field, label, type) {
-  const wrapper = document.createElement("label");
-  wrapper.className = type === "long" || type === "list" ? "field wide" : "field";
-  const labelElement = document.createElement("span");
-  labelElement.textContent = label;
-  wrapper.appendChild(labelElement);
+function formatFieldValue(value, type) {
+  if (type === "boolean" || type === "booleanRequired") {
+    if (value === null || value === undefined) return "—";
+    return value ? "Yes" : "No";
+  }
+  if (type === "list") {
+    const items = Array.isArray(value) ? value : [];
+    return items.length ? items.map((item) => `• ${item}`).join("\n") : "—";
+  }
+  return value === null || value === undefined || value === "" ? "—" : String(value);
+}
 
+function buildFieldControl(annotation, index, field, type) {
   let control;
   if (type === "boolean" || type === "booleanRequired") {
     control = document.createElement("select");
@@ -1125,17 +1138,12 @@ function renderEditableField(annotation, index, field, label, type) {
         : String(Boolean(annotation[field]));
   } else if (type === "long" || type === "list") {
     control = document.createElement("textarea");
-    control.rows = type === "long" ? 4 : 2;
+    control.rows = type === "long" ? 4 : 3;
     control.value =
       type === "list" ? formatList(annotation[field]) : annotation[field] || "";
   } else {
     control = document.createElement("input");
     control.type = type === "number" ? "number" : "text";
-    if (field === "evidence_support_score") {
-      control.step = "0.01";
-      control.min = "0";
-      control.max = "1";
-    }
     control.value =
       annotation[field] === null || annotation[field] === undefined ? "" : annotation[field];
   }
@@ -1143,8 +1151,116 @@ function renderEditableField(annotation, index, field, label, type) {
   control.dataset.index = index;
   control.dataset.field = field;
   control.dataset.type = type;
-  control.addEventListener("input", handleAnnotationEdit);
-  wrapper.appendChild(control);
+  return control;
+}
+
+// Renders a field as plain text; clicking it swaps in the real control in
+// place (same pattern as renderStatusLine), reverting to text on blur.
+function renderField(annotation, index, field, label, type) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "field-row";
+
+  const labelElement = document.createElement("span");
+  labelElement.className = "field-row-label";
+  labelElement.textContent = label;
+  wrapper.appendChild(labelElement);
+
+  const display = document.createElement("div");
+  display.className = "field-row-value";
+  display.tabIndex = 0;
+  display.title = "Click to edit";
+  display.textContent = formatFieldValue(annotation[field], type);
+
+  const activate = () => {
+    const control = buildFieldControl(annotation, index, field, type);
+    control.className = "field-row-control";
+    wrapper.replaceChild(control, display);
+    control.focus();
+
+    const commit = () => {
+      handleAnnotationEdit({ target: control });
+      display.textContent = formatFieldValue(annotation[field], type);
+      wrapper.replaceChild(display, control);
+    };
+
+    control.addEventListener("input", handleAnnotationEdit);
+    control.addEventListener("blur", commit);
+    control.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" || (event.key === "Enter" && control.tagName !== "TEXTAREA")) {
+        control.blur();
+      }
+    });
+  };
+
+  display.addEventListener("click", activate);
+  display.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") activate();
+  });
+
+  wrapper.appendChild(display);
+  return wrapper;
+}
+
+// Compact Yes/No status for the two booleans curators check first —
+// rendered as plain colored text next to the header, not a form field.
+function renderStatusLine(annotation, index) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "status-line";
+
+  for (const [field, label] of statusFields) {
+    const item = document.createElement("span");
+    item.className = "status-item";
+
+    const display = document.createElement("span");
+    display.tabIndex = 0;
+    display.title = "Click to edit";
+
+    const applyDisplay = () => {
+      const value = annotation[field];
+      const text = value === null || value === undefined ? "—" : value ? "Yes" : "No";
+      display.textContent = `${label}: ${text}`;
+      display.className =
+        "status-value " +
+        (value === true ? "status-yes" : value === false ? "status-no" : "status-unknown");
+    };
+    applyDisplay();
+
+    const activate = () => {
+      const control = document.createElement("select");
+      control.className = "status-control";
+      control.appendChild(new Option("", ""));
+      control.appendChild(new Option("Yes", "true"));
+      control.appendChild(new Option("No", "false"));
+      control.value =
+        annotation[field] === null || annotation[field] === undefined
+          ? ""
+          : String(Boolean(annotation[field]));
+      control.dataset.index = index;
+      control.dataset.field = field;
+      control.dataset.type = "boolean";
+
+      item.replaceChild(control, display);
+      control.focus();
+
+      const commit = () => {
+        handleAnnotationEdit({ target: control });
+        applyDisplay();
+        item.replaceChild(display, control);
+      };
+      control.addEventListener("input", handleAnnotationEdit);
+      control.addEventListener("change", commit);
+      control.addEventListener("blur", commit);
+    };
+
+    display.addEventListener("click", activate);
+    display.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") activate();
+    });
+
+    item.appendChild(display);
+    wrapper.appendChild(item);
+  }
+
   return wrapper;
 }
 
