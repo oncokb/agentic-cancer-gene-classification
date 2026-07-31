@@ -1,6 +1,6 @@
 # Agentic Cancer Gene Classification
 
-M0 annotation engine for candidate cancer gene fusions. The pipeline splits fusions into genes, resolves HGNC symbols, retrieves PubMed literature, and asks an LLM to produce structured cancer-gene annotations with verified PMID citations.
+M0 annotation engine for candidate cancer genes and gene fusions. The pipeline accepts either singleton gene symbols or fusions, resolves HGNC symbols, retrieves PubMed literature, and asks an LLM to produce structured cancer-gene annotations with verified PMID citations.
 
 ## Setup
 
@@ -77,23 +77,24 @@ Then run the CLI:
 
 ```bash
 python -m src.cli \
-  --fusions "TP53::BRAF" \
+  --fusions "ALK" \
   --output results.json \
   --output-csv results.csv
 ```
 
-To test multiple fusions in one run, pass each fusion after `--fusions`:
+To test multiple genes or fusions in one run, pass each input after `--fusions`:
 
 ```bash
 python -m src.cli \
-  --fusions "TP53::BRAF" "ETV6::NTRK3" "BCR::ABL1" \
+  --fusions "ALK" "TP53::BRAF" "ETV6::NTRK3" "BCR::ABL1" \
   --output results.json \
   --output-csv results.csv
 ```
 
-For larger batches, put one fusion per line in a text file:
+For larger batches, put one gene or fusion per line in a text file:
 
 ```text
+ALK
 TP53::BRAF
 ETV6::NTRK3
 BCR::ABL1
@@ -103,18 +104,35 @@ Then run:
 
 ```bash
 python -m src.cli \
-  --input fusions.txt \
+  --input inputs.txt \
   --output results.json \
   --output-csv results.csv
 ```
 
-Or run the API:
+Or run the API. To annotate one gene and return the same JSON payload used by a
+result card:
+
+```bash
+uvicorn src.main:app --host 0.0.0.0 --port 8000
+curl -X POST http://127.0.0.1:8000/v1/annotate/gene \
+  -H "Content-Type: application/json" \
+  -d '{"gene":"ALK","tumor_type":"LUAD"}'
+```
+
+The response is one `GeneAnnotation` object with fields such as `gene`,
+`fusions`, `in_oncokb`, `cancer_associated`,
+`cancer_association_rationale`, `cancer_type_prevalence`, `gene_class`,
+`signaling_pathways`, `gene_summary`, `citations`, `supporting_quotes`,
+`retrieval_count`, `retrieved_pmids`, `evidence_support_score`, and cache
+metadata.
+
+For batch runs or mixed genes and fusions, use `/v1/annotate`:
 
 ```bash
 uvicorn src.main:app --host 0.0.0.0 --port 8000
 curl -X POST http://127.0.0.1:8000/v1/annotate \
   -H "Content-Type: application/json" \
-  -d '{"fusions":["TP53::BRAF"]}'
+  -d '{"fusions":["ALK",{"fusion":"EML4::ALK","tumor_type":"LUAD"}]}'
 ```
 
 This path uses the Anthropic SDK for selection, synthesis, benchmark judging, and
@@ -162,19 +180,19 @@ Examples:
 
 ```bash
 python -m src.cli \
-  --fusions "TP53::BRAF" \
+  --fusions "ALK" \
   --local codex \
   --output results.json \
   --output-csv results.csv
 
 python -m src.cli \
-  --fusions "TP53::BRAF" \
+  --fusions "ALK" \
   --local claude-code \
   --output results.json \
   --output-csv results.csv
 
 python -m src.cli \
-  --fusions "TP53::BRAF" \
+  --fusions "ALK" \
   --local antigravity \
   --output results.json \
   --output-csv results.csv
@@ -197,7 +215,7 @@ Override that command shape if needed:
 
 ```bash
 ANTIGRAVITY_LOCAL_COMMAND='your-command {prompt}' \
-  python -m src.cli --fusions "TP53::BRAF" --local antigravity
+  python -m src.cli --fusions "ALK" --local antigravity
 ```
 
 ## Docker
@@ -266,7 +284,7 @@ Dockerized local Codex:
 docker compose --profile local up --build annotation-service-local
 curl -X POST http://127.0.0.1:8001/v1/annotate \
   -H "Content-Type: application/json" \
-  -d '{"fusions":["TP53::BRAF"],"local_backend":"codex"}'
+  -d '{"fusions":["ALK","TP53::BRAF"],"local_backend":"codex"}'
 ```
 
 The local Docker profile builds the image with:

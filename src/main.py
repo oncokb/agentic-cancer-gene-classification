@@ -20,7 +20,14 @@ from pydantic import BaseModel, Field
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
 from src.config import settings
-from src.models.schema import AnnotateRequest, AnnotationResult, LocalBackend
+from src.models.schema import (
+    AnnotateRequest,
+    AnnotationResult,
+    FusionInput,
+    GeneAnnotateRequest,
+    GeneAnnotation,
+    LocalBackend,
+)
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.run_store import RunStore
 
@@ -65,7 +72,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Agentic Cancer Gene Classification",
     description=(
-        "M0: LLM annotation engine for candidate cancer gene fusions. "
+        "M0: LLM annotation engine for candidate cancer genes and gene fusions. "
         "Automates Nicole's MSK TARGET Gene Triaging workflow."
     ),
     version="0.1.0",
@@ -109,6 +116,21 @@ def require_dev_mode() -> None:
         raise HTTPException(status_code=404, detail="Not found")
 
 
+async def _persist_run_result(
+    http_request: Request,
+    request_payload: dict,
+    result: AnnotationResult,
+) -> None:
+    try:
+        await http_request.app.state.run_store.save_run(
+            result.run_id, result.timestamp, request_payload, result.model_dump()
+        )
+    except Exception:
+        # A run's own result always returns even if it can't be persisted for
+        # later sharing — the run store isn't on the critical path for the caller.
+        logger.exception("Failed to persist run %s", result.run_id)
+
+
 @app.get("/")
 async def root() -> RedirectResponse:
     return RedirectResponse(url="/static/index.html")
@@ -127,14 +149,14 @@ async def dev_status() -> DevStatusResponse:
 @app.post("/v1/annotate", response_model=AnnotationResult)
 async def annotate(request: AnnotateRequest, http_request: Request) -> AnnotationResult:
     """
-    Annotate a list of candidate gene fusions.
+    Annotate a list of candidate genes or gene fusions.
 
-    Each fusion is split into its partner genes. The unit of annotation
+    Each fusion is split into its partner genes; singleton genes are used directly. The unit of annotation
     is the gene. Returns one annotation row per unique gene, matching
     the MSK TARGET Gene Triaging schema.
 
     Input supports plain strings or structured objects with optional tumor_type and breakpoint fields:
-    `{ "fusions": [{"fusion": "GENE1::GENE2", "tumor_type": "LUAD"}] }`
+    `{ "fusions": ["ALK", {"fusion": "EML4::ALK", "tumor_type": "LUAD"}] }`
     """
     try:
         result = await run_pipeline(
@@ -147,16 +169,36 @@ async def annotate(request: AnnotateRequest, http_request: Request) -> Annotatio
         logger.exception("Pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    try:
-        await http_request.app.state.run_store.save_run(
-            result.run_id, result.timestamp, request.model_dump(), result.model_dump()
-        )
-    except Exception:
-        # A run's own result always returns even if it can't be persisted for
-        # later sharing — the run store isn't on the critical path for the caller.
-        logger.exception("Failed to persist run %s", result.run_id)
+    await _persist_run_result(http_request, request.model_dump(), result)
 
     return result
+
+
+@app.post("/v1/annotate/gene", response_model=GeneAnnotation)
+async def annotate_gene(request: GeneAnnotateRequest, http_request: Request) -> GeneAnnotation:
+    """
+    Annotate a single gene and return the result-card payload as JSON.
+
+    This is a convenience endpoint for external REST clients. For batch runs or
+    mixed gene/fusion inputs, use POST /v1/annotate.
+    """
+    gene_input = FusionInput(gene=request.gene, tumor_type=request.tumor_type)
+    try:
+        result = await run_pipeline(
+            [gene_input],
+            local_backend=request.local_backend,
+            run_store=http_request.app.state.run_store,
+            force_refresh=request.force_refresh,
+        )
+    except Exception as e:
+        logger.exception("Gene annotation pipeline error")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    await _persist_run_result(http_request, request.model_dump(), result)
+
+    if not result.annotations:
+        raise HTTPException(status_code=500, detail="No gene annotation was returned")
+    return result.annotations[0]
 
 
 @app.get("/v1/annotate/{run_id}", response_model=AnnotationResult)
