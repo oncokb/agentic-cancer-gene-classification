@@ -1048,12 +1048,20 @@ body.batch-active .app-shell {
 }
 
 .retrieval-summary {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   cursor: pointer;
   list-style: none;
   user-select: none;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+}
+
+.retrieval-summary:hover,
+.retrieval-summary:focus-visible {
+  background: var(--surface-strong);
 }
 
 .retrieval-summary::-webkit-details-marker {
@@ -1061,15 +1069,15 @@ body.batch-active .app-shell {
 }
 
 .retrieval-summary::after {
-  content: "▸";
-  margin-left: auto;
+  content: "▸ show";
   font-size: 11px;
-  color: var(--muted);
+  font-weight: 700;
+  color: var(--accent);
   transition: transform 0.15s ease;
 }
 
 details[open] > .retrieval-summary::after {
-  transform: rotate(90deg);
+  content: "▾ hide";
 }
 
 .quote-details {
