@@ -861,12 +861,18 @@ function renderAnnotationResult(result) {
     for (const [field, label, type] of editableFields) {
       if (field === "error" && !annotation.error) continue;
       const row = renderField(annotation, index, field, label, type);
-      if (field === "cancer_association_rationale") row.classList.add("field-row-highlight");
+      if (field === "cancer_association_rationale") {
+        row.classList.add("field-row-highlight");
+        fields.appendChild(row);
+        // Evidence for the rationale belongs right next to it, not buried
+        // below the rest of the fields — also keeps the initial card
+        // height down, since the quotes inside are collapsed by default.
+        const evidence = renderSupportingEvidence(annotation);
+        if (evidence) fields.appendChild(evidence);
+        continue;
+      }
       fields.appendChild(row);
     }
-
-    const evidence = renderSupportingEvidence(annotation);
-    if (evidence) card.appendChild(evidence);
 
     list.appendChild(card);
   });
@@ -939,8 +945,22 @@ function renderSupportingEvidence(annotation) {
     section.appendChild(citBlock);
   }
 
-  // Grounding quotes
+  // Grounding quotes — collapsed by default. These are the deepest level
+  // of "show your work" (the actual sentences the annotation was derived
+  // from) and take real vertical space; curators who want to check the
+  // primary source can expand, but the card shouldn't lead with them.
   if (quotes.length) {
+    const quoteDetails = document.createElement("details");
+    quoteDetails.className = "quote-details";
+    const quoteSummary = document.createElement("summary");
+    quoteSummary.className = "quote-summary retrieval-summary";
+    quoteSummary.innerHTML = `
+      <span class="retrieval-count-label">
+        ${quotes.length} supporting quote${quotes.length === 1 ? "" : "s"}
+      </span>
+    `;
+    quoteDetails.appendChild(quoteSummary);
+
     const quoteList = document.createElement("div");
     quoteList.className = "quote-list";
     quotes.forEach((q) => {
@@ -959,7 +979,8 @@ function renderSupportingEvidence(annotation) {
       blockquote.appendChild(cite);
       quoteList.appendChild(blockquote);
     });
-    section.appendChild(quoteList);
+    quoteDetails.appendChild(quoteList);
+    section.appendChild(quoteDetails);
   }
 
   return section;

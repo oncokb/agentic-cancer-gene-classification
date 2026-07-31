@@ -1060,6 +1060,26 @@ body.batch-active .app-shell {
   display: none;
 }
 
+.retrieval-summary::after {
+  content: "▸";
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  transition: transform 0.15s ease;
+}
+
+details[open] > .retrieval-summary::after {
+  transform: rotate(90deg);
+}
+
+.quote-details {
+  margin-top: 8px;
+}
+
+.quote-details .quote-list {
+  margin-top: 7px;
+}
+
 .retrieval-count-label {
   font-size: 12px;
   font-weight: 700;
