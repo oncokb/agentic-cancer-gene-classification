@@ -682,6 +682,17 @@ textarea {
   display: none;
 }
 
+.breakpoint-section summary::after {
+  content: "▸";
+  margin-left: auto;
+  font-size: 11px;
+  transition: transform 0.15s ease;
+}
+
+.breakpoint-section[open] summary::after {
+  transform: rotate(90deg);
+}
+
 .breakpoint-section[open] summary {
   margin-bottom: 10px;
 }

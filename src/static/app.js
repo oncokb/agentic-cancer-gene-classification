@@ -92,21 +92,13 @@ const elements = {
 };
 
 const editableFields = [
-  ["in_oncokb", "In OncoKB", "boolean"],
   ["cancer_associated", "Cancer associated", "boolean"],
   ["cancer_association_rationale", "Rationale", "long"],
-  ["cancer_type_prevalence", "Cancer type prevalence", "text"],
+  ["in_oncokb", "In OncoKB", "boolean"],
+  ["cancer_type_prevalence", "Cancer type prevalence", "long"],
   ["gene_class", "Gene class", "text"],
-  ["signaling_pathways", "Signaling pathways", "text"],
+  ["signaling_pathways", "Signaling pathways", "long"],
   ["gene_summary", "Gene summary", "long"],
-  ["citations", "Supporting citation PMIDs", "list"],
-  ["insufficient_evidence", "Insufficient evidence", "booleanRequired"],
-  ["evidence_support_score", "Evidence support score", "number"],
-  ["evidence_support_explanation", "Evidence support explanation", "long"],
-  ["cache_status", "Cache status", "text"],
-  ["cache_reason", "Cache reason", "text"],
-  ["cached_at", "Cached at", "text"],
-  ["last_pubmed_checked_at", "Last PubMed checked", "text"],
   ["error", "Error", "text"],
 ];
 
@@ -810,10 +802,11 @@ function renderEmptyState(title, body) {
 }
 
 function renderAnnotationResult(result) {
-  const annotations = result.annotations || [];
-  const hasAnnotations = annotations.length > 0;
-  elements.exportCsv.disabled = !hasAnnotations;
-  elements.exportJson.disabled = !hasAnnotations;
+  const allAnnotations = result.annotations || [];
+  const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
+  const hasAnnotations = visibleAnnotations.length > 0;
+  elements.exportCsv.disabled = !allAnnotations.length;
+  elements.exportJson.disabled = !allAnnotations.length;
   elements.shareRun.disabled = !result.run_id;
 
   const total = result.genes_annotated;
@@ -822,17 +815,27 @@ function renderAnnotationResult(result) {
     `${result.fusions_processed} fusion${result.fusions_processed === 1 ? "" : "s"}.`;
 
   if (!hasAnnotations) {
-    renderEmptyState(
-      result.run_error ? "Run stopped" : "No results",
-      result.run_error || "No gene annotations were returned.",
-    );
+    if (allAnnotations.length > 0) {
+      renderEmptyState(
+        "Insufficient evidence",
+        "Every annotated gene had insufficient evidence, so no results are shown here. " +
+          "Export JSON/CSV to review the underlying data.",
+      );
+    } else {
+      renderEmptyState(
+        result.run_error ? "Run stopped" : "No results",
+        result.run_error || "No gene annotations were returned.",
+      );
+    }
     return;
   }
 
   const list = document.createElement("div");
   list.className = "annotation-list";
 
-  annotations.forEach((annotation, index) => {
+  allAnnotations.forEach((annotation, index) => {
+    if (annotation.insufficient_evidence) return;
+
     const card = document.createElement("article");
     card.className = "annotation-card";
     card.id = `gene-${annotation.gene}`;
@@ -860,7 +863,7 @@ function renderAnnotationResult(result) {
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex(annotations);
+  rebuildGeneIndex(visibleAnnotations);
 }
 
 function makePubMedLink(pmid) {
@@ -899,7 +902,7 @@ function renderSupportingEvidence(annotation) {
       <span class="retrieval-count-label">
         ${count} total retrieved PMID${count === 1 ? "" : "s"}
       </span>
-      <span class="retrieval-info-icon" title="Total number of PubMed abstracts fetched during literature retrieval for this gene. A subset of these was selected for synthesis; the PMIDs used in the final annotation appear in the Supporting Citation PMIDs field above.">ⓘ</span>
+      <span class="retrieval-info-icon" title="Total number of PubMed abstracts fetched during literature retrieval for this gene. A subset of these was selected for synthesis; the PMIDs used in the final annotation appear in the Cited on PubMed list below.">ⓘ</span>
     `;
     details.appendChild(summary);
 
