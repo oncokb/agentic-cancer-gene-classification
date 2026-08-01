@@ -83,8 +83,11 @@ class GeneAnnotation(BaseModel):
 
 
 class FusionInput(BaseModel):
-    """Structured fusion input supporting optional tumor type and breakpoint context."""
-    fusion: str = Field(..., description="Gene fusion in GENE1::GENE2 or GENE1--GENE2 format")
+    """Structured gene or fusion input supporting optional tumor type and breakpoint context."""
+    fusion: str = Field(
+        ...,
+        description="Single gene symbol or gene fusion in GENE1::GENE2 or GENE1--GENE2 format",
+    )
     tumor_type: Optional[str] = Field(default=None, description="Tumor type for literature retrieval")
     five_exon: Optional[int] = Field(default=None, description="5' partner exon number at breakpoint")
     three_exon: Optional[int] = Field(default=None, description="3' partner exon number at breakpoint")
@@ -93,11 +96,21 @@ class FusionInput(BaseModel):
     five_transcript: Optional[str] = Field(default=None, description="5' transcript breakpoint")
     three_transcript: Optional[str] = Field(default=None, description="3' transcript breakpoint")
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_gene_input_aliases(cls, data: Any) -> Any:
+        """Allow structured rows to name the required value as gene/input/query."""
+        if isinstance(data, dict) and "fusion" not in data:
+            for alias in ("gene", "input", "query"):
+                if alias in data:
+                    return {**data, "fusion": data[alias]}
+        return data
+
 
 class AnnotateRequest(BaseModel):
     fusions: List[FusionInput] = Field(
         ...,
-        description="Gene fusions with optional tumor type and breakpoint context",
+        description="Gene or fusion inputs with optional tumor type and breakpoint context",
         min_length=1,
     )
     local_backend: Optional[LocalBackend] = Field(
@@ -114,7 +127,7 @@ class AnnotateRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def coerce_string_fusions(cls, data: Any) -> Any:
-        """Accept plain fusion strings alongside structured FusionInput dicts."""
+        """Accept plain gene/fusion strings alongside structured FusionInput dicts."""
         if isinstance(data, dict) and "fusions" in data:
             coerced = []
             for item in data["fusions"]:
@@ -124,6 +137,21 @@ class AnnotateRequest(BaseModel):
                     coerced.append(item)
             data = {**data, "fusions": coerced}
         return data
+
+
+class GeneAnnotateRequest(BaseModel):
+    gene: str = Field(..., description="Single gene symbol to annotate")
+    tumor_type: Optional[str] = Field(default=None, description="Tumor type for literature retrieval")
+    local_backend: Optional[LocalBackend] = Field(
+        default=None,
+        description=(
+            "Optional local agent backend for LLM calls. When unset, the Anthropic SDK path is used."
+        ),
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="Bypass stored gene annotations and recompute results.",
+    )
 
 
 class AnnotationResult(BaseModel):
