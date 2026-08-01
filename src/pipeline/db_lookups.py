@@ -7,6 +7,7 @@ Currently implements:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional, Set
 
@@ -30,34 +31,39 @@ class OncoKBGeneLookup:
     def __init__(self, api_token: Optional[str] = None) -> None:
         self.api_token = api_token if api_token is not None else settings.oncokb_api_token
         self._gene_cache: Optional[Set[str]] = None
+        self._load_lock = asyncio.Lock()
 
     async def load_genes(self, client: httpx.AsyncClient) -> Set[str]:
         if self._gene_cache is not None:
             return self._gene_cache
 
-        if not self.api_token:
-            raise OncoKBConfigurationError(
-                "ONCOKB_API_TOKEN is required for OncoKB membership lookup"
-            )
+        async with self._load_lock:
+            if self._gene_cache is not None:
+                return self._gene_cache
 
-        headers = {
-            "Authorization": f"Bearer {self.api_token}",
-            "Accept": "application/json",
-        }
+            if not self.api_token:
+                raise OncoKBConfigurationError(
+                    "ONCOKB_API_TOKEN is required for OncoKB membership lookup"
+                )
 
-        async def _fetch() -> list:
-            resp = await client.get(ONCOKB_CURATED_GENES_URL, headers=headers, timeout=15.0)
-            resp.raise_for_status()
-            return resp.json()
+            headers = {
+                "Authorization": f"Bearer {self.api_token}",
+                "Accept": "application/json",
+            }
 
-        try:
-            genes = await cached_call("oncokb:curated_genes", _fetch)
-            self._gene_cache = {g["hugoSymbol"] for g in genes if "hugoSymbol" in g}
-            logger.info("Loaded %d OncoKB genes", len(self._gene_cache))
-            return self._gene_cache
-        except httpx.HTTPError as e:
-            logger.error("Failed to load OncoKB genes: %s", e)
-            raise
+            async def _fetch() -> list:
+                resp = await client.get(ONCOKB_CURATED_GENES_URL, headers=headers, timeout=15.0)
+                resp.raise_for_status()
+                return resp.json()
+
+            try:
+                genes = await cached_call("oncokb:curated_genes", _fetch)
+                self._gene_cache = {g["hugoSymbol"] for g in genes if "hugoSymbol" in g}
+                logger.info("Loaded %d OncoKB genes", len(self._gene_cache))
+                return self._gene_cache
+            except httpx.HTTPError as e:
+                logger.error("Failed to load OncoKB genes: %s", e)
+                raise
 
     async def contains(
         self,
