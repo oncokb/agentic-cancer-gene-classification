@@ -1,7 +1,13 @@
 """Tests for latency optimization plumbing."""
 
 import asyncio
+import time
 
+from fastapi.testclient import TestClient
+
+from src import main
+from src.main import app
+from src.models.schema import AnnotationResult
 from src.models.schema import GeneAnnotation, ResolvedGene
 from src.models.schema import AnnotateRequest, LiteratureRecord
 from src.pipeline import orchestrator
@@ -75,3 +81,64 @@ async def test_selection_skips_llm_above_threshold(monkeypatch):
     selected = await select_papers_for_synthesis("GENE", records, max_papers=2)
 
     assert [record.pmid for record in selected] == ["0", "1"]
+
+
+def test_annotation_job_endpoint_streams_partial_results(monkeypatch):
+    async def fake_run_pipeline(
+        fusions,
+        local_backend=None,
+        run_store=None,
+        force_refresh=False,
+        mode="full",
+        on_annotation=None,
+    ):
+        annotation = GeneAnnotation(
+            gene="TP53",
+            fusions=["TP53::BRAF"],
+            cancer_associated=True,
+            cancer_association_rationale="Known tumor suppressor.",
+            gene_summary="TP53 is recurrently altered in cancer.",
+            evidence_support_score=0.95,
+            timings_ms={"total": 1.0},
+        )
+        if on_annotation:
+            await on_annotation(annotation)
+        return AnnotationResult(
+            run_id="run-1",
+            timestamp="2026-08-01T00:00:00+00:00",
+            fusions_processed=1,
+            genes_annotated=1,
+            annotations=[annotation],
+            timings_ms={"total": 2.0},
+        )
+
+    async def fake_persist_run_result(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(main, "_persist_run_result", fake_persist_run_result)
+    app.state.run_store = None
+    client = TestClient(app)
+
+    create_response = client.post(
+        "/v1/annotate/jobs",
+        json={"fusions": ["TP53::BRAF"], "mode": "core"},
+    )
+
+    assert create_response.status_code == 200
+    status_url = create_response.json()["status_url"]
+
+    status_payload = None
+    for _ in range(20):
+        status_response = client.get(status_url)
+        assert status_response.status_code == 200
+        status_payload = status_response.json()
+        if status_payload["status"] == "complete":
+            break
+        time.sleep(0.01)
+
+    assert status_payload is not None
+    assert status_payload["status"] == "complete"
+    assert status_payload["genes_completed"] == 1
+    assert status_payload["annotations"][0]["gene"] == "TP53"
+    assert status_payload["result"]["timings_ms"]["total"] == 2.0

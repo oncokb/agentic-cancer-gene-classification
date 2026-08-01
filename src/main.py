@@ -4,12 +4,14 @@ FastAPI application — manually invokable, Docker/K8s-ready.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -95,6 +97,23 @@ class DevStatusResponse(BaseModel):
     enabled: bool
 
 
+class AnnotationJobCreateResponse(BaseModel):
+    job_id: str
+    status_url: str
+
+
+class AnnotationJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    fusions_processed: int
+    genes_completed: int = 0
+    genes_total: Optional[int] = None
+    annotations: List[GeneAnnotation] = Field(default_factory=list)
+    result: Optional[AnnotationResult] = None
+    error: Optional[str] = None
+    timings_ms: Dict[str, float] = Field(default_factory=dict)
+
+
 class BenchmarkRequest(BaseModel):
     no_judge: bool = Field(
         default=True,
@@ -114,6 +133,23 @@ class BenchmarkRequest(BaseModel):
 def require_dev_mode() -> None:
     if not settings.agcg_dev_mode:
         raise HTTPException(status_code=404, detail="Not found")
+
+
+_annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
+_annotation_jobs_lock = asyncio.Lock()
+
+
+async def _store_annotation_job(job: AnnotationJobStatusResponse) -> None:
+    async with _annotation_jobs_lock:
+        _annotation_jobs[job.job_id] = job
+
+
+async def _get_annotation_job(job_id: str) -> AnnotationJobStatusResponse:
+    async with _annotation_jobs_lock:
+        job = _annotation_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Annotation job not found")
+    return job
 
 
 async def _persist_run_result(
@@ -173,6 +209,67 @@ async def annotate(request: AnnotateRequest, http_request: Request) -> Annotatio
     await _persist_run_result(http_request, request.model_dump(), result)
 
     return result
+
+
+@app.post("/v1/annotate/jobs", response_model=AnnotationJobCreateResponse)
+async def create_annotation_job(
+    request: AnnotateRequest,
+    http_request: Request,
+) -> AnnotationJobCreateResponse:
+    job_id = str(uuid.uuid4())
+    job = AnnotationJobStatusResponse(
+        job_id=job_id,
+        status="queued",
+        fusions_processed=len(request.fusions),
+    )
+    await _store_annotation_job(job)
+
+    async def on_annotation(annotation: GeneAnnotation) -> None:
+        current = await _get_annotation_job(job_id)
+        current.annotations.append(annotation)
+        current.annotations.sort(key=lambda item: item.gene)
+        current.genes_completed = len(current.annotations)
+        await _store_annotation_job(current)
+
+    async def run_job() -> None:
+        current = await _get_annotation_job(job_id)
+        current.status = "running"
+        await _store_annotation_job(current)
+        try:
+            result = await run_pipeline(
+                request.fusions,
+                local_backend=request.local_backend,
+                run_store=http_request.app.state.run_store,
+                force_refresh=request.force_refresh,
+                mode=request.mode,
+                on_annotation=on_annotation,
+            )
+            await _persist_run_result(http_request, request.model_dump(), result)
+            current = await _get_annotation_job(job_id)
+            current.status = "complete"
+            current.result = result
+            current.annotations = result.annotations
+            current.genes_completed = result.genes_annotated
+            current.genes_total = result.genes_annotated
+            current.timings_ms = result.timings_ms
+            await _store_annotation_job(current)
+        except Exception as exc:
+            logger.exception("Annotation job %s failed", job_id)
+            current = await _get_annotation_job(job_id)
+            current.status = "failed"
+            current.error = str(exc)
+            await _store_annotation_job(current)
+
+    asyncio.create_task(run_job())
+    return AnnotationJobCreateResponse(
+        job_id=job_id,
+        status_url=f"/v1/annotate/jobs/{job_id}",
+    )
+
+
+@app.get("/v1/annotate/jobs/{job_id}", response_model=AnnotationJobStatusResponse)
+async def get_annotation_job(job_id: str) -> AnnotationJobStatusResponse:
+    return await _get_annotation_job(job_id)
 
 
 @app.post("/v1/annotate/gene", response_model=GeneAnnotation)

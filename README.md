@@ -21,6 +21,16 @@ Citation precision knobs:
 - `MAX_PAPERS_FOR_SYNTHESIS`: selected PubMed records passed to synthesis.
 - `MAX_CITATIONS_PER_ANNOTATION`: verified PMIDs retained in final output.
 
+Latency knobs:
+
+- `ANNOTATION_GENE_CONCURRENCY`: number of genes annotated concurrently.
+- `LLM_CONCURRENCY`: maximum concurrent LLM calls across retrieval, selection,
+  and synthesis.
+- `PUBMED_STAGED_RETRIEVAL`: when true, Tier 1 PubMed retrieval stops after
+  enough abstracts are found for synthesis instead of running every query family.
+- `SELECTION_LLM_THRESHOLD`: only use the selection LLM when the retrieved
+  corpus is at or below this size; larger corpora use deterministic ranking.
+
 ## API Keys
 
 Copy `.env.example` to `.env` and add only the keys you need for the mode you are
@@ -82,6 +92,16 @@ python -m src.cli \
   --output-csv results.csv
 ```
 
+To prioritize the latency-sensitive fields (`cancer_associated`, rationale,
+gene summary, citations, and evidence support), run in core mode:
+
+```bash
+python -m src.cli \
+  --fusions "TP53::BRAF" \
+  --mode core \
+  --output results.json
+```
+
 To test multiple genes or fusions in one run, pass each input after `--fusions`:
 
 ```bash
@@ -132,7 +152,18 @@ For batch runs or mixed genes and fusions, use `/v1/annotate`:
 uvicorn src.main:app --host 0.0.0.0 --port 8000
 curl -X POST http://127.0.0.1:8000/v1/annotate \
   -H "Content-Type: application/json" \
-  -d '{"fusions":["ALK",{"fusion":"EML4::ALK","tumor_type":"LUAD"}]}'
+  -d '{"fusions":["ALK",{"fusion":"EML4::ALK","tumor_type":"LUAD"}],"mode":"core"}'
+```
+
+For progressive delivery, create an annotation job and poll its status. The
+status response includes completed gene annotations as they finish:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/annotate/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"fusions":["TP53::BRAF","ETV6::NTRK3"],"mode":"core"}'
+
+curl http://127.0.0.1:8000/v1/annotate/jobs/{job_id}
 ```
 
 This path uses the Anthropic SDK for selection, synthesis, benchmark judging, and
@@ -140,6 +171,25 @@ Tier 2 agentic retrieval. In Bedrock mode, direct Anthropic model names must be
 replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL` and
 `BEDROCK_SELECTION_MODEL`, or by setting `SYNTHESIS_MODEL` and `SELECTION_MODEL`
 to Bedrock IDs directly.
+
+## Latency Comparison
+
+The comparison runner executes the same input set twice:
+
+- baseline-like settings: sequential genes, broad Tier 1 retrieval, selection
+  LLM enabled
+- optimized settings: configured concurrency, staged Tier 1 retrieval, and
+  selection skipping for large corpora
+
+```bash
+python -m benchmarks.compare_latency \
+  --fusions "TP53::BRAF" "ETV6::NTRK3" \
+  --mode core \
+  --output latency_report.json
+```
+
+The report includes run-level timings, per-gene retrieval/selection/synthesis
+timings, and total milliseconds plus percent savings.
 
 ## Output Files
 

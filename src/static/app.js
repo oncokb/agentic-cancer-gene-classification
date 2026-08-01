@@ -110,6 +110,7 @@ const elements = {
   // dev-mode annotation backend
   annotateBackendField: document.querySelector("#annotate-backend-field"),
   annotateLocalBackend: document.querySelector("#annotate-local-backend"),
+  annotateMode: document.querySelector("#annotate-mode"),
 };
 
 const statusFields = [
@@ -607,6 +608,10 @@ function setRunning(isRunning) {
   elements.runButton.disabled = isRunning;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function setBenchmarkRunning(isRunning) {
   state.isBenchmarkRunning = isRunning;
   elements.runBenchmarkButton.textContent = isRunning ? "Running..." : "Run Benchmark";
@@ -656,9 +661,9 @@ async function runAnnotation() {
 
   try {
     const localBackend = elements.annotateLocalBackend.value || undefined;
-    const body = { fusions: annotationInputs };
+    const body = { fusions: annotationInputs, mode: elements.annotateMode.value || "full" };
     if (localBackend) body.local_backend = localBackend;
-    const response = await fetch(apiUrl("/v1/annotate"), {
+    const response = await fetch(apiUrl("/v1/annotate/jobs"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -676,15 +681,51 @@ async function runAnnotation() {
       throw new Error(detail || "Request failed");
     }
 
-    const result = await response.json();
-    state.currentResult = result;
-    renderAnnotationResult(result);
+    const job = await response.json();
+    const result = await pollAnnotationJob(job.status_url);
     saveLastResult(result);
     setMessage("Annotation complete. Review fields before exporting.", "info");
   } catch (error) {
     setMessage(formatRunError(error.message), "error");
   } finally {
     setRunning(false);
+  }
+}
+
+async function pollAnnotationJob(statusUrl) {
+  while (true) {
+    const response = await fetch(apiUrl(statusUrl));
+    if (!response.ok) {
+      throw new Error(response.statusText || "Unable to load annotation job status");
+    }
+    const status = await response.json();
+    if (status.status === "failed") {
+      throw new Error(status.error || "Annotation job failed");
+    }
+
+    const partial = status.result || {
+      run_id: status.job_id,
+      timestamp: "",
+      fusions_processed: status.fusions_processed,
+      genes_annotated: status.genes_total || status.genes_completed,
+      annotations: status.annotations || [],
+      timings_ms: status.timings_ms || {},
+    };
+    state.currentResult = partial;
+    renderAnnotationResult(partial);
+    elements.exportCsv.disabled = status.status !== "complete";
+    elements.exportJson.disabled = status.status !== "complete";
+    elements.shareRun.disabled = status.status !== "complete";
+
+    if (status.status === "complete") {
+      state.currentResult = status.result;
+      renderAnnotationResult(status.result);
+      return status.result;
+    }
+
+    const total = status.genes_total || "?";
+    setMessage(`Annotation running: ${status.genes_completed}/${total} genes complete.`, "info");
+    await sleep(1500);
   }
 }
 
