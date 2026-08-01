@@ -3,7 +3,9 @@
 import asyncio
 
 from src.models.schema import GeneAnnotation, ResolvedGene
+from src.models.schema import AnnotateRequest, LiteratureRecord
 from src.pipeline import orchestrator
+from src.pipeline.selection import select_papers_for_synthesis
 
 
 async def test_run_pipeline_parallelizes_genes_and_reports_timings(monkeypatch):
@@ -51,3 +53,25 @@ async def test_run_pipeline_parallelizes_genes_and_reports_timings(monkeypatch):
     assert result.timings_ms["normalization"] >= 0
     assert result.timings_ms["annotation"] >= 0
     assert result.timings_ms["total"] >= 0
+
+
+def test_annotate_request_accepts_core_mode():
+    request = AnnotateRequest(fusions=["TP53::BRAF"], mode="core")
+
+    assert request.mode == "core"
+
+
+async def test_selection_skips_llm_above_threshold(monkeypatch):
+    async def fail_complete_with_tool(**kwargs):
+        raise AssertionError("selection LLM should not be called")
+
+    monkeypatch.setattr("src.pipeline.selection.complete_with_tool", fail_complete_with_tool)
+    monkeypatch.setattr("src.pipeline.selection.settings.selection_llm_threshold", 3)
+    records = [
+        LiteratureRecord(pmid=str(i), title=f"Paper {i}", abstract=f"Abstract {i}")
+        for i in range(5)
+    ]
+
+    selected = await select_papers_for_synthesis("GENE", records, max_papers=2)
+
+    assert [record.pmid for record in selected] == ["0", "1"]

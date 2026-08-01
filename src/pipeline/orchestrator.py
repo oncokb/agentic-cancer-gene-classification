@@ -15,7 +15,7 @@ from time import perf_counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from src.config import settings
-from src.models.schema import AnnotationResult, FusionInput, GeneAnnotation, ResolvedGene
+from src.models.schema import AnnotationMode, AnnotationResult, FusionInput, GeneAnnotation, ResolvedGene
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import retrieve_literature, search_recent_pubmed_pmids
 from src.pipeline.llm_client import resolve_local_backend
@@ -177,6 +177,7 @@ async def _annotate_gene(
     tumor_type: Optional[str] = None,
     local_mode: bool = False,
     local_backend: Optional[str] = None,
+    mode: AnnotationMode = "full",
     oncokb_lookup: Optional[OncoKBGeneLookup] = None,
 ) -> GeneAnnotation:
     """Run the full annotation pipeline for a single gene."""
@@ -252,6 +253,7 @@ async def _annotate_gene(
                 gene_identity=gene_identity,
                 local_mode=local_mode,
                 local_backend=local_backend,
+                mode=mode,
             ),
         )
     except Exception as e:
@@ -315,6 +317,7 @@ async def run_pipeline(
     local_backend: Optional[str] = None,
     run_store: Any = None,
     force_refresh: bool = False,
+    mode: AnnotationMode = "full",
     on_annotation: Optional[AnnotationProgressCallback] = None,
 ) -> AnnotationResult:
     """
@@ -379,6 +382,7 @@ async def run_pipeline(
                     tumor_type=tumor_type,
                     local_mode=local_mode,
                     local_backend=local_backend,
+                    mode=mode,
                     oncokb_lookup=oncokb_lookup,
                 )
             if force_refresh and annotation.cache_status == "refreshed":

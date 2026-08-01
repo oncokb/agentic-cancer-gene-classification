@@ -407,38 +407,88 @@ async def _tier1_retrieve(
       4. Tumor-type-specific query with alias expansion when tumor_type is supplied
       5. Co-query with each fusion partner
     """
-    queries = [
+    evidence_queries = _evidence_priority_queries(gene)
+    stage_1 = [
         f'"{gene}"[Gene Name] AND cancer[MeSH Terms]',
-        f'"{gene}" AND (cancer OR tumor OR oncology OR carcinoma)',
-        *_evidence_priority_queries(gene),
     ]
     if tumor_type:
         tt = _tumor_type_query_fragment(tumor_type)
-        queries.insert(0, f'"{gene}" AND {tt}')
+        stage_1.insert(0, f'"{gene}" AND {tt}')
+
+    stage_2 = [
+        f'"{gene}" AND (cancer OR tumor OR oncology OR carcinoma)',
+        evidence_queries[0],
+    ]
+    stage_3 = [
+        *evidence_queries[1:],
+    ]
     for partner in _fusion_partners(gene, fusions or [])[:2]:
-        queries.append(f'"{gene}" AND "{partner}"')
+        stage_3.append(f'"{gene}" AND "{partner}"')
         if tumor_type:
-            queries.append(f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}')
-    queries = list(dict.fromkeys(queries))
+            stage_3.append(f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}')
+
+    stages = [
+        list(dict.fromkeys(stage))
+        for stage in (stage_1, stage_2, stage_3)
+        if stage
+    ]
+    queries = list(dict.fromkeys(query for stage in stages for query in stage))
+
+    if not settings.pubmed_staged_retrieval:
+        async with httpx.AsyncClient() as client:
+            pmid_lists = await asyncio.gather(
+                *[_esearch(q, settings.pubmed_max_results, client) for q in queries]
+            )
+            seen: Set[str] = set()
+            merged: List[str] = []
+            for pmids in pmid_lists:
+                for pmid in pmids:
+                    if pmid not in seen:
+                        seen.add(pmid)
+                        merged.append(pmid)
+            fetch_cap = settings.pubmed_max_results * len(queries)
+            records = await _efetch(merged[:fetch_cap], client)
+
+        records = _rank_records(records)
+        logger.info(
+            "Tier 1: %d abstracts for %s (%d queries, %d unique PMIDs before cap)",
+            len(records), gene, len(queries), len(merged),
+        )
+        return records
+
+    stop_target = max(settings.min_papers_for_strong_association, settings.max_papers_for_synthesis)
+    all_records: Dict[str, LiteratureRecord] = {}
+    seen_pmids: Set[str] = set()
+    searched_queries = 0
 
     async with httpx.AsyncClient() as client:
-        pmid_lists = await asyncio.gather(
-            *[_esearch(q, settings.pubmed_max_results, client) for q in queries]
-        )
-        seen: Set[str] = set()
-        merged: List[str] = []
-        for pmids in pmid_lists:
-            for pmid in pmids:
-                if pmid not in seen:
-                    seen.add(pmid)
-                    merged.append(pmid)
-        fetch_cap = settings.pubmed_max_results * len(queries)
-        records = await _efetch(merged[:fetch_cap], client)
+        for stage in stages:
+            searched_queries += len(stage)
+            pmid_lists = await asyncio.gather(
+                *[_esearch(q, settings.pubmed_max_results, client) for q in stage]
+            )
+            stage_pmids: List[str] = []
+            for pmids in pmid_lists:
+                for pmid in pmids:
+                    if pmid not in seen_pmids:
+                        seen_pmids.add(pmid)
+                        stage_pmids.append(pmid)
+            stage_records = await _efetch(stage_pmids, client)
+            for record in stage_records:
+                all_records[record.pmid] = record
 
-    records = _rank_records(records)
+            ranked = _rank_records(list(all_records.values()))
+            if len(ranked) >= stop_target:
+                logger.info(
+                    "Tier 1 staged: %d abstracts for %s after %d/%d queries",
+                    len(ranked), gene, searched_queries, len(queries),
+                )
+                return ranked
+
+    records = _rank_records(list(all_records.values()))
     logger.info(
-        "Tier 1: %d abstracts for %s (%d queries, %d unique PMIDs before cap)",
-        len(records), gene, len(queries), len(merged),
+        "Tier 1 staged: %d abstracts for %s after all %d queries",
+        len(records), gene, searched_queries,
     )
     return records
 

@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
             "when --local is provided without a backend."
         ),
     )
+    parser.add_argument(
+        "--mode",
+        choices=("full", "core"),
+        default="full",
+        help="Use 'core' to prioritize the latency-sensitive annotation fields.",
+    )
     return parser.parse_args()
 
 
@@ -80,7 +86,7 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    result = asyncio.run(run_pipeline(fusions, local_backend=args.local))
+    result = asyncio.run(run_pipeline(fusions, local_backend=args.local, mode=args.mode))
     output = result.model_dump_json(indent=2)
 
     if args.output_csv:

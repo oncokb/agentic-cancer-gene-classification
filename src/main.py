@@ -164,6 +164,7 @@ async def annotate(request: AnnotateRequest, http_request: Request) -> Annotatio
             local_backend=request.local_backend,
             run_store=http_request.app.state.run_store,
             force_refresh=request.force_refresh,
+            mode=request.mode,
         )
     except Exception as e:
         logger.exception("Pipeline error")
@@ -189,6 +190,7 @@ async def annotate_gene(request: GeneAnnotateRequest, http_request: Request) -> 
             local_backend=request.local_backend,
             run_store=http_request.app.state.run_store,
             force_refresh=request.force_refresh,
+            mode=request.mode,
         )
     except Exception as e:
         logger.exception("Gene annotation pipeline error")

@@ -13,7 +13,7 @@ import logging
 from typing import Dict, List, Optional
 
 from src.config import settings
-from src.models.schema import GeneAnnotation, LiteratureRecord
+from src.models.schema import AnnotationMode, GeneAnnotation, LiteratureRecord
 from src.pipeline.citation_precision import filter_and_rank_citations
 from src.pipeline.literature import _HIGH_IMPACT_JOURNALS, _publication_evidence_rank
 from src.pipeline.llm_client import complete_with_tool
@@ -159,6 +159,25 @@ ANNOTATE_TOOL: dict = {
     },
 }
 
+CORE_ANNOTATE_TOOL: dict = {
+    "name": "annotate_gene",
+    "description": (
+        "Produce the latency-sensitive core cancer gene annotation fields grounded in retrieved literature. "
+        "Only cite PMIDs explicitly provided in the context."
+    ),
+    "input_schema": {
+        "type": "object",
+        "required": ["cancer_associated", "insufficient_evidence"],
+        "properties": {
+            "cancer_associated": ANNOTATE_TOOL["input_schema"]["properties"]["cancer_associated"],
+            "insufficient_evidence": ANNOTATE_TOOL["input_schema"]["properties"]["insufficient_evidence"],
+            "cancer_association_rationale": ANNOTATE_TOOL["input_schema"]["properties"]["cancer_association_rationale"],
+            "gene_summary": ANNOTATE_TOOL["input_schema"]["properties"]["gene_summary"],
+            "citations": ANNOTATE_TOOL["input_schema"]["properties"]["citations"],
+        },
+    },
+}
+
 
 def _build_user_prompt(
     gene: str,
@@ -168,6 +187,7 @@ def _build_user_prompt(
     records: List[LiteratureRecord],
     retrieval_tier: int,
     gene_identity: Optional[str] = None,
+    mode: AnnotationMode = "full",
 ) -> str:
     tier_label = (
         "Tier 1 (direct NCBI structured query — abundant indexed literature)"
@@ -186,6 +206,12 @@ def _build_user_prompt(
         "",
         f"### Retrieved PubMed abstracts ({len(records)} papers):",
     ]
+    if mode == "core":
+        lines += [
+            "",
+            "Core mode: prioritize cancer_associated, cancer_association_rationale, "
+            "gene_summary, citations, and evidence support. Omit non-core fields.",
+        ]
 
     if not records:
         lines.append("No abstracts retrieved. Set insufficient_evidence: true.")
@@ -197,7 +223,7 @@ def _build_user_prompt(
                 "---",
                 f"PMID: {rec.pmid}{journal_tag}{impact_tag}",
                 f"Title: {rec.title}",
-                f"Abstract: {rec.abstract}",
+                f"Abstract: {rec.abstract[:900] if mode == 'core' else rec.abstract}",
             ]
 
     return "\n".join(lines)
@@ -308,6 +334,7 @@ async def synthesize_gene_annotation(
     gene_identity: Optional[str] = None,
     local_mode: bool = False,
     local_backend: Optional[str] = None,
+    mode: AnnotationMode = "full",
 ) -> Dict:
     """
     Call Claude to produce a structured annotation. Returns raw tool-use input dict.
@@ -321,13 +348,15 @@ async def synthesize_gene_annotation(
         records,
         retrieval_tier,
         gene_identity,
+        mode,
     )
+    tool = CORE_ANNOTATE_TOOL if mode == "core" else ANNOTATE_TOOL
     tool_input = await complete_with_tool(
         model=settings.synthesis_model,
         system=SYSTEM_PROMPT,
         user=user_prompt,
-        tool=ANNOTATE_TOOL,
-        max_tokens=2048,
+        tool=tool,
+        max_tokens=1024 if mode == "core" else 2048,
         local_mode=local_mode,
         local_backend=local_backend,
         model_purpose="synthesis",
