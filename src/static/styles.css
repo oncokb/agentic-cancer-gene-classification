@@ -68,7 +68,7 @@ button:disabled {
   overflow: auto;
   border-right: 1px solid var(--line);
   background: #edf3f2;
-  padding: 20px;
+  padding: 20px 28px 20px 20px;
 }
 
 .brand h1,
@@ -406,13 +406,6 @@ textarea {
   font-size: 13px;
 }
 
-.review-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
-}
-
 .review-badge {
   display: inline-flex;
   align-items: center;
@@ -465,14 +458,108 @@ textarea {
   white-space: nowrap;
 }
 
-.annotation-fields {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
-  gap: 12px;
+.status-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 8px;
 }
 
-.annotation-fields .wide {
-  grid-column: 1 / -1;
+.status-value {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.status-yes {
+  color: var(--ok);
+}
+
+.status-no {
+  color: var(--muted);
+}
+
+.status-unknown {
+  color: var(--muted);
+}
+
+.annotation-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.field-row-label {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.field-row-value {
+  display: inline-block;
+  font-size: 14px;
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+/* Same rounded-pill language as .review-badge/.citation-link elsewhere
+   in the card, so a parsed list of cancer-type entries reads as a
+   designed element instead of raw "- " text lines. */
+.cancer-type-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cancer-type-chip {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 11px;
+  background: var(--surface-strong);
+  line-height: 1.3;
+}
+
+.cancer-type-chip-main {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.cancer-type-chip-context {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Rationale is the primary signal on the card — same accent-border
+   callout treatment already used for supporting-quote blocks, so it
+   reads as "the important one" using a pattern already established
+   elsewhere in this app rather than a new visual language. */
+.field-row-highlight {
+  border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0;
+  background: var(--surface-strong);
+  padding: 10px 14px;
+}
+
+.field-row-highlight .field-row-label {
+  color: var(--accent-strong);
+}
+
+.field-row-highlight .field-row-value {
+  font-size: 16px;
+  font-weight: 500;
+  font-style: italic;
 }
 
 .benchmark-report {
@@ -971,7 +1058,7 @@ body.batch-active .app-shell {
 
 .supporting-evidence-heading {
   margin: 0 0 10px;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 800;
   color: var(--muted);
   text-transform: uppercase;
@@ -983,16 +1070,44 @@ body.batch-active .app-shell {
 }
 
 .retrieval-summary {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   cursor: pointer;
   list-style: none;
   user-select: none;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+}
+
+.retrieval-summary:hover,
+.retrieval-summary:focus-visible {
+  background: var(--surface-strong);
 }
 
 .retrieval-summary::-webkit-details-marker {
   display: none;
+}
+
+.retrieval-summary::after {
+  content: "▸ show";
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  transition: transform 0.15s ease;
+}
+
+details[open] > .retrieval-summary::after {
+  content: "▾ hide";
+}
+
+.quote-details {
+  margin-top: 8px;
+}
+
+.quote-details .quote-list {
+  margin-top: 7px;
 }
 
 .retrieval-count-label {
