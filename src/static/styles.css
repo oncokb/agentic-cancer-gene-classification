@@ -55,7 +55,6 @@ button:disabled {
 .app-shell {
   display: grid;
   grid-template-columns: minmax(300px, 360px) 1fr;
-  gap: 24px;
   height: 100vh;
   min-height: 0;
   overflow: hidden;
@@ -69,7 +68,7 @@ button:disabled {
   overflow: auto;
   border-right: 1px solid var(--line);
   background: #edf3f2;
-  padding: 20px;
+  padding: 20px 28px 20px 20px;
 }
 
 .brand h1,
@@ -377,13 +376,6 @@ textarea {
   font-size: 13px;
 }
 
-.review-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
-}
-
 .review-badge {
   display: inline-flex;
   align-items: center;
@@ -489,7 +481,7 @@ textarea {
 
 .field-row-label {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -497,6 +489,7 @@ textarea {
 
 .field-row-value {
   cursor: pointer;
+  font-size: 14px;
   white-space: pre-wrap;
   line-height: 1.5;
   border-radius: 4px;
@@ -562,7 +555,7 @@ textarea {
 }
 
 .field-row-highlight .field-row-value {
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 500;
   margin: 0;
   padding: 0;
@@ -1069,7 +1062,7 @@ body.batch-active .app-shell {
 
 .supporting-evidence-heading {
   margin: 0 0 10px;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 800;
   color: var(--muted);
   text-transform: uppercase;

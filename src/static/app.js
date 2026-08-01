@@ -847,7 +847,6 @@ function renderAnnotationResult(result) {
         <div>
           <h3>${escapeHtml(annotation.gene)}</h3>
           <div class="subtle">${escapeHtml(formatList(annotation.fusions))}</div>
-          <div class="review-badges">${renderCompactBadges(annotation)}</div>
           <div class="status-line-slot"></div>
         </div>
         <span class="status-pill">${escapeHtml(annotation.date_annotated || "")}</span>
@@ -1057,59 +1056,6 @@ function renderBenchmarkRow(row) {
       <td>${escapeHtml(formatList(row.citation_fn))}</td>
     </tr>
   `;
-}
-
-// "Review: High/Medium/Low" — explicitly a curator review-workflow
-// signal (how urgently this gene's annotation needs a look), not a
-// restatement of cancer_associated/in_oncokb — those have their own
-// plain-text answer in the status line, so this badge doesn't repeat
-// them, just says how urgently to look.
-function reviewPriority(annotation) {
-  if (annotation.insufficient_evidence) {
-    return {
-      label: "Review: Low",
-      tone: "low",
-      title: "Retrieved evidence was insufficient for a confident cancer annotation.",
-    };
-  }
-  if (annotation.cancer_associated === false) {
-    return {
-      label: "Review: Low",
-      tone: "low",
-      title: "Current evidence does not support a cancer association.",
-    };
-  }
-  if (annotation.in_oncokb) {
-    return {
-      label: "Review: High",
-      tone: "high",
-      title: "Already represented in OncoKB — may need curator attention to reconcile or update.",
-    };
-  }
-  if (annotation.cancer_associated === true) {
-    return {
-      label: "Review: Medium",
-      tone: "neutral",
-      title: "New cancer-associated candidate, not yet in OncoKB — review before export.",
-    };
-  }
-  return { label: "Review: Medium", tone: "neutral", title: "Review this result before export." };
-}
-
-function compactBadges(annotation) {
-  return [reviewPriority(annotation)].filter(Boolean);
-}
-
-function renderCompactBadges(annotation) {
-  return compactBadges(annotation)
-    .map(
-      (badge) => `
-        <span class="review-badge ${escapeHtml(badge.tone)}" title="${escapeHtml(badge.title)}">
-          ${escapeHtml(badge.label)}
-        </span>
-      `,
-    )
-    .join("");
 }
 
 function formatFieldValue(value, type) {
