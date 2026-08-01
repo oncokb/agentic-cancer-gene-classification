@@ -466,18 +466,8 @@ textarea {
 }
 
 .status-value {
-  cursor: pointer;
   font-size: 13px;
   font-weight: 700;
-  border-radius: 4px;
-  padding: 1px 2px;
-  border-bottom: 1px dashed var(--line);
-}
-
-.status-value:hover,
-.status-value:focus-visible {
-  background: var(--surface-strong);
-  border-bottom-color: var(--accent);
 }
 
 .status-yes {
@@ -490,13 +480,6 @@ textarea {
 
 .status-unknown {
   color: var(--muted);
-}
-
-.status-control {
-  font-size: 13px;
-  font-weight: 700;
-  padding: 1px 4px;
-  width: auto;
 }
 
 .annotation-fields {
@@ -521,24 +504,8 @@ textarea {
 
 .field-row-value {
   display: inline-block;
-  cursor: pointer;
   font-size: 14px;
   white-space: pre-wrap;
-  line-height: 1.5;
-  border-radius: 4px;
-  padding: 2px 4px;
-  margin: -2px -4px;
-  border-bottom: 1px dashed var(--line);
-}
-
-.field-row-value:hover,
-.field-row-value:focus-visible {
-  background: var(--surface-strong);
-  border-bottom-color: var(--accent);
-}
-
-.field-row-control {
-  font-size: 14px;
   line-height: 1.5;
 }
 
@@ -593,13 +560,6 @@ textarea {
   font-size: 16px;
   font-weight: 500;
   font-style: italic;
-  margin: 0;
-  padding: 0;
-}
-
-.field-row-highlight .field-row-value:hover,
-.field-row-highlight .field-row-value:focus-visible {
-  background: rgba(15, 118, 110, 0.08);
 }
 
 .benchmark-report {
