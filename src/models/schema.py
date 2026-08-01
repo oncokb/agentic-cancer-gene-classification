@@ -34,6 +34,47 @@ class SupportingQuote(BaseModel):
     quote: str
 
 
+class FusionTreatmentKnowledge(BaseModel):
+    """Deterministic, CIViC-sourced treatment/evidence data for a fusion, keyed by
+    gene pair (e.g. EML4::ALK). Never LLM-generated — displayed as-is."""
+
+    oncogenic: Optional[str] = None
+    therapies: List[str] = Field(default_factory=list)
+    evidence: List[dict] = Field(default_factory=list)
+    diseases: List[str] = Field(default_factory=list)
+    sources: List[str] = Field(default_factory=list)
+
+
+class FusionPartnerContext(BaseModel):
+    """Domain-retention and breakpoint context for one side of a fusion."""
+
+    gene: str
+    side: Literal["five_prime", "three_prime"]
+    transcript_id: Optional[str] = None
+    exon: Optional[str] = None
+    genomic_breakpoint: Optional[str] = None
+    transcript_breakpoint: Optional[str] = None
+    protein_breakpoint: Optional[str] = None
+    retained_domains: List[str] = Field(default_factory=list)
+    lost_domains: List[str] = Field(default_factory=list)
+    disrupted_domains: List[str] = Field(default_factory=list)
+
+
+class FusionPositionContext(BaseModel):
+    """Protein-level fusion context: per-partner domain retention plus fusion-level
+    treatment knowledge. Fetched on demand, never blocking the core annotation."""
+
+    fusion: str
+    five_prime: FusionPartnerContext
+    three_prime: FusionPartnerContext
+    kinase_gene: Optional[str] = None
+    kinase_gene_side: Optional[str] = None
+    kinase_domain_status: Optional[str] = None
+    knowledge: Optional[FusionTreatmentKnowledge] = None
+    source: Literal["input", "genome_nexus"] = "input"
+    error: Optional[str] = None
+
+
 class GeneAnnotation(BaseModel):
     """One row in Nicole's spreadsheet, keyed by gene."""
 
