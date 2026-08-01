@@ -112,10 +112,13 @@ const elements = {
   annotateLocalBackend: document.querySelector("#annotate-local-backend"),
 };
 
+const statusFields = [
+  ["cancer_associated", "Cancer associated"],
+  ["in_oncokb", "In OncoKB"],
+];
+
 const editableFields = [
-  ["cancer_associated", "Cancer associated", "boolean"],
   ["cancer_association_rationale", "Rationale", "long"],
-  ["in_oncokb", "In OncoKB", "boolean"],
   ["cancer_type_prevalence", "Cancer type prevalence", "long"],
   ["gene_class", "Gene class", "text"],
   ["signaling_pathways", "Signaling pathways", "long"],
@@ -898,7 +901,7 @@ function renderAnnotationResult(result) {
   const list = document.createElement("div");
   list.className = "annotation-list";
 
-  allAnnotations.forEach((annotation, index) => {
+  allAnnotations.forEach((annotation) => {
     if (annotation.insufficient_evidence) return;
 
     const card = document.createElement("article");
@@ -909,20 +912,31 @@ function renderAnnotationResult(result) {
         <div>
           <h3>${escapeHtml(annotation.gene)}</h3>
           <div class="subtle">${escapeHtml(annotation.fusions?.length ? formatList(annotation.fusions) : "Gene lookup")}</div>
-          <div class="review-badges">${renderCompactBadges(annotation)}</div>
+          <div class="status-line-slot"></div>
         </div>
         <span class="status-pill">${escapeHtml(annotation.date_annotated || "")}</span>
       </header>
       <div class="annotation-fields"></div>
     `;
 
+    card.querySelector(".status-line-slot").appendChild(renderStatusLine(annotation));
+
     const fields = card.querySelector(".annotation-fields");
     for (const [field, label, type] of editableFields) {
-      fields.appendChild(renderEditableField(annotation, index, field, label, type));
+      if (field === "error" && !annotation.error) continue;
+      const row = renderField(annotation, field, label, type);
+      if (field === "cancer_association_rationale") {
+        row.classList.add("field-row-highlight");
+        fields.appendChild(row);
+        // Evidence for the rationale belongs right next to it, not buried
+        // below the rest of the fields — also keeps the initial card
+        // height down, since the quotes inside are collapsed by default.
+        const evidence = renderSupportingEvidence(annotation);
+        if (evidence) fields.appendChild(evidence);
+        continue;
+      }
+      fields.appendChild(row);
     }
-
-    const evidence = renderSupportingEvidence(annotation);
-    if (evidence) card.appendChild(evidence);
 
     list.appendChild(card);
   });
@@ -967,7 +981,7 @@ function renderSupportingEvidence(annotation) {
       <span class="retrieval-count-label">
         ${count} total retrieved PMID${count === 1 ? "" : "s"}
       </span>
-      <span class="retrieval-info-icon" title="Total number of PubMed abstracts fetched during literature retrieval for this gene. A subset of these was selected for synthesis; the PMIDs used in the final annotation appear in the Cited on PubMed list below.">ⓘ</span>
+      <span class="retrieval-info-icon" title="Click to expand and see every PMID retrieved during literature search for this gene. A subset of these was selected for synthesis; the PMIDs actually used in the final annotation appear in the Cited on PubMed list below.">ⓘ</span>
     `;
     details.appendChild(summary);
 
@@ -995,8 +1009,22 @@ function renderSupportingEvidence(annotation) {
     section.appendChild(citBlock);
   }
 
-  // Grounding quotes
+  // Grounding quotes — collapsed by default. These are the deepest level
+  // of "show your work" (the actual sentences the annotation was derived
+  // from) and take real vertical space; curators who want to check the
+  // primary source can expand, but the card shouldn't lead with them.
   if (quotes.length) {
+    const quoteDetails = document.createElement("details");
+    quoteDetails.className = "quote-details";
+    const quoteSummary = document.createElement("summary");
+    quoteSummary.className = "quote-summary retrieval-summary";
+    quoteSummary.innerHTML = `
+      <span class="retrieval-count-label">
+        ${quotes.length} supporting quote${quotes.length === 1 ? "" : "s"}
+      </span>
+    `;
+    quoteDetails.appendChild(quoteSummary);
+
     const quoteList = document.createElement("div");
     quoteList.className = "quote-list";
     quotes.forEach((q) => {
@@ -1015,7 +1043,8 @@ function renderSupportingEvidence(annotation) {
       blockquote.appendChild(cite);
       quoteList.appendChild(blockquote);
     });
-    section.appendChild(quoteList);
+    quoteDetails.appendChild(quoteList);
+    section.appendChild(quoteDetails);
   }
 
   return section;
@@ -1094,143 +1123,115 @@ function renderBenchmarkRow(row) {
   `;
 }
 
-function reviewPriority(annotation) {
-  if (annotation.insufficient_evidence) {
-    return {
-      label: "Low priority",
-      tone: "low",
-      title: "Retrieved evidence was insufficient for a confident cancer annotation.",
-    };
+function formatFieldValue(value, type) {
+  if (type === "boolean" || type === "booleanRequired") {
+    if (value === null || value === undefined) return "—";
+    return value ? "Yes" : "No";
   }
-  if (annotation.cancer_associated === false) {
-    return {
-      label: "Low priority",
-      tone: "low",
-      title: "Current evidence does not support a cancer association.",
-    };
+  if (type === "list") {
+    const items = Array.isArray(value) ? value : [];
+    return items.length ? items.map((item) => `• ${item}`).join("\n") : "—";
   }
-  if (annotation.in_oncokb) {
-    return {
-      label: "High priority",
-      tone: "high",
-      title: "This gene is already represented in OncoKB and may need curator attention.",
-    };
-  }
-  if (annotation.cancer_associated === true) {
-    return { label: "Review", tone: "neutral", title: "Review this result before export." };
-  }
-  return { label: "Review", tone: "neutral", title: "Review this result before export." };
+  return value === null || value === undefined || value === "" ? "—" : String(value);
 }
 
-function evidenceSignal(annotation) {
-  if (annotation.insufficient_evidence) {
-    return {
-      label: "Insufficient evidence",
-      tone: "low",
-      title: "The model did not find enough grounded evidence to classify this gene.",
-    };
-  }
-  if (annotation.cancer_associated === false) {
-    return {
-      label: "No cancer evidence",
-      tone: "low",
-      title: "Current retrieved evidence does not support a cancer association.",
-    };
-  }
-  if (annotation.cancer_associated === true) {
-    return {
-      label: "Cancer associated",
-      tone: "neutral",
-      title: "Literature supports a cancer association.",
-    };
-  }
-  return null;
+// cancer_type_prevalence is a "- entry per line" string (see synthesis
+// prompt) — parsed into chips for display so it doesn't read as a raw
+// text dump next to the rest of the redesigned card. Editing still
+// works on the same underlying string; only the at-rest display differs.
+function parseCancerTypeEntries(value) {
+  if (!value) return [];
+  return String(value)
+    .split("\n")
+    .map((line) => line.replace(/^[\s•-]+/, "").trim())
+    .filter(Boolean);
 }
 
-function compactBadges(annotation) {
-  return [
-    reviewPriority(annotation),
-    evidenceSignal(annotation),
-    annotation.in_oncokb
-      ? { label: "OncoKB", tone: "high", title: "OncoKB membership lookup returned true." }
-      : null,
-  ].filter(Boolean);
+function renderCancerTypeChips(value) {
+  const entries = parseCancerTypeEntries(value);
+  if (!entries.length) return null;
+
+  const wrap = document.createElement("div");
+  wrap.className = "cancer-type-chips";
+
+  entries.forEach((entry) => {
+    const match = entry.match(/^(.*?)\s*(\([^)]*\))?$/);
+    const main = (match ? match[1] : entry).trim();
+    const context = match && match[2] ? match[2] : "";
+
+    const chip = document.createElement("span");
+    chip.className = "cancer-type-chip";
+
+    const mainSpan = document.createElement("span");
+    mainSpan.className = "cancer-type-chip-main";
+    mainSpan.textContent = main;
+    chip.appendChild(mainSpan);
+
+    if (context) {
+      const contextSpan = document.createElement("span");
+      contextSpan.className = "cancer-type-chip-context";
+      contextSpan.textContent = ` ${context}`;
+      chip.appendChild(contextSpan);
+    }
+
+    wrap.appendChild(chip);
+  });
+
+  return wrap;
 }
 
-function renderCompactBadges(annotation) {
-  return compactBadges(annotation)
-    .map(
-      (badge) => `
-        <span class="review-badge ${escapeHtml(badge.tone)}" title="${escapeHtml(badge.title)}">
-          ${escapeHtml(badge.label)}
-        </span>
-      `,
-    )
-    .join("");
+// Populates a field-row-value display element — chips for
+// cancer_type_prevalence, plain text (via formatFieldValue) otherwise.
+function populateFieldDisplay(display, annotation, field, type) {
+  if (field === "cancer_type_prevalence") {
+    const chips = renderCancerTypeChips(annotation[field]);
+    if (chips) {
+      display.replaceChildren(chips);
+      return;
+    }
+  }
+  display.textContent = formatFieldValue(annotation[field], type);
 }
 
-function renderEditableField(annotation, index, field, label, type) {
-  const wrapper = document.createElement("label");
-  wrapper.className = type === "long" || type === "list" ? "field wide" : "field";
+// Plain read-only label + value. This card is for reviewing/understanding
+// a run, not correcting it yet — inline editing was removed since there's
+// no annotation/approval workflow for it to feed into right now. Revisit
+// when that workflow exists.
+function renderField(annotation, field, label, type) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "field-row";
+
   const labelElement = document.createElement("span");
+  labelElement.className = "field-row-label";
   labelElement.textContent = label;
   wrapper.appendChild(labelElement);
 
-  let control;
-  if (type === "boolean" || type === "booleanRequired") {
-    control = document.createElement("select");
-    if (type === "boolean") {
-      control.appendChild(new Option("", ""));
-    }
-    control.appendChild(new Option("TRUE", "true"));
-    control.appendChild(new Option("FALSE", "false"));
-    control.value =
-      annotation[field] === null || annotation[field] === undefined
-        ? ""
-        : String(Boolean(annotation[field]));
-  } else if (type === "long" || type === "list") {
-    control = document.createElement("textarea");
-    control.rows = type === "long" ? 4 : 2;
-    control.value =
-      type === "list" ? formatList(annotation[field]) : annotation[field] || "";
-  } else {
-    control = document.createElement("input");
-    control.type = type === "number" ? "number" : "text";
-    if (field === "evidence_support_score") {
-      control.step = "0.01";
-      control.min = "0";
-      control.max = "1";
-    }
-    control.value =
-      annotation[field] === null || annotation[field] === undefined ? "" : annotation[field];
-  }
+  const value = document.createElement("div");
+  value.className = "field-row-value";
+  populateFieldDisplay(value, annotation, field, type);
+  wrapper.appendChild(value);
 
-  control.dataset.index = index;
-  control.dataset.field = field;
-  control.dataset.type = type;
-  control.addEventListener("input", handleAnnotationEdit);
-  wrapper.appendChild(control);
   return wrapper;
 }
 
-function handleAnnotationEdit(event) {
-  if (!state.currentResult) return;
-  const { index, field, type } = event.target.dataset;
-  const annotation = state.currentResult.annotations[Number(index)];
-  let value = event.target.value;
+// Compact Yes/No status for the two booleans curators check first —
+// plain colored text next to the header, not a form field.
+function renderStatusLine(annotation) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "status-line";
 
-  if (type === "boolean" || type === "booleanRequired") {
-    value = value === "" ? null : value === "true";
-  } else if (type === "list") {
-    value = value
-      .split(";")
-      .map((item) => item.trim())
-      .filter(Boolean);
-  } else if (type === "number") {
-    value = value === "" ? 0 : Number(value);
+  for (const [field, label] of statusFields) {
+    const value = annotation[field];
+    const text = value === null || value === undefined ? "—" : value ? "Yes" : "No";
+    const item = document.createElement("span");
+    item.className =
+      "status-value " +
+      (value === true ? "status-yes" : value === false ? "status-no" : "status-unknown");
+    item.textContent = `${label}: ${text}`;
+    wrapper.appendChild(item);
   }
 
-  annotation[field] = value;
+  return wrapper;
 }
 
 // ---------------------------------------------------------------------------
