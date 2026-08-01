@@ -1194,6 +1194,80 @@ details[open] > .retrieval-summary::after {
   text-decoration: underline;
 }
 
+/* Domains & treatments — reuses the same collapsible disclosure pattern as
+   Supporting Evidence (.retrieval-details/.retrieval-summary) so a curator
+   who already knows that affordance recognizes it here immediately. */
+.domain-context-body {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.domain-partners {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.domain-partner-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+
+.domain-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+/* Same rounded-pill language as .review-badge, colored by domain status. */
+.domain-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid var(--line);
+}
+
+.domain-chip-retained {
+  border-color: #b8dec9;
+  background: #dff3e8;
+  color: var(--ok);
+}
+
+.domain-chip-disrupted {
+  border-color: #d4c39b;
+  background: #fff6db;
+  color: #7c5a00;
+}
+
+.domain-chip-lost {
+  border-color: #d6dce1;
+  background: #f2f5f7;
+  color: var(--muted);
+}
+
+.domain-kinase-callout {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+
+.fusion-knowledge {
+  margin-top: 12px;
+}
+
+.fusion-knowledge-sources {
+  margin-top: 5px;
+  font-size: 11px;
+}
+
 .hidden {
   display: none !important;
 }
