@@ -55,6 +55,7 @@ button:disabled {
 .app-shell {
   display: grid;
   grid-template-columns: minmax(300px, 360px) 1fr;
+  gap: 24px;
   height: 100vh;
   min-height: 0;
   overflow: hidden;

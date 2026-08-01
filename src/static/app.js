@@ -1059,67 +1059,45 @@ function renderBenchmarkRow(row) {
   `;
 }
 
+// "Review: High/Medium/Low" — explicitly a curator review-workflow
+// signal (how urgently this gene's annotation needs a look), not a
+// restatement of cancer_associated/in_oncokb — those have their own
+// plain-text answer in the status line, so this badge doesn't repeat
+// them, just says how urgently to look.
 function reviewPriority(annotation) {
   if (annotation.insufficient_evidence) {
     return {
-      label: "Low priority",
+      label: "Review: Low",
       tone: "low",
       title: "Retrieved evidence was insufficient for a confident cancer annotation.",
     };
   }
   if (annotation.cancer_associated === false) {
     return {
-      label: "Low priority",
+      label: "Review: Low",
       tone: "low",
       title: "Current evidence does not support a cancer association.",
     };
   }
   if (annotation.in_oncokb) {
     return {
-      label: "High priority",
+      label: "Review: High",
       tone: "high",
-      title: "This gene is already represented in OncoKB and may need curator attention.",
-    };
-  }
-  if (annotation.cancer_associated === true) {
-    return { label: "Review", tone: "neutral", title: "Review this result before export." };
-  }
-  return { label: "Review", tone: "neutral", title: "Review this result before export." };
-}
-
-function evidenceSignal(annotation) {
-  if (annotation.insufficient_evidence) {
-    return {
-      label: "Insufficient evidence",
-      tone: "low",
-      title: "The model did not find enough grounded evidence to classify this gene.",
-    };
-  }
-  if (annotation.cancer_associated === false) {
-    return {
-      label: "No cancer evidence",
-      tone: "low",
-      title: "Current retrieved evidence does not support a cancer association.",
+      title: "Already represented in OncoKB — may need curator attention to reconcile or update.",
     };
   }
   if (annotation.cancer_associated === true) {
     return {
-      label: "Cancer associated",
+      label: "Review: Medium",
       tone: "neutral",
-      title: "Literature supports a cancer association.",
+      title: "New cancer-associated candidate, not yet in OncoKB — review before export.",
     };
   }
-  return null;
+  return { label: "Review: Medium", tone: "neutral", title: "Review this result before export." };
 }
 
 function compactBadges(annotation) {
-  return [
-    reviewPriority(annotation),
-    evidenceSignal(annotation),
-    annotation.in_oncokb
-      ? { label: "OncoKB", tone: "high", title: "OncoKB membership lookup returned true." }
-      : null,
-  ].filter(Boolean);
+  return [reviewPriority(annotation)].filter(Boolean);
 }
 
 function renderCompactBadges(annotation) {
