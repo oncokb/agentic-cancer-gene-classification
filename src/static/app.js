@@ -48,6 +48,15 @@ const state = {
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
+  // Breakpoint fields from the most recent submission, keyed by the exact
+  // fusion string as submitted (matches GeneAnnotation.fusions entries) —
+  // needed by the on-demand /v1/fusion-context lookup, since breakpoint
+  // context isn't persisted on the annotation result itself.
+  lastInputsByFusion: {},
+  // In-flight/completed /v1/fusion-context lookups, keyed by fusion string,
+  // so re-expanding a disclosure (or expanding the other partner gene's
+  // card for the same fusion) never re-fetches.
+  fusionContextByFusion: {},
 };
 
 const elements = {
@@ -650,6 +659,10 @@ async function runAnnotation() {
   // Collapse the expanded batch sidebar so results have room
   document.body.classList.remove("batch-active");
 
+  annotationInputs.forEach((item) => {
+    if (item.fusion) state.lastInputsByFusion[item.fusion] = item;
+  });
+
   setRunning(true);
   clearMessage();
   setMessage(`Submitting ${annotationInputs.length} input${annotationInputs.length === 1 ? "" : "s"} for annotation...`, "info");
@@ -938,6 +951,9 @@ function renderAnnotationResult(result) {
       fields.appendChild(row);
     }
 
+    const domainsSection = renderDomainsAndTreatments(annotation);
+    if (domainsSection) fields.appendChild(domainsSection);
+
     list.appendChild(card);
   });
 
@@ -1048,6 +1064,168 @@ function renderSupportingEvidence(annotation) {
   }
 
   return section;
+}
+
+// ---------------------------------------------------------------------------
+// Domains & treatments (on-demand, lazy-loaded fusion context)
+// ---------------------------------------------------------------------------
+
+// Structured facts only — domain names/status and drug names come straight
+// from the fusion-annotation service response, never through the LLM. This
+// keeps latency and clutter off the default card: nothing here fetches until
+// a curator explicitly expands the section for a given fusion.
+function fetchFusionContext(fusionKey) {
+  if (state.fusionContextByFusion[fusionKey]) {
+    return state.fusionContextByFusion[fusionKey];
+  }
+  const requestBody = { fusion: fusionKey, ...(state.lastInputsByFusion[fusionKey] || {}) };
+  const promise = fetch(apiUrl("/v1/fusion-context"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(requestBody),
+  })
+    .then((response) => {
+      if (!response.ok) throw new Error(response.statusText || "Request failed");
+      return response.json();
+    })
+    .catch((error) => {
+      delete state.fusionContextByFusion[fusionKey]; // allow retry on next expand
+      throw error;
+    });
+  state.fusionContextByFusion[fusionKey] = promise;
+  return promise;
+}
+
+function renderDomainPartner(partner) {
+  const wrap = document.createElement("div");
+  wrap.className = "domain-partner";
+
+  const label = document.createElement("div");
+  label.className = "domain-partner-label";
+  label.textContent = `${partner.gene} (${partner.side === "five_prime" ? "5′" : "3′"})`;
+  wrap.appendChild(label);
+
+  const chipRow = document.createElement("div");
+  chipRow.className = "domain-chip-row";
+  const addChips = (names, statusClass) => {
+    (names || []).forEach((name) => {
+      const chip = document.createElement("span");
+      chip.className = `domain-chip ${statusClass}`;
+      chip.textContent = name;
+      chipRow.appendChild(chip);
+    });
+  };
+  addChips(partner.retained_domains, "domain-chip-retained");
+  addChips(partner.disrupted_domains, "domain-chip-disrupted");
+  addChips(partner.lost_domains, "domain-chip-lost");
+  if (!chipRow.children.length) {
+    const none = document.createElement("span");
+    none.className = "subtle";
+    none.textContent = "No domain data";
+    chipRow.appendChild(none);
+  }
+  wrap.appendChild(chipRow);
+  return wrap;
+}
+
+function renderFusionKnowledge(knowledge) {
+  if (!knowledge || !knowledge.therapies?.length) return null;
+
+  const wrap = document.createElement("div");
+  wrap.className = "fusion-knowledge";
+
+  const label = document.createElement("span");
+  label.className = "field-label";
+  label.textContent = "Known treatments";
+  wrap.appendChild(label);
+
+  const list = document.createElement("div");
+  list.className = "citation-link-list";
+  knowledge.therapies.forEach((therapy) => {
+    const pill = document.createElement("span");
+    pill.className = "review-badge context";
+    pill.textContent = therapy;
+    list.appendChild(pill);
+  });
+  wrap.appendChild(list);
+
+  if (knowledge.sources?.length) {
+    const sources = document.createElement("div");
+    sources.className = "fusion-knowledge-sources subtle";
+    sources.textContent = `Source: ${knowledge.sources.join(", ")}`;
+    wrap.appendChild(sources);
+  }
+
+  return wrap;
+}
+
+function renderFusionContextResult(container, response) {
+  if (!response.available) {
+    container.textContent = "Domain and treatment data is not configured for this deployment.";
+    return;
+  }
+  const context = response.context;
+  if (!context || context.error) {
+    container.textContent = "Domain and treatment data not available for this fusion.";
+    return;
+  }
+
+  container.replaceChildren();
+
+  if (context.kinase_gene && context.kinase_domain_status) {
+    const kinaseLine = document.createElement("div");
+    kinaseLine.className = "domain-kinase-callout";
+    kinaseLine.textContent =
+      `Kinase domain (${context.kinase_gene}): ${context.kinase_domain_status}`;
+    container.appendChild(kinaseLine);
+  }
+
+  const partners = document.createElement("div");
+  partners.className = "domain-partners";
+  partners.appendChild(renderDomainPartner(context.five_prime));
+  partners.appendChild(renderDomainPartner(context.three_prime));
+  container.appendChild(partners);
+
+  const knowledge = renderFusionKnowledge(context.knowledge);
+  if (knowledge) container.appendChild(knowledge);
+
+  if (!knowledge && !context.kinase_gene) {
+    const none = document.createElement("div");
+    none.className = "subtle";
+    none.textContent = "No known treatments reported for this fusion.";
+    container.appendChild(none);
+  }
+}
+
+function renderDomainsAndTreatments(annotation) {
+  const fusionKey = annotation.fusions?.[0];
+  if (!fusionKey) return null; // singleton gene lookup — no breakpoint to analyze
+
+  const details = document.createElement("details");
+  details.className = "retrieval-details";
+  const summary = document.createElement("summary");
+  summary.className = "retrieval-summary";
+  summary.innerHTML = `<span class="retrieval-count-label">Domains &amp; treatments</span>`;
+  details.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "domain-context-body";
+  body.textContent = "Loading…";
+  details.appendChild(body);
+
+  let loaded = false;
+  details.addEventListener("toggle", () => {
+    if (!details.open || loaded) return;
+    loaded = true;
+    fetchFusionContext(fusionKey)
+      .then((response) => renderFusionContextResult(body, response))
+      .catch(() => {
+        body.textContent = "Domain and treatment data not available for this fusion.";
+        loaded = false; // allow a retry on next expand
+      });
+  });
+
+  return details;
 }
 
 function renderBenchmarkResult(result) {
