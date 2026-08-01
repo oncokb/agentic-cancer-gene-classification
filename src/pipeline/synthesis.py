@@ -43,7 +43,9 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 ## Field guidance:
 - `cancer_associated`: true if there is credible peer-reviewed evidence linking this gene to cancer biology.
 - `cancer_association_rationale`: list the evidence types (structural-variant, expression, mutation, methylation, copy-number) with a brief justification.
-- `cancer_type_prevalence`: cancer types and alteration contexts observed for this gene (e.g., "Lung adenocarcinoma (fusion), breast cancer (amplification)"). The deterministic facts above provide MSK/GENIE prevalence when available — use that value unchanged. When it is "not available", infer from the retrieved literature: list the cancer types explicitly mentioned in the abstracts along with the alteration type.
+- `cancer_type_prevalence`: cancer types and alteration contexts for this gene, as a concise bullet list — one cancer type + alteration context per line, each prefixed with "- ", e.g.:
+  "- Lung adenocarcinoma (fusion)\n- Breast cancer (amplification)"
+  Keep each bullet short (cancer type + alteration type only, no extended explanation). Use the MSK/GENIE prevalence value from deterministic facts when available, reformatted into this bullet style; otherwise infer from the retrieved literature and list the cancer types explicitly mentioned in the abstracts. Never mention MSK/GENIE, prevalence-data availability, or any other meta-commentary about the data source in this field — output only the bullets themselves.
 - `gene_class`: molecular/functional class (e.g., "Serine/threonine kinase", "RNA-binding protein", "Transcription factor").
 - `signaling_pathways`: comma-separated associated signaling pathways (e.g., "PI3K/AKT", "RAS/MAPK", "WNT/β-catenin").
 - Do not assign a generic certainty/probability score. The application calculates
@@ -95,9 +97,12 @@ ANNOTATE_TOOL: dict = {
             "cancer_type_prevalence": {
                 "type": "string",
                 "description": (
-                    "Cancer types and alteration contexts for this gene. "
-                    "Use the MSK/GENIE value from deterministic facts if available; "
-                    "otherwise infer from retrieved literature."
+                    "Cancer types and alteration contexts for this gene, as a concise bullet "
+                    "list — one per line, each prefixed with '- ' (e.g., "
+                    "'- Lung adenocarcinoma (fusion)\\n- Breast cancer (amplification)'). "
+                    "No mention of MSK/GENIE or data-source availability, bullets only. "
+                    "Use the MSK/GENIE value from deterministic facts if available, "
+                    "reformatted into bullets; otherwise infer from retrieved literature."
                 ),
             },
             "gene_class": {
