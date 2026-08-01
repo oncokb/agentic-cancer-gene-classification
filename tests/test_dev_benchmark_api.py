@@ -48,7 +48,13 @@ def test_benchmark_endpoint_runs_when_dev_mode_enabled(monkeypatch):
 
     response = client.post(
         "/v1/dev/benchmark",
-        json={"no_judge": True, "max_genes": 1, "local_backend": "codex"},
+        json={
+            "no_judge": True,
+            "max_genes": 1,
+            "local_backend": "codex",
+            "mode": "core",
+            "route": "local",
+        },
     )
 
     assert response.status_code == 200
@@ -56,3 +62,5 @@ def test_benchmark_endpoint_runs_when_dev_mode_enabled(monkeypatch):
     assert seen["no_judge"] is True
     assert seen["max_genes"] == 1
     assert seen["local_backend"] == "codex"
+    assert seen["mode"] == "core"
+    assert seen["route"] == "local"

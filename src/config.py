@@ -10,8 +10,14 @@ class Settings(BaseSettings):
     ncbi_api_key: str = ""
 
     synthesis_model: str = "claude-opus-4-7"
+    synthesis_fast_model: str = "claude-haiku-4-5-20251001"
+    synthesis_model_escalation: bool = True
+    synthesis_escalation_min_support_score: float = 0.5
+    synthesis_escalation_min_citations: int = 1
+    synthesis_escalation_tier2: bool = True
     selection_model: str = "claude-haiku-4-5-20251001"
     bedrock_synthesis_model: str = ""
+    bedrock_synthesis_fast_model: str = ""
     bedrock_selection_model: str = ""
     bedrock_aws_access_key_id: str = ""
     bedrock_aws_secret_access_key: str = ""

@@ -265,6 +265,25 @@ def _verify_citations(
     return verified
 
 
+def _postprocess_synthesis_output(
+    *,
+    gene: str,
+    tool_input: Dict,
+    records: List[LiteratureRecord],
+    gene_identity: Optional[str],
+) -> Dict:
+    """Apply deterministic citation verification to a raw synthesis tool response."""
+    if "citations" in tool_input:
+        tool_input["citations"] = _verify_citations(
+            gene,
+            tool_input["citations"],
+            records,
+            settings.max_citations_per_annotation,
+            gene_identity,
+        )
+    return tool_input
+
+
 def _evidence_support(
     citations: List[str],
     records: List[LiteratureRecord],
@@ -324,6 +343,48 @@ def _evidence_support(
     return score, explanation
 
 
+def _needs_synthesis_escalation(
+    *,
+    tool_input: Dict,
+    records: List[LiteratureRecord],
+    retrieval_tier: int,
+) -> tuple[bool, str]:
+    """Decide whether the fast synthesis pass needs a deeper model pass."""
+    if not settings.synthesis_model_escalation:
+        return False, "disabled"
+    if not records:
+        return False, "no_retrieved_literature"
+    if retrieval_tier == 2 and settings.synthesis_escalation_tier2:
+        return True, "tier2_retrieval"
+    if not tool_input:
+        return True, "empty_synthesis"
+    if not tool_input.get("gene_summary"):
+        return True, "missing_gene_summary"
+    if not tool_input.get("cancer_association_rationale"):
+        return True, "missing_rationale"
+
+    citations = tool_input.get("citations", []) or []
+    if (
+        len(records) >= settings.min_papers_for_strong_association
+        and len(citations) < settings.synthesis_escalation_min_citations
+    ):
+        return True, "too_few_verified_citations"
+
+    score, _ = _evidence_support(
+        citations=citations,
+        records=records,
+        insufficient_evidence=bool(tool_input.get("insufficient_evidence")),
+        cancer_association_rationale=tool_input.get("cancer_association_rationale"),
+        gene_summary=tool_input.get("gene_summary"),
+    )
+    if (
+        len(records) >= settings.min_papers_for_strong_association
+        and score < settings.synthesis_escalation_min_support_score
+    ):
+        return True, f"low_support_score_{score:.2f}"
+    return False, "fast_pass_sufficient"
+
+
 async def synthesize_gene_annotation(
     gene: str,
     fusions: List[str],
@@ -351,30 +412,64 @@ async def synthesize_gene_annotation(
         mode,
     )
     tool = CORE_ANNOTATE_TOOL if mode == "core" else ANNOTATE_TOOL
+
+    fast_model = settings.synthesis_fast_model if settings.synthesis_model_escalation else settings.synthesis_model
+    fast_purpose = "synthesis_fast" if settings.synthesis_model_escalation else "synthesis"
     tool_input = await complete_with_tool(
-        model=settings.synthesis_model,
+        model=fast_model,
         system=SYSTEM_PROMPT,
         user=user_prompt,
         tool=tool,
         max_tokens=1024 if mode == "core" else 2048,
         local_mode=local_mode,
         local_backend=local_backend,
-        model_purpose="synthesis",
+        model_purpose=fast_purpose,
     )
 
     if not tool_input:
         logger.error("No annotation returned for gene %s", gene)
-        return {"insufficient_evidence": True, "cancer_associated": None}
+        tool_input = {"insufficient_evidence": True, "cancer_associated": None}
 
-    # PMID verification — reject any citation not in retrieved set
-    if "citations" in tool_input:
-        tool_input["citations"] = _verify_citations(
+    tool_input = _postprocess_synthesis_output(
+        gene=gene,
+        tool_input=tool_input,
+        records=records,
+        gene_identity=gene_identity,
+    )
+    should_escalate, reason = _needs_synthesis_escalation(
+        tool_input=tool_input,
+        records=records,
+        retrieval_tier=retrieval_tier,
+    )
+    if should_escalate and not local_mode and settings.synthesis_model != fast_model:
+        logger.info(
+            "Escalating synthesis for %s from %s to %s: %s",
             gene,
-            tool_input["citations"],
-            records,
-            settings.max_citations_per_annotation,
-            gene_identity,
+            fast_model,
+            settings.synthesis_model,
+            reason,
         )
+        deep_input = await complete_with_tool(
+            model=settings.synthesis_model,
+            system=SYSTEM_PROMPT,
+            user=user_prompt,
+            tool=tool,
+            max_tokens=1024 if mode == "core" else 2048,
+            local_mode=local_mode,
+            local_backend=local_backend,
+            model_purpose="synthesis",
+        )
+        if deep_input:
+            tool_input = _postprocess_synthesis_output(
+                gene=gene,
+                tool_input=deep_input,
+                records=records,
+                gene_identity=gene_identity,
+            )
+        else:
+            logger.warning("Deep synthesis returned no annotation for gene %s; keeping fast pass", gene)
+    else:
+        logger.info("Synthesis fast pass accepted for %s: %s", gene, reason)
 
     return tool_input
 

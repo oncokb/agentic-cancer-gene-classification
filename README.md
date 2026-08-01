@@ -26,6 +26,9 @@ Latency knobs:
 - `ANNOTATION_GENE_CONCURRENCY`: number of genes annotated concurrently.
 - `LLM_CONCURRENCY`: maximum concurrent LLM calls across retrieval, selection,
   and synthesis.
+- `SYNTHESIS_MODEL_ESCALATION`: when true, use `SYNTHESIS_FAST_MODEL` first and
+  call `SYNTHESIS_MODEL` only when the fast pass is missing core fields,
+  under-cited, low-support, or sourced from Tier 2 retrieval.
 - `PUBMED_STAGED_RETRIEVAL`: when true, Tier 1 PubMed retrieval stops after
   enough abstracts are found for synthesis instead of running every query family.
 - `SELECTION_LLM_THRESHOLD`: only use the selection LLM when the retrieved
@@ -50,6 +53,8 @@ running.
 - `BEDROCK_SYNTHESIS_MODEL` and `BEDROCK_SELECTION_MODEL`: optional Bedrock
   model IDs for AGCG's synthesis and selection calls. Use these when the normal
   `SYNTHESIS_MODEL` / `SELECTION_MODEL` values are direct Anthropic model names.
+- `BEDROCK_SYNTHESIS_FAST_MODEL`: optional Bedrock model ID for the lightweight
+  synthesis pass when `SYNTHESIS_MODEL_ESCALATION=true`.
 - `ONCOKB_API_TOKEN`: optional, but recommended for OncoKB membership lookups.
   OncoKB requires an account and data-access approval/license. After approval,
   the token is available in account settings:
@@ -80,6 +85,7 @@ ANTHROPIC_SDK_PROVIDER=bedrock
 BEDROCK_AWS_DEFAULT_REGION=us-east-1
 AWS_PROFILE=490004633549
 BEDROCK_SYNTHESIS_MODEL=anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_SYNTHESIS_FAST_MODEL=anthropic.claude-haiku-4-5-20251001-v1:0
 BEDROCK_SELECTION_MODEL=anthropic.claude-haiku-4-5-20251001-v1:0
 ```
 
@@ -168,9 +174,10 @@ curl http://127.0.0.1:8000/v1/annotate/jobs/{job_id}
 
 This path uses the Anthropic SDK for selection, synthesis, benchmark judging, and
 Tier 2 agentic retrieval. In Bedrock mode, direct Anthropic model names must be
-replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL` and
-`BEDROCK_SELECTION_MODEL`, or by setting `SYNTHESIS_MODEL` and `SELECTION_MODEL`
-to Bedrock IDs directly.
+replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL`,
+`BEDROCK_SYNTHESIS_FAST_MODEL`, and `BEDROCK_SELECTION_MODEL`, or by setting
+`SYNTHESIS_MODEL`, `SYNTHESIS_FAST_MODEL`, and `SELECTION_MODEL` to Bedrock IDs
+directly.
 
 ## Latency Comparison
 
@@ -387,6 +394,8 @@ Run the benchmark with API credits:
 
 ```bash
 python -m benchmarks.run_benchmark \
+  --route local \
+  --mode core \
   --output benchmark_report.json \
   --results-csv benchmark_results.csv
 ```
@@ -395,6 +404,7 @@ Run the benchmark locally and skip the SDK judge call:
 
 ```bash
 python -m benchmarks.run_benchmark \
+  --route local \
   --local codex \
   --no-judge \
   --output benchmark_report.json \

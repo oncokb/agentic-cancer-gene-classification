@@ -11,7 +11,7 @@ import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -22,8 +22,10 @@ from pydantic import BaseModel, Field
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
 from src.config import settings
+from src.logging_utils import install_secret_redaction_filter
 from src.models.schema import (
     AnnotateRequest,
+    AnnotationMode,
     AnnotationResult,
     FusionInput,
     GeneAnnotateRequest,
@@ -61,6 +63,7 @@ logging.basicConfig(
     ),
     stream=sys.stdout,
 )
+install_secret_redaction_filter()
 logger = logging.getLogger(__name__)
 
 
@@ -127,6 +130,14 @@ class BenchmarkRequest(BaseModel):
     local_backend: Optional[LocalBackend] = Field(
         default=None,
         description="Optional local agent backend for benchmark pipeline calls.",
+    )
+    mode: AnnotationMode = Field(
+        default="full",
+        description="Annotation mode passed to benchmark runs.",
+    )
+    route: Literal["direct", "local"] = Field(
+        default="direct",
+        description="Benchmark route: 'direct' pipeline call or local FastAPI /v1/annotate route.",
     )
 
 
@@ -318,6 +329,8 @@ async def benchmark(request: BenchmarkRequest) -> dict:
             no_judge=request.no_judge,
             local_backend=request.local_backend,
             max_genes=request.max_genes,
+            mode=request.mode,
+            route=request.route,
         )
     except Exception as e:
         logger.exception("Benchmark error")
