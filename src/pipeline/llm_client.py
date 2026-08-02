@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOCAL_BACKEND = "claude-code"
 LOCAL_BACKENDS = ("claude-code", "codex", "antigravity")
 SDK_PROVIDERS = ("anthropic", "bedrock")
+_llm_semaphores: Dict[int, asyncio.Semaphore] = {}
 
 _BEDROCK_MODEL_ALIASES = {
     "claude-haiku-4-5-20251001": "anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -167,16 +168,19 @@ async def complete_with_tool(
     SDK mode  — uses tool_use with prompt caching on the system prompt.
     Local mode — shells out to the selected local agent CLI with JSON-in-text prompting.
     """
-    backend = resolve_local_backend(local_mode=local_mode, local_backend=local_backend)
-    if backend:
-        return await _complete_local(system=system, user=user, tool=tool, backend=backend)
-    return await _complete_sdk(
-        model=resolve_sdk_model(model, model_purpose),
-        system=system,
-        user=user,
-        tool=tool,
-        max_tokens=max_tokens,
-    )
+    limit = max(1, settings.llm_concurrency)
+    semaphore = _llm_semaphores.setdefault(limit, asyncio.Semaphore(limit))
+    async with semaphore:
+        backend = resolve_local_backend(local_mode=local_mode, local_backend=local_backend)
+        if backend:
+            return await _complete_local(system=system, user=user, tool=tool, backend=backend)
+        return await _complete_sdk(
+            model=resolve_sdk_model(model, model_purpose),
+            system=system,
+            user=user,
+            tool=tool,
+            max_tokens=max_tokens,
+        )
 
 
 async def _complete_sdk(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -121,6 +121,7 @@ class GeneAnnotation(BaseModel):
     cached_at: Optional[str] = None
     last_pubmed_checked_at: Optional[str] = None
     error: Optional[str] = None
+    timings_ms: Dict[str, float] = Field(default_factory=dict)
 
 
 class FusionInput(BaseModel):
@@ -201,3 +202,4 @@ class AnnotationResult(BaseModel):
     fusions_processed: int
     genes_annotated: int
     annotations: List[GeneAnnotation]
+    timings_ms: Dict[str, float] = Field(default_factory=dict)

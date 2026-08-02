@@ -7,14 +7,16 @@ for each gene derived from an input gene/fusion list.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Union
+from time import perf_counter
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from src.config import settings
 from src.models.schema import AnnotationResult, FusionInput, GeneAnnotation, ResolvedGene
-from src.pipeline.db_lookups import check_oncokb_membership, get_msk_genie_prevalence
+from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import retrieve_literature, search_recent_pubmed_pmids
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
@@ -22,6 +24,30 @@ from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
 
 logger = logging.getLogger(__name__)
+AnnotationProgressCallback = Callable[[GeneAnnotation], Union[Awaitable[None], None]]
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((perf_counter() - start) * 1000, 2)
+
+
+async def _maybe_call_progress(
+    callback: Optional[AnnotationProgressCallback],
+    annotation: GeneAnnotation,
+) -> None:
+    if callback is None:
+        return
+    result = callback(annotation)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _timed(name: str, timings: Dict[str, float], awaitable):
+    start = perf_counter()
+    try:
+        return await awaitable
+    finally:
+        timings[name] = _elapsed_ms(start)
 
 
 def _isoformat(value: Optional[datetime]) -> Optional[str]:
@@ -151,11 +177,14 @@ async def _annotate_gene(
     tumor_type: Optional[str] = None,
     local_mode: bool = False,
     local_backend: Optional[str] = None,
+    oncokb_lookup: Optional[OncoKBGeneLookup] = None,
 ) -> GeneAnnotation:
     """Run the full annotation pipeline for a single gene."""
+    total_start = perf_counter()
+    timings: Dict[str, float] = {}
     if unresolvable:
         logger.info("Gene %s is unresolvable (bare Ensembl / unannotated locus)", gene)
-        return GeneAnnotation(
+        annotation = GeneAnnotation(
             gene=gene,
             fusions=list(dict.fromkeys(fusions)),
             in_oncokb=False,
@@ -170,48 +199,64 @@ async def _annotate_gene(
             cache_reason="unresolvable_gene",
             error="Unresolvable gene symbol — bare Ensembl ID or unannotated locus",
         )
+        annotation.timings_ms["total"] = _elapsed_ms(total_start)
+        return annotation
 
     # Run DB lookup and literature retrieval concurrently
     oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
-        check_oncokb_membership(gene),
-        retrieve_literature(
-            gene, fusions,
-            tumor_type=tumor_type,
-            local_mode=local_mode,
-            local_backend=local_backend,
+        _timed("oncokb", timings, check_oncokb_membership(gene, lookup=oncokb_lookup)),
+        _timed(
+            "literature_retrieval",
+            timings,
+            retrieve_literature(
+                gene, fusions,
+                tumor_type=tumor_type,
+                local_mode=local_mode,
+                local_backend=local_backend,
+            ),
         ),
     )
 
+    prevalence_start = perf_counter()
     prevalence = get_msk_genie_prevalence(gene)
+    timings["prevalence"] = _elapsed_ms(prevalence_start)
     gene_identity = _format_gene_identity(resolved_gene)
 
     # Citation selection pass: filter broad retrieval corpus down to the
     # most directly relevant papers before synthesis to improve precision
     # without shrinking the recall pool.
-    selected_records = await select_papers_for_synthesis(
-        gene,
-        records,
-        settings.max_papers_for_synthesis,
-        gene_identity=gene_identity,
-        local_mode=local_mode,
-        local_backend=local_backend,
-    )
-
-    try:
-        synthesis = await synthesize_gene_annotation(
-            gene=gene,
-            fusions=fusions,
-            in_oncokb=oncokb_membership,
-            cancer_type_prevalence=prevalence,
-            records=selected_records,
-            retrieval_tier=retrieval_tier,
+    selected_records = await _timed(
+        "paper_selection",
+        timings,
+        select_papers_for_synthesis(
+            gene,
+            records,
+            settings.max_papers_for_synthesis,
             gene_identity=gene_identity,
             local_mode=local_mode,
             local_backend=local_backend,
+        ),
+    )
+
+    try:
+        synthesis = await _timed(
+            "synthesis",
+            timings,
+            synthesize_gene_annotation(
+                gene=gene,
+                fusions=fusions,
+                in_oncokb=oncokb_membership,
+                cancer_type_prevalence=prevalence,
+                records=selected_records,
+                retrieval_tier=retrieval_tier,
+                gene_identity=gene_identity,
+                local_mode=local_mode,
+                local_backend=local_backend,
+            ),
         )
     except Exception as e:
         logger.error("Synthesis failed for gene %s: %s", gene, e)
-        return GeneAnnotation(
+        annotation = GeneAnnotation(
             gene=gene,
             fusions=list(dict.fromkeys(fusions)),
             in_oncokb=oncokb_membership,
@@ -226,8 +271,11 @@ async def _annotate_gene(
             cache_reason="synthesis_error",
             error=f"Synthesis error: {e}",
         )
+        timings["total"] = _elapsed_ms(total_start)
+        annotation.timings_ms = timings
+        return annotation
 
-    return build_gene_annotation(
+    annotation = build_gene_annotation(
         gene=gene,
         fusions=fusions,
         in_oncokb=oncokb_membership,
@@ -235,6 +283,9 @@ async def _annotate_gene(
         records=records,       # full count for retrieval_count field
         synthesis_result=synthesis,
     )
+    timings["total"] = _elapsed_ms(total_start)
+    annotation.timings_ms = timings
+    return annotation
 
 
 def _normalize_fusion_inputs(
@@ -264,6 +315,7 @@ async def run_pipeline(
     local_backend: Optional[str] = None,
     run_store: Any = None,
     force_refresh: bool = False,
+    on_annotation: Optional[AnnotationProgressCallback] = None,
 ) -> AnnotationResult:
     """
     Main entry point: accepts a list of gene/fusion strings (or FusionInput objects) and returns
@@ -272,13 +324,17 @@ async def run_pipeline(
     run_id = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc)
     timestamp = started_at.isoformat()
+    total_start = perf_counter()
+    timings: Dict[str, float] = {}
     local_backend = resolve_local_backend(local_mode=local_mode, local_backend=local_backend)
     local_mode = local_backend is not None
 
     input_strings, tumor_type_by_input = _normalize_fusion_inputs(fusions)
     logger.info("Pipeline run %s started — %d inputs", run_id, len(input_strings))
 
+    normalization_start = perf_counter()
     gene_map = await normalize_fusions(input_strings)
+    timings["normalization"] = _elapsed_ms(normalization_start)
     logger.info("Resolved %d unique genes from %d inputs", len(gene_map), len(input_strings))
 
     # Build per-gene tumor_type: first non-null tumor_type from the gene's submitted inputs.
@@ -290,10 +346,18 @@ async def run_pipeline(
                 gene_tumor_type[canonical] = tt
                 break
 
-    # Annotate all genes; run sequentially to respect rate limits
-    # (PubMed: 3 req/s without key; LLM calls are already async within each gene)
+    # Annotate genes with bounded fan-out. PubMed, Redis, and LLM paths still
+    # enforce their own lower-level limits/caches.
     annotations: List[GeneAnnotation] = []
-    for canonical, (resolved_gene, gene_inputs) in gene_map.items():
+    annotation_start = perf_counter()
+    gene_semaphore = asyncio.Semaphore(max(1, settings.annotation_gene_concurrency))
+    oncokb_lookup = OncoKBGeneLookup()
+
+    async def annotate_one(
+        canonical: str,
+        resolved_gene: ResolvedGene,
+        gene_inputs: List[str],
+    ) -> GeneAnnotation:
         associated_fusions = [value for value in gene_inputs if is_fusion_input(value)]
         tumor_type = gene_tumor_type.get(canonical)
         annotation = await _maybe_reuse_cached_annotation(
@@ -306,15 +370,17 @@ async def run_pipeline(
             local_mode=local_mode,
         )
         if annotation is None:
-            annotation = await _annotate_gene(
-                gene=canonical,
-                fusions=associated_fusions,
-                resolved_gene=resolved_gene,
-                unresolvable=resolved_gene.unresolvable,
-                tumor_type=tumor_type,
-                local_mode=local_mode,
-                local_backend=local_backend,
-            )
+            async with gene_semaphore:
+                annotation = await _annotate_gene(
+                    gene=canonical,
+                    fusions=associated_fusions,
+                    resolved_gene=resolved_gene,
+                    unresolvable=resolved_gene.unresolvable,
+                    tumor_type=tumor_type,
+                    local_mode=local_mode,
+                    local_backend=local_backend,
+                    oncokb_lookup=oncokb_lookup,
+                )
             if force_refresh and annotation.cache_status == "refreshed":
                 annotation.cache_reason = "force_refresh"
             elif annotation.cache_status == "refreshed":
@@ -333,16 +399,28 @@ async def run_pipeline(
                 except Exception:
                     logger.exception("Failed to persist cached gene annotation for %s", canonical)
 
+        return annotation
+
+    tasks = [
+        asyncio.create_task(annotate_one(canonical, resolved_gene, gene_inputs))
+        for canonical, (resolved_gene, gene_inputs) in gene_map.items()
+    ]
+    for task in asyncio.as_completed(tasks):
+        annotation = await task
         annotations.append(annotation)
+        await _maybe_call_progress(on_annotation, annotation)
         logger.info(
-            "Annotated %s — cancer_associated=%s, citations=%d, evidence_support_score=%.2f",
-            canonical,
+            "Annotated %s — cancer_associated=%s, citations=%d, evidence_support_score=%.2f, total_ms=%.2f",
+            annotation.gene,
             annotation.cancer_associated,
             len(annotation.citations),
             annotation.evidence_support_score,
+            annotation.timings_ms.get("total", 0.0),
         )
+    timings["annotation"] = _elapsed_ms(annotation_start)
 
     annotations.sort(key=lambda a: a.gene)
+    timings["total"] = _elapsed_ms(total_start)
 
     return AnnotationResult(
         run_id=run_id,
@@ -350,4 +428,5 @@ async def run_pipeline(
         fusions_processed=len(input_strings),
         genes_annotated=len(annotations),
         annotations=annotations,
+        timings_ms=timings,
     )

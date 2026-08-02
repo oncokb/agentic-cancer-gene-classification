@@ -58,6 +58,7 @@ async def test_run_pipeline_passes_single_gene_without_associated_fusion(monkeyp
         tumor_type=None,
         local_mode=False,
         local_backend=None,
+        oncokb_lookup=None,
     ):
         seen["annotation"] = {
             "gene": gene,
@@ -110,6 +111,7 @@ async def test_run_pipeline_preserves_real_fusions_for_partner_context(monkeypat
         tumor_type=None,
         local_mode=False,
         local_backend=None,
+        oncokb_lookup=None,
     ):
         seen["annotation"] = {
             "gene": gene,

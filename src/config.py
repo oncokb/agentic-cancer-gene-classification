@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     min_papers_for_strong_association: int = 4
     max_papers_for_synthesis: int = 8
     max_citations_per_annotation: int = 4
+    annotation_gene_concurrency: int = 3
+    llm_concurrency: int = 2
 
     redis_url: str = "redis://localhost:6379/0"
     redis_cache_ttl_seconds: int = 86400
