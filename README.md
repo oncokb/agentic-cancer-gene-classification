@@ -29,6 +29,12 @@ Latency knobs:
 - `SYNTHESIS_MODEL_ESCALATION`: when true, use `SYNTHESIS_FAST_MODEL` first and
   call `SYNTHESIS_MODEL` only when the fast pass is missing core fields,
   under-cited, low-support, or sourced from Tier 2 retrieval.
+- `CORE_SYNTHESIS_MAX_TOKENS`, `CORE_SYNTHESIS_ABSTRACT_CHARS`, and
+  `CORE_SYNTHESIS_MAX_PAPERS`: keep core-mode synthesis compact so the first
+  response focuses on cancer association, rationale, summary, and citations.
+- `CORE_SYNTHESIS_ESCALATION_MIN_SUPPORT_SCORE` and
+  `CORE_SYNTHESIS_ESCALATION_TIER2`: let core mode avoid deep-model escalation
+  for complete fast-pass answers while full mode keeps stricter escalation.
 - `PUBMED_STAGED_RETRIEVAL`: when true, Tier 1 PubMed retrieval stops after
   enough abstracts are found for synthesis instead of running every query family.
 - `SELECTION_LLM_THRESHOLD`: only use the selection LLM when the retrieved
@@ -377,6 +383,8 @@ work for genes that are still fresh enough.
 
 Default freshness policy:
 
+- Any non-error final gene annotation is reused for 180 days before the PubMed
+  freshness probe runs. This is the aggressive latency path for repeated genes.
 - OncoKB-positive cached genes are reused for 90 days before a lightweight PubMed
   freshness check.
 - High evidence support (`evidence_support_score >= 0.8`) is reused for 60 days.
@@ -387,6 +395,17 @@ Default freshness policy:
   and `last_pubmed_checked_at` is updated. If new PMIDs are found, the gene is
   rerun through retrieval and synthesis.
 - Requests can set `force_refresh: true` to bypass gene cache reuse.
+
+Warm the Tier 1 PubMed literature cache ahead of benchmark or batch runs:
+
+```bash
+python -m benchmarks.warm_literature_cache \
+  --fusions "TP53::BRAF" "ETV6::NTRK3" \
+  --output benchmarks/results/literature_warmup.json
+```
+
+The warmer only runs Tier 1 PubMed retrieval, so it populates Redis-backed
+`esearch`/`efetch` cache entries without invoking Tier 2 agentic retrieval.
 
 ## Benchmark
 

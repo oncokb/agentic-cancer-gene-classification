@@ -1,3 +1,4 @@
 *_pipeline.json
 *_benchmark_report.json
 latency_*.json
+*_warmup.json

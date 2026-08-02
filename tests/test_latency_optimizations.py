@@ -217,3 +217,86 @@ async def test_synthesis_escalates_weak_fast_result(monkeypatch):
 
     assert result["cancer_association_rationale"] == "Supported by retrieved PMIDs."
     assert calls == [("fast-model", "synthesis_fast"), ("deep-model", "synthesis")]
+
+
+async def test_core_synthesis_accepts_complete_low_support_fast_result(monkeypatch):
+    calls = []
+
+    async def fake_complete_with_tool(**kwargs):
+        calls.append((kwargs["model"], kwargs["model_purpose"]))
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Supported by limited retrieved evidence.",
+            "gene_summary": "GENE has limited cancer evidence (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(synthesis.settings, "synthesis_model_escalation", True)
+    monkeypatch.setattr(synthesis.settings, "synthesis_fast_model", "fast-model")
+    monkeypatch.setattr(synthesis.settings, "synthesis_model", "deep-model")
+    monkeypatch.setattr(synthesis.settings, "core_synthesis_escalation_min_support_score", 0.0)
+    records = [
+        LiteratureRecord(pmid=str(index), title=f"Paper {index}", abstract="GENE cancer")
+        for index in range(1, 5)
+    ]
+
+    result = await synthesis.synthesize_gene_annotation(
+        gene="GENE",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=records,
+        retrieval_tier=1,
+        mode="core",
+    )
+
+    assert result["citations"] == ["1"]
+    assert calls == [("fast-model", "synthesis_fast")]
+
+
+async def test_core_synthesis_uses_tight_prompt_and_token_budget(monkeypatch):
+    seen = {}
+
+    async def fake_complete_with_tool(**kwargs):
+        seen.update(kwargs)
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Supported by retrieved evidence.",
+            "gene_summary": "GENE has cancer evidence (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(synthesis.settings, "synthesis_model_escalation", False)
+    monkeypatch.setattr(synthesis.settings, "core_synthesis_max_tokens", 512)
+    monkeypatch.setattr(synthesis.settings, "core_synthesis_abstract_chars", 24)
+    monkeypatch.setattr(synthesis.settings, "core_synthesis_max_papers", 2)
+    records = [
+        LiteratureRecord(
+            pmid=str(index),
+            title=f"Paper {index}",
+            abstract=f"GENE cancer abstract {index} with extra details",
+        )
+        for index in range(1, 5)
+    ]
+
+    await synthesis.synthesize_gene_annotation(
+        gene="GENE",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=records,
+        retrieval_tier=1,
+        mode="core",
+    )
+
+    assert seen["max_tokens"] == 512
+    assert "supporting quotes" in seen["system"].lower()
+    assert "PMID: 1" in seen["user"]
+    assert "PMID: 2" in seen["user"]
+    assert "PMID: 3" not in seen["user"]
+    assert "GENE cancer abstract 1 w" in seen["user"]
+    assert "ith extra details" not in seen["user"]

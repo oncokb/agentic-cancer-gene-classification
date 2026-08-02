@@ -99,6 +99,7 @@ async def test_run_pipeline_reuses_stale_cache_when_pubmed_has_no_new_pmids(monk
     async def fail_if_called(**_kwargs):
         raise AssertionError("clean PubMed freshness check should avoid recomputation")
 
+    monkeypatch.setattr(orchestrator.settings, "gene_cache_final_annotation_days", 0)
     monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
     monkeypatch.setattr(orchestrator, "search_recent_pubmed_pmids", fake_recent_pmids)
     monkeypatch.setattr(orchestrator, "_annotate_gene", fail_if_called)
@@ -151,6 +152,7 @@ async def test_run_pipeline_refreshes_stale_cache_when_pubmed_has_new_pmids(monk
             cache_status="refreshed",
         )
 
+    monkeypatch.setattr(orchestrator.settings, "gene_cache_final_annotation_days", 0)
     monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
     monkeypatch.setattr(orchestrator, "search_recent_pubmed_pmids", fake_recent_pmids)
     monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
@@ -160,6 +162,50 @@ async def test_run_pipeline_refreshes_stale_cache_when_pubmed_has_new_pmids(monk
     assert result.annotations[0].cache_status == "refreshed"
     assert result.annotations[0].cache_reason == "cache_miss_or_stale"
     assert store.saved[0][0].gene == "BRAF"
+
+
+async def test_run_pipeline_reuses_final_annotation_before_freshness_probe(monkeypatch):
+    updated_at = datetime.now(timezone.utc) - timedelta(days=120)
+    cached_annotation = GeneAnnotation(
+        gene="BRAF",
+        fusions=["OLD::BRAF"],
+        in_oncokb=False,
+        cancer_associated=True,
+        citations=["12345"],
+        insufficient_evidence=False,
+        evidence_support_score=0.6,
+        evidence_support_explanation="Medium support.",
+    )
+    store = FakeGeneStore(
+        {
+            "BRAF": {
+                "annotation": cached_annotation.model_dump(),
+                "updated_at": updated_at,
+                "last_pubmed_checked_at": updated_at,
+            }
+        }
+    )
+
+    async def fake_normalize_fusions(_fusions):
+        return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
+
+    async def fail_recent_pmids(*_args, **_kwargs):
+        raise AssertionError("final annotation cache should avoid PubMed freshness probe")
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("final annotation cache should avoid recomputation")
+
+    monkeypatch.setattr(orchestrator.settings, "gene_cache_final_annotation_days", 180)
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "search_recent_pubmed_pmids", fail_recent_pmids)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fail_if_called)
+
+    result = await run_pipeline(["TP53::BRAF"], run_store=store)
+
+    assert result.annotations[0].cache_status == "reused"
+    assert result.annotations[0].cache_reason == "fresh_final_annotation"
+    assert store.checked == []
+    assert store.saved == []
 
 
 async def test_run_pipeline_force_refresh_bypasses_cache(monkeypatch):
