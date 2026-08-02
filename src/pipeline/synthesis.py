@@ -65,6 +65,21 @@ End the `gene_summary` with one parenthetical sentence noting the retrieval tier
   "(Literature sourced via Tier 2 Claude agentic retrieval — sparse initial results required expanded search.)"
 """
 
+CORE_SYSTEM_PROMPT = """\
+You are a cancer genomics expert filling only the latency-sensitive core fields for a gene triage result.
+
+Return a compact annotation through the `annotate_gene` tool:
+- `cancer_associated`: true only for credible peer-reviewed cancer evidence.
+- `cancer_association_rationale`: one concise sentence naming evidence type(s) and cancer context.
+- `gene_summary`: 1-2 concise sentences grounded only in the provided abstracts, with inline PMIDs.
+- `citations`: strongest PMIDs from the provided abstracts only.
+- `insufficient_evidence`: true when the provided abstracts do not support a confident call.
+
+Do not produce supporting quotes, pathways, prevalence, gene class, or extended background.
+Never invent PMIDs or use facts outside the provided abstracts.
+Prefer a precise short answer over a broad answer.
+"""
+
 ANNOTATE_TOOL: dict = {
     "name": "annotate_gene",
     "description": (
@@ -167,13 +182,35 @@ CORE_ANNOTATE_TOOL: dict = {
     ),
     "input_schema": {
         "type": "object",
-        "required": ["cancer_associated", "insufficient_evidence"],
+        "required": [
+            "cancer_associated",
+            "insufficient_evidence",
+            "cancer_association_rationale",
+            "gene_summary",
+            "citations",
+        ],
         "properties": {
-            "cancer_associated": ANNOTATE_TOOL["input_schema"]["properties"]["cancer_associated"],
-            "insufficient_evidence": ANNOTATE_TOOL["input_schema"]["properties"]["insufficient_evidence"],
-            "cancer_association_rationale": ANNOTATE_TOOL["input_schema"]["properties"]["cancer_association_rationale"],
-            "gene_summary": ANNOTATE_TOOL["input_schema"]["properties"]["gene_summary"],
-            "citations": ANNOTATE_TOOL["input_schema"]["properties"]["citations"],
+            "cancer_associated": {
+                "type": "boolean",
+                "description": "Whether retrieved abstracts support a cancer association.",
+            },
+            "insufficient_evidence": {
+                "type": "boolean",
+                "description": "True when the retrieved abstracts are too weak or sparse.",
+            },
+            "cancer_association_rationale": {
+                "type": "string",
+                "description": "One concise sentence naming evidence type(s) and cancer context.",
+            },
+            "gene_summary": {
+                "type": "string",
+                "description": "1-2 concise sentences with inline PMIDs from provided abstracts only.",
+            },
+            "citations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Strongest supporting PMIDs from the provided abstracts only.",
+            },
         },
     },
 }
@@ -194,6 +231,8 @@ def _build_user_prompt(
         if retrieval_tier == 1
         else "Tier 2 (Claude agentic retrieval — sparse initial results required expanded search)"
     )
+    if mode == "core":
+        records = records[: settings.core_synthesis_max_papers]
     lines = [
         f"## Gene: {gene}",
         f"Associated fusions: {', '.join(fusions) if fusions else 'none'}",
@@ -209,8 +248,8 @@ def _build_user_prompt(
     if mode == "core":
         lines += [
             "",
-            "Core mode: prioritize cancer_associated, cancer_association_rationale, "
-            "gene_summary, citations, and evidence support. Omit non-core fields.",
+            "Core mode: return only the decision, one-sentence rationale, 1-2 sentence "
+            "summary, citations, and insufficient_evidence flag.",
         ]
 
     if not records:
@@ -223,7 +262,7 @@ def _build_user_prompt(
                 "---",
                 f"PMID: {rec.pmid}{journal_tag}{impact_tag}",
                 f"Title: {rec.title}",
-                f"Abstract: {rec.abstract[:900] if mode == 'core' else rec.abstract}",
+                f"Abstract: {rec.abstract[:settings.core_synthesis_abstract_chars] if mode == 'core' else rec.abstract}",
             ]
 
     return "\n".join(lines)
@@ -263,6 +302,25 @@ def _verify_citations(
             len(citations),
         )
     return verified
+
+
+def _postprocess_synthesis_output(
+    *,
+    gene: str,
+    tool_input: Dict,
+    records: List[LiteratureRecord],
+    gene_identity: Optional[str],
+) -> Dict:
+    """Apply deterministic citation verification to a raw synthesis tool response."""
+    if "citations" in tool_input:
+        tool_input["citations"] = _verify_citations(
+            gene,
+            tool_input["citations"],
+            records,
+            settings.max_citations_per_annotation,
+            gene_identity,
+        )
+    return tool_input
 
 
 def _evidence_support(
@@ -324,6 +382,56 @@ def _evidence_support(
     return score, explanation
 
 
+def _needs_synthesis_escalation(
+    *,
+    tool_input: Dict,
+    records: List[LiteratureRecord],
+    retrieval_tier: int,
+    mode: AnnotationMode,
+) -> tuple[bool, str]:
+    """Decide whether the fast synthesis pass needs a deeper model pass."""
+    if not settings.synthesis_model_escalation:
+        return False, "disabled"
+    if not records:
+        return False, "no_retrieved_literature"
+    tier2_escalation = (
+        settings.core_synthesis_escalation_tier2
+        if mode == "core"
+        else settings.synthesis_escalation_tier2
+    )
+    if retrieval_tier == 2 and tier2_escalation:
+        return True, "tier2_retrieval"
+    if not tool_input:
+        return True, "empty_synthesis"
+    if not tool_input.get("gene_summary"):
+        return True, "missing_gene_summary"
+    if not tool_input.get("cancer_association_rationale"):
+        return True, "missing_rationale"
+
+    citations = tool_input.get("citations", []) or []
+    if (
+        len(records) >= settings.min_papers_for_strong_association
+        and len(citations) < settings.synthesis_escalation_min_citations
+    ):
+        return True, "too_few_verified_citations"
+
+    score, _ = _evidence_support(
+        citations=citations,
+        records=records,
+        insufficient_evidence=bool(tool_input.get("insufficient_evidence")),
+        cancer_association_rationale=tool_input.get("cancer_association_rationale"),
+        gene_summary=tool_input.get("gene_summary"),
+    )
+    min_support_score = (
+        settings.core_synthesis_escalation_min_support_score
+        if mode == "core"
+        else settings.synthesis_escalation_min_support_score
+    )
+    if len(records) >= settings.min_papers_for_strong_association and score < min_support_score:
+        return True, f"low_support_score_{score:.2f}"
+    return False, "fast_pass_sufficient"
+
+
 async def synthesize_gene_annotation(
     gene: str,
     fusions: List[str],
@@ -340,41 +448,83 @@ async def synthesize_gene_annotation(
     Call Claude to produce a structured annotation. Returns raw tool-use input dict.
     Raises on API error.
     """
+    prompt_records = (
+        records[: settings.core_synthesis_max_papers]
+        if mode == "core"
+        else records
+    )
     user_prompt = _build_user_prompt(
         gene,
         fusions,
         in_oncokb,
         cancer_type_prevalence,
-        records,
+        prompt_records,
         retrieval_tier,
         gene_identity,
         mode,
     )
     tool = CORE_ANNOTATE_TOOL if mode == "core" else ANNOTATE_TOOL
+    system_prompt = CORE_SYSTEM_PROMPT if mode == "core" else SYSTEM_PROMPT
+    max_tokens = settings.core_synthesis_max_tokens if mode == "core" else 2048
+
+    fast_model = settings.synthesis_fast_model if settings.synthesis_model_escalation else settings.synthesis_model
+    fast_purpose = "synthesis_fast" if settings.synthesis_model_escalation else "synthesis"
     tool_input = await complete_with_tool(
-        model=settings.synthesis_model,
-        system=SYSTEM_PROMPT,
+        model=fast_model,
+        system=system_prompt,
         user=user_prompt,
         tool=tool,
-        max_tokens=1024 if mode == "core" else 2048,
+        max_tokens=max_tokens,
         local_mode=local_mode,
         local_backend=local_backend,
-        model_purpose="synthesis",
+        model_purpose=fast_purpose,
     )
 
     if not tool_input:
         logger.error("No annotation returned for gene %s", gene)
-        return {"insufficient_evidence": True, "cancer_associated": None}
+        tool_input = {"insufficient_evidence": True, "cancer_associated": None}
 
-    # PMID verification — reject any citation not in retrieved set
-    if "citations" in tool_input:
-        tool_input["citations"] = _verify_citations(
+    tool_input = _postprocess_synthesis_output(
+        gene=gene,
+        tool_input=tool_input,
+        records=prompt_records,
+        gene_identity=gene_identity,
+    )
+    should_escalate, reason = _needs_synthesis_escalation(
+        tool_input=tool_input,
+        records=records,
+        retrieval_tier=retrieval_tier,
+        mode=mode,
+    )
+    if should_escalate and not local_mode and settings.synthesis_model != fast_model:
+        logger.info(
+            "Escalating synthesis for %s from %s to %s: %s",
             gene,
-            tool_input["citations"],
-            records,
-            settings.max_citations_per_annotation,
-            gene_identity,
+            fast_model,
+            settings.synthesis_model,
+            reason,
         )
+        deep_input = await complete_with_tool(
+            model=settings.synthesis_model,
+            system=system_prompt,
+            user=user_prompt,
+            tool=tool,
+            max_tokens=max_tokens,
+            local_mode=local_mode,
+            local_backend=local_backend,
+            model_purpose="synthesis",
+        )
+        if deep_input:
+            tool_input = _postprocess_synthesis_output(
+                gene=gene,
+                tool_input=deep_input,
+                records=prompt_records,
+                gene_identity=gene_identity,
+            )
+        else:
+            logger.warning("Deep synthesis returned no annotation for gene %s; keeping fast pass", gene)
+    else:
+        logger.info("Synthesis fast pass accepted for %s: %s", gene, reason)
 
     return tool_input
 

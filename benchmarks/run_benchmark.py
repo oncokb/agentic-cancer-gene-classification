@@ -31,12 +31,16 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
+
+from src.logging_utils import install_secret_redaction_filter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(message)s")
+install_secret_redaction_filter()
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOLDOUT = Path(__file__).parent / "data" / "holdout.jsonl"
+BenchmarkRoute = Literal["direct", "local"]
 
 
 def load_holdout(path: Path) -> List[Dict]:
@@ -61,10 +65,53 @@ def _get_fusions_from_holdout(holdout: List[Dict]) -> List[str]:
     return fusions
 
 
-async def _run_pipeline(fusions: List[str], local_backend: Optional[str] = None) -> Dict:
+async def _run_pipeline(
+    fusions: List[str],
+    local_backend: Optional[str] = None,
+    mode: str = "full",
+) -> Dict:
     from src.pipeline.orchestrator import run_pipeline
-    result = await run_pipeline(fusions, local_backend=local_backend)
+    result = await run_pipeline(fusions, local_backend=local_backend, mode=mode)
     return result.model_dump()
+
+
+class _BenchmarkRunStore:
+    """No-op route store so local route benchmarks do not require MySQL."""
+
+    async def save_run(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def get_run(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def save_gene_annotation(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def get_gene_annotation(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def mark_gene_pubmed_checked(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+async def _run_pipeline_via_local_route(
+    fusions: List[str],
+    local_backend: Optional[str] = None,
+    mode: str = "full",
+) -> Dict:
+    """Exercise the FastAPI /v1/annotate route without requiring a server process."""
+    import httpx
+    from src.main import app
+
+    app.state.run_store = _BenchmarkRunStore()
+    payload: Dict[str, Any] = {"fusions": fusions, "mode": mode, "force_refresh": True}
+    if local_backend:
+        payload["local_backend"] = local_backend
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post("/v1/annotate", json=payload, timeout=None)
+    response.raise_for_status()
+    return response.json()
 
 
 def _align_predictions(
@@ -193,6 +240,8 @@ async def run_benchmark(
     no_judge: bool = False,
     local_backend: Optional[str] = None,
     max_genes: Optional[int] = None,
+    mode: str = "full",
+    route: BenchmarkRoute = "direct",
 ) -> Dict:
     """Run or score the holdout benchmark and return the full report."""
     # --- Load holdout ---
@@ -209,8 +258,19 @@ async def run_benchmark(
             pipeline_result = json.load(f)
     else:
         fusions = _get_fusions_from_holdout(holdout)
-        logger.info("Running pipeline on %d fusions from holdout...", len(fusions))
-        pipeline_result = await _run_pipeline(fusions, local_backend=local_backend)
+        logger.info("Running pipeline on %d fusions from holdout via %s route...", len(fusions), route)
+        if route == "local":
+            pipeline_result = await _run_pipeline_via_local_route(
+                fusions,
+                local_backend=local_backend,
+                mode=mode,
+            )
+        else:
+            pipeline_result = await _run_pipeline(
+                fusions,
+                local_backend=local_backend,
+                mode=mode,
+            )
 
     # --- Align ---
     aligned_pred, aligned_gold = _align_predictions(holdout, pipeline_result)
@@ -232,6 +292,8 @@ async def run_benchmark(
 
     return {
         "holdout_path": str(holdout_path),
+        "route": route,
+        "mode": mode,
         "n_genes": len(holdout),
         "categorical_metrics": metrics,
         "per_gene_report": per_gene_report,
@@ -274,6 +336,24 @@ def main() -> None:
         help="Skip the LLM-as-a-judge step (no API calls for summary scoring)",
     )
     parser.add_argument(
+        "--mode",
+        choices=("full", "core"),
+        default="full",
+        help="Annotation mode passed to the pipeline or API route.",
+    )
+    parser.add_argument(
+        "--route",
+        choices=("direct", "local"),
+        default="direct",
+        help="Use 'local' to benchmark through the in-process FastAPI /v1/annotate route.",
+    )
+    parser.add_argument(
+        "--max-genes",
+        type=int,
+        default=None,
+        help="Limit holdout genes for smoke/regression runs.",
+    )
+    parser.add_argument(
         "--local",
         nargs="?",
         const=DEFAULT_LOCAL_BACKEND,
@@ -294,6 +374,9 @@ def main() -> None:
             results_path=args.results,
             no_judge=args.no_judge,
             local_backend=args.local,
+            max_genes=args.max_genes,
+            mode=args.mode,
+            route=args.route,
         )
     )
 
