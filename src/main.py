@@ -5,11 +5,13 @@ FastAPI application — manually invokable, Docker/K8s-ready.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -26,10 +28,13 @@ from src.models.schema import (
     AnnotateRequest,
     AnnotationResult,
     FusionInput,
+    FusionPositionContext,
     GeneAnnotateRequest,
     GeneAnnotation,
     LocalBackend,
 )
+from src.pipeline.cache import cached_call
+from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.run_store import RunStore
 
@@ -112,6 +117,20 @@ class AnnotationJobStatusResponse(BaseModel):
     result: Optional[AnnotationResult] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+
+
+class FusionContextResponse(BaseModel):
+    available: bool
+    context: Optional[FusionPositionContext] = None
+
+
+class _TransientFusionContextError(Exception):
+    """Raised from the fusion-context cache compute step so cached_call never
+    caches a transient upstream failure (unlike a real "no domain data" result,
+    which is fine to cache)."""
+
+    def __init__(self, context: FusionPositionContext) -> None:
+        self.context = context
 
 
 class BenchmarkRequest(BaseModel):
@@ -307,6 +326,51 @@ async def get_annotation_run(run_id: str, http_request: Request) -> AnnotationRe
     if stored is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return AnnotationResult(**stored)
+
+
+@app.post("/v1/fusion-context", response_model=FusionContextResponse)
+async def fusion_context(request: FusionInput) -> FusionContextResponse:
+    """
+    On-demand protein-domain-retention and treatment-knowledge lookup for a single
+    fusion, via the sibling fusion-annotation service. Deliberately NOT part of
+    POST /v1/annotate — this only runs when a curator explicitly expands the
+    "Domains & treatments" section for a fusion, so it never adds latency to the
+    core annotation result.
+
+    Structured data only, no LLM involvement. Returns {"available": false} (not
+    an error) when the integration isn't configured, so the frontend can hide the
+    section entirely rather than show a broken one.
+    """
+    if not settings.fusion_annotation_api_enabled or not settings.fusion_annotation_api_base_url.strip():
+        return FusionContextResponse(available=False)
+
+    try:
+        parsed = parsed_input_from_fields(
+            request.fusion,
+            five_exon=request.five_exon,
+            three_exon=request.three_exon,
+            five_genomic=request.five_genomic,
+            three_genomic=request.three_genomic,
+            five_transcript=request.five_transcript,
+            three_transcript=request.three_transcript,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    async def compute() -> dict:
+        contexts = await annotate_fusion_position_contexts([parsed])
+        context = contexts[0]
+        if context.error is not None:
+            raise _TransientFusionContextError(context)
+        return context.model_dump()
+
+    cache_key = "fusion_context:" + json.dumps(asdict(parsed), sort_keys=True, default=str)
+    try:
+        cached = await cached_call(cache_key, compute, ttl_seconds=settings.fusion_context_cache_ttl_seconds)
+    except _TransientFusionContextError as exc:
+        return FusionContextResponse(available=True, context=exc.context)
+
+    return FusionContextResponse(available=True, context=FusionPositionContext(**cached))
 
 
 @app.post("/v1/dev/benchmark")

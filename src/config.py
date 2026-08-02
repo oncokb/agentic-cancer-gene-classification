@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     mysql_password: str = ""
     mysql_database: str = "agcg"
 
+    fusion_annotation_api_enabled: bool = False
+    fusion_annotation_api_base_url: str = ""
+    fusion_annotation_api_timeout_seconds: float = 15.0
+    fusion_context_cache_ttl_seconds: int = 604800
+
     log_level: str = "INFO"
 
 

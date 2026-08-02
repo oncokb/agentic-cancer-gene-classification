@@ -16,7 +16,7 @@ from src.models.schema import AnnotationResult
 _FAKE_RUN_ID = "22222222-2222-2222-2222-222222222222"
 
 
-async def _fake_run_pipeline(fusions, local_backend=None, run_store=None, force_refresh=False):
+async def _fake_run_pipeline(fusions, local_backend=None, run_store=None, force_refresh=False, **kwargs):
     return AnnotationResult(
         run_id=_FAKE_RUN_ID,
         timestamp="2026-07-30T19:24:12.406639+00:00",
