@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     max_citations_per_annotation: int = 4
     annotation_gene_concurrency: int = 3
     llm_concurrency: int = 2
+    pubmed_staged_retrieval: bool = True
+    selection_llm_threshold: int = 24
 
     redis_url: str = "redis://localhost:6379/0"
     redis_cache_ttl_seconds: int = 86400
