@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
+AnnotationMode = Literal["full", "core"]
 CacheStatus = Literal["miss", "reused", "refreshed", "bypassed"]
 
 
@@ -124,6 +125,13 @@ class AnnotateRequest(BaseModel):
         default=False,
         description="Bypass stored gene annotations and recompute results.",
     )
+    mode: AnnotationMode = Field(
+        default="full",
+        description=(
+            "Use 'core' to prioritize cancer association, rationale, summary, citations, "
+            "and evidence support."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -152,6 +160,13 @@ class GeneAnnotateRequest(BaseModel):
     force_refresh: bool = Field(
         default=False,
         description="Bypass stored gene annotations and recompute results.",
+    )
+    mode: AnnotationMode = Field(
+        default="full",
+        description=(
+            "Use 'core' to prioritize cancer association, rationale, summary, citations, "
+            "and evidence support."
+        ),
     )
 
 

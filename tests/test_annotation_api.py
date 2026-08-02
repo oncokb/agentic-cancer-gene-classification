@@ -21,7 +21,13 @@ def test_single_gene_annotation_endpoint_returns_result_card_json(monkeypatch):
     run_store = FakeRunStore()
     main.app.state.run_store = run_store
 
-    async def fake_run_pipeline(fusions, local_backend=None, run_store=None, force_refresh=False):
+    async def fake_run_pipeline(
+        fusions,
+        local_backend=None,
+        run_store=None,
+        force_refresh=False,
+        **kwargs,
+    ):
         seen["fusions"] = fusions
         seen["local_backend"] = local_backend
         seen["run_store"] = run_store
@@ -89,7 +95,13 @@ def test_single_gene_annotation_endpoint_returns_result_card_json(monkeypatch):
 def test_batch_annotation_endpoint_returns_annotation_result_json(monkeypatch):
     main.app.state.run_store = FakeRunStore()
 
-    async def fake_run_pipeline(fusions, local_backend=None, run_store=None, force_refresh=False):
+    async def fake_run_pipeline(
+        fusions,
+        local_backend=None,
+        run_store=None,
+        force_refresh=False,
+        **kwargs,
+    ):
         return AnnotationResult(
             run_id="run-2",
             timestamp="2026-07-31T14:00:00+00:00",

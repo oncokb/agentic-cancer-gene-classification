@@ -80,6 +80,15 @@ async def select_papers_for_synthesis(
     if len(records) <= max_papers:
         return records
 
+    if settings.selection_llm_threshold <= 0 or len(records) > settings.selection_llm_threshold:
+        logger.info(
+            "Selection pass skipped for %s: using top %d/%d ranked papers",
+            gene,
+            max_papers,
+            len(records),
+        )
+        return records[:max_papers]
+
     abstracts_text = "\n\n".join(
         f"PMID {r.pmid}\nTitle: {r.title}\nAbstract: {r.abstract[:400]}"
         for r in records
