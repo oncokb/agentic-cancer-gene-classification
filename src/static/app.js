@@ -41,6 +41,7 @@ function emptyRow() {
 
 const state = {
   isRunning: false,
+  isEnriching: false,
   isBenchmarkRunning: false,
   currentResult: null,
   currentBenchmark: null,
@@ -62,6 +63,7 @@ const elements = {
   saveApiUrlModal: document.querySelector("#save-api-url-modal"),
   closeSetup: document.querySelector("#close-setup"),
   dismissSetup: document.querySelector("#dismiss-setup"),
+  enrichResults: document.querySelector("#enrich-results"),
   exportCsv: document.querySelector("#export-csv"),
   exportJson: document.querySelector("#export-json"),
   shareRun: document.querySelector("#share-run"),
@@ -174,8 +176,10 @@ function switchView(view) {
   elements.benchmarkPanel.classList.toggle("hidden", !isBenchmark);
   elements.workspaceTitle.textContent = isBenchmark ? "Benchmark" : "Results";
   elements.exportCsv.classList.toggle("hidden", isBenchmark);
+  elements.enrichResults.classList.toggle("hidden", isBenchmark);
   elements.shareRun.classList.toggle("hidden", isBenchmark);
   elements.exportJson.disabled = isBenchmark ? !state.currentBenchmark : !state.currentResult;
+  elements.enrichResults.disabled = isBenchmark || !hasEnrichableAnnotations();
   elements.shareRun.disabled = isBenchmark || !state.currentResult?.run_id;
 
   if (isBenchmark) {
@@ -606,10 +610,17 @@ function setRunning(isRunning) {
   state.isRunning = isRunning;
   elements.runButton.textContent = isRunning ? "Running..." : "Run";
   elements.runButton.disabled = isRunning;
+  elements.enrichResults.disabled = isRunning || state.isEnriching || !hasEnrichableAnnotations();
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function setEnriching(isEnriching) {
+  state.isEnriching = isEnriching;
+  elements.enrichResults.textContent = isEnriching ? "Enriching..." : "Enrich results";
+  elements.enrichResults.disabled = isEnriching || state.isRunning || !hasEnrichableAnnotations();
 }
 
 function setBenchmarkRunning(isRunning) {
@@ -725,6 +736,95 @@ async function pollAnnotationJob(statusUrl) {
 
     const total = status.genes_total || "?";
     setMessage(`Annotation running: ${status.genes_completed}/${total} genes complete.`, "info");
+    await sleep(1500);
+  }
+}
+
+function hasEnrichableAnnotations() {
+  const annotations = state.currentResult?.annotations || [];
+  return annotations.some((annotation) => !annotation.insufficient_evidence);
+}
+
+function mergeAnnotations(existing, enriched) {
+  const byGene = new Map((existing || []).map((annotation) => [annotation.gene, annotation]));
+  (enriched || []).forEach((annotation) => {
+    byGene.set(annotation.gene, { ...(byGene.get(annotation.gene) || {}), ...annotation });
+  });
+  return Array.from(byGene.values()).sort((a, b) => a.gene.localeCompare(b.gene));
+}
+
+async function enrichCurrentResult() {
+  if (!hasEnrichableAnnotations() || state.isEnriching) return;
+
+  setEnriching(true);
+  clearMessage();
+  setMessage("Submitting lazy enrichment job...", "info");
+
+  try {
+    const localBackend = elements.annotateLocalBackend.value || undefined;
+    const annotations = (state.currentResult.annotations || []).filter(
+      (annotation) => !annotation.insufficient_evidence,
+    );
+    const body = { annotations };
+    if (localBackend) body.local_backend = localBackend;
+
+    const response = await fetch(apiUrl("/v1/annotate/enrichment/jobs"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      const text = await response.text();
+      try {
+        const payload = JSON.parse(text);
+        detail = payload.detail || detail;
+      } catch {
+        detail = text || detail;
+      }
+      throw new Error(detail || "Enrichment request failed");
+    }
+
+    const job = await response.json();
+    await pollEnrichmentJob(job.status_url);
+    saveLastResult(state.currentResult);
+    setMessage("Enrichment complete. Review expanded fields and evidence.", "info");
+  } catch (error) {
+    setMessage(formatRunError(error.message), "error");
+  } finally {
+    setEnriching(false);
+  }
+}
+
+async function pollEnrichmentJob(statusUrl) {
+  while (true) {
+    const response = await fetch(apiUrl(statusUrl));
+    if (!response.ok) {
+      throw new Error(response.statusText || "Unable to load enrichment job status");
+    }
+    const status = await response.json();
+    if (status.status === "failed") {
+      throw new Error(status.error || "Enrichment job failed");
+    }
+
+    state.currentResult = {
+      ...state.currentResult,
+      annotations: mergeAnnotations(
+        state.currentResult?.annotations || [],
+        status.annotations || [],
+      ),
+    };
+    renderAnnotationResult(state.currentResult);
+
+    if (status.status === "complete") {
+      return status.annotations || [];
+    }
+
+    const total = status.annotations_total || "?";
+    setMessage(
+      `Enrichment running: ${status.annotations_completed}/${total} genes complete.`,
+      "info",
+    );
     await sleep(1500);
   }
 }
@@ -915,6 +1015,7 @@ function renderAnnotationResult(result) {
   const hasAnnotations = visibleAnnotations.length > 0;
   elements.exportCsv.disabled = !allAnnotations.length;
   elements.exportJson.disabled = !allAnnotations.length;
+  elements.enrichResults.disabled = state.isRunning || state.isEnriching || !hasAnnotations;
   elements.shareRun.disabled = !result.run_id;
 
   const total = result.genes_annotated;
@@ -1405,6 +1506,7 @@ function bindEvents() {
   elements.saveNcbiApiKey.addEventListener("click", saveNCBIApiKey);
 
   elements.shareRun.addEventListener("click", copyShareLink);
+  elements.enrichResults.addEventListener("click", enrichCurrentResult);
   elements.exportJson.addEventListener("click", exportJson);
   elements.exportCsv.addEventListener("click", async () => {
     try {

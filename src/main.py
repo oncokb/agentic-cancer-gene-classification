@@ -32,6 +32,7 @@ from src.models.schema import (
     GeneAnnotation,
     LocalBackend,
 )
+from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.run_store import RunStore
 
@@ -117,6 +118,33 @@ class AnnotationJobStatusResponse(BaseModel):
     timings_ms: Dict[str, float] = Field(default_factory=dict)
 
 
+class EnrichmentJobCreateResponse(BaseModel):
+    job_id: str
+    status_url: str
+
+
+class EnrichmentRequest(BaseModel):
+    annotations: List[GeneAnnotation] = Field(
+        ...,
+        min_length=1,
+        description="Core annotations to enrich lazily.",
+    )
+    local_backend: Optional[LocalBackend] = Field(
+        default=None,
+        description="Optional local agent backend for enrichment LLM calls.",
+    )
+
+
+class EnrichmentJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    annotations_completed: int = 0
+    annotations_total: int = 0
+    annotations: List[GeneAnnotation] = Field(default_factory=list)
+    error: Optional[str] = None
+    timings_ms: Dict[str, float] = Field(default_factory=dict)
+
+
 class BenchmarkRequest(BaseModel):
     no_judge: bool = Field(
         default=True,
@@ -148,6 +176,8 @@ def require_dev_mode() -> None:
 
 _annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
 _annotation_jobs_lock = asyncio.Lock()
+_enrichment_jobs: Dict[str, EnrichmentJobStatusResponse] = {}
+_enrichment_jobs_lock = asyncio.Lock()
 
 
 async def _store_annotation_job(job: AnnotationJobStatusResponse) -> None:
@@ -160,6 +190,19 @@ async def _get_annotation_job(job_id: str) -> AnnotationJobStatusResponse:
         job = _annotation_jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Annotation job not found")
+    return job
+
+
+async def _store_enrichment_job(job: EnrichmentJobStatusResponse) -> None:
+    async with _enrichment_jobs_lock:
+        _enrichment_jobs[job.job_id] = job
+
+
+async def _get_enrichment_job(job_id: str) -> EnrichmentJobStatusResponse:
+    async with _enrichment_jobs_lock:
+        job = _enrichment_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Enrichment job not found")
     return job
 
 
@@ -281,6 +324,67 @@ async def create_annotation_job(
 @app.get("/v1/annotate/jobs/{job_id}", response_model=AnnotationJobStatusResponse)
 async def get_annotation_job(job_id: str) -> AnnotationJobStatusResponse:
     return await _get_annotation_job(job_id)
+
+
+@app.post("/v1/annotate/enrichment/jobs", response_model=EnrichmentJobCreateResponse)
+async def create_enrichment_job(
+    request: EnrichmentRequest,
+) -> EnrichmentJobCreateResponse:
+    """Lazily enrich already-returned core annotations in the background."""
+    job_id = str(uuid.uuid4())
+    job = EnrichmentJobStatusResponse(
+        job_id=job_id,
+        status="queued",
+        annotations_total=len(request.annotations),
+    )
+    await _store_enrichment_job(job)
+
+    async def on_annotation(annotation: GeneAnnotation) -> None:
+        current = await _get_enrichment_job(job_id)
+        current.annotations.append(annotation)
+        current.annotations.sort(key=lambda item: item.gene)
+        current.annotations_completed = len(current.annotations)
+        await _store_enrichment_job(current)
+
+    async def run_job() -> None:
+        current = await _get_enrichment_job(job_id)
+        current.status = "running"
+        await _store_enrichment_job(current)
+        try:
+            enriched = await enrich_gene_annotations(
+                request.annotations,
+                local_backend=request.local_backend,
+                on_annotation=on_annotation,
+            )
+            current = await _get_enrichment_job(job_id)
+            current.status = "complete"
+            current.annotations = enriched
+            current.annotations_completed = len(enriched)
+            current.annotations_total = len(request.annotations)
+            current.timings_ms = {
+                "total": round(
+                    sum(annotation.timings_ms.get("total", 0.0) for annotation in enriched),
+                    2,
+                )
+            }
+            await _store_enrichment_job(current)
+        except Exception as exc:
+            logger.exception("Enrichment job %s failed", job_id)
+            current = await _get_enrichment_job(job_id)
+            current.status = "failed"
+            current.error = str(exc)
+            await _store_enrichment_job(current)
+
+    asyncio.create_task(run_job())
+    return EnrichmentJobCreateResponse(
+        job_id=job_id,
+        status_url=f"/v1/annotate/enrichment/jobs/{job_id}",
+    )
+
+
+@app.get("/v1/annotate/enrichment/jobs/{job_id}", response_model=EnrichmentJobStatusResponse)
+async def get_enrichment_job(job_id: str) -> EnrichmentJobStatusResponse:
+    return await _get_enrichment_job(job_id)
 
 
 @app.post("/v1/annotate/gene", response_model=GeneAnnotation)
