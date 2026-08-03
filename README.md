@@ -178,6 +178,22 @@ curl -X POST http://127.0.0.1:8000/v1/annotate/jobs \
 curl http://127.0.0.1:8000/v1/annotate/jobs/{job_id}
 ```
 
+Core results can be enriched lazily after the first response returns. The UI
+exposes this through **Enrich results**; API callers can submit returned
+annotations to the enrichment job endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/annotate/enrichment/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"annotations":[{"gene":"TP53","fusions":["TP53::BRAF"],"cancer_associated":true,"citations":["12345"]}]}'
+
+curl http://127.0.0.1:8000/v1/annotate/enrichment/jobs/{job_id}
+```
+
+Enrichment runs full retrieval/synthesis off the core request path and streams
+expanded annotations with fields such as supporting quotes, pathway/class
+context, prevalence context, and fuller summaries.
+
 This path uses the Anthropic SDK for selection, synthesis, benchmark judging, and
 Tier 2 agentic retrieval. In Bedrock mode, direct Anthropic model names must be
 replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL`,
