@@ -38,14 +38,12 @@
               <span>Tumor Type</span>
               <input id="single-tumor-type" type="text" placeholder="e.g. LUAD, breast cancer" autocomplete="off" />
             </label>
-            <div class="input-examples" aria-label="Valid input examples">
-              <span class="field-label">Examples</span>
-              <div class="example-pill-row">
-                <button class="example-pill" type="button" data-example-id="alk-gene" data-example-mode="single">ALK</button>
-                <button class="example-pill" type="button" data-example-id="braf-gene" data-example-mode="single">BRAF · melanoma</button>
-                <button class="example-pill" type="button" data-example-id="eml4-alk-fusion" data-example-mode="single">EML4::ALK · LUAD</button>
-                <button class="example-pill" type="button" data-example-id="bcr-abl1-fusion" data-example-mode="single">BCR::ABL1 · CML</button>
-              </div>
+            <div class="input-examples-compact" aria-label="Valid input examples">
+              <span class="examples-label">Try:</span>
+              <button class="example-pill" type="button" data-example-id="alk-gene" data-example-mode="single">ALK</button>
+              <button class="example-pill" type="button" data-example-id="braf-gene" data-example-mode="single">BRAF · melanoma</button>
+              <button class="example-pill" type="button" data-example-id="eml4-alk-fusion" data-example-mode="single">EML4::ALK · LUAD</button>
+              <button class="example-pill" type="button" data-example-id="bcr-abl1-fusion" data-example-mode="single">BCR::ABL1 · CML</button>
             </div>
             <details class="breakpoint-section">
               <summary>Add breakpoint details <span class="optional-tag">optional</span></summary>
@@ -58,7 +56,7 @@
                 <label class="field"><span>3' Transcript</span><input id="single-three-transcript" type="text" placeholder="NM_..." /></label>
               </div>
             </details>
-            <button id="add-fusion-btn" type="button">+ Add to queue</button>
+            <button class="text-button" id="add-fusion-btn" type="button">+ Add to queue</button>
             <div id="fusion-queue" class="hidden">
               <div class="queue-header">
                 <span id="queue-count" class="field-label">0 queued</span>
@@ -119,34 +117,28 @@
             </div>
           </div>
 
-          <div class="api-url-row">
-            <span class="field-label">Backend URL</span>
-            <input
-              id="api-base-url-input"
-              type="text"
-              placeholder="https://your-server.example.com (leave blank for same-host)"
-              autocomplete="off"
-            />
-            <button class="text-button" id="save-api-url" type="button">Save</button>
-          </div>
+          <details class="breakpoint-section">
+            <summary>Advanced <span class="optional-tag">backend &amp; mode</span></summary>
+            <div class="breakpoint-grid">
+              <label class="field hidden" id="annotate-backend-field">
+                <span>Local Backend</span>
+                <select id="annotate-local-backend">
+                  <option value="">Anthropic SDK</option>
+                  <option value="claude-code">Claude Code</option>
+                  <option value="codex">Codex</option>
+                  <option value="antigravity">Antigravity</option>
+                </select>
+              </label>
 
-          <label class="field hidden" id="annotate-backend-field">
-            <span>Local Backend</span>
-            <select id="annotate-local-backend">
-              <option value="">Anthropic SDK</option>
-              <option value="claude-code">Claude Code</option>
-              <option value="codex">Codex</option>
-              <option value="antigravity">Antigravity</option>
-            </select>
-          </label>
-
-          <label class="field">
-            <span>Annotation Mode</span>
-            <select id="annotate-mode">
-              <option value="full">Full</option>
-              <option value="core">Core</option>
-            </select>
-          </label>
+              <label class="field">
+                <span>Annotation Mode</span>
+                <select id="annotate-mode">
+                  <option value="full">Full</option>
+                  <option value="core">Core</option>
+                </select>
+              </label>
+            </div>
+          </details>
 
           <button class="primary-action" id="run-button" type="button">Run</button>
         </section>
