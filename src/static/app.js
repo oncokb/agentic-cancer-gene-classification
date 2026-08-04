@@ -1116,10 +1116,11 @@ function makePubMedLink(pmid) {
 function renderSupportingEvidence(annotation) {
   const quotes = annotation.supporting_quotes || [];
   const citations = annotation.citations || [];
+  const evidenceCards = annotation.evidence_cards || [];
   const allRetrieved = annotation.retrieved_pmids || [];
   const count = annotation.retrieval_count ?? allRetrieved.length;
 
-  if (!quotes.length && !citations.length && !count) return null;
+  if (!quotes.length && !citations.length && !evidenceCards.length && !count) return null;
 
   const section = document.createElement("div");
   section.className = "supporting-evidence";
@@ -1165,6 +1166,40 @@ function renderSupportingEvidence(annotation) {
     citations.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
     citBlock.appendChild(linkRow);
     section.appendChild(citBlock);
+  }
+
+  if (evidenceCards.length) {
+    const cardDetails = document.createElement("details");
+    cardDetails.className = "evidence-card-details";
+    const cardSummary = document.createElement("summary");
+    cardSummary.className = "retrieval-summary";
+    cardSummary.innerHTML = `
+      <span class="retrieval-count-label">
+        ${evidenceCards.length} evidence card${evidenceCards.length === 1 ? "" : "s"}
+      </span>
+    `;
+    cardDetails.appendChild(cardSummary);
+
+    const cardList = document.createElement("div");
+    cardList.className = "evidence-card-list";
+    evidenceCards.forEach((card) => {
+      const item = document.createElement("article");
+      item.className = "evidence-card";
+      const evidenceType = String(card.evidence_type || "other").replace(/_/g, " ");
+      item.innerHTML = `
+        <div class="evidence-card-topline">
+          <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(card.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(card.pmid)}</a>
+          <span class="review-badge context">${escapeHtml(evidenceType)}</span>
+        </div>
+        <h5>${escapeHtml(card.title || "Untitled PubMed record")}</h5>
+        <p class="evidence-card-meta">${escapeHtml(card.journal || "Journal unavailable")}</p>
+        ${card.selected_reason ? `<p>${escapeHtml(card.selected_reason)}</p>` : ""}
+        ${card.quote ? `<blockquote>${escapeHtml(card.quote)}</blockquote>` : ""}
+      `;
+      cardList.appendChild(item);
+    });
+    cardDetails.appendChild(cardList);
+    section.appendChild(cardDetails);
   }
 
   // Grounding quotes — collapsed by default. These are the deepest level
@@ -1551,7 +1586,47 @@ function renderStatusLine(annotation) {
     wrapper.appendChild(item);
   }
 
+  const cacheBadge = renderCacheBadge(annotation);
+  if (cacheBadge) wrapper.appendChild(cacheBadge);
+
+  (annotation.quality_flags || []).forEach((flag) => {
+    const badge = document.createElement("span");
+    const severity = ["info", "warning", "critical"].includes(flag.severity)
+      ? flag.severity
+      : "info";
+    badge.className = `review-badge quality-${severity}`;
+    badge.title = flag.code === "low_evidence_score"
+      ? annotation.evidence_support_explanation || flag.detail || ""
+      : flag.detail || "";
+    badge.textContent = flag.label || flag.code;
+    wrapper.appendChild(badge);
+  });
+
   return wrapper;
+}
+
+function renderCacheBadge(annotation) {
+  const status = annotation.cache_status;
+  const reason = annotation.cache_reason;
+  if (!status && !reason) return null;
+
+  const badge = document.createElement("span");
+  badge.className = "review-badge cache-badge";
+  const labelByReason = {
+    fresh_final_annotation: "Cached final",
+    no_new_pubmed_pmids_since_last_check: "Cached after PubMed check",
+    force_refresh: "Force refreshed",
+    computed_new_annotation: "Freshly computed",
+    cache_miss_or_stale: "Freshly computed",
+  };
+  const labelByStatus = {
+    reused: "Cached",
+    refreshed: "Freshly computed",
+    bypassed: "Cache bypassed",
+  };
+  badge.textContent = labelByReason[reason] || labelByStatus[status] || "Cache status";
+  badge.title = [status, reason].filter(Boolean).join(": ");
+  return badge;
 }
 
 // ---------------------------------------------------------------------------

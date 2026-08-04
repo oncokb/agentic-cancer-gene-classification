@@ -35,6 +35,22 @@ class SupportingQuote(BaseModel):
     quote: str
 
 
+class EvidenceCard(BaseModel):
+    pmid: str
+    title: str = ""
+    journal: str = ""
+    evidence_type: str = "other"
+    selected_reason: str = ""
+    quote: Optional[str] = None
+
+
+class QualityFlag(BaseModel):
+    code: str
+    label: str
+    severity: Literal["info", "warning", "critical"] = "info"
+    detail: str = ""
+
+
 class FusionTreatmentKnowledge(BaseModel):
     """Deterministic, CIViC-sourced treatment/evidence data for a fusion, keyed by
     gene pair (e.g. EML4::ALK). Never LLM-generated — displayed as-is."""
@@ -91,6 +107,8 @@ class GeneAnnotation(BaseModel):
     gene_summary: Optional[str] = None
     citations: List[str] = Field(default_factory=list)  # verified PMIDs only
     supporting_quotes: List[SupportingQuote] = Field(default_factory=list)
+    evidence_cards: List[EvidenceCard] = Field(default_factory=list)
+    quality_flags: List[QualityFlag] = Field(default_factory=list)
     date_annotated: str = Field(
         default_factory=lambda: date.today().strftime("%-m/%-d/%y")
     )

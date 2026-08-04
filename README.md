@@ -194,6 +194,20 @@ Enrichment runs full retrieval/synthesis off the core request path and streams
 expanded annotations with fields such as supporting quotes, pathway/class
 context, prevalence context, and fuller summaries.
 
+Enriched/full annotations also include deterministic review metadata:
+
+- `evidence_cards`: one card per verified citation with PMID, title, journal,
+  evidence type, selected reason, and a supporting excerpt when available.
+- `quality_flags`: review-priority badges for no verified citations, low
+  evidence score, Tier 2 retrieval, deep-model escalation, and mixed/contextual
+  evidence language.
+- Cache provenance stays on each annotation through `cache_status` and
+  `cache_reason`; the UI renders these as badges such as freshly computed,
+  cached final, cached after PubMed check, or force refreshed.
+
+These fields are computed from existing retrieval/synthesis metadata. They do
+not add extra calls to the core annotation request.
+
 This path uses the Anthropic SDK for selection, synthesis, benchmark judging, and
 Tier 2 agentic retrieval. In Bedrock mode, direct Anthropic model names must be
 replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL`,

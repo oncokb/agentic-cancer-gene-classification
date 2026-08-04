@@ -113,6 +113,8 @@ async def enrich_gene_annotation(
         cancer_type_prevalence=prevalence,
         records=records,
         synthesis_result=synthesis,
+        retrieval_tier=retrieval_tier,
+        mode="full",
     )
     enriched = _merge_enriched_annotation(annotation, enriched)
     timings["total"] = _elapsed_ms(total_start)

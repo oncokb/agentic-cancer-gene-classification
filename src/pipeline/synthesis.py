@@ -13,7 +13,7 @@ import logging
 from typing import Dict, List, Optional
 
 from src.config import settings
-from src.models.schema import AnnotationMode, GeneAnnotation, LiteratureRecord
+from src.models.schema import AnnotationMode, EvidenceCard, GeneAnnotation, LiteratureRecord, QualityFlag
 from src.pipeline.citation_precision import filter_and_rank_citations
 from src.pipeline.literature import _HIGH_IMPACT_JOURNALS, _publication_evidence_rank
 from src.pipeline.llm_client import complete_with_tool
@@ -323,6 +323,69 @@ def _postprocess_synthesis_output(
     return tool_input
 
 
+def _evidence_type(record: LiteratureRecord) -> str:
+    combined = f"{record.title} {record.abstract}".lower()
+    publication_types = {value.lower() for value in record.publication_types}
+    if any("clinical trial" in value for value in publication_types):
+        return "clinical"
+    if any(term in combined for term in ("patient", "cohort", "survival", "prognosis")):
+        return "clinical"
+    if any(term in combined for term in ("fusion", "rearrangement", "translocation")):
+        return "structural_variant"
+    if any(term in combined for term in ("mutation", "mutant", "somatic")):
+        return "mutation"
+    if any(term in combined for term in ("expression", "overexpress", "upregulated", "downregulated")):
+        return "expression"
+    if any(term in combined for term in ("knockdown", "knockout", "xenograft", "proliferation", "invasion")):
+        return "functional"
+    if any(term in combined for term in ("methylation", "copy number", "amplification", "deletion")):
+        return "genomic"
+    return "other"
+
+
+def _fallback_quote(record: LiteratureRecord) -> Optional[str]:
+    text = record.abstract.strip()
+    if not text:
+        return None
+    sentence = text.split(". ", 1)[0].strip()
+    if not sentence.endswith("."):
+        sentence += "."
+    return sentence[:320]
+
+
+def _build_evidence_cards(
+    citations: List[str],
+    records: List[LiteratureRecord],
+    supporting_quotes: List[dict],
+) -> List[EvidenceCard]:
+    records_by_pmid = {record.pmid: record for record in records}
+    quote_by_pmid = {
+        quote["pmid"]: quote.get("quote")
+        for quote in supporting_quotes
+        if isinstance(quote, dict) and quote.get("pmid")
+    }
+    cards: List[EvidenceCard] = []
+    for pmid in citations:
+        record = records_by_pmid.get(pmid)
+        if record is None:
+            continue
+        evidence_type = _evidence_type(record)
+        selected_reason = f"Verified PMID selected as {evidence_type.replace('_', ' ')} evidence."
+        if record.journal in _HIGH_IMPACT_JOURNALS:
+            selected_reason += " High-impact journal signal."
+        cards.append(
+            EvidenceCard(
+                pmid=pmid,
+                title=record.title,
+                journal=record.journal,
+                evidence_type=evidence_type,
+                selected_reason=selected_reason,
+                quote=quote_by_pmid.get(pmid) or _fallback_quote(record),
+            )
+        )
+    return cards
+
+
 def _evidence_support(
     citations: List[str],
     records: List[LiteratureRecord],
@@ -380,6 +443,79 @@ def _evidence_support(
             "This score estimates literature grounding, not biological truth or clinical actionability."
         )
     return score, explanation
+
+
+def _has_contradictory_evidence_text(*values: Optional[str]) -> bool:
+    text = " ".join(value or "" for value in values).lower()
+    contradiction_terms = (
+        "contradictory evidence",
+        "conflicting evidence",
+        "mixed evidence",
+        "conflicting results",
+        "inconsistent findings",
+        "context-dependent",
+        "context dependent",
+    )
+    return any(term in text for term in contradiction_terms)
+
+
+def _quality_flags(
+    *,
+    citations: List[str],
+    evidence_support_score: float,
+    retrieval_tier: int,
+    synthesis_result: Dict,
+) -> List[QualityFlag]:
+    flags: List[QualityFlag] = []
+    if not citations:
+        flags.append(
+            QualityFlag(
+                code="no_verified_citations",
+                label="No verified citations",
+                severity="critical",
+                detail="The annotation has no PMID that passed retrieval-set verification.",
+            )
+        )
+    if evidence_support_score < settings.gene_cache_medium_support_threshold:
+        flags.append(
+            QualityFlag(
+                code="low_evidence_score",
+                label="Low evidence score",
+                severity="warning",
+                detail=f"Evidence support score is {evidence_support_score:.2f}.",
+            )
+        )
+    if retrieval_tier == 2:
+        flags.append(
+            QualityFlag(
+                code="tier2_retrieval_used",
+                label="Tier 2 retrieval",
+                severity="info",
+                detail="Sparse Tier 1 results required expanded agentic retrieval.",
+            )
+        )
+    if synthesis_result.get("_synthesis_escalated"):
+        flags.append(
+            QualityFlag(
+                code="deep_model_escalated",
+                label="Deep model escalated",
+                severity="info",
+                detail=str(synthesis_result.get("_synthesis_escalation_reason") or ""),
+            )
+        )
+    if _has_contradictory_evidence_text(
+        synthesis_result.get("cancer_association_rationale"),
+        synthesis_result.get("gene_summary"),
+    ):
+        flags.append(
+            QualityFlag(
+                code="contradictory_evidence_detected",
+                label="Contradictory evidence",
+                severity="warning",
+                detail="The generated rationale or summary indicates mixed or context-dependent evidence.",
+            )
+        )
+    return flags
 
 
 def _needs_synthesis_escalation(
@@ -490,6 +626,8 @@ async def synthesize_gene_annotation(
         records=prompt_records,
         gene_identity=gene_identity,
     )
+    tool_input["_synthesis_escalated"] = False
+    tool_input["_synthesis_escalation_reason"] = None
     should_escalate, reason = _needs_synthesis_escalation(
         tool_input=tool_input,
         records=records,
@@ -521,8 +659,11 @@ async def synthesize_gene_annotation(
                 records=prompt_records,
                 gene_identity=gene_identity,
             )
+            tool_input["_synthesis_escalated"] = True
+            tool_input["_synthesis_escalation_reason"] = reason
         else:
             logger.warning("Deep synthesis returned no annotation for gene %s; keeping fast pass", gene)
+            tool_input["_synthesis_escalation_reason"] = reason
     else:
         logger.info("Synthesis fast pass accepted for %s: %s", gene, reason)
 
@@ -536,6 +677,8 @@ def build_gene_annotation(
     cancer_type_prevalence: Optional[str],
     records: List[LiteratureRecord],
     synthesis_result: Dict,
+    retrieval_tier: int = 1,
+    mode: AnnotationMode = "full",
 ) -> GeneAnnotation:
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
     citations = synthesis_result.get("citations", [])
@@ -555,6 +698,18 @@ def build_gene_annotation(
         cancer_association_rationale=synthesis_result.get("cancer_association_rationale"),
         gene_summary=synthesis_result.get("gene_summary"),
     )
+    include_evidence_cards = mode == "full"
+    evidence_cards = (
+        _build_evidence_cards(citations, records, verified_quotes)
+        if include_evidence_cards
+        else []
+    )
+    quality_flags = _quality_flags(
+        citations=citations,
+        evidence_support_score=evidence_support_score,
+        retrieval_tier=retrieval_tier,
+        synthesis_result=synthesis_result,
+    )
     return GeneAnnotation(
         gene=gene,
         fusions=list(dict.fromkeys(fusions)),  # deduplicate, preserve order
@@ -567,6 +722,8 @@ def build_gene_annotation(
         gene_summary=synthesis_result.get("gene_summary"),
         citations=citations,
         supporting_quotes=verified_quotes,
+        evidence_cards=evidence_cards,
+        quality_flags=quality_flags,
         retrieval_count=len(records),
         retrieved_pmids=[record.pmid for record in records],
         insufficient_evidence=insufficient_evidence,

@@ -142,6 +142,22 @@ def test_enrichment_job_endpoint_streams_enriched_annotations(monkeypatch):
                 gene_class="Tumor suppressor",
                 signaling_pathways="p53 pathway",
                 supporting_quotes=[{"pmid": "12345", "quote": "TP53 cancer"}],
+                evidence_cards=[
+                    {
+                        "pmid": "12345",
+                        "title": "TP53 cancer evidence",
+                        "evidence_type": "clinical",
+                        "selected_reason": "Verified PMID selected as clinical evidence.",
+                    }
+                ],
+                quality_flags=[
+                    {
+                        "code": "low_evidence_score",
+                        "label": "Low evidence score",
+                        "severity": "warning",
+                        "detail": "Evidence support score is 0.30.",
+                    }
+                ],
                 timings_ms={"total": 1.5},
             )
             for annotation in annotations
@@ -187,4 +203,6 @@ def test_enrichment_job_endpoint_streams_enriched_annotations(monkeypatch):
     assert status_payload["annotations_total"] == 1
     assert status_payload["annotations"][0]["gene_class"] == "Tumor suppressor"
     assert status_payload["annotations"][0]["supporting_quotes"][0]["quote"] == "TP53 cancer"
+    assert status_payload["annotations"][0]["evidence_cards"][0]["evidence_type"] == "clinical"
+    assert status_payload["annotations"][0]["quality_flags"][0]["code"] == "low_evidence_score"
     assert status_payload["timings_ms"]["total"] == 1.5

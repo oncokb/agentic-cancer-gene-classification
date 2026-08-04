@@ -66,6 +66,8 @@ async def test_enrich_gene_annotation_runs_full_synthesis_and_preserves_cache(mo
     assert enriched.gene_class == "Tumor suppressor"
     assert enriched.signaling_pathways == "p53 pathway"
     assert enriched.supporting_quotes[0].quote == "TP53 cancer"
+    assert enriched.evidence_cards[0].pmid == "1"
+    assert enriched.evidence_cards[0].quote == "TP53 cancer"
     assert enriched.cache_status == "reused"
     assert enriched.cache_reason == "fresh_final_annotation"
     assert enriched.cached_at == "2026-08-03T00:00:00+00:00"

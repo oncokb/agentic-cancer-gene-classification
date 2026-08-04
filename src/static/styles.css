@@ -445,6 +445,30 @@ textarea {
   color: var(--muted);
 }
 
+.review-badge.cache-badge {
+  border-color: #b9d9d5;
+  background: #eef9f7;
+  color: var(--accent-strong);
+}
+
+.review-badge.quality-info {
+  border-color: #b9d9d5;
+  background: #eef9f7;
+  color: var(--accent-strong);
+}
+
+.review-badge.quality-warning {
+  border-color: #d4c39b;
+  background: #fff6db;
+  color: #7c5a00;
+}
+
+.review-badge.quality-critical {
+  border-color: #e5b0aa;
+  background: #fdecea;
+  color: var(--danger);
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -1104,6 +1128,64 @@ details[open] > .retrieval-summary::after {
 
 .quote-details {
   margin-top: 8px;
+}
+
+.evidence-card-details {
+  margin-top: 8px;
+}
+
+.evidence-card-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.evidence-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.evidence-card-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.evidence-card-topline a {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.evidence-card h5 {
+  margin: 0 0 4px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.evidence-card p {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.evidence-card .evidence-card-meta {
+  font-weight: 700;
+}
+
+.evidence-card blockquote {
+  margin: 7px 0 0;
+  border-left: 3px solid var(--accent);
+  padding-left: 9px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .quote-details .quote-list {
