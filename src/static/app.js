@@ -41,7 +41,6 @@ function emptyRow() {
 
 const state = {
   isRunning: false,
-  isEnriching: false,
   isBenchmarkRunning: false,
   currentResult: null,
   currentBenchmark: null,
@@ -49,6 +48,7 @@ const state = {
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
+  enrichmentByGene: new Map(),
   // Breakpoint fields from the most recent submission, keyed by the exact
   // fusion string as submitted (matches GeneAnnotation.fusions entries) —
   // needed by the on-demand /v1/fusion-context lookup, since breakpoint
@@ -73,7 +73,6 @@ const elements = {
   clearResults: document.querySelector("#clear-results"),
   closeSetup: document.querySelector("#close-setup"),
   dismissSetup: document.querySelector("#dismiss-setup"),
-  enrichResults: document.querySelector("#enrich-results"),
   exportCsv: document.querySelector("#export-csv"),
   exportJson: document.querySelector("#export-json"),
   shareRun: document.querySelector("#share-run"),
@@ -129,6 +128,12 @@ const statusFields = [
   ["cancer_associated", "Cancer associated"],
   ["in_oncokb", "In OncoKB"],
 ];
+
+const lazyAnnotationFields = new Set([
+  "cancer_type_prevalence",
+  "gene_class",
+  "signaling_pathways",
+]);
 
 const editableFields = [
   ["cancer_association_rationale", "Rationale", "long"],
@@ -186,11 +191,9 @@ function switchView(view) {
   elements.benchmarkPanel.classList.toggle("hidden", !isBenchmark);
   elements.workspaceTitle.textContent = isBenchmark ? "Benchmark" : "Results";
   elements.exportCsv.classList.toggle("hidden", isBenchmark);
-  elements.enrichResults.classList.toggle("hidden", isBenchmark);
   elements.clearResults.classList.toggle("hidden", isBenchmark);
   elements.shareRun.classList.toggle("hidden", isBenchmark);
   elements.exportJson.disabled = isBenchmark ? !state.currentBenchmark : !state.currentResult;
-  elements.enrichResults.disabled = isBenchmark || !hasEnrichableAnnotations();
   elements.clearResults.disabled = isBenchmark || !state.currentResult;
   elements.shareRun.disabled = isBenchmark || !state.currentResult?.run_id;
 
@@ -281,7 +284,6 @@ function clearResults() {
   localStorage.removeItem(LAST_RESULT_KEY);
   elements.exportJson.disabled = state.currentView === "benchmark" ? !state.currentBenchmark : true;
   elements.exportCsv.disabled = true;
-  elements.enrichResults.disabled = true;
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
   rebuildGeneIndex([]);
@@ -635,17 +637,10 @@ function setRunning(isRunning) {
   state.isRunning = isRunning;
   elements.runButton.textContent = isRunning ? "Running..." : "Run";
   elements.runButton.disabled = isRunning;
-  elements.enrichResults.disabled = isRunning || state.isEnriching || !hasEnrichableAnnotations();
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function setEnriching(isEnriching) {
-  state.isEnriching = isEnriching;
-  elements.enrichResults.textContent = isEnriching ? "Enriching..." : "Enrich results";
-  elements.enrichResults.disabled = isEnriching || state.isRunning || !hasEnrichableAnnotations();
 }
 
 function setBenchmarkRunning(isRunning) {
@@ -769,11 +764,6 @@ async function pollAnnotationJob(statusUrl) {
   }
 }
 
-function hasEnrichableAnnotations() {
-  const annotations = state.currentResult?.annotations || [];
-  return annotations.some((annotation) => !annotation.insufficient_evidence);
-}
-
 function mergeAnnotations(existing, enriched) {
   const byGene = new Map((existing || []).map((annotation) => [annotation.gene, annotation]));
   (enriched || []).forEach((annotation) => {
@@ -782,50 +772,53 @@ function mergeAnnotations(existing, enriched) {
   return Array.from(byGene.values()).sort((a, b) => a.gene.localeCompare(b.gene));
 }
 
-async function enrichCurrentResult() {
-  if (!hasEnrichableAnnotations() || state.isEnriching) return;
-
-  setEnriching(true);
-  clearMessage();
-  setMessage("Submitting lazy enrichment job...", "info");
-
-  try {
-    const localBackend = elements.annotateLocalBackend.value || undefined;
-    const annotations = (state.currentResult.annotations || []).filter(
-      (annotation) => !annotation.insufficient_evidence,
-    );
-    const body = { annotations };
-    if (localBackend) body.local_backend = localBackend;
-
-    const response = await fetch(apiUrl("/v1/annotate/enrichment/jobs"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      let detail = response.statusText;
-      const text = await response.text();
-      try {
-        const payload = JSON.parse(text);
-        detail = payload.detail || detail;
-      } catch {
-        detail = text || detail;
-      }
-      throw new Error(detail || "Enrichment request failed");
-    }
-
-    const job = await response.json();
-    await pollEnrichmentJob(job.status_url);
-    saveLastResult(state.currentResult);
-    setMessage("Enrichment complete. Review expanded fields and evidence.", "info");
-  } catch (error) {
-    setMessage(formatRunError(error.message), "error");
-  } finally {
-    setEnriching(false);
-  }
+function canEnrichAnnotation(annotation) {
+  return annotation && !annotation.insufficient_evidence && annotation.gene;
 }
 
-async function pollEnrichmentJob(statusUrl) {
+async function enrichAnnotationOnDemand(annotation, label = "details") {
+  if (!canEnrichAnnotation(annotation)) return null;
+  if (state.enrichmentByGene.has(annotation.gene)) {
+    return state.enrichmentByGene.get(annotation.gene);
+  }
+
+  const promise = submitAnnotationEnrichment(annotation, label).finally(() => {
+    state.enrichmentByGene.delete(annotation.gene);
+  });
+  state.enrichmentByGene.set(annotation.gene, promise);
+  return promise;
+}
+
+async function submitAnnotationEnrichment(annotation, label) {
+  const localBackend = elements.annotateLocalBackend.value || undefined;
+  const body = { annotations: [annotation] };
+  if (localBackend) body.local_backend = localBackend;
+
+  const response = await fetch(apiUrl("/v1/annotate/enrichment/jobs"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let detail = response.statusText;
+    const text = await response.text();
+    try {
+      const payload = JSON.parse(text);
+      detail = payload.detail || detail;
+    } catch {
+      detail = text || detail;
+    }
+    throw new Error(detail || "Enrichment request failed");
+  }
+
+  const job = await response.json();
+  const enriched = await pollAnnotationEnrichmentJob(job.status_url, annotation.gene);
+  saveLastResult(state.currentResult);
+  setMessage(`${annotation.gene} ${label} enriched.`, "info");
+  return enriched;
+}
+
+async function pollAnnotationEnrichmentJob(statusUrl, gene) {
   while (true) {
     const response = await fetch(apiUrl(statusUrl));
     if (!response.ok) {
@@ -836,24 +829,20 @@ async function pollEnrichmentJob(statusUrl) {
       throw new Error(status.error || "Enrichment job failed");
     }
 
-    state.currentResult = {
-      ...state.currentResult,
-      annotations: mergeAnnotations(
-        state.currentResult?.annotations || [],
-        status.annotations || [],
-      ),
-    };
-    renderAnnotationResult(state.currentResult);
-
-    if (status.status === "complete") {
-      return status.annotations || [];
+    const annotations = status.annotations || [];
+    if (annotations.length) {
+      state.currentResult = {
+        ...state.currentResult,
+        annotations: mergeAnnotations(state.currentResult?.annotations || [], annotations),
+      };
     }
 
-    const total = status.annotations_total || "?";
-    setMessage(
-      `Enrichment running: ${status.annotations_completed}/${total} genes complete.`,
-      "info",
-    );
+    if (status.status === "complete") {
+      renderAnnotationResult(state.currentResult);
+      return annotations.find((annotation) => annotation.gene === gene) || annotations[0] || null;
+    }
+
+    setMessage(`Loading ${gene} enrichment...`, "info");
     await sleep(1500);
   }
 }
@@ -1044,7 +1033,6 @@ function renderAnnotationResult(result) {
   const hasAnnotations = visibleAnnotations.length > 0;
   elements.exportCsv.disabled = !allAnnotations.length;
   elements.exportJson.disabled = !allAnnotations.length;
-  elements.enrichResults.disabled = state.isRunning || state.isEnriching || !hasAnnotations;
   elements.clearResults.disabled = false;
   elements.shareRun.disabled = !result.run_id;
 
@@ -1101,6 +1089,10 @@ function renderAnnotationResult(result) {
     const fields = card.querySelector(".annotation-fields");
     for (const [field, label, type] of editableFields) {
       if (field === "error" && !annotation.error) continue;
+      if (lazyAnnotationFields.has(field)) {
+        fields.appendChild(renderLazyField(annotation, field, label, type));
+        continue;
+      }
       const row = renderField(annotation, field, label, type);
       if (field === "cancer_association_rationale") {
         row.classList.add("field-row-highlight");
@@ -1190,20 +1182,22 @@ function renderSupportingEvidence(annotation) {
     section.appendChild(citBlock);
   }
 
-  if (evidenceCards.length) {
-    const cardDetails = document.createElement("details");
-    cardDetails.className = "evidence-card-details";
-    const cardSummary = document.createElement("summary");
-    cardSummary.className = "retrieval-summary";
-    cardSummary.innerHTML = `
-      <span class="retrieval-count-label">
-        ${evidenceCards.length} evidence card${evidenceCards.length === 1 ? "" : "s"}
-      </span>
-    `;
-    cardDetails.appendChild(cardSummary);
+  const cardDetails = document.createElement("details");
+  cardDetails.className = "evidence-card-details";
+  const cardSummary = document.createElement("summary");
+  cardSummary.className = "retrieval-summary";
+  cardSummary.innerHTML = `
+    <span class="retrieval-count-label">
+      ${evidenceCards.length
+        ? `${evidenceCards.length} evidence card${evidenceCards.length === 1 ? "" : "s"}`
+        : "Evidence cards"}
+    </span>
+  `;
+  cardDetails.appendChild(cardSummary);
 
-    const cardList = document.createElement("div");
-    cardList.className = "evidence-card-list";
+  const cardList = document.createElement("div");
+  cardList.className = "evidence-card-list";
+  if (evidenceCards.length) {
     evidenceCards.forEach((card) => {
       const item = document.createElement("article");
       item.className = "evidence-card";
@@ -1220,9 +1214,26 @@ function renderSupportingEvidence(annotation) {
       `;
       cardList.appendChild(item);
     });
-    cardDetails.appendChild(cardList);
-    section.appendChild(cardDetails);
+  } else {
+    const placeholder = document.createElement("div");
+    placeholder.className = "lazy-evidence-placeholder";
+    placeholder.textContent = `Expand to load evidence cards for ${annotation.gene}.`;
+    cardList.appendChild(placeholder);
   }
+  cardDetails.appendChild(cardList);
+  cardDetails.addEventListener("toggle", () => {
+    if (!cardDetails.open || evidenceCards.length) return;
+    cardList.textContent = `Loading evidence cards for ${annotation.gene}...`;
+    enrichAnnotationOnDemand(annotation, "evidence cards")
+      .then(() => {
+        cardList.textContent = "Loaded. Refreshing this gene card...";
+      })
+      .catch((error) => {
+        cardList.textContent = "Unable to load evidence cards.";
+        setMessage(formatRunError(error.message), "error");
+      });
+  });
+  section.appendChild(cardDetails);
 
   // Grounding quotes — collapsed by default. These are the deepest level
   // of "show your work" (the actual sentences the annotation was derived
@@ -1570,6 +1581,48 @@ function populateFieldDisplay(display, annotation, field, type) {
   display.textContent = formatFieldValue(annotation[field], type);
 }
 
+function hasFieldValue(annotation, field) {
+  const value = annotation[field];
+  return value !== null && value !== undefined && String(value).trim() !== "";
+}
+
+function renderLazyField(annotation, field, label, type) {
+  const details = document.createElement("details");
+  details.className = "field-row lazy-field-row";
+
+  const summary = document.createElement("summary");
+  summary.className = "lazy-field-summary";
+  summary.innerHTML = `
+    <span class="field-row-label">${escapeHtml(label)}</span>
+    <span class="lazy-field-state">${hasFieldValue(annotation, field) ? "Loaded" : "Load on expand"}</span>
+  `;
+  details.appendChild(summary);
+
+  const value = document.createElement("div");
+  value.className = "field-row-value lazy-field-value";
+  if (hasFieldValue(annotation, field)) {
+    populateFieldDisplay(value, annotation, field, type);
+  } else {
+    value.textContent = `Expand to load ${label.toLowerCase()} for ${annotation.gene}.`;
+  }
+  details.appendChild(value);
+
+  details.addEventListener("toggle", () => {
+    if (!details.open || hasFieldValue(annotation, field)) return;
+    value.textContent = `Loading ${label.toLowerCase()} for ${annotation.gene}...`;
+    enrichAnnotationOnDemand(annotation, label.toLowerCase())
+      .then(() => {
+        value.textContent = "Loaded. Refreshing this gene card...";
+      })
+      .catch((error) => {
+        value.textContent = `Unable to load ${label.toLowerCase()}.`;
+        setMessage(formatRunError(error.message), "error");
+      });
+  });
+
+  return details;
+}
+
 // Plain read-only label + value. This card is for reviewing/understanding
 // a run, not correcting it yet — inline editing was removed since there's
 // no annotation/approval workflow for it to feed into right now. Revisit
@@ -1778,7 +1831,6 @@ function bindEvents() {
   elements.saveNcbiApiKey.addEventListener("click", saveNCBIApiKey);
 
   elements.shareRun.addEventListener("click", copyShareLink);
-  elements.enrichResults.addEventListener("click", enrichCurrentResult);
   elements.clearResults.addEventListener("click", clearResults);
   elements.exportJson.addEventListener("click", exportJson);
   elements.exportCsv.addEventListener("click", async () => {

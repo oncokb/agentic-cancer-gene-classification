@@ -543,6 +543,48 @@ textarea {
   gap: 3px;
 }
 
+.lazy-field-row {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 0;
+}
+
+.lazy-field-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  list-style: none;
+  padding: 10px 12px;
+}
+
+.lazy-field-summary::-webkit-details-marker {
+  display: none;
+}
+
+.lazy-field-summary::after {
+  content: "▸";
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.lazy-field-row[open] .lazy-field-summary::after {
+  content: "▾";
+}
+
+.lazy-field-state {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.lazy-field-value {
+  padding: 0 12px 12px;
+}
+
 .field-row-label {
   color: var(--muted);
   font-size: 13px;
