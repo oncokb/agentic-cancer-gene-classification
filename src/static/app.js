@@ -1064,16 +1064,21 @@ function renderAnnotationResult(result) {
     card.id = `gene-${annotation.gene}`;
     card.innerHTML = `
       <header>
-        <div>
+        <div class="annotation-heading">
           <h3>${escapeHtml(annotation.gene)}</h3>
           <div class="subtle">${escapeHtml(annotation.fusions?.length ? formatList(annotation.fusions) : "Gene lookup")}</div>
-          <div class="status-line-slot"></div>
         </div>
-        <span class="status-pill">${escapeHtml(annotation.date_annotated || "")}</span>
+        <div class="annotation-card-meta">
+          ${annotation.date_annotated ? `<span class="status-pill">${escapeHtml(annotation.date_annotated)}</span>` : ""}
+          <div class="cache-badge-slot"></div>
+        </div>
       </header>
+      <div class="status-line-slot"></div>
       <div class="annotation-fields"></div>
     `;
 
+    const cacheBadge = renderCacheBadge(annotation);
+    if (cacheBadge) card.querySelector(".cache-badge-slot").appendChild(cacheBadge);
     card.querySelector(".status-line-slot").appendChild(renderStatusLine(annotation));
 
     const fields = card.querySelector(".annotation-fields");
@@ -1585,9 +1590,6 @@ function renderStatusLine(annotation) {
     item.textContent = `${label}: ${text}`;
     wrapper.appendChild(item);
   }
-
-  const cacheBadge = renderCacheBadge(annotation);
-  if (cacheBadge) wrapper.appendChild(cacheBadge);
 
   (annotation.quality_flags || []).forEach((flag) => {
     const badge = document.createElement("span");

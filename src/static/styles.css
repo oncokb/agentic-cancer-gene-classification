@@ -390,10 +390,14 @@ textarea {
 
 .annotation-card header {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
+}
+
+.annotation-heading {
+  min-width: 0;
 }
 
 .annotation-card h3 {
@@ -406,9 +410,28 @@ textarea {
   font-size: 13px;
 }
 
+.annotation-card-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.cache-badge-slot {
+  display: flex;
+  justify-content: flex-end;
+  min-height: 24px;
+}
+
+.cache-badge-slot:empty {
+  display: none;
+}
+
 .review-badge {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   min-height: 24px;
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -485,8 +508,9 @@ textarea {
 .status-line {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 16px;
-  margin-top: 8px;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 0 0 12px;
 }
 
 .status-value {
