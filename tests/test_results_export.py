@@ -70,6 +70,8 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             "insufficient_evidence": "FALSE",
             "evidence_support_score": "0.91",
             "evidence_support_explanation": "Strong support from verified citations.",
+            "quality_flags": "",
+            "evidence_card_count": "0",
             "cache_status": "reused",
             "cache_reason": "fresh_high_evidence_support",
             "cached_at": "2026-07-13T00:00:00+00:00",
