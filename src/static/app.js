@@ -137,10 +137,10 @@ const lazyAnnotationFields = new Set([
 
 const editableFields = [
   ["cancer_association_rationale", "Rationale", "long"],
+  ["gene_summary", "Gene summary", "long"],
   ["cancer_type_prevalence", "Cancer type prevalence", "long"],
   ["gene_class", "Gene class", "text"],
   ["signaling_pathways", "Signaling pathways", "long"],
-  ["gene_summary", "Gene summary", "long"],
   ["error", "Error", "text"],
 ];
 
