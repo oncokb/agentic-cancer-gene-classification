@@ -9,11 +9,12 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Coroutine, Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -117,6 +118,7 @@ class AnnotationJobStatusResponse(BaseModel):
     result: Optional[AnnotationResult] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    created_at: float = Field(default_factory=time.monotonic, exclude=True)
 
 
 class FusionContextResponse(BaseModel):
@@ -157,6 +159,20 @@ def require_dev_mode() -> None:
 _annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
 _annotation_jobs_lock = asyncio.Lock()
 
+# asyncio.create_task() only keeps a weak reference to the task via the event
+# loop — an unreferenced task can be garbage-collected mid-execution. This set
+# holds a strong reference for the life of each background job, and the
+# done-callback removes it once the task finishes (success or failure) so the
+# set doesn't grow unbounded either.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _track_background_task(coro: Coroutine[Any, Any, None]) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 async def _store_annotation_job(job: AnnotationJobStatusResponse) -> None:
     async with _annotation_jobs_lock:
@@ -169,6 +185,21 @@ async def _get_annotation_job(job_id: str) -> AnnotationJobStatusResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Annotation job not found")
     return job
+
+
+async def _evict_stale_annotation_jobs() -> None:
+    """Drop finished jobs older than the TTL so the in-memory job store
+    doesn't grow unbounded over the life of the process. Jobs still queued
+    or running are never evicted, regardless of age."""
+    cutoff = time.monotonic() - settings.annotation_job_ttl_seconds
+    async with _annotation_jobs_lock:
+        stale = [
+            job_id
+            for job_id, job in _annotation_jobs.items()
+            if job.status in ("complete", "failed") and job.created_at < cutoff
+        ]
+        for job_id in stale:
+            del _annotation_jobs[job_id]
 
 
 async def _persist_run_result(
@@ -235,6 +266,8 @@ async def create_annotation_job(
     request: AnnotateRequest,
     http_request: Request,
 ) -> AnnotationJobCreateResponse:
+    await _evict_stale_annotation_jobs()
+
     job_id = str(uuid.uuid4())
     job = AnnotationJobStatusResponse(
         job_id=job_id,
@@ -279,7 +312,7 @@ async def create_annotation_job(
             current.error = str(exc)
             await _store_annotation_job(current)
 
-    asyncio.create_task(run_job())
+    _track_background_task(run_job())
     return AnnotationJobCreateResponse(
         job_id=job_id,
         status_url=f"/v1/annotate/jobs/{job_id}",

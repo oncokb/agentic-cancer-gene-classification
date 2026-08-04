@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     llm_concurrency: int = 2
     pubmed_staged_retrieval: bool = True
     selection_llm_threshold: int = 24
+    annotation_job_ttl_seconds: int = 3600
 
     redis_url: str = "redis://localhost:6379/0"
     redis_cache_ttl_seconds: int = 86400
