@@ -1540,7 +1540,7 @@ function bindEvents() {
   elements.tabSingle.addEventListener("click", () => switchMode("single"));
   elements.tabBatch.addEventListener("click", () => switchMode("batch"));
 
-  document.querySelectorAll(".input-examples").forEach((container) => {
+  document.querySelectorAll(".input-examples, .input-examples-compact").forEach((container) => {
     container.addEventListener("click", (event) => {
       const button = event.target.closest(".example-pill");
       if (!button) return;
