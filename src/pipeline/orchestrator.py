@@ -301,6 +301,8 @@ async def _annotate_gene(
         cancer_type_prevalence=prevalence,
         records=records,       # full count for retrieval_count field
         synthesis_result=synthesis,
+        retrieval_tier=retrieval_tier,
+        mode=mode,
     )
     timings["total"] = _elapsed_ms(total_start)
     annotation.timings_ms = timings
