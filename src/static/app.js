@@ -643,6 +643,23 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function renderLoadingState(message) {
+  const wrap = document.createElement("div");
+  wrap.className = "inline-loading";
+  wrap.setAttribute("role", "status");
+
+  const spinner = document.createElement("span");
+  spinner.className = "inline-spinner";
+  spinner.setAttribute("aria-hidden", "true");
+  wrap.appendChild(spinner);
+
+  const text = document.createElement("span");
+  text.textContent = message;
+  wrap.appendChild(text);
+
+  return wrap;
+}
+
 function setBenchmarkRunning(isRunning) {
   state.isBenchmarkRunning = isRunning;
   elements.runBenchmarkButton.textContent = isRunning ? "Running..." : "Run Benchmark";
@@ -899,7 +916,7 @@ async function loadSharedRunOrRestoreLast() {
       state.currentResult = result;
       renderAnnotationResult(result);
       saveLastResult(result);
-      setMessage("Loaded shared run.", "info");
+      setMessage("Shared run restored.", "info");
     } catch (error) {
       setMessage(formatRunError(error.message), "error");
     }
@@ -1223,10 +1240,10 @@ function renderSupportingEvidence(annotation) {
   cardDetails.appendChild(cardList);
   cardDetails.addEventListener("toggle", () => {
     if (!cardDetails.open || evidenceCards.length) return;
-    cardList.textContent = `Loading evidence cards for ${annotation.gene}...`;
+    cardList.replaceChildren(renderLoadingState(`Loading evidence cards for ${annotation.gene}`));
     enrichAnnotationOnDemand(annotation, "evidence cards")
       .then(() => {
-        cardList.textContent = "Loaded. Refreshing this gene card...";
+        cardList.textContent = "Updating...";
       })
       .catch((error) => {
         cardList.textContent = "Unable to load evidence cards.";
@@ -1594,7 +1611,6 @@ function renderLazyField(annotation, field, label, type) {
   summary.className = "lazy-field-summary";
   summary.innerHTML = `
     <span class="field-row-label">${escapeHtml(label)}</span>
-    <span class="lazy-field-state">${hasFieldValue(annotation, field) ? "Loaded" : "Load on expand"}</span>
   `;
   details.appendChild(summary);
 
@@ -1609,10 +1625,10 @@ function renderLazyField(annotation, field, label, type) {
 
   details.addEventListener("toggle", () => {
     if (!details.open || hasFieldValue(annotation, field)) return;
-    value.textContent = `Loading ${label.toLowerCase()} for ${annotation.gene}...`;
+    value.replaceChildren(renderLoadingState(`Loading ${label.toLowerCase()} for ${annotation.gene}`));
     enrichAnnotationOnDemand(annotation, label.toLowerCase())
       .then(() => {
-        value.textContent = "Loaded. Refreshing this gene card...";
+        value.textContent = "Updating...";
       })
       .catch((error) => {
         value.textContent = `Unable to load ${label.toLowerCase()}.`;
