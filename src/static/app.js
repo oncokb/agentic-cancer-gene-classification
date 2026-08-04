@@ -61,13 +61,11 @@ const state = {
 
 const elements = {
   annotatePanel: document.querySelector("#annotate-panel"),
-  apiBaseUrlInput: document.querySelector("#api-base-url-input"),
   apiBaseUrlModal: document.querySelector("#api-base-url-modal"),
   benchmarkJudge: document.querySelector("#benchmark-judge"),
   benchmarkLocalBackend: document.querySelector("#benchmark-local-backend"),
   benchmarkMaxGenes: document.querySelector("#benchmark-max-genes"),
   benchmarkPanel: document.querySelector("#benchmark-panel"),
-  saveApiUrl: document.querySelector("#save-api-url"),
   saveApiUrlModal: document.querySelector("#save-api-url-modal"),
   closeSetup: document.querySelector("#close-setup"),
   dismissSetup: document.querySelector("#dismiss-setup"),
@@ -543,7 +541,6 @@ function parseInputs() {
 
 function loadSettings() {
   const savedUrl = getApiBaseUrl();
-  elements.apiBaseUrlInput.value = savedUrl;
   elements.apiBaseUrlModal.value = savedUrl;
 
   const hasOncokb = Boolean(localStorage.getItem(ONCOKB_TOKEN_KEY));
@@ -566,7 +563,6 @@ function saveApiUrl(url) {
   } else {
     localStorage.removeItem(API_BASE_URL_KEY);
   }
-  elements.apiBaseUrlInput.value = trimmed;
   elements.apiBaseUrlModal.value = trimmed;
   elements.setupSummary.textContent = trimmed ? `API: ${trimmed}` : "Using same-host API.";
   setInstallOutput("Backend URL saved", trimmed || "Using same-host API.");
@@ -1573,9 +1569,6 @@ function bindEvents() {
     renderGrid({ row: state.batchRows.length - 1, col: 0 });
   });
 
-  elements.saveApiUrl.addEventListener("click", () =>
-    saveApiUrl(elements.apiBaseUrlInput.value),
-  );
   elements.saveApiUrlModal.addEventListener("click", () =>
     saveApiUrl(elements.apiBaseUrlModal.value),
   );

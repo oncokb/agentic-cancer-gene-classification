@@ -178,20 +178,6 @@ textarea {
   line-height: 1.45;
 }
 
-.api-url-row {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.api-url-row input {
-  font-size: 12px;
-}
-
-.api-url-row .text-button {
-  align-self: flex-start;
-}
-
 .primary-action {
   border-color: var(--accent);
   background: var(--accent);
