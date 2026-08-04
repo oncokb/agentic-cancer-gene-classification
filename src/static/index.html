@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Agentic Cancer Gene Classification</title>
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -190,6 +190,7 @@
             <p id="run-summary">Run annotations to populate this review area.</p>
           </div>
           <div class="actions">
+            <button id="clear-results" type="button" disabled>Clear results</button>
             <button id="share-run" type="button" disabled title="Copy a link to this run — only works for peers who can reach the same Backend URL">Copy share link</button>
             <button id="export-json" type="button" disabled>Export JSON</button>
             <button id="export-csv" type="button" disabled>Export CSV</button>
@@ -307,6 +308,6 @@
       </section>
     </div>
 
-    <script src="app.js"></script>
+    <script src="/static/app.js"></script>
   </body>
 </html>

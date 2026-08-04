@@ -119,6 +119,8 @@ def resolve_sdk_model(model: str, purpose: str = "") -> str:
     if resolve_sdk_provider() != "bedrock":
         return model
 
+    if purpose == "synthesis_fast" and settings.bedrock_synthesis_fast_model:
+        return settings.bedrock_synthesis_fast_model
     if purpose == "synthesis" and settings.bedrock_synthesis_model:
         return settings.bedrock_synthesis_model
     if purpose == "selection" and settings.bedrock_selection_model:

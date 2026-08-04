@@ -83,6 +83,12 @@ def _cache_window_days(annotation: GeneAnnotation) -> tuple[int, str]:
     return settings.gene_cache_medium_support_days, "fresh_medium_evidence_support"
 
 
+def _final_annotation_cache_days(annotation: GeneAnnotation) -> int:
+    if annotation.error:
+        return 0
+    return max(0, settings.gene_cache_final_annotation_days)
+
+
 def _cached_annotation_for_request(
     annotation_payload: dict,
     fusions: List[str],
@@ -127,12 +133,23 @@ async def _maybe_reuse_cached_annotation(
         return None
     last_pubmed_checked_at = cached.get("last_pubmed_checked_at") or updated_at
     window_days, reason = _cache_window_days(annotation)
+    age = now - updated_at
 
-    if now - updated_at <= timedelta(days=window_days):
+    if age <= timedelta(days=window_days):
         return _cached_annotation_for_request(
             cached["annotation"],
             fusions,
             reason,
+            updated_at,
+            last_pubmed_checked_at,
+        )
+
+    final_cache_days = _final_annotation_cache_days(annotation)
+    if final_cache_days and age <= timedelta(days=final_cache_days):
+        return _cached_annotation_for_request(
+            cached["annotation"],
+            fusions,
+            "fresh_final_annotation",
             updated_at,
             last_pubmed_checked_at,
         )
@@ -296,6 +313,8 @@ async def _annotate_gene(
         cancer_type_prevalence=prevalence,
         records=records,       # full count for retrieval_count field
         synthesis_result=synthesis,
+        retrieval_tier=retrieval_tier,
+        mode=mode,
     )
     timings["total"] = _elapsed_ms(total_start)
     annotation.timings_ms = timings

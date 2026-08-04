@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi.testclient import TestClient
 
 from src import main
@@ -124,3 +126,83 @@ def test_batch_annotation_endpoint_returns_annotation_result_json(monkeypatch):
     assert payload["fusions_processed"] == 2
     assert payload["annotations"][0]["gene"] == "BRAF"
     assert payload["annotations"][0]["fusions"] == ["TP53::BRAF"]
+
+
+def test_enrichment_job_endpoint_streams_enriched_annotations(monkeypatch):
+    async def fake_enrich_gene_annotations(
+        annotations,
+        local_backend=None,
+        on_annotation=None,
+    ):
+        enriched = [
+            GeneAnnotation(
+                gene=annotation.gene,
+                fusions=annotation.fusions,
+                cancer_associated=annotation.cancer_associated,
+                gene_class="Tumor suppressor",
+                signaling_pathways="p53 pathway",
+                supporting_quotes=[{"pmid": "12345", "quote": "TP53 cancer"}],
+                evidence_cards=[
+                    {
+                        "pmid": "12345",
+                        "title": "TP53 cancer evidence",
+                        "evidence_type": "clinical",
+                        "selected_reason": "Verified PMID selected as clinical evidence.",
+                    }
+                ],
+                quality_flags=[
+                    {
+                        "code": "low_evidence_score",
+                        "label": "Low evidence score",
+                        "severity": "warning",
+                        "detail": "Evidence support score is 0.30.",
+                    }
+                ],
+                timings_ms={"total": 1.5},
+            )
+            for annotation in annotations
+        ]
+        for annotation in enriched:
+            if on_annotation:
+                await on_annotation(annotation)
+        return enriched
+
+    monkeypatch.setattr(main, "enrich_gene_annotations", fake_enrich_gene_annotations)
+    client = TestClient(main.app)
+
+    create_response = client.post(
+        "/v1/annotate/enrichment/jobs",
+        json={
+            "local_backend": "codex",
+            "annotations": [
+                {
+                    "gene": "TP53",
+                    "fusions": ["TP53::BRAF"],
+                    "cancer_associated": True,
+                    "citations": ["12345"],
+                }
+            ],
+        },
+    )
+
+    assert create_response.status_code == 200
+    status_url = create_response.json()["status_url"]
+
+    status_payload = None
+    for _ in range(20):
+        status_response = client.get(status_url)
+        assert status_response.status_code == 200
+        status_payload = status_response.json()
+        if status_payload["status"] == "complete":
+            break
+        time.sleep(0.01)
+
+    assert status_payload is not None
+    assert status_payload["status"] == "complete"
+    assert status_payload["annotations_completed"] == 1
+    assert status_payload["annotations_total"] == 1
+    assert status_payload["annotations"][0]["gene_class"] == "Tumor suppressor"
+    assert status_payload["annotations"][0]["supporting_quotes"][0]["quote"] == "TP53 cancer"
+    assert status_payload["annotations"][0]["evidence_cards"][0]["evidence_type"] == "clinical"
+    assert status_payload["annotations"][0]["quality_flags"][0]["code"] == "low_evidence_score"
+    assert status_payload["timings_ms"]["total"] == 1.5

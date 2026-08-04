@@ -26,6 +26,15 @@ Latency knobs:
 - `ANNOTATION_GENE_CONCURRENCY`: number of genes annotated concurrently.
 - `LLM_CONCURRENCY`: maximum concurrent LLM calls across retrieval, selection,
   and synthesis.
+- `SYNTHESIS_MODEL_ESCALATION`: when true, use `SYNTHESIS_FAST_MODEL` first and
+  call `SYNTHESIS_MODEL` only when the fast pass is missing core fields,
+  under-cited, low-support, or sourced from Tier 2 retrieval.
+- `CORE_SYNTHESIS_MAX_TOKENS`, `CORE_SYNTHESIS_ABSTRACT_CHARS`, and
+  `CORE_SYNTHESIS_MAX_PAPERS`: keep core-mode synthesis compact so the first
+  response focuses on cancer association, rationale, summary, and citations.
+- `CORE_SYNTHESIS_ESCALATION_MIN_SUPPORT_SCORE` and
+  `CORE_SYNTHESIS_ESCALATION_TIER2`: let core mode avoid deep-model escalation
+  for complete fast-pass answers while full mode keeps stricter escalation.
 - `PUBMED_STAGED_RETRIEVAL`: when true, Tier 1 PubMed retrieval stops after
   enough abstracts are found for synthesis instead of running every query family.
 - `SELECTION_LLM_THRESHOLD`: only use the selection LLM when the retrieved
@@ -50,6 +59,8 @@ running.
 - `BEDROCK_SYNTHESIS_MODEL` and `BEDROCK_SELECTION_MODEL`: optional Bedrock
   model IDs for AGCG's synthesis and selection calls. Use these when the normal
   `SYNTHESIS_MODEL` / `SELECTION_MODEL` values are direct Anthropic model names.
+- `BEDROCK_SYNTHESIS_FAST_MODEL`: optional Bedrock model ID for the lightweight
+  synthesis pass when `SYNTHESIS_MODEL_ESCALATION=true`.
 - `ONCOKB_API_TOKEN`: optional, but recommended for OncoKB membership lookups.
   OncoKB requires an account and data-access approval/license. After approval,
   the token is available in account settings:
@@ -80,6 +91,7 @@ ANTHROPIC_SDK_PROVIDER=bedrock
 BEDROCK_AWS_DEFAULT_REGION=us-east-1
 AWS_PROFILE=490004633549
 BEDROCK_SYNTHESIS_MODEL=anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_SYNTHESIS_FAST_MODEL=anthropic.claude-haiku-4-5-20251001-v1:0
 BEDROCK_SELECTION_MODEL=anthropic.claude-haiku-4-5-20251001-v1:0
 ```
 
@@ -166,11 +178,42 @@ curl -X POST http://127.0.0.1:8000/v1/annotate/jobs \
 curl http://127.0.0.1:8000/v1/annotate/jobs/{job_id}
 ```
 
+Core results can be enriched lazily after the first response returns. The UI
+exposes this through **Enrich results**; API callers can submit returned
+annotations to the enrichment job endpoint:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/annotate/enrichment/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"annotations":[{"gene":"TP53","fusions":["TP53::BRAF"],"cancer_associated":true,"citations":["12345"]}]}'
+
+curl http://127.0.0.1:8000/v1/annotate/enrichment/jobs/{job_id}
+```
+
+Enrichment runs full retrieval/synthesis off the core request path and streams
+expanded annotations with fields such as supporting quotes, pathway/class
+context, prevalence context, and fuller summaries.
+
+Enriched/full annotations also include deterministic review metadata:
+
+- `evidence_cards`: one card per verified citation with PMID, title, journal,
+  evidence type, selected reason, and a supporting excerpt when available.
+- `quality_flags`: review-priority badges for no verified citations, low
+  evidence score, Tier 2 retrieval, deep-model escalation, and mixed/contextual
+  evidence language.
+- Cache provenance stays on each annotation through `cache_status` and
+  `cache_reason`; the UI renders these as badges such as freshly computed,
+  cached final, cached after PubMed check, or force refreshed.
+
+These fields are computed from existing retrieval/synthesis metadata. They do
+not add extra calls to the core annotation request.
+
 This path uses the Anthropic SDK for selection, synthesis, benchmark judging, and
 Tier 2 agentic retrieval. In Bedrock mode, direct Anthropic model names must be
-replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL` and
-`BEDROCK_SELECTION_MODEL`, or by setting `SYNTHESIS_MODEL` and `SELECTION_MODEL`
-to Bedrock IDs directly.
+replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL`,
+`BEDROCK_SYNTHESIS_FAST_MODEL`, and `BEDROCK_SELECTION_MODEL`, or by setting
+`SYNTHESIS_MODEL`, `SYNTHESIS_FAST_MODEL`, and `SELECTION_MODEL` to Bedrock IDs
+directly.
 
 ## Latency Comparison
 
@@ -370,6 +413,8 @@ work for genes that are still fresh enough.
 
 Default freshness policy:
 
+- Any non-error final gene annotation is reused for 180 days before the PubMed
+  freshness probe runs. This is the aggressive latency path for repeated genes.
 - OncoKB-positive cached genes are reused for 90 days before a lightweight PubMed
   freshness check.
 - High evidence support (`evidence_support_score >= 0.8`) is reused for 60 days.
@@ -381,12 +426,25 @@ Default freshness policy:
   rerun through retrieval and synthesis.
 - Requests can set `force_refresh: true` to bypass gene cache reuse.
 
+Warm the Tier 1 PubMed literature cache ahead of benchmark or batch runs:
+
+```bash
+python -m benchmarks.warm_literature_cache \
+  --fusions "TP53::BRAF" "ETV6::NTRK3" \
+  --output benchmarks/results/literature_warmup.json
+```
+
+The warmer only runs Tier 1 PubMed retrieval, so it populates Redis-backed
+`esearch`/`efetch` cache entries without invoking Tier 2 agentic retrieval.
+
 ## Benchmark
 
 Run the benchmark with API credits:
 
 ```bash
 python -m benchmarks.run_benchmark \
+  --route local \
+  --mode core \
   --output benchmark_report.json \
   --results-csv benchmark_results.csv
 ```
@@ -395,6 +453,7 @@ Run the benchmark locally and skip the SDK judge call:
 
 ```bash
 python -m benchmarks.run_benchmark \
+  --route local \
   --local codex \
   --no-judge \
   --output benchmark_report.json \

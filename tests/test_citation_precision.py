@@ -139,3 +139,68 @@ def test_build_gene_annotation_propagates_insufficient_evidence():
 
     assert annotation.cancer_associated is False
     assert annotation.insufficient_evidence is True
+
+
+def test_build_gene_annotation_adds_lazy_evidence_cards_and_quality_flags():
+    annotation = build_gene_annotation(
+        gene="TP53",
+        fusions=["TP53::BRAF"],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=[
+            LiteratureRecord(
+                pmid="12345",
+                title="TP53 mutation predicts cancer prognosis",
+                abstract="Patient cohort data link TP53 mutation to cancer prognosis.",
+                journal="J Clin Oncol",
+                publication_types=["Journal Article"],
+            )
+        ],
+        synthesis_result={
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Context-dependent cancer association.",
+            "gene_summary": "TP53 has context-dependent cancer evidence (PMID 12345).",
+            "citations": ["12345"],
+            "supporting_quotes": [{"pmid": "12345", "quote": "Patient cohort data."}],
+            "_synthesis_escalated": True,
+            "_synthesis_escalation_reason": "too_few_verified_citations",
+        },
+        retrieval_tier=2,
+        mode="full",
+    )
+
+    assert annotation.evidence_cards[0].pmid == "12345"
+    assert annotation.evidence_cards[0].evidence_type == "clinical"
+    assert annotation.evidence_cards[0].quote == "Patient cohort data."
+    assert {flag.code for flag in annotation.quality_flags} == {
+        "tier2_retrieval_used",
+        "deep_model_escalated",
+        "contradictory_evidence_detected",
+    }
+
+
+def test_build_gene_annotation_omits_evidence_cards_in_core_mode():
+    annotation = build_gene_annotation(
+        gene="TP53",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=[
+            LiteratureRecord(
+                pmid="12345",
+                title="TP53 mutation",
+                abstract="TP53 mutation in cancer.",
+            )
+        ],
+        synthesis_result={
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Mutation evidence.",
+            "gene_summary": "TP53 mutation evidence (PMID 12345).",
+            "citations": ["12345"],
+        },
+        mode="core",
+    )
+
+    assert annotation.evidence_cards == []

@@ -13,7 +13,7 @@ import logging
 from typing import Dict, List, Optional
 
 from src.config import settings
-from src.models.schema import AnnotationMode, GeneAnnotation, LiteratureRecord
+from src.models.schema import AnnotationMode, EvidenceCard, GeneAnnotation, LiteratureRecord, QualityFlag
 from src.pipeline.citation_precision import filter_and_rank_citations
 from src.pipeline.literature import _HIGH_IMPACT_JOURNALS, _publication_evidence_rank
 from src.pipeline.llm_client import complete_with_tool
@@ -63,6 +63,21 @@ The context will tell you which retrieval tier sourced the literature:
 End the `gene_summary` with one parenthetical sentence noting the retrieval tier, for example:
   "(Literature sourced via Tier 1 direct PubMed query.)" or
   "(Literature sourced via Tier 2 Claude agentic retrieval — sparse initial results required expanded search.)"
+"""
+
+CORE_SYSTEM_PROMPT = """\
+You are a cancer genomics expert filling only the latency-sensitive core fields for a gene triage result.
+
+Return a compact annotation through the `annotate_gene` tool:
+- `cancer_associated`: true only for credible peer-reviewed cancer evidence.
+- `cancer_association_rationale`: one concise sentence naming evidence type(s) and cancer context.
+- `gene_summary`: 1-2 concise sentences grounded only in the provided abstracts, with inline PMIDs.
+- `citations`: strongest PMIDs from the provided abstracts only.
+- `insufficient_evidence`: true when the provided abstracts do not support a confident call.
+
+Do not produce supporting quotes, pathways, prevalence, gene class, or extended background.
+Never invent PMIDs or use facts outside the provided abstracts.
+Prefer a precise short answer over a broad answer.
 """
 
 ANNOTATE_TOOL: dict = {
@@ -167,13 +182,35 @@ CORE_ANNOTATE_TOOL: dict = {
     ),
     "input_schema": {
         "type": "object",
-        "required": ["cancer_associated", "insufficient_evidence"],
+        "required": [
+            "cancer_associated",
+            "insufficient_evidence",
+            "cancer_association_rationale",
+            "gene_summary",
+            "citations",
+        ],
         "properties": {
-            "cancer_associated": ANNOTATE_TOOL["input_schema"]["properties"]["cancer_associated"],
-            "insufficient_evidence": ANNOTATE_TOOL["input_schema"]["properties"]["insufficient_evidence"],
-            "cancer_association_rationale": ANNOTATE_TOOL["input_schema"]["properties"]["cancer_association_rationale"],
-            "gene_summary": ANNOTATE_TOOL["input_schema"]["properties"]["gene_summary"],
-            "citations": ANNOTATE_TOOL["input_schema"]["properties"]["citations"],
+            "cancer_associated": {
+                "type": "boolean",
+                "description": "Whether retrieved abstracts support a cancer association.",
+            },
+            "insufficient_evidence": {
+                "type": "boolean",
+                "description": "True when the retrieved abstracts are too weak or sparse.",
+            },
+            "cancer_association_rationale": {
+                "type": "string",
+                "description": "One concise sentence naming evidence type(s) and cancer context.",
+            },
+            "gene_summary": {
+                "type": "string",
+                "description": "1-2 concise sentences with inline PMIDs from provided abstracts only.",
+            },
+            "citations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Strongest supporting PMIDs from the provided abstracts only.",
+            },
         },
     },
 }
@@ -194,6 +231,8 @@ def _build_user_prompt(
         if retrieval_tier == 1
         else "Tier 2 (Claude agentic retrieval — sparse initial results required expanded search)"
     )
+    if mode == "core":
+        records = records[: settings.core_synthesis_max_papers]
     lines = [
         f"## Gene: {gene}",
         f"Associated fusions: {', '.join(fusions) if fusions else 'none'}",
@@ -209,8 +248,8 @@ def _build_user_prompt(
     if mode == "core":
         lines += [
             "",
-            "Core mode: prioritize cancer_associated, cancer_association_rationale, "
-            "gene_summary, citations, and evidence support. Omit non-core fields.",
+            "Core mode: return only the decision, one-sentence rationale, 1-2 sentence "
+            "summary, citations, and insufficient_evidence flag.",
         ]
 
     if not records:
@@ -223,7 +262,7 @@ def _build_user_prompt(
                 "---",
                 f"PMID: {rec.pmid}{journal_tag}{impact_tag}",
                 f"Title: {rec.title}",
-                f"Abstract: {rec.abstract[:900] if mode == 'core' else rec.abstract}",
+                f"Abstract: {rec.abstract[:settings.core_synthesis_abstract_chars] if mode == 'core' else rec.abstract}",
             ]
 
     return "\n".join(lines)
@@ -263,6 +302,88 @@ def _verify_citations(
             len(citations),
         )
     return verified
+
+
+def _postprocess_synthesis_output(
+    *,
+    gene: str,
+    tool_input: Dict,
+    records: List[LiteratureRecord],
+    gene_identity: Optional[str],
+) -> Dict:
+    """Apply deterministic citation verification to a raw synthesis tool response."""
+    if "citations" in tool_input:
+        tool_input["citations"] = _verify_citations(
+            gene,
+            tool_input["citations"],
+            records,
+            settings.max_citations_per_annotation,
+            gene_identity,
+        )
+    return tool_input
+
+
+def _evidence_type(record: LiteratureRecord) -> str:
+    combined = f"{record.title} {record.abstract}".lower()
+    publication_types = {value.lower() for value in record.publication_types}
+    if any("clinical trial" in value for value in publication_types):
+        return "clinical"
+    if any(term in combined for term in ("patient", "cohort", "survival", "prognosis")):
+        return "clinical"
+    if any(term in combined for term in ("fusion", "rearrangement", "translocation")):
+        return "structural_variant"
+    if any(term in combined for term in ("mutation", "mutant", "somatic")):
+        return "mutation"
+    if any(term in combined for term in ("expression", "overexpress", "upregulated", "downregulated")):
+        return "expression"
+    if any(term in combined for term in ("knockdown", "knockout", "xenograft", "proliferation", "invasion")):
+        return "functional"
+    if any(term in combined for term in ("methylation", "copy number", "amplification", "deletion")):
+        return "genomic"
+    return "other"
+
+
+def _fallback_quote(record: LiteratureRecord) -> Optional[str]:
+    text = record.abstract.strip()
+    if not text:
+        return None
+    sentence = text.split(". ", 1)[0].strip()
+    if not sentence.endswith("."):
+        sentence += "."
+    return sentence[:320]
+
+
+def _build_evidence_cards(
+    citations: List[str],
+    records: List[LiteratureRecord],
+    supporting_quotes: List[dict],
+) -> List[EvidenceCard]:
+    records_by_pmid = {record.pmid: record for record in records}
+    quote_by_pmid = {
+        quote["pmid"]: quote.get("quote")
+        for quote in supporting_quotes
+        if isinstance(quote, dict) and quote.get("pmid")
+    }
+    cards: List[EvidenceCard] = []
+    for pmid in citations:
+        record = records_by_pmid.get(pmid)
+        if record is None:
+            continue
+        evidence_type = _evidence_type(record)
+        selected_reason = f"Verified PMID selected as {evidence_type.replace('_', ' ')} evidence."
+        if record.journal in _HIGH_IMPACT_JOURNALS:
+            selected_reason += " High-impact journal signal."
+        cards.append(
+            EvidenceCard(
+                pmid=pmid,
+                title=record.title,
+                journal=record.journal,
+                evidence_type=evidence_type,
+                selected_reason=selected_reason,
+                quote=quote_by_pmid.get(pmid) or _fallback_quote(record),
+            )
+        )
+    return cards
 
 
 def _evidence_support(
@@ -324,6 +445,129 @@ def _evidence_support(
     return score, explanation
 
 
+def _has_contradictory_evidence_text(*values: Optional[str]) -> bool:
+    text = " ".join(value or "" for value in values).lower()
+    contradiction_terms = (
+        "contradictory evidence",
+        "conflicting evidence",
+        "mixed evidence",
+        "conflicting results",
+        "inconsistent findings",
+        "context-dependent",
+        "context dependent",
+    )
+    return any(term in text for term in contradiction_terms)
+
+
+def _quality_flags(
+    *,
+    citations: List[str],
+    evidence_support_score: float,
+    retrieval_tier: int,
+    synthesis_result: Dict,
+) -> List[QualityFlag]:
+    flags: List[QualityFlag] = []
+    if not citations:
+        flags.append(
+            QualityFlag(
+                code="no_verified_citations",
+                label="No verified citations",
+                severity="critical",
+                detail="The annotation has no PMID that passed retrieval-set verification.",
+            )
+        )
+    if evidence_support_score < settings.gene_cache_medium_support_threshold:
+        flags.append(
+            QualityFlag(
+                code="low_evidence_score",
+                label="Low evidence score",
+                severity="warning",
+                detail=f"Evidence support score is {evidence_support_score:.2f}.",
+            )
+        )
+    if retrieval_tier == 2:
+        flags.append(
+            QualityFlag(
+                code="tier2_retrieval_used",
+                label="Tier 2 retrieval",
+                severity="info",
+                detail="Sparse Tier 1 results required expanded agentic retrieval.",
+            )
+        )
+    if synthesis_result.get("_synthesis_escalated"):
+        flags.append(
+            QualityFlag(
+                code="deep_model_escalated",
+                label="Deep model escalated",
+                severity="info",
+                detail=str(synthesis_result.get("_synthesis_escalation_reason") or ""),
+            )
+        )
+    if _has_contradictory_evidence_text(
+        synthesis_result.get("cancer_association_rationale"),
+        synthesis_result.get("gene_summary"),
+    ):
+        flags.append(
+            QualityFlag(
+                code="contradictory_evidence_detected",
+                label="Contradictory evidence",
+                severity="warning",
+                detail="The generated rationale or summary indicates mixed or context-dependent evidence.",
+            )
+        )
+    return flags
+
+
+def _needs_synthesis_escalation(
+    *,
+    tool_input: Dict,
+    records: List[LiteratureRecord],
+    retrieval_tier: int,
+    mode: AnnotationMode,
+) -> tuple[bool, str]:
+    """Decide whether the fast synthesis pass needs a deeper model pass."""
+    if not settings.synthesis_model_escalation:
+        return False, "disabled"
+    if not records:
+        return False, "no_retrieved_literature"
+    tier2_escalation = (
+        settings.core_synthesis_escalation_tier2
+        if mode == "core"
+        else settings.synthesis_escalation_tier2
+    )
+    if retrieval_tier == 2 and tier2_escalation:
+        return True, "tier2_retrieval"
+    if not tool_input:
+        return True, "empty_synthesis"
+    if not tool_input.get("gene_summary"):
+        return True, "missing_gene_summary"
+    if not tool_input.get("cancer_association_rationale"):
+        return True, "missing_rationale"
+
+    citations = tool_input.get("citations", []) or []
+    if (
+        len(records) >= settings.min_papers_for_strong_association
+        and len(citations) < settings.synthesis_escalation_min_citations
+    ):
+        return True, "too_few_verified_citations"
+
+    score, _ = _evidence_support(
+        citations=citations,
+        records=records,
+        insufficient_evidence=bool(tool_input.get("insufficient_evidence")),
+        cancer_association_rationale=tool_input.get("cancer_association_rationale"),
+        gene_summary=tool_input.get("gene_summary"),
+    )
+    min_support_score = (
+        settings.core_synthesis_escalation_min_support_score
+        if mode == "core"
+        else settings.synthesis_escalation_min_support_score
+    )
+    if len(records) >= settings.min_papers_for_strong_association and score < min_support_score:
+        return True, f"low_support_score_{score:.2f}"
+    return False, "fast_pass_sufficient"
+
+
 async def synthesize_gene_annotation(
     gene: str,
     fusions: List[str],
@@ -340,41 +584,88 @@ async def synthesize_gene_annotation(
     Call Claude to produce a structured annotation. Returns raw tool-use input dict.
     Raises on API error.
     """
+    prompt_records = (
+        records[: settings.core_synthesis_max_papers]
+        if mode == "core"
+        else records
+    )
     user_prompt = _build_user_prompt(
         gene,
         fusions,
         in_oncokb,
         cancer_type_prevalence,
-        records,
+        prompt_records,
         retrieval_tier,
         gene_identity,
         mode,
     )
     tool = CORE_ANNOTATE_TOOL if mode == "core" else ANNOTATE_TOOL
+    system_prompt = CORE_SYSTEM_PROMPT if mode == "core" else SYSTEM_PROMPT
+    max_tokens = settings.core_synthesis_max_tokens if mode == "core" else 2048
+
+    fast_model = settings.synthesis_fast_model if settings.synthesis_model_escalation else settings.synthesis_model
+    fast_purpose = "synthesis_fast" if settings.synthesis_model_escalation else "synthesis"
     tool_input = await complete_with_tool(
-        model=settings.synthesis_model,
-        system=SYSTEM_PROMPT,
+        model=fast_model,
+        system=system_prompt,
         user=user_prompt,
         tool=tool,
-        max_tokens=1024 if mode == "core" else 2048,
+        max_tokens=max_tokens,
         local_mode=local_mode,
         local_backend=local_backend,
-        model_purpose="synthesis",
+        model_purpose=fast_purpose,
     )
 
     if not tool_input:
         logger.error("No annotation returned for gene %s", gene)
-        return {"insufficient_evidence": True, "cancer_associated": None}
+        tool_input = {"insufficient_evidence": True, "cancer_associated": None}
 
-    # PMID verification — reject any citation not in retrieved set
-    if "citations" in tool_input:
-        tool_input["citations"] = _verify_citations(
+    tool_input = _postprocess_synthesis_output(
+        gene=gene,
+        tool_input=tool_input,
+        records=prompt_records,
+        gene_identity=gene_identity,
+    )
+    tool_input["_synthesis_escalated"] = False
+    tool_input["_synthesis_escalation_reason"] = None
+    should_escalate, reason = _needs_synthesis_escalation(
+        tool_input=tool_input,
+        records=records,
+        retrieval_tier=retrieval_tier,
+        mode=mode,
+    )
+    if should_escalate and not local_mode and settings.synthesis_model != fast_model:
+        logger.info(
+            "Escalating synthesis for %s from %s to %s: %s",
             gene,
-            tool_input["citations"],
-            records,
-            settings.max_citations_per_annotation,
-            gene_identity,
+            fast_model,
+            settings.synthesis_model,
+            reason,
         )
+        deep_input = await complete_with_tool(
+            model=settings.synthesis_model,
+            system=system_prompt,
+            user=user_prompt,
+            tool=tool,
+            max_tokens=max_tokens,
+            local_mode=local_mode,
+            local_backend=local_backend,
+            model_purpose="synthesis",
+        )
+        if deep_input:
+            tool_input = _postprocess_synthesis_output(
+                gene=gene,
+                tool_input=deep_input,
+                records=prompt_records,
+                gene_identity=gene_identity,
+            )
+            tool_input["_synthesis_escalated"] = True
+            tool_input["_synthesis_escalation_reason"] = reason
+        else:
+            logger.warning("Deep synthesis returned no annotation for gene %s; keeping fast pass", gene)
+            tool_input["_synthesis_escalation_reason"] = reason
+    else:
+        logger.info("Synthesis fast pass accepted for %s: %s", gene, reason)
 
     return tool_input
 
@@ -386,6 +677,8 @@ def build_gene_annotation(
     cancer_type_prevalence: Optional[str],
     records: List[LiteratureRecord],
     synthesis_result: Dict,
+    retrieval_tier: int = 1,
+    mode: AnnotationMode = "full",
 ) -> GeneAnnotation:
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
     citations = synthesis_result.get("citations", [])
@@ -405,6 +698,18 @@ def build_gene_annotation(
         cancer_association_rationale=synthesis_result.get("cancer_association_rationale"),
         gene_summary=synthesis_result.get("gene_summary"),
     )
+    include_evidence_cards = mode == "full"
+    evidence_cards = (
+        _build_evidence_cards(citations, records, verified_quotes)
+        if include_evidence_cards
+        else []
+    )
+    quality_flags = _quality_flags(
+        citations=citations,
+        evidence_support_score=evidence_support_score,
+        retrieval_tier=retrieval_tier,
+        synthesis_result=synthesis_result,
+    )
     return GeneAnnotation(
         gene=gene,
         fusions=list(dict.fromkeys(fusions)),  # deduplicate, preserve order
@@ -417,6 +722,8 @@ def build_gene_annotation(
         gene_summary=synthesis_result.get("gene_summary"),
         citations=citations,
         supporting_quotes=verified_quotes,
+        evidence_cards=evidence_cards,
+        quality_flags=quality_flags,
         retrieval_count=len(records),
         retrieved_pmids=[record.pmid for record in records],
         insufficient_evidence=insufficient_evidence,
