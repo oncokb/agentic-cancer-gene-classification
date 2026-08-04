@@ -283,6 +283,11 @@ async def create_annotation_job(
         current.genes_completed = len(current.annotations)
         await _store_annotation_job(current)
 
+    async def on_total_known(total: int) -> None:
+        current = await _get_annotation_job(job_id)
+        current.genes_total = total
+        await _store_annotation_job(current)
+
     async def run_job() -> None:
         current = await _get_annotation_job(job_id)
         current.status = "running"
@@ -295,6 +300,7 @@ async def create_annotation_job(
                 force_refresh=request.force_refresh,
                 mode=request.mode,
                 on_annotation=on_annotation,
+                on_total_known=on_total_known,
             )
             await _persist_run_result(http_request, request.model_dump(), result)
             current = await _get_annotation_job(job_id)
