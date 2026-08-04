@@ -18,7 +18,7 @@ from typing import Dict, List, Literal, Optional
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -241,8 +241,8 @@ async def _persist_run_result(
 
 
 @app.get("/")
-async def root() -> RedirectResponse:
-    return RedirectResponse(url="/static/index.html")
+async def root() -> FileResponse:
+    return FileResponse(_STATIC_DIR / "index.html")
 
 
 @app.get("/health")

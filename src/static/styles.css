@@ -412,16 +412,17 @@ textarea {
 
 .annotation-card-meta {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
+  flex-direction: row;
+  align-items: center;
   gap: 6px;
   flex-shrink: 0;
+  justify-content: flex-end;
+  flex-wrap: wrap;
 }
 
 .cache-badge-slot {
   display: flex;
   justify-content: flex-end;
-  min-height: 24px;
 }
 
 .cache-badge-slot:empty {

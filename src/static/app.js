@@ -70,6 +70,7 @@ const elements = {
   benchmarkPanel: document.querySelector("#benchmark-panel"),
   saveApiUrl: document.querySelector("#save-api-url"),
   saveApiUrlModal: document.querySelector("#save-api-url-modal"),
+  clearResults: document.querySelector("#clear-results"),
   closeSetup: document.querySelector("#close-setup"),
   dismissSetup: document.querySelector("#dismiss-setup"),
   enrichResults: document.querySelector("#enrich-results"),
@@ -186,9 +187,11 @@ function switchView(view) {
   elements.workspaceTitle.textContent = isBenchmark ? "Benchmark" : "Results";
   elements.exportCsv.classList.toggle("hidden", isBenchmark);
   elements.enrichResults.classList.toggle("hidden", isBenchmark);
+  elements.clearResults.classList.toggle("hidden", isBenchmark);
   elements.shareRun.classList.toggle("hidden", isBenchmark);
   elements.exportJson.disabled = isBenchmark ? !state.currentBenchmark : !state.currentResult;
   elements.enrichResults.disabled = isBenchmark || !hasEnrichableAnnotations();
+  elements.clearResults.disabled = isBenchmark || !state.currentResult;
   elements.shareRun.disabled = isBenchmark || !state.currentResult?.run_id;
 
   if (isBenchmark) {
@@ -271,6 +274,19 @@ function removeFromQueue(index) {
 function clearQueue() {
   state.queue = [];
   renderQueue();
+}
+
+function clearResults() {
+  state.currentResult = null;
+  localStorage.removeItem(LAST_RESULT_KEY);
+  elements.exportJson.disabled = state.currentView === "benchmark" ? !state.currentBenchmark : true;
+  elements.exportCsv.disabled = true;
+  elements.enrichResults.disabled = true;
+  elements.clearResults.disabled = true;
+  elements.shareRun.disabled = true;
+  rebuildGeneIndex([]);
+  renderEmptyState("No results yet", "Enter genes or fusions, then click Run to annotate.");
+  clearMessage();
 }
 
 function populateSingleForm(example) {
@@ -1029,6 +1045,7 @@ function renderAnnotationResult(result) {
   elements.exportCsv.disabled = !allAnnotations.length;
   elements.exportJson.disabled = !allAnnotations.length;
   elements.enrichResults.disabled = state.isRunning || state.isEnriching || !hasAnnotations;
+  elements.clearResults.disabled = false;
   elements.shareRun.disabled = !result.run_id;
 
   const total = result.genes_annotated;
@@ -1762,6 +1779,7 @@ function bindEvents() {
 
   elements.shareRun.addEventListener("click", copyShareLink);
   elements.enrichResults.addEventListener("click", enrichCurrentResult);
+  elements.clearResults.addEventListener("click", clearResults);
   elements.exportJson.addEventListener("click", exportJson);
   elements.exportCsv.addEventListener("click", async () => {
     try {
