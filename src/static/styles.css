@@ -204,6 +204,19 @@ textarea {
   gap: 7px;
 }
 
+.input-examples-compact {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.examples-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .example-pill-row {
   display: flex;
   flex-wrap: wrap;
