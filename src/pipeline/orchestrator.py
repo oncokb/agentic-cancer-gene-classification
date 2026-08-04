@@ -25,6 +25,7 @@ from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annota
 
 logger = logging.getLogger(__name__)
 AnnotationProgressCallback = Callable[[GeneAnnotation], Union[Awaitable[None], None]]
+AnnotationTotalCallback = Callable[[int], Union[Awaitable[None], None]]
 
 
 def _elapsed_ms(start: float) -> float:
@@ -38,6 +39,17 @@ async def _maybe_call_progress(
     if callback is None:
         return
     result = callback(annotation)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _maybe_call_total(
+    callback: Optional[AnnotationTotalCallback],
+    total: int,
+) -> None:
+    if callback is None:
+        return
+    result = callback(total)
     if inspect.isawaitable(result):
         await result
 
@@ -319,6 +331,7 @@ async def run_pipeline(
     force_refresh: bool = False,
     mode: AnnotationMode = "full",
     on_annotation: Optional[AnnotationProgressCallback] = None,
+    on_total_known: Optional[AnnotationTotalCallback] = None,
 ) -> AnnotationResult:
     """
     Main entry point: accepts a list of gene/fusion strings (or FusionInput objects) and returns
@@ -339,6 +352,7 @@ async def run_pipeline(
     gene_map = await normalize_fusions(input_strings)
     timings["normalization"] = _elapsed_ms(normalization_start)
     logger.info("Resolved %d unique genes from %d inputs", len(gene_map), len(input_strings))
+    await _maybe_call_total(on_total_known, len(gene_map))
 
     # Build per-gene tumor_type: first non-null tumor_type from the gene's submitted inputs.
     gene_tumor_type: Dict[str, Optional[str]] = {}

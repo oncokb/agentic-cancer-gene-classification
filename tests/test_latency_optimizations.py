@@ -61,6 +61,48 @@ async def test_run_pipeline_parallelizes_genes_and_reports_timings(monkeypatch):
     assert result.timings_ms["total"] >= 0
 
 
+async def test_run_pipeline_reports_total_before_any_gene_completes(monkeypatch):
+    totals_seen = []
+    completed_at_total_time = []
+
+    async def fake_normalize_fusions(inputs):
+        return {
+            "AAA": (
+                ResolvedGene(input_symbol="AAA", canonical_symbol="AAA", resolved=True),
+                ["AAA::BBB"],
+            ),
+            "BBB": (
+                ResolvedGene(input_symbol="BBB", canonical_symbol="BBB", resolved=True),
+                ["AAA::BBB"],
+            ),
+        }
+
+    async def fake_annotate_gene(*, gene, **kwargs):
+        await asyncio.sleep(0.01)
+        return GeneAnnotation(
+            gene=gene,
+            cancer_associated=True,
+            evidence_support_score=0.9,
+            timings_ms={"total": 10.0},
+        )
+
+    async def on_total_known(total):
+        totals_seen.append(total)
+
+    async def on_annotation(annotation):
+        completed_at_total_time.append(len(totals_seen))
+
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
+
+    await orchestrator.run_pipeline(
+        ["AAA::BBB"], on_annotation=on_annotation, on_total_known=on_total_known
+    )
+
+    assert totals_seen == [2]
+    assert completed_at_total_time == [1, 1]
+
+
 def test_annotate_request_accepts_core_mode():
     request = AnnotateRequest(fusions=["TP53::BRAF"], mode="core")
 
@@ -91,7 +133,10 @@ def test_annotation_job_endpoint_streams_partial_results(monkeypatch):
         force_refresh=False,
         mode="full",
         on_annotation=None,
+        on_total_known=None,
     ):
+        if on_total_known:
+            await on_total_known(1)
         annotation = GeneAnnotation(
             gene="TP53",
             fusions=["TP53::BRAF"],
@@ -140,6 +185,7 @@ def test_annotation_job_endpoint_streams_partial_results(monkeypatch):
     assert status_payload is not None
     assert status_payload["status"] == "complete"
     assert status_payload["genes_completed"] == 1
+    assert status_payload["genes_total"] == 1
     assert status_payload["annotations"][0]["gene"] == "TP53"
     assert status_payload["result"]["timings_ms"]["total"] == 2.0
 
