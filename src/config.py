@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_cache_ttl_seconds: int = 86400
 
+    # Redis Sentinel (master/replica with automatic failover). When enabled,
+    # takes over from redis_url entirely for cache connections.
+    redis_sentinel_enabled: bool = False
+    redis_sentinel_hosts: str = ""  # comma-separated host:port, e.g. "sentinel-0:26379,sentinel-1:26379"
+    redis_sentinel_master_set: str = "mymaster"
+    redis_sentinel_password: str = ""
+
     gene_cache_enabled: bool = True
     gene_cache_oncokb_check_days: int = 90
     gene_cache_high_support_days: int = 60

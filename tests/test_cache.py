@@ -66,3 +66,53 @@ async def test_cached_call_fails_open_when_redis_unreachable(monkeypatch):
 
     assert result == {"value": "computed anyway"}
     assert len(calls) == 1
+
+
+def test_parse_sentinel_hosts_defaults_port_and_strips_whitespace():
+    parsed = cache_module._parse_sentinel_hosts(
+        " sentinel-0:26379, sentinel-1:26380 ,sentinel-2"
+    )
+    assert parsed == [("sentinel-0", 26379), ("sentinel-1", 26380), ("sentinel-2", 26379)]
+
+
+def test_parse_sentinel_hosts_skips_empty_entries():
+    assert cache_module._parse_sentinel_hosts("sentinel-0:26379,,") == [
+        ("sentinel-0", 26379)
+    ]
+
+
+def test_get_client_sentinel_mode_connects_via_master_for(monkeypatch):
+    seen_sentinel_args = {}
+    seen_master_for_args = {}
+
+    class FakeMasterClient:
+        pass
+
+    class FakeSentinel:
+        def __init__(self, sentinels, **kwargs):
+            seen_sentinel_args["sentinels"] = sentinels
+            seen_sentinel_args.update(kwargs)
+
+        def master_for(self, service_name, **kwargs):
+            seen_master_for_args["service_name"] = service_name
+            seen_master_for_args.update(kwargs)
+            return FakeMasterClient()
+
+    monkeypatch.setattr(cache_module, "Sentinel", FakeSentinel)
+    monkeypatch.setattr(cache_module.settings, "redis_sentinel_enabled", True)
+    monkeypatch.setattr(
+        cache_module.settings, "redis_sentinel_hosts", "sentinel-0:26379,sentinel-1:26379"
+    )
+    monkeypatch.setattr(cache_module.settings, "redis_sentinel_master_set", "mymaster")
+    monkeypatch.setattr(cache_module.settings, "redis_sentinel_password", "hunter2")
+    cache_module._client = None
+
+    client = cache_module._get_client()
+
+    assert isinstance(client, FakeMasterClient)
+    assert seen_sentinel_args["sentinels"] == [("sentinel-0", 26379), ("sentinel-1", 26379)]
+    assert seen_sentinel_args["password"] == "hunter2"
+    assert seen_sentinel_args["sentinel_kwargs"]["password"] == "hunter2"
+    assert seen_master_for_args["service_name"] == "mymaster"
+
+    cache_module._client = None

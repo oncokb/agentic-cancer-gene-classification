@@ -18,6 +18,7 @@ import logging
 from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as redis
+from redis.asyncio.sentinel import Sentinel
 
 from src.config import settings
 
@@ -26,12 +27,41 @@ logger = logging.getLogger(__name__)
 _client: Optional[redis.Redis] = None
 
 
+def _parse_sentinel_hosts(raw: str) -> list[tuple[str, int]]:
+    hosts = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        host, _, port = entry.partition(":")
+        hosts.append((host, int(port) if port else 26379))
+    return hosts
+
+
 def _get_client() -> redis.Redis:
     global _client
     if _client is None:
-        _client = redis.from_url(
-            settings.redis_url, socket_connect_timeout=1, socket_timeout=1
-        )
+        if settings.redis_sentinel_enabled:
+            password = settings.redis_sentinel_password or None
+            sentinel = Sentinel(
+                _parse_sentinel_hosts(settings.redis_sentinel_hosts),
+                sentinel_kwargs={
+                    "socket_connect_timeout": 1,
+                    "socket_timeout": 1,
+                    "password": password,
+                },
+                socket_connect_timeout=1,
+                socket_timeout=1,
+                password=password,
+            )
+            # All reads and writes go through the master. This is a
+            # low-volume cache, not a read-scaling workload — routing
+            # everything through one place avoids replica-lag staleness.
+            _client = sentinel.master_for(settings.redis_sentinel_master_set)
+        else:
+            _client = redis.from_url(
+                settings.redis_url, socket_connect_timeout=1, socket_timeout=1
+            )
     return _client
 
 
