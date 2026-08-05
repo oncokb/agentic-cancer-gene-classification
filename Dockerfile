@@ -18,7 +18,7 @@ COPY pyproject.toml ./
 # Install package in editable mode (no source needed yet)
 RUN pip install --no-cache-dir hatchling && \
     pip install --no-cache-dir \
-    anthropic \
+    "anthropic[bedrock]" \
     ddtrace \
     fastapi \
     "uvicorn[standard]" \

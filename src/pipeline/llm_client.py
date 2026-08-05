@@ -30,9 +30,12 @@ SDK_PROVIDERS = ("anthropic", "bedrock")
 _llm_semaphores: Dict[int, asyncio.Semaphore] = {}
 
 _BEDROCK_MODEL_ALIASES = {
-    "claude-haiku-4-5-20251001": "anthropic.claude-haiku-4-5-20251001-v1:0",
-    "claude-sonnet-4-5-20250929": "anthropic.claude-sonnet-4-5-20250929-v1:0",
-    "claude-opus-4-1-20250805": "anthropic.claude-opus-4-1-20250805-v1:0",
+    # Bare "anthropic.<model>-v1:0" IDs are rejected by Bedrock for these
+    # models ("on-demand throughput isn't supported") — they require the
+    # "us." cross-region inference profile prefix instead.
+    "claude-haiku-4-5-20251001": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "claude-sonnet-4-5-20250929": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "claude-opus-4-1-20250805": "us.anthropic.claude-opus-4-1-20250805-v1:0",
 }
 
 AsyncSDKClient = Union[anthropic.AsyncAnthropic, anthropic.AsyncAnthropicBedrock]

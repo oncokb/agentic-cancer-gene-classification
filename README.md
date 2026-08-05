@@ -84,16 +84,24 @@ ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 For AWS Bedrock, use the same `BEDROCK_AWS_*` env family as the LibreChat
-deployment:
+deployment. This talks to Bedrock through the AWS credential chain (no static
+API key) — locally, that means a SAML-federated session via `saml2aws login`
+(or your org's equivalent), which writes temporary credentials to
+`~/.aws/credentials` under a named profile. Point `AWS_PROFILE` /
+`BEDROCK_AWS_PROFILE` at that same profile name:
 
 ```bash
 ANTHROPIC_SDK_PROVIDER=bedrock
 BEDROCK_AWS_DEFAULT_REGION=us-east-1
-AWS_PROFILE=490004633549
-BEDROCK_SYNTHESIS_MODEL=anthropic.claude-sonnet-4-5-20250929-v1:0
-BEDROCK_SYNTHESIS_FAST_MODEL=anthropic.claude-haiku-4-5-20251001-v1:0
-BEDROCK_SELECTION_MODEL=anthropic.claude-haiku-4-5-20251001-v1:0
+AWS_PROFILE=490004633549-SA
+BEDROCK_SYNTHESIS_MODEL=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_SYNTHESIS_FAST_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
+BEDROCK_SELECTION_MODEL=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ```
+
+Model IDs use the `us.` cross-region inference profile prefix — the bare
+`anthropic.<model>-v1:0` form is rejected by Bedrock for these models with
+"on-demand throughput isn't supported".
 
 Then run the CLI:
 

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Agentic LLM annotation engine for cancer genes and gene fusions (M0)"
 requires-python = ">=3.9"
 dependencies = [
-    "anthropic>=0.40.0",
+    "anthropic[bedrock]>=0.40.0",
     "ddtrace>=3.0.0",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
