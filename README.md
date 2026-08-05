@@ -328,14 +328,21 @@ docker compose up --build annotation-service
 curl http://127.0.0.1:8000/health
 ```
 
-Build a registry-ready image for IT:
+CI publishes a fresh image to GitHub Container Registry on every merge to
+`main` — no manual build/handoff needed. IT (or any deploy tooling) pulls it
+directly:
 
 ```bash
-docker build -t cbioportal/agentic-cancer-gene-classification:latest .
+docker pull ghcr.io/oncokb/agentic-cancer-gene-classification:latest
 ```
 
-Use a release-specific tag when handing an image to IT, for example
-`cbioportal/agentic-cancer-gene-classification:2026-07-30`.
+For a reproducible, pinned deploy, use the commit-SHA tag instead of
+`:latest` — find it at
+[the package's tag list](https://github.com/oncokb/agentic-cancer-gene-classification/pkgs/container/agentic-cancer-gene-classification):
+
+```bash
+docker pull ghcr.io/oncokb/agentic-cancer-gene-classification:main-<short-sha>
+```
 
 The default Docker service uses the Anthropic SDK path. Provide
 `ANTHROPIC_API_KEY` in a local `.env` for direct Anthropic Compose-based
