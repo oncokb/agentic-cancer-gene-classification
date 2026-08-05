@@ -52,7 +52,7 @@ def test_resolve_sdk_model_maps_known_bedrock_alias(monkeypatch):
     monkeypatch.setattr(llm_client.settings, "bedrock_selection_model", "")
 
     assert resolve_sdk_model("claude-haiku-4-5-20251001", "selection") == (
-        "anthropic.claude-haiku-4-5-20251001-v1:0"
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     )
 
 
