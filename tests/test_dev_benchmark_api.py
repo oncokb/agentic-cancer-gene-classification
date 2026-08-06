@@ -7,7 +7,7 @@ from src.main import app
 
 
 def test_dev_status_reflects_config(monkeypatch):
-    monkeypatch.setattr(main.settings, "agcg_dev_mode", True)
+    monkeypatch.setattr(main.settings, "acgc_dev_mode", True)
     client = TestClient(app)
 
     response = client.get("/v1/dev/status")
@@ -17,7 +17,7 @@ def test_dev_status_reflects_config(monkeypatch):
 
 
 def test_benchmark_endpoint_hidden_when_dev_mode_disabled(monkeypatch):
-    monkeypatch.setattr(main.settings, "agcg_dev_mode", False)
+    monkeypatch.setattr(main.settings, "acgc_dev_mode", False)
     client = TestClient(app)
 
     response = client.post("/v1/dev/benchmark", json={"no_judge": True})
@@ -42,7 +42,7 @@ def test_benchmark_endpoint_runs_when_dev_mode_enabled(monkeypatch):
             "pipeline_result": {"annotations": []},
         }
 
-    monkeypatch.setattr(main.settings, "agcg_dev_mode", True)
+    monkeypatch.setattr(main.settings, "acgc_dev_mode", True)
     monkeypatch.setattr(main, "run_benchmark", fake_run_benchmark)
     client = TestClient(app)
 

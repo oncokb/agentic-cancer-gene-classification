@@ -4,7 +4,7 @@ services:
     ports:
       - "6379:6379"
     volumes:
-      - agcg-redis-data:/data
+      - acgc-redis-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -15,14 +15,14 @@ services:
   mysql:
     image: mysql:8
     environment:
-      - MYSQL_DATABASE=${MYSQL_DATABASE:-agcg}
-      - MYSQL_USER=${MYSQL_USER:-agcg}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-agcg}
-      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD:-agcg}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-acgc}
+      - MYSQL_USER=${MYSQL_USER:-acgc}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-acgc}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD:-acgc}
     ports:
       - "3306:3306"
     volumes:
-      - agcg-mysql-data:/var/lib/mysql
+      - acgc-mysql-data:/var/lib/mysql
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
@@ -42,9 +42,9 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
-      - MYSQL_USER=${MYSQL_USER:-agcg}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-agcg}
-      - MYSQL_DATABASE=${MYSQL_DATABASE:-agcg}
+      - MYSQL_USER=${MYSQL_USER:-acgc}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-acgc}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-acgc}
     depends_on:
       redis:
         condition: service_healthy
@@ -82,9 +82,9 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
-      - MYSQL_USER=${MYSQL_USER:-agcg}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-agcg}
-      - MYSQL_DATABASE=${MYSQL_DATABASE:-agcg}
+      - MYSQL_USER=${MYSQL_USER:-acgc}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-acgc}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-acgc}
     volumes:
       - ${HOME}/.codex:/home/appuser/.codex
       - ${HOME}/.claude:/home/appuser/.claude
@@ -109,5 +109,5 @@ services:
       start_period: 10s
 
 volumes:
-  agcg-redis-data:
-  agcg-mysql-data:
+  acgc-redis-data:
+  acgc-mysql-data:

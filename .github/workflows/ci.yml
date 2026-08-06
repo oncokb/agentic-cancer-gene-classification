@@ -37,10 +37,10 @@ jobs:
       mysql:
         image: mysql:8
         env:
-          MYSQL_DATABASE: agcg
-          MYSQL_USER: agcg
-          MYSQL_PASSWORD: agcg
-          MYSQL_ROOT_PASSWORD: agcg
+          MYSQL_DATABASE: acgc
+          MYSQL_USER: acgc
+          MYSQL_PASSWORD: acgc
+          MYSQL_ROOT_PASSWORD: acgc
         ports:
           - 3306:3306
         options: >-
@@ -62,9 +62,9 @@ jobs:
     env:
       MYSQL_HOST: 127.0.0.1
       MYSQL_PORT: 3306
-      MYSQL_USER: agcg
-      MYSQL_PASSWORD: agcg
-      MYSQL_DATABASE: agcg
+      MYSQL_USER: acgc
+      MYSQL_PASSWORD: acgc
+      MYSQL_DATABASE: acgc
       REDIS_URL: redis://localhost:6379/0
 
     steps:

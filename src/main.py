@@ -191,7 +191,7 @@ class BenchmarkRequest(BaseModel):
 
 
 def require_dev_mode() -> None:
-    if not settings.agcg_dev_mode:
+    if not settings.acgc_dev_mode:
         raise HTTPException(status_code=404, detail="Not found")
 
 
@@ -283,7 +283,7 @@ async def health() -> dict:
 
 @app.get("/v1/dev/status", response_model=DevStatusResponse)
 async def dev_status() -> DevStatusResponse:
-    return DevStatusResponse(enabled=settings.agcg_dev_mode)
+    return DevStatusResponse(enabled=settings.acgc_dev_mode)
 
 
 @app.post("/v1/annotate", response_model=AnnotationResult)
