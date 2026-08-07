@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     aws_region: str = ""
     aws_default_region: str = ""
     aws_profile: str = ""
-    agcg_dev_mode: bool = False
+    acgc_dev_mode: bool = False
     pubmed_max_results: int = 50
     min_papers_for_strong_association: int = 4
     max_papers_for_synthesis: int = 8
@@ -66,9 +66,9 @@ class Settings(BaseSettings):
 
     mysql_host: str = "localhost"
     mysql_port: int = 3306
-    mysql_user: str = "agcg"
+    mysql_user: str = "acgc"
     mysql_password: str = ""
-    mysql_database: str = "agcg"
+    mysql_database: str = "acgc"
 
     # Alternative to MYSQL_HOST/MYSQL_PORT: a JDBC-style connection string
     # (e.g. "jdbc:mysql://host:3306"), as used by this org's shared RDS

@@ -57,7 +57,7 @@ running.
   names. If explicit keys are omitted, the AWS credential chain/profile is used.
 - `AWS_PROFILE` or `BEDROCK_AWS_PROFILE`: optional AWS profile for Bedrock.
 - `BEDROCK_SYNTHESIS_MODEL` and `BEDROCK_SELECTION_MODEL`: optional Bedrock
-  model IDs for AGCG's synthesis and selection calls. Use these when the normal
+  model IDs for ACGC's synthesis and selection calls. Use these when the normal
   `SYNTHESIS_MODEL` / `SELECTION_MODEL` values are direct Anthropic model names.
 - `BEDROCK_SYNTHESIS_FAST_MODEL`: optional Bedrock model ID for the lightweight
   synthesis pass when `SYNTHESIS_MODEL_ESCALATION=true`.
@@ -256,7 +256,7 @@ verified PMID citations. Multi-value fields such as `fusions`, `citations`, and
 Unknown optional values are left blank.
 
 `evidence_support_score` is an explainable 0.0-1.0 grounding score calculated by
-AGCG after PMID verification. It estimates how strongly the generated annotation
+ACGC after PMID verification. It estimates how strongly the generated annotation
 is supported by retrieved literature and verified citations; it is not a
 calibrated probability of biological truth or clinical actionability.
 
