@@ -1,7 +1,7 @@
-const API_BASE_URL_KEY = "agcg.apiBaseUrl";
-const ONCOKB_TOKEN_KEY = "agcg.oncokbToken";
-const NCBI_KEY_KEY = "agcg.ncbiApiKey";
-const LAST_RESULT_KEY = "agcg.lastResult";
+const API_BASE_URL_KEY = "acgc.apiBaseUrl";
+const ONCOKB_TOKEN_KEY = "acgc.oncokbToken";
+const NCBI_KEY_KEY = "acgc.ncbiApiKey";
+const LAST_RESULT_KEY = "acgc.lastResult";
 
 const GRID_COLUMNS = [
   { key: "fusion",           label: "Gene/Fusion",   required: true,  type: "text",   width: 140 },
