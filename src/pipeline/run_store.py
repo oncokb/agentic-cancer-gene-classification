@@ -62,6 +62,34 @@ def _from_mysql_datetime(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=timezone.utc)
 
 
+def _parse_jdbc_mysql_host_port(url: str) -> tuple[str, int]:
+    """Parse host and port from a jdbc:mysql:// URL, e.g.
+    "jdbc:mysql://host:3306" or "jdbc:mysql://host:3306/dbname?useSSL=false".
+    """
+    prefix = "jdbc:mysql://"
+    if not url.startswith(prefix):
+        raise ValueError(f"Expected a jdbc:mysql:// URL, got {url!r}")
+    host_port = url[len(prefix) :].split("/", 1)[0].split("?", 1)[0]
+    host, sep, port = host_port.rpartition(":")
+    if not sep:
+        raise ValueError(f"jdbc:mysql URL missing port: {url!r}")
+    return host, int(port)
+
+
+def _mysql_connection_kwargs() -> Dict[str, Any]:
+    if settings.db_url:
+        host, port = _parse_jdbc_mysql_host_port(settings.db_url)
+    else:
+        host, port = settings.mysql_host, settings.mysql_port
+    return {
+        "host": host,
+        "port": port,
+        "user": settings.db_username or settings.mysql_user,
+        "password": settings.db_password or settings.mysql_password,
+        "db": settings.mysql_database,
+    }
+
+
 class RunStore:
     """Save/fetch runs and reusable gene annotations. Calling code never issues raw SQL."""
 
@@ -71,11 +99,7 @@ class RunStore:
     @classmethod
     async def create(cls) -> "RunStore":
         pool = await aiomysql.create_pool(
-            host=settings.mysql_host,
-            port=settings.mysql_port,
-            user=settings.mysql_user,
-            password=settings.mysql_password,
-            db=settings.mysql_database,
+            **_mysql_connection_kwargs(),
             autocommit=True,
         )
         store = cls(pool)

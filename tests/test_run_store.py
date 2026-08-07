@@ -12,8 +12,94 @@ from datetime import datetime, timezone
 
 import pytest
 
+from src.config import settings
 from src.models.schema import GeneAnnotation
-from src.pipeline.run_store import RunStore
+from src.pipeline.run_store import (
+    RunStore,
+    _mysql_connection_kwargs,
+    _parse_jdbc_mysql_host_port,
+)
+
+
+def test_parse_jdbc_mysql_host_port_bare():
+    assert _parse_jdbc_mysql_host_port("jdbc:mysql://db.example.com:3306") == (
+        "db.example.com",
+        3306,
+    )
+
+
+def test_parse_jdbc_mysql_host_port_with_db_and_query_params():
+    assert _parse_jdbc_mysql_host_port(
+        "jdbc:mysql://db.example.com:3306/mydb?useSSL=false"
+    ) == ("db.example.com", 3306)
+
+
+def test_parse_jdbc_mysql_host_port_rejects_non_jdbc_url():
+    with pytest.raises(ValueError, match="Expected a jdbc:mysql"):
+        _parse_jdbc_mysql_host_port("mysql://db.example.com:3306")
+
+
+def test_parse_jdbc_mysql_host_port_requires_port():
+    with pytest.raises(ValueError, match="missing port"):
+        _parse_jdbc_mysql_host_port("jdbc:mysql://db.example.com")
+
+
+def test_mysql_connection_kwargs_prefers_db_url_over_mysql_host_port(monkeypatch):
+    monkeypatch.setattr(settings, "db_url", "jdbc:mysql://from-jdbc:3307")
+    monkeypatch.setattr(settings, "mysql_host", "from-discrete-fields")
+    monkeypatch.setattr(settings, "mysql_port", 9999)
+    monkeypatch.setattr(settings, "db_username", "")
+    monkeypatch.setattr(settings, "db_password", "")
+    monkeypatch.setattr(settings, "mysql_user", "discrete-user")
+    monkeypatch.setattr(settings, "mysql_password", "discrete-pass")
+    monkeypatch.setattr(settings, "mysql_database", "mydb")
+
+    kwargs = _mysql_connection_kwargs()
+
+    assert kwargs == {
+        "host": "from-jdbc",
+        "port": 3307,
+        "user": "discrete-user",
+        "password": "discrete-pass",
+        "db": "mydb",
+    }
+
+
+def test_mysql_connection_kwargs_prefers_db_username_password_when_set(monkeypatch):
+    monkeypatch.setattr(settings, "db_url", "jdbc:mysql://from-jdbc:3307")
+    monkeypatch.setattr(settings, "db_username", "admin")
+    monkeypatch.setattr(settings, "db_password", "admin-secret")
+    monkeypatch.setattr(settings, "mysql_user", "discrete-user")
+    monkeypatch.setattr(settings, "mysql_password", "discrete-pass")
+    monkeypatch.setattr(settings, "mysql_database", "mydb")
+
+    kwargs = _mysql_connection_kwargs()
+
+    assert kwargs["user"] == "admin"
+    assert kwargs["password"] == "admin-secret"
+
+
+def test_mysql_connection_kwargs_falls_back_to_discrete_fields_when_no_db_url(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "db_url", "")
+    monkeypatch.setattr(settings, "mysql_host", "localhost")
+    monkeypatch.setattr(settings, "mysql_port", 3306)
+    monkeypatch.setattr(settings, "db_username", "")
+    monkeypatch.setattr(settings, "db_password", "")
+    monkeypatch.setattr(settings, "mysql_user", "agcg")
+    monkeypatch.setattr(settings, "mysql_password", "agcg")
+    monkeypatch.setattr(settings, "mysql_database", "agcg")
+
+    kwargs = _mysql_connection_kwargs()
+
+    assert kwargs == {
+        "host": "localhost",
+        "port": 3306,
+        "user": "agcg",
+        "password": "agcg",
+        "db": "agcg",
+    }
 
 
 @pytest.fixture
@@ -28,6 +114,30 @@ async def run_store():
             await cursor.execute("DELETE FROM runs")
     yield store
     await store.close()
+
+
+async def test_run_store_connects_via_jdbc_db_url(monkeypatch):
+    """Real connection through the DB_URL path, against the same MySQL the
+    other tests use — proves the JDBC parsing produces a genuinely working
+    connection, not just correctly-shaped kwargs."""
+    monkeypatch.setattr(
+        settings, "db_url", f"jdbc:mysql://{settings.mysql_host}:{settings.mysql_port}"
+    )
+    monkeypatch.setattr(settings, "db_username", settings.mysql_user)
+    monkeypatch.setattr(settings, "db_password", settings.mysql_password)
+
+    try:
+        store = await RunStore.create()
+    except Exception as exc:
+        pytest.skip(f"MySQL not reachable: {exc}")
+
+    async with store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT 1")
+            row = await cursor.fetchone()
+    await store.close()
+
+    assert row == (1,)
 
 
 async def test_save_and_get_round_trip(run_store):

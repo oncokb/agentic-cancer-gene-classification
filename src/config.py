@@ -70,6 +70,16 @@ class Settings(BaseSettings):
     mysql_password: str = ""
     mysql_database: str = "agcg"
 
+    # Alternative to MYSQL_HOST/MYSQL_PORT: a JDBC-style connection string
+    # (e.g. "jdbc:mysql://host:3306"), as used by this org's shared RDS
+    # secrets. When set, host/port are parsed from it and take precedence
+    # over MYSQL_HOST/MYSQL_PORT. DB_USERNAME/DB_PASSWORD similarly take
+    # precedence over MYSQL_USER/MYSQL_PASSWORD when set. MYSQL_DATABASE
+    # is unaffected — a JDBC URL identifies a server, not a database.
+    db_url: str = ""
+    db_username: str = ""
+    db_password: str = ""
+
     fusion_annotation_api_enabled: bool = False
     fusion_annotation_api_base_url: str = ""
     fusion_annotation_api_timeout_seconds: float = 15.0
