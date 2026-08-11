@@ -1,0 +1,37 @@
+name: Build/Push Docker image to Docker Hub on release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag-name:
+        description: 'Tag name to use for the image (required if manually running)'
+        required: true
+        type: string
+  release:
+    types: [published]
+
+jobs:
+  main:
+    if: github.repository == 'oncokb/agentic-cancer-gene-classification'
+    name: Build and Push
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ inputs.tag-name || github.ref_name }}
+      REPOSITORY: oncokb/agentic-cancer-gene-classification
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REPOSITORY }}:${{ env.TAG_NAME }}
+            ${{ env.REPOSITORY }}:latest
