@@ -17,7 +17,7 @@ jobs:
         uses: docker/metadata-action@v4
         with:
           images: |
-            mskcc/agentic-cancer-gene-classification
+            oncokb/agentic-cancer-gene-classification
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest
