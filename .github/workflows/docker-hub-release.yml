@@ -1,37 +1,42 @@
-name: Build/Push Docker image to Docker Hub on release
+name: Publish Docker Image on Tag
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag-name:
-        description: 'Tag name to use for the image (required if manually running)'
-        required: true
-        type: string
   release:
     types: [published]
 
 jobs:
-  main:
+  build_and_publish:
     if: github.repository == 'oncokb/agentic-cancer-gene-classification'
-    name: Build and Push
     runs-on: ubuntu-latest
-    env:
-      TAG_NAME: ${{ inputs.tag-name || github.ref_name }}
-      REPOSITORY: oncokb/agentic-cancer-gene-classification
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: |
+            mskcc/agentic-cancer-gene-classification
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v3
         with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.REPOSITORY }}:${{ env.TAG_NAME }}
-            ${{ env.REPOSITORY }}:latest
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ steps.meta.outputs.tags }}
