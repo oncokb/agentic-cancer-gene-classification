@@ -183,6 +183,7 @@
             <p id="run-summary">Run annotations to populate this review area.</p>
           </div>
           <div class="actions">
+            <button id="open-feedback" type="button" class="feedback-button">Send feedback</button>
             <button id="clear-results" type="button" disabled>Clear results</button>
             <button id="share-run" type="button" disabled title="Copy a link to this run — only works for peers who can reach the same Backend URL">Copy share link</button>
             <button id="export-json" type="button" disabled>Export JSON</button>
@@ -207,6 +208,58 @@
           </section>
         </div>
       </main>
+    </div>
+
+    <div class="modal-backdrop hidden" id="feedback-modal" role="presentation">
+      <section
+        class="feedback-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="feedback-title"
+      >
+        <div class="modal-header">
+          <div>
+            <h2 id="feedback-title">Send feedback</h2>
+            <p>Report a bug, request a feature, or flag an issue with a specific gene's annotation.</p>
+          </div>
+          <button class="icon-button" id="close-feedback" type="button" aria-label="Close">x</button>
+        </div>
+
+        <p class="feedback-run-context hidden" id="feedback-run-context"></p>
+
+        <label class="feedback-field">
+          <span>Category</span>
+          <select id="feedback-category">
+            <option value="bug">Bug</option>
+            <option value="gene_annotation_issue">Gene annotation issue</option>
+            <option value="feature_request">Feature request</option>
+            <option value="other">Other</option>
+          </select>
+        </label>
+
+        <label class="feedback-field hidden" id="feedback-gene-field">
+          <span>Gene (optional)</span>
+          <select id="feedback-gene">
+            <option value="">Not specific to a gene</option>
+          </select>
+        </label>
+
+        <label class="feedback-field">
+          <span>What's going on? *</span>
+          <textarea id="feedback-message" rows="5" placeholder="Describe what you expected vs. what happened..."></textarea>
+        </label>
+
+        <label class="feedback-field">
+          <span>Email (optional)</span>
+          <input id="feedback-email" type="email" autocomplete="email" placeholder="you@mskcc.org" />
+        </label>
+
+        <section class="install-output hidden" id="feedback-output"></section>
+
+        <div class="modal-footer">
+          <button class="primary-action" id="submit-feedback" type="button">Submit</button>
+        </div>
+      </section>
     </div>
 
     <script src="/static/app.js"></script>

@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS gene_annotations (
 )
 """
 
+_CREATE_FEEDBACK_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS feedback (
+    feedback_id VARCHAR(36) PRIMARY KEY,
+    created_at DATETIME NOT NULL,
+    category VARCHAR(32) NOT NULL,
+    message TEXT NOT NULL,
+    contact_email VARCHAR(255) NULL,
+    run_id VARCHAR(36) NULL,
+    gene VARCHAR(64) NULL,
+    page_url VARCHAR(512) NULL,
+    user_agent VARCHAR(512) NULL,
+    INDEX idx_feedback_created_at (created_at),
+    INDEX idx_feedback_run_id (run_id)
+)
+"""
+
 
 def _to_utc_datetime(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
@@ -111,6 +127,7 @@ class RunStore:
             async with conn.cursor() as cursor:
                 await cursor.execute(_CREATE_TABLE_SQL)
                 await cursor.execute(_CREATE_GENE_TABLE_SQL)
+                await cursor.execute(_CREATE_FEEDBACK_TABLE_SQL)
 
     async def save_run(
         self,
@@ -231,6 +248,41 @@ class RunStore:
                         """,
                         (checked, json.dumps(payload), gene),
                     )
+
+    async def save_feedback(
+        self,
+        feedback_id: str,
+        created_at: str | datetime,
+        category: str,
+        message: str,
+        contact_email: Optional[str],
+        run_id: Optional[str],
+        gene: Optional[str],
+        page_url: Optional[str],
+        user_agent: Optional[str],
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO feedback (
+                        feedback_id, created_at, category, message,
+                        contact_email, run_id, gene, page_url, user_agent
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        feedback_id,
+                        _to_utc_datetime(created_at),
+                        category,
+                        message,
+                        contact_email,
+                        run_id,
+                        gene,
+                        page_url,
+                        user_agent,
+                    ),
+                )
 
     async def close(self) -> None:
         self._pool.close()
