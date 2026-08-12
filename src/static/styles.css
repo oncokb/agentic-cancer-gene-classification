@@ -296,6 +296,23 @@ textarea {
   background: #eef9f7;
 }
 
+/* Results view tabs (Results / No result) */
+
+.results-view-tabs {
+  display: inline-flex;
+  gap: 3px;
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px;
+  background: var(--surface-strong);
+}
+
+.results-view-tabs .mode-tab {
+  flex: initial;
+  padding: 3px 14px;
+}
+
 /* Gene index + results layout */
 
 .results-layout {
@@ -1103,6 +1120,38 @@ body.batch-active .app-shell {
 
 details[open] > .retrieval-summary::after {
   content: "▾ hide";
+}
+
+.hidden-genes-list {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  margin: 0;
+  list-style: none;
+}
+
+.hidden-genes-list li {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #fbfcfc;
+}
+
+.hidden-genes-list li strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.hidden-genes-list li .subtle {
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.hidden-genes-list li p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .quote-details {

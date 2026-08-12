@@ -42,6 +42,7 @@ const state = {
   currentResult: null,
   currentBenchmark: null,
   currentView: "annotate",
+  resultsViewMode: "results",
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -72,6 +73,9 @@ const elements = {
   navAnnotate: document.querySelector("#nav-annotate"),
   navBenchmark: document.querySelector("#nav-benchmark"),
   resultsWindow: document.querySelector("#results-window"),
+  resultsViewTabs: document.querySelector("#results-view-tabs"),
+  tabResultsView: document.querySelector("#tab-results-view"),
+  tabNoResultView: document.querySelector("#tab-noresult-view"),
   runButton: document.querySelector("#run-button"),
   runBenchmarkButton: document.querySelector("#run-benchmark-button"),
   runSummary: document.querySelector("#run-summary"),
@@ -249,11 +253,13 @@ function clearQueue() {
 
 function clearResults() {
   state.currentResult = null;
+  state.resultsViewMode = "results";
   localStorage.removeItem(LAST_RESULT_KEY);
   elements.exportJson.disabled = state.currentView === "benchmark" ? !state.currentBenchmark : true;
   elements.exportCsv.disabled = true;
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
+  elements.resultsViewTabs.classList.add("hidden");
   rebuildGeneIndex([]);
   renderEmptyState("No results yet", "Enter genes or fusions, then click Run to annotate.");
   clearMessage();
@@ -934,10 +940,22 @@ function renderEmptyState(title, body) {
   rebuildGeneIndex([]);
 }
 
+function switchResultsView(mode) {
+  if (state.resultsViewMode === mode || !state.currentResult) return;
+  state.resultsViewMode = mode;
+  elements.tabResultsView.classList.toggle("active", mode === "results");
+  elements.tabNoResultView.classList.toggle("active", mode === "noresult");
+
+  const allAnnotations = state.currentResult.annotations || [];
+  const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
+  const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
+  applyResultsViewMode(visibleAnnotations, hiddenAnnotations);
+}
+
 function renderAnnotationResult(result) {
   const allAnnotations = result.annotations || [];
   const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
-  const hasAnnotations = visibleAnnotations.length > 0;
+  const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
   elements.exportCsv.disabled = !allAnnotations.length;
   elements.exportJson.disabled = !allAnnotations.length;
   elements.clearResults.disabled = false;
@@ -945,37 +963,51 @@ function renderAnnotationResult(result) {
 
   const total = result.genes_annotated;
   const inputCount = result.fusions_processed || 0;
-  const hiddenCount = allAnnotations.length - visibleAnnotations.length;
   elements.runSummary.textContent =
     `${total} gene${total === 1 ? "" : "s"} annotated from ` +
-    `${inputCount} input${inputCount === 1 ? "" : "s"}.` +
-    (hiddenCount > 0 && visibleAnnotations.length > 0
-      ? ` ${hiddenCount} gene${hiddenCount === 1 ? "" : "s"} had insufficient evidence and ` +
-        `${hiddenCount === 1 ? "is" : "are"} not shown below — export JSON/CSV to review.`
-      : "");
+    `${inputCount} input${inputCount === 1 ? "" : "s"}.`;
 
-  if (!hasAnnotations) {
-    if (allAnnotations.length > 0) {
-      renderEmptyState(
-        "Insufficient evidence",
-        "Every annotated gene had insufficient evidence, so no results are shown here. " +
-          "Export JSON/CSV to review the underlying data.",
-      );
-    } else {
-      renderEmptyState(
-        result.run_error ? "Run stopped" : "No results",
-        result.run_error || "No gene annotations were returned.",
-      );
-    }
+  elements.tabResultsView.textContent = `Results (${visibleAnnotations.length})`;
+  elements.tabNoResultView.textContent = `No result (${hiddenAnnotations.length})`;
+  elements.resultsViewTabs.classList.toggle("hidden", hiddenAnnotations.length === 0);
+
+  // Default to whichever tab actually has something to show — a fresh run
+  // with nothing but hidden genes should land straight on "No result"
+  // instead of an empty "Results" tab the user has to switch away from.
+  state.resultsViewMode = visibleAnnotations.length > 0 ? "results" : "noresult";
+  elements.tabResultsView.classList.toggle("active", state.resultsViewMode === "results");
+  elements.tabNoResultView.classList.toggle("active", state.resultsViewMode === "noresult");
+
+  if (!allAnnotations.length) {
+    renderEmptyState(
+      result.run_error ? "Run stopped" : "No results",
+      result.run_error || "No gene annotations were returned.",
+    );
+    return;
+  }
+
+  applyResultsViewMode(visibleAnnotations, hiddenAnnotations);
+}
+
+function applyResultsViewMode(visibleAnnotations, hiddenAnnotations) {
+  if (state.resultsViewMode === "noresult") {
+    renderNoResultView(hiddenAnnotations);
+    return;
+  }
+
+  if (!visibleAnnotations.length) {
+    renderEmptyState(
+      "Insufficient evidence",
+      "Every annotated gene had insufficient evidence, so no results are shown here. " +
+        "See the \"No result\" tab above for details.",
+    );
     return;
   }
 
   const list = document.createElement("div");
   list.className = "annotation-list";
 
-  allAnnotations.forEach((annotation) => {
-    if (annotation.insufficient_evidence) return;
-
+  visibleAnnotations.forEach((annotation) => {
     const card = document.createElement("article");
     card.className = "annotation-card";
     card.id = `gene-${annotation.gene}`;
@@ -1027,6 +1059,32 @@ function renderAnnotationResult(result) {
 
   elements.resultsWindow.replaceChildren(list);
   rebuildGeneIndex(visibleAnnotations);
+}
+
+function renderNoResultView(hiddenAnnotations) {
+  if (!hiddenAnnotations.length) {
+    renderEmptyState("No result", "Nothing to show here.");
+    return;
+  }
+
+  const list = document.createElement("ul");
+  list.className = "hidden-genes-list";
+  hiddenAnnotations.forEach((annotation) => {
+    const item = document.createElement("li");
+    const reason =
+      annotation.error ||
+      annotation.evidence_support_explanation ||
+      "Insufficient evidence to support an annotation.";
+    item.innerHTML = `
+      <strong>${escapeHtml(annotation.gene)}</strong>
+      <span class="subtle">${escapeHtml(annotation.fusions?.length ? formatList(annotation.fusions) : "Gene lookup")}</span>
+      <p>${escapeHtml(reason)}</p>
+    `;
+    list.appendChild(item);
+  });
+
+  elements.resultsWindow.replaceChildren(list);
+  rebuildGeneIndex([]);
 }
 
 function makePubMedLink(pmid) {
@@ -1699,6 +1757,9 @@ function bindEvents() {
 
   elements.tabSingle.addEventListener("click", () => switchMode("single"));
   elements.tabBatch.addEventListener("click", () => switchMode("batch"));
+
+  elements.tabResultsView.addEventListener("click", () => switchResultsView("results"));
+  elements.tabNoResultView.addEventListener("click", () => switchResultsView("noresult"));
 
   document.querySelectorAll(".input-examples, .input-examples-compact").forEach((container) => {
     container.addEventListener("click", (event) => {
