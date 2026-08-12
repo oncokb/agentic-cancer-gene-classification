@@ -103,6 +103,18 @@ if _STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def no_cache_static(request: Request, call_next):
+    # Without this, browsers apply heuristic caching to /static/* (no
+    # explicit Cache-Control from StaticFiles) and can silently keep
+    # serving a stale app.js/styles.css after a deploy on a plain reload,
+    # not just a hard refresh — force revalidation on every request.
+    response = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 class DevStatusResponse(BaseModel):
     enabled: bool
 

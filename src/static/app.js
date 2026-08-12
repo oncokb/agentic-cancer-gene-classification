@@ -1082,6 +1082,7 @@ function renderNoResultView(hiddenAnnotations) {
 
     const card = document.createElement("article");
     card.className = "annotation-card";
+    card.id = `gene-${annotation.gene}`;
     card.innerHTML = `
       <header>
         <div class="annotation-heading">
@@ -1103,7 +1104,7 @@ function renderNoResultView(hiddenAnnotations) {
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex([]);
+  rebuildGeneIndex(hiddenAnnotations);
 }
 
 function makePubMedLink(pmid) {

@@ -318,14 +318,17 @@ textarea {
   border: 1px solid var(--line);
   border-bottom: none;
   border-radius: 8px 8px 0 0;
-  background: var(--surface-strong);
+  background: #e7edec;
   color: var(--muted);
   font-size: 13px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, box-shadow 0.12s;
 }
 
 .results-view-tabs .mode-tab:hover {
-  background: var(--surface);
+  background: var(--surface-strong);
   color: var(--text);
+  box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.06);
 }
 
 .results-view-tabs .mode-tab.active {
@@ -333,8 +336,14 @@ textarea {
   color: var(--text);
   border-color: var(--line);
   border-bottom: 1px solid var(--surface);
-  box-shadow: none;
+  box-shadow: 0 -2px 6px rgba(0, 0, 0, 0.05);
   font-weight: 700;
+  z-index: 1;
+}
+
+.results-view-tabs .mode-tab.active:hover {
+  background: var(--surface);
+  box-shadow: 0 -2px 6px rgba(0, 0, 0, 0.05);
 }
 
 /* Gene index + results layout */
