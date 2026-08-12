@@ -1,5 +1,3 @@
-const LAST_RESULT_KEY = "acgc.lastResult";
-
 const GRID_COLUMNS = [
   { key: "fusion",           label: "Gene/Fusion",   required: true,  type: "text",   width: 140 },
   { key: "tumor_type",       label: "Tumor Type",    required: false, type: "text",   width: 110 },
@@ -265,7 +263,6 @@ function clearQueue() {
 function clearResults() {
   state.currentResult = null;
   state.resultsViewMode = "results";
-  localStorage.removeItem(LAST_RESULT_KEY);
   elements.exportJson.disabled = state.currentView === "benchmark" ? !state.currentBenchmark : true;
   elements.exportCsv.disabled = true;
   elements.clearResults.disabled = true;
@@ -641,8 +638,7 @@ async function runAnnotation() {
     }
 
     const job = await response.json();
-    const result = await pollAnnotationJob(job.status_url);
-    saveLastResult(result);
+    await pollAnnotationJob(job.status_url);
     setMessage("Annotation complete. Review fields before exporting.", "info");
   } catch (error) {
     setMessage(formatRunError(error.message), "error");
@@ -737,7 +733,6 @@ async function submitAnnotationEnrichment(annotation, label) {
 
   const job = await response.json();
   const enriched = await pollAnnotationEnrichmentJob(job.status_url, annotation.gene);
-  saveLastResult(state.currentResult);
   setMessage(`${annotation.gene} ${label} enriched.`, "info");
   return enriched;
 }
@@ -782,15 +777,6 @@ function formatRunError(message) {
 // Sharing a run by link
 // ---------------------------------------------------------------------------
 
-function saveLastResult(result) {
-  try {
-    localStorage.setItem(LAST_RESULT_KEY, JSON.stringify(result));
-  } catch {
-    // Storage full/unavailable — the run already rendered successfully, so
-    // this is purely a "resume after an accidental reload" nicety. Skip it.
-  }
-}
-
 async function copyShareLink() {
   const runId = state.currentResult?.run_id;
   if (!runId) return;
@@ -807,37 +793,30 @@ async function copyShareLink() {
   }
 }
 
-async function loadSharedRunOrRestoreLast() {
+// Every page load starts fresh (no auto-restore of a previous run) except
+// for the one explicit case a curator asked for: opening a share link.
+// Without this, a shared production URL would show whichever run last ran
+// on that browser — possibly someone else's, possibly days old — instead
+// of a clean landing page.
+async function loadSharedRun() {
   const sharedRunId = new URLSearchParams(location.search).get("run");
-  if (sharedRunId) {
-    try {
-      const response = await fetch(`/v1/annotate/${encodeURIComponent(sharedRunId)}`);
-      if (!response.ok) {
-        throw new Error(
-          response.status === 404
-            ? "This shared run wasn't found on the configured Backend URL."
-            : response.statusText,
-        );
-      }
-      const result = await response.json();
-      state.currentResult = result;
-      renderAnnotationResult(result);
-      saveLastResult(result);
-      setMessage("Shared run restored.", "info");
-    } catch (error) {
-      setMessage(formatRunError(error.message), "error");
-    }
-    return;
-  }
+  if (!sharedRunId) return;
 
-  const saved = localStorage.getItem(LAST_RESULT_KEY);
-  if (!saved) return;
   try {
-    const result = JSON.parse(saved);
+    const response = await fetch(`/v1/annotate/${encodeURIComponent(sharedRunId)}`);
+    if (!response.ok) {
+      throw new Error(
+        response.status === 404
+          ? "This shared run wasn't found on the configured Backend URL."
+          : response.statusText,
+      );
+    }
+    const result = await response.json();
     state.currentResult = result;
     renderAnnotationResult(result);
-  } catch {
-    localStorage.removeItem(LAST_RESULT_KEY);
+    setMessage("Shared run restored.", "info");
+  } catch (error) {
+    setMessage(formatRunError(error.message), "error");
   }
 }
 
@@ -1925,4 +1904,4 @@ function bindEvents() {
 bindEvents();
 renderGrid();
 loadDevStatus();
-loadSharedRunOrRestoreLast();
+loadSharedRun();
