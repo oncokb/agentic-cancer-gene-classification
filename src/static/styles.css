@@ -75,10 +75,7 @@ button:disabled {
 .brand p,
 .workspace-header h2,
 .workspace-header p,
-.section-heading h2,
-.setup-modal h2,
-.setup-modal h3,
-.setup-modal p {
+.section-heading h2 {
   margin: 0;
 }
 
@@ -297,6 +294,56 @@ textarea {
 .status-box.info {
   border-color: #b9d9d5;
   background: #eef9f7;
+}
+
+/* Results view tabs (Results / No result) — browser-tab affordance: each
+   tab is its own raised shape with top-rounded corners, sitting on a
+   baseline rule; the active tab's bottom edge matches the panel
+   background below it so it visually fuses with the content, exactly
+   like a Chrome tab. */
+.results-view-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 22px 0 0;
+  border-bottom: 1px solid var(--line);
+  padding: 0 4px;
+}
+
+.results-view-tabs .mode-tab {
+  flex: initial;
+  position: relative;
+  top: 1px;
+  min-height: 34px;
+  padding: 7px 18px;
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: #e7edec;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, box-shadow 0.12s;
+}
+
+.results-view-tabs .mode-tab:hover {
+  background: var(--surface-strong);
+  color: var(--text);
+  box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.06);
+}
+
+.results-view-tabs .mode-tab.active {
+  background: var(--surface);
+  color: var(--text);
+  border-color: var(--line);
+  border-bottom: 1px solid var(--surface);
+  box-shadow: 0 -2px 6px rgba(0, 0, 0, 0.05);
+  font-weight: 700;
+  z-index: 1;
+}
+
+.results-view-tabs .mode-tab.active:hover {
+  background: var(--surface);
+  box-shadow: 0 -2px 6px rgba(0, 0, 0, 0.05);
 }
 
 /* Gene index + results layout */
@@ -739,116 +786,6 @@ textarea {
 
 .benchmark-table tr:last-child td {
   border-bottom: 0;
-}
-
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: rgba(15, 23, 42, 0.42);
-}
-
-.setup-modal {
-  width: min(760px, 100%);
-  max-height: min(720px, 92vh);
-  overflow: auto;
-  border-radius: 8px;
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  padding: 20px;
-}
-
-.modal-header,
-.modal-footer,
-.setup-card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-}
-
-.modal-header p {
-  margin-top: 6px;
-  color: var(--muted);
-}
-
-.icon-button {
-  width: 36px;
-  min-height: 36px;
-  padding: 0;
-}
-
-.integration-panel {
-  margin-top: 16px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 16px;
-}
-
-.integration-panel p {
-  margin: 8px 0 0;
-  color: var(--muted);
-  font-size: 14px;
-  line-height: 1.4;
-}
-
-.integration-panel a {
-  color: var(--accent);
-  font-weight: 700;
-}
-
-.installer-box {
-  display: grid;
-  gap: 8px;
-  margin: 14px 0;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #f7faf9;
-  padding: 12px;
-}
-
-.installer-box > span {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  text-transform: uppercase;
-}
-
-#save-api-url-modal,
-#save-ncbi-api-key,
-#save-oncokb-token {
-  justify-self: start;
-  border-color: var(--accent);
-  color: var(--accent);
-  font-weight: 700;
-}
-
-.install-output {
-  margin-top: 16px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #fbfcfc;
-  padding: 14px;
-}
-
-.install-output.error {
-  border-color: #f3b4af;
-  background: #fff4f2;
-}
-
-.install-output h3 {
-  margin: 0 0 8px;
-}
-
-.install-output p {
-  margin: 8px 0;
-}
-
-.modal-footer {
-  margin-top: 18px;
-  justify-content: flex-end;
 }
 
 /* Input mode tabs */

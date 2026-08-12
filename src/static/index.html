@@ -174,13 +174,6 @@
           <button class="primary-action" id="run-benchmark-button" type="button">Run Benchmark</button>
         </section>
 
-        <section class="panel compact">
-          <div class="section-heading inline">
-            <h2>Settings</h2>
-            <button class="text-button" id="open-setup" type="button">View</button>
-          </div>
-          <p id="setup-summary">Configure API tokens and backend URL.</p>
-        </section>
       </aside>
 
       <main class="workspace">
@@ -199,6 +192,11 @@
 
         <section class="status-box hidden" id="message-box"></section>
 
+        <div class="results-view-tabs hidden" id="results-view-tabs">
+          <button class="mode-tab active" id="tab-results-view" type="button">Results</button>
+          <button class="mode-tab" id="tab-noresult-view" type="button">No result</button>
+        </div>
+
         <div class="results-layout">
           <nav class="gene-index" id="gene-index" aria-label="Gene index"></nav>
           <section class="results-window" id="results-window">
@@ -209,103 +207,6 @@
           </section>
         </div>
       </main>
-    </div>
-
-    <div class="modal-backdrop hidden" id="setup-modal" role="presentation">
-      <section
-        class="setup-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="setup-title"
-      >
-        <div class="modal-header">
-          <div>
-            <h2 id="setup-title">Settings</h2>
-            <p>Configure API keys and backend connection.</p>
-          </div>
-          <button class="icon-button" id="close-setup" type="button" aria-label="Close">x</button>
-        </div>
-
-        <section class="integration-panel">
-          <div class="setup-card-header">
-            <div>
-              <h3>Backend API URL</h3>
-              <p id="api-url-status">Configure the annotation server URL for GitHub Pages hosting.</p>
-            </div>
-          </div>
-          <p>
-            When running this app from GitHub Pages, point it at your deployed
-            ACGC API server. Leave blank when serving from the same host as the API.
-          </p>
-          <div class="installer-box">
-            <span>Server URL</span>
-            <input
-              id="api-base-url-modal"
-              type="text"
-              autocomplete="off"
-              placeholder="https://your-server.example.com"
-            />
-            <button id="save-api-url-modal" type="button">Save Backend URL</button>
-          </div>
-        </section>
-
-        <section class="integration-panel">
-          <div class="setup-card-header">
-            <div>
-              <h3>OncoKB API token</h3>
-              <p id="oncokb-status">Configure OncoKB membership lookup.</p>
-            </div>
-          </div>
-          <p>
-            Paste your OncoKB API token to enable membership lookup during annotation.
-            The token is sent with each API request.
-          </p>
-          <div class="installer-box">
-            <span>API token</span>
-            <input
-              id="oncokb-token-input"
-              type="password"
-              autocomplete="off"
-              placeholder="Paste OncoKB API token"
-            />
-            <button id="save-oncokb-token" type="button">Save OncoKB Token</button>
-          </div>
-          <a href="https://www.oncokb.org/account/settings" target="_blank" rel="noreferrer">
-            OncoKB account settings
-          </a>
-        </section>
-
-        <section class="integration-panel">
-          <div class="setup-card-header">
-            <div>
-              <h3>NCBI API key</h3>
-              <p id="ncbi-status">Improves PubMed retrieval throughput.</p>
-            </div>
-          </div>
-          <p>
-            Add an NCBI API key to raise PubMed E-utilities limits during literature retrieval.
-          </p>
-          <div class="installer-box">
-            <span>API key</span>
-            <input
-              id="ncbi-api-key-input"
-              type="password"
-              autocomplete="off"
-              placeholder="Paste NCBI API key"
-            />
-            <button id="save-ncbi-api-key" type="button">Save NCBI API Key</button>
-          </div>
-          <a href="https://support.nlm.nih.gov/kbArticle/?pn=KA-05317" target="_blank" rel="noreferrer">
-            NCBI API key setup
-          </a>
-        </section>
-
-        <section class="install-output hidden" id="install-output"></section>
-
-        <div class="modal-footer">
-          <button class="primary-action" id="dismiss-setup" type="button">Done</button>
-        </div>
-      </section>
     </div>
 
     <script src="/static/app.js"></script>

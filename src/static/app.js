@@ -1,6 +1,3 @@
-const API_BASE_URL_KEY = "acgc.apiBaseUrl";
-const ONCOKB_TOKEN_KEY = "acgc.oncokbToken";
-const NCBI_KEY_KEY = "acgc.ncbiApiKey";
 const LAST_RESULT_KEY = "acgc.lastResult";
 
 const GRID_COLUMNS = [
@@ -45,6 +42,7 @@ const state = {
   currentResult: null,
   currentBenchmark: null,
   currentView: "annotate",
+  resultsViewMode: "results",
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -62,36 +60,25 @@ const state = {
 
 const elements = {
   annotatePanel: document.querySelector("#annotate-panel"),
-  apiBaseUrlModal: document.querySelector("#api-base-url-modal"),
   benchmarkJudge: document.querySelector("#benchmark-judge"),
   benchmarkLocalBackend: document.querySelector("#benchmark-local-backend"),
   benchmarkMaxGenes: document.querySelector("#benchmark-max-genes"),
   benchmarkPanel: document.querySelector("#benchmark-panel"),
-  saveApiUrlModal: document.querySelector("#save-api-url-modal"),
   clearResults: document.querySelector("#clear-results"),
-  closeSetup: document.querySelector("#close-setup"),
-  dismissSetup: document.querySelector("#dismiss-setup"),
   exportCsv: document.querySelector("#export-csv"),
   exportJson: document.querySelector("#export-json"),
   shareRun: document.querySelector("#share-run"),
   geneIndex: document.querySelector("#gene-index"),
-  installOutput: document.querySelector("#install-output"),
   messageBox: document.querySelector("#message-box"),
-  ncbiApiKeyInput: document.querySelector("#ncbi-api-key-input"),
-  ncbiStatus: document.querySelector("#ncbi-status"),
   navAnnotate: document.querySelector("#nav-annotate"),
   navBenchmark: document.querySelector("#nav-benchmark"),
-  oncokbStatus: document.querySelector("#oncokb-status"),
-  oncokbTokenInput: document.querySelector("#oncokb-token-input"),
-  openSetup: document.querySelector("#open-setup"),
   resultsWindow: document.querySelector("#results-window"),
+  resultsViewTabs: document.querySelector("#results-view-tabs"),
+  tabResultsView: document.querySelector("#tab-results-view"),
+  tabNoResultView: document.querySelector("#tab-noresult-view"),
   runButton: document.querySelector("#run-button"),
   runBenchmarkButton: document.querySelector("#run-benchmark-button"),
   runSummary: document.querySelector("#run-summary"),
-  saveNcbiApiKey: document.querySelector("#save-ncbi-api-key"),
-  saveOncokbToken: document.querySelector("#save-oncokb-token"),
-  setupModal: document.querySelector("#setup-modal"),
-  setupSummary: document.querySelector("#setup-summary"),
   workspaceTitle: document.querySelector("#workspace-title"),
   // mode tabs
   tabSingle: document.querySelector("#tab-single"),
@@ -143,25 +130,12 @@ const editableFields = [
 ];
 
 // ---------------------------------------------------------------------------
-// API URL helpers
-// ---------------------------------------------------------------------------
-
-function getApiBaseUrl() {
-  return (localStorage.getItem(API_BASE_URL_KEY) || "").replace(/\/$/, "");
-}
-
-function apiUrl(path) {
-  const base = getApiBaseUrl();
-  return base ? base + path : path;
-}
-
-// ---------------------------------------------------------------------------
 // App section switching
 // ---------------------------------------------------------------------------
 
 async function loadDevStatus() {
   try {
-    const response = await fetch(apiUrl("/v1/dev/status"));
+    const response = await fetch("/v1/dev/status");
     if (!response.ok) {
       elements.navBenchmark.classList.add("hidden");
       elements.annotateBackendField.classList.add("hidden");
@@ -279,11 +253,13 @@ function clearQueue() {
 
 function clearResults() {
   state.currentResult = null;
+  state.resultsViewMode = "results";
   localStorage.removeItem(LAST_RESULT_KEY);
   elements.exportJson.disabled = state.currentView === "benchmark" ? !state.currentBenchmark : true;
   elements.exportCsv.disabled = true;
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
+  elements.resultsViewTabs.classList.add("hidden");
   rebuildGeneIndex([]);
   renderEmptyState("No results yet", "Enter genes or fusions, then click Run to annotate.");
   clearMessage();
@@ -558,64 +534,6 @@ function parseInputs() {
 }
 
 // ---------------------------------------------------------------------------
-// Settings persistence
-// ---------------------------------------------------------------------------
-
-function loadSettings() {
-  const savedUrl = getApiBaseUrl();
-  elements.apiBaseUrlModal.value = savedUrl;
-
-  const hasOncokb = Boolean(localStorage.getItem(ONCOKB_TOKEN_KEY));
-  const hasNcbi = Boolean(localStorage.getItem(NCBI_KEY_KEY));
-  elements.oncokbStatus.textContent = hasOncokb
-    ? "OncoKB token is saved locally."
-    : "Not configured. Paste a token to enable OncoKB membership lookup.";
-  elements.ncbiStatus.textContent = hasNcbi
-    ? "NCBI API key is saved locally."
-    : "Recommended. Add an NCBI API key to reduce PubMed rate-limit delays.";
-  elements.setupSummary.textContent = savedUrl
-    ? `API: ${savedUrl}`
-    : "Using same-host API.";
-}
-
-function saveApiUrl(url) {
-  const trimmed = url.trim().replace(/\/$/, "");
-  if (trimmed) {
-    localStorage.setItem(API_BASE_URL_KEY, trimmed);
-  } else {
-    localStorage.removeItem(API_BASE_URL_KEY);
-  }
-  elements.apiBaseUrlModal.value = trimmed;
-  elements.setupSummary.textContent = trimmed ? `API: ${trimmed}` : "Using same-host API.";
-  setInstallOutput("Backend URL saved", trimmed || "Using same-host API.");
-  loadDevStatus();
-}
-
-function saveOncoKBToken() {
-  const token = elements.oncokbTokenInput.value.trim();
-  if (!token) {
-    setInstallOutput("OncoKB token not entered", "Paste a token before saving.", "error");
-    return;
-  }
-  localStorage.setItem(ONCOKB_TOKEN_KEY, token);
-  elements.oncokbTokenInput.value = "";
-  elements.oncokbStatus.textContent = "OncoKB token is saved locally.";
-  setInstallOutput("OncoKB token saved", "The token will be sent with each annotation request.");
-}
-
-function saveNCBIApiKey() {
-  const key = elements.ncbiApiKeyInput.value.trim();
-  if (!key) {
-    setInstallOutput("NCBI API key not entered", "Paste a key before saving.", "error");
-    return;
-  }
-  localStorage.setItem(NCBI_KEY_KEY, key);
-  elements.ncbiApiKeyInput.value = "";
-  elements.ncbiStatus.textContent = "NCBI API key is saved locally.";
-  setInstallOutput("NCBI API key saved", "The key will be sent with each annotation request.");
-}
-
-// ---------------------------------------------------------------------------
 // UI state helpers
 // ---------------------------------------------------------------------------
 
@@ -662,24 +580,6 @@ function setBenchmarkRunning(isRunning) {
   elements.runBenchmarkButton.disabled = isRunning;
 }
 
-function showSetupModal() {
-  elements.setupModal.classList.remove("hidden");
-}
-
-function hideSetupModal() {
-  elements.setupModal.classList.add("hidden");
-}
-
-function setInstallOutput(title, body, type = "info") {
-  elements.installOutput.className = "install-output";
-  elements.installOutput.innerHTML = `
-    <h3>${escapeHtml(title)}</h3>
-    <p>${escapeHtml(body)}</p>
-  `;
-  elements.installOutput.classList.toggle("error", type === "error");
-  elements.installOutput.classList.remove("hidden");
-}
-
 // ---------------------------------------------------------------------------
 // Annotation run
 // ---------------------------------------------------------------------------
@@ -711,7 +611,7 @@ async function runAnnotation() {
     const localBackend = elements.annotateLocalBackend.value || undefined;
     const body = { fusions: annotationInputs, mode: elements.annotateMode.value || "full" };
     if (localBackend) body.local_backend = localBackend;
-    const response = await fetch(apiUrl("/v1/annotate/jobs"), {
+    const response = await fetch("/v1/annotate/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -742,7 +642,7 @@ async function runAnnotation() {
 
 async function pollAnnotationJob(statusUrl) {
   while (true) {
-    const response = await fetch(apiUrl(statusUrl));
+    const response = await fetch(statusUrl);
     if (!response.ok) {
       throw new Error(response.statusText || "Unable to load annotation job status");
     }
@@ -807,7 +707,7 @@ async function submitAnnotationEnrichment(annotation, label) {
   const body = { annotations: [annotation] };
   if (localBackend) body.local_backend = localBackend;
 
-  const response = await fetch(apiUrl("/v1/annotate/enrichment/jobs"), {
+  const response = await fetch("/v1/annotate/enrichment/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -833,7 +733,7 @@ async function submitAnnotationEnrichment(annotation, label) {
 
 async function pollAnnotationEnrichmentJob(statusUrl, gene) {
   while (true) {
-    const response = await fetch(apiUrl(statusUrl));
+    const response = await fetch(statusUrl);
     if (!response.ok) {
       throw new Error(response.statusText || "Unable to load enrichment job status");
     }
@@ -900,7 +800,7 @@ async function loadSharedRunOrRestoreLast() {
   const sharedRunId = new URLSearchParams(location.search).get("run");
   if (sharedRunId) {
     try {
-      const response = await fetch(apiUrl(`/v1/annotate/${encodeURIComponent(sharedRunId)}`));
+      const response = await fetch(`/v1/annotate/${encodeURIComponent(sharedRunId)}`);
       if (!response.ok) {
         throw new Error(
           response.status === 404
@@ -948,7 +848,7 @@ async function runBenchmark() {
   setMessage("Running benchmark...", "info");
 
   try {
-    const response = await fetch(apiUrl("/v1/dev/benchmark"), {
+    const response = await fetch("/v1/dev/benchmark", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -1040,10 +940,22 @@ function renderEmptyState(title, body) {
   rebuildGeneIndex([]);
 }
 
+function switchResultsView(mode) {
+  if (state.resultsViewMode === mode || !state.currentResult) return;
+  state.resultsViewMode = mode;
+  elements.tabResultsView.classList.toggle("active", mode === "results");
+  elements.tabNoResultView.classList.toggle("active", mode === "noresult");
+
+  const allAnnotations = state.currentResult.annotations || [];
+  const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
+  const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
+  applyResultsViewMode(visibleAnnotations, hiddenAnnotations);
+}
+
 function renderAnnotationResult(result) {
   const allAnnotations = result.annotations || [];
   const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
-  const hasAnnotations = visibleAnnotations.length > 0;
+  const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
   elements.exportCsv.disabled = !allAnnotations.length;
   elements.exportJson.disabled = !allAnnotations.length;
   elements.clearResults.disabled = false;
@@ -1055,28 +967,47 @@ function renderAnnotationResult(result) {
     `${total} gene${total === 1 ? "" : "s"} annotated from ` +
     `${inputCount} input${inputCount === 1 ? "" : "s"}.`;
 
-  if (!hasAnnotations) {
-    if (allAnnotations.length > 0) {
-      renderEmptyState(
-        "Insufficient evidence",
-        "Every annotated gene had insufficient evidence, so no results are shown here. " +
-          "Export JSON/CSV to review the underlying data.",
-      );
-    } else {
-      renderEmptyState(
-        result.run_error ? "Run stopped" : "No results",
-        result.run_error || "No gene annotations were returned.",
-      );
-    }
+  elements.tabResultsView.textContent = `Results (${visibleAnnotations.length})`;
+  elements.tabNoResultView.textContent = `No result (${hiddenAnnotations.length})`;
+  elements.resultsViewTabs.classList.toggle("hidden", hiddenAnnotations.length === 0);
+
+  // Default to whichever tab actually has something to show — a fresh run
+  // with nothing but hidden genes should land straight on "No result"
+  // instead of an empty "Results" tab the user has to switch away from.
+  state.resultsViewMode = visibleAnnotations.length > 0 ? "results" : "noresult";
+  elements.tabResultsView.classList.toggle("active", state.resultsViewMode === "results");
+  elements.tabNoResultView.classList.toggle("active", state.resultsViewMode === "noresult");
+
+  if (!allAnnotations.length) {
+    renderEmptyState(
+      result.run_error ? "Run stopped" : "No results",
+      result.run_error || "No gene annotations were returned.",
+    );
+    return;
+  }
+
+  applyResultsViewMode(visibleAnnotations, hiddenAnnotations);
+}
+
+function applyResultsViewMode(visibleAnnotations, hiddenAnnotations) {
+  if (state.resultsViewMode === "noresult") {
+    renderNoResultView(hiddenAnnotations);
+    return;
+  }
+
+  if (!visibleAnnotations.length) {
+    renderEmptyState(
+      "Insufficient evidence",
+      "Every annotated gene had insufficient evidence, so no results are shown here. " +
+        "See the \"No result\" tab above for details.",
+    );
     return;
   }
 
   const list = document.createElement("div");
   list.className = "annotation-list";
 
-  allAnnotations.forEach((annotation) => {
-    if (annotation.insufficient_evidence) return;
-
+  visibleAnnotations.forEach((annotation) => {
     const card = document.createElement("article");
     card.className = "annotation-card";
     card.id = `gene-${annotation.gene}`;
@@ -1128,6 +1059,52 @@ function renderAnnotationResult(result) {
 
   elements.resultsWindow.replaceChildren(list);
   rebuildGeneIndex(visibleAnnotations);
+}
+
+function renderNoResultView(hiddenAnnotations) {
+  if (!hiddenAnnotations.length) {
+    renderEmptyState("No result", "Nothing to show here.");
+    return;
+  }
+
+  // Reuses the same annotation-card/field-row-highlight visual language as
+  // the Results tab (rather than a plain bulleted list) so this reads as
+  // part of the same app, not a fallback debug view.
+  const list = document.createElement("div");
+  list.className = "annotation-list";
+
+  hiddenAnnotations.forEach((annotation) => {
+    const isError = Boolean(annotation.error);
+    const reason =
+      annotation.error ||
+      annotation.evidence_support_explanation ||
+      "Insufficient evidence to support an annotation.";
+
+    const card = document.createElement("article");
+    card.className = "annotation-card";
+    card.id = `gene-${annotation.gene}`;
+    card.innerHTML = `
+      <header>
+        <div class="annotation-heading">
+          <h3>${escapeHtml(annotation.gene)}</h3>
+          <div class="subtle">${escapeHtml(annotation.fusions?.length ? formatList(annotation.fusions) : "Gene lookup")}</div>
+        </div>
+        <div class="annotation-card-meta">
+          <span class="review-badge ${isError ? "quality-warning" : "low"}">
+            ${isError ? "Error" : "Insufficient evidence"}
+          </span>
+        </div>
+      </header>
+      <div class="field-row field-row-highlight">
+        <span class="field-row-label">Reason</span>
+        <div class="field-row-value">${escapeHtml(reason)}</div>
+      </div>
+    `;
+    list.appendChild(card);
+  });
+
+  elements.resultsWindow.replaceChildren(list);
+  rebuildGeneIndex(hiddenAnnotations);
 }
 
 function makePubMedLink(pmid) {
@@ -1302,7 +1279,7 @@ function fetchFusionContext(fusionKey) {
     return state.fusionContextByFusion[fusionKey];
   }
   const requestBody = { fusion: fusionKey, ...(state.lastInputsByFusion[fusionKey] || {}) };
-  const promise = fetch(apiUrl("/v1/fusion-context"), {
+  const promise = fetch("/v1/fusion-context", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
@@ -1730,7 +1707,7 @@ function downloadBlob(blob, filename) {
 
 async function exportCsv() {
   if (!state.currentResult) return;
-  const response = await fetch(apiUrl("/v1/export/annotation-results.csv"), {
+  const response = await fetch("/v1/export/annotation-results.csv", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(state.currentResult),
@@ -1797,12 +1774,12 @@ function bindEvents() {
   elements.runBenchmarkButton.addEventListener("click", runBenchmark);
   elements.navAnnotate.addEventListener("click", () => switchView("annotate"));
   elements.navBenchmark.addEventListener("click", () => switchView("benchmark"));
-  elements.openSetup.addEventListener("click", () => showSetupModal());
-  elements.closeSetup.addEventListener("click", () => hideSetupModal());
-  elements.dismissSetup.addEventListener("click", () => hideSetupModal());
 
   elements.tabSingle.addEventListener("click", () => switchMode("single"));
   elements.tabBatch.addEventListener("click", () => switchMode("batch"));
+
+  elements.tabResultsView.addEventListener("click", () => switchResultsView("results"));
+  elements.tabNoResultView.addEventListener("click", () => switchResultsView("noresult"));
 
   document.querySelectorAll(".input-examples, .input-examples-compact").forEach((container) => {
     container.addEventListener("click", (event) => {
@@ -1833,12 +1810,6 @@ function bindEvents() {
     renderGrid({ row: state.batchRows.length - 1, col: 0 });
   });
 
-  elements.saveApiUrlModal.addEventListener("click", () =>
-    saveApiUrl(elements.apiBaseUrlModal.value),
-  );
-  elements.saveOncokbToken.addEventListener("click", saveOncoKBToken);
-  elements.saveNcbiApiKey.addEventListener("click", saveNCBIApiKey);
-
   elements.shareRun.addEventListener("click", copyShareLink);
   elements.clearResults.addEventListener("click", clearResults);
   elements.exportJson.addEventListener("click", exportJson);
@@ -1853,6 +1824,5 @@ function bindEvents() {
 
 bindEvents();
 renderGrid();
-loadSettings();
 loadDevStatus();
 loadSharedRunOrRestoreLast();
