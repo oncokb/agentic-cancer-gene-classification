@@ -13,6 +13,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Literal, Optional
 
@@ -30,6 +31,8 @@ from src.models.schema import (
     AnnotateRequest,
     AnnotationMode,
     AnnotationResult,
+    FeedbackRequest,
+    FeedbackResponse,
     FusionInput,
     FusionPositionContext,
     GeneAnnotateRequest,
@@ -105,12 +108,13 @@ if _STATIC_DIR.exists():
 
 @app.middleware("http")
 async def no_cache_static(request: Request, call_next):
-    # Without this, browsers apply heuristic caching to /static/* (no
-    # explicit Cache-Control from StaticFiles) and can silently keep
-    # serving a stale app.js/styles.css after a deploy on a plain reload,
-    # not just a hard refresh — force revalidation on every request.
+    # Without this, browsers apply heuristic caching to /static/* and to
+    # / itself (neither StaticFiles nor FileResponse set an explicit
+    # Cache-Control) and can silently keep serving a stale index.html/
+    # app.js/styles.css after a deploy on a plain reload, not just a hard
+    # refresh — force revalidation on every request for both.
     response = await call_next(request)
-    if request.url.path.startswith("/static/"):
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -537,6 +541,28 @@ async def fusion_context(request: FusionInput) -> FusionContextResponse:
         return FusionContextResponse(available=True, context=exc.context)
 
     return FusionContextResponse(available=True, context=FusionPositionContext(**cached))
+
+
+@app.post("/v1/feedback", response_model=FeedbackResponse, status_code=201)
+async def submit_feedback(payload: FeedbackRequest, http_request: Request) -> FeedbackResponse:
+    """
+    Beta feedback intake. Stores run_id/gene alongside the message so a
+    reported issue can be traced back to the exact run that produced it,
+    without needing the curator to describe what they did from memory.
+    """
+    feedback_id = str(uuid.uuid4())
+    await http_request.app.state.run_store.save_feedback(
+        feedback_id=feedback_id,
+        created_at=datetime.now(timezone.utc),
+        category=payload.category,
+        message=payload.message,
+        contact_email=payload.contact_email,
+        run_id=payload.run_id,
+        gene=payload.gene,
+        page_url=payload.page_url,
+        user_agent=http_request.headers.get("user-agent"),
+    )
+    return FeedbackResponse(feedback_id=feedback_id)
 
 
 @app.post("/v1/dev/benchmark")
