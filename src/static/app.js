@@ -1067,20 +1067,39 @@ function renderNoResultView(hiddenAnnotations) {
     return;
   }
 
-  const list = document.createElement("ul");
-  list.className = "hidden-genes-list";
+  // Reuses the same annotation-card/field-row-highlight visual language as
+  // the Results tab (rather than a plain bulleted list) so this reads as
+  // part of the same app, not a fallback debug view.
+  const list = document.createElement("div");
+  list.className = "annotation-list";
+
   hiddenAnnotations.forEach((annotation) => {
-    const item = document.createElement("li");
+    const isError = Boolean(annotation.error);
     const reason =
       annotation.error ||
       annotation.evidence_support_explanation ||
       "Insufficient evidence to support an annotation.";
-    item.innerHTML = `
-      <strong>${escapeHtml(annotation.gene)}</strong>
-      <span class="subtle">${escapeHtml(annotation.fusions?.length ? formatList(annotation.fusions) : "Gene lookup")}</span>
-      <p>${escapeHtml(reason)}</p>
+
+    const card = document.createElement("article");
+    card.className = "annotation-card";
+    card.innerHTML = `
+      <header>
+        <div class="annotation-heading">
+          <h3>${escapeHtml(annotation.gene)}</h3>
+          <div class="subtle">${escapeHtml(annotation.fusions?.length ? formatList(annotation.fusions) : "Gene lookup")}</div>
+        </div>
+        <div class="annotation-card-meta">
+          <span class="review-badge ${isError ? "quality-warning" : "low"}">
+            ${isError ? "Error" : "Insufficient evidence"}
+          </span>
+        </div>
+      </header>
+      <div class="field-row field-row-highlight">
+        <span class="field-row-label">Reason</span>
+        <div class="field-row-value">${escapeHtml(reason)}</div>
+      </div>
     `;
-    list.appendChild(item);
+    list.appendChild(card);
   });
 
   elements.resultsWindow.replaceChildren(list);
