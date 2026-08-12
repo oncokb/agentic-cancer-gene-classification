@@ -69,6 +69,17 @@ const elements = {
   exportJson: document.querySelector("#export-json"),
   shareRun: document.querySelector("#share-run"),
   geneIndex: document.querySelector("#gene-index"),
+  openFeedback: document.querySelector("#open-feedback"),
+  closeFeedback: document.querySelector("#close-feedback"),
+  feedbackModal: document.querySelector("#feedback-modal"),
+  feedbackRunContext: document.querySelector("#feedback-run-context"),
+  feedbackCategory: document.querySelector("#feedback-category"),
+  feedbackGeneField: document.querySelector("#feedback-gene-field"),
+  feedbackGene: document.querySelector("#feedback-gene"),
+  feedbackMessage: document.querySelector("#feedback-message"),
+  feedbackEmail: document.querySelector("#feedback-email"),
+  feedbackOutput: document.querySelector("#feedback-output"),
+  submitFeedback: document.querySelector("#submit-feedback"),
   messageBox: document.querySelector("#message-box"),
   navAnnotate: document.querySelector("#nav-annotate"),
   navBenchmark: document.querySelector("#nav-benchmark"),
@@ -940,6 +951,91 @@ function renderEmptyState(title, body) {
   rebuildGeneIndex([]);
 }
 
+// ---------------------------------------------------------------------------
+// Feedback
+// ---------------------------------------------------------------------------
+
+function setInstallOutput(title, body, type = "info") {
+  elements.feedbackOutput.className = "install-output";
+  elements.feedbackOutput.innerHTML = `
+    <h3>${escapeHtml(title)}</h3>
+    <p>${escapeHtml(body)}</p>
+  `;
+  elements.feedbackOutput.classList.toggle("error", type === "error");
+  elements.feedbackOutput.classList.remove("hidden");
+}
+
+function showFeedbackModal() {
+  elements.feedbackOutput.classList.add("hidden");
+  elements.feedbackMessage.value = "";
+  elements.feedbackCategory.value = "bug";
+
+  const result = state.currentResult;
+  const genes = (result?.annotations || []).map((a) => a.gene).filter(Boolean);
+
+  if (result?.run_id) {
+    elements.feedbackRunContext.textContent =
+      `Attached: run ${result.run_id.slice(0, 8)} (${genes.length} gene${genes.length === 1 ? "" : "s"})`;
+    elements.feedbackRunContext.classList.remove("hidden");
+  } else {
+    elements.feedbackRunContext.classList.add("hidden");
+  }
+
+  if (genes.length) {
+    elements.feedbackGene.innerHTML = '<option value="">Not specific to a gene</option>';
+    genes.forEach((gene) => {
+      const option = document.createElement("option");
+      option.value = gene;
+      option.textContent = gene;
+      elements.feedbackGene.appendChild(option);
+    });
+    elements.feedbackGeneField.classList.remove("hidden");
+  } else {
+    elements.feedbackGeneField.classList.add("hidden");
+  }
+
+  elements.feedbackModal.classList.remove("hidden");
+}
+
+function hideFeedbackModal() {
+  elements.feedbackModal.classList.add("hidden");
+}
+
+async function submitFeedbackForm() {
+  const message = elements.feedbackMessage.value.trim();
+  if (!message) {
+    setInstallOutput("Message required", "Describe what's going on before submitting.", "error");
+    return;
+  }
+
+  elements.submitFeedback.disabled = true;
+  try {
+    const response = await fetch("/v1/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        category: elements.feedbackCategory.value,
+        message,
+        contact_email: elements.feedbackEmail.value.trim() || null,
+        run_id: state.currentResult?.run_id || null,
+        gene: elements.feedbackGene?.value || null,
+        page_url: window.location.href,
+      }),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || "Failed to submit feedback");
+    }
+    setInstallOutput("Thanks!", "Your feedback was submitted.");
+    elements.feedbackMessage.value = "";
+    elements.feedbackEmail.value = "";
+  } catch (error) {
+    setInstallOutput("Couldn't submit feedback", error.message, "error");
+  } finally {
+    elements.submitFeedback.disabled = false;
+  }
+}
+
 function switchResultsView(mode) {
   if (state.resultsViewMode === mode || !state.currentResult) return;
   state.resultsViewMode = mode;
@@ -1780,6 +1876,10 @@ function bindEvents() {
 
   elements.tabResultsView.addEventListener("click", () => switchResultsView("results"));
   elements.tabNoResultView.addEventListener("click", () => switchResultsView("noresult"));
+
+  elements.openFeedback.addEventListener("click", () => showFeedbackModal());
+  elements.closeFeedback.addEventListener("click", () => hideFeedbackModal());
+  elements.submitFeedback.addEventListener("click", submitFeedbackForm);
 
   document.querySelectorAll(".input-examples, .input-examples-compact").forEach((container) => {
     container.addEventListener("click", (event) => {
