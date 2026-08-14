@@ -31,13 +31,16 @@ CREATE TABLE IF NOT EXISTS runs (
 
 _CREATE_GENE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS gene_annotations (
-    gene VARCHAR(64) PRIMARY KEY,
+    gene VARCHAR(64) NOT NULL,
+    tumor_type VARCHAR(128) NOT NULL DEFAULT '',
     updated_at DATETIME NOT NULL,
     last_pubmed_checked_at DATETIME NULL,
     in_oncokb BOOLEAN NULL,
     evidence_support_score DOUBLE NOT NULL DEFAULT 0,
     insufficient_evidence BOOLEAN NOT NULL DEFAULT FALSE,
     annotation_json JSON NOT NULL,
+    PRIMARY KEY (gene, tumor_type),
+    INDEX idx_gene_annotations_gene (gene),
     INDEX idx_gene_annotations_updated_at (updated_at),
     INDEX idx_gene_annotations_last_pubmed_checked_at (last_pubmed_checked_at)
 )
@@ -92,6 +95,11 @@ def _parse_jdbc_mysql_host_port(url: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def _normalize_cache_tumor_type(tumor_type: Optional[str]) -> str:
+    """Normalize tumor type for the reusable gene annotation cache key."""
+    return " ".join((tumor_type or "").strip().lower().split())
+
+
 def _mysql_connection_kwargs() -> Dict[str, Any]:
     if settings.db_url:
         host, port = _parse_jdbc_mysql_host_port(settings.db_url)
@@ -127,7 +135,26 @@ class RunStore:
             async with conn.cursor() as cursor:
                 await cursor.execute(_CREATE_TABLE_SQL)
                 await cursor.execute(_CREATE_GENE_TABLE_SQL)
+                await self._ensure_gene_annotation_schema(cursor)
                 await cursor.execute(_CREATE_FEEDBACK_TABLE_SQL)
+
+    async def _ensure_gene_annotation_schema(self, cursor) -> None:
+        """Migrate older gene-only annotation caches to gene + tumor-type keys."""
+        await cursor.execute("SHOW COLUMNS FROM gene_annotations LIKE 'tumor_type'")
+        if await cursor.fetchone() is None:
+            await cursor.execute(
+                "ALTER TABLE gene_annotations "
+                "ADD COLUMN tumor_type VARCHAR(128) NOT NULL DEFAULT '' AFTER gene"
+            )
+
+        await cursor.execute("SHOW INDEX FROM gene_annotations WHERE Key_name = 'PRIMARY'")
+        rows = await cursor.fetchall()
+        primary_columns = [row[4] for row in sorted(rows, key=lambda row: row[3])]
+        if primary_columns == ["gene"]:
+            await cursor.execute(
+                "ALTER TABLE gene_annotations "
+                "DROP PRIMARY KEY, ADD PRIMARY KEY (gene, tumor_type)"
+            )
 
     async def save_run(
         self,
@@ -164,15 +191,18 @@ class RunStore:
         self,
         annotation: GeneAnnotation,
         updated_at: str | datetime,
+        tumor_type: Optional[str] = None,
     ) -> None:
-        """Upsert the latest reusable annotation for a canonical gene."""
+        """Upsert the latest reusable annotation for a canonical gene and tumor context."""
         payload = annotation.model_dump()
+        cache_tumor_type = _normalize_cache_tumor_type(tumor_type)
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
                     """
                     INSERT INTO gene_annotations (
                         gene,
+                        tumor_type,
                         updated_at,
                         last_pubmed_checked_at,
                         in_oncokb,
@@ -180,7 +210,7 @@ class RunStore:
                         insufficient_evidence,
                         annotation_json
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         updated_at = VALUES(updated_at),
                         last_pubmed_checked_at = VALUES(last_pubmed_checked_at),
@@ -191,6 +221,7 @@ class RunStore:
                     """,
                     (
                         annotation.gene,
+                        cache_tumor_type,
                         _to_utc_datetime(updated_at),
                         _to_utc_datetime(annotation.last_pubmed_checked_at)
                         if annotation.last_pubmed_checked_at
@@ -202,17 +233,22 @@ class RunStore:
                     ),
                 )
 
-    async def get_gene_annotation(self, gene: str) -> Optional[Dict[str, Any]]:
-        """Return cached annotation payload and freshness metadata for a gene."""
+    async def get_gene_annotation(
+        self,
+        gene: str,
+        tumor_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return cached annotation payload and freshness metadata for a gene/tumor context."""
+        cache_tumor_type = _normalize_cache_tumor_type(tumor_type)
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
                     """
-                    SELECT annotation_json, updated_at, last_pubmed_checked_at
+                    SELECT annotation_json, updated_at, last_pubmed_checked_at, tumor_type
                     FROM gene_annotations
-                    WHERE gene = %s
+                    WHERE gene = %s AND tumor_type = %s
                     """,
-                    (gene,),
+                    (gene, cache_tumor_type),
                 )
                 row = await cursor.fetchone()
         if row is None:
@@ -221,6 +257,7 @@ class RunStore:
             "annotation": json.loads(row[0]),
             "updated_at": _from_mysql_datetime(row[1]),
             "last_pubmed_checked_at": _from_mysql_datetime(row[2]),
+            "tumor_type": row[3] or None,
         }
 
     async def mark_gene_pubmed_checked(
@@ -228,15 +265,18 @@ class RunStore:
         gene: str,
         checked_at: str | datetime,
         annotation: GeneAnnotation | None = None,
+        tumor_type: Optional[str] = None,
     ) -> None:
         """Record that PubMed freshness was checked without needing regeneration."""
         checked = _to_utc_datetime(checked_at)
+        cache_tumor_type = _normalize_cache_tumor_type(tumor_type)
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 if annotation is None:
                     await cursor.execute(
-                        "UPDATE gene_annotations SET last_pubmed_checked_at = %s WHERE gene = %s",
-                        (checked, gene),
+                        "UPDATE gene_annotations SET last_pubmed_checked_at = %s "
+                        "WHERE gene = %s AND tumor_type = %s",
+                        (checked, gene, cache_tumor_type),
                     )
                 else:
                     payload = annotation.model_dump()
@@ -244,9 +284,9 @@ class RunStore:
                         """
                         UPDATE gene_annotations
                         SET last_pubmed_checked_at = %s, annotation_json = %s
-                        WHERE gene = %s
+                        WHERE gene = %s AND tumor_type = %s
                         """,
-                        (checked, json.dumps(payload), gene),
+                        (checked, json.dumps(payload), gene, cache_tumor_type),
                     )
 
     async def save_feedback(
