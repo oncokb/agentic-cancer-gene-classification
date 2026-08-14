@@ -87,5 +87,11 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    datadog_metrics_enabled: bool = False
+    datadog_metrics_namespace: str = "acgc"
+    datadog_statsd_host: str = "127.0.0.1"
+    datadog_statsd_port: int = 8125
+    datadog_user_id_header: str = "x-user-id"
+
 
 settings = Settings()
