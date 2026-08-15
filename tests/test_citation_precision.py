@@ -141,6 +141,43 @@ def test_build_gene_annotation_propagates_insufficient_evidence():
     assert annotation.insufficient_evidence is True
 
 
+def test_build_gene_annotation_keeps_summary_and_pmids_when_insufficient():
+    annotation = build_gene_annotation(
+        gene="GENE",
+        fusions=["GENE::PARTNER"],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=[
+            LiteratureRecord(
+                pmid="111",
+                title="GENE fusion case",
+                abstract="A sparse case report mentions GENE in a fusion.",
+                publication_types=["Case Reports"],
+            ),
+            LiteratureRecord(
+                pmid="222",
+                title="GENE biology",
+                abstract="GENE biology was studied outside cancer.",
+                publication_types=["Journal Article"],
+            ),
+        ],
+        synthesis_result={
+            "cancer_associated": None,
+            "insufficient_evidence": True,
+            "gene_summary": (
+                "Retrieved papers mention sparse GENE fusion or non-cancer biology, "
+                "but do not establish a confident cancer role (PMID 111; PMID 222)."
+            ),
+            "citations": [],
+        },
+    )
+
+    assert annotation.insufficient_evidence is True
+    assert annotation.gene_summary
+    assert annotation.retrieved_pmids == ["111", "222"]
+    assert annotation.retrieval_count == 2
+
+
 def test_build_gene_annotation_adds_lazy_evidence_cards_and_quality_flags():
     annotation = build_gene_annotation(
         gene="TP53",
