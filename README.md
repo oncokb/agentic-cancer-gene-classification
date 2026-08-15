@@ -386,6 +386,56 @@ Local Docker Compose sets `DD_TRACE_ENABLED=false` so development containers do
 not attempt to send traces to a missing local Datadog Agent. Override that env
 var if you are testing with a local Agent.
 
+The app also emits optional DogStatsD product metrics for dashboarding. Enable
+them only when the pod/container can reach a Datadog Agent:
+
+```bash
+DATADOG_METRICS_ENABLED=true
+DATADOG_METRICS_NAMESPACE=acgc
+DATADOG_STATSD_HOST=$DD_AGENT_HOST
+DATADOG_STATSD_PORT=8125
+```
+
+Metrics emitted:
+
+- `acgc.users.active`: unique hashed users seen per DogStatsD flush interval.
+  The app reads the identity from `DATADOG_USER_ID_HEADER`, default `x-user-id`.
+- `acgc.users.anonymous_requests`: annotation requests without a user header.
+- `acgc.inputs.submitted`: number of submitted genes/fusions.
+- `acgc.genes.queried`: number of unique normalized genes derived from the
+  submitted inputs. This is the primary "genes queried" metric.
+- `acgc.genes.annotated`: completed gene annotations.
+- `acgc.genes.errors`: gene annotations that ended with an error field.
+- `acgc.pipeline.runs`: annotation pipeline runs.
+- `acgc.pipeline.duration_ms` and `acgc.gene.annotation.duration_ms`: duration
+  distributions.
+
+Metric tags are intentionally low-cardinality: `mode`, `local_backend`, and
+`tumor_type_present`. Raw user IDs and gene symbols are not metric tags.
+
+Quick verification:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/annotate \
+  -H "Content-Type: application/json" \
+  -H "x-user-id: curator@example.com" \
+  -d '{"fusions":["TP53::BRAF","ETV6::NTRK3"],"mode":"core"}'
+```
+
+Then check Metrics Explorer for `acgc.genes.queried`, `acgc.users.active`, and
+`acgc.pipeline.runs`; check APM for spans named `acgc.pipeline.normalize` and
+`acgc.gene.annotate`.
+
+Suggested dashboard widgets:
+
+- Active users: `sum:acgc.users.active{*}.rollup(sum)`
+- Genes queried: `sum:acgc.genes.queried{*}.as_count()`
+- Inputs submitted: `sum:acgc.inputs.submitted{*}.as_count()`
+- Pipeline runs: `sum:acgc.pipeline.runs{*}.as_count()`
+- Gene errors: `sum:acgc.genes.errors{*}.as_count()`
+- Pipeline latency p95: `p95:acgc.pipeline.duration_ms{*}`
+- Gene latency p95: `p95:acgc.gene.annotation.duration_ms{*}`
+
 Dockerized local Codex:
 
 ```bash

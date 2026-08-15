@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from src.config import settings
 from src.models.schema import AnnotationMode, AnnotationResult, FusionInput, GeneAnnotation, ResolvedGene
+from src.observability import distribution, increment, trace
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import retrieve_literature, search_recent_pubmed_pmids
 from src.pipeline.llm_client import resolve_local_backend
@@ -212,6 +213,11 @@ async def _annotate_gene(
     """Run the full annotation pipeline for a single gene."""
     total_start = perf_counter()
     timings: Dict[str, float] = {}
+    metric_tags = [
+        f"mode:{mode}",
+        f"local_backend:{local_backend or 'sdk'}",
+        f"tumor_type_present:{bool(tumor_type)}",
+    ]
     if unresolvable:
         logger.info("Gene %s is unresolvable (bare Ensembl / unannotated locus)", gene)
         annotation = GeneAnnotation(
@@ -230,95 +236,109 @@ async def _annotate_gene(
             error="Unresolvable gene symbol — bare Ensembl ID or unannotated locus",
         )
         annotation.timings_ms["total"] = _elapsed_ms(total_start)
+        distribution("gene.annotation.duration_ms", annotation.timings_ms["total"], tags=metric_tags)
         return annotation
 
-    # Run DB lookup and literature retrieval concurrently
-    oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
-        _timed("oncokb", timings, check_oncokb_membership(gene, lookup=oncokb_lookup)),
-        _timed(
-            "literature_retrieval",
-            timings,
-            retrieve_literature(
-                gene, fusions,
-                tumor_type=tumor_type,
-                local_mode=local_mode,
-                local_backend=local_backend,
+    with trace(
+        "acgc.gene.annotate",
+        resource="annotate_gene",
+        tags={
+            "acgc.gene": gene,
+            "acgc.fusions_for_gene": len(fusions),
+            "acgc.mode": mode,
+            "acgc.local_backend": local_backend or "sdk",
+            "acgc.tumor_type_present": bool(tumor_type),
+        },
+    ):
+        # Run DB lookup and literature retrieval concurrently
+        oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
+            _timed("oncokb", timings, check_oncokb_membership(gene, lookup=oncokb_lookup)),
+            _timed(
+                "literature_retrieval",
+                timings,
+                retrieve_literature(
+                    gene, fusions,
+                    tumor_type=tumor_type,
+                    local_mode=local_mode,
+                    local_backend=local_backend,
+                ),
             ),
-        ),
-    )
+        )
 
-    prevalence_start = perf_counter()
-    prevalence = get_msk_genie_prevalence(gene)
-    timings["prevalence"] = _elapsed_ms(prevalence_start)
-    gene_identity = _format_gene_identity(resolved_gene)
+        prevalence_start = perf_counter()
+        prevalence = get_msk_genie_prevalence(gene)
+        timings["prevalence"] = _elapsed_ms(prevalence_start)
+        gene_identity = _format_gene_identity(resolved_gene)
 
-    # Citation selection pass: filter broad retrieval corpus down to the
-    # most directly relevant papers before synthesis to improve precision
-    # without shrinking the recall pool.
-    selected_records = await _timed(
-        "paper_selection",
-        timings,
-        select_papers_for_synthesis(
-            gene,
-            records,
-            settings.max_papers_for_synthesis,
-            gene_identity=gene_identity,
-            local_mode=local_mode,
-            local_backend=local_backend,
-        ),
-    )
-
-    try:
-        synthesis = await _timed(
-            "synthesis",
+        # Citation selection pass: filter broad retrieval corpus down to the
+        # most directly relevant papers before synthesis to improve precision
+        # without shrinking the recall pool.
+        selected_records = await _timed(
+            "paper_selection",
             timings,
-            synthesize_gene_annotation(
-                gene=gene,
-                fusions=fusions,
-                in_oncokb=oncokb_membership,
-                cancer_type_prevalence=prevalence,
-                records=selected_records,
-                retrieval_tier=retrieval_tier,
+            select_papers_for_synthesis(
+                gene,
+                records,
+                settings.max_papers_for_synthesis,
                 gene_identity=gene_identity,
                 local_mode=local_mode,
                 local_backend=local_backend,
-                mode=mode,
             ),
         )
-    except Exception as e:
-        logger.error("Synthesis failed for gene %s: %s", gene, e)
-        annotation = GeneAnnotation(
+
+        try:
+            synthesis = await _timed(
+                "synthesis",
+                timings,
+                synthesize_gene_annotation(
+                    gene=gene,
+                    fusions=fusions,
+                    in_oncokb=oncokb_membership,
+                    cancer_type_prevalence=prevalence,
+                    records=selected_records,
+                    retrieval_tier=retrieval_tier,
+                    gene_identity=gene_identity,
+                    local_mode=local_mode,
+                    local_backend=local_backend,
+                    mode=mode,
+                ),
+            )
+        except Exception as e:
+            logger.error("Synthesis failed for gene %s: %s", gene, e)
+            annotation = GeneAnnotation(
+                gene=gene,
+                fusions=list(dict.fromkeys(fusions)),
+                in_oncokb=oncokb_membership,
+                retrieval_count=len(records),
+                insufficient_evidence=True,
+                evidence_support_score=0.0,
+                evidence_support_explanation=(
+                    "Evidence support score 0.00: synthesis failed, so no "
+                    "literature-grounded annotation was generated."
+                ),
+                cache_status="bypassed",
+                cache_reason="synthesis_error",
+                error=f"Synthesis error: {e}",
+            )
+            timings["total"] = _elapsed_ms(total_start)
+            annotation.timings_ms = timings
+            distribution("gene.annotation.duration_ms", timings["total"], tags=metric_tags)
+            return annotation
+
+        annotation = build_gene_annotation(
             gene=gene,
-            fusions=list(dict.fromkeys(fusions)),
+            fusions=fusions,
             in_oncokb=oncokb_membership,
-            retrieval_count=len(records),
-            insufficient_evidence=True,
-            evidence_support_score=0.0,
-            evidence_support_explanation=(
-                "Evidence support score 0.00: synthesis failed, so no "
-                "literature-grounded annotation was generated."
-            ),
-            cache_status="bypassed",
-            cache_reason="synthesis_error",
-            error=f"Synthesis error: {e}",
+            cancer_type_prevalence=prevalence,
+            records=records,       # full count for retrieval_count field
+            synthesis_result=synthesis,
+            retrieval_tier=retrieval_tier,
+            mode=mode,
         )
         timings["total"] = _elapsed_ms(total_start)
         annotation.timings_ms = timings
+        distribution("gene.annotation.duration_ms", timings["total"], tags=metric_tags)
         return annotation
-
-    annotation = build_gene_annotation(
-        gene=gene,
-        fusions=fusions,
-        in_oncokb=oncokb_membership,
-        cancer_type_prevalence=prevalence,
-        records=records,       # full count for retrieval_count field
-        synthesis_result=synthesis,
-        retrieval_tier=retrieval_tier,
-        mode=mode,
-    )
-    timings["total"] = _elapsed_ms(total_start)
-    annotation.timings_ms = timings
-    return annotation
 
 
 def _normalize_fusion_inputs(
@@ -365,11 +385,27 @@ async def run_pipeline(
     local_mode = local_backend is not None
 
     input_strings, tumor_type_by_input = _normalize_fusion_inputs(fusions)
+    metric_tags = [f"mode:{mode}", f"local_backend:{local_backend or 'sdk'}"]
+    increment("pipeline.runs", tags=metric_tags)
+    increment("inputs.submitted", value=len(input_strings), tags=metric_tags)
     logger.info("Pipeline run %s started — %d inputs", run_id, len(input_strings))
 
     normalization_start = perf_counter()
-    gene_map = await normalize_fusions(input_strings)
+    with trace(
+        "acgc.pipeline.normalize",
+        resource="normalize_fusions",
+        tags={
+            "acgc.run_id": run_id,
+            "acgc.inputs.count": len(input_strings),
+            "acgc.mode": mode,
+            "acgc.local_backend": local_backend or "sdk",
+            "acgc.force_refresh": force_refresh,
+        },
+    ) as span:
+        gene_map = await normalize_fusions(input_strings)
+        span.set_tag("acgc.genes.count", len(gene_map))
     timings["normalization"] = _elapsed_ms(normalization_start)
+    increment("genes.queried", value=len(gene_map), tags=metric_tags)
     logger.info("Resolved %d unique genes from %d inputs", len(gene_map), len(input_strings))
     await _maybe_call_total(on_total_known, len(gene_map))
 
@@ -450,6 +486,9 @@ async def run_pipeline(
         annotation = await task
         annotations.append(annotation)
         await _maybe_call_progress(on_annotation, annotation)
+        increment("genes.annotated", tags=metric_tags)
+        if annotation.error:
+            increment("genes.errors", tags=metric_tags)
         logger.info(
             "Annotated %s — cancer_associated=%s, citations=%d, evidence_support_score=%.2f, total_ms=%.2f",
             annotation.gene,
@@ -462,6 +501,7 @@ async def run_pipeline(
 
     annotations.sort(key=lambda a: a.gene)
     timings["total"] = _elapsed_ms(total_start)
+    distribution("pipeline.duration_ms", timings["total"], tags=metric_tags)
 
     return AnnotationResult(
         run_id=run_id,

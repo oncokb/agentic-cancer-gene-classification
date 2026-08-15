@@ -39,6 +39,7 @@ from src.models.schema import (
     GeneAnnotation,
     LocalBackend,
 )
+from src.observability import record_user_seen, tag_current_span
 from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
@@ -287,6 +288,27 @@ async def _persist_run_result(
         logger.exception("Failed to persist run %s", result.run_id)
 
 
+def _request_user_id(request: Request) -> Optional[str]:
+    value = request.headers.get(settings.datadog_user_id_header)
+    return value.strip() if value and value.strip() else None
+
+
+def _record_annotation_request_metrics(
+    request: AnnotateRequest | GeneAnnotateRequest,
+    http_request: Request,
+) -> None:
+    user_id = _request_user_id(http_request)
+    tags = [f"mode:{request.mode}", f"local_backend:{request.local_backend or 'sdk'}"]
+    record_user_seen(user_id, tags=tags)
+    tag_current_span(
+        {
+            "acgc.user.present": bool(user_id),
+            "acgc.mode": request.mode,
+            "acgc.local_backend": request.local_backend or "sdk",
+        }
+    )
+
+
 @app.get("/")
 async def root() -> FileResponse:
     return FileResponse(_STATIC_DIR / "index.html")
@@ -314,6 +336,7 @@ async def annotate(request: AnnotateRequest, http_request: Request) -> Annotatio
     Input supports plain strings or structured objects with optional tumor_type and breakpoint fields:
     `{ "fusions": ["ALK", {"fusion": "EML4::ALK", "tumor_type": "LUAD"}] }`
     """
+    _record_annotation_request_metrics(request, http_request)
     try:
         result = await run_pipeline(
             request.fusions,
@@ -336,6 +359,7 @@ async def create_annotation_job(
     request: AnnotateRequest,
     http_request: Request,
 ) -> AnnotationJobCreateResponse:
+    _record_annotation_request_metrics(request, http_request)
     await _evict_stale_annotation_jobs()
 
     job_id = str(uuid.uuid4())
@@ -469,6 +493,7 @@ async def annotate_gene(request: GeneAnnotateRequest, http_request: Request) -> 
     This is a convenience endpoint for external REST clients. For batch runs or
     mixed gene/fusion inputs, use POST /v1/annotate.
     """
+    _record_annotation_request_metrics(request, http_request)
     gene_input = FusionInput(gene=request.gene, tumor_type=request.tumor_type)
     try:
         result = await run_pipeline(

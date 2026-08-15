@@ -29,7 +29,8 @@ RUN pip install --no-cache-dir hatchling && \
     tenacity \
     aiomysql \
     cryptography \
-    redis
+    redis \
+    datadog
 
 COPY src/ ./src/
 COPY benchmarks/ ./benchmarks/
