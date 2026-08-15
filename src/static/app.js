@@ -1175,6 +1175,18 @@ function renderNoResultView(hiddenAnnotations) {
         <div class="field-row-value">${escapeHtml(reason)}</div>
       </div>
     `;
+    const summary = String(annotation.gene_summary || "").trim();
+    if (summary) {
+      const summaryRow = document.createElement("div");
+      summaryRow.className = "field-row";
+      summaryRow.innerHTML = `
+        <span class="field-row-label">Interpreted gene summary</span>
+        <div class="field-row-value">${escapeHtml(summary)}</div>
+      `;
+      card.appendChild(summaryRow);
+    }
+    const evidence = renderSupportingEvidence(annotation);
+    if (evidence) card.appendChild(evidence);
     list.appendChild(card);
   });
 
