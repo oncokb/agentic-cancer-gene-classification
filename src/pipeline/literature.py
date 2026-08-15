@@ -42,6 +42,15 @@ _request_semaphore = asyncio.Semaphore(3 if not settings.ncbi_api_key else 10)
 
 MAX_AGENTIC_TOOL_CALLS = 6  # cap Claude's search budget per gene
 
+_RETRACTION_PUBLICATION_TYPES: frozenset[str] = frozenset({
+    "retracted publication",
+    "retraction of publication",
+})
+_RETRACTION_QUERY_EXCLUSION = (
+    '("Retracted Publication"[Publication Type] OR '
+    '"Retraction of Publication"[Publication Type])'
+)
+
 # ---------------------------------------------------------------------------
 # Tumor type alias expansion
 # ---------------------------------------------------------------------------
@@ -138,6 +147,29 @@ def _tumor_type_prompt_note(tumor_type: str) -> str:
     return tumor_type
 
 
+def _exclude_retracted_query(query: str) -> str:
+    """Add a PubMed query clause excluding retracted papers and retraction notices."""
+    if _RETRACTION_QUERY_EXCLUSION in query:
+        return query
+    return f"({query}) NOT {_RETRACTION_QUERY_EXCLUSION}"
+
+
+def _is_retracted_publication(record: LiteratureRecord) -> bool:
+    publication_types = {value.strip().lower() for value in record.publication_types}
+    if publication_types.intersection(_RETRACTION_PUBLICATION_TYPES):
+        return True
+    title = record.title.strip().lower()
+    return title.startswith(("retracted:", "retraction:"))
+
+
+def _filter_retracted_records(records: List[LiteratureRecord]) -> List[LiteratureRecord]:
+    filtered = [record for record in records if not _is_retracted_publication(record)]
+    dropped = len(records) - len(filtered)
+    if dropped:
+        logger.info("Filtered %d retracted PubMed record(s)", dropped)
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Evidence priority ranking
 # ---------------------------------------------------------------------------
@@ -232,8 +264,9 @@ async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> L
     """Return PMIDs matching a PubMed query string."""
 
     async def _fetch() -> List[str]:
+        search_query = _exclude_retracted_query(query)
         params = _ncbi_params(
-            {"db": "pubmed", "term": query, "retmax": max_results, "sort": "relevance"}
+            {"db": "pubmed", "term": search_query, "retmax": max_results, "sort": "relevance"}
         )
         async with _request_semaphore:
             await asyncio.sleep(_RATE_LIMIT_DELAY)
@@ -241,7 +274,7 @@ async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> L
             resp.raise_for_status()
         return resp.json().get("esearchresult", {}).get("idlist", [])
 
-    return await cached_call(f"pubmed:esearch:{query}:{max_results}", _fetch)
+    return await cached_call(f"pubmed:esearch:{_exclude_retracted_query(query)}:{max_results}", _fetch)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
@@ -253,10 +286,11 @@ async def _esearch_since(
 ) -> List[str]:
     """Return PMIDs published since a UTC timestamp for lightweight cache freshness checks."""
     since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+    search_query = _exclude_retracted_query(query)
     params = _ncbi_params(
         {
             "db": "pubmed",
-            "term": query,
+            "term": search_query,
             "retmax": max_results,
             "sort": "pub date",
             "datetype": "pdat",
@@ -356,7 +390,7 @@ async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[Literatur
 
     cache_key = f"pubmed:efetch:{','.join(sorted(pmids))}"
     records = await cached_call(cache_key, _fetch)
-    return [LiteratureRecord(**r) for r in records]
+    return _filter_retracted_records([LiteratureRecord(**r) for r in records])
 
 
 async def _search_and_fetch(
@@ -590,7 +624,9 @@ async def _tier2_agentic_retrieve(
     Fallback retrieval: Claude decides what queries to run.
     Runs an agentic tool-use loop, accumulating unique records across all searches.
     """
-    accumulated: Dict[str, LiteratureRecord] = {r.pmid: r for r in initial_records}
+    accumulated: Dict[str, LiteratureRecord] = {
+        r.pmid: r for r in _filter_retracted_records(initial_records)
+    }
 
     fusion_context = f"Associated fusions: {', '.join(fusions)}" if fusions else ""
     tumor_note = f"Tumor type: {_tumor_type_prompt_note(tumor_type)}" if tumor_type else ""
@@ -686,7 +722,7 @@ async def _tier2_agentic_retrieve(
         "Tier 2 complete for %s: %d total abstracts (%d from agentic, %d tool calls)",
         gene, total, total - len(initial_records), tool_calls_made,
     )
-    return _rank_records(list(accumulated.values()))
+    return _rank_records(_filter_retracted_records(list(accumulated.values())))
 
 
 async def _tier2_local_retrieve(
@@ -702,7 +738,9 @@ async def _tier2_local_retrieve(
     Claude Code cannot participate in Anthropic SDK tool-use loops, so ask it for
     concrete PubMed query strings, then execute those queries locally.
     """
-    accumulated: Dict[str, LiteratureRecord] = {r.pmid: r for r in initial_records}
+    accumulated: Dict[str, LiteratureRecord] = {
+        r.pmid: r for r in _filter_retracted_records(initial_records)
+    }
     fusion_context = f"Associated fusions: {', '.join(fusions)}" if fusions else "Associated fusions: none"
     tumor_note = f"Tumor type: {_tumor_type_prompt_note(tumor_type)}" if tumor_type else ""
     initial_summary = _format_initial_records(initial_records)
@@ -756,7 +794,7 @@ async def _tier2_local_retrieve(
         len(accumulated),
         len(accumulated) - len(initial_records),
     )
-    return _rank_records(list(accumulated.values()))
+    return _rank_records(_filter_retracted_records(list(accumulated.values())))
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +821,7 @@ async def retrieve_literature(
     Returns (records, tier) where tier is 1 or 2.
     """
     try:
-        records = await _tier1_retrieve(gene, fusions, tumor_type)
+        records = _filter_retracted_records(await _tier1_retrieve(gene, fusions, tumor_type))
     except httpx.HTTPError as exc:
         logger.error("Tier 1 NCBI call failed for %s: %s", gene, exc)
         records = []
@@ -803,4 +841,4 @@ async def retrieve_literature(
         records = await _tier2_local_retrieve(gene, fusions or [], records, local_backend, tumor_type)
     else:
         records = await _tier2_agentic_retrieve(gene, fusions or [], records, tumor_type)
-    return records, 2
+    return _filter_retracted_records(records), 2

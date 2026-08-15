@@ -260,6 +260,10 @@ ACGC after PMID verification. It estimates how strongly the generated annotation
 is supported by retrieved literature and verified citations; it is not a
 calibrated probability of biological truth or clinical actionability.
 
+PubMed retrieval excludes records marked as `Retracted Publication` or
+`Retraction of Publication`, and citation verification ignores any retracted
+records that reach synthesis through cached or test fixtures.
+
 To import into Google Sheets, create or open a sheet, use **File > Import**,
 upload `results.csv`, and choose whether to insert it as a new sheet or append it
 to an existing sheet. Treat this CSV as a review artifact; it does not write back
