@@ -173,16 +173,19 @@ async def test_gene_annotation_cache_round_trip(run_store):
     )
     updated_at = datetime(2026, 7, 30, 19, 24, 12, tzinfo=timezone.utc)
 
-    await run_store.save_gene_annotation(annotation, updated_at)
-    stored = await run_store.get_gene_annotation("BRAF")
+    await run_store.save_gene_annotation(annotation, updated_at, tumor_type="LUAD")
+    stored = await run_store.get_gene_annotation("BRAF", tumor_type="luad")
 
     assert stored is not None
     assert stored["annotation"]["gene"] == "BRAF"
     assert stored["annotation"]["evidence_support_score"] == 0.8
     assert stored["updated_at"] == updated_at
+    assert stored["tumor_type"] == "luad"
 
-    await run_store.mark_gene_pubmed_checked("BRAF", updated_at, annotation)
-    stored = await run_store.get_gene_annotation("BRAF")
+    assert await run_store.get_gene_annotation("BRAF", tumor_type="melanoma") is None
+
+    await run_store.mark_gene_pubmed_checked("BRAF", updated_at, annotation, tumor_type="LUAD")
+    stored = await run_store.get_gene_annotation("BRAF", tumor_type="LUAD")
 
     assert stored is not None
     assert stored["last_pubmed_checked_at"] == updated_at

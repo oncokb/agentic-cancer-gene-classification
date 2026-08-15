@@ -123,7 +123,7 @@ async def _maybe_reuse_cached_annotation(
     ):
         return None
 
-    cached = await run_store.get_gene_annotation(gene)
+    cached = await run_store.get_gene_annotation(gene, tumor_type=tumor_type)
     if cached is None:
         return None
 
@@ -176,7 +176,7 @@ async def _maybe_reuse_cached_annotation(
         updated_at,
         now,
     )
-    await run_store.mark_gene_pubmed_checked(gene, now, reused)
+    await run_store.mark_gene_pubmed_checked(gene, now, reused, tumor_type=tumor_type)
     return reused
 
 
@@ -432,7 +432,11 @@ async def run_pipeline(
                 annotation.cached_at = timestamp
                 annotation.last_pubmed_checked_at = timestamp
                 try:
-                    await run_store.save_gene_annotation(annotation, started_at)
+                    await run_store.save_gene_annotation(
+                        annotation,
+                        started_at,
+                        tumor_type=tumor_type,
+                    )
                 except Exception:
                     logger.exception("Failed to persist cached gene annotation for %s", canonical)
 

@@ -421,10 +421,13 @@ same result without recomputing it:
 curl http://127.0.0.1:8000/v1/annotate/<run_id>
 ```
 
-The same store also keeps the latest reusable annotation per canonical gene in
-`gene_annotations`. This is separate from run sharing: `runs` preserves exact
-request/response history, while `gene_annotations` reduces future LLM/PubMed
-work for genes that are still fresh enough.
+The same store also keeps the latest reusable annotation per canonical gene and
+tumor-type context in `gene_annotations`. This is separate from run sharing:
+`runs` preserves exact request/response history, while `gene_annotations`
+reduces future LLM/PubMed work for genes that are still fresh enough. Tumor type
+is part of the reusable cache key, so `BRAF` with `melanoma` and `BRAF` with
+`LUAD` are cached independently; requests without tumor type use a general
+empty tumor-type bucket.
 
 Default freshness policy:
 
