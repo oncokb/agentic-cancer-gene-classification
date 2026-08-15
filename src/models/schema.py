@@ -44,6 +44,20 @@ class EvidenceCard(BaseModel):
     quote: Optional[str] = None
 
 
+class FusionEvidenceCard(EvidenceCard):
+    fusion: str = ""
+
+
+class FusionEvidenceResult(BaseModel):
+    fusion: str
+    tumor_type: Optional[str] = None
+    well_supported: bool = False
+    retrieved_count: int = 0
+    pmids: List[str] = Field(default_factory=list)
+    interpretation: str = ""
+    evidence_cards: List[FusionEvidenceCard] = Field(default_factory=list)
+
+
 class QualityFlag(BaseModel):
     code: str
     label: str
@@ -235,6 +249,7 @@ class AnnotationResult(BaseModel):
     fusions_processed: int
     genes_annotated: int
     annotations: List[GeneAnnotation]
+    fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
     timings_ms: Dict[str, float] = Field(default_factory=dict)
 
 

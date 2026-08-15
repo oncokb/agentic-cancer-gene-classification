@@ -33,6 +33,7 @@ from src.models.schema import (
     AnnotationResult,
     FeedbackRequest,
     FeedbackResponse,
+    FusionEvidenceResult,
     FusionInput,
     FusionPositionContext,
     GeneAnnotateRequest,
@@ -43,6 +44,8 @@ from src.observability import record_user_seen, tag_current_span
 from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
+from src.pipeline.literature import retrieve_fusion_evidence
+from src.pipeline.normalization import is_fusion_input
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.run_store import RunStore
 
@@ -183,6 +186,22 @@ class EnrichmentJobStatusResponse(BaseModel):
     timings_ms: Dict[str, float] = Field(default_factory=dict)
 
 
+class FusionEvidenceJobCreateResponse(BaseModel):
+    job_id: str
+    status_url: str
+
+
+class FusionEvidenceJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    fusions_completed: int = 0
+    fusions_total: int = 0
+    fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
+    error: Optional[str] = None
+    timings_ms: Dict[str, float] = Field(default_factory=dict)
+    created_at: float = Field(default_factory=time.monotonic, exclude=True)
+
+
 class BenchmarkRequest(BaseModel):
     no_judge: bool = Field(
         default=True,
@@ -216,6 +235,8 @@ _annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
 _annotation_jobs_lock = asyncio.Lock()
 _enrichment_jobs: Dict[str, EnrichmentJobStatusResponse] = {}
 _enrichment_jobs_lock = asyncio.Lock()
+_fusion_evidence_jobs: Dict[str, FusionEvidenceJobStatusResponse] = {}
+_fusion_evidence_jobs_lock = asyncio.Lock()
 
 # asyncio.create_task() only keeps a weak reference to the task via the event
 # loop — an unreferenced task can be garbage-collected mid-execution. This set
@@ -271,6 +292,33 @@ async def _get_enrichment_job(job_id: str) -> EnrichmentJobStatusResponse:
     if job is None:
         raise HTTPException(status_code=404, detail="Enrichment job not found")
     return job
+
+
+async def _store_fusion_evidence_job(job: FusionEvidenceJobStatusResponse) -> None:
+    async with _fusion_evidence_jobs_lock:
+        _fusion_evidence_jobs[job.job_id] = job
+
+
+async def _get_fusion_evidence_job(job_id: str) -> FusionEvidenceJobStatusResponse:
+    async with _fusion_evidence_jobs_lock:
+        job = _fusion_evidence_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Fusion evidence job not found")
+    return job
+
+
+def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
+    seen: set[tuple[str, Optional[str]]] = set()
+    inputs: List[FusionInput] = []
+    for item in fusions:
+        if not is_fusion_input(item.fusion):
+            continue
+        key = (item.fusion, " ".join((item.tumor_type or "").strip().lower().split()) or None)
+        if key in seen:
+            continue
+        seen.add(key)
+        inputs.append(item)
+    return inputs
 
 
 async def _persist_run_result(
@@ -483,6 +531,72 @@ async def create_enrichment_job(
 @app.get("/v1/annotate/enrichment/jobs/{job_id}", response_model=EnrichmentJobStatusResponse)
 async def get_enrichment_job(job_id: str) -> EnrichmentJobStatusResponse:
     return await _get_enrichment_job(job_id)
+
+
+@app.post("/v1/fusion-evidence/jobs", response_model=FusionEvidenceJobCreateResponse)
+async def create_fusion_evidence_job(
+    request: AnnotateRequest,
+) -> FusionEvidenceJobCreateResponse:
+    """Run exact fusion-pair PubMed evidence retrieval outside the annotation critical path."""
+    fusion_inputs = _fusion_evidence_inputs(request.fusions)
+    job_id = str(uuid.uuid4())
+    job = FusionEvidenceJobStatusResponse(
+        job_id=job_id,
+        status="queued",
+        fusions_total=len(fusion_inputs),
+    )
+    await _store_fusion_evidence_job(job)
+
+    async def run_one(item: FusionInput, semaphore: asyncio.Semaphore) -> FusionEvidenceResult:
+        async with semaphore:
+            try:
+                return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
+            except Exception as exc:
+                logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
+                return FusionEvidenceResult(
+                    fusion=item.fusion,
+                    tumor_type=item.tumor_type,
+                    interpretation=f"Fusion evidence retrieval failed: {exc}",
+                )
+
+    async def run_job() -> None:
+        start = time.perf_counter()
+        current = await _get_fusion_evidence_job(job_id)
+        current.status = "running"
+        await _store_fusion_evidence_job(current)
+        try:
+            semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
+            tasks = [asyncio.create_task(run_one(item, semaphore)) for item in fusion_inputs]
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                current = await _get_fusion_evidence_job(job_id)
+                current.fusion_evidence.append(result)
+                current.fusion_evidence.sort(key=lambda item: item.fusion)
+                current.fusions_completed = len(current.fusion_evidence)
+                await _store_fusion_evidence_job(current)
+
+            current = await _get_fusion_evidence_job(job_id)
+            current.status = "complete"
+            current.fusions_completed = len(current.fusion_evidence)
+            current.timings_ms = {"total": round((time.perf_counter() - start) * 1000, 2)}
+            await _store_fusion_evidence_job(current)
+        except Exception as exc:
+            logger.exception("Fusion evidence job %s failed", job_id)
+            current = await _get_fusion_evidence_job(job_id)
+            current.status = "failed"
+            current.error = str(exc)
+            await _store_fusion_evidence_job(current)
+
+    _track_background_task(run_job())
+    return FusionEvidenceJobCreateResponse(
+        job_id=job_id,
+        status_url=f"/v1/fusion-evidence/jobs/{job_id}",
+    )
+
+
+@app.get("/v1/fusion-evidence/jobs/{job_id}", response_model=FusionEvidenceJobStatusResponse)
+async def get_fusion_evidence_job(job_id: str) -> FusionEvidenceJobStatusResponse:
+    return await _get_fusion_evidence_job(job_id)
 
 
 @app.post("/v1/annotate/gene", response_model=GeneAnnotation)

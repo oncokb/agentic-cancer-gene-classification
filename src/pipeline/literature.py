@@ -17,6 +17,7 @@ PMID verification at synthesis time applies regardless of which tier produced th
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -28,7 +29,8 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
-from src.models.schema import LiteratureRecord
+from src.models.schema import FusionEvidenceCard, FusionEvidenceResult, LiteratureRecord
+from src.pipeline.normalization import split_fusion
 from src.pipeline.cache import cached_call
 from src.pipeline.llm_client import complete_with_tool, make_async_sdk_client, resolve_sdk_model
 
@@ -168,6 +170,208 @@ def _filter_retracted_records(records: List[LiteratureRecord]) -> List[Literatur
     if dropped:
         logger.info("Filtered %d retracted PubMed record(s)", dropped)
     return filtered
+
+
+_NOVEL_FUSION_TERMS = (
+    "novel fusion",
+    "novel gene fusion",
+    "first report",
+    "first case",
+    "case report",
+    "previously undescribed",
+    "previously unreported",
+)
+
+
+def _fusion_query_variants(fusion: str) -> List[str]:
+    five_prime, three_prime = split_fusion(fusion)
+    if not five_prime or not three_prime:
+        return []
+    variants = [
+        f"{five_prime}::{three_prime}",
+        f"{five_prime}-{three_prime}",
+        f"{five_prime}/{three_prime}",
+        f"{five_prime} {three_prime}",
+    ]
+    return list(dict.fromkeys(variants))
+
+
+def _fusion_evidence_queries(fusion: str, tumor_type: Optional[str] = None) -> List[str]:
+    variants = _fusion_query_variants(fusion)
+    if not variants:
+        return []
+    variant_fragment = " OR ".join(f'"{variant}"' for variant in variants)
+    queries = [
+        f"({variant_fragment}) AND (fusion OR rearrangement OR translocation) AND "
+        "(cancer OR tumor OR carcinoma OR neoplasm)",
+    ]
+    if tumor_type:
+        queries.insert(
+            0,
+            f"({variant_fragment}) AND {_tumor_type_query_fragment(tumor_type)}",
+        )
+    return list(dict.fromkeys(queries))
+
+
+def _novelty_record_count(records: List[LiteratureRecord]) -> int:
+    count = 0
+    for record in records:
+        text = f"{record.title} {record.abstract}".lower()
+        if any(term in text for term in _NOVEL_FUSION_TERMS):
+            count += 1
+    return count
+
+
+def _fusion_evidence_type(record: LiteratureRecord) -> str:
+    combined = f"{record.title} {record.abstract}".lower()
+    publication_types = {value.lower() for value in record.publication_types}
+    if any("clinical trial" in value for value in publication_types):
+        return "clinical"
+    if any(term in combined for term in ("patient", "cohort", "survival", "response", "therapy")):
+        return "clinical"
+    if any(term in combined for term in ("cell line", "xenograft", "knockdown", "inhibitor")):
+        return "functional"
+    if any(term in combined for term in ("case report", "first report", "novel fusion")):
+        return "case_report"
+    return "fusion"
+
+
+def _record_quote(record: LiteratureRecord) -> Optional[str]:
+    text = record.abstract.strip()
+    if not text:
+        return None
+    sentence = text.split(". ", 1)[0].strip()
+    if sentence and not sentence.endswith("."):
+        sentence += "."
+    return sentence[:320] or None
+
+
+def _build_fusion_evidence_cards(
+    fusion: str,
+    records: List[LiteratureRecord],
+    limit: int = 5,
+) -> List[FusionEvidenceCard]:
+    cards: List[FusionEvidenceCard] = []
+    for record in records[:limit]:
+        evidence_type = _fusion_evidence_type(record)
+        selected_reason = f"Matched an exact fusion-pair PubMed query as {evidence_type.replace('_', ' ')} evidence."
+        if record.journal in _HIGH_IMPACT_JOURNALS:
+            selected_reason += " High-impact journal signal."
+        cards.append(
+            FusionEvidenceCard(
+                fusion=fusion,
+                pmid=record.pmid,
+                title=record.title,
+                journal=record.journal,
+                evidence_type=evidence_type,
+                selected_reason=selected_reason,
+                quote=_record_quote(record),
+            )
+        )
+    return cards
+
+
+def _fusion_evidence_interpretation(
+    *,
+    fusion: str,
+    tumor_type: Optional[str],
+    records: List[LiteratureRecord],
+    well_supported: bool,
+) -> str:
+    tumor_note = f" in {tumor_type}" if tumor_type else ""
+    novelty_count = _novelty_record_count(records)
+    if well_supported:
+        return (
+            f"{fusion}{tumor_note} has {len(records)} non-retracted PubMed record(s) from exact "
+            "fusion-pair searches, suggesting this is a studied fusion event rather than a "
+            "single novelty-only report."
+        )
+    if records:
+        novelty_note = " Most retrieved records look novelty or case-report driven." if novelty_count else ""
+        return (
+            f"{fusion}{tumor_note} has {len(records)} non-retracted PubMed record(s) from exact "
+            f"fusion-pair searches, below the well-supported threshold.{novelty_note}"
+        )
+    return f"No non-retracted PubMed records were found for exact {fusion}{tumor_note} fusion-pair searches."
+
+
+async def retrieve_fusion_evidence(
+    fusion: str,
+    tumor_type: Optional[str] = None,
+    max_results: Optional[int] = None,
+) -> FusionEvidenceResult:
+    """Return deterministic fusion-level PubMed evidence for exact gene-pair queries."""
+    max_results = max_results or settings.fusion_evidence_max_results
+    cache_key = "fusion_evidence:" + json.dumps(
+        {
+            "fusion": fusion.strip(),
+            "tumor_type": " ".join((tumor_type or "").strip().lower().split()),
+            "max_results": max_results,
+            "min_papers": settings.min_papers_for_strong_association,
+        },
+        sort_keys=True,
+    )
+
+    async def _compute() -> dict:
+        result = await _retrieve_fusion_evidence_uncached(
+            fusion,
+            tumor_type=tumor_type,
+            max_results=max_results,
+        )
+        return result.model_dump()
+
+    payload = await cached_call(
+        cache_key,
+        _compute,
+        ttl_seconds=settings.fusion_evidence_cache_ttl_seconds,
+    )
+    return FusionEvidenceResult(**payload)
+
+
+async def _retrieve_fusion_evidence_uncached(
+    fusion: str,
+    tumor_type: Optional[str],
+    max_results: int,
+) -> FusionEvidenceResult:
+    queries = _fusion_evidence_queries(fusion, tumor_type)
+    if not queries:
+        return FusionEvidenceResult(
+            fusion=fusion,
+            tumor_type=tumor_type,
+            interpretation="Fusion evidence is only available for two-partner fusion inputs.",
+        )
+
+    async with httpx.AsyncClient() as client:
+        pmid_lists = await asyncio.gather(*[_esearch(query, max_results, client) for query in queries])
+        seen_pmids: Set[str] = set()
+        pmids: List[str] = []
+        for pmid_list in pmid_lists:
+            for pmid in pmid_list:
+                if pmid not in seen_pmids:
+                    seen_pmids.add(pmid)
+                    pmids.append(pmid)
+        records = await _efetch(pmids, client)
+
+    records = _rank_records(_filter_retracted_records(records))
+    novelty_count = _novelty_record_count(records)
+    well_supported = (
+        len(records) >= settings.min_papers_for_strong_association
+        and novelty_count < len(records)
+    )
+    return FusionEvidenceResult(
+        fusion=fusion,
+        tumor_type=tumor_type,
+        well_supported=well_supported,
+        retrieved_count=len(records),
+        pmids=[record.pmid for record in records],
+        interpretation=_fusion_evidence_interpretation(
+            fusion=fusion,
+            tumor_type=tumor_type,
+            records=records,
+            well_supported=well_supported,
+        ),
+        evidence_cards=_build_fusion_evidence_cards(fusion, records),
+    )
 
 
 # ---------------------------------------------------------------------------
