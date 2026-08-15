@@ -15,7 +15,14 @@ from time import perf_counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from src.config import settings
-from src.models.schema import AnnotationMode, AnnotationResult, FusionInput, GeneAnnotation, ResolvedGene
+from src.models.schema import (
+    AnnotationMode,
+    AnnotationResult,
+    FusionInput,
+    GeneAnnotation,
+    QualityFlag,
+    ResolvedGene,
+)
 from src.observability import distribution, increment, trace
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import retrieve_literature, search_recent_pubmed_pmids
@@ -199,6 +206,49 @@ def _format_gene_identity(resolved_gene: ResolvedGene) -> Optional[str]:
     return "; ".join(parts) if parts else None
 
 
+def _oncokb_literature_skipped_annotation(
+    *,
+    gene: str,
+    fusions: List[str],
+    cancer_type_prevalence: Optional[str],
+) -> GeneAnnotation:
+    return GeneAnnotation(
+        gene=gene,
+        fusions=list(dict.fromkeys(fusions)),
+        in_oncokb=True,
+        cancer_associated=True,
+        cancer_association_rationale=(
+            "Gene is present in OncoKB; PubMed retrieval and LLM synthesis were "
+            "skipped by request to save compute."
+        ),
+        cancer_type_prevalence=cancer_type_prevalence,
+        gene_summary=(
+            f"{gene} is present in OncoKB. Literature retrieval was skipped by "
+            "the request, so this result does not include retrieved PMIDs or a "
+            "literature-grounded summary."
+        ),
+        citations=[],
+        retrieval_count=0,
+        retrieved_pmids=[],
+        insufficient_evidence=False,
+        evidence_support_score=0.0,
+        evidence_support_explanation=(
+            "Evidence support score 0.00: literature retrieval was skipped for "
+            "an OncoKB-positive gene, so no PMID-grounded evidence support was calculated."
+        ),
+        quality_flags=[
+            QualityFlag(
+                code="literature_retrieval_skipped",
+                label="Literature retrieval skipped",
+                severity="info",
+                detail="OncoKB membership was confirmed and the request opted out of PubMed retrieval.",
+            )
+        ],
+        cache_status="bypassed",
+        cache_reason="oncokb_literature_skip",
+    )
+
+
 async def _annotate_gene(
     gene: str,
     fusions: List[str],
@@ -209,6 +259,7 @@ async def _annotate_gene(
     local_backend: Optional[str] = None,
     mode: AnnotationMode = "full",
     oncokb_lookup: Optional[OncoKBGeneLookup] = None,
+    skip_literature_for_oncokb: bool = False,
 ) -> GeneAnnotation:
     """Run the full annotation pipeline for a single gene."""
     total_start = perf_counter()
@@ -217,6 +268,7 @@ async def _annotate_gene(
         f"mode:{mode}",
         f"local_backend:{local_backend or 'sdk'}",
         f"tumor_type_present:{bool(tumor_type)}",
+        f"skip_literature_for_oncokb:{skip_literature_for_oncokb}",
     ]
     if unresolvable:
         logger.info("Gene %s is unresolvable (bare Ensembl / unannotated locus)", gene)
@@ -248,12 +300,31 @@ async def _annotate_gene(
             "acgc.mode": mode,
             "acgc.local_backend": local_backend or "sdk",
             "acgc.tumor_type_present": bool(tumor_type),
+            "acgc.skip_literature_for_oncokb": skip_literature_for_oncokb,
         },
     ):
-        # Run DB lookup and literature retrieval concurrently
-        oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
-            _timed("oncokb", timings, check_oncokb_membership(gene, lookup=oncokb_lookup)),
-            _timed(
+        prevalence_start = perf_counter()
+        prevalence = get_msk_genie_prevalence(gene)
+        timings["prevalence"] = _elapsed_ms(prevalence_start)
+        gene_identity = _format_gene_identity(resolved_gene)
+
+        if skip_literature_for_oncokb:
+            oncokb_membership = await _timed(
+                "oncokb",
+                timings,
+                check_oncokb_membership(gene, lookup=oncokb_lookup),
+            )
+            if oncokb_membership is True:
+                annotation = _oncokb_literature_skipped_annotation(
+                    gene=gene,
+                    fusions=fusions,
+                    cancer_type_prevalence=prevalence,
+                )
+                timings["total"] = _elapsed_ms(total_start)
+                annotation.timings_ms = timings
+                distribution("gene.annotation.duration_ms", timings["total"], tags=metric_tags)
+                return annotation
+            records, retrieval_tier = await _timed(
                 "literature_retrieval",
                 timings,
                 retrieve_literature(
@@ -262,13 +333,22 @@ async def _annotate_gene(
                     local_mode=local_mode,
                     local_backend=local_backend,
                 ),
-            ),
-        )
-
-        prevalence_start = perf_counter()
-        prevalence = get_msk_genie_prevalence(gene)
-        timings["prevalence"] = _elapsed_ms(prevalence_start)
-        gene_identity = _format_gene_identity(resolved_gene)
+            )
+        else:
+            # Run DB lookup and literature retrieval concurrently for the normal low-latency path.
+            oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
+                _timed("oncokb", timings, check_oncokb_membership(gene, lookup=oncokb_lookup)),
+                _timed(
+                    "literature_retrieval",
+                    timings,
+                    retrieve_literature(
+                        gene, fusions,
+                        tumor_type=tumor_type,
+                        local_mode=local_mode,
+                        local_backend=local_backend,
+                    ),
+                ),
+            )
 
         # Citation selection pass: filter broad retrieval corpus down to the
         # most directly relevant papers before synthesis to improve precision
@@ -368,6 +448,7 @@ async def run_pipeline(
     local_backend: Optional[str] = None,
     run_store: Any = None,
     force_refresh: bool = False,
+    skip_literature_for_oncokb: bool = False,
     mode: AnnotationMode = "full",
     on_annotation: Optional[AnnotationProgressCallback] = None,
     on_total_known: Optional[AnnotationTotalCallback] = None,
@@ -385,7 +466,11 @@ async def run_pipeline(
     local_mode = local_backend is not None
 
     input_strings, tumor_type_by_input = _normalize_fusion_inputs(fusions)
-    metric_tags = [f"mode:{mode}", f"local_backend:{local_backend or 'sdk'}"]
+    metric_tags = [
+        f"mode:{mode}",
+        f"local_backend:{local_backend or 'sdk'}",
+        f"skip_literature_for_oncokb:{skip_literature_for_oncokb}",
+    ]
     increment("pipeline.runs", tags=metric_tags)
     increment("inputs.submitted", value=len(input_strings), tags=metric_tags)
     logger.info("Pipeline run %s started — %d inputs", run_id, len(input_strings))
@@ -400,6 +485,7 @@ async def run_pipeline(
             "acgc.mode": mode,
             "acgc.local_backend": local_backend or "sdk",
             "acgc.force_refresh": force_refresh,
+            "acgc.skip_literature_for_oncokb": skip_literature_for_oncokb,
         },
     ) as span:
         gene_map = await normalize_fusions(input_strings)
@@ -453,6 +539,7 @@ async def run_pipeline(
                     local_backend=local_backend,
                     mode=mode,
                     oncokb_lookup=oncokb_lookup,
+                    skip_literature_for_oncokb=skip_literature_for_oncokb,
                 )
             if force_refresh and annotation.cache_status == "refreshed":
                 annotation.cache_reason = "force_refresh"
@@ -464,6 +551,7 @@ async def run_pipeline(
                 and settings.gene_cache_enabled
                 and not local_mode
                 and annotation.error is None
+                and annotation.cache_status != "bypassed"
             ):
                 annotation.cached_at = timestamp
                 annotation.last_pubmed_checked_at = timestamp

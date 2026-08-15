@@ -298,13 +298,18 @@ def _record_annotation_request_metrics(
     http_request: Request,
 ) -> None:
     user_id = _request_user_id(http_request)
-    tags = [f"mode:{request.mode}", f"local_backend:{request.local_backend or 'sdk'}"]
+    tags = [
+        f"mode:{request.mode}",
+        f"local_backend:{request.local_backend or 'sdk'}",
+        f"skip_literature_for_oncokb:{request.skip_literature_for_oncokb}",
+    ]
     record_user_seen(user_id, tags=tags)
     tag_current_span(
         {
             "acgc.user.present": bool(user_id),
             "acgc.mode": request.mode,
             "acgc.local_backend": request.local_backend or "sdk",
+            "acgc.skip_literature_for_oncokb": request.skip_literature_for_oncokb,
         }
     )
 
@@ -343,6 +348,7 @@ async def annotate(request: AnnotateRequest, http_request: Request) -> Annotatio
             local_backend=request.local_backend,
             run_store=http_request.app.state.run_store,
             force_refresh=request.force_refresh,
+            skip_literature_for_oncokb=request.skip_literature_for_oncokb,
             mode=request.mode,
         )
     except Exception as e:
@@ -392,6 +398,7 @@ async def create_annotation_job(
                 local_backend=request.local_backend,
                 run_store=http_request.app.state.run_store,
                 force_refresh=request.force_refresh,
+                skip_literature_for_oncokb=request.skip_literature_for_oncokb,
                 mode=request.mode,
                 on_annotation=on_annotation,
                 on_total_known=on_total_known,
@@ -501,6 +508,7 @@ async def annotate_gene(request: GeneAnnotateRequest, http_request: Request) -> 
             local_backend=request.local_backend,
             run_store=http_request.app.state.run_store,
             force_refresh=request.force_refresh,
+            skip_literature_for_oncokb=request.skip_literature_for_oncokb,
             mode=request.mode,
         )
     except Exception as e:

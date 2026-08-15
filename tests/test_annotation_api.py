@@ -34,6 +34,7 @@ def test_single_gene_annotation_endpoint_returns_result_card_json(monkeypatch):
         seen["local_backend"] = local_backend
         seen["run_store"] = run_store
         seen["force_refresh"] = force_refresh
+        seen["skip_literature_for_oncokb"] = kwargs.get("skip_literature_for_oncokb")
         return AnnotationResult(
             run_id="run-1",
             timestamp="2026-07-31T14:00:00+00:00",
@@ -68,6 +69,7 @@ def test_single_gene_annotation_endpoint_returns_result_card_json(monkeypatch):
             "tumor_type": "LUAD",
             "local_backend": "codex",
             "force_refresh": True,
+            "skip_literature_for_oncokb": True,
         },
     )
 
@@ -91,10 +93,12 @@ def test_single_gene_annotation_endpoint_returns_result_card_json(monkeypatch):
     assert seen["local_backend"] == "codex"
     assert seen["run_store"] is run_store
     assert seen["force_refresh"] is True
+    assert seen["skip_literature_for_oncokb"] is True
     assert run_store.saved_runs[0][0] == "run-1"
 
 
 def test_batch_annotation_endpoint_returns_annotation_result_json(monkeypatch):
+    seen = {}
     main.app.state.run_store = FakeRunStore()
 
     async def fake_run_pipeline(
@@ -104,6 +108,7 @@ def test_batch_annotation_endpoint_returns_annotation_result_json(monkeypatch):
         force_refresh=False,
         **kwargs,
     ):
+        seen["skip_literature_for_oncokb"] = kwargs.get("skip_literature_for_oncokb")
         return AnnotationResult(
             run_id="run-2",
             timestamp="2026-07-31T14:00:00+00:00",
@@ -117,7 +122,7 @@ def test_batch_annotation_endpoint_returns_annotation_result_json(monkeypatch):
 
     response = client.post(
         "/v1/annotate",
-        json={"fusions": ["BRAF", "TP53::BRAF"]},
+        json={"fusions": ["BRAF", "TP53::BRAF"], "skip_literature_for_oncokb": True},
     )
 
     assert response.status_code == 200
@@ -126,6 +131,7 @@ def test_batch_annotation_endpoint_returns_annotation_result_json(monkeypatch):
     assert payload["fusions_processed"] == 2
     assert payload["annotations"][0]["gene"] == "BRAF"
     assert payload["annotations"][0]["fusions"] == ["TP53::BRAF"]
+    assert seen["skip_literature_for_oncokb"] is True
 
 
 def test_enrichment_job_endpoint_streams_enriched_annotations(monkeypatch):

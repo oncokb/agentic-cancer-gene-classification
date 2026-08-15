@@ -175,6 +175,17 @@ curl -X POST http://127.0.0.1:8000/v1/annotate \
   -d '{"fusions":["ALK",{"fusion":"EML4::ALK","tumor_type":"LUAD"}],"mode":"core"}'
 ```
 
+To save compute for known curated genes, set `skip_literature_for_oncokb` to
+`true`. Genes confirmed present in OncoKB return a deterministic OncoKB-based
+annotation without PubMed retrieval or LLM synthesis; genes absent from OncoKB
+continue through the normal literature retrieval path.
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/annotate \
+  -H "Content-Type: application/json" \
+  -d '{"fusions":["BRAF","TP53"],"skip_literature_for_oncokb":true}'
+```
+
 For progressive delivery, create an annotation job and poll its status. The
 status response includes completed gene annotations as they finish:
 
@@ -289,6 +300,11 @@ Bare `--local` defaults to `claude-code`.
 Examples:
 
 ```bash
+python -m src.cli \
+  --fusions "ALK" \
+  --skip-literature-for-oncokb \
+  --output results.json
+
 python -m src.cli \
   --fusions "ALK" \
   --local codex \

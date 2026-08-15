@@ -146,6 +146,22 @@ button:disabled {
   font-weight: 600;
 }
 
+.checkbox-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.checkbox-control input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex: 0 0 16px;
+}
+
 .field-hint {
   color: var(--accent);
   font-size: 12px;

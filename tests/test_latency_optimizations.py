@@ -110,6 +110,15 @@ def test_annotate_request_accepts_core_mode():
     assert request.mode == "core"
 
 
+def test_annotate_request_accepts_oncokb_literature_skip():
+    request = AnnotateRequest(
+        fusions=["BRAF"],
+        skip_literature_for_oncokb=True,
+    )
+
+    assert request.skip_literature_for_oncokb is True
+
+
 async def test_selection_skips_llm_above_threshold(monkeypatch):
     async def fail_complete_with_tool(**kwargs):
         raise AssertionError("selection LLM should not be called")
@@ -132,6 +141,7 @@ def test_annotation_job_endpoint_streams_partial_results(monkeypatch):
         local_backend=None,
         run_store=None,
         force_refresh=False,
+        skip_literature_for_oncokb=False,
         mode="full",
         on_annotation=None,
         on_total_known=None,

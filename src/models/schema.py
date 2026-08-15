@@ -184,6 +184,13 @@ class AnnotateRequest(BaseModel):
         default=False,
         description="Bypass stored gene annotations and recompute results.",
     )
+    skip_literature_for_oncokb: bool = Field(
+        default=False,
+        description=(
+            "When true, genes confirmed present in OncoKB return a deterministic "
+            "OncoKB-based annotation without PubMed retrieval or LLM synthesis."
+        ),
+    )
     mode: AnnotationMode = Field(
         default="full",
         description=(
@@ -219,6 +226,13 @@ class GeneAnnotateRequest(BaseModel):
     force_refresh: bool = Field(
         default=False,
         description="Bypass stored gene annotations and recompute results.",
+    )
+    skip_literature_for_oncokb: bool = Field(
+        default=False,
+        description=(
+            "When true, a gene confirmed present in OncoKB returns a deterministic "
+            "OncoKB-based annotation without PubMed retrieval or LLM synthesis."
+        ),
     )
     mode: AnnotationMode = Field(
         default="full",
