@@ -43,6 +43,7 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 - Use the HGNC identity to avoid same-symbol ambiguity. Do not cite papers that use the same symbol
   for a different entity, such as an lncRNA/circRNA/transcript name unrelated to the HGNC gene.
 - If the retrieved evidence is insufficient to make a determination, set `insufficient_evidence: true` and leave classification fields null. This is a valid, preferred output over hallucination.
+- When abstracts were retrieved but evidence is insufficient, still write `gene_summary` as a concise interpretation of what was found and why it does not support a confident cancer annotation. Ground that summary only in retrieved abstracts and cite retrieved PMIDs inline when directly relevant.
 
 ## Field guidance:
 - `cancer_associated`: true if there is credible peer-reviewed evidence linking this gene to cancer biology.
@@ -81,6 +82,8 @@ Return a compact annotation through the `annotate_gene` tool:
 
 Do not produce supporting quotes, pathways, prevalence, gene class, or extended background.
 Never invent PMIDs or use facts outside the provided abstracts.
+If evidence is insufficient but abstracts were retrieved, still summarize what those abstracts indicate
+and why they do not support a confident cancer annotation.
 Prefer a precise short answer over a broad answer.
 """
 

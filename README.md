@@ -271,6 +271,11 @@ Fusion evidence tab. Each exact fusion/tumor lookup is cached in Redis under
 `fusion_evidence:*` using `FUSION_EVIDENCE_CACHE_TTL_SECONDS`, with bounded
 per-job fan-out controlled by `FUSION_EVIDENCE_CONCURRENCY`.
 
+When a gene is marked `insufficient_evidence`, the JSON result still includes
+`retrieved_pmids` and any grounded `gene_summary` produced from the retrieved
+abstracts. The UI surfaces those fields in the No result tab so researchers can
+open the candidate papers and make their own judgment.
+
 To import into Google Sheets, create or open a sheet, use **File > Import**,
 upload `results.csv`, and choose whether to insert it as a new sheet or append it
 to an existing sheet. Treat this CSV as a review artifact; it does not write back
