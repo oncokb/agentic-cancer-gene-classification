@@ -15,7 +15,11 @@ from typing import Dict, List, Optional
 from src.config import settings
 from src.models.schema import AnnotationMode, EvidenceCard, GeneAnnotation, LiteratureRecord, QualityFlag
 from src.pipeline.citation_precision import filter_and_rank_citations
-from src.pipeline.literature import _HIGH_IMPACT_JOURNALS, _publication_evidence_rank
+from src.pipeline.literature import (
+    _HIGH_IMPACT_JOURNALS,
+    _filter_retracted_records,
+    _publication_evidence_rank,
+)
 from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
@@ -312,6 +316,7 @@ def _postprocess_synthesis_output(
     gene_identity: Optional[str],
 ) -> Dict:
     """Apply deterministic citation verification to a raw synthesis tool response."""
+    records = _filter_retracted_records(records)
     if "citations" in tool_input:
         tool_input["citations"] = _verify_citations(
             gene,
@@ -681,6 +686,7 @@ def build_gene_annotation(
     mode: AnnotationMode = "full",
 ) -> GeneAnnotation:
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
+    records = _filter_retracted_records(records)
     citations = synthesis_result.get("citations", [])
     insufficient_evidence = synthesis_result.get("insufficient_evidence", False)
     verified_pmids = set(citations)
