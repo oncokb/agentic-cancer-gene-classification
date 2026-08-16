@@ -118,6 +118,7 @@ const elements = {
   annotateBackendField: document.querySelector("#annotate-backend-field"),
   annotateLocalBackend: document.querySelector("#annotate-local-backend"),
   annotateMode: document.querySelector("#annotate-mode"),
+  skipLiteratureOncokb: document.querySelector("#skip-literature-oncokb"),
 };
 
 const statusFields = [
@@ -623,6 +624,9 @@ async function runAnnotation() {
     const localBackend = elements.annotateLocalBackend.value || undefined;
     const body = { fusions: annotationInputs, mode: elements.annotateMode.value || "full" };
     if (localBackend) body.local_backend = localBackend;
+    if (elements.skipLiteratureOncokb.checked) {
+      body.skip_literature_for_oncokb = true;
+    }
     const response = await fetch("/v1/annotate/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
