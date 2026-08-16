@@ -51,6 +51,7 @@ async def test_run_pipeline_via_local_route_posts_to_annotate(monkeypatch):
         local_backend=None,
         run_store=None,
         force_refresh=False,
+        skip_literature_for_oncokb=False,
         mode="full",
         on_annotation=None,
     ):

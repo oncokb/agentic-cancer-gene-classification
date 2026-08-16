@@ -86,9 +86,10 @@ async def test_run_pipeline_emits_gene_and_input_metrics(monkeypatch):
     result = await orchestrator.run_pipeline(["BRAF::TP53"], mode="core")
 
     assert result.genes_annotated == 2
-    assert ("increment", "pipeline.runs", 1, ["mode:core", "local_backend:sdk"]) in metric_calls
-    assert ("increment", "inputs.submitted", 1, ["mode:core", "local_backend:sdk"]) in metric_calls
-    assert ("increment", "genes.queried", 2, ["mode:core", "local_backend:sdk"]) in metric_calls
+    tags = ["mode:core", "local_backend:sdk", "skip_literature_for_oncokb:False"]
+    assert ("increment", "pipeline.runs", 1, tags) in metric_calls
+    assert ("increment", "inputs.submitted", 1, tags) in metric_calls
+    assert ("increment", "genes.queried", 2, tags) in metric_calls
     assert any(call[1] == "pipeline.duration_ms" for call in metric_calls)
 
 
@@ -100,6 +101,7 @@ def test_annotate_endpoint_records_user_header(monkeypatch):
         local_backend=None,
         run_store=None,
         force_refresh=False,
+        skip_literature_for_oncokb=False,
         mode="full",
     ):
         return AnnotationResult(
@@ -133,5 +135,5 @@ def test_annotate_endpoint_records_user_header(monkeypatch):
     assert response.status_code == 200
     assert seen == {
         "user_id": "curator@example.com",
-        "tags": ["mode:core", "local_backend:sdk"],
+        "tags": ["mode:core", "local_backend:sdk", "skip_literature_for_oncokb:False"],
     }

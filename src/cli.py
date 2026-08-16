@@ -64,6 +64,14 @@ def parse_args() -> argparse.Namespace:
         default="full",
         help="Use 'core' to prioritize the latency-sensitive annotation fields.",
     )
+    parser.add_argument(
+        "--skip-literature-for-oncokb",
+        action="store_true",
+        help=(
+            "For genes confirmed present in OncoKB, skip PubMed retrieval and LLM "
+            "synthesis to save compute."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -86,7 +94,14 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    result = asyncio.run(run_pipeline(fusions, local_backend=args.local, mode=args.mode))
+    result = asyncio.run(
+        run_pipeline(
+            fusions,
+            local_backend=args.local,
+            mode=args.mode,
+            skip_literature_for_oncokb=args.skip_literature_for_oncokb,
+        )
+    )
     output = result.model_dump_json(indent=2)
 
     if args.output_csv:

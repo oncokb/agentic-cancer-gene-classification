@@ -129,6 +129,16 @@ def test_cli_accepts_output_csv(monkeypatch):
     assert args.output_csv == "results.csv"
 
 
+def test_cli_accepts_oncokb_literature_skip(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prog", "--fusions", "BRAF", "--skip-literature-for-oncokb"],
+    )
+    args = parse_args()
+
+    assert args.skip_literature_for_oncokb is True
+
+
 def test_annotate_request_accepts_local_backend():
     request = AnnotateRequest(fusions=["TP53::BRAF"], local_backend="codex")
     assert request.local_backend == "codex"
