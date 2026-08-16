@@ -41,6 +41,7 @@ const state = {
   currentBenchmark: null,
   currentView: "annotate",
   resultsViewMode: "results",
+  fusionEvidenceStatus: null,
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -84,6 +85,7 @@ const elements = {
   resultsWindow: document.querySelector("#results-window"),
   resultsViewTabs: document.querySelector("#results-view-tabs"),
   tabResultsView: document.querySelector("#tab-results-view"),
+  tabFusionEvidenceView: document.querySelector("#tab-fusion-evidence-view"),
   tabNoResultView: document.querySelector("#tab-noresult-view"),
   runButton: document.querySelector("#run-button"),
   runBenchmarkButton: document.querySelector("#run-benchmark-button"),
@@ -263,11 +265,13 @@ function clearQueue() {
 function clearResults() {
   state.currentResult = null;
   state.resultsViewMode = "results";
+  state.fusionEvidenceStatus = null;
   elements.exportJson.disabled = state.currentView === "benchmark" ? !state.currentBenchmark : true;
   elements.exportCsv.disabled = true;
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
   elements.resultsViewTabs.classList.add("hidden");
+  elements.tabFusionEvidenceView.classList.add("hidden");
   rebuildGeneIndex([]);
   renderEmptyState("No results yet", "Enter genes or fusions, then click Run to annotate.");
   clearMessage();
@@ -639,6 +643,11 @@ async function runAnnotation() {
 
     const job = await response.json();
     await pollAnnotationJob(job.status_url);
+    startFusionEvidenceJob(annotationInputs).catch((error) => {
+      state.fusionEvidenceStatus = "failed";
+      setMessage(formatRunError(error.message), "error");
+      if (state.currentResult) renderAnnotationResult(state.currentResult);
+    });
     setMessage("Annotation complete. Review fields before exporting.", "info");
   } catch (error) {
     setMessage(formatRunError(error.message), "error");
@@ -664,6 +673,7 @@ async function pollAnnotationJob(statusUrl) {
       fusions_processed: status.fusions_processed,
       genes_annotated: status.genes_total || status.genes_completed,
       annotations: status.annotations || [],
+      fusion_evidence: state.currentResult?.fusion_evidence || [],
       timings_ms: status.timings_ms || {},
     };
     state.currentResult = partial;
@@ -680,6 +690,82 @@ async function pollAnnotationJob(statusUrl) {
 
     const total = status.genes_total || "?";
     setMessage(`Annotation running: ${status.genes_completed}/${total} genes complete.`, "info");
+    await sleep(1500);
+  }
+}
+
+function isFusionInputValue(value) {
+  return /::|--|\//.test(String(value || ""));
+}
+
+function fusionEvidenceInputs(inputs) {
+  const seen = new Set();
+  const fusionInputs = [];
+  (inputs || []).forEach((item) => {
+    if (!item?.fusion || !isFusionInputValue(item.fusion)) return;
+    const tumorType = String(item.tumor_type || "").trim().toLowerCase();
+    const key = `${item.fusion}||${tumorType}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    fusionInputs.push(item);
+  });
+  return fusionInputs;
+}
+
+async function startFusionEvidenceJob(inputs) {
+  const fusions = fusionEvidenceInputs(inputs);
+  if (!fusions.length || !state.currentResult) return;
+
+  state.fusionEvidenceStatus = "running";
+  state.currentResult = {
+    ...state.currentResult,
+    fusion_evidence: state.currentResult.fusion_evidence || [],
+  };
+  renderAnnotationResult(state.currentResult);
+
+  const response = await fetch("/v1/fusion-evidence/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      fusions,
+      mode: elements.annotateMode.value || "full",
+    }),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || response.statusText || "Fusion evidence job failed");
+  }
+
+  const job = await response.json();
+  await pollFusionEvidenceJob(job.status_url);
+}
+
+async function pollFusionEvidenceJob(statusUrl) {
+  while (true) {
+    const response = await fetch(statusUrl);
+    if (!response.ok) {
+      throw new Error(response.statusText || "Unable to load fusion evidence job status");
+    }
+    const status = await response.json();
+    if (status.status === "failed") {
+      throw new Error(status.error || "Fusion evidence job failed");
+    }
+
+    state.currentResult = {
+      ...state.currentResult,
+      fusion_evidence: status.fusion_evidence || [],
+    };
+    renderAnnotationResult(state.currentResult);
+
+    if (status.status === "complete") {
+      state.fusionEvidenceStatus = "complete";
+      renderAnnotationResult(state.currentResult);
+      setMessage("Fusion evidence retrieval complete.", "info");
+      return status.fusion_evidence || [];
+    }
+
+    const total = status.fusions_total || "?";
+    setMessage(`Fusion evidence running: ${status.fusions_completed}/${total} fusions complete.`, "info");
     await sleep(1500);
   }
 }
@@ -1019,18 +1105,21 @@ function switchResultsView(mode) {
   if (state.resultsViewMode === mode || !state.currentResult) return;
   state.resultsViewMode = mode;
   elements.tabResultsView.classList.toggle("active", mode === "results");
+  elements.tabFusionEvidenceView.classList.toggle("active", mode === "fusion");
   elements.tabNoResultView.classList.toggle("active", mode === "noresult");
 
   const allAnnotations = state.currentResult.annotations || [];
   const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
   const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
-  applyResultsViewMode(visibleAnnotations, hiddenAnnotations);
+  applyResultsViewMode(visibleAnnotations, hiddenAnnotations, state.currentResult.fusion_evidence || []);
 }
 
 function renderAnnotationResult(result) {
   const allAnnotations = result.annotations || [];
   const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
   const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
+  const fusionEvidence = result.fusion_evidence || [];
+  const showFusionTab = fusionEvidence.length > 0 || state.fusionEvidenceStatus === "running";
   elements.exportCsv.disabled = !allAnnotations.length;
   elements.exportJson.disabled = !allAnnotations.length;
   elements.clearResults.disabled = false;
@@ -1043,14 +1132,24 @@ function renderAnnotationResult(result) {
     `${inputCount} input${inputCount === 1 ? "" : "s"}.`;
 
   elements.tabResultsView.textContent = `Results (${visibleAnnotations.length})`;
+  elements.tabFusionEvidenceView.textContent =
+    state.fusionEvidenceStatus === "running"
+      ? `Fusion evidence (${fusionEvidence.length}...)`
+      : `Fusion evidence (${fusionEvidence.length})`;
   elements.tabNoResultView.textContent = `No result (${hiddenAnnotations.length})`;
-  elements.resultsViewTabs.classList.toggle("hidden", hiddenAnnotations.length === 0);
+  elements.tabFusionEvidenceView.classList.toggle("hidden", !showFusionTab);
+  elements.resultsViewTabs.classList.toggle("hidden", hiddenAnnotations.length === 0 && !showFusionTab);
 
-  // Default to whichever tab actually has something to show — a fresh run
-  // with nothing but hidden genes should land straight on "No result"
-  // instead of an empty "Results" tab the user has to switch away from.
-  state.resultsViewMode = visibleAnnotations.length > 0 ? "results" : "noresult";
+  const validModes = new Set(["results"]);
+  if (showFusionTab) validModes.add("fusion");
+  if (hiddenAnnotations.length) validModes.add("noresult");
+  if (!validModes.has(state.resultsViewMode)) {
+    state.resultsViewMode = visibleAnnotations.length > 0
+      ? "results"
+      : (showFusionTab ? "fusion" : "noresult");
+  }
   elements.tabResultsView.classList.toggle("active", state.resultsViewMode === "results");
+  elements.tabFusionEvidenceView.classList.toggle("active", state.resultsViewMode === "fusion");
   elements.tabNoResultView.classList.toggle("active", state.resultsViewMode === "noresult");
 
   if (!allAnnotations.length) {
@@ -1061,12 +1160,16 @@ function renderAnnotationResult(result) {
     return;
   }
 
-  applyResultsViewMode(visibleAnnotations, hiddenAnnotations);
+  applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvidence);
 }
 
-function applyResultsViewMode(visibleAnnotations, hiddenAnnotations) {
+function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvidence) {
   if (state.resultsViewMode === "noresult") {
     renderNoResultView(hiddenAnnotations);
+    return;
+  }
+  if (state.resultsViewMode === "fusion") {
+    renderFusionEvidenceView(fusionEvidence);
     return;
   }
 
@@ -1192,6 +1295,94 @@ function renderNoResultView(hiddenAnnotations) {
 
   elements.resultsWindow.replaceChildren(list);
   rebuildGeneIndex(hiddenAnnotations);
+}
+
+function renderFusionEvidenceView(fusionEvidence) {
+  const items = fusionEvidence || [];
+  if (!items.length) {
+    renderEmptyState(
+      state.fusionEvidenceStatus === "running" ? "Fusion evidence loading" : "No fusion evidence",
+      state.fusionEvidenceStatus === "running"
+        ? "Exact fusion-pair PubMed retrieval is running in the background."
+        : "No fusion-level evidence has been retrieved for this run.",
+    );
+    return;
+  }
+
+  const list = document.createElement("div");
+  list.className = "annotation-list fusion-evidence-list";
+
+  items.forEach((item) => {
+    const card = document.createElement("article");
+    card.className = "annotation-card fusion-evidence-card";
+    card.id = `fusion-${cssSafeId(item.fusion)}`;
+    const pmids = item.pmids || [];
+    const cards = item.evidence_cards || [];
+    card.innerHTML = `
+      <header>
+        <div class="annotation-heading">
+          <h3>${escapeHtml(item.fusion)}</h3>
+          <div class="subtle">${escapeHtml(item.tumor_type || "Any tumor type")}</div>
+        </div>
+        <div class="annotation-card-meta">
+          <span class="review-badge ${item.well_supported ? "high" : "low"}">
+            ${item.well_supported ? "Well supported" : "Exploratory"}
+          </span>
+          <span class="status-pill">
+            ${item.retrieved_count || pmids.length} PMID${(item.retrieved_count || pmids.length) === 1 ? "" : "s"}
+          </span>
+        </div>
+      </header>
+      <div class="field-row field-row-highlight">
+        <span class="field-row-label">Fusion interpretation</span>
+        <div class="field-row-value">${escapeHtml(item.interpretation || "No interpretation available.")}</div>
+      </div>
+      <div class="supporting-evidence fusion-supporting-evidence"></div>
+    `;
+
+    const evidence = card.querySelector(".fusion-supporting-evidence");
+    if (pmids.length) {
+      const links = document.createElement("div");
+      links.className = "citation-links";
+      links.innerHTML = '<span class="field-label">Retrieved PMIDs</span>';
+      const linkRow = document.createElement("div");
+      linkRow.className = "citation-link-list";
+      pmids.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
+      links.appendChild(linkRow);
+      evidence.appendChild(links);
+    }
+
+    if (cards.length) {
+      const cardList = document.createElement("div");
+      cardList.className = "evidence-card-list";
+      cards.forEach((evidenceCard) => {
+        const itemCard = document.createElement("article");
+        itemCard.className = "evidence-card";
+        const evidenceType = String(evidenceCard.evidence_type || "fusion").replace(/_/g, " ");
+        itemCard.innerHTML = `
+          <div class="evidence-card-topline">
+            <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(evidenceCard.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(evidenceCard.pmid)}</a>
+            <span class="review-badge context">${escapeHtml(evidenceType)}</span>
+          </div>
+          <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
+          <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
+          ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
+          ${evidenceCard.quote ? `<blockquote>${escapeHtml(evidenceCard.quote)}</blockquote>` : ""}
+        `;
+        cardList.appendChild(itemCard);
+      });
+      evidence.appendChild(cardList);
+    }
+
+    list.appendChild(card);
+  });
+
+  elements.resultsWindow.replaceChildren(list);
+  rebuildGeneIndex([]);
+}
+
+function cssSafeId(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 
 function makePubMedLink(pmid) {
@@ -1866,6 +2057,7 @@ function bindEvents() {
   elements.tabBatch.addEventListener("click", () => switchMode("batch"));
 
   elements.tabResultsView.addEventListener("click", () => switchResultsView("results"));
+  elements.tabFusionEvidenceView.addEventListener("click", () => switchResultsView("fusion"));
   elements.tabNoResultView.addEventListener("click", () => switchResultsView("noresult"));
 
   elements.openFeedback.addEventListener("click", () => showFeedbackModal());
