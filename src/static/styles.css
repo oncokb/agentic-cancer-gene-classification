@@ -462,6 +462,14 @@ textarea {
   font-size: 13px;
 }
 
+.fusion-evidence-list .field-row-highlight {
+  margin-bottom: 12px;
+}
+
+.fusion-supporting-evidence {
+  margin-top: 0;
+}
+
 .annotation-card-meta {
   display: flex;
   flex-direction: row;

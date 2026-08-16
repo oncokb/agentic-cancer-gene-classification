@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     aws_profile: str = ""
     acgc_dev_mode: bool = False
     pubmed_max_results: int = 50
+    fusion_evidence_max_results: int = 20
+    fusion_evidence_cache_ttl_seconds: int = 604800
+    fusion_evidence_concurrency: int = 2
     min_papers_for_strong_association: int = 4
     max_papers_for_synthesis: int = 8
     max_citations_per_annotation: int = 4
