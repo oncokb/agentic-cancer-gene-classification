@@ -162,6 +162,10 @@ button:disabled {
   flex: 0 0 16px;
 }
 
+.checkbox-field {
+  grid-column: 1 / -1;
+}
+
 .field-hint {
   color: var(--accent);
   font-size: 12px;
