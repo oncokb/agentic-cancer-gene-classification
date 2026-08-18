@@ -25,7 +25,11 @@ from src.models.schema import (
 )
 from src.observability import distribution, increment, trace
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
-from src.pipeline.literature import retrieve_literature, search_recent_pubmed_pmids
+from src.pipeline.literature import (
+    rank_literature_for_synthesis,
+    retrieve_literature,
+    search_recent_pubmed_pmids,
+)
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
 from src.pipeline.selection import select_papers_for_synthesis
@@ -350,6 +354,14 @@ async def _annotate_gene(
                 ),
             )
 
+        # Composite pre-ranking: sort the deduplicated retrieval pool so the
+        # citation selection pass sees the strongest candidates first, and so
+        # its algorithmic fallback (on LLM failure) is top-N by this heuristic
+        # rather than recency alone.
+        ranked_records, retrieval_scores = rank_literature_for_synthesis(
+            records, gene, fusions, settings.max_papers_for_synthesis,
+        )
+
         # Citation selection pass: filter broad retrieval corpus down to the
         # most directly relevant papers before synthesis to improve precision
         # without shrinking the recall pool.
@@ -358,7 +370,7 @@ async def _annotate_gene(
             timings,
             select_papers_for_synthesis(
                 gene,
-                records,
+                ranked_records,
                 settings.max_papers_for_synthesis,
                 gene_identity=gene_identity,
                 local_mode=local_mode,
@@ -414,6 +426,7 @@ async def _annotate_gene(
             synthesis_result=synthesis,
             retrieval_tier=retrieval_tier,
             mode=mode,
+            retrieval_ranking=retrieval_scores,
         )
         timings["total"] = _elapsed_ms(total_start)
         annotation.timings_ms = timings

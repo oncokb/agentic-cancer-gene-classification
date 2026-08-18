@@ -16,7 +16,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Union
 from src.config import settings
 from src.models.schema import GeneAnnotation
 from src.pipeline.db_lookups import check_oncokb_membership, get_msk_genie_prevalence
-from src.pipeline.literature import retrieve_literature
+from src.pipeline.literature import rank_literature_for_synthesis, retrieve_literature
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
@@ -82,10 +82,14 @@ async def enrich_gene_annotation(
     prevalence = get_msk_genie_prevalence(annotation.gene)
     timings["prevalence"] = _elapsed_ms(prevalence_start)
 
+    ranked_records, retrieval_scores = rank_literature_for_synthesis(
+        records, annotation.gene, annotation.fusions, settings.max_papers_for_synthesis,
+    )
+
     selection_start = perf_counter()
     selected_records = await select_papers_for_synthesis(
         annotation.gene,
-        records,
+        ranked_records,
         settings.max_papers_for_synthesis,
         local_mode=local_mode,
         local_backend=local_backend,
@@ -115,6 +119,7 @@ async def enrich_gene_annotation(
         synthesis_result=synthesis,
         retrieval_tier=retrieval_tier,
         mode="full",
+        retrieval_ranking=retrieval_scores,
     )
     enriched = _merge_enriched_annotation(annotation, enriched)
     timings["total"] = _elapsed_ms(total_start)

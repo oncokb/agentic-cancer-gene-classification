@@ -47,6 +47,40 @@ class Settings(BaseSettings):
     llm_concurrency: int = 2
     pubmed_staged_retrieval: bool = True
     selection_llm_threshold: int = 24
+
+    # Composite pre-ranking heuristic, applied to the deduplicated retrieval pool
+    # before the Haiku citation selection pass. Four signals combined into a
+    # weighted average (weights renormalized per-paper over whichever signals
+    # actually apply — e.g. fusion co-occurrence is skipped for standalone genes).
+    citation_score_query_tier_weight: float = 0.30
+    citation_score_fusion_cooccurrence_weight: float = 0.20
+    citation_score_recency_weight: float = 0.15
+    citation_score_publication_type_weight: float = 0.35
+    # Recency decays as 0.5 ** (age_years / half_life) — larger relaxes the decay
+    # for genes whose key literature skews older.
+    citation_score_recency_half_life_years: float = 8.0
+    # How many extra review-leaning papers (from the context-weighted ranking) to
+    # merge into the citation-ranked candidate pool as background-framing support.
+    citation_score_review_supplement_count: int = 2
+
+    # Publication-type weight tables. "citation" favors original research, for the
+    # candidate pool synthesis draws verified PMID citations from. "context" favors
+    # reviews/meta-analyses, for the small supplement used only for summary framing.
+    citation_score_pubtype_trial_weight: float = 1.0
+    citation_score_pubtype_comparative_weight: float = 0.85
+    citation_score_pubtype_original_research_weight: float = 0.8
+    citation_score_pubtype_meta_analysis_weight: float = 0.6
+    citation_score_pubtype_case_report_weight: float = 0.5
+    citation_score_pubtype_review_weight: float = 0.4
+    citation_score_pubtype_editorial_weight: float = 0.2
+
+    context_score_pubtype_review_weight: float = 1.0
+    context_score_pubtype_meta_analysis_weight: float = 0.9
+    context_score_pubtype_trial_weight: float = 0.6
+    context_score_pubtype_comparative_weight: float = 0.6
+    context_score_pubtype_original_research_weight: float = 0.5
+    context_score_pubtype_case_report_weight: float = 0.3
+    context_score_pubtype_editorial_weight: float = 0.15
     annotation_job_ttl_seconds: int = 3600
 
     redis_url: str = "redis://localhost:6379/0"

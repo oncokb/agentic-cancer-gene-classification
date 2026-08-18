@@ -13,7 +13,14 @@ import logging
 from typing import Dict, List, Optional
 
 from src.config import settings
-from src.models.schema import AnnotationMode, EvidenceCard, GeneAnnotation, LiteratureRecord, QualityFlag
+from src.models.schema import (
+    AnnotationMode,
+    EvidenceCard,
+    GeneAnnotation,
+    LiteraturePaperScore,
+    LiteratureRecord,
+    QualityFlag,
+)
 from src.pipeline.citation_precision import filter_and_rank_citations
 from src.pipeline.literature import (
     _HIGH_IMPACT_JOURNALS,
@@ -473,6 +480,7 @@ def _quality_flags(
     evidence_support_score: float,
     retrieval_tier: int,
     synthesis_result: Dict,
+    retrieval_ranking: Optional[List[LiteraturePaperScore]] = None,
 ) -> List[QualityFlag]:
     flags: List[QualityFlag] = []
     if not citations:
@@ -500,6 +508,19 @@ def _quality_flags(
                 label="Tier 2 retrieval",
                 severity="info",
                 detail="Sparse Tier 1 results required expanded agentic retrieval.",
+            )
+        )
+    if retrieval_ranking:
+        top = max(retrieval_ranking, key=lambda score: score.citation_composite_score)
+        flags.append(
+            QualityFlag(
+                code="literature_preranked",
+                label="Pre-ranked literature",
+                severity="info",
+                detail=(
+                    f"Retrieval pool pre-ranked by composite heuristic before selection "
+                    f"(top score {top.citation_composite_score:.2f}, PMID {top.pmid})."
+                ),
             )
         )
     if synthesis_result.get("_synthesis_escalated"):
@@ -687,6 +708,7 @@ def build_gene_annotation(
     synthesis_result: Dict,
     retrieval_tier: int = 1,
     mode: AnnotationMode = "full",
+    retrieval_ranking: Optional[List[LiteraturePaperScore]] = None,
 ) -> GeneAnnotation:
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
     records = _filter_retracted_records(records)
@@ -718,6 +740,7 @@ def build_gene_annotation(
         evidence_support_score=evidence_support_score,
         retrieval_tier=retrieval_tier,
         synthesis_result=synthesis_result,
+        retrieval_ranking=retrieval_ranking,
     )
     return GeneAnnotation(
         gene=gene,
@@ -735,6 +758,7 @@ def build_gene_annotation(
         quality_flags=quality_flags,
         retrieval_count=len(records),
         retrieved_pmids=[record.pmid for record in records],
+        retrieval_ranking=retrieval_ranking or [],
         insufficient_evidence=insufficient_evidence,
         evidence_support_score=evidence_support_score,
         evidence_support_explanation=evidence_support_explanation,
