@@ -58,6 +58,40 @@ class FusionEvidenceResult(BaseModel):
     evidence_cards: List[FusionEvidenceCard] = Field(default_factory=list)
 
 
+class FusionPartnerEvidenceRequest(BaseModel):
+    """On-demand lookup: does `gene` have precedent as an oncogenic fusion partner
+    elsewhere? Not the same question as FusionEvidenceResult, which checks an exact
+    fusion pair — this checks a single partner gene against any reported fusion."""
+
+    gene: str = Field(..., description="Partner gene symbol to check for oncogenic fusion precedent")
+    tumor_type: Optional[str] = Field(
+        default=None,
+        description="Tumor type context. When set, the default search is scoped to this tumor type.",
+    )
+    agnostic: bool = Field(
+        default=False,
+        description=(
+            "Broaden the search to all tumor types instead of scoping to `tumor_type`. Intended as a "
+            "follow-up call after reviewing the tumor-type-scoped result."
+        ),
+    )
+    exclude_pmids: List[str] = Field(
+        default_factory=list,
+        description="PMIDs already surfaced by a prior call to exclude, so results show only new evidence.",
+    )
+
+
+class FusionPartnerEvidenceResult(BaseModel):
+    gene: str
+    tumor_type: Optional[str] = None
+    scope: Literal["tumor_type_scoped", "all_tumor_types"] = "all_tumor_types"
+    has_precedent: bool = False
+    retrieved_count: int = 0
+    pmids: List[str] = Field(default_factory=list)
+    interpretation: str = ""
+    evidence_cards: List[EvidenceCard] = Field(default_factory=list)
+
+
 class QualityFlag(BaseModel):
     code: str
     label: str

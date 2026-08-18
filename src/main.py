@@ -35,6 +35,8 @@ from src.models.schema import (
     FeedbackResponse,
     FusionEvidenceResult,
     FusionInput,
+    FusionPartnerEvidenceRequest,
+    FusionPartnerEvidenceResult,
     FusionPositionContext,
     GeneAnnotateRequest,
     GeneAnnotation,
@@ -44,7 +46,7 @@ from src.observability import record_user_seen, tag_current_span
 from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
-from src.pipeline.literature import retrieve_fusion_evidence
+from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
 from src.pipeline.normalization import is_fusion_input
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.run_store import RunStore
@@ -688,6 +690,30 @@ async def fusion_context(request: FusionInput) -> FusionContextResponse:
         return FusionContextResponse(available=True, context=exc.context)
 
     return FusionContextResponse(available=True, context=FusionPositionContext(**cached))
+
+
+@app.post("/v1/fusion-partner-evidence", response_model=FusionPartnerEvidenceResult)
+async def fusion_partner_evidence(request: FusionPartnerEvidenceRequest) -> FusionPartnerEvidenceResult:
+    """
+    On-demand check for whether a fusion partner gene has precedent as an oncogenic
+    fusion partner elsewhere — a different question from /v1/fusion-evidence/jobs,
+    which checks the exact fusion pair. Deliberately NOT part of POST /v1/annotate or
+    the background fusion-evidence job: this only runs when a curator explicitly
+    expands the "Check fusion partner precedent" disclosure on a gene that came back
+    insufficient_evidence, so it never adds cost to the core annotation run.
+    """
+    gene = request.gene.strip().upper()
+    if not gene:
+        raise HTTPException(status_code=400, detail="gene is required")
+    tumor_type = request.tumor_type.strip() if request.tumor_type else None
+    # No tumor type to scope by — agnostic is the only meaningful search.
+    agnostic = request.agnostic or not tumor_type
+    return await retrieve_fusion_partner_evidence(
+        gene,
+        tumor_type=tumor_type,
+        agnostic=agnostic,
+        exclude_pmids=set(request.exclude_pmids),
+    )
 
 
 @app.post("/v1/feedback", response_model=FeedbackResponse, status_code=201)

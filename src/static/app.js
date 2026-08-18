@@ -55,6 +55,10 @@ const state = {
   // so re-expanding a disclosure (or expanding the other partner gene's
   // card for the same fusion) never re-fetches.
   fusionContextByFusion: {},
+  // In-flight/completed /v1/fusion-partner-evidence lookups, keyed by
+  // gene|tumorType|agnostic, so re-expanding a "Check fusion partner
+  // precedent" disclosure never re-fetches.
+  fusionPartnerEvidenceByKey: {},
 };
 
 const elements = {
@@ -1294,6 +1298,10 @@ function renderNoResultView(hiddenAnnotations) {
     }
     const evidence = renderSupportingEvidence(annotation);
     if (evidence) card.appendChild(evidence);
+    if (!isError) {
+      const partnerPrecedent = renderFusionPartnerPrecedent(annotation);
+      if (partnerPrecedent) card.appendChild(partnerPrecedent);
+    }
     list.appendChild(card);
   });
 
@@ -1708,6 +1716,200 @@ function renderDomainsAndTreatments(annotation) {
   });
 
   return details;
+}
+
+// ---------------------------------------------------------------------------
+// Fusion partner precedent (lazy — only runs when a curator expands it for a
+// gene with insufficient_evidence; never fired automatically)
+// ---------------------------------------------------------------------------
+
+function splitFusionGenes(fusion) {
+  for (const sep of ["::", "--", "/"]) {
+    if (fusion.includes(sep)) {
+      return fusion.split(sep).map((g) => g.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function fusionPartnerGenes(annotation) {
+  const seen = new Set();
+  const partners = [];
+  (annotation.fusions || []).forEach((fusion) => {
+    splitFusionGenes(fusion).forEach((gene) => {
+      const normalized = gene.trim().toUpperCase();
+      if (!normalized || normalized === annotation.gene || seen.has(normalized)) return;
+      seen.add(normalized);
+      partners.push(normalized);
+    });
+  });
+  return partners;
+}
+
+function tumorTypeForAnnotation(annotation) {
+  for (const fusion of annotation.fusions || []) {
+    const match = state.lastInputsByFusion[fusion];
+    if (match && match.tumor_type) return match.tumor_type;
+  }
+  return null;
+}
+
+function fetchFusionPartnerEvidence(gene, { tumorType, agnostic, excludePmids } = {}) {
+  const key = `${gene}|${tumorType || ""}|${agnostic ? "1" : "0"}`;
+  if (state.fusionPartnerEvidenceByKey[key]) {
+    return state.fusionPartnerEvidenceByKey[key];
+  }
+  const payload = { gene };
+  if (tumorType) payload.tumor_type = tumorType;
+  if (agnostic) payload.agnostic = true;
+  if (excludePmids && excludePmids.length) payload.exclude_pmids = excludePmids;
+
+  const promise = fetch("/v1/fusion-partner-evidence", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then((response) => {
+      if (!response.ok) throw new Error(response.statusText || "Request failed");
+      return response.json();
+    })
+    .catch((error) => {
+      delete state.fusionPartnerEvidenceByKey[key]; // allow retry
+      throw error;
+    });
+  state.fusionPartnerEvidenceByKey[key] = promise;
+  return promise;
+}
+
+function renderFusionPartnerResultBody(container, data) {
+  container.replaceChildren();
+
+  const scopeNote =
+    data.scope === "tumor_type_scoped" && data.tumor_type
+      ? ` in ${data.tumor_type}`
+      : data.scope === "all_tumor_types"
+        ? " across other tumor types"
+        : "";
+
+  const summary = document.createElement("div");
+  summary.className = "subtle";
+  summary.textContent = data.has_precedent
+    ? `${data.retrieved_count} paper${data.retrieved_count === 1 ? "" : "s"} found discussing ` +
+      `${data.gene} in oncogenic fusions${scopeNote}.`
+    : `No oncogenic fusion literature found for ${data.gene}${scopeNote}.`;
+  container.appendChild(summary);
+
+  if (data.pmids?.length) {
+    const linkRow = document.createElement("div");
+    linkRow.className = "citation-link-list";
+    data.pmids.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
+    container.appendChild(linkRow);
+  }
+
+  if (data.evidence_cards?.length) {
+    const cardList = document.createElement("div");
+    cardList.className = "evidence-card-list";
+    data.evidence_cards.forEach((evidenceCard) => {
+      const itemCard = document.createElement("article");
+      itemCard.className = "evidence-card";
+      const evidenceType = String(evidenceCard.evidence_type || "fusion").replace(/_/g, " ");
+      itemCard.innerHTML = `
+        <div class="evidence-card-topline">
+          <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(evidenceCard.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(evidenceCard.pmid)}</a>
+          <span class="review-badge context">${escapeHtml(evidenceType)}</span>
+        </div>
+        <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
+        <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
+        ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
+        ${evidenceCard.quote ? `<blockquote>${escapeHtml(evidenceCard.quote)}</blockquote>` : ""}
+      `;
+      cardList.appendChild(itemCard);
+    });
+    container.appendChild(cardList);
+  }
+}
+
+function appendFusionPartnerAgnosticFollowUp(body, gene, tumorType, seenPmids) {
+  const followUp = document.createElement("div");
+  followUp.className = "fusion-partner-followup";
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "text-button";
+  button.textContent = "Explore all tumor types for extra evidence";
+
+  const resultBox = document.createElement("div");
+
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    resultBox.replaceChildren(renderLoadingState(`Searching all tumor types for ${gene}`));
+    followUp.appendChild(resultBox);
+    fetchFusionPartnerEvidence(gene, { tumorType, agnostic: true, excludePmids: seenPmids })
+      .then((data) => {
+        renderFusionPartnerResultBody(resultBox, data);
+        button.remove();
+      })
+      .catch((error) => {
+        resultBox.textContent = `Unable to load fusion precedent for ${gene}.`;
+        setMessage(formatRunError(error.message), "error");
+        button.disabled = false;
+      });
+  });
+
+  followUp.appendChild(button);
+  body.appendChild(followUp);
+}
+
+function renderFusionPartnerCheck(gene, tumorType) {
+  const details = document.createElement("details");
+  details.className = "field-row lazy-field-row";
+
+  const summary = document.createElement("summary");
+  summary.className = "lazy-field-summary";
+  summary.innerHTML = tumorType
+    ? `<span class="field-row-label">Check ${escapeHtml(gene)} for ${escapeHtml(tumorType)} fusion precedent</span>`
+    : `<span class="field-row-label">Check ${escapeHtml(gene)} for fusion precedent</span>`;
+  details.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "field-row-value lazy-field-value";
+  body.textContent = `Expand to search PubMed for ${gene} fusion precedent.`;
+  details.appendChild(body);
+
+  let loaded = false;
+  details.addEventListener("toggle", () => {
+    if (!details.open || loaded) return;
+    loaded = true;
+    body.replaceChildren(renderLoadingState(`Searching PubMed for ${gene} fusion precedent`));
+    fetchFusionPartnerEvidence(gene, { tumorType, agnostic: !tumorType })
+      .then((data) => {
+        body.replaceChildren();
+        renderFusionPartnerResultBody(body, data);
+        if (tumorType) appendFusionPartnerAgnosticFollowUp(body, gene, tumorType, data.pmids || []);
+      })
+      .catch((error) => {
+        body.textContent = `Unable to load fusion precedent for ${gene}.`;
+        setMessage(formatRunError(error.message), "error");
+        loaded = false; // allow a retry on next expand
+      });
+  });
+
+  return details;
+}
+
+// Only for genes that came back insufficient_evidence — prioritizes the
+// tumor type already in play for this case (if known), with a subsequent
+// tumor-type-agnostic search offered as a follow-up rather than run by
+// default, since it's an extra round of PubMed calls per gene.
+function renderFusionPartnerPrecedent(annotation) {
+  const partners = fusionPartnerGenes(annotation);
+  if (!partners.length) return null;
+
+  const tumorType = tumorTypeForAnnotation(annotation);
+  const wrapper = document.createElement("div");
+  wrapper.className = "fusion-partner-precedent";
+  partners.forEach((partner) => wrapper.appendChild(renderFusionPartnerCheck(partner, tumorType)));
+  return wrapper;
 }
 
 function renderBenchmarkResult(result) {
