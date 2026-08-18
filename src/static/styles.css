@@ -1277,6 +1277,17 @@ details[open] > .retrieval-summary::after {
   margin-top: 5px;
 }
 
+.fusion-partner-precedent {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.fusion-partner-followup {
+  margin-top: 10px;
+}
+
 .citation-link {
   display: inline-flex;
   align-items: center;

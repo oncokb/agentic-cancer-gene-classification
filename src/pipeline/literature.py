@@ -29,7 +29,13 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
-from src.models.schema import FusionEvidenceCard, FusionEvidenceResult, LiteratureRecord
+from src.models.schema import (
+    EvidenceCard,
+    FusionEvidenceCard,
+    FusionEvidenceResult,
+    FusionPartnerEvidenceResult,
+    LiteratureRecord,
+)
 from src.pipeline.normalization import split_fusion
 from src.pipeline.cache import cached_call
 from src.pipeline.llm_client import complete_with_tool, make_async_sdk_client, resolve_sdk_model
@@ -371,6 +377,153 @@ async def _retrieve_fusion_evidence_uncached(
             well_supported=well_supported,
         ),
         evidence_cards=_build_fusion_evidence_cards(fusion, records),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fusion partner precedent lookup (on-demand, per gene)
+#
+# Different question from retrieve_fusion_evidence above: that checks an exact
+# fusion pair (e.g. "EML4::ALK"). This checks whether a single partner gene has
+# precedent in ANY reported oncogenic fusion — used as a curator-triggered
+# follow-up when a gene comes back insufficient_evidence, to see whether a
+# fusion partner has known fusion precedent even though this exact pair doesn't
+# have direct literature yet.
+# ---------------------------------------------------------------------------
+
+def _fusion_partner_precedent_queries(
+    gene: str, tumor_type: Optional[str], agnostic: bool
+) -> List[str]:
+    """Queries biased toward 'has this gene been reported in oncogenic fusions', not
+    general cancer relevance.
+
+    When a tumor_type is supplied and agnostic=False, queries are scoped to that tumor
+    type only — the prioritized first pass, most relevant to the case at hand. Pass
+    agnostic=True (typically as a follow-up once the scoped pass has been reviewed) to
+    broaden to any tumor type.
+    """
+    fusion_terms = '(fusion OR "gene fusion" OR chimeric OR rearrangement OR translocation)'
+    if tumor_type and not agnostic:
+        tt = _tumor_type_query_fragment(tumor_type)
+        return [
+            f'"{gene}" AND {fusion_terms} AND {tt}',
+            f'"{gene}"[Gene Name] AND {fusion_terms} AND {tt}',
+        ]
+    return [
+        f'"{gene}"[Gene Name] AND {fusion_terms} AND cancer[MeSH Terms]',
+        f'"{gene}" AND {fusion_terms} AND (cancer OR tumor OR oncogenic OR malignancy)',
+    ]
+
+
+def _fusion_partner_evidence_cards(records: List[LiteratureRecord], limit: int = 5) -> List[EvidenceCard]:
+    cards: List[EvidenceCard] = []
+    for record in records[:limit]:
+        evidence_type = _fusion_evidence_type(record)
+        selected_reason = (
+            f"Matched a fusion-precedent PubMed query as {evidence_type.replace('_', ' ')} evidence."
+        )
+        if record.journal in _HIGH_IMPACT_JOURNALS:
+            selected_reason += " High-impact journal signal."
+        cards.append(
+            EvidenceCard(
+                pmid=record.pmid,
+                title=record.title,
+                journal=record.journal,
+                evidence_type=evidence_type,
+                selected_reason=selected_reason,
+                quote=_record_quote(record),
+            )
+        )
+    return cards
+
+
+def _fusion_partner_interpretation(
+    gene: str, tumor_type: Optional[str], agnostic: bool, records: List[LiteratureRecord]
+) -> str:
+    if tumor_type and not agnostic:
+        scope_note = f" in {tumor_type}"
+    elif agnostic:
+        scope_note = " across other tumor types"
+    else:
+        scope_note = ""
+    if records:
+        return (
+            f"{gene} has {len(records)} non-retracted PubMed record(s) discussing oncogenic "
+            f"fusions{scope_note}, suggesting precedent as a fusion partner."
+        )
+    return f"No non-retracted PubMed records were found for {gene} in oncogenic fusions{scope_note}."
+
+
+async def _retrieve_fusion_partner_records(
+    gene: str,
+    tumor_type: Optional[str],
+    agnostic: bool,
+    max_results: int,
+) -> List[LiteratureRecord]:
+    """Cached, Tier-1-only retrieval — no Tier 2 agentic fallback, since this is an
+    optional curator-triggered follow-up rather than part of the core annotation."""
+    cache_key = "fusion_partner_evidence:" + json.dumps(
+        {
+            "gene": gene.strip().upper(),
+            "tumor_type": (
+                " ".join((tumor_type or "").strip().lower().split()) if tumor_type and not agnostic else None
+            ),
+            "agnostic": agnostic,
+            "max_results": max_results,
+        },
+        sort_keys=True,
+    )
+
+    async def _compute() -> List[dict]:
+        queries = _fusion_partner_precedent_queries(gene, tumor_type, agnostic)
+        async with httpx.AsyncClient() as client:
+            pmid_lists = await asyncio.gather(*[_esearch(q, max_results, client) for q in queries])
+            seen_pmids: Set[str] = set()
+            pmids: List[str] = []
+            for pmid_list in pmid_lists:
+                for pmid in pmid_list:
+                    if pmid not in seen_pmids:
+                        seen_pmids.add(pmid)
+                        pmids.append(pmid)
+            records = await _efetch(pmids, client)
+        records = _rank_records(_filter_retracted_records(records))
+        return [record.model_dump() for record in records]
+
+    payload = await cached_call(
+        cache_key, _compute, ttl_seconds=settings.fusion_partner_evidence_cache_ttl_seconds
+    )
+    return [LiteratureRecord(**record) for record in payload]
+
+
+async def retrieve_fusion_partner_evidence(
+    gene: str,
+    tumor_type: Optional[str] = None,
+    agnostic: bool = False,
+    exclude_pmids: Optional[Set[str]] = None,
+    max_results: Optional[int] = None,
+) -> FusionPartnerEvidenceResult:
+    """
+    Return deterministic evidence for whether `gene` has precedent as an oncogenic
+    fusion partner, independent of the exact fusion pair under review.
+
+    exclude_pmids lets a follow-up agnostic call report only the PMIDs not already
+    surfaced by an earlier tumor-type-scoped call for the same gene.
+    """
+    max_results = max_results or settings.fusion_partner_evidence_max_results
+    exclude = exclude_pmids or set()
+    records = await _retrieve_fusion_partner_records(gene, tumor_type, agnostic, max_results)
+    records = [record for record in records if record.pmid not in exclude]
+
+    scope = "tumor_type_scoped" if (tumor_type and not agnostic) else "all_tumor_types"
+    return FusionPartnerEvidenceResult(
+        gene=gene,
+        tumor_type=tumor_type,
+        scope=scope,
+        has_precedent=bool(records),
+        retrieved_count=len(records),
+        pmids=[record.pmid for record in records],
+        interpretation=_fusion_partner_interpretation(gene, tumor_type, agnostic, records),
+        evidence_cards=_fusion_partner_evidence_cards(records),
     )
 
 
