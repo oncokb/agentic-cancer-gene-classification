@@ -28,11 +28,36 @@ class LiteratureRecord(BaseModel):
     abstract: str
     journal: str = ""
     publication_types: list[str] = []
+    publication_year: Optional[int] = None
+    # Query families that surfaced this PMID during retrieval (e.g. "mesh_gene_name",
+    # "free_text", "tier2_agentic") — a PMID can be found by more than one query.
+    # Feeds the query-tier precision signal in the citation pre-ranking heuristic.
+    matched_query_tiers: List[str] = Field(default_factory=list)
 
 
 class SupportingQuote(BaseModel):
     pmid: str
     quote: str
+
+
+class LiteraturePaperScore(BaseModel):
+    """Composite pre-ranking score for one retrieved paper, with the individual signal
+    values that produced it — for auditing why a PMID ranked where it did."""
+
+    pmid: str
+    citation_composite_score: float
+    context_composite_score: float
+    query_tier_score: float
+    fusion_cooccurrence_score: Optional[float] = None  # None when not a fusion annotation
+    recency_score: float
+    publication_type_citation_score: float
+    publication_type_context_score: float
+    matched_query_tiers: List[str] = Field(default_factory=list)
+    publication_year: Optional[int] = None
+    # Which candidate pool this paper was merged into ahead of the Haiku selection
+    # pass, if any — "citation" (top of the citation-weighted ranking) or
+    # "context_supplement" (review-leaning paper pulled in for summary framing).
+    pool: Optional[Literal["citation", "context_supplement"]] = None
 
 
 class EvidenceCard(BaseModel):
@@ -164,6 +189,7 @@ class GeneAnnotation(BaseModel):
     # Internal quality metadata (not exported to Nicole's sheet)
     retrieval_count: int = 0
     retrieved_pmids: List[str] = Field(default_factory=list)
+    retrieval_ranking: List[LiteraturePaperScore] = Field(default_factory=list)
     insufficient_evidence: bool = False
     evidence_support_score: float = Field(
         default=0.0,

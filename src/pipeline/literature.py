@@ -34,6 +34,7 @@ from src.models.schema import (
     FusionEvidenceCard,
     FusionEvidenceResult,
     FusionPartnerEvidenceResult,
+    LiteraturePaperScore,
     LiteratureRecord,
 )
 from src.pipeline.normalization import split_fusion
@@ -701,6 +702,22 @@ async def search_recent_pubmed_pmids(
     return recent_pmids
 
 
+def _parse_pub_year(pub_date_el: Optional[ET.Element]) -> Optional[int]:
+    """Extract a publication year from a PubDate element. Falls back to pulling the
+    first 4-digit year out of MedlineDate (e.g. "2020 Jan-Feb") when Year is absent."""
+    if pub_date_el is None:
+        return None
+    year_el = pub_date_el.find("Year")
+    if year_el is not None and year_el.text and year_el.text.strip().isdigit():
+        return int(year_el.text.strip())
+    medline_date_el = pub_date_el.find("MedlineDate")
+    if medline_date_el is not None and medline_date_el.text:
+        match = re.search(r"\b(1[89]\d{2}|20\d{2})\b", medline_date_el.text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
 async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[LiteratureRecord]:
     """Fetch abstracts for a list of PMIDs, including journal and publication type metadata."""
@@ -736,10 +753,13 @@ async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[Literatur
                     for el in article.findall(".//PublicationType")
                     if el.text
                 ]
+                pub_date_el = article.find(".//Article/Journal/JournalIssue/PubDate")
+                year = _parse_pub_year(pub_date_el)
                 if pmid and abstract:
                     records.append({
                         "pmid": pmid, "title": title, "abstract": abstract,
                         "journal": journal, "publication_types": pub_types,
+                        "publication_year": year,
                     })
         except ET.ParseError as exc:
             logger.warning("XML parse error in efetch: %s", exc)
@@ -799,24 +819,35 @@ async def _tier1_retrieve(
       5. Co-query with each fusion partner
     """
     evidence_queries = _evidence_priority_queries(gene)
+    family_by_query: Dict[str, str] = {}
+
+    def _tag(query: str, family: str) -> str:
+        # First family assigned to a query string wins; collisions are rare
+        # (would require two distinct query builders producing identical text).
+        family_by_query.setdefault(query, family)
+        return query
+
     stage_1 = [
-        f'"{gene}"[Gene Name] AND cancer[MeSH Terms]',
+        _tag(f'"{gene}"[Gene Name] AND cancer[MeSH Terms]', "mesh_gene_name"),
     ]
     if tumor_type:
         tt = _tumor_type_query_fragment(tumor_type)
-        stage_1.insert(0, f'"{gene}" AND {tt}')
+        stage_1.insert(0, _tag(f'"{gene}" AND {tt}', "tumor_type"))
 
     stage_2 = [
-        f'"{gene}" AND (cancer OR tumor OR oncology OR carcinoma)',
-        evidence_queries[0],
+        _tag(f'"{gene}" AND (cancer OR tumor OR oncology OR carcinoma)', "free_text"),
+        _tag(evidence_queries[0], "evidence_priority"),
     ]
-    stage_3 = [
-        *evidence_queries[1:],
-    ]
+    stage_3 = [_tag(q, "evidence_priority") for q in evidence_queries[1:]]
     for partner in _fusion_partners(gene, fusions or [])[:2]:
-        stage_3.append(f'"{gene}" AND "{partner}"')
+        stage_3.append(_tag(f'"{gene}" AND "{partner}"', "fusion_partner"))
         if tumor_type:
-            stage_3.append(f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}')
+            stage_3.append(
+                _tag(
+                    f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}',
+                    "fusion_partner",
+                )
+            )
 
     stages = [
         list(dict.fromkeys(stage))
@@ -825,21 +856,31 @@ async def _tier1_retrieve(
     ]
     queries = list(dict.fromkeys(query for stage in stages for query in stage))
 
+    def _tag_matched_query_tiers(records: List[LiteratureRecord], matched: Dict[str, Set[str]]) -> None:
+        for record in records:
+            families = matched.get(record.pmid)
+            if families:
+                record.matched_query_tiers = list(set(record.matched_query_tiers) | families)
+
     if not settings.pubmed_staged_retrieval:
+        matched: Dict[str, Set[str]] = {}
         async with httpx.AsyncClient() as client:
             pmid_lists = await asyncio.gather(
                 *[_esearch(q, settings.pubmed_max_results, client) for q in queries]
             )
             seen: Set[str] = set()
             merged: List[str] = []
-            for pmids in pmid_lists:
+            for query, pmids in zip(queries, pmid_lists):
+                family = family_by_query.get(query, "free_text")
                 for pmid in pmids:
+                    matched.setdefault(pmid, set()).add(family)
                     if pmid not in seen:
                         seen.add(pmid)
                         merged.append(pmid)
             fetch_cap = settings.pubmed_max_results * len(queries)
             records = await _efetch(merged[:fetch_cap], client)
 
+        _tag_matched_query_tiers(records, matched)
         records = _rank_records(records)
         logger.info(
             "Tier 1: %d abstracts for %s (%d queries, %d unique PMIDs before cap)",
@@ -849,6 +890,7 @@ async def _tier1_retrieve(
 
     stop_target = max(settings.min_papers_for_strong_association, settings.max_papers_for_synthesis)
     all_records: Dict[str, LiteratureRecord] = {}
+    matched: Dict[str, Set[str]] = {}
     seen_pmids: Set[str] = set()
     searched_queries = 0
 
@@ -859,8 +901,10 @@ async def _tier1_retrieve(
                 *[_esearch(q, settings.pubmed_max_results, client) for q in stage]
             )
             stage_pmids: List[str] = []
-            for pmids in pmid_lists:
+            for query, pmids in zip(stage, pmid_lists):
+                family = family_by_query.get(query, "free_text")
                 for pmid in pmids:
+                    matched.setdefault(pmid, set()).add(family)
                     if pmid not in seen_pmids:
                         seen_pmids.add(pmid)
                         stage_pmids.append(pmid)
@@ -868,6 +912,7 @@ async def _tier1_retrieve(
             for record in stage_records:
                 all_records[record.pmid] = record
 
+            _tag_matched_query_tiers(list(all_records.values()), matched)
             ranked = _rank_records(list(all_records.values()))
             if len(ranked) >= stop_target:
                 logger.info(
@@ -1052,6 +1097,7 @@ async def _tier2_agentic_retrieve(
                             query, max_res, http_client, set(accumulated.keys())
                         )
                         for r in new_records:
+                            r.matched_query_tiers = list(set(r.matched_query_tiers) | {"tier2_agentic"})
                             accumulated[r.pmid] = r
                         result_text = (
                             f"Found {len(new_records)} new abstracts.\n"
@@ -1143,6 +1189,7 @@ async def _tier2_local_retrieve(
                 logger.warning("Local Tier 2 PubMed query failed for %s: %s", gene, exc)
                 continue
             for record in new_records:
+                record.matched_query_tiers = list(set(record.matched_query_tiers) | {"tier2_agentic"})
                 accumulated[record.pmid] = record
 
     logger.info(
@@ -1152,6 +1199,210 @@ async def _tier2_local_retrieve(
         len(accumulated) - len(initial_records),
     )
     return _rank_records(_filter_retracted_records(list(accumulated.values())))
+
+
+# ---------------------------------------------------------------------------
+# Composite pre-ranking heuristic
+#
+# Applied to the deduplicated retrieval pool between Tier 1/2 retrieval and the
+# Haiku citation selection pass, so Haiku sees the strongest candidates first
+# and there's a better deterministic fallback than recency alone on failure.
+# Four signals, each normalized to [0, 1], combined into a weighted average
+# (weights renormalized per-paper over whichever signals actually apply — e.g.
+# fusion co-occurrence doesn't apply to standalone, non-fusion gene lookups).
+# ---------------------------------------------------------------------------
+
+_QUERY_TIER_PRECISION: Dict[str, float] = {
+    "mesh_gene_name": 1.0,
+    "tumor_type": 0.9,
+    "evidence_priority": 0.75,
+    "fusion_partner": 0.75,
+    "tier2_agentic": 0.5,
+    "free_text": 0.5,
+}
+
+_PUBTYPE_CATEGORY_PATTERNS: Dict[str, tuple[str, ...]] = {
+    "trial": ("clinical trial", "randomized controlled trial"),
+    "comparative": ("comparative study",),
+    "meta_analysis": ("meta-analysis",),
+    "review": ("review", "systematic review"),
+    "case_report": ("case reports",),
+    "editorial": ("letter", "comment", "editorial", "news"),
+}
+
+
+def _query_tier_score(record: LiteratureRecord) -> float:
+    """Highest precision weight among the query families that surfaced this PMID.
+    Untagged records (e.g. constructed outside the retrieval pipeline) get a
+    neutral score rather than being penalized for missing provenance."""
+    if not record.matched_query_tiers:
+        return 0.5
+    return max(_QUERY_TIER_PRECISION.get(family, 0.5) for family in record.matched_query_tiers)
+
+
+def _fusion_cooccurrence_score(record: LiteratureRecord, partner_genes: List[str]) -> Optional[float]:
+    """Fraction of the fusion's other partner gene(s) mentioned in title+abstract.
+    None (not zero) for standalone, non-fusion annotations — this signal doesn't
+    apply, and is excluded from the composite rather than counted as a miss."""
+    if not partner_genes:
+        return None
+    text = f"{record.title} {record.abstract}".lower()
+    mentioned = sum(
+        1
+        for partner in partner_genes
+        if re.search(rf"(?<![a-z0-9]){re.escape(partner.lower())}(?![a-z0-9])", text)
+    )
+    return mentioned / len(partner_genes)
+
+
+def _recency_score(record: LiteratureRecord) -> float:
+    """Exponential decay by publication age; missing year gets a neutral score
+    rather than being penalized as if it were maximally stale."""
+    if not record.publication_year:
+        return 0.5
+    half_life = max(settings.citation_score_recency_half_life_years, 0.1)
+    age_years = max(0, datetime.now(timezone.utc).year - record.publication_year)
+    return 0.5 ** (age_years / half_life)
+
+
+def _matched_pubtype_categories(record: LiteratureRecord) -> List[str]:
+    types_lower = [t.lower() for t in record.publication_types]
+    matched = [
+        category
+        for category, patterns in _PUBTYPE_CATEGORY_PATTERNS.items()
+        if any(pattern in t for t in types_lower for pattern in patterns)
+    ]
+    return matched or ["original_research"]
+
+
+def _pubtype_weight_table(profile: str) -> Dict[str, float]:
+    if profile == "context":
+        return {
+            "trial": settings.context_score_pubtype_trial_weight,
+            "comparative": settings.context_score_pubtype_comparative_weight,
+            "meta_analysis": settings.context_score_pubtype_meta_analysis_weight,
+            "review": settings.context_score_pubtype_review_weight,
+            "case_report": settings.context_score_pubtype_case_report_weight,
+            "editorial": settings.context_score_pubtype_editorial_weight,
+            "original_research": settings.context_score_pubtype_original_research_weight,
+        }
+    return {
+        "trial": settings.citation_score_pubtype_trial_weight,
+        "comparative": settings.citation_score_pubtype_comparative_weight,
+        "meta_analysis": settings.citation_score_pubtype_meta_analysis_weight,
+        "review": settings.citation_score_pubtype_review_weight,
+        "case_report": settings.citation_score_pubtype_case_report_weight,
+        "editorial": settings.citation_score_pubtype_editorial_weight,
+        "original_research": settings.citation_score_pubtype_original_research_weight,
+    }
+
+
+def _pubtype_score(record: LiteratureRecord, profile: str) -> float:
+    """profile is 'citation' (favors original research/trials) or 'context' (favors
+    reviews/meta-analyses). A paper can match multiple categories; take the max."""
+    table = _pubtype_weight_table(profile)
+    categories = _matched_pubtype_categories(record)
+    return max(table.get(category, table["original_research"]) for category in categories)
+
+
+def _weighted_composite(signals: Dict[str, Optional[float]], weights: Dict[str, float]) -> float:
+    applicable = {name: value for name, value in signals.items() if value is not None}
+    weight_total = sum(weights[name] for name in applicable)
+    if weight_total <= 0:
+        return 0.0
+    return sum(weights[name] * value for name, value in applicable.items()) / weight_total
+
+
+def score_literature_records(
+    records: List[LiteratureRecord],
+    gene: str,
+    fusions: Optional[List[str]] = None,
+) -> List[LiteraturePaperScore]:
+    """Compute the composite pre-ranking score (and its component signals) for every
+    record in a retrieval pool. Pure/deterministic — no network calls — so it's cheap
+    to recompute wherever the breakdown is needed for auditability."""
+    partner_genes = _fusion_partners(gene, fusions or [])
+    weights = {
+        "query_tier": settings.citation_score_query_tier_weight,
+        "fusion": settings.citation_score_fusion_cooccurrence_weight,
+        "recency": settings.citation_score_recency_weight,
+        "pubtype": settings.citation_score_publication_type_weight,
+    }
+
+    scores: List[LiteraturePaperScore] = []
+    for record in records:
+        query_tier = _query_tier_score(record)
+        fusion = _fusion_cooccurrence_score(record, partner_genes)
+        recency = _recency_score(record)
+        pubtype_citation = _pubtype_score(record, "citation")
+        pubtype_context = _pubtype_score(record, "context")
+
+        citation_composite = _weighted_composite(
+            {"query_tier": query_tier, "fusion": fusion, "recency": recency, "pubtype": pubtype_citation},
+            weights,
+        )
+        context_composite = _weighted_composite(
+            {"query_tier": query_tier, "fusion": fusion, "recency": recency, "pubtype": pubtype_context},
+            weights,
+        )
+
+        scores.append(
+            LiteraturePaperScore(
+                pmid=record.pmid,
+                citation_composite_score=round(citation_composite, 4),
+                context_composite_score=round(context_composite, 4),
+                query_tier_score=round(query_tier, 4),
+                fusion_cooccurrence_score=None if fusion is None else round(fusion, 4),
+                recency_score=round(recency, 4),
+                publication_type_citation_score=round(pubtype_citation, 4),
+                publication_type_context_score=round(pubtype_context, 4),
+                matched_query_tiers=list(record.matched_query_tiers),
+                publication_year=record.publication_year,
+            )
+        )
+    return scores
+
+
+def rank_literature_for_synthesis(
+    records: List[LiteratureRecord],
+    gene: str,
+    fusions: Optional[List[str]],
+    max_papers: int,
+) -> tuple[List[LiteratureRecord], List[LiteraturePaperScore]]:
+    """
+    Build the ranked candidate pool handed to the Haiku selection pass (and used
+    as its algorithmic fallback on failure): the top `max_papers` by citation-
+    weighted composite score (favors original research/trials — what synthesis
+    draws verified PMID citations from), plus a small supplement of review-leaning
+    papers pulled from the context-weighted ranking for summary framing only.
+
+    Returns (candidate_pool, scores) — scores cover the FULL input pool (for
+    retrieval-level auditability), with `pool` set on the subset that made the
+    candidate cut.
+    """
+    scores = score_literature_records(records, gene, fusions)
+    scores_by_pmid = {score.pmid: score for score in scores}
+    records_by_pmid = {record.pmid: record for record in records}
+
+    citation_ranked = sorted(
+        records, key=lambda r: scores_by_pmid[r.pmid].citation_composite_score, reverse=True
+    )
+    context_ranked = sorted(
+        records, key=lambda r: scores_by_pmid[r.pmid].context_composite_score, reverse=True
+    )
+
+    primary = citation_ranked[: max(max_papers, 0)]
+    primary_pmids = {record.pmid for record in primary}
+    supplement_count = max(settings.citation_score_review_supplement_count, 0)
+    supplement = [r for r in context_ranked if r.pmid not in primary_pmids][:supplement_count]
+
+    for record in primary:
+        scores_by_pmid[record.pmid].pool = "citation"
+    for record in supplement:
+        scores_by_pmid[record.pmid].pool = "context_supplement"
+
+    candidate_pool = [records_by_pmid[r.pmid] for r in primary + supplement]
+    return candidate_pool, scores
 
 
 # ---------------------------------------------------------------------------
