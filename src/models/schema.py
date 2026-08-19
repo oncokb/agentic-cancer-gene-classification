@@ -124,6 +124,41 @@ class QualityFlag(BaseModel):
     detail: str = ""
 
 
+class ClinicalActionabilityEvidence(BaseModel):
+    pmid: str
+    title: str = ""
+    evidence_type: Literal["clinical", "preclinical", "case_report", "review", "other"] = "other"
+    therapies: List[str] = Field(default_factory=list)
+    domains: List[str] = Field(default_factory=list)
+    matched_terms: List[str] = Field(default_factory=list)
+    quote: Optional[str] = None
+
+
+class ClinicalActionabilityScoreComponent(BaseModel):
+    code: str
+    label: str
+    delta: float
+    pmids: List[str] = Field(default_factory=list)
+    detail: str = ""
+
+
+class ClinicalActionability(BaseModel):
+    """High-confidence literature-derived therapeutic precedent.
+
+    This is intentionally conservative and deterministic. It is not a treatment
+    recommendation; it only indicates that retrieved, verified literature contains
+    a strong enough therapeutic/domain-actionability signal to show curators.
+    """
+
+    confidence_score: float = Field(ge=0.0, le=1.0)
+    confidence_level: Literal["high"] = "high"
+    summary: str
+    confidence_explanation: str
+    pmids: List[str] = Field(default_factory=list)
+    score_components: List[ClinicalActionabilityScoreComponent] = Field(default_factory=list)
+    evidence: List[ClinicalActionabilityEvidence] = Field(default_factory=list)
+
+
 class FusionTreatmentKnowledge(BaseModel):
     """Deterministic, CIViC-sourced treatment/evidence data for a fusion, keyed by
     gene pair (e.g. EML4::ALK). Never LLM-generated — displayed as-is."""
@@ -181,6 +216,7 @@ class GeneAnnotation(BaseModel):
     citations: List[str] = Field(default_factory=list)  # verified PMIDs only
     supporting_quotes: List[SupportingQuote] = Field(default_factory=list)
     evidence_cards: List[EvidenceCard] = Field(default_factory=list)
+    clinical_actionability: Optional[ClinicalActionability] = None
     quality_flags: List[QualityFlag] = Field(default_factory=list)
     date_annotated: str = Field(
         default_factory=lambda: date.today().strftime("%-m/%-d/%y")

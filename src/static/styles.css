@@ -751,6 +751,93 @@ textarea {
   font-style: italic;
 }
 
+.clinical-actionability {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid #b9d9d5;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0;
+  background: #eef9f7;
+  padding: 10px 14px;
+}
+
+.clinical-actionability-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.clinical-actionability-summary {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.clinical-actionability-breakdown {
+  border-top: 1px solid #b9d9d5;
+  padding-top: 8px;
+}
+
+.clinical-actionability-breakdown-summary {
+  cursor: pointer;
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.clinical-actionability-breakdown-summary::-webkit-details-marker {
+  display: none;
+}
+
+.clinical-actionability-breakdown-summary::after {
+  content: "▸";
+  margin-left: 6px;
+  font-size: 11px;
+}
+
+.clinical-actionability-breakdown[open] .clinical-actionability-breakdown-summary::after {
+  content: "▾";
+}
+
+.clinical-actionability-component-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.clinical-actionability-component {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: 8px;
+}
+
+.clinical-actionability-delta {
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.clinical-actionability-delta.positive {
+  color: var(--ok);
+}
+
+.clinical-actionability-delta.negative {
+  color: var(--danger);
+}
+
+.clinical-actionability-component-body {
+  display: grid;
+  gap: 5px;
+}
+
+.clinical-actionability-component-label {
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .benchmark-report {
   display: grid;
   gap: 14px;

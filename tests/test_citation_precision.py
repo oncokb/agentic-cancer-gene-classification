@@ -241,3 +241,48 @@ def test_build_gene_annotation_omits_evidence_cards_in_core_mode():
     )
 
     assert annotation.evidence_cards == []
+
+
+def test_build_gene_annotation_adds_high_confidence_clinical_actionability():
+    annotation = build_gene_annotation(
+        gene="ALK",
+        fusions=["EML4::ALK"],
+        in_oncokb=True,
+        cancer_type_prevalence=None,
+        records=[
+            LiteratureRecord(
+                pmid="12345",
+                title="ALK fusion lung adenocarcinoma responds to crizotinib",
+                abstract=(
+                    "Patients with lung adenocarcinoma harboring ALK fusion retained "
+                    "the kinase domain and responded to crizotinib inhibitor therapy."
+                ),
+                journal="J Clin Oncol",
+                publication_types=["Clinical Trial"],
+            ),
+            LiteratureRecord(
+                pmid="67890",
+                title="ALK inhibitor response in lung adenocarcinoma",
+                abstract=(
+                    "An independent patient cohort with ALK rearrangement lung "
+                    "adenocarcinoma showed response to alectinib targeted therapy."
+                ),
+                publication_types=["Journal Article"],
+            ),
+        ],
+        synthesis_result={
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "ALK fusion has inhibitor response evidence.",
+            "gene_summary": "ALK has clinical inhibitor evidence (PMID 12345; PMID 67890).",
+            "citations": ["12345", "67890"],
+        },
+        mode="full",
+        tumor_type="lung adenocarcinoma",
+    )
+
+    assert annotation.clinical_actionability is not None
+    assert annotation.clinical_actionability.confidence_score == 1.0
+    assert annotation.clinical_actionability.pmids == ["12345", "67890"]
+    assert annotation.clinical_actionability.score_components[1].code == "direct_actionability_language"
+    assert "kinase domain" in annotation.clinical_actionability.score_components[1].detail

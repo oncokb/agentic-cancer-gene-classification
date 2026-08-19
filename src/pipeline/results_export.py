@@ -25,6 +25,11 @@ ANNOTATION_RESULTS_CSV_HEADERS = [
     "insufficient_evidence",
     "evidence_support_score",
     "evidence_support_explanation",
+    "clinical_actionability_score",
+    "clinical_actionability_summary",
+    "clinical_actionability_pmids",
+    "clinical_actionability_explanation",
+    "clinical_actionability_score_components",
     "quality_flags",
     "evidence_card_count",
     "cache_status",
@@ -65,6 +70,18 @@ def _publication_links(pmids: Iterable[str]) -> list[str]:
     return [f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" for pmid in pmids]
 
 
+def _format_actionability_components(annotation: GeneAnnotation) -> str:
+    if not annotation.clinical_actionability:
+        return ""
+    parts = []
+    for component in annotation.clinical_actionability.score_components:
+        delta = f"{component.delta:+.2f}"
+        pmids = f" PMID(s): {', '.join(component.pmids)}" if component.pmids else ""
+        detail = f" {component.detail}" if component.detail else ""
+        parts.append(f"{delta} {component.label}.{detail}{pmids}")
+    return " | ".join(parts)
+
+
 def build_annotation_results_csv_rows(
     result: AnnotationResult,
 ) -> list[dict[str, str]]:
@@ -103,6 +120,27 @@ def annotation_to_csv_row(
         "insufficient_evidence": _format_bool(annotation.insufficient_evidence),
         "evidence_support_score": str(annotation.evidence_support_score),
         "evidence_support_explanation": annotation.evidence_support_explanation,
+        "clinical_actionability_score": (
+            str(annotation.clinical_actionability.confidence_score)
+            if annotation.clinical_actionability
+            else ""
+        ),
+        "clinical_actionability_summary": (
+            annotation.clinical_actionability.summary
+            if annotation.clinical_actionability
+            else ""
+        ),
+        "clinical_actionability_pmids": (
+            "; ".join(annotation.clinical_actionability.pmids)
+            if annotation.clinical_actionability
+            else ""
+        ),
+        "clinical_actionability_explanation": (
+            annotation.clinical_actionability.confidence_explanation
+            if annotation.clinical_actionability
+            else ""
+        ),
+        "clinical_actionability_score_components": _format_actionability_components(annotation),
         "quality_flags": "; ".join(flag.code for flag in annotation.quality_flags),
         "evidence_card_count": str(len(annotation.evidence_cards)),
         "cache_status": _format_optional_text(annotation.cache_status),
