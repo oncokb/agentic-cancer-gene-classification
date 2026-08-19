@@ -79,6 +79,17 @@ button:disabled {
   margin: 0;
 }
 
+.brand-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-icon {
+  flex-shrink: 0;
+  border-radius: 6px;
+}
+
 .brand h1 {
   font-size: 24px;
   line-height: 1.15;
