@@ -153,6 +153,28 @@ async def test_save_and_get_round_trip(run_store):
     assert stored == {"run_id": "11111111-1111-1111-1111-111111111111", "annotations": []}
 
 
+async def test_update_run_result_overwrites_saved_result(run_store):
+    await run_store.save_run(
+        "22222222-2222-2222-2222-222222222222",
+        "2026-07-30T19:24:12.406639+00:00",
+        {"fusions": ["EML4::ALK"]},
+        {"run_id": "22222222-2222-2222-2222-222222222222", "annotations": [], "fusion_evidence": []},
+    )
+
+    await run_store.update_run_result(
+        "22222222-2222-2222-2222-222222222222",
+        {
+            "run_id": "22222222-2222-2222-2222-222222222222",
+            "annotations": [],
+            "fusion_evidence": [{"fusion": "EML4::ALK", "well_supported": True}],
+        },
+    )
+
+    stored = await run_store.get_run("22222222-2222-2222-2222-222222222222")
+
+    assert stored["fusion_evidence"] == [{"fusion": "EML4::ALK", "well_supported": True}]
+
+
 async def test_get_run_returns_none_for_missing_id(run_store):
     stored = await run_store.get_run("does-not-exist")
 

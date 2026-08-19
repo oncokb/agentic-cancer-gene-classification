@@ -651,7 +651,7 @@ async function runAnnotation() {
 
     const job = await response.json();
     await pollAnnotationJob(job.status_url);
-    startFusionEvidenceJob(annotationInputs).catch((error) => {
+    startFusionEvidenceJob(annotationInputs, state.currentResult?.run_id).catch((error) => {
       state.fusionEvidenceStatus = "failed";
       setMessage(formatRunError(error.message), "error");
       if (state.currentResult) renderAnnotationResult(state.currentResult);
@@ -720,7 +720,7 @@ function fusionEvidenceInputs(inputs) {
   return fusionInputs;
 }
 
-async function startFusionEvidenceJob(inputs) {
+async function startFusionEvidenceJob(inputs, runId) {
   const fusions = fusionEvidenceInputs(inputs);
   if (!fusions.length || !state.currentResult) return;
 
@@ -737,6 +737,7 @@ async function startFusionEvidenceJob(inputs) {
     body: JSON.stringify({
       fusions,
       mode: elements.annotateMode.value || "full",
+      run_id: runId || null,
     }),
   });
   if (!response.ok) {
@@ -906,6 +907,13 @@ async function loadSharedRun() {
       );
     }
     const result = await response.json();
+    // A run's fusion evidence job runs after the core annotation completes, so
+    // it's normally persisted onto the run by the time anyone opens a share
+    // link. Mark it complete up front so the tab shows immediately instead of
+    // staying hidden (fusionEvidenceStatus otherwise defaults to not-running).
+    if (result.fusion_evidence?.length) {
+      state.fusionEvidenceStatus = "complete";
+    }
     state.currentResult = result;
     renderAnnotationResult(result);
     setMessage("Shared run restored.", "info");
