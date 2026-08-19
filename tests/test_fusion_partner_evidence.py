@@ -3,6 +3,7 @@ from __future__ import annotations
 from src.models.schema import LiteratureRecord
 from src.pipeline import literature
 from src.pipeline.literature import (
+    _filter_fusion_partner_precedent_records,
     _fusion_partner_precedent_queries,
     retrieve_fusion_partner_evidence,
 )
@@ -79,8 +80,16 @@ async def test_agnostic_follow_up_excludes_already_seen_pmids(monkeypatch):
 
     async def fake_efetch(pmids, client):
         return [
-            LiteratureRecord(pmid="1", title="Scoped paper", abstract="Found in scoped pass."),
-            LiteratureRecord(pmid="2", title="New paper", abstract="Only found in agnostic pass."),
+            LiteratureRecord(
+                pmid="1",
+                title="ALK fusion lung cancer",
+                abstract="ALK rearrangement was found in a scoped lung cancer cohort.",
+            ),
+            LiteratureRecord(
+                pmid="2",
+                title="Novel ALK fusion",
+                abstract="An ALK fusion was reported in another tumor type.",
+            ),
         ]
 
     monkeypatch.setattr(literature, "cached_call", _uncached)
@@ -98,6 +107,35 @@ async def test_agnostic_follow_up_excludes_already_seen_pmids(monkeypatch):
     assert result.scope == "all_tumor_types"
     assert result.pmids == ["2"]
     assert result.retrieved_count == 1
+
+
+def test_partner_precedent_filter_requires_gene_near_fusion_language():
+    records = [
+        LiteratureRecord(
+            pmid="1",
+            title="ALK fusions in lung adenocarcinoma",
+            abstract="Patients with ALK fusion lung cancer respond to targeted therapy.",
+        ),
+        LiteratureRecord(
+            pmid="2",
+            title="Global gene expression profiling of PAX-FKHR fusion-positive tumors",
+            abstract=(
+                "The fusion-positive cohort was analyzed by expression profiling across many pathways. "
+                "Clinical groups, histology, treatment response, pathway activity, and broad transcript "
+                "clusters were compared without reporting additional rearranged genes. ALK expression was "
+                "listed among many genes, but the fusion is PAX-FKHR."
+            ),
+        ),
+        LiteratureRecord(
+            pmid="3",
+            title="STRN-ALK rearrangement in thyroid carcinoma",
+            abstract="The STRN-ALK fusion activates ALK signaling.",
+        ),
+    ]
+
+    filtered = _filter_fusion_partner_precedent_records(records, "ALK")
+
+    assert [record.pmid for record in filtered] == ["1", "3"]
 
 
 async def test_no_precedent_found_reports_zero_papers(monkeypatch):

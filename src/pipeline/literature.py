@@ -416,6 +416,42 @@ def _fusion_partner_precedent_queries(
     ]
 
 
+def _record_has_gene_fusion_precedent(record: LiteratureRecord, gene: str) -> bool:
+    """Keep broad PubMed hits only when the queried gene is actually tied to fusion language."""
+    normalized_gene = re.escape(gene.strip().upper())
+    if not normalized_gene:
+        return False
+
+    text = f"{record.title} {record.abstract}".upper()
+    gene_pattern = re.compile(rf"(?<![A-Z0-9]){normalized_gene}(?![A-Z0-9])")
+    direct_precedent_pattern = re.compile(
+        rf"(?<![A-Z0-9]){normalized_gene}(?![A-Z0-9])[-\s]+"
+        r"(FUSION|FUSIONS|REARRANGEMENT|REARRANGEMENTS|TRANSLOCATION|TRANSLOCATIONS|REARRANGED)"
+        rf"|(FUSION|FUSIONS|REARRANGEMENT|REARRANGEMENTS|TRANSLOCATION|TRANSLOCATIONS)\s+"
+        rf"(OF|INVOLVING|IN)\s+(?<![A-Z0-9]){normalized_gene}(?![A-Z0-9])"
+        rf"|CHIMERIC\s+(?<![A-Z0-9]){normalized_gene}(?![A-Z0-9])"
+    )
+    fusion_notation_pattern = re.compile(
+        rf"(?<![A-Z0-9]){normalized_gene}(?![A-Z0-9])\s*(?:::+|--|[-/])\s*[A-Z0-9]+"
+        rf"|[A-Z0-9]+\s*(?:::+|--|[-/])\s*(?<![A-Z0-9]){normalized_gene}(?![A-Z0-9])"
+    )
+
+    if fusion_notation_pattern.search(text):
+        return True
+
+    return bool(gene_pattern.search(text) and direct_precedent_pattern.search(text))
+
+
+def _filter_fusion_partner_precedent_records(
+    records: List[LiteratureRecord], gene: str
+) -> List[LiteratureRecord]:
+    return [
+        record
+        for record in records
+        if _record_has_gene_fusion_precedent(record, gene)
+    ]
+
+
 def _fusion_partner_evidence_cards(records: List[LiteratureRecord], limit: int = 5) -> List[EvidenceCard]:
     cards: List[EvidenceCard] = []
     for record in records[:limit]:
@@ -487,7 +523,12 @@ async def _retrieve_fusion_partner_records(
                         seen_pmids.add(pmid)
                         pmids.append(pmid)
             records = await _efetch(pmids, client)
-        records = _rank_records(_filter_retracted_records(records))
+        records = _rank_records(
+            _filter_fusion_partner_precedent_records(
+                _filter_retracted_records(records),
+                gene,
+            )
+        )
         return [record.model_dump() for record in records]
 
     payload = await cached_call(
