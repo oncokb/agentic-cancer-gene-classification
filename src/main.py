@@ -188,6 +188,16 @@ class EnrichmentJobStatusResponse(BaseModel):
     timings_ms: Dict[str, float] = Field(default_factory=dict)
 
 
+class FusionEvidenceJobRequest(AnnotateRequest):
+    run_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Run ID to persist completed fusion evidence back onto, so a shared link "
+            "for this run includes it instead of recomputing on every open."
+        ),
+    )
+
+
 class FusionEvidenceJobCreateResponse(BaseModel):
     job_id: str
     status_url: str
@@ -336,6 +346,23 @@ async def _persist_run_result(
         # A run's own result always returns even if it can't be persisted for
         # later sharing — the run store isn't on the critical path for the caller.
         logger.exception("Failed to persist run %s", result.run_id)
+
+
+async def _persist_fusion_evidence(
+    http_request: Request,
+    run_id: str,
+    fusion_evidence: List[FusionEvidenceResult],
+) -> None:
+    """Merge a completed fusion-evidence job back onto its run, so opening a
+    shared link later shows it instead of a hidden/empty fusion evidence tab."""
+    try:
+        stored = await http_request.app.state.run_store.get_run(run_id)
+        if stored is None:
+            return
+        stored["fusion_evidence"] = [item.model_dump() for item in fusion_evidence]
+        await http_request.app.state.run_store.update_run_result(run_id, stored)
+    except Exception:
+        logger.exception("Failed to persist fusion evidence for run %s", run_id)
 
 
 def _request_user_id(request: Request) -> Optional[str]:
@@ -544,7 +571,8 @@ async def get_enrichment_job(job_id: str) -> EnrichmentJobStatusResponse:
 
 @app.post("/v1/fusion-evidence/jobs", response_model=FusionEvidenceJobCreateResponse)
 async def create_fusion_evidence_job(
-    request: AnnotateRequest,
+    request: FusionEvidenceJobRequest,
+    http_request: Request,
 ) -> FusionEvidenceJobCreateResponse:
     """Run exact fusion-pair PubMed evidence retrieval outside the annotation critical path."""
     fusion_inputs = _fusion_evidence_inputs(request.fusions)
@@ -589,6 +617,8 @@ async def create_fusion_evidence_job(
             current.fusions_completed = len(current.fusion_evidence)
             current.timings_ms = {"total": round((time.perf_counter() - start) * 1000, 2)}
             await _store_fusion_evidence_job(current)
+            if request.run_id:
+                await _persist_fusion_evidence(http_request, request.run_id, current.fusion_evidence)
         except Exception as exc:
             logger.exception("Fusion evidence job %s failed", job_id)
             current = await _get_fusion_evidence_job(job_id)

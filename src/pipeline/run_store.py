@@ -176,6 +176,16 @@ class RunStore:
                     ),
                 )
 
+    async def update_run_result(self, run_id: str, result_payload: Dict[str, Any]) -> None:
+        """Overwrite a saved run's result (e.g. once a background job, like fusion
+        evidence retrieval, completes after the initial save)."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "UPDATE runs SET result_json = %s WHERE run_id = %s",
+                    (json.dumps(result_payload), run_id),
+                )
+
     async def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
