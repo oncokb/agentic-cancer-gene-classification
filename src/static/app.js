@@ -1386,6 +1386,9 @@ function renderFusionEvidenceView(fusionEvidence) {
       evidence.appendChild(cardList);
     }
 
+    const partnerPrecedent = renderFusionPartnerPrecedentForFusionEvidence(item);
+    if (partnerPrecedent) evidence.appendChild(partnerPrecedent);
+
     list.appendChild(card);
   });
 
@@ -1895,6 +1898,78 @@ function renderFusionPartnerCheck(gene, tumorType) {
   });
 
   return details;
+}
+
+function renderFusionPartnerQueryButton(gene, tumorType) {
+  const container = document.createElement("div");
+  container.className = "fusion-partner-query";
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "fusion-partner-query-button";
+  button.textContent = gene;
+  const queryLabel = tumorType
+    ? `Query ${gene} fusion precedent in ${tumorType}`
+    : `Query ${gene} fusion precedent`;
+  button.setAttribute("aria-label", queryLabel);
+  button.title = queryLabel;
+
+  const resultBox = document.createElement("div");
+  resultBox.className = "fusion-partner-query-result hidden";
+
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    resultBox.classList.remove("hidden");
+    resultBox.replaceChildren(renderLoadingState(`Searching PubMed for ${gene} fusion precedent`));
+    fetchFusionPartnerEvidence(gene, { tumorType, agnostic: !tumorType })
+      .then((data) => {
+        resultBox.replaceChildren();
+        renderFusionPartnerResultBody(resultBox, data);
+        if (tumorType) appendFusionPartnerAgnosticFollowUp(resultBox, gene, tumorType, data.pmids || []);
+      })
+      .catch((error) => {
+        resultBox.textContent = `Unable to load fusion precedent for ${gene}.`;
+        setMessage(formatRunError(error.message), "error");
+      })
+      .finally(() => {
+        button.disabled = false;
+      });
+  });
+
+  container.appendChild(button);
+  container.appendChild(resultBox);
+  return container;
+}
+
+function renderFusionPartnerPrecedentForFusionEvidence(item) {
+  const retrievedCount = item.retrieved_count ?? (item.pmids || []).length;
+  if (retrievedCount > 0) return null;
+
+  const partners = [];
+  const seen = new Set();
+  splitFusionGenes(item.fusion || "").forEach((gene) => {
+    const normalized = gene.trim().toUpperCase();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    partners.push(normalized);
+  });
+  if (partners.length < 2) return null;
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "fusion-partner-precedent fusion-partner-precedent-inline";
+
+  const note = document.createElement("div");
+  note.className = "subtle";
+  note.textContent = item.tumor_type
+    ? `No exact fusion-pair literature was found. Select a partner gene to query fusion precedent in ${item.tumor_type}; after that, the search can be broadened across all tumor types.`
+    : "No exact fusion-pair literature was found. Select a partner gene to query fusion precedent across reported fusions.";
+  wrapper.appendChild(note);
+
+  const queryList = document.createElement("div");
+  queryList.className = "fusion-partner-query-list";
+  partners.forEach((partner) => queryList.appendChild(renderFusionPartnerQueryButton(partner, item.tumor_type || null)));
+  wrapper.appendChild(queryList);
+  return wrapper;
 }
 
 // Only for genes that came back insufficient_evidence — prioritizes the
