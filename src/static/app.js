@@ -1227,6 +1227,8 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
       if (field === "cancer_association_rationale") {
         row.classList.add("field-row-highlight");
         fields.appendChild(row);
+        const actionability = renderClinicalActionability(annotation);
+        if (actionability) fields.appendChild(actionability);
         // Evidence for the rationale belongs right next to it, not buried
         // below the rest of the fields — also keeps the initial card
         // height down, since the quotes inside are collapsed by default.
@@ -2190,6 +2192,104 @@ function renderField(annotation, field, label, type) {
   wrapper.appendChild(value);
 
   return wrapper;
+}
+
+function renderClinicalActionability(annotation) {
+  const actionability = annotation.clinical_actionability;
+  if (!actionability) return null;
+
+  const section = document.createElement("div");
+  section.className = "clinical-actionability";
+
+  const header = document.createElement("div");
+  header.className = "clinical-actionability-header";
+  const title = document.createElement("span");
+  title.className = "field-label";
+  title.textContent = "High-confidence therapeutic precedent";
+  header.appendChild(title);
+
+  const score = document.createElement("span");
+  score.className = "review-badge high";
+  const scoreValue = Number(actionability.confidence_score || 0);
+  score.textContent = `${Math.round(scoreValue * 100)}% confidence`;
+  score.title = actionability.confidence_explanation || "";
+  header.appendChild(score);
+  section.appendChild(header);
+
+  const summary = document.createElement("p");
+  summary.className = "clinical-actionability-summary";
+  summary.textContent = actionability.summary || "";
+  section.appendChild(summary);
+
+  if (actionability.pmids?.length) {
+    const links = document.createElement("div");
+    links.className = "citation-link-list";
+    actionability.pmids.forEach((pmid) => links.appendChild(makePubMedLink(pmid)));
+    section.appendChild(links);
+  }
+
+  const breakdown = renderClinicalActionabilityBreakdown(actionability);
+  if (breakdown) section.appendChild(breakdown);
+
+  if (actionability.confidence_explanation) {
+    const explanation = document.createElement("div");
+    explanation.className = "subtle";
+    explanation.textContent = actionability.confidence_explanation;
+    section.appendChild(explanation);
+  }
+
+  return section;
+}
+
+function renderClinicalActionabilityBreakdown(actionability) {
+  const components = actionability.score_components || [];
+  if (!components.length) return null;
+
+  const details = document.createElement("details");
+  details.className = "clinical-actionability-breakdown";
+
+  const summary = document.createElement("summary");
+  summary.className = "clinical-actionability-breakdown-summary";
+  summary.textContent = "Score derivation";
+  details.appendChild(summary);
+
+  const list = document.createElement("div");
+  list.className = "clinical-actionability-component-list";
+  components.forEach((component) => {
+    const row = document.createElement("div");
+    row.className = "clinical-actionability-component";
+
+    const delta = document.createElement("span");
+    delta.className = `clinical-actionability-delta ${component.delta < 0 ? "negative" : "positive"}`;
+    delta.textContent = `${component.delta < 0 ? "" : "+"}${Number(component.delta || 0).toFixed(2)}`;
+    row.appendChild(delta);
+
+    const body = document.createElement("div");
+    body.className = "clinical-actionability-component-body";
+    const label = document.createElement("div");
+    label.className = "clinical-actionability-component-label";
+    label.textContent = component.label || component.code || "Score component";
+    body.appendChild(label);
+
+    if (component.detail) {
+      const detail = document.createElement("div");
+      detail.className = "subtle";
+      detail.textContent = component.detail;
+      body.appendChild(detail);
+    }
+
+    if (component.pmids?.length) {
+      const pmids = document.createElement("div");
+      pmids.className = "citation-link-list";
+      component.pmids.forEach((pmid) => pmids.appendChild(makePubMedLink(pmid)));
+      body.appendChild(pmids);
+    }
+
+    row.appendChild(body);
+    list.appendChild(row);
+  });
+  details.appendChild(list);
+  return details;
 }
 
 // Compact Yes/No status for the two booleans curators check first —

@@ -22,6 +22,7 @@ from src.models.schema import (
     QualityFlag,
 )
 from src.pipeline.citation_precision import filter_and_rank_citations
+from src.pipeline.clinical_actionability import assess_clinical_actionability
 from src.pipeline.literature import (
     _HIGH_IMPACT_JOURNALS,
     _filter_retracted_records,
@@ -709,6 +710,7 @@ def build_gene_annotation(
     retrieval_tier: int = 1,
     mode: AnnotationMode = "full",
     retrieval_ranking: Optional[List[LiteraturePaperScore]] = None,
+    tumor_type: Optional[str] = None,
 ) -> GeneAnnotation:
     """Merge synthesis output with deterministic facts into a GeneAnnotation."""
     records = _filter_retracted_records(records)
@@ -742,6 +744,14 @@ def build_gene_annotation(
         synthesis_result=synthesis_result,
         retrieval_ranking=retrieval_ranking,
     )
+    clinical_actionability = assess_clinical_actionability(
+        gene=gene,
+        citations=citations,
+        records=records,
+        tumor_type=tumor_type,
+        in_oncokb=in_oncokb,
+        insufficient_evidence=insufficient_evidence,
+    )
     return GeneAnnotation(
         gene=gene,
         fusions=list(dict.fromkeys(fusions)),  # deduplicate, preserve order
@@ -755,6 +765,7 @@ def build_gene_annotation(
         citations=citations,
         supporting_quotes=verified_quotes,
         evidence_cards=evidence_cards,
+        clinical_actionability=clinical_actionability,
         quality_flags=quality_flags,
         retrieval_count=len(records),
         retrieved_pmids=[record.pmid for record in records],

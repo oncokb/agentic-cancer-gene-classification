@@ -21,6 +21,17 @@ Citation precision knobs:
 - `MAX_PAPERS_FOR_SYNTHESIS`: selected PubMed records passed to synthesis.
 - `MAX_CITATIONS_PER_ANNOTATION`: verified PMIDs retained in final output.
 
+Default model stack:
+
+- Full synthesis first calls `SYNTHESIS_FAST_MODEL`
+  (`claude-haiku-4-5-20251001` by default) and escalates to
+  `SYNTHESIS_MODEL` (`claude-opus-4-7` by default) when quality gates fail.
+- Core synthesis uses the same fast-first path, capped by
+  `CORE_SYNTHESIS_MAX_TOKENS`, `CORE_SYNTHESIS_ABSTRACT_CHARS`, and
+  `CORE_SYNTHESIS_MAX_PAPERS`.
+- Paper selection uses `SELECTION_MODEL` (`claude-haiku-4-5-20251001` by
+  default) when the retrieved corpus is small enough for the selection pass.
+
 Latency knobs:
 
 - `ANNOTATION_GENE_CONCURRENCY`: number of genes annotated concurrently.
@@ -220,12 +231,40 @@ Enriched/full annotations also include deterministic review metadata:
 - `quality_flags`: review-priority badges for no verified citations, low
   evidence score, Tier 2 retrieval, deep-model escalation, and mixed/contextual
   evidence language.
+- `clinical_actionability`: omitted unless ACGC finds high-confidence,
+  literature-derived therapeutic precedent from verified cited PMIDs. This is
+  not a treatment recommendation. When present, it is stored with the initial
+  annotation result and includes score components so the UI can lazily expand
+  the derivation without another API/model call.
 - Cache provenance stays on each annotation through `cache_status` and
   `cache_reason`; the UI renders these as badges such as freshly computed,
   cached final, cached after PubMed check, or force refreshed.
 
 These fields are computed from existing retrieval/synthesis metadata. They do
 not add extra calls to the core annotation request.
+
+Clinical actionability confidence is deterministic and citation-bound. A result
+is surfaced only when the score is at least 0.85. The score starts from verified
+cited abstracts only and applies this rubric:
+
+- +0.35 for direct human clinical evidence.
+- +0.25 for drug/domain/actionability language tied to the queried gene.
+- +0.15 when the supporting abstract matches the query tumor type.
+- +0.15 for two or more independent supporting PMIDs.
+- +0.05 for a high-impact journal signal.
+- +0.20 when OncoKB membership corroborates the gene context.
+- -0.25 for preclinical-only support.
+- -0.15 for case-report-only support.
+- -0.30 for conflicting or negative-response language.
+
+If a candidate lacks verified cited PMID support, is review-only, is
+preclinical-only below the threshold, or depends on indirect pathway inference,
+the field stays absent.
+
+Each surfaced actionability result stores `score_components` with the component
+code, label, score delta, PMIDs, and detail text such as matched therapies or
+matched domain terms. This makes the confidence calculation auditable in JSON,
+CSV, and the UI.
 
 This path uses the Anthropic SDK for selection, synthesis, benchmark judging, and
 Tier 2 agentic retrieval. In Bedrock mode, direct Anthropic model names must be
@@ -252,6 +291,33 @@ python -m benchmarks.compare_latency \
 
 The report includes run-level timings, per-gene retrieval/selection/synthesis
 timings, and total milliseconds plus percent savings.
+
+## Synthesis Paper Count A/B
+
+Use the synthesis-paper-count runner to compare whether passing more selected
+abstracts into synthesis improves rationale support or high-confidence
+clinical-actionability findings:
+
+```bash
+python -m benchmarks.compare_synthesis_paper_counts \
+  --fusions "HAPSTR1::ABAT" "EML4::ALK" \
+  --paper-counts 4 8 \
+  --mode full \
+  --output synthesis_ab_report.json
+```
+
+The report includes per-arm timings, average evidence-support score, verified
+citation counts, insufficient-evidence counts, high-confidence
+clinical-actionability counts, deep-model escalation counts, and per-gene
+deltas between the smallest and largest paper-count arms.
+
+Initial smoke benchmark on `EML4::ALK` and `HAPSTR1::ABAT` supported keeping
+full-mode synthesis context at 8 selected papers while leaving the final
+curator-facing citation cap at 4. Moving from 4 to 8 synthesis papers improved
+average evidence-support score from 0.65 to 0.75 and average verified citation
+count from 3.5 to 3.75, with no change in high-confidence clinical-actionability
+count. Increasing `MAX_CITATIONS_PER_ANNOTATION` should be evaluated separately,
+because that changes final output volume rather than only synthesis context.
 
 ## Output Files
 

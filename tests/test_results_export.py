@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import csv
 
-from src.models.schema import AnnotationResult, GeneAnnotation
+from src.models.schema import (
+    AnnotationResult,
+    ClinicalActionability,
+    ClinicalActionabilityScoreComponent,
+    GeneAnnotation,
+)
 from src.pipeline.results_export import (
     ANNOTATION_RESULTS_CSV_HEADERS,
     build_annotation_results_csv_rows,
@@ -40,6 +45,21 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             insufficient_evidence=False,
             evidence_support_score=0.91,
             evidence_support_explanation="Strong support from verified citations.",
+            clinical_actionability=ClinicalActionability(
+                confidence_score=0.9,
+                summary="High-confidence therapeutic precedent for BRAF.",
+                confidence_explanation="Clinical actionability confidence 0.90.",
+                pmids=["12345"],
+                score_components=[
+                    ClinicalActionabilityScoreComponent(
+                        code="clinical_evidence",
+                        label="Direct human clinical evidence",
+                        delta=0.35,
+                        pmids=["12345"],
+                        detail="Patient cohort evidence.",
+                    )
+                ],
+            ),
             cache_status="reused",
             cache_reason="fresh_high_evidence_support",
             cached_at="2026-07-13T00:00:00+00:00",
@@ -70,6 +90,13 @@ def test_build_annotation_results_csv_rows_flattens_gene_annotations():
             "insufficient_evidence": "FALSE",
             "evidence_support_score": "0.91",
             "evidence_support_explanation": "Strong support from verified citations.",
+            "clinical_actionability_score": "0.9",
+            "clinical_actionability_summary": "High-confidence therapeutic precedent for BRAF.",
+            "clinical_actionability_pmids": "12345",
+            "clinical_actionability_explanation": "Clinical actionability confidence 0.90.",
+            "clinical_actionability_score_components": (
+                "+0.35 Direct human clinical evidence. Patient cohort evidence. PMID(s): 12345"
+            ),
             "quality_flags": "",
             "evidence_card_count": "0",
             "cache_status": "reused",
