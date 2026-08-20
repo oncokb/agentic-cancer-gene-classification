@@ -191,6 +191,16 @@
 
       </aside>
 
+      <div
+        class="sidebar-resizer"
+        id="sidebar-resizer"
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-orientation="vertical"
+        tabindex="0"
+        title="Drag to resize sidebar. Double-click to reset."
+      ></div>
+
       <main class="workspace">
         <header class="workspace-header">
           <div>
@@ -201,8 +211,15 @@
             <button id="open-feedback" type="button" class="feedback-button">Send feedback</button>
             <button id="clear-results" type="button" disabled>Clear results</button>
             <button id="share-run" type="button" disabled title="Copy a link to this run — only works for peers who can reach the same Backend URL">Copy share link</button>
-            <button id="export-json" type="button" disabled>Export JSON</button>
-            <button id="export-csv" type="button" disabled>Export CSV</button>
+            <label class="export-control" for="export-format">
+              <span>Format</span>
+              <select id="export-format">
+                <option value="json">JSON</option>
+                <option value="csv">CSV</option>
+                <option value="pdf">PDF</option>
+              </select>
+            </label>
+            <button id="export-button" type="button" disabled>Export</button>
           </div>
         </header>
 
