@@ -1,3 +1,7 @@
+const SIDEBAR_DEFAULT_WIDTH = 360;
+const SIDEBAR_MIN_WIDTH = 280;
+const SIDEBAR_MAX_WIDTH = 920;
+
 const GRID_COLUMNS = [
   { key: "fusion",           label: "Gene/Fusion",   required: true,  type: "text",   width: 140 },
   { key: "tumor_type",       label: "Tumor Type",    required: false, type: "text",   width: 110 },
@@ -68,9 +72,10 @@ const elements = {
   benchmarkMaxGenes: document.querySelector("#benchmark-max-genes"),
   benchmarkPanel: document.querySelector("#benchmark-panel"),
   clearResults: document.querySelector("#clear-results"),
-  exportCsv: document.querySelector("#export-csv"),
-  exportJson: document.querySelector("#export-json"),
+  exportButton: document.querySelector("#export-button"),
+  exportFormat: document.querySelector("#export-format"),
   shareRun: document.querySelector("#share-run"),
+  appShell: document.querySelector(".app-shell"),
   geneIndex: document.querySelector("#gene-index"),
   openFeedback: document.querySelector("#open-feedback"),
   closeFeedback: document.querySelector("#close-feedback"),
@@ -94,6 +99,7 @@ const elements = {
   runButton: document.querySelector("#run-button"),
   runBenchmarkButton: document.querySelector("#run-benchmark-button"),
   runSummary: document.querySelector("#run-summary"),
+  sidebarResizer: document.querySelector("#sidebar-resizer"),
   workspaceTitle: document.querySelector("#workspace-title"),
   // mode tabs
   tabSingle: document.querySelector("#tab-single"),
@@ -146,6 +152,79 @@ const editableFields = [
 ];
 
 // ---------------------------------------------------------------------------
+// Sidebar resizing
+// ---------------------------------------------------------------------------
+
+function sidebarMaxWidth() {
+  if (window.innerWidth <= 900) return SIDEBAR_DEFAULT_WIDTH;
+  return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, window.innerWidth - 360));
+}
+
+function clampSidebarWidth(width) {
+  return Math.min(sidebarMaxWidth(), Math.max(SIDEBAR_MIN_WIDTH, Math.round(width)));
+}
+
+function setSidebarWidth(width) {
+  elements.appShell.style.setProperty("--sidebar-width", `${clampSidebarWidth(width)}px`);
+}
+
+function resetSidebarWidth() {
+  elements.appShell.style.removeProperty("--sidebar-width");
+}
+
+function initSidebarResize() {
+  const handle = elements.sidebarResizer;
+  if (!handle) return;
+
+  let startX = 0;
+  let startWidth = SIDEBAR_DEFAULT_WIDTH;
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (window.innerWidth <= 900) return;
+    event.preventDefault();
+    startX = event.clientX;
+    startWidth = document.querySelector(".sidebar").getBoundingClientRect().width;
+    document.body.classList.add("sidebar-resizing");
+    handle.setPointerCapture(event.pointerId);
+  });
+
+  handle.addEventListener("pointermove", (event) => {
+    if (!document.body.classList.contains("sidebar-resizing")) return;
+    setSidebarWidth(startWidth + event.clientX - startX);
+  });
+
+  function stopResize(event) {
+    if (!document.body.classList.contains("sidebar-resizing")) return;
+    document.body.classList.remove("sidebar-resizing");
+    if (handle.hasPointerCapture(event.pointerId)) {
+      handle.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  handle.addEventListener("pointerup", stopResize);
+  handle.addEventListener("pointercancel", stopResize);
+  handle.addEventListener("dblclick", resetSidebarWidth);
+  handle.addEventListener("keydown", (event) => {
+    if (event.key === "Home") {
+      event.preventDefault();
+      resetSidebarWidth();
+      return;
+    }
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const delta = event.key === "ArrowRight" ? 24 : -24;
+    const currentWidth = document.querySelector(".sidebar").getBoundingClientRect().width;
+    setSidebarWidth(currentWidth + delta);
+  });
+
+  window.addEventListener("resize", () => {
+    const inlineWidth = elements.appShell.style.getPropertyValue("--sidebar-width");
+    if (!inlineWidth) return;
+    setSidebarWidth(parseFloat(inlineWidth));
+  });
+}
+
+// ---------------------------------------------------------------------------
 // App section switching
 // ---------------------------------------------------------------------------
 
@@ -178,12 +257,11 @@ function switchView(view) {
   elements.annotatePanel.classList.toggle("hidden", isBenchmark);
   elements.benchmarkPanel.classList.toggle("hidden", !isBenchmark);
   elements.workspaceTitle.textContent = isBenchmark ? "Benchmark" : "Results";
-  elements.exportCsv.classList.toggle("hidden", isBenchmark);
   elements.clearResults.classList.toggle("hidden", isBenchmark);
   elements.shareRun.classList.toggle("hidden", isBenchmark);
-  elements.exportJson.disabled = isBenchmark ? !state.currentBenchmark : !state.currentResult;
   elements.clearResults.disabled = isBenchmark || !state.currentResult;
   elements.shareRun.disabled = isBenchmark || !state.currentResult?.run_id;
+  updateExportState();
 
   if (isBenchmark) {
     renderBenchmarkResult(state.currentBenchmark);
@@ -271,8 +349,7 @@ function clearResults() {
   state.currentResult = null;
   state.resultsViewMode = "results";
   state.fusionEvidenceStatus = null;
-  elements.exportJson.disabled = state.currentView === "benchmark" ? !state.currentBenchmark : true;
-  elements.exportCsv.disabled = true;
+  updateExportState();
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
   elements.resultsViewTabs.classList.add("hidden");
@@ -574,6 +651,22 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function updateExportState({ annotationExportDisabled = false } = {}) {
+  const isBenchmark = state.currentView === "benchmark";
+  const hasAnnotationExport = Boolean(state.currentResult?.annotations?.length);
+  const hasBenchmarkExport = Boolean(state.currentBenchmark);
+  const csvOption = elements.exportFormat.querySelector('option[value="csv"]');
+
+  csvOption.disabled = isBenchmark;
+  if (isBenchmark && elements.exportFormat.value === "csv") {
+    elements.exportFormat.value = "json";
+  }
+
+  elements.exportButton.disabled = isBenchmark
+    ? !hasBenchmarkExport
+    : annotationExportDisabled || !hasAnnotationExport;
+}
+
 function renderLoadingState(message) {
   const wrap = document.createElement("div");
   wrap.className = "inline-loading";
@@ -621,6 +714,7 @@ async function runAnnotation() {
   });
 
   setRunning(true);
+  updateExportState({ annotationExportDisabled: true });
   clearMessage();
   setMessage(`Submitting ${annotationInputs.length} input${annotationInputs.length === 1 ? "" : "s"} for annotation...`, "info");
 
@@ -686,8 +780,7 @@ async function pollAnnotationJob(statusUrl) {
     };
     state.currentResult = partial;
     renderAnnotationResult(partial);
-    elements.exportCsv.disabled = status.status !== "complete";
-    elements.exportJson.disabled = status.status !== "complete";
+    updateExportState({ annotationExportDisabled: status.status !== "complete" });
     elements.shareRun.disabled = status.status !== "complete";
 
     if (status.status === "complete") {
@@ -1082,6 +1175,13 @@ function hideFeedbackModal() {
   elements.feedbackModal.classList.add("hidden");
 }
 
+function githubIssueUrl(title, body) {
+  const url = new URL("https://github.com/oncokb/agentic-cancer-gene-classification/issues/new");
+  url.searchParams.set("title", title);
+  url.searchParams.set("body", body);
+  return url.toString();
+}
+
 async function submitFeedbackForm() {
   const message = elements.feedbackMessage.value.trim();
   if (!message) {
@@ -1107,7 +1207,13 @@ async function submitFeedbackForm() {
       const text = await response.text();
       throw new Error(text || "Failed to submit feedback");
     }
-    setInstallOutput("Thanks!", "Your feedback was submitted.");
+    const payload = await response.json();
+    if (payload.issue_title && payload.issue_body) {
+      window.open(githubIssueUrl(payload.issue_title, payload.issue_body), "_blank", "noopener");
+      setInstallOutput("Thanks!", "Your feedback was stored and a GitHub issue draft was opened.");
+    } else {
+      setInstallOutput("Thanks!", "Your feedback was submitted.");
+    }
     elements.feedbackMessage.value = "";
     elements.feedbackEmail.value = "";
   } catch (error) {
@@ -1136,8 +1242,7 @@ function renderAnnotationResult(result) {
   const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
   const fusionEvidence = result.fusion_evidence || [];
   const showFusionTab = fusionEvidence.length > 0 || state.fusionEvidenceStatus === "running";
-  elements.exportCsv.disabled = !allAnnotations.length;
-  elements.exportJson.disabled = !allAnnotations.length;
+  updateExportState();
   elements.clearResults.disabled = false;
   elements.shareRun.disabled = !result.run_id;
 
@@ -1998,8 +2103,7 @@ function renderFusionPartnerPrecedent(annotation) {
 }
 
 function renderBenchmarkResult(result) {
-  elements.exportCsv.disabled = true;
-  elements.exportJson.disabled = !result;
+  updateExportState();
   rebuildGeneIndex([]);
 
   if (!result) {
@@ -2373,17 +2477,10 @@ function downloadBlob(blob, filename) {
 }
 
 async function exportCsv() {
-  if (!state.currentResult) return;
-  const response = await fetch("/v1/export/annotation-results.csv", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(state.currentResult),
+  if (!state.currentResult?.annotations?.length) return;
+  const blob = new Blob([annotationResultToCsv(state.currentResult)], {
+    type: "text/csv;charset=utf-8",
   });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || "CSV export failed");
-  }
-  const blob = await response.blob();
   downloadBlob(blob, "annotation_results.csv");
 }
 
@@ -2395,6 +2492,288 @@ function exportJson() {
     type: "application/json",
   });
   downloadBlob(blob, filename);
+}
+
+function exportPdf() {
+  const payload = state.currentView === "benchmark" ? state.currentBenchmark : state.currentResult;
+  if (!payload) return;
+  const filename = state.currentView === "benchmark" ? "benchmark_report.pdf" : "annotation_results.pdf";
+  downloadBlob(buildPdfBlob(buildPdfLines(payload)), filename);
+}
+
+async function exportSelectedFormat() {
+  const format = elements.exportFormat.value;
+  if (format === "json") {
+    exportJson();
+    return;
+  }
+  if (format === "csv") {
+    if (state.currentView === "benchmark") {
+      throw new Error("CSV export is available for annotation results only.");
+    }
+    await exportCsv();
+    return;
+  }
+  if (format === "pdf") {
+    exportPdf();
+  }
+}
+
+const CSV_HEADERS = [
+  "gene",
+  "fusions",
+  "in_oncokb",
+  "cancer_associated",
+  "cancer_association_rationale",
+  "cancer_type_prevalence",
+  "gene_class",
+  "signaling_pathways",
+  "gene_summary",
+  "citations",
+  "publication_links",
+  "date_annotated",
+  "retrieval_count",
+  "insufficient_evidence",
+  "evidence_support_score",
+  "evidence_support_explanation",
+  "clinical_actionability_score",
+  "clinical_actionability_summary",
+  "clinical_actionability_pmids",
+  "clinical_actionability_explanation",
+  "clinical_actionability_score_components",
+  "quality_flags",
+  "evidence_card_count",
+  "cache_status",
+  "cache_reason",
+  "cached_at",
+  "last_pubmed_checked_at",
+  "error",
+];
+
+function uniqueValues(values) {
+  const seen = new Set();
+  return (values || []).filter((value) => {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+}
+
+function csvCell(value) {
+  const text = Array.isArray(value) ? value.join("; ") : String(value ?? "");
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function formatClinicalActionabilityComponents(annotation) {
+  const components = annotation.clinical_actionability?.score_components || [];
+  return components
+    .map((component) => {
+      const delta = component.delta === undefined ? "" : `${component.delta >= 0 ? "+" : ""}${Number(component.delta).toFixed(2)}`;
+      const pmids = component.pmids?.length ? ` PMID(s): ${component.pmids.join(", ")}` : "";
+      const detail = component.detail ? ` ${component.detail}` : "";
+      return `${delta} ${component.label || ""}.${detail}${pmids}`.trim();
+    })
+    .filter(Boolean)
+    .join(" | ");
+}
+
+function annotationToCsvRow(annotation) {
+  const citations = uniqueValues(annotation.citations || []);
+  const actionability = annotation.clinical_actionability;
+  return {
+    gene: annotation.gene,
+    fusions: uniqueValues(annotation.fusions || []).join("; "),
+    in_oncokb:
+      annotation.in_oncokb === null || annotation.in_oncokb === undefined
+        ? ""
+        : formatBool(annotation.in_oncokb),
+    cancer_associated:
+      annotation.cancer_associated === null || annotation.cancer_associated === undefined
+        ? ""
+        : formatBool(annotation.cancer_associated),
+    cancer_association_rationale: annotation.cancer_association_rationale,
+    cancer_type_prevalence: annotation.cancer_type_prevalence,
+    gene_class: annotation.gene_class,
+    signaling_pathways: annotation.signaling_pathways,
+    gene_summary: annotation.gene_summary,
+    citations: citations.join("; "),
+    publication_links: citations.map((pmid) => `https://pubmed.ncbi.nlm.nih.gov/${pmid}/`).join("; "),
+    date_annotated: annotation.date_annotated,
+    retrieval_count: annotation.retrieval_count,
+    insufficient_evidence: formatBool(annotation.insufficient_evidence),
+    evidence_support_score: annotation.evidence_support_score,
+    evidence_support_explanation: annotation.evidence_support_explanation,
+    clinical_actionability_score: actionability?.confidence_score ?? "",
+    clinical_actionability_summary: actionability?.summary || "",
+    clinical_actionability_pmids: (actionability?.pmids || []).join("; "),
+    clinical_actionability_explanation: actionability?.confidence_explanation || "",
+    clinical_actionability_score_components: formatClinicalActionabilityComponents(annotation),
+    quality_flags: (annotation.quality_flags || []).map((flag) => flag.code).join("; "),
+    evidence_card_count: (annotation.evidence_cards || []).length,
+    cache_status: annotation.cache_status,
+    cache_reason: annotation.cache_reason,
+    cached_at: annotation.cached_at,
+    last_pubmed_checked_at: annotation.last_pubmed_checked_at,
+    error: annotation.error,
+  };
+}
+
+function annotationResultToCsv(result) {
+  const rows = (result.annotations || []).map(annotationToCsvRow);
+  return [
+    CSV_HEADERS.join(","),
+    ...rows.map((row) => CSV_HEADERS.map((header) => csvCell(row[header])).join(",")),
+  ].join("\n");
+}
+
+function buildPdfLines(payload) {
+  return state.currentView === "benchmark"
+    ? buildBenchmarkPdfLines(payload)
+    : buildAnnotationPdfLines(payload);
+}
+
+function buildAnnotationPdfLines(result) {
+  const lines = [
+    "Cancer Gene Classification Results",
+    `Run ID: ${result.run_id || ""}`,
+    `Timestamp: ${result.timestamp || ""}`,
+    `Inputs processed: ${result.fusions_processed ?? ""}`,
+    `Genes annotated: ${result.genes_annotated ?? ""}`,
+    "",
+  ];
+
+  (result.annotations || []).forEach((annotation) => {
+    lines.push(
+      annotation.gene || "Unknown gene",
+      `Inputs: ${formatList(annotation.fusions)}`,
+      `In OncoKB: ${formatBool(annotation.in_oncokb)}`,
+      `Cancer associated: ${formatBool(annotation.cancer_associated)}`,
+      `Evidence support: ${annotation.evidence_support_score ?? ""}`,
+      `Clinical actionability: ${annotation.clinical_actionability?.confidence_score ?? ""}`,
+      `Gene class: ${annotation.gene_class || ""}`,
+      `Signaling pathways: ${annotation.signaling_pathways || ""}`,
+      `Insufficient evidence: ${formatBool(annotation.insufficient_evidence)}`,
+      `Citations: ${formatList(uniqueValues(annotation.citations || []))}`,
+      `Rationale: ${annotation.cancer_association_rationale || ""}`,
+      `Gene summary: ${annotation.gene_summary || ""}`,
+      "",
+    );
+  });
+  return lines;
+}
+
+function buildBenchmarkPdfLines(result) {
+  const metrics = result.categorical_metrics || {};
+  const cancer = metrics.cancer_associated || {};
+  const citations = metrics.citations || {};
+  const judge = result.judge && result.judge.aggregate ? result.judge.aggregate : null;
+  const lines = [
+    "Benchmark Report",
+    `Genes evaluated: ${result.n_genes || metrics.n || 0}`,
+    `Cancer accuracy: ${formatMetric(cancer.accuracy)}`,
+    `Cancer Cohen's kappa: ${formatMetric(cancer.cohen_kappa)}`,
+    `Citation F1: ${formatMetric(citations.f1)}`,
+    `Citation precision / recall: ${formatMetric(citations.precision)} / ${formatMetric(citations.recall)}`,
+    `Summary judge: ${judge ? `${formatMetric(judge.mean_score)}/4` : "Skipped"}`,
+    "",
+  ];
+
+  (result.per_gene_report || []).forEach((row) => {
+    lines.push(
+      `${row.gene || "Unknown gene"}: cancer ${formatBool(row.pred_cancer_associated)} / ${formatBool(row.gold_cancer_associated)}, citation F1 ${formatMetric(row.citation_f1)}`,
+      `TP: ${formatList(row.citation_tp)}`,
+      `FP: ${formatList(row.citation_fp)}`,
+      `FN: ${formatList(row.citation_fn)}`,
+      "",
+    );
+  });
+  return lines;
+}
+
+function sanitizePdfText(value) {
+  return String(value ?? "")
+    .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function wrapPdfLine(line, maxChars = 94) {
+  const text = sanitizePdfText(line);
+  if (!text) return [""];
+  const words = text.split(" ");
+  const lines = [];
+  let current = "";
+  words.forEach((word) => {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length > maxChars && current) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = next;
+    }
+  });
+  if (current) lines.push(current);
+  return lines;
+}
+
+function escapePdfString(value) {
+  return sanitizePdfText(value)
+    .replaceAll("\\", "\\\\")
+    .replaceAll("(", "\\(")
+    .replaceAll(")", "\\)");
+}
+
+function buildPdfBlob(rawLines) {
+  const lines = rawLines.flatMap((line) => wrapPdfLine(line));
+  const pageLineCount = 52;
+  const pages = [];
+  for (let i = 0; i < lines.length; i += pageLineCount) {
+    pages.push(lines.slice(i, i + pageLineCount));
+  }
+  if (!pages.length) pages.push(["No exportable data."]);
+
+  const objects = [];
+  const fontObjectNumber = 3;
+  const pageObjectNumbers = pages.map((_, index) => 4 + index * 2);
+  const contentObjectNumbers = pages.map((_, index) => 5 + index * 2);
+
+  objects[1] = "<< /Type /Catalog /Pages 2 0 R >>";
+  objects[2] = `<< /Type /Pages /Kids [${pageObjectNumbers.map((n) => `${n} 0 R`).join(" ")}] /Count ${pages.length} >>`;
+  objects[fontObjectNumber] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+
+  pages.forEach((pageLines, index) => {
+    const pageNumber = pageObjectNumbers[index];
+    const contentNumber = contentObjectNumbers[index];
+    const commands = [
+      "BT",
+      "/F1 10 Tf",
+      "14 TL",
+      "50 770 Td",
+      ...pageLines.map((line, lineIndex) =>
+        `${lineIndex === 0 ? "" : "T* "}(${escapePdfString(line)}) Tj`.trim(),
+      ),
+      "ET",
+    ];
+    const stream = commands.join("\n");
+    objects[pageNumber] =
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ` +
+      `/Resources << /Font << /F1 ${fontObjectNumber} 0 R >> >> /Contents ${contentNumber} 0 R >>`;
+    objects[contentNumber] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`;
+  });
+
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (let i = 1; i < objects.length; i += 1) {
+    offsets[i] = pdf.length;
+    pdf += `${i} 0 obj\n${objects[i]}\nendobj\n`;
+  }
+  const xrefOffset = pdf.length;
+  pdf += `xref\n0 ${objects.length}\n0000000000 65535 f \n`;
+  for (let i = 1; i < objects.length; i += 1) {
+    pdf += `${String(offsets[i]).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return new Blob([pdf], { type: "application/pdf" });
 }
 
 // ---------------------------------------------------------------------------
@@ -2484,17 +2863,19 @@ function bindEvents() {
 
   elements.shareRun.addEventListener("click", copyShareLink);
   elements.clearResults.addEventListener("click", clearResults);
-  elements.exportJson.addEventListener("click", exportJson);
-  elements.exportCsv.addEventListener("click", async () => {
+  elements.exportButton.addEventListener("click", async () => {
     try {
-      await exportCsv();
+      await exportSelectedFormat();
     } catch (error) {
       setMessage(error.message, "error");
     }
   });
+  elements.exportFormat.addEventListener("change", updateExportState);
 }
 
+initSidebarResize();
 bindEvents();
 renderGrid();
+updateExportState();
 loadDevStatus();
 loadSharedRun();

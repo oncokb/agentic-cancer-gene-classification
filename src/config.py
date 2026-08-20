@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     core_synthesis_escalation_min_support_score: float = 0.0
     core_synthesis_escalation_tier2: bool = False
     selection_model: str = "claude-haiku-4-5-20251001"
+    feedback_model: str = "claude-haiku-4-5-20251001"
     bedrock_synthesis_model: str = ""
     bedrock_synthesis_fast_model: str = ""
     bedrock_selection_model: str = ""
