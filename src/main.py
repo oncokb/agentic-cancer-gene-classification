@@ -47,6 +47,7 @@ from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
+from src.pipeline.llm_client import complete_with_tool
 from src.pipeline.normalization import is_fusion_input
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.run_store import RunStore
@@ -746,6 +747,120 @@ async def fusion_partner_evidence(request: FusionPartnerEvidenceRequest) -> Fusi
     )
 
 
+FEEDBACK_ISSUE_TOOL = {
+    "name": "draft_feedback_issue",
+    "description": "Draft a concise GitHub issue from curator feedback.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "A concise GitHub issue title, 80 characters or fewer.",
+            },
+            "problem_summary": {
+                "type": "string",
+                "description": "A neutral summary of the reported bug, request, or annotation issue.",
+            },
+            "suggested_solution": {
+                "type": "string",
+                "description": "Concrete engineering guidance for how to address the feedback.",
+            },
+            "acceptance_criteria": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short checklist items for resolving the issue.",
+            },
+        },
+        "required": [
+            "title",
+            "problem_summary",
+            "suggested_solution",
+            "acceptance_criteria",
+        ],
+    },
+}
+
+
+def _fallback_feedback_issue(payload: FeedbackRequest) -> dict:
+    first_line = payload.message.strip().splitlines()[0][:80] or "Curator feedback"
+    return {
+        "title": f"Feedback: {first_line}",
+        "problem_summary": payload.message.strip(),
+        "suggested_solution": "Review the original feedback and translate it into a scoped UI or pipeline change.",
+        "acceptance_criteria": [
+            "Original feedback is addressed or explicitly declined.",
+            "Relevant UI/API behavior is covered by a focused test or smoke check.",
+        ],
+    }
+
+
+def _feedback_issue_body(payload: FeedbackRequest, draft: dict, feedback_id: str) -> str:
+    criteria = draft.get("acceptance_criteria") or []
+    criteria_lines = "\n".join(f"- [ ] {item}" for item in criteria if str(item).strip())
+    context_lines = [
+        f"- Feedback ID: {feedback_id}",
+        f"- Category: {payload.category}",
+        f"- Run ID: {payload.run_id or ''}",
+        f"- Gene: {payload.gene or ''}",
+        f"- Page URL: {payload.page_url or ''}",
+        f"- Contact email: {payload.contact_email or ''}",
+    ]
+    return "\n".join(
+        [
+            "## Parsed Feedback",
+            str(draft.get("problem_summary") or "").strip(),
+            "",
+            "## Suggested Solution",
+            str(draft.get("suggested_solution") or "").strip(),
+            "",
+            "## Acceptance Criteria",
+            criteria_lines or "- [ ] Review and resolve this feedback.",
+            "",
+            "## Original Feedback",
+            "```",
+            payload.message.strip(),
+            "```",
+            "",
+            "## Context",
+            "\n".join(context_lines),
+        ]
+    )
+
+
+async def _draft_feedback_issue(payload: FeedbackRequest, feedback_id: str) -> tuple[str, str]:
+    system = (
+        "You triage feedback for a cancer gene annotation web app. "
+        "Turn the raw curator feedback into a small, actionable GitHub issue. "
+        "Do not invent facts. Keep the title concise. Suggested solutions should be concrete "
+        "engineering guidance, not vague product language."
+    )
+    user = (
+        f"Raw feedback:\n{payload.message.strip()}\n\n"
+        f"Category: {payload.category}\n"
+        f"Run ID: {payload.run_id or ''}\n"
+        f"Gene: {payload.gene or ''}\n"
+        f"Page URL: {payload.page_url or ''}"
+    )
+    try:
+        draft = await complete_with_tool(
+            model=settings.feedback_model,
+            system=system,
+            user=user,
+            tool=FEEDBACK_ISSUE_TOOL,
+            max_tokens=1200,
+            model_purpose="selection",
+        )
+    except Exception:
+        logger.exception("Feedback issue LLM draft failed; using fallback draft")
+        draft = _fallback_feedback_issue(payload)
+
+    if not draft:
+        draft = _fallback_feedback_issue(payload)
+
+    title = str(draft.get("title") or "ACGC feedback").strip()[:120] or "ACGC feedback"
+    return title, _feedback_issue_body(payload, draft, feedback_id)
+
+
 @app.post("/v1/feedback", response_model=FeedbackResponse, status_code=201)
 async def submit_feedback(payload: FeedbackRequest, http_request: Request) -> FeedbackResponse:
     """
@@ -765,7 +880,12 @@ async def submit_feedback(payload: FeedbackRequest, http_request: Request) -> Fe
         page_url=payload.page_url,
         user_agent=http_request.headers.get("user-agent"),
     )
-    return FeedbackResponse(feedback_id=feedback_id)
+    issue_title, issue_body = await _draft_feedback_issue(payload, feedback_id)
+    return FeedbackResponse(
+        feedback_id=feedback_id,
+        issue_title=issue_title,
+        issue_body=issue_body,
+    )
 
 
 @app.post("/v1/dev/benchmark")
