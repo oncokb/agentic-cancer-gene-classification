@@ -9,6 +9,7 @@ from src.pipeline.literature import (
     _esearch,
     _exclude_retracted_query,
     _filter_retracted_records,
+    find_retracted_pmids,
 )
 from src.pipeline.synthesis import _postprocess_synthesis_output
 
@@ -21,7 +22,7 @@ def test_filter_retracted_records_uses_publication_type_and_title_prefix():
     records = [
         LiteratureRecord(
             pmid="1",
-            title="Retracted: BRWD1 cancer study",
+            title="[Retracted] BRWD1 cancer study",
             abstract="Retracted abstract.",
             publication_types=["Journal Article"],
         ),
@@ -36,6 +37,14 @@ def test_filter_retracted_records_uses_publication_type_and_title_prefix():
             title="BRWD1 cancer biology",
             abstract="Supported abstract.",
             publication_types=["Journal Article"],
+        ),
+        LiteratureRecord(
+            pmid="4",
+            title="BRWD1 cancer biology",
+            abstract="Supported abstract.",
+            publication_types=["Journal Article"],
+            pubmed_comment_ref_types=["RetractionIn"],
+            pubmed_comment_pmids=["5"],
         ),
     ]
 
@@ -109,6 +118,89 @@ async def test_efetch_filters_retracted_pubmed_records(monkeypatch):
         records = await _efetch(["1", "2"], client)
 
     assert [record.pmid for record in records] == ["2"]
+
+
+async def test_efetch_filters_pubmed_comments_retraction_metadata(monkeypatch):
+    monkeypatch.setattr(literature, "cached_call", _uncached)
+    xml = """\
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>1</PMID>
+      <Article>
+        <ArticleTitle>BRWD1 cancer paper later retracted</ArticleTitle>
+        <Abstract><AbstractText>Retracted abstract.</AbstractText></Abstract>
+        <PublicationTypeList>
+          <PublicationType>Journal Article</PublicationType>
+        </PublicationTypeList>
+      </Article>
+      <CommentsCorrectionsList>
+        <CommentsCorrections RefType="RetractionIn">
+          <PMID>3</PMID>
+        </CommentsCorrections>
+      </CommentsCorrectionsList>
+    </MedlineCitation>
+  </PubmedArticle>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>2</PMID>
+      <Article>
+        <ArticleTitle>BRWD1 cancer paper</ArticleTitle>
+        <Abstract><AbstractText>Supported abstract.</AbstractText></Abstract>
+        <PublicationTypeList>
+          <PublicationType>Journal Article</PublicationType>
+        </PublicationTypeList>
+      </Article>
+    </MedlineCitation>
+  </PubmedArticle>
+</PubmedArticleSet>
+"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=xml)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        records = await _efetch(["1", "2"], client)
+
+    assert [record.pmid for record in records] == ["2"]
+
+
+async def test_find_retracted_pmids_detects_metadata_even_without_abstract(monkeypatch):
+    monkeypatch.setattr(literature, "cached_call", _uncached)
+    xml = """\
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>1</PMID>
+      <Article>
+        <ArticleTitle>BRWD1 cancer paper later retracted</ArticleTitle>
+        <PublicationTypeList>
+          <PublicationType>Journal Article</PublicationType>
+        </PublicationTypeList>
+      </Article>
+      <CommentsCorrectionsList>
+        <CommentsCorrections RefType="RetractionIn">
+          <PMID>3</PMID>
+        </CommentsCorrections>
+      </CommentsCorrectionsList>
+    </MedlineCitation>
+  </PubmedArticle>
+</PubmedArticleSet>
+"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=xml)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        original_efetch = literature._efetch
+
+        async def fake_efetch(pmids, _client, *, filter_retracted=True):
+            return await original_efetch(pmids, client, filter_retracted=filter_retracted)
+
+        monkeypatch.setattr(literature, "_efetch", fake_efetch)
+        retracted = await find_retracted_pmids(["1"])
+
+    assert retracted == {"1"}
 
 
 def test_synthesis_postprocess_drops_retracted_citation():

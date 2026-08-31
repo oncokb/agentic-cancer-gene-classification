@@ -3,7 +3,9 @@ from __future__ import annotations
 from src.models.schema import LiteratureRecord
 from src.pipeline import literature
 from src.pipeline.literature import (
+    _filter_exact_fusion_records,
     _fusion_evidence_queries,
+    record_discusses_exact_fusion,
     retrieve_fusion_evidence,
 )
 
@@ -18,6 +20,34 @@ def test_fusion_evidence_queries_use_exact_pair_variants_and_tumor_type():
     assert queries[0].startswith('("EML4::ALK" OR "EML4-ALK"')
     assert "lung adenocarcinoma" in queries[0]
     assert "fusion OR rearrangement OR translocation" in queries[1]
+
+
+def test_record_discusses_exact_fusion_rejects_broad_cooccurrence():
+    exact = LiteratureRecord(
+        pmid="1",
+        title="Recurrent PLAGL1-MYB fusion in leukemia",
+        abstract="The PLAGL1-MYB fusion was detected by RNA sequencing.",
+        publication_types=["Journal Article"],
+    )
+    contextual = LiteratureRecord(
+        pmid="2",
+        title="Gene rearrangements in leukemia",
+        abstract="We identified a fusion involving PLAGL1 and MYB in a patient sample.",
+        publication_types=["Journal Article"],
+    )
+    false_positive = LiteratureRecord(
+        pmid="3",
+        title="Studies of genomic imbalances and the MYB-NFIB gene fusion",
+        abstract="PLAGL1 methylation was also evaluated in the same cohort.",
+        publication_types=["Journal Article"],
+    )
+
+    assert record_discusses_exact_fusion(exact, "PLAGL1::MYB") is True
+    assert record_discusses_exact_fusion(contextual, "PLAGL1::MYB") is True
+    assert record_discusses_exact_fusion(false_positive, "PLAGL1::MYB") is False
+    assert [record.pmid for record in _filter_exact_fusion_records(
+        [exact, contextual, false_positive], "PLAGL1::MYB"
+    )] == ["1", "2"]
 
 
 async def test_retrieve_fusion_evidence_uses_cache_and_marks_supported(monkeypatch):
@@ -42,10 +72,10 @@ async def test_retrieve_fusion_evidence_uses_cache_and_marks_supported(monkeypat
             ),
             LiteratureRecord(
                 pmid="2",
-                title="Novel fusion report",
-                abstract="A novel fusion was observed in one case.",
+                title="Additional EML4-ALK fusion cohort",
+                abstract="The EML4-ALK fusion was observed in a second lung cancer cohort.",
                 journal="Cancer Res",
-                publication_types=["Case Reports"],
+                publication_types=["Journal Article"],
             ),
         ]
 

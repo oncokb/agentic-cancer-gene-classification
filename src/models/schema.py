@@ -27,8 +27,10 @@ class LiteratureRecord(BaseModel):
     title: str
     abstract: str
     journal: str = ""
-    publication_types: list[str] = []
+    publication_types: List[str] = Field(default_factory=list)
     publication_year: Optional[int] = None
+    pubmed_comment_ref_types: List[str] = Field(default_factory=list)
+    pubmed_comment_pmids: List[str] = Field(default_factory=list)
     # Query families that surfaced this PMID during retrieval (e.g. "mesh_gene_name",
     # "free_text", "tier2_agentic") — a PMID can be found by more than one query.
     # Feeds the query-tier precision signal in the citation pre-ranking heuristic.

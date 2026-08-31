@@ -2,9 +2,19 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from src.models.schema import FusionInput, GeneAnnotation, ResolvedGene
 from src.pipeline import orchestrator
 from src.pipeline.orchestrator import run_pipeline
+
+
+async def _no_retracted_pmids(_annotation):
+    return set()
+
+
+async def _retracted_pmid_12345(_annotation):
+    return {"12345"}
 
 
 class FakeGeneStore:
@@ -34,6 +44,11 @@ class FakeGeneStore:
 
 def _resolved_gene(gene: str) -> ResolvedGene:
     return ResolvedGene(input_symbol=gene, canonical_symbol=gene, resolved=True)
+
+
+@pytest.fixture(autouse=True)
+def _assume_cached_annotations_are_not_retracted(monkeypatch):
+    monkeypatch.setattr(orchestrator, "find_retracted_annotation_pmids", _no_retracted_pmids)
 
 
 async def test_run_pipeline_reuses_fresh_high_support_cached_annotation(monkeypatch):
@@ -74,6 +89,55 @@ async def test_run_pipeline_reuses_fresh_high_support_cached_annotation(monkeypa
     assert result.annotations[0].cache_status == "reused"
     assert result.annotations[0].cache_reason == "fresh_high_evidence_support"
     assert store.saved == []
+
+
+async def test_run_pipeline_refreshes_cached_annotation_with_retracted_pmid(monkeypatch):
+    updated_at = datetime.now(timezone.utc) - timedelta(days=10)
+    cached_annotation = GeneAnnotation(
+        gene="BRAF",
+        fusions=["OLD::BRAF"],
+        in_oncokb=False,
+        cancer_associated=True,
+        citations=["12345", "67890"],
+        insufficient_evidence=False,
+        evidence_support_score=0.9,
+        evidence_support_explanation="High support.",
+    )
+    store = FakeGeneStore(
+        {
+            "BRAF": {
+                "annotation": cached_annotation.model_dump(),
+                "updated_at": updated_at,
+                "last_pubmed_checked_at": updated_at,
+            }
+        }
+    )
+
+    async def fake_normalize_fusions(_fusions):
+        return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
+
+    async def fake_annotate_gene(**kwargs):
+        return GeneAnnotation(
+            gene=kwargs["gene"],
+            fusions=kwargs["fusions"],
+            in_oncokb=False,
+            cancer_associated=True,
+            citations=["67890"],
+            insufficient_evidence=False,
+            evidence_support_score=0.7,
+            evidence_support_explanation="Refreshed without retracted citations.",
+            cache_status="refreshed",
+        )
+
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "find_retracted_annotation_pmids", _retracted_pmid_12345)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
+
+    result = await run_pipeline(["TP53::BRAF"], run_store=store)
+
+    assert result.annotations[0].cache_status == "refreshed"
+    assert result.annotations[0].citations == ["67890"]
+    assert store.saved[0][0].gene == "BRAF"
 
 
 async def test_run_pipeline_reuses_stale_cache_when_pubmed_has_no_new_pmids(monkeypatch):
