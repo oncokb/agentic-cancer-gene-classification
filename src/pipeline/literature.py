@@ -55,6 +55,12 @@ _RETRACTION_PUBLICATION_TYPES: frozenset[str] = frozenset({
     "retracted publication",
     "retraction of publication",
 })
+_RETRACTION_COMMENT_REF_TYPES: frozenset[str] = frozenset({
+    "retractionin",
+    "retractionof",
+    "retractedandrepublishedin",
+    "retractedandrepublishedfrom",
+})
 _RETRACTION_QUERY_EXCLUSION = (
     '("Retracted Publication"[Publication Type] OR '
     '"Retraction of Publication"[Publication Type])'
@@ -167,8 +173,14 @@ def _is_retracted_publication(record: LiteratureRecord) -> bool:
     publication_types = {value.strip().lower() for value in record.publication_types}
     if publication_types.intersection(_RETRACTION_PUBLICATION_TYPES):
         return True
+    comment_ref_types = {
+        value.strip().lower().replace(" ", "")
+        for value in record.pubmed_comment_ref_types
+    }
+    if comment_ref_types.intersection(_RETRACTION_COMMENT_REF_TYPES):
+        return True
     title = record.title.strip().lower()
-    return title.startswith(("retracted:", "retraction:"))
+    return bool(re.match(r"^\[?retract(?:ed|ion)\b", title))
 
 
 def _filter_retracted_records(records: List[LiteratureRecord]) -> List[LiteratureRecord]:
@@ -201,6 +213,73 @@ def _fusion_query_variants(fusion: str) -> List[str]:
         f"{five_prime} {three_prime}",
     ]
     return list(dict.fromkeys(variants))
+
+
+def _gene_boundary_pattern(gene: str) -> str:
+    return rf"(?<![A-Z0-9]){re.escape(gene.strip().upper())}(?![A-Z0-9])"
+
+
+def _fusion_notation_pairs(text: str) -> List[tuple[str, str]]:
+    return [
+        (match.group(1), match.group(2))
+        for match in re.finditer(
+            r"(?<![A-Z0-9])([A-Z0-9]+)\s*(?:::+|--|[-/])\s*([A-Z0-9]+)(?![A-Z0-9])",
+            text,
+        )
+    ]
+
+
+def record_discusses_exact_fusion(record: LiteratureRecord, fusion: str) -> bool:
+    """Require the cited record to explicitly connect both partners as one fusion."""
+    five_prime, three_prime = split_fusion(fusion)
+    if not five_prime or not three_prime:
+        return False
+
+    text = f"{record.title} {record.abstract}".upper()
+    left = _gene_boundary_pattern(five_prime)
+    right = _gene_boundary_pattern(three_prime)
+    separator = r"\s*(?:::+|--|[-/])\s*"
+    direct_patterns = (
+        rf"{left}{separator}{right}",
+        rf"{right}{separator}{left}",
+    )
+    if any(re.search(pattern, text) for pattern in direct_patterns):
+        return True
+
+    requested_pair = {five_prime.strip().upper(), three_prime.strip().upper()}
+    for notation_pair in _fusion_notation_pairs(text):
+        pair = set(notation_pair)
+        if pair != requested_pair and pair.intersection(requested_pair):
+            return False
+
+    fusion_term = (
+        r"(FUSION|FUSIONS|FUSED|CHIMERIC|REARRANGEMENT|REARRANGEMENTS|"
+        r"REARRANGED|TRANSLOCATION|TRANSLOCATIONS)"
+    )
+    bridge = r"[^.;\n]{0,120}"
+    contextual_patterns = (
+        rf"{left}{bridge}{right}{bridge}{fusion_term}",
+        rf"{right}{bridge}{left}{bridge}{fusion_term}",
+        rf"{left}{bridge}{fusion_term}{bridge}{right}",
+        rf"{right}{bridge}{fusion_term}{bridge}{left}",
+        rf"{fusion_term}{bridge}{left}{bridge}{right}",
+        rf"{fusion_term}{bridge}{right}{bridge}{left}",
+    )
+    return any(re.search(pattern, text) for pattern in contextual_patterns)
+
+
+def _filter_exact_fusion_records(
+    records: List[LiteratureRecord], fusion: str
+) -> List[LiteratureRecord]:
+    filtered = [record for record in records if record_discusses_exact_fusion(record, fusion)]
+    dropped = len(records) - len(filtered)
+    if dropped:
+        logger.info(
+            "Filtered %d PubMed record(s) that did not explicitly discuss %s",
+            dropped,
+            fusion,
+        )
+    return filtered
 
 
 def _fusion_evidence_queries(fusion: str, tumor_type: Optional[str] = None) -> List[str]:
@@ -261,7 +340,9 @@ def _build_fusion_evidence_cards(
     cards: List[FusionEvidenceCard] = []
     for record in records[:limit]:
         evidence_type = _fusion_evidence_type(record)
-        selected_reason = f"Matched an exact fusion-pair PubMed query as {evidence_type.replace('_', ' ')} evidence."
+        selected_reason = (
+            f"Explicitly discussed the exact fusion pair as {evidence_type.replace('_', ' ')} evidence."
+        )
         if record.journal in _HIGH_IMPACT_JOURNALS:
             selected_reason += " High-impact journal signal."
         cards.append(
@@ -315,6 +396,8 @@ async def retrieve_fusion_evidence(
             "tumor_type": " ".join((tumor_type or "").strip().lower().split()),
             "max_results": max_results,
             "min_papers": settings.min_papers_for_strong_association,
+            "exact_fusion_filter_version": 2,
+            "retraction_filter_version": 2,
         },
         sort_keys=True,
     )
@@ -359,7 +442,7 @@ async def _retrieve_fusion_evidence_uncached(
                     pmids.append(pmid)
         records = await _efetch(pmids, client)
 
-    records = _rank_records(_filter_retracted_records(records))
+    records = _rank_records(_filter_exact_fusion_records(_filter_retracted_records(records), fusion))
     novelty_count = _novelty_record_count(records)
     well_supported = (
         len(records) >= settings.min_papers_for_strong_association
@@ -760,7 +843,12 @@ def _parse_pub_year(pub_date_el: Optional[ET.Element]) -> Optional[int]:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[LiteratureRecord]:
+async def _efetch(
+    pmids: List[str],
+    client: httpx.AsyncClient,
+    *,
+    filter_retracted: bool = True,
+) -> List[LiteratureRecord]:
     """Fetch abstracts for a list of PMIDs, including journal and publication type metadata."""
     if not pmids:
         return []
@@ -782,10 +870,10 @@ async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[Literatur
                 pmid_el = article.find(".//PMID")
                 pmid = pmid_el.text if pmid_el is not None else None
                 title_el = article.find(".//ArticleTitle")
-                title = (title_el.text or "").strip() if title_el is not None else ""
+                title = "".join(title_el.itertext()).strip() if title_el is not None else ""
                 abstract_parts = article.findall(".//AbstractText")
                 abstract = " ".join(
-                    (el.text or "").strip() for el in abstract_parts if el.text
+                    " ".join(el.itertext()).strip() for el in abstract_parts
                 ).strip()
                 journal_el = article.find(".//MedlineTA")
                 journal = journal_el.text.strip() if journal_el is not None and journal_el.text else ""
@@ -796,19 +884,60 @@ async def _efetch(pmids: List[str], client: httpx.AsyncClient) -> List[Literatur
                 ]
                 pub_date_el = article.find(".//Article/Journal/JournalIssue/PubDate")
                 year = _parse_pub_year(pub_date_el)
-                if pmid and abstract:
+                comments_corrections = article.findall(".//CommentsCorrections")
+                comment_ref_types = [
+                    ref_type.strip()
+                    for ref_type in (
+                        el.attrib.get("RefType", "")
+                        for el in comments_corrections
+                    )
+                    if ref_type.strip()
+                ]
+                comment_pmids = [
+                    pmid_el.text.strip()
+                    for el in comments_corrections
+                    for pmid_el in el.findall("PMID")
+                    if pmid_el.text and pmid_el.text.strip()
+                ]
+                retraction_metadata = set(
+                    value.strip().lower().replace(" ", "")
+                    for value in comment_ref_types
+                ).intersection(_RETRACTION_COMMENT_REF_TYPES) or set(
+                    value.strip().lower() for value in pub_types
+                ).intersection(_RETRACTION_PUBLICATION_TYPES)
+                if pmid and (abstract or retraction_metadata):
                     records.append({
                         "pmid": pmid, "title": title, "abstract": abstract,
                         "journal": journal, "publication_types": pub_types,
                         "publication_year": year,
+                        "pubmed_comment_ref_types": comment_ref_types,
+                        "pubmed_comment_pmids": comment_pmids,
                     })
         except ET.ParseError as exc:
             logger.warning("XML parse error in efetch: %s", exc)
         return records
 
-    cache_key = f"pubmed:efetch:{','.join(sorted(pmids))}"
+    cache_key = f"pubmed:efetch:v2:{','.join(sorted(pmids))}"
     records = await cached_call(cache_key, _fetch)
-    return _filter_retracted_records([LiteratureRecord(**r) for r in records])
+    parsed_records = [LiteratureRecord(**r) for r in records]
+    return _filter_retracted_records(parsed_records) if filter_retracted else parsed_records
+
+
+async def find_retracted_pmids(pmids: List[str]) -> Set[str]:
+    """Return PMIDs whose PubMed metadata marks them as retracted or retraction notices."""
+    unique_pmids = list(dict.fromkeys(pmid for pmid in pmids if pmid))
+    if not unique_pmids:
+        return set()
+    async with httpx.AsyncClient() as client:
+        records = await _efetch(unique_pmids, client, filter_retracted=False)
+    fetched_pmids = {record.pmid for record in records}
+    retracted_pmids = {
+        record.pmid for record in records if _is_retracted_publication(record)
+    }
+    missing_pmids = set(unique_pmids) - fetched_pmids
+    if missing_pmids:
+        logger.warning("PubMed retraction check could not fetch %d PMID(s)", len(missing_pmids))
+    return retracted_pmids
 
 
 async def _search_and_fetch(

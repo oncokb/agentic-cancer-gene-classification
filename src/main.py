@@ -50,6 +50,7 @@ from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_pa
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline.normalization import is_fusion_input
 from src.pipeline.orchestrator import run_pipeline
+from src.pipeline.result_sanitizer import sanitize_annotation_result
 from src.pipeline.run_store import RunStore
 
 _log_record_factory = logging.getLogRecordFactory()
@@ -675,7 +676,14 @@ async def get_annotation_run(run_id: str, http_request: Request) -> AnnotationRe
     stored = await http_request.app.state.run_store.get_run(run_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="Run not found")
-    return AnnotationResult(**stored)
+    result = AnnotationResult(**stored)
+    try:
+        result, changed = await sanitize_annotation_result(result)
+        if changed:
+            await http_request.app.state.run_store.update_run_result(run_id, result.model_dump())
+    except Exception:
+        logger.exception("Failed to sanitize stored run %s", run_id)
+    return result
 
 
 @app.post("/v1/fusion-context", response_model=FusionContextResponse)

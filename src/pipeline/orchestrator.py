@@ -32,6 +32,7 @@ from src.pipeline.literature import (
 )
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
+from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
 
@@ -140,6 +141,19 @@ async def _maybe_reuse_cached_annotation(
         return None
 
     annotation = GeneAnnotation(**cached["annotation"])
+    try:
+        retracted_pmids = await find_retracted_annotation_pmids(annotation)
+    except Exception:
+        logger.exception("Refreshing cached annotation for %s because retraction validation failed", gene)
+        return None
+    if retracted_pmids:
+        logger.info(
+            "Refreshing cached annotation for %s because referenced PMID(s) are retracted: %s",
+            gene,
+            ", ".join(sorted(retracted_pmids)),
+        )
+        return None
+
     updated_at = cached.get("updated_at")
     if updated_at is None:
         return None
