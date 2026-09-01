@@ -1224,9 +1224,15 @@ async def _tier2_agentic_retrieve(
     async with httpx.AsyncClient() as http_client:
         while tool_calls_made < MAX_AGENTIC_TOOL_CALLS:
             response = await client.messages.create(
-                model=resolve_sdk_model(settings.synthesis_model, "synthesis"),
+                model=resolve_sdk_model(settings.retrieval_model, "retrieval"),
                 max_tokens=1024,
-                system=_AGENTIC_SYSTEM,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _AGENTIC_SYSTEM,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
                 tools=[_SEARCH_PUBMED_TOOL, _DONE_TOOL],
                 messages=messages,
             )
@@ -1330,14 +1336,14 @@ async def _tier2_local_retrieve(
     )
 
     result = await complete_with_tool(
-        model=settings.synthesis_model,
+        model=settings.retrieval_model,
         system=_AGENTIC_SYSTEM,
         user=user_prompt,
         tool=_SUGGEST_QUERIES_TOOL,
         max_tokens=1024,
         local_mode=True,
         local_backend=local_backend,
-        model_purpose="synthesis",
+        model_purpose="retrieval",
     )
     queries = [q for q in result.get("queries", []) if isinstance(q, str) and q.strip()]
     queries = list(dict.fromkeys(q.strip() for q in queries))[:MAX_AGENTIC_TOOL_CALLS]

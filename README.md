@@ -31,6 +31,11 @@ Default model stack:
   `CORE_SYNTHESIS_MAX_PAPERS`.
 - Paper selection uses `SELECTION_MODEL` (`claude-haiku-4-5-20251001` by
   default) when the retrieved corpus is small enough for the selection pass.
+- Tier 2 agentic PubMed query planning uses `RETRIEVAL_MODEL`
+  (`claude-haiku-4-5-20251001` by default), decoupled from `SYNTHESIS_MODEL` —
+  deciding what to search for doesn't need a frontier-tier model, and this loop
+  can run several tool turns per gene. Its system prompt is also marked for
+  prompt caching, since it's static and reused across every Tier 2 gene and turn.
 
 Latency knobs:
 
@@ -67,9 +72,11 @@ running.
   `ANTHROPIC_SDK_PROVIDER=bedrock`. These mirror the LibreChat Bedrock env
   names. If explicit keys are omitted, the AWS credential chain/profile is used.
 - `AWS_PROFILE` or `BEDROCK_AWS_PROFILE`: optional AWS profile for Bedrock.
-- `BEDROCK_SYNTHESIS_MODEL` and `BEDROCK_SELECTION_MODEL`: optional Bedrock
-  model IDs for ACGC's synthesis and selection calls. Use these when the normal
-  `SYNTHESIS_MODEL` / `SELECTION_MODEL` values are direct Anthropic model names.
+- `BEDROCK_SYNTHESIS_MODEL`, `BEDROCK_SELECTION_MODEL`, and
+  `BEDROCK_RETRIEVAL_MODEL`: optional Bedrock model IDs for ACGC's synthesis,
+  selection, and Tier 2 retrieval-planning calls. Use these when the normal
+  `SYNTHESIS_MODEL` / `SELECTION_MODEL` / `RETRIEVAL_MODEL` values are direct
+  Anthropic model names.
 - `BEDROCK_SYNTHESIS_FAST_MODEL`: optional Bedrock model ID for the lightweight
   synthesis pass when `SYNTHESIS_MODEL_ESCALATION=true`.
 - `ONCOKB_API_TOKEN`: optional, but recommended for OncoKB membership lookups.
@@ -269,8 +276,9 @@ CSV, and the UI.
 This path uses the Anthropic SDK for selection, synthesis, benchmark judging, and
 Tier 2 agentic retrieval. In Bedrock mode, direct Anthropic model names must be
 replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL`,
-`BEDROCK_SYNTHESIS_FAST_MODEL`, and `BEDROCK_SELECTION_MODEL`, or by setting
-`SYNTHESIS_MODEL`, `SYNTHESIS_FAST_MODEL`, and `SELECTION_MODEL` to Bedrock IDs
+`BEDROCK_SYNTHESIS_FAST_MODEL`, `BEDROCK_SELECTION_MODEL`, and
+`BEDROCK_RETRIEVAL_MODEL`, or by setting `SYNTHESIS_MODEL`,
+`SYNTHESIS_FAST_MODEL`, `SELECTION_MODEL`, and `RETRIEVAL_MODEL` to Bedrock IDs
 directly.
 
 ## Latency Comparison
