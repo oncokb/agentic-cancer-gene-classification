@@ -385,3 +385,4 @@ class FeedbackResponse(BaseModel):
     feedback_id: str
     issue_title: Optional[str] = None
     issue_body: Optional[str] = None
+    issue_url: Optional[str] = None
