@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Set
 
 import anthropic
 import httpx
+from aiolimiter import AsyncLimiter
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
@@ -46,8 +47,49 @@ logger = logging.getLogger(__name__)
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-_RATE_LIMIT_DELAY = 0.34 if not settings.ncbi_api_key else 0.11
-_request_semaphore = asyncio.Semaphore(3 if not settings.ncbi_api_key else 10)
+_NCBI_CONCURRENCY = 3 if not settings.ncbi_api_key else 10
+
+_ncbi_rate_limiter: Optional[AsyncLimiter] = None
+
+
+def _get_ncbi_rate_limiter() -> AsyncLimiter:
+    """Lazily create a token-bucket limiter shared across all NCBI E-utilities calls.
+
+    NCBI's documented E-utilities rate limit is 3 requests/second without an API
+    key, 10/second with one. A token-bucket limiter only delays a call when the
+    rate is actually about to be exceeded — unlike a flat per-call sleep, bursts
+    up to the limit go through immediately, and it self-corrects for however long
+    the previous requests actually took instead of taxing every call by a fixed
+    amount. Lazy + reset-per-test like _get_ncbi_client below: AsyncLimiter binds
+    to the event loop active at creation time.
+    """
+    global _ncbi_rate_limiter
+    if _ncbi_rate_limiter is None:
+        _ncbi_rate_limiter = AsyncLimiter(_NCBI_CONCURRENCY, 1)
+    return _ncbi_rate_limiter
+
+
+_ncbi_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_ncbi_client() -> httpx.AsyncClient:
+    """Lazily create a pooled AsyncClient shared across all NCBI E-utilities calls.
+
+    Reusing one client lets keep-alive connections amortize the TCP+TLS handshake
+    across calls instead of paying it per request. This does not change request
+    pacing to NCBI — that's still gated entirely by _ncbi_rate_limiter, independent
+    of which client object issues the request.
+    """
+    global _ncbi_client
+    if _ncbi_client is None:
+        _ncbi_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=_NCBI_CONCURRENCY,
+                max_keepalive_connections=_NCBI_CONCURRENCY,
+            )
+        )
+    return _ncbi_client
+
 
 MAX_AGENTIC_TOOL_CALLS = 6  # cap Claude's search budget per gene
 
@@ -431,16 +473,16 @@ async def _retrieve_fusion_evidence_uncached(
             interpretation="Fusion evidence is only available for two-partner fusion inputs.",
         )
 
-    async with httpx.AsyncClient() as client:
-        pmid_lists = await asyncio.gather(*[_esearch(query, max_results, client) for query in queries])
-        seen_pmids: Set[str] = set()
-        pmids: List[str] = []
-        for pmid_list in pmid_lists:
-            for pmid in pmid_list:
-                if pmid not in seen_pmids:
-                    seen_pmids.add(pmid)
-                    pmids.append(pmid)
-        records = await _efetch(pmids, client)
+    client = _get_ncbi_client()
+    pmid_lists = await asyncio.gather(*[_esearch(query, max_results, client) for query in queries])
+    seen_pmids: Set[str] = set()
+    pmids: List[str] = []
+    for pmid_list in pmid_lists:
+        for pmid in pmid_list:
+            if pmid not in seen_pmids:
+                seen_pmids.add(pmid)
+                pmids.append(pmid)
+    records = await _efetch(pmids, client)
 
     records = _rank_records(_filter_exact_fusion_records(_filter_retracted_records(records), fusion))
     novelty_count = _novelty_record_count(records)
@@ -596,16 +638,16 @@ async def _retrieve_fusion_partner_records(
 
     async def _compute() -> List[dict]:
         queries = _fusion_partner_precedent_queries(gene, tumor_type, agnostic)
-        async with httpx.AsyncClient() as client:
-            pmid_lists = await asyncio.gather(*[_esearch(q, max_results, client) for q in queries])
-            seen_pmids: Set[str] = set()
-            pmids: List[str] = []
-            for pmid_list in pmid_lists:
-                for pmid in pmid_list:
-                    if pmid not in seen_pmids:
-                        seen_pmids.add(pmid)
-                        pmids.append(pmid)
-            records = await _efetch(pmids, client)
+        client = _get_ncbi_client()
+        pmid_lists = await asyncio.gather(*[_esearch(q, max_results, client) for q in queries])
+        seen_pmids: Set[str] = set()
+        pmids: List[str] = []
+        for pmid_list in pmid_lists:
+            for pmid in pmid_list:
+                if pmid not in seen_pmids:
+                    seen_pmids.add(pmid)
+                    pmids.append(pmid)
+        records = await _efetch(pmids, client)
         records = _rank_records(
             _filter_fusion_partner_precedent_records(
                 _filter_retracted_records(records),
@@ -750,8 +792,7 @@ async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> L
         params = _ncbi_params(
             {"db": "pubmed", "term": search_query, "retmax": max_results, "sort": "relevance"}
         )
-        async with _request_semaphore:
-            await asyncio.sleep(_RATE_LIMIT_DELAY)
+        async with _get_ncbi_rate_limiter():
             resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
             resp.raise_for_status()
         return resp.json().get("esearchresult", {}).get("idlist", [])
@@ -779,8 +820,7 @@ async def _esearch_since(
             "mindate": since_utc.strftime("%Y/%m/%d"),
         }
     )
-    async with _request_semaphore:
-        await asyncio.sleep(_RATE_LIMIT_DELAY)
+    async with _get_ncbi_rate_limiter():
         resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
         resp.raise_for_status()
     return resp.json().get("esearchresult", {}).get("idlist", [])
@@ -808,13 +848,13 @@ async def search_recent_pubmed_pmids(
             queries.append(f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}')
     queries = list(dict.fromkeys(queries))
 
-    async with httpx.AsyncClient() as client:
-        pmid_lists = await asyncio.gather(
-            *[
-                _esearch_since(query, since, settings.gene_cache_freshness_pmids, client)
-                for query in queries
-            ]
-        )
+    client = _get_ncbi_client()
+    pmid_lists = await asyncio.gather(
+        *[
+            _esearch_since(query, since, settings.gene_cache_freshness_pmids, client)
+            for query in queries
+        ]
+    )
 
     seen: Set[str] = set()
     recent_pmids: List[str] = []
@@ -858,8 +898,7 @@ async def _efetch(
         if settings.ncbi_api_key:
             params["api_key"] = settings.ncbi_api_key
 
-        async with _request_semaphore:
-            await asyncio.sleep(_RATE_LIMIT_DELAY)
+        async with _get_ncbi_rate_limiter():
             resp = await client.get(EFETCH_URL, params=params, timeout=30.0)
             resp.raise_for_status()
 
@@ -928,8 +967,8 @@ async def find_retracted_pmids(pmids: List[str]) -> Set[str]:
     unique_pmids = list(dict.fromkeys(pmid for pmid in pmids if pmid))
     if not unique_pmids:
         return set()
-    async with httpx.AsyncClient() as client:
-        records = await _efetch(unique_pmids, client, filter_retracted=False)
+    client = _get_ncbi_client()
+    records = await _efetch(unique_pmids, client, filter_retracted=False)
     fetched_pmids = {record.pmid for record in records}
     retracted_pmids = {
         record.pmid for record in records if _is_retracted_publication(record)
@@ -1034,21 +1073,21 @@ async def _tier1_retrieve(
 
     if not settings.pubmed_staged_retrieval:
         matched: Dict[str, Set[str]] = {}
-        async with httpx.AsyncClient() as client:
-            pmid_lists = await asyncio.gather(
-                *[_esearch(q, settings.pubmed_max_results, client) for q in queries]
-            )
-            seen: Set[str] = set()
-            merged: List[str] = []
-            for query, pmids in zip(queries, pmid_lists):
-                family = family_by_query.get(query, "free_text")
-                for pmid in pmids:
-                    matched.setdefault(pmid, set()).add(family)
-                    if pmid not in seen:
-                        seen.add(pmid)
-                        merged.append(pmid)
-            fetch_cap = settings.pubmed_max_results * len(queries)
-            records = await _efetch(merged[:fetch_cap], client)
+        client = _get_ncbi_client()
+        pmid_lists = await asyncio.gather(
+            *[_esearch(q, settings.pubmed_max_results, client) for q in queries]
+        )
+        seen: Set[str] = set()
+        merged: List[str] = []
+        for query, pmids in zip(queries, pmid_lists):
+            family = family_by_query.get(query, "free_text")
+            for pmid in pmids:
+                matched.setdefault(pmid, set()).add(family)
+                if pmid not in seen:
+                    seen.add(pmid)
+                    merged.append(pmid)
+        fetch_cap = settings.pubmed_max_results * len(queries)
+        records = await _efetch(merged[:fetch_cap], client)
 
         _tag_matched_query_tiers(records, matched)
         records = _rank_records(records)
@@ -1064,32 +1103,32 @@ async def _tier1_retrieve(
     seen_pmids: Set[str] = set()
     searched_queries = 0
 
-    async with httpx.AsyncClient() as client:
-        for stage in stages:
-            searched_queries += len(stage)
-            pmid_lists = await asyncio.gather(
-                *[_esearch(q, settings.pubmed_max_results, client) for q in stage]
-            )
-            stage_pmids: List[str] = []
-            for query, pmids in zip(stage, pmid_lists):
-                family = family_by_query.get(query, "free_text")
-                for pmid in pmids:
-                    matched.setdefault(pmid, set()).add(family)
-                    if pmid not in seen_pmids:
-                        seen_pmids.add(pmid)
-                        stage_pmids.append(pmid)
-            stage_records = await _efetch(stage_pmids, client)
-            for record in stage_records:
-                all_records[record.pmid] = record
+    client = _get_ncbi_client()
+    for stage in stages:
+        searched_queries += len(stage)
+        pmid_lists = await asyncio.gather(
+            *[_esearch(q, settings.pubmed_max_results, client) for q in stage]
+        )
+        stage_pmids: List[str] = []
+        for query, pmids in zip(stage, pmid_lists):
+            family = family_by_query.get(query, "free_text")
+            for pmid in pmids:
+                matched.setdefault(pmid, set()).add(family)
+                if pmid not in seen_pmids:
+                    seen_pmids.add(pmid)
+                    stage_pmids.append(pmid)
+        stage_records = await _efetch(stage_pmids, client)
+        for record in stage_records:
+            all_records[record.pmid] = record
 
-            _tag_matched_query_tiers(list(all_records.values()), matched)
-            ranked = _rank_records(list(all_records.values()))
-            if len(ranked) >= stop_target:
-                logger.info(
-                    "Tier 1 staged: %d abstracts for %s after %d/%d queries",
-                    len(ranked), gene, searched_queries, len(queries),
-                )
-                return ranked
+        _tag_matched_query_tiers(list(all_records.values()), matched)
+        ranked = _rank_records(list(all_records.values()))
+        if len(ranked) >= stop_target:
+            logger.info(
+                "Tier 1 staged: %d abstracts for %s after %d/%d queries",
+                len(ranked), gene, searched_queries, len(queries),
+            )
+            return ranked
 
     records = _rank_records(list(all_records.values()))
     logger.info(
@@ -1220,81 +1259,90 @@ async def _tier2_agentic_retrieve(
     messages = [{"role": "user", "content": user_message}]
     tool_calls_made = 0
     client = make_async_sdk_client()
+    http_client = _get_ncbi_client()
 
-    async with httpx.AsyncClient() as http_client:
-        while tool_calls_made < MAX_AGENTIC_TOOL_CALLS:
-            response = await client.messages.create(
-                model=resolve_sdk_model(settings.retrieval_model, "retrieval"),
-                max_tokens=1024,
-                system=[
-                    {
-                        "type": "text",
-                        "text": _AGENTIC_SYSTEM,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                tools=[_SEARCH_PUBMED_TOOL, _DONE_TOOL],
-                messages=messages,
+    async def _run_search(block) -> tuple[str, str]:
+        query = block.input.get("query", "")
+        max_res = min(int(block.input.get("max_results", 10)), 20)
+        try:
+            new_records = await _search_and_fetch(
+                query, max_res, http_client, set(accumulated.keys())
             )
+        except httpx.HTTPError as exc:
+            return block.id, f"Search failed: {exc}"
+        for r in new_records:
+            r.matched_query_tiers = list(set(r.matched_query_tiers) | {"tier2_agentic"})
+            accumulated[r.pmid] = r
+        text = (
+            f"Found {len(new_records)} new abstracts.\n"
+            + "\n".join(
+                f"PMID {r.pmid}: {r.title[:80]}\n{r.abstract[:200]}..."
+                for r in new_records
+            )
+        ) if new_records else "No new results for this query."
+        return block.id, text
 
-            # Accumulate assistant turn
-            messages.append({"role": "assistant", "content": response.content})
+    while tool_calls_made < MAX_AGENTIC_TOOL_CALLS:
+        response = await client.messages.create(
+            model=resolve_sdk_model(settings.retrieval_model, "retrieval"),
+            max_tokens=1024,
+            system=[
+                {
+                    "type": "text",
+                    "text": _AGENTIC_SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=[_SEARCH_PUBMED_TOOL, _DONE_TOOL],
+            messages=messages,
+        )
 
-            if response.stop_reason == "end_turn":
-                logger.info("Claude ended agentic retrieval for %s without calling done()", gene)
-                break
+        # Accumulate assistant turn
+        messages.append({"role": "assistant", "content": response.content})
 
-            # Process all tool_use blocks in this turn
-            tool_results = []
-            called_done = False
+        if response.stop_reason == "end_turn":
+            logger.info("Claude ended agentic retrieval for %s without calling done()", gene)
+            break
 
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
+        # Run every search_pubmed call in this turn concurrently — Claude can emit
+        # several in one turn, and they're independent NCBI lookups gated by the
+        # shared rate-limit semaphore, not by each other.
+        search_blocks = [
+            block for block in response.content
+            if block.type == "tool_use" and block.name == "search_pubmed"
+        ]
+        for block in search_blocks:
+            tool_calls_made += 1
+            logger.info(
+                "Claude search_pubmed [%d/%d] for %s: %s",
+                tool_calls_made, MAX_AGENTIC_TOOL_CALLS, gene, block.input.get("query", ""),
+            )
+        results_by_id = dict(await asyncio.gather(*[_run_search(block) for block in search_blocks]))
 
-                if block.name == "done":
-                    called_done = True
-                    tool_results.append(
-                        {"type": "tool_result", "tool_use_id": block.id, "content": "Acknowledged."}
-                    )
-                    continue
+        # Process all tool_use blocks in this turn, in original order
+        tool_results = []
+        called_done = False
 
-                if block.name == "search_pubmed":
-                    query = block.input.get("query", "")
-                    max_res = min(int(block.input.get("max_results", 10)), 20)
-                    tool_calls_made += 1
-                    logger.info(
-                        "Claude search_pubmed [%d/%d] for %s: %s",
-                        tool_calls_made, MAX_AGENTIC_TOOL_CALLS, gene, query,
-                    )
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
 
-                    try:
-                        new_records = await _search_and_fetch(
-                            query, max_res, http_client, set(accumulated.keys())
-                        )
-                        for r in new_records:
-                            r.matched_query_tiers = list(set(r.matched_query_tiers) | {"tier2_agentic"})
-                            accumulated[r.pmid] = r
-                        result_text = (
-                            f"Found {len(new_records)} new abstracts.\n"
-                            + "\n".join(
-                                f"PMID {r.pmid}: {r.title[:80]}\n{r.abstract[:200]}..."
-                                for r in new_records
-                            )
-                        ) if new_records else "No new results for this query."
-                    except httpx.HTTPError as exc:
-                        result_text = f"Search failed: {exc}"
+            if block.name == "done":
+                called_done = True
+                tool_results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": "Acknowledged."}
+                )
+            elif block.name == "search_pubmed":
+                tool_results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": results_by_id[block.id]}
+                )
 
-                    tool_results.append(
-                        {"type": "tool_result", "tool_use_id": block.id, "content": result_text}
-                    )
+        # Feed all tool results back in a single user turn
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
 
-            # Feed all tool results back in a single user turn
-            if tool_results:
-                messages.append({"role": "user", "content": tool_results})
-
-            if called_done or response.stop_reason != "tool_use":
-                break
+        if called_done or response.stop_reason != "tool_use":
+            break
 
     total = len(accumulated)
     logger.info(
@@ -1348,25 +1396,25 @@ async def _tier2_local_retrieve(
     queries = [q for q in result.get("queries", []) if isinstance(q, str) and q.strip()]
     queries = list(dict.fromkeys(q.strip() for q in queries))[:MAX_AGENTIC_TOOL_CALLS]
 
-    async with httpx.AsyncClient() as http_client:
-        for i, query in enumerate(queries, start=1):
-            logger.info(
-                "Local agent suggested PubMed query [%d/%d] for %s: %s",
-                i,
-                len(queries),
-                gene,
-                query,
+    http_client = _get_ncbi_client()
+    for i, query in enumerate(queries, start=1):
+        logger.info(
+            "Local agent suggested PubMed query [%d/%d] for %s: %s",
+            i,
+            len(queries),
+            gene,
+            query,
+        )
+        try:
+            new_records = await _search_and_fetch(
+                query, 20, http_client, set(accumulated.keys())
             )
-            try:
-                new_records = await _search_and_fetch(
-                    query, 20, http_client, set(accumulated.keys())
-                )
-            except httpx.HTTPError as exc:
-                logger.warning("Local Tier 2 PubMed query failed for %s: %s", gene, exc)
-                continue
-            for record in new_records:
-                record.matched_query_tiers = list(set(record.matched_query_tiers) | {"tier2_agentic"})
-                accumulated[record.pmid] = record
+        except httpx.HTTPError as exc:
+            logger.warning("Local Tier 2 PubMed query failed for %s: %s", gene, exc)
+            continue
+        for record in new_records:
+            record.matched_query_tiers = list(set(record.matched_query_tiers) | {"tier2_agentic"})
+            accumulated[record.pmid] = record
 
     logger.info(
         "Local Tier 2 complete for %s: %d total abstracts (%d from suggested queries)",
