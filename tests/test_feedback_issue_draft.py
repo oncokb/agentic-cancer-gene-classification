@@ -92,7 +92,7 @@ def test_feedback_submit_creates_github_issue_when_token_configured(monkeypatch)
             return FakeResponse()
 
     monkeypatch.setattr(main, "complete_with_tool", fake_complete_with_tool)
-    monkeypatch.setattr(main.settings, "github_token", "gh-token-123")
+    monkeypatch.setattr(main.settings, "oncokbdev_private_access_token", "gh-token-123")
     monkeypatch.setattr(main.settings, "github_repo", "oncokb/agentic-cancer-gene-classification")
     monkeypatch.setattr(main, "httpx", type("_httpx", (), {"AsyncClient": FakeAsyncClient}))
     client = TestClient(main.app)
@@ -123,7 +123,7 @@ def test_feedback_submit_omits_issue_url_when_token_not_configured(monkeypatch):
         }
 
     monkeypatch.setattr(main, "complete_with_tool", fake_complete_with_tool)
-    monkeypatch.setattr(main.settings, "github_token", "")
+    monkeypatch.setattr(main.settings, "oncokbdev_private_access_token", "")
     client = TestClient(main.app)
 
     response = client.post(
@@ -163,7 +163,7 @@ def test_feedback_submit_falls_back_when_github_api_fails(monkeypatch):
             raise RuntimeError("GitHub API unavailable")
 
     monkeypatch.setattr(main, "complete_with_tool", fake_complete_with_tool)
-    monkeypatch.setattr(main.settings, "github_token", "gh-token-123")
+    monkeypatch.setattr(main.settings, "oncokbdev_private_access_token", "gh-token-123")
     monkeypatch.setattr(main, "httpx", type("_httpx", (), {"AsyncClient": FakeAsyncClient}))
     client = TestClient(main.app)
 

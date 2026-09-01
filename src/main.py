@@ -874,18 +874,18 @@ async def _create_github_issue(title: str, body: str) -> Optional[str]:
     """
     File the drafted issue on GITHUB_REPO via the GitHub API, so curators
     without a GitHub account never have to submit the issue themselves.
-    Returns the created issue's HTML URL, or None if GITHUB_TOKEN isn't
+    Returns the created issue's HTML URL, or None if ONCOKBDEV_PRIVATE_ACCESS_TOKEN isn't
     configured or the API call fails (feedback storage above already
     succeeded either way, so this is best-effort).
     """
-    if not settings.github_token:
+    if not settings.oncokbdev_private_access_token:
         return None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
                 f"https://api.github.com/repos/{settings.github_repo}/issues",
                 headers={
-                    "Authorization": f"Bearer {settings.github_token}",
+                    "Authorization": f"Bearer {settings.oncokbdev_private_access_token}",
                     "Accept": "application/vnd.github+json",
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
