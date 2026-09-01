@@ -167,3 +167,58 @@ async def test_tier2_agentic_tags_new_records_uniformly(monkeypatch):
 
     assert by_pmid["1"].matched_query_tiers == ["mesh_gene_name"]  # untouched
     assert by_pmid["2"].matched_query_tiers == ["tier2_agentic"]
+
+
+async def test_tier2_agentic_runs_multiple_searches_in_one_turn_concurrently(monkeypatch):
+    """A turn with several search_pubmed calls should dispatch them concurrently
+    and correctly pair each tool_result back to its own tool_use_id, not just
+    the single-call-per-turn case the other test above covers."""
+    seen_queries: list[str] = []
+
+    async def fake_search_and_fetch(query, max_results, client, already_seen):
+        seen_queries.append(query)
+        return [LiteratureRecord(pmid=query, title=f"Paper for {query}", abstract="Found.")]
+
+    monkeypatch.setattr(literature, "_search_and_fetch", fake_search_and_fetch)
+
+    class _FakeToolUse:
+        type = "tool_use"
+
+        def __init__(self, call_id, query):
+            self.id = call_id
+            self.name = "search_pubmed"
+            self.input = {"query": query, "max_results": 5}
+
+    class _FakeDone:
+        type = "tool_use"
+        id = "call_done"
+        name = "done"
+        input = {}
+
+    class _FakeResponse:
+        def __init__(self, content, stop_reason):
+            self.content = content
+            self.stop_reason = stop_reason
+
+    call_count = {"n": 0}
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _FakeResponse(
+                    [_FakeToolUse("call_a", "query-a"), _FakeToolUse("call_b", "query-b")],
+                    "tool_use",
+                )
+            return _FakeResponse([_FakeDone()], "tool_use")
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    monkeypatch.setattr(literature, "make_async_sdk_client", lambda: _FakeClient())
+
+    records = await _tier2_agentic_retrieve("ALK", ["ALK::EML4"], [], tumor_type=None)
+    pmids = {r.pmid for r in records}
+
+    assert pmids == {"query-a", "query-b"}
+    assert set(seen_queries) == {"query-a", "query-b"}

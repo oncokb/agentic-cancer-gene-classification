@@ -3,6 +3,7 @@
 import pytest
 
 from src.pipeline import cache as cache_module
+from src.pipeline import literature as literature_module
 
 
 @pytest.fixture(autouse=True)
@@ -22,3 +23,18 @@ async def _reset_cache_client():
         pass  # Redis not reachable — tests relying on it will skip themselves
     yield
     cache_module._client = None
+
+
+@pytest.fixture(autouse=True)
+async def _reset_ncbi_client():
+    """Reset the pooled NCBI httpx client singleton before each test.
+
+    Same event-loop-binding issue as the Redis client above — httpx.AsyncClient's
+    connection pool is bound to the loop active at creation time.
+    """
+    literature_module._ncbi_client = None
+    yield
+    client = literature_module._ncbi_client
+    literature_module._ncbi_client = None
+    if client is not None:
+        await client.aclose()

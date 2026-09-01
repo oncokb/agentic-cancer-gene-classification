@@ -56,6 +56,14 @@ Latency knobs:
 - `SELECTION_LLM_THRESHOLD`: only use the selection LLM when the retrieved
   corpus is at or below this size; larger corpora use deterministic ranking.
 
+Not a config knob, but relevant to latency: all NCBI E-utilities calls share one
+pooled `httpx.AsyncClient` (`_get_ncbi_client()` in `src/pipeline/literature.py`)
+instead of opening a fresh client per call, so keep-alive connections amortize
+the TCP+TLS handshake instead of paying it on every request — request pacing to
+NCBI is unchanged, still gated by the existing rate-limit semaphore. Similarly,
+when Claude's Tier 2 agentic retrieval emits several `search_pubmed` calls in
+one turn, they're dispatched concurrently rather than awaited one at a time.
+
 ## API Keys
 
 Copy `.env.example` to `.env` and add only the keys you need for the mode you are
