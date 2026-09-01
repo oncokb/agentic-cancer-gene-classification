@@ -38,3 +38,16 @@ async def _reset_ncbi_client():
     literature_module._ncbi_client = None
     if client is not None:
         await client.aclose()
+
+
+@pytest.fixture(autouse=True)
+def _reset_ncbi_rate_limiter():
+    """Reset the NCBI rate limiter singleton before each test.
+
+    Same event-loop-binding issue as the Redis and httpx clients above —
+    AsyncLimiter binds internal asyncio primitives to the loop active at
+    creation time.
+    """
+    literature_module._ncbi_rate_limiter = None
+    yield
+    literature_module._ncbi_rate_limiter = None

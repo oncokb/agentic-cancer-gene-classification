@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Set
 
 import anthropic
 import httpx
+from aiolimiter import AsyncLimiter
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
@@ -47,8 +48,26 @@ ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
 _NCBI_CONCURRENCY = 3 if not settings.ncbi_api_key else 10
-_RATE_LIMIT_DELAY = 0.34 if not settings.ncbi_api_key else 0.11
-_request_semaphore = asyncio.Semaphore(_NCBI_CONCURRENCY)
+
+_ncbi_rate_limiter: Optional[AsyncLimiter] = None
+
+
+def _get_ncbi_rate_limiter() -> AsyncLimiter:
+    """Lazily create a token-bucket limiter shared across all NCBI E-utilities calls.
+
+    NCBI's documented E-utilities rate limit is 3 requests/second without an API
+    key, 10/second with one. A token-bucket limiter only delays a call when the
+    rate is actually about to be exceeded — unlike a flat per-call sleep, bursts
+    up to the limit go through immediately, and it self-corrects for however long
+    the previous requests actually took instead of taxing every call by a fixed
+    amount. Lazy + reset-per-test like _get_ncbi_client below: AsyncLimiter binds
+    to the event loop active at creation time.
+    """
+    global _ncbi_rate_limiter
+    if _ncbi_rate_limiter is None:
+        _ncbi_rate_limiter = AsyncLimiter(_NCBI_CONCURRENCY, 1)
+    return _ncbi_rate_limiter
+
 
 _ncbi_client: Optional[httpx.AsyncClient] = None
 
@@ -58,8 +77,8 @@ def _get_ncbi_client() -> httpx.AsyncClient:
 
     Reusing one client lets keep-alive connections amortize the TCP+TLS handshake
     across calls instead of paying it per request. This does not change request
-    pacing to NCBI — that's still gated entirely by _request_semaphore/_RATE_LIMIT_DELAY,
-    independent of which client object issues the request.
+    pacing to NCBI — that's still gated entirely by _ncbi_rate_limiter, independent
+    of which client object issues the request.
     """
     global _ncbi_client
     if _ncbi_client is None:
@@ -773,8 +792,7 @@ async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> L
         params = _ncbi_params(
             {"db": "pubmed", "term": search_query, "retmax": max_results, "sort": "relevance"}
         )
-        async with _request_semaphore:
-            await asyncio.sleep(_RATE_LIMIT_DELAY)
+        async with _get_ncbi_rate_limiter():
             resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
             resp.raise_for_status()
         return resp.json().get("esearchresult", {}).get("idlist", [])
@@ -802,8 +820,7 @@ async def _esearch_since(
             "mindate": since_utc.strftime("%Y/%m/%d"),
         }
     )
-    async with _request_semaphore:
-        await asyncio.sleep(_RATE_LIMIT_DELAY)
+    async with _get_ncbi_rate_limiter():
         resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
         resp.raise_for_status()
     return resp.json().get("esearchresult", {}).get("idlist", [])
@@ -881,8 +898,7 @@ async def _efetch(
         if settings.ncbi_api_key:
             params["api_key"] = settings.ncbi_api_key
 
-        async with _request_semaphore:
-            await asyncio.sleep(_RATE_LIMIT_DELAY)
+        async with _get_ncbi_rate_limiter():
             resp = await client.get(EFETCH_URL, params=params, timeout=30.0)
             resp.raise_for_status()
 

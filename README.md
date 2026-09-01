@@ -59,10 +59,14 @@ Latency knobs:
 Not a config knob, but relevant to latency: all NCBI E-utilities calls share one
 pooled `httpx.AsyncClient` (`_get_ncbi_client()` in `src/pipeline/literature.py`)
 instead of opening a fresh client per call, so keep-alive connections amortize
-the TCP+TLS handshake instead of paying it on every request — request pacing to
-NCBI is unchanged, still gated by the existing rate-limit semaphore. Similarly,
-when Claude's Tier 2 agentic retrieval emits several `search_pubmed` calls in
-one turn, they're dispatched concurrently rather than awaited one at a time.
+the TCP+TLS handshake instead of paying it on every request. Request pacing to
+NCBI is enforced by a token-bucket rate limiter (`_get_ncbi_rate_limiter()`,
+3 requests/second without `NCBI_API_KEY`, 10/second with one, matching NCBI's
+documented E-utilities limits) rather than a flat per-call sleep — bursts up to
+the limit go through immediately instead of every call paying a fixed tax.
+Similarly, when Claude's Tier 2 agentic retrieval emits several `search_pubmed`
+calls in one turn, they're dispatched concurrently rather than awaited one at a
+time.
 
 ## API Keys
 
