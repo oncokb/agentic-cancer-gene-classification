@@ -1208,7 +1208,9 @@ async function submitFeedbackForm() {
       throw new Error(text || "Failed to submit feedback");
     }
     const payload = await response.json();
-    if (payload.issue_title && payload.issue_body) {
+    if (payload.issue_url) {
+      setInstallOutput("Thanks!", `Your feedback was filed as a GitHub issue: ${payload.issue_url}`);
+    } else if (payload.issue_title && payload.issue_body) {
       window.open(githubIssueUrl(payload.issue_title, payload.issue_body), "_blank", "noopener");
       setInstallOutput("Thanks!", "Your feedback was stored and a GitHub issue draft was opened.");
     } else {
