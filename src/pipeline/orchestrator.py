@@ -544,6 +544,7 @@ async def run_pipeline(
         resolved_gene: ResolvedGene,
         gene_inputs: List[str],
     ) -> GeneAnnotation:
+        gene_start = perf_counter()
         associated_fusions = [value for value in gene_inputs if is_fusion_input(value)]
         tumor_type = gene_tumor_type.get(canonical)
         annotation = await _maybe_reuse_cached_annotation(
@@ -592,6 +593,15 @@ async def run_pipeline(
                 except Exception:
                     logger.exception("Failed to persist cached gene annotation for %s", canonical)
 
+        distribution(
+            "gene.total_duration_ms",
+            _elapsed_ms(gene_start),
+            tags=metric_tags
+            + [
+                f"cache_status:{annotation.cache_status or 'unknown'}",
+                f"is_fusion:{bool(associated_fusions)}",
+            ],
+        )
         return annotation
 
     tasks = [
@@ -602,9 +612,13 @@ async def run_pipeline(
         annotation = await task
         annotations.append(annotation)
         await _maybe_call_progress(on_annotation, annotation)
-        increment("genes.annotated", tags=metric_tags)
+        gene_tags = metric_tags + [
+            f"cache_status:{annotation.cache_status or 'unknown'}",
+            f"is_fusion:{bool(annotation.fusions)}",
+        ]
+        increment("genes.annotated", tags=gene_tags)
         if annotation.error:
-            increment("genes.errors", tags=metric_tags)
+            increment("genes.errors", tags=gene_tags)
         logger.info(
             "Annotated %s — cancer_associated=%s, citations=%d, evidence_support_score=%.2f, total_ms=%.2f",
             annotation.gene,

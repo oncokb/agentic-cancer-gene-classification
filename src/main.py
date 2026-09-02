@@ -43,7 +43,7 @@ from src.models.schema import (
     GeneAnnotation,
     LocalBackend,
 )
-from src.observability import record_user_seen, tag_current_span
+from src.observability import increment, record_user_seen, tag_current_span
 from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
@@ -861,6 +861,7 @@ async def _draft_feedback_issue(payload: FeedbackRequest, feedback_id: str) -> t
         )
     except Exception:
         logger.exception("Feedback issue LLM draft failed; using fallback draft")
+        increment("feedback.llm_draft_failed", tags=[f"category:{payload.category}"])
         draft = _fallback_feedback_issue(payload)
 
     if not draft:
@@ -879,6 +880,7 @@ async def _create_github_issue(title: str, body: str) -> Optional[str]:
     succeeded either way, so this is best-effort).
     """
     if not settings.oncokbdev_private_access_token:
+        increment("feedback.github_issue_creation_skipped", tags=["reason:token_not_configured"])
         return None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -892,9 +894,11 @@ async def _create_github_issue(title: str, body: str) -> Optional[str]:
                 json={"title": title, "body": body},
             )
             response.raise_for_status()
+            increment("feedback.github_issue_created")
             return response.json().get("html_url")
     except Exception:
         logger.exception("Failed to create GitHub issue for feedback")
+        increment("feedback.github_issue_creation_failed")
         return None
 
 
@@ -906,6 +910,7 @@ async def submit_feedback(payload: FeedbackRequest, http_request: Request) -> Fe
     without needing the curator to describe what they did from memory.
     """
     feedback_id = str(uuid.uuid4())
+    increment("feedback.submitted", tags=[f"category:{payload.category}"])
     await http_request.app.state.run_store.save_feedback(
         feedback_id=feedback_id,
         created_at=datetime.now(timezone.utc),

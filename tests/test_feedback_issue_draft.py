@@ -54,9 +54,69 @@ def test_feedback_submit_stores_feedback_and_returns_llm_issue_draft(monkeypatch
     )
 
 
+def test_feedback_submit_emits_usage_metrics(monkeypatch):
+    run_store = FakeRunStore()
+    main.app.state.run_store = run_store
+    metric_calls = []
+    monkeypatch.setattr(
+        main, "increment", lambda metric, tags=None: metric_calls.append((metric, tags))
+    )
+
+    async def fake_complete_with_tool(**kwargs):
+        return {
+            "title": "Clarify export dropdown behavior",
+            "problem_summary": "The export dropdown behavior is confusing.",
+            "suggested_solution": "Keep the format selector enabled and disable only export.",
+            "acceptance_criteria": ["Format dropdown remains clickable before results exist."],
+        }
+
+    monkeypatch.setattr(main, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(main.settings, "oncokbdev_private_access_token", "")
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/feedback",
+        json={"category": "bug", "message": "Export dropdown is confusing"},
+    )
+
+    assert response.status_code == 201
+    assert ("feedback.submitted", ["category:bug"]) in metric_calls
+    assert (
+        "feedback.github_issue_creation_skipped",
+        ["reason:token_not_configured"],
+    ) in metric_calls
+
+
+def test_feedback_submit_emits_llm_draft_failed_metric(monkeypatch):
+    run_store = FakeRunStore()
+    main.app.state.run_store = run_store
+    metric_calls = []
+    monkeypatch.setattr(
+        main, "increment", lambda metric, tags=None: metric_calls.append((metric, tags))
+    )
+
+    async def fake_complete_with_tool(**kwargs):
+        raise RuntimeError("LLM unavailable")
+
+    monkeypatch.setattr(main, "complete_with_tool", fake_complete_with_tool)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/feedback",
+        json={"category": "feature_request", "message": "Please add PDF export."},
+    )
+
+    assert response.status_code == 201
+    assert ("feedback.llm_draft_failed", ["category:feature_request"]) in metric_calls
+
+
 def test_feedback_submit_creates_github_issue_when_token_configured(monkeypatch):
     run_store = FakeRunStore()
     main.app.state.run_store = run_store
+    metric_calls = []
+    monkeypatch.setattr(
+        main, "increment", lambda metric, tags=None: metric_calls.append((metric, tags))
+    )
 
     async def fake_complete_with_tool(**kwargs):
         return {
@@ -108,6 +168,7 @@ def test_feedback_submit_creates_github_issue_when_token_configured(monkeypatch)
     assert seen["url"] == "https://api.github.com/repos/oncokb/agentic-cancer-gene-classification/issues"
     assert seen["headers"]["Authorization"] == "Bearer gh-token-123"
     assert seen["json"]["title"] == "Clarify export dropdown behavior"
+    assert ("feedback.github_issue_created", None) in metric_calls
 
 
 def test_feedback_submit_omits_issue_url_when_token_not_configured(monkeypatch):
@@ -140,6 +201,10 @@ def test_feedback_submit_omits_issue_url_when_token_not_configured(monkeypatch):
 def test_feedback_submit_falls_back_when_github_api_fails(monkeypatch):
     run_store = FakeRunStore()
     main.app.state.run_store = run_store
+    metric_calls = []
+    monkeypatch.setattr(
+        main, "increment", lambda metric, tags=None: metric_calls.append((metric, tags))
+    )
 
     async def fake_complete_with_tool(**kwargs):
         return {
@@ -176,6 +241,7 @@ def test_feedback_submit_falls_back_when_github_api_fails(monkeypatch):
     payload = response.json()
     assert payload["issue_url"] is None
     assert payload["issue_title"] == "Clarify export dropdown behavior"
+    assert ("feedback.github_issue_creation_failed", None) in metric_calls
 
 
 def test_feedback_submit_falls_back_when_llm_fails(monkeypatch):

@@ -133,8 +133,13 @@ class Settings(BaseSettings):
 
     datadog_metrics_enabled: bool = False
     datadog_metrics_namespace: str = "acgc"
-    datadog_statsd_host: str = "127.0.0.1"
-    datadog_statsd_port: int = 8125
+    # Left blank by default so the DogStatsd client falls through to its own
+    # DD_DOGSTATSD_URL/DD_AGENT_HOST/DD_DOGSTATSD_PORT env var detection —
+    # which is what actually resolves to the Datadog Agent in this cluster
+    # (a Unix domain socket injected by the admission controller, not a
+    # UDP host:port). Only set these to override that with a fixed target.
+    datadog_statsd_host: str = ""
+    datadog_statsd_port: int = 0
     datadog_user_id_header: str = "x-user-id"
 
 

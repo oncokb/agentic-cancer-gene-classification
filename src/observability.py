@@ -38,11 +38,17 @@ def _statsd():
             _statsd_warning_logged = True
         return None
 
-    _statsd_client = DogStatsd(
-        host=settings.datadog_statsd_host,
-        port=settings.datadog_statsd_port,
-        namespace=settings.datadog_metrics_namespace,
-    )
+    # Only pin an explicit host/port when configured; otherwise leave them
+    # unset so DogStatsd falls through to its own DD_DOGSTATSD_URL /
+    # DD_AGENT_HOST / DD_DOGSTATSD_PORT env var detection, which is what
+    # actually resolves to the Datadog Agent's Unix domain socket in this
+    # cluster (mirrors how ddtrace-run auto-detects DD_TRACE_AGENT_URL).
+    kwargs: dict = {"namespace": settings.datadog_metrics_namespace}
+    if settings.datadog_statsd_host:
+        kwargs["host"] = settings.datadog_statsd_host
+        kwargs["port"] = settings.datadog_statsd_port or 8125
+
+    _statsd_client = DogStatsd(**kwargs)
     return _statsd_client
 
 
