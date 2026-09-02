@@ -128,6 +128,8 @@ def resolve_sdk_model(model: str, purpose: str = "") -> str:
         return settings.bedrock_synthesis_model
     if purpose == "selection" and settings.bedrock_selection_model:
         return settings.bedrock_selection_model
+    if purpose == "retrieval" and settings.bedrock_retrieval_model:
+        return settings.bedrock_retrieval_model
 
     if model in _BEDROCK_MODEL_ALIASES:
         return _BEDROCK_MODEL_ALIASES[model]

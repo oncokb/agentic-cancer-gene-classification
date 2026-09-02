@@ -24,9 +24,11 @@ class Settings(BaseSettings):
     core_synthesis_escalation_tier2: bool = False
     selection_model: str = "claude-haiku-4-5-20251001"
     feedback_model: str = "claude-haiku-4-5-20251001"
+    retrieval_model: str = "claude-haiku-4-5-20251001"
     bedrock_synthesis_model: str = ""
     bedrock_synthesis_fast_model: str = ""
     bedrock_selection_model: str = ""
+    bedrock_retrieval_model: str = ""
     bedrock_aws_access_key_id: str = ""
     bedrock_aws_secret_access_key: str = ""
     bedrock_aws_session_token: str = ""
