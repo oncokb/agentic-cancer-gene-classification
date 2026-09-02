@@ -40,7 +40,12 @@ from src.models.schema import (
 )
 from src.pipeline.normalization import split_fusion
 from src.pipeline.cache import cached_call
-from src.pipeline.llm_client import complete_with_tool, make_async_sdk_client, resolve_sdk_model
+from src.pipeline.llm_client import (
+    complete_with_tool,
+    make_async_sdk_client,
+    record_llm_usage,
+    resolve_sdk_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1283,8 +1288,9 @@ async def _tier2_agentic_retrieve(
         return block.id, text
 
     while tool_calls_made < MAX_AGENTIC_TOOL_CALLS:
+        retrieval_model = resolve_sdk_model(settings.retrieval_model, "retrieval")
         response = await client.messages.create(
-            model=resolve_sdk_model(settings.retrieval_model, "retrieval"),
+            model=retrieval_model,
             max_tokens=1024,
             system=[
                 {
@@ -1296,6 +1302,7 @@ async def _tier2_agentic_retrieve(
             tools=[_SEARCH_PUBMED_TOOL, _DONE_TOOL],
             messages=messages,
         )
+        record_llm_usage(retrieval_model, "retrieval_agentic", response.usage)
 
         # Accumulate assistant turn
         messages.append({"role": "assistant", "content": response.content})

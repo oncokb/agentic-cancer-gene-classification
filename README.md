@@ -549,11 +549,23 @@ Metrics emitted:
   `acgc.feedback.github_issue_creation_failed` /
   `acgc.feedback.github_issue_creation_skipped`: outcomes of filing the
   drafted issue via the GitHub API.
+- `acgc.llm.requests`: every Anthropic/Bedrock Messages API call, tagged with
+  `model` (the resolved model ID actually billed) and `model_purpose`
+  (`synthesis`/`synthesis_fast`/`selection`/`retrieval`/`retrieval_agentic`) —
+  the two axes Anthropic/Bedrock bill on, so LLM spend can be broken down by
+  model and by feature. Local-backend calls (`--local`) aren't SDK calls and
+  don't emit this.
+- `acgc.llm.tokens.input` / `acgc.llm.tokens.output`: per-call token counts
+  from the API response's `usage` block, same tags as `llm.requests`.
+- `acgc.llm.tokens.cache_creation` / `acgc.llm.tokens.cache_read`: prompt
+  cache token usage — Anthropic bills cache reads far cheaper than a fresh
+  input token, so a low cache-read share relative to cache-creation points at
+  wasted spend on repeated system prompts that aren't hitting cache.
 
 Metric tags are intentionally low-cardinality: `mode`, `local_backend`,
 `tumor_type_present`, `cache_status`, `is_fusion`, `cache_name`, `result`,
-and `category`. Raw user IDs, gene symbols, and full cache keys are never
-metric tags.
+`category`, `model`, and `model_purpose`. Raw user IDs, gene symbols, and
+full cache keys are never metric tags.
 
 Quick verification:
 

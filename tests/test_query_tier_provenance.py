@@ -142,10 +142,17 @@ async def test_tier2_agentic_tags_new_records_uniformly(monkeypatch):
         name = "done"
         input = {}
 
+    class _FakeUsage:
+        input_tokens = 100
+        output_tokens = 50
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
+
     class _FakeResponse:
         def __init__(self, content, stop_reason):
             self.content = content
             self.stop_reason = stop_reason
+            self.usage = _FakeUsage()
 
     call_count = {"n": 0}
 
@@ -195,10 +202,17 @@ async def test_tier2_agentic_runs_multiple_searches_in_one_turn_concurrently(mon
         name = "done"
         input = {}
 
+    class _FakeUsage:
+        input_tokens = 100
+        output_tokens = 50
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
+
     class _FakeResponse:
         def __init__(self, content, stop_reason):
             self.content = content
             self.stop_reason = stop_reason
+            self.usage = _FakeUsage()
 
     call_count = {"n": 0}
 
