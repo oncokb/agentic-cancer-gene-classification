@@ -15,25 +15,20 @@ RUN if [ "$INSTALL_LOCAL_AGENTS" = "true" ]; then \
 # Copy dependency spec first for layer caching
 COPY pyproject.toml ./
 
-# Install package in editable mode (no source needed yet)
+# Install runtime dependencies straight from pyproject.toml, in their own
+# layer, so a source-only change below doesn't reinstall every dependency.
+# tomllib is stdlib on this Python version, so no extra parser is needed.
 RUN pip install --no-cache-dir hatchling && \
-    pip install --no-cache-dir \
-    "anthropic[bedrock]" \
-    ddtrace \
-    fastapi \
-    "uvicorn[standard]" \
-    httpx \
-    pydantic \
-    pydantic-settings \
-    python-dotenv \
-    tenacity \
-    aiomysql \
-    cryptography \
-    redis \
-    datadog
+    python -c "import tomllib; deps = tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']; open('requirements.txt', 'w').write('\n'.join(deps))" && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 COPY benchmarks/ ./benchmarks/
+
+# Install the project itself (console script + package metadata) against
+# the dependencies already installed above, so pyproject.toml stays the
+# single source of truth for what this image needs.
+RUN pip install --no-cache-dir --no-deps --no-build-isolation .
 
 # Non-root user for K8s security context
 RUN useradd -m appuser && chown -R appuser /app
