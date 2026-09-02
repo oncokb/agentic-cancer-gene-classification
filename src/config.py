@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     oncokb_api_token: str = ""
     ncbi_api_key: str = ""
+    oncokbdev_private_access_token: str = ""
+    github_repo: str = "oncokb/agentic-cancer-gene-classification"
 
     synthesis_model: str = "claude-opus-4-7"
     synthesis_fast_model: str = "claude-haiku-4-5-20251001"

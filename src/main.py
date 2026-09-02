@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Literal, Optional
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -869,6 +870,34 @@ async def _draft_feedback_issue(payload: FeedbackRequest, feedback_id: str) -> t
     return title, _feedback_issue_body(payload, draft, feedback_id)
 
 
+async def _create_github_issue(title: str, body: str) -> Optional[str]:
+    """
+    File the drafted issue on GITHUB_REPO via the GitHub API, so curators
+    without a GitHub account never have to submit the issue themselves.
+    Returns the created issue's HTML URL, or None if ONCOKBDEV_PRIVATE_ACCESS_TOKEN isn't
+    configured or the API call fails (feedback storage above already
+    succeeded either way, so this is best-effort).
+    """
+    if not settings.oncokbdev_private_access_token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"https://api.github.com/repos/{settings.github_repo}/issues",
+                headers={
+                    "Authorization": f"Bearer {settings.oncokbdev_private_access_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json={"title": title, "body": body},
+            )
+            response.raise_for_status()
+            return response.json().get("html_url")
+    except Exception:
+        logger.exception("Failed to create GitHub issue for feedback")
+        return None
+
+
 @app.post("/v1/feedback", response_model=FeedbackResponse, status_code=201)
 async def submit_feedback(payload: FeedbackRequest, http_request: Request) -> FeedbackResponse:
     """
@@ -889,10 +918,12 @@ async def submit_feedback(payload: FeedbackRequest, http_request: Request) -> Fe
         user_agent=http_request.headers.get("user-agent"),
     )
     issue_title, issue_body = await _draft_feedback_issue(payload, feedback_id)
+    issue_url = await _create_github_issue(issue_title, issue_body)
     return FeedbackResponse(
         feedback_id=feedback_id,
         issue_title=issue_title,
         issue_body=issue_body,
+        issue_url=issue_url,
     )
 
 
