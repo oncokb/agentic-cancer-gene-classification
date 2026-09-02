@@ -21,6 +21,7 @@ import redis.asyncio as redis
 from redis.asyncio.sentinel import Sentinel
 
 from src.config import settings
+from src.observability import increment
 
 logger = logging.getLogger(__name__)
 
@@ -72,13 +73,19 @@ async def cached_call(
 ) -> Any:
     """Return compute()'s JSON-serializable result, caching it in Redis under `key`."""
     client = _get_client()
+    # Key prefix (e.g. "hgnc", "oncokb", "pubmed") as a low-cardinality tag —
+    # never the full key, which embeds gene symbols/query text.
+    cache_tags = [f"cache_name:{key.split(':', 1)[0]}"]
 
     try:
         cached = await client.get(key)
         if cached is not None:
+            increment("redis_cache.lookups", tags=cache_tags + ["result:hit"])
             return json.loads(cached)
+        increment("redis_cache.lookups", tags=cache_tags + ["result:miss"])
     except Exception as exc:
         logger.warning("Redis cache read failed for %r, falling through to live call: %s", key, exc)
+        increment("redis_cache.lookups", tags=cache_tags + ["result:error"])
 
     result = await compute()
 

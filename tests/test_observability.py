@@ -2,7 +2,7 @@ from contextlib import contextmanager
 
 from fastapi.testclient import TestClient
 
-from src import main
+from src import main, observability
 from src.main import app
 from src.models.schema import AnnotationResult, GeneAnnotation, ResolvedGene
 from src.observability import NoopSpan, record_user_seen, stable_user_key
@@ -91,6 +91,110 @@ async def test_run_pipeline_emits_gene_and_input_metrics(monkeypatch):
     assert ("increment", "inputs.submitted", 1, tags) in metric_calls
     assert ("increment", "genes.queried", 2, tags) in metric_calls
     assert any(call[1] == "pipeline.duration_ms" for call in metric_calls)
+
+
+async def test_run_pipeline_tags_gene_metrics_with_cache_status_and_fusion(monkeypatch):
+    metric_calls = []
+
+    async def fake_normalize_fusions(inputs):
+        return {
+            "BRAF": (
+                ResolvedGene(input_symbol="BRAF", canonical_symbol="BRAF", resolved=True),
+                ["BRAF::TP53"],
+            ),
+            "MYH9": (
+                ResolvedGene(input_symbol="MYH9", canonical_symbol="MYH9", resolved=True),
+                ["MYH9"],
+            ),
+        }
+
+    async def fake_annotate_gene(*, gene, fusions, **kwargs):
+        # Real _annotate_gene/synthesis code always sets .fusions from the
+        # fusions it was called with (see orchestrator.py's own branches) —
+        # mirror that contract here rather than leaving it at the model default.
+        return GeneAnnotation(
+            gene=gene,
+            fusions=list(fusions),
+            timings_ms={"total": 5.0},
+            cache_status="refreshed",
+        )
+
+    def fake_increment(metric, value=1, tags=None):
+        metric_calls.append(("increment", metric, value, tags))
+
+    def fake_distribution(metric, value, tags=None):
+        metric_calls.append(("distribution", metric, value, tags))
+
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
+    monkeypatch.setattr(orchestrator, "increment", fake_increment)
+    monkeypatch.setattr(orchestrator, "distribution", fake_distribution)
+    monkeypatch.setattr(orchestrator, "trace", noop_trace)
+
+    await orchestrator.run_pipeline(["BRAF::TP53", "MYH9"], mode="core")
+
+    base_tags = ["mode:core", "local_backend:sdk", "skip_literature_for_oncokb:False"]
+    fusion_gene_tags = base_tags + ["cache_status:refreshed", "is_fusion:True"]
+    non_fusion_gene_tags = base_tags + ["cache_status:refreshed", "is_fusion:False"]
+    assert ("increment", "genes.annotated", 1, fusion_gene_tags) in metric_calls
+    assert ("increment", "genes.annotated", 1, non_fusion_gene_tags) in metric_calls
+    assert any(
+        call[1] == "gene.total_duration_ms" and call[3] == fusion_gene_tags for call in metric_calls
+    )
+    assert any(
+        call[1] == "gene.total_duration_ms" and call[3] == non_fusion_gene_tags
+        for call in metric_calls
+    )
+
+
+def test_statsd_omits_host_port_when_unconfigured(monkeypatch):
+    """DogStatsd must fall through to its own DD_DOGSTATSD_URL/DD_AGENT_HOST
+    detection (the cluster's injected Unix socket) rather than being pinned
+    to a UDP host:port that doesn't exist in the pod."""
+    captured = {}
+
+    class FakeDogStatsd:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(observability, "_statsd_client", None)
+    monkeypatch.setattr(observability.settings, "datadog_metrics_enabled", True)
+    monkeypatch.setattr(observability.settings, "datadog_statsd_host", "")
+    monkeypatch.setattr(observability.settings, "datadog_metrics_namespace", "acgc")
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "datadog",
+        type("_module", (), {"DogStatsd": FakeDogStatsd}),
+    )
+
+    observability._statsd()
+
+    assert captured == {"namespace": "acgc"}
+    assert "host" not in captured
+    assert "port" not in captured
+
+
+def test_statsd_uses_configured_host_port_when_set(monkeypatch):
+    captured = {}
+
+    class FakeDogStatsd:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(observability, "_statsd_client", None)
+    monkeypatch.setattr(observability.settings, "datadog_metrics_enabled", True)
+    monkeypatch.setattr(observability.settings, "datadog_statsd_host", "10.0.0.5")
+    monkeypatch.setattr(observability.settings, "datadog_statsd_port", 9125)
+    monkeypatch.setattr(observability.settings, "datadog_metrics_namespace", "acgc")
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "datadog",
+        type("_module", (), {"DogStatsd": FakeDogStatsd}),
+    )
+
+    observability._statsd()
+
+    assert captured == {"namespace": "acgc", "host": "10.0.0.5", "port": 9125}
 
 
 def test_annotate_endpoint_records_user_header(monkeypatch):

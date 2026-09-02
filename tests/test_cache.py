@@ -22,7 +22,11 @@ async def _require_redis():
         pytest.skip(f"Redis not reachable: {exc}")
 
 
-async def test_cache_miss_calls_compute_and_populates(_require_redis):
+async def test_cache_miss_calls_compute_and_populates(_require_redis, monkeypatch):
+    metric_calls = []
+    monkeypatch.setattr(
+        cache_module, "increment", lambda metric, tags=None: metric_calls.append((metric, tags))
+    )
     calls = []
 
     async def compute():
@@ -32,10 +36,13 @@ async def test_cache_miss_calls_compute_and_populates(_require_redis):
     result = await cached_call("test:miss-then-hit", compute)
     assert result == {"value": 42}
     assert len(calls) == 1
+    assert ("redis_cache.lookups", ["cache_name:test", "result:miss"]) in metric_calls
 
+    metric_calls.clear()
     result_again = await cached_call("test:miss-then-hit", compute)
     assert result_again == {"value": 42}
     assert len(calls) == 1  # second call served from cache, compute() not re-invoked
+    assert ("redis_cache.lookups", ["cache_name:test", "result:hit"]) in metric_calls
 
 
 async def test_cache_hit_skips_compute(_require_redis):
@@ -55,6 +62,10 @@ async def test_cached_call_fails_open_when_redis_unreachable(monkeypatch):
         cache_module.settings, "redis_url", "redis://127.0.0.1:1/0"
     )  # port 1: nothing listens here
     cache_module._client = None
+    metric_calls = []
+    monkeypatch.setattr(
+        cache_module, "increment", lambda metric, tags=None: metric_calls.append((metric, tags))
+    )
 
     calls = []
 
@@ -66,6 +77,7 @@ async def test_cached_call_fails_open_when_redis_unreachable(monkeypatch):
 
     assert result == {"value": "computed anyway"}
     assert len(calls) == 1
+    assert ("redis_cache.lookups", ["cache_name:test", "result:error"]) in metric_calls
 
 
 def test_parse_sentinel_hosts_defaults_port_and_strips_whitespace():

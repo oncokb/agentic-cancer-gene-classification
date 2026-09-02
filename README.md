@@ -510,9 +510,14 @@ them only when the pod/container can reach a Datadog Agent:
 ```bash
 DATADOG_METRICS_ENABLED=true
 DATADOG_METRICS_NAMESPACE=acgc
-DATADOG_STATSD_HOST=$DD_AGENT_HOST
-DATADOG_STATSD_PORT=8125
 ```
+
+Leave `DATADOG_STATSD_HOST`/`DATADOG_STATSD_PORT` unset unless you need to pin
+a fixed UDP target — by default the client falls through to DogStatsd's own
+`DD_DOGSTATSD_URL`/`DD_AGENT_HOST`/`DD_DOGSTATSD_PORT` env var detection,
+which is what resolves to the Datadog Agent's Unix domain socket in this
+cluster (the same env vars the Datadog admission controller already injects
+for APM tracing).
 
 Metrics emitted:
 
@@ -522,14 +527,33 @@ Metrics emitted:
 - `acgc.inputs.submitted`: number of submitted genes/fusions.
 - `acgc.genes.queried`: number of unique normalized genes derived from the
   submitted inputs. This is the primary "genes queried" metric.
-- `acgc.genes.annotated`: completed gene annotations.
+- `acgc.genes.annotated`: completed gene annotations, tagged with
+  `cache_status` (`reused`/`refreshed`/`bypassed`) and `is_fusion` — the
+  primary cache hit-rate / fresh-query-rate signal.
 - `acgc.genes.errors`: gene annotations that ended with an error field.
 - `acgc.pipeline.runs`: annotation pipeline runs.
-- `acgc.pipeline.duration_ms` and `acgc.gene.annotation.duration_ms`: duration
-  distributions.
+- `acgc.pipeline.duration_ms`, `acgc.gene.annotation.duration_ms`, and
+  `acgc.gene.total_duration_ms`: duration distributions. The last is tagged
+  with `cache_status`/`is_fusion` and covers the whole per-gene path
+  (including the cache lookup), so cache-hit vs. fresh-compute latency can
+  be compared directly.
+- `acgc.redis_cache.lookups`: Redis cache-aside lookups (HGNC/OncoKB/PubMed),
+  tagged with `cache_name` (the key prefix, e.g. `hgnc`/`oncokb`/`pubmed`) and
+  `result` (`hit`/`miss`/`error`) — the Redis-layer hit rate, distinct from
+  the MySQL-backed gene annotation reuse above.
+- `acgc.feedback.submitted`: curator feedback submissions, tagged with
+  `category`.
+- `acgc.feedback.llm_draft_failed`: feedback issue drafts that fell back to
+  the non-LLM template because the LLM call failed.
+- `acgc.feedback.github_issue_created` /
+  `acgc.feedback.github_issue_creation_failed` /
+  `acgc.feedback.github_issue_creation_skipped`: outcomes of filing the
+  drafted issue via the GitHub API.
 
-Metric tags are intentionally low-cardinality: `mode`, `local_backend`, and
-`tumor_type_present`. Raw user IDs and gene symbols are not metric tags.
+Metric tags are intentionally low-cardinality: `mode`, `local_backend`,
+`tumor_type_present`, `cache_status`, `is_fusion`, `cache_name`, `result`,
+and `category`. Raw user IDs, gene symbols, and full cache keys are never
+metric tags.
 
 Quick verification:
 
