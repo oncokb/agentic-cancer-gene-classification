@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Union
 import anthropic
 
 from src.config import settings
+from src.observability import distribution, increment
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +188,27 @@ async def complete_with_tool(
             user=user,
             tool=tool,
             max_tokens=max_tokens,
+            model_purpose=model_purpose,
         )
+
+
+def record_llm_usage(model: str, model_purpose: str, usage: Any) -> None:
+    """Emit Datadog request-count/token-usage metrics for one LLM call.
+
+    Tagged by the resolved model ID and model_purpose (selection/synthesis/
+    retrieval/etc.) — the two axes that map directly to Anthropic/Bedrock
+    billing, so cost can be broken down by model and by feature.
+    """
+    tags = [f"model:{model}", f"model_purpose:{model_purpose or 'unspecified'}"]
+    increment("llm.requests", tags=tags)
+    if usage is None:
+        return
+    distribution("llm.tokens.input", usage.input_tokens, tags=tags)
+    distribution("llm.tokens.output", usage.output_tokens, tags=tags)
+    if usage.cache_creation_input_tokens:
+        distribution("llm.tokens.cache_creation", usage.cache_creation_input_tokens, tags=tags)
+    if usage.cache_read_input_tokens:
+        distribution("llm.tokens.cache_read", usage.cache_read_input_tokens, tags=tags)
 
 
 async def _complete_sdk(
@@ -197,6 +218,7 @@ async def _complete_sdk(
     user: str,
     tool: Dict[str, Any],
     max_tokens: int,
+    model_purpose: str = "",
 ) -> Dict[str, Any]:
     client = make_async_sdk_client()
     response = await client.messages.create(
@@ -213,6 +235,7 @@ async def _complete_sdk(
         tool_choice={"type": "tool", "name": tool["name"]},
         messages=[{"role": "user", "content": user}],
     )
+    record_llm_usage(model, model_purpose, response.usage)
     for block in response.content:
         if block.type == "tool_use" and block.name == tool["name"]:
             return block.input  # type: ignore[return-value]

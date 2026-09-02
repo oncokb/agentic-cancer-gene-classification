@@ -6,7 +6,7 @@ from src import main, observability
 from src.main import app
 from src.models.schema import AnnotationResult, GeneAnnotation, ResolvedGene
 from src.observability import NoopSpan, record_user_seen, stable_user_key
-from src.pipeline import orchestrator
+from src.pipeline import llm_client, orchestrator
 
 
 class FakeStatsd:
@@ -145,6 +145,91 @@ async def test_run_pipeline_tags_gene_metrics_with_cache_status_and_fusion(monke
         call[1] == "gene.total_duration_ms" and call[3] == non_fusion_gene_tags
         for call in metric_calls
     )
+
+
+def test_record_llm_usage_emits_request_count_and_token_distributions(monkeypatch):
+    metric_calls = []
+    monkeypatch.setattr(
+        llm_client, "increment", lambda metric, value=1, tags=None: metric_calls.append(("increment", metric, value, tags))
+    )
+    monkeypatch.setattr(
+        llm_client, "distribution", lambda metric, value, tags=None: metric_calls.append(("distribution", metric, value, tags))
+    )
+
+    class FakeUsage:
+        input_tokens = 1200
+        output_tokens = 340
+        cache_creation_input_tokens = 500
+        cache_read_input_tokens = 2000
+
+    llm_client.record_llm_usage("claude-haiku-4-5-20251001", "selection", FakeUsage())
+
+    tags = ["model:claude-haiku-4-5-20251001", "model_purpose:selection"]
+    assert ("increment", "llm.requests", 1, tags) in metric_calls
+    assert ("distribution", "llm.tokens.input", 1200, tags) in metric_calls
+    assert ("distribution", "llm.tokens.output", 340, tags) in metric_calls
+    assert ("distribution", "llm.tokens.cache_creation", 500, tags) in metric_calls
+    assert ("distribution", "llm.tokens.cache_read", 2000, tags) in metric_calls
+
+
+def test_record_llm_usage_tags_unspecified_purpose_and_handles_missing_usage(monkeypatch):
+    metric_calls = []
+    monkeypatch.setattr(
+        llm_client, "increment", lambda metric, value=1, tags=None: metric_calls.append(("increment", metric, value, tags))
+    )
+    monkeypatch.setattr(
+        llm_client, "distribution", lambda metric, value, tags=None: metric_calls.append(("distribution", metric, value, tags))
+    )
+
+    llm_client.record_llm_usage("claude-opus-4-7", "", None)
+
+    tags = ["model:claude-opus-4-7", "model_purpose:unspecified"]
+    assert metric_calls == [("increment", "llm.requests", 1, tags)]
+
+
+async def test_complete_sdk_records_llm_usage(monkeypatch):
+    recorded = {}
+    monkeypatch.setattr(
+        llm_client, "record_llm_usage", lambda model, purpose, usage: recorded.update(
+            model=model, purpose=purpose, usage=usage
+        )
+    )
+
+    class FakeUsage:
+        input_tokens = 10
+        output_tokens = 5
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
+
+    class FakeToolUseBlock:
+        type = "tool_use"
+        name = "draft_feedback_issue"
+        input = {"title": "ok"}
+
+    class FakeResponse:
+        content = [FakeToolUseBlock()]
+        usage = FakeUsage()
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            return FakeResponse()
+
+    class FakeClient:
+        messages = FakeMessages()
+
+    monkeypatch.setattr(llm_client, "make_async_sdk_client", lambda: FakeClient())
+
+    result = await llm_client._complete_sdk(
+        model="claude-haiku-4-5-20251001",
+        system="sys",
+        user="user",
+        tool={"name": "draft_feedback_issue"},
+        max_tokens=100,
+        model_purpose="selection",
+    )
+
+    assert result == {"title": "ok"}
+    assert recorded == {"model": "claude-haiku-4-5-20251001", "purpose": "selection", "usage": FakeResponse.usage}
 
 
 def test_statsd_omits_host_port_when_unconfigured(monkeypatch):
