@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
 AnnotationMode = Literal["full", "core"]
@@ -286,6 +286,21 @@ class GeneAnnotation(BaseModel):
     last_pubmed_checked_at: Optional[str] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def _omit_openevidence_supplementary_when_absent(self, handler):
+        """Omit `openevidence_supplementary` entirely (not present-as-null)
+        when it's None, so the OPENEVIDENCE_ENABLED=false path has zero new
+        keys in any serialized GeneAnnotation — API responses, exports, and
+        persisted run/gene-cache JSON — matching current main's shape
+        exactly. Deliberately scoped to this one field only: this is NOT a
+        model-wide exclude_none, so every other None-valued field (e.g.
+        clinical_actionability) still serializes as null, unchanged.
+        """
+        data = handler(self)
+        if self.openevidence_supplementary is None:
+            data.pop("openevidence_supplementary", None)
+        return data
 
 
 class FusionInput(BaseModel):

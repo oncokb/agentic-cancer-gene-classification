@@ -7,7 +7,12 @@ import time
 from fastapi.testclient import TestClient
 
 from src import main
-from src.models.schema import AnnotationResult, GeneAnnotation
+from src.models.schema import (
+    AnnotationResult,
+    GeneAnnotation,
+    OpenEvidenceAnalysis,
+    OpenEvidenceCitation,
+)
 
 
 class FakeRunStore:
@@ -95,6 +100,69 @@ def test_single_gene_annotation_endpoint_returns_result_card_json(monkeypatch):
     assert seen["force_refresh"] is True
     assert seen["skip_literature_for_oncokb"] is True
     assert run_store.saved_runs[0][0] == "run-1"
+
+
+def test_single_gene_annotation_endpoint_omits_openevidence_supplementary_when_disabled(monkeypatch):
+    """Contract (a): the OPENEVIDENCE_ENABLED=false path must have zero new
+    keys in serialized output. `openevidence_supplementary` defaults to None
+    (as it does whenever OpenEvidence isn't enabled — see
+    build_gene_annotation), and the actual JSON returned through the real
+    /v1/annotate/gene response_model=GeneAnnotation serialization path must
+    omit the key entirely, not send it as null."""
+    main.app.state.run_store = FakeRunStore()
+
+    async def fake_run_pipeline(fusions, **kwargs):
+        return AnnotationResult(
+            run_id="run-1",
+            timestamp="2026-07-31T14:00:00+00:00",
+            fusions_processed=1,
+            genes_annotated=1,
+            annotations=[GeneAnnotation(gene="ALK")],
+        )
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    client = TestClient(main.app)
+
+    response = client.post("/v1/annotate/gene", json={"gene": "ALK"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "openevidence_supplementary" not in payload
+    # Sanity check this isn't a global exclude_none: other None-valued fields
+    # (e.g. clinical_actionability) still serialize as null, unchanged.
+    assert "clinical_actionability" in payload
+    assert payload["clinical_actionability"] is None
+
+
+def test_single_gene_annotation_endpoint_includes_openevidence_supplementary_when_enabled(monkeypatch):
+    """When OpenEvidence context was actually fetched, the same real
+    serialization path must include the field with its real content."""
+    main.app.state.run_store = FakeRunStore()
+
+    analysis = OpenEvidenceAnalysis(
+        question="What does the evidence show about ALK's role in cancer?",
+        text="OpenEvidence summary text.",
+        citations=[OpenEvidenceCitation(citation_key="c1", title="A source")],
+    )
+
+    async def fake_run_pipeline(fusions, **kwargs):
+        return AnnotationResult(
+            run_id="run-1",
+            timestamp="2026-07-31T14:00:00+00:00",
+            fusions_processed=1,
+            genes_annotated=1,
+            annotations=[GeneAnnotation(gene="ALK", openevidence_supplementary=analysis)],
+        )
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    client = TestClient(main.app)
+
+    response = client.post("/v1/annotate/gene", json={"gene": "ALK"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["openevidence_supplementary"]["text"] == "OpenEvidence summary text."
+    assert payload["openevidence_supplementary"]["citations"][0]["citation_key"] == "c1"
 
 
 def test_batch_annotation_endpoint_returns_annotation_result_json(monkeypatch):
