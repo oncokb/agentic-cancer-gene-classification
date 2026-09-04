@@ -1,0 +1,49 @@
+name: Claude Issue Triage
+
+# Auto-triages issues filed from the in-app feedback form (see
+# src/main.py::_draft_feedback_issue / _feedback_issue_body). Those issue
+# bodies always contain a "Feedback ID:" line, which we use as the trigger
+# gate so this doesn't run on every issue opened in the repo.
+#
+# Comment-only by design: Claude posts its assessment/suggested fix as an
+# issue comment. It is not granted pull-requests: write and is not given a
+# PR-creation tool, so a human still opens and reviews any resulting fix.
+
+on:
+  issues:
+    types: [opened]
+
+concurrency:
+  group: claude-issue-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    if: contains(github.event.issue.body, 'Feedback ID:')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Investigate this curator feedback issue against the current state of
+            the repository. Read the referenced code paths, form a concrete
+            assessment of whether it's a real, scoped bug and what the fix would
+            look like.
+
+            Post a single comment on the issue with:
+            - your assessment (real bug / needs more info / not actionable)
+            - the root cause if you found one, with file:line references
+            - a concrete suggested fix, described in enough detail that a
+              maintainer could implement it directly
+
+            Do not open a pull request or push any commits — comment only.
+          claude_args: |
+            --max-turns 5
+            --allowedTools "mcp__github__create_issue_comment"
