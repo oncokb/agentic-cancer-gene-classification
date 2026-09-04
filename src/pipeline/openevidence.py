@@ -20,7 +20,7 @@ import logging
 from typing import Dict, List, Optional
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.config import settings
 from src.models.schema import OpenEvidenceAnalysis, OpenEvidenceCitation
@@ -29,10 +29,37 @@ from src.pipeline.cache import cached_call
 logger = logging.getLogger(__name__)
 
 STREAMING_ANALYSIS_PATH = "/streaming/analysis"
+_DONE_MARKER = "[DONE]"
+
+# HTTP statuses worth retrying: request timeout, rate limit, and 5xx. Any other
+# 4xx (e.g. 401 bad API key, 404) can never succeed on retry, so fail fast.
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429})
 
 
 class OpenEvidenceConfigurationError(RuntimeError):
     """Raised when OpenEvidence lookups are requested without required configuration."""
+
+
+class OpenEvidenceIncompleteStreamError(RuntimeError):
+    """Raised when an OpenEvidence SSE stream ends without a [DONE] marker —
+    e.g. a dropped connection mid-response. Never treated as a successful
+    result: callers must retry rather than cache a partial/empty output."""
+
+
+def _is_transient_openevidence_error(exc: BaseException) -> bool:
+    """Retry predicate: only network/connection errors and 408/429/5xx are
+    transient. A permanent 4xx (e.g. 401 bad API key) can never succeed on
+    retry, so it must fail fast instead of burning the retry budget."""
+    if isinstance(exc, OpenEvidenceIncompleteStreamError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status in _RETRYABLE_HTTP_STATUSES or status >= 500
+    if isinstance(exc, httpx.HTTPError):
+        # Any other HTTPError subclass here is a connection/timeout/network
+        # failure (HTTPStatusError is already handled above), always transient.
+        return True
+    return False
 
 
 def _build_question(gene: str, tumor_type: Optional[str] = None) -> str:
@@ -43,15 +70,16 @@ def _build_question(gene: str, tumor_type: Optional[str] = None) -> str:
     )
 
 
-def _parse_sse_events(raw: str) -> List[dict]:
-    """Parse an SSE stream body into a list of JSON event payloads.
+def _iter_sse_payloads(raw: str) -> List[str]:
+    """Split an SSE stream body into raw per-event data payloads.
 
     Each event is a blank-line-separated block containing one or more
-    `data:` lines; a payload of exactly "[DONE]" ends the stream. Malformed
-    payloads are skipped rather than failing the whole parse, since a single
-    bad delta shouldn't discard everything accumulated so far.
+    `data:` lines. Per the SSE spec, multiple `data:` lines within one event
+    are joined with "\\n" between them (NOT concatenated directly — plain
+    concatenation can corrupt JSON payload semantics when a single JSON
+    payload is split across lines).
     """
-    events: List[dict] = []
+    payloads: List[str] = []
     for block in raw.replace("\r\n", "\n").split("\n\n"):
         data_lines = [
             line[len("data:"):].strip()
@@ -60,8 +88,29 @@ def _parse_sse_events(raw: str) -> List[dict]:
         ]
         if not data_lines:
             continue
-        payload = "".join(data_lines)
-        if payload == "[DONE]":
+        payloads.append("\n".join(data_lines))
+    return payloads
+
+
+def _stream_saw_done_marker(raw: str) -> bool:
+    """Whether this SSE stream body actually reached its [DONE] terminator.
+
+    A stream that never emits [DONE] (e.g. a connection dropped mid-response)
+    must never be treated as a complete, cacheable result.
+    """
+    return any(payload == _DONE_MARKER for payload in _iter_sse_payloads(raw))
+
+
+def _parse_sse_events(raw: str) -> List[dict]:
+    """Parse an SSE stream body into a list of JSON event payloads.
+
+    A payload of exactly "[DONE]" ends the stream. Malformed payloads are
+    skipped rather than failing the whole parse, since a single bad delta
+    shouldn't discard everything accumulated so far.
+    """
+    events: List[dict] = []
+    for payload in _iter_sse_payloads(raw):
+        if payload == _DONE_MARKER:
             break
         try:
             event = json.loads(payload)
@@ -122,7 +171,11 @@ def _build_analysis(question: str, events: List[dict]) -> OpenEvidenceAnalysis:
     )
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception(_is_transient_openevidence_error),
+)
 async def _post_streaming_analysis(question: str, api_key: str, client: httpx.AsyncClient) -> str:
     base_url = settings.openevidence_base_url.strip().rstrip("/")
     url = f"{base_url}{STREAMING_ANALYSIS_PATH}"
@@ -137,7 +190,14 @@ async def _post_streaming_analysis(question: str, api_key: str, client: httpx.As
     ) as response:
         response.raise_for_status()
         chunks = [chunk async for chunk in response.aiter_text()]
-    return "".join(chunks)
+    raw = "".join(chunks)
+
+    if not _stream_saw_done_marker(raw):
+        raise OpenEvidenceIncompleteStreamError(
+            "OpenEvidence stream ended without a [DONE] marker "
+            "(connection dropped mid-response) — refusing to treat as complete"
+        )
+    return raw
 
 
 class OpenEvidenceClient:
@@ -186,7 +246,10 @@ class OpenEvidenceClient:
             payload = await cached_call(
                 cache_key, _compute, ttl_seconds=settings.openevidence_cache_ttl_seconds
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, OpenEvidenceIncompleteStreamError, RetryError) as exc:
+            # cached_call only caches a successful compute() result (see
+            # src.pipeline.cache) — an exception here, including a retry-
+            # exhausted incomplete stream, is never cached.
             logger.error("OpenEvidence lookup failed for %s: %s", gene, exc)
             raise
         return OpenEvidenceAnalysis(**payload)
