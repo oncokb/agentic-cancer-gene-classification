@@ -32,6 +32,7 @@ from src.pipeline.literature import (
 )
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
+from src.pipeline.openevidence import OpenEvidenceClient
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
@@ -73,6 +74,23 @@ async def _timed(name: str, timings: Dict[str, float], awaitable):
         return await awaitable
     finally:
         timings[name] = _elapsed_ms(start)
+
+
+async def _maybe_fetch_openevidence_context(gene: str, tumor_type: Optional[str]):
+    """Fetch a supplementary OpenEvidence analysis when explicitly enabled.
+
+    Returns None (never raises) when disabled or on any lookup failure — this
+    is a best-effort supplementary input, not part of the core annotation
+    guarantee. Zero behavior change from current main when disabled, since
+    this makes no HTTP call at all in that case.
+    """
+    if not settings.openevidence_enabled:
+        return None
+    try:
+        return await OpenEvidenceClient().get_gene_analysis(gene, tumor_type=tumor_type)
+    except Exception as exc:
+        logger.warning("OpenEvidence supplementary lookup failed for %s: %s", gene, exc)
+        return None
 
 
 def _isoformat(value: Optional[datetime]) -> Optional[str]:
@@ -392,6 +410,17 @@ async def _annotate_gene(
             ),
         )
 
+        # Guard on the flag here (not just inside the helper) so the disabled
+        # path adds nothing to timings_ms either — zero behavior change from
+        # current main when OPENEVIDENCE_ENABLED=false.
+        openevidence_context = None
+        if settings.openevidence_enabled:
+            openevidence_context = await _timed(
+                "openevidence",
+                timings,
+                _maybe_fetch_openevidence_context(gene, tumor_type),
+            )
+
         try:
             synthesis = await _timed(
                 "synthesis",
@@ -407,6 +436,7 @@ async def _annotate_gene(
                     local_mode=local_mode,
                     local_backend=local_backend,
                     mode=mode,
+                    openevidence_context=openevidence_context,
                 ),
             )
         except Exception as e:
@@ -442,6 +472,7 @@ async def _annotate_gene(
             mode=mode,
             retrieval_ranking=retrieval_scores,
             tumor_type=tumor_type,
+            openevidence_context=openevidence_context,
         )
         timings["total"] = _elapsed_ms(total_start)
         annotation.timings_ms = timings
