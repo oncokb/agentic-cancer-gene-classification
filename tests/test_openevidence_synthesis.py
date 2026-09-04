@@ -299,39 +299,28 @@ async def test_synthesize_gene_annotation_does_not_verify_openevidence_citations
     assert result["citations"] == ["1"]
 
 
-def test_verify_citations_strips_by_openevidence_provenance_even_on_pmid_collision():
-    """Provenance-based enforcement, not just format-based: an OpenEvidence
-    citation_key that happens to be the SAME string as a real retrieved PMID
-    must still be excluded, because it did not come from the retrieved
-    PubMed set — it came from OpenEvidence. (A non-colliding key like
-    'oe-99' only proves 'wrong format' gets rejected; this proves 'wrong
-    provenance' gets rejected even when the format/retrieved-set check alone
-    would have let it through.)"""
+def test_verify_citations_keeps_real_pmid_despite_openevidence_citation_key_collision():
+    """A retrieved PMID must NEVER be rejected merely because an OpenEvidence
+    citation_key/DOI/URL for this call happens to share the same string value.
+    Provenance cannot be inferred from string collision alone with the current
+    flat `citations: List[str]` shape — "1" is a genuinely retrieved PMID here,
+    so citing it is legitimate regardless of what OpenEvidence's payload used
+    as a citation_key. (An OpenEvidence-only round-2 fix incorrectly stripped
+    this case; _verify_citations() no longer takes an openevidence_context at
+    all — the existing retrieved-PMID-set check in filter_and_rank_citations()
+    is the sole gate, and it doesn't special-case OpenEvidence.)"""
     records = [LiteratureRecord(pmid="1", title="GENE cancer", abstract="GENE mutation in cancer.")]
-    colliding_analysis = OpenEvidenceAnalysis(
-        question="q",
-        citations=[OpenEvidenceCitation(citation_key="1", title="Colliding OpenEvidence source")],
-    )
 
-    verified = synthesis._verify_citations(
-        "GENE",
-        ["1"],
-        records,
-        max_citations=4,
-        openevidence_context=colliding_analysis,
-    )
+    verified = synthesis._verify_citations("GENE", ["1"], records, max_citations=4)
 
-    assert verified == []
+    assert verified == ["1"]
 
 
-async def test_synthesize_gene_annotation_rejects_openevidence_citation_key_colliding_with_real_pmid(
-    monkeypatch,
-):
+async def test_synthesize_gene_annotation_keeps_real_pmid_despite_openevidence_collision(monkeypatch):
     """End-to-end version of the collision test above, through
-    synthesize_gene_annotation: "1" is a genuinely retrieved PMID (RECORDS
-    has pmid="1"), so a retrieved-PMID-set check alone would accept it. It
-    must still be stripped because this call's OpenEvidence citation_key is
-    also "1"."""
+    synthesize_gene_annotation: this call's OpenEvidence citation_key is also
+    "1", but "1" is a genuinely retrieved PMID (RECORDS has pmid="1"), so it
+    must be kept — not stripped."""
     colliding_analysis = OpenEvidenceAnalysis(
         question="q",
         text="OpenEvidence text.",
@@ -360,7 +349,18 @@ async def test_synthesize_gene_annotation_rejects_openevidence_citation_key_coll
         openevidence_context=colliding_analysis,
     )
 
-    assert result["citations"] == []
+    assert result["citations"] == ["1"]
+
+
+def test_verify_citations_still_rejects_openevidence_only_identifier_not_a_retrieved_pmid():
+    """The flip side: an OpenEvidence-only identifier (e.g. "oe-99") that is
+    NOT itself a retrieved PMID is rejected — purely via the existing
+    retrieved-PMID-set check, with no OpenEvidence-specific logic involved."""
+    records = [LiteratureRecord(pmid="1", title="GENE cancer", abstract="GENE mutation in cancer.")]
+
+    verified = synthesis._verify_citations("GENE", ["1", "oe-99"], records, max_citations=4)
+
+    assert verified == ["1"]
 
 
 def test_build_gene_annotation_surfaces_openevidence_without_touching_citations():

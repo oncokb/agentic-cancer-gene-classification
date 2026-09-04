@@ -10,7 +10,7 @@ Enforces three invariants:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 from src.config import settings
 from src.models.schema import (
@@ -320,58 +320,28 @@ def _build_user_prompt(
     return "\n".join(lines)
 
 
-def _openevidence_excluded_identifiers(
-    openevidence_context: Optional[OpenEvidenceAnalysis],
-) -> Set[str]:
-    """Identifiers (citation_key, DOI, URL) belonging to this call's OpenEvidence
-    supplementary evidence.
-
-    Used to structurally strip those values out of `citations` before PMID
-    verification even runs — enforced by provenance, not merely by whether the
-    value happens to look like an unretrieved PMID. This matters because an
-    OpenEvidence citation_key could coincidentally be a numeric string that
-    collides with a real retrieved PMID; format-based verification alone would
-    let it through.
-    """
-    if openevidence_context is None:
-        return set()
-    identifiers: Set[str] = set()
-    for citation in openevidence_context.citations:
-        if citation.citation_key:
-            identifiers.add(citation.citation_key)
-        if citation.doi:
-            identifiers.add(citation.doi)
-        if citation.url:
-            identifiers.add(citation.url)
-    return identifiers
-
-
 def _verify_citations(
     gene: str,
     citations: List[str],
     records: List[LiteratureRecord],
     max_citations: int,
     gene_identity: Optional[str] = None,
-    openevidence_context: Optional[OpenEvidenceAnalysis] = None,
 ) -> List[str]:
     """
     Remove ambiguous or unretrieved PMIDs from the LLM's citation list, then rank.
     An identifier that was not retrieved is a rejection, not a warning.
 
-    Any value matching this call's OpenEvidence citation_key/DOI/URL is stripped
-    first, unconditionally — see _openevidence_excluded_identifiers.
+    This is the sole gate for OpenEvidence citation isolation too: an
+    OpenEvidence-only identifier (citation_key/DOI/URL) is, by construction,
+    never a member of `records` (the retrieved LiteratureRecord set for this
+    gene), so filter_and_rank_citations already rejects it here — no separate
+    value-based blocklist is needed or wanted. A string that DOES match a
+    retrieved PMID is a legitimate, verified citation regardless of whether an
+    OpenEvidence citation_key/DOI/URL for this call happens to share that same
+    string value; provenance cannot be inferred from string collision alone
+    with the current flat citations: List[str] shape, and rejecting it would
+    incorrectly drop a real citation.
     """
-    excluded_identifiers = _openevidence_excluded_identifiers(openevidence_context)
-    openevidence_collisions = excluded_identifiers.intersection(citations)
-    if openevidence_collisions:
-        logger.warning(
-            "Stripped %d citation(s) matching this call's OpenEvidence provenance "
-            "(citation_key/DOI/URL) — rejected regardless of PMID-format overlap: %s",
-            len(openevidence_collisions),
-            openevidence_collisions,
-        )
-    citations = [c for c in citations if c not in excluded_identifiers]
-
     retrieved_pmids = {record.pmid for record in records}
     verified = filter_and_rank_citations(
         gene=gene,
@@ -403,7 +373,6 @@ def _postprocess_synthesis_output(
     tool_input: Dict,
     records: List[LiteratureRecord],
     gene_identity: Optional[str],
-    openevidence_context: Optional[OpenEvidenceAnalysis] = None,
 ) -> Dict:
     """Apply deterministic citation verification to a raw synthesis tool response."""
     records = _filter_retracted_records(records)
@@ -414,7 +383,6 @@ def _postprocess_synthesis_output(
             records,
             settings.max_citations_per_annotation,
             gene_identity,
-            openevidence_context,
         )
     return tool_input
 
@@ -744,7 +712,6 @@ async def synthesize_gene_annotation(
         tool_input=tool_input,
         records=prompt_records,
         gene_identity=gene_identity,
-        openevidence_context=openevidence_context,
     )
     tool_input["_synthesis_escalated"] = False
     tool_input["_synthesis_escalation_reason"] = None
@@ -778,7 +745,6 @@ async def synthesize_gene_annotation(
                 tool_input=deep_input,
                 records=prompt_records,
                 gene_identity=gene_identity,
-                openevidence_context=openevidence_context,
             )
             tool_input["_synthesis_escalated"] = True
             tool_input["_synthesis_escalation_reason"] = reason
