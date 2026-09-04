@@ -129,6 +129,20 @@ class Settings(BaseSettings):
     fusion_annotation_api_timeout_seconds: float = 15.0
     fusion_context_cache_ttl_seconds: int = 604800
 
+    # Optional: OpenEvidence supplementary evidence lookup for gene synthesis.
+    # Off by default — adds a clearly-labeled, unverified "Supplementary
+    # AI-synthesized evidence (unverified, from OpenEvidence)" section to the
+    # synthesis prompt. Its citations are never treated as verified PMIDs.
+    # Requires org-provisioned API access (Order Form) — see
+    # github.com/oncokb/oe-api-exp. Leave disabled until access, pricing,
+    # rate limits, and redistribution rights are confirmed.
+    openevidence_enabled: bool = False
+    openevidence_api_key: str = ""
+    openevidence_base_url: str = "https://api.openevidence.com"
+    openevidence_model: str = "darwin"
+    openevidence_timeout_seconds: float = 30.0
+    openevidence_cache_ttl_seconds: int = 604800
+
     log_level: str = "INFO"
 
     datadog_metrics_enabled: bool = False

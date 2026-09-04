@@ -202,6 +202,35 @@ class FusionPositionContext(BaseModel):
     error: Optional[str] = None
 
 
+class OpenEvidenceCitation(BaseModel):
+    """One bibliographic source cited by an OpenEvidence analysis.
+
+    Unverified — these citation_keys are not guaranteed to correspond to
+    PMIDs in the retrieved LiteratureRecord set, so they must never be
+    merged into GeneAnnotation.citations or run through PMID verification.
+    """
+
+    citation_key: str
+    title: str = ""
+    authors: str = ""
+    journal: str = ""
+    date: str = ""
+    doi: str = ""
+    url: str = ""
+    source_texts: List[str] = Field(default_factory=list)
+
+
+class OpenEvidenceAnalysis(BaseModel):
+    """Supplementary AI-synthesized evidence from OpenEvidence for one gene
+    question. Unverified: `text` and `citations` are not grounded against the
+    retrieved PubMed set and must always be surfaced as clearly-labeled
+    supplementary context, never as verified citations."""
+
+    question: str
+    text: str = ""
+    citations: List[OpenEvidenceCitation] = Field(default_factory=list)
+
+
 class GeneAnnotation(BaseModel):
     """One row in Nicole's spreadsheet, keyed by gene."""
 
@@ -220,6 +249,10 @@ class GeneAnnotation(BaseModel):
     evidence_cards: List[EvidenceCard] = Field(default_factory=list)
     clinical_actionability: Optional[ClinicalActionability] = None
     quality_flags: List[QualityFlag] = Field(default_factory=list)
+    # Supplementary AI-synthesized evidence from OpenEvidence, only populated
+    # when OPENEVIDENCE_ENABLED=true. Unverified — never counted among the
+    # verified PMID `citations` above.
+    openevidence_supplementary: Optional[OpenEvidenceAnalysis] = None
     date_annotated: str = Field(
         default_factory=lambda: date.today().strftime("%-m/%-d/%y")
     )
