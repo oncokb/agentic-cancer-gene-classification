@@ -3,6 +3,12 @@
 No test in this file makes a real network call to openevidence.com — all
 HTTP is mocked via httpx.MockTransport, following the pattern used for
 OncoKB (tests/test_db_lookups.py) and PubMed (tests/test_literature_cache.py).
+
+Event fixtures below are the REAL, confirmed shapes — verified against both
+the official OpenEvidence API docs and a live-captured streaming response
+(HTTP 200, real API key, question about BRAF V600E in melanoma). There is no
+`[DONE]` sentinel anywhere in the real contract; citation data is nested
+under event["reference"]["reference_detail"], not flat top-level fields.
 """
 
 from __future__ import annotations
@@ -23,16 +29,46 @@ from src.pipeline.openevidence import (
     _parse_sse_events,
 )
 
+# Verbatim (real, live-captured) NCCN guideline citation — note the absence
+# of doi/journal fields, unlike the journal-article example below.
+_NCCN_CITATION_EVENT = (
+    '{"text": "[[1]]", "reference": {"citation_key": 1, '
+    '"reference_text": "National Comprehensive Cancer Network. Melanoma: Cutaneous.", '
+    '"reference_detail": {"title": "Melanoma: Cutaneous", '
+    '"authors_string": "National Comprehensive Cancer Network", '
+    '"publication_info_string": "Updated 2026-09-02", '
+    '"publication_date": "2026-09-02", '
+    '"url": "https://www.nccn.org/professionals/physician_gls/pdf/cutaneous_melanoma.pdf#page=77"}, '
+    '"source_texts": []}}'
+)
+
+# From the official docs: a journal-article citation, showing doi/journal_name/
+# journal_short_name/source_texts present (which the NCCN example lacks).
+_PSORIASIS_CITATION_EVENT = (
+    '{"text": "[[2]]", "reference": {"citation_key": 2, '
+    '"reference_text": "Lebwohl M, Ting PT, Koo JY. Psoriasis Treatment: Traditional Therapy. '
+    'Annals of the Rheumatic Diseases. 2005;64 Suppl 2:ii83-6. doi:10.1136/ard.2004.030791.", '
+    '"reference_detail": {"title": "Psoriasis Treatment: Traditional Therapy", '
+    '"authors_string": "Lebwohl M, Ting PT, Koo JY.", '
+    '"publication_info_string": "Annals of the Rheumatic Diseases. 2005;64 Suppl 2:ii83-6. doi:10.1136/ard.2004.030791.", '
+    '"journal_name": "Annals of the Rheumatic Diseases", '
+    '"journal_short_name": "Ann Rheum Dis", '
+    '"publication_date": "2005-03-01", '
+    '"doi": "10.1136/ard.2004.030791", '
+    '"url": "https://pubmed.ncbi.nlm.nih.gov/15708945"}, '
+    '"source_texts": ["Even before the recent development of biological agents, a long list '
+    'of effective treatments has been available for patients with psoriasis..."]}}'
+)
+
+_TABLE_EVENT = '{"table": {"rows": [{"gene": "BRAF", "alteration": "V600E"}]}}'
+
+# A real streaming response has no [DONE] terminator — it just ends.
 SSE_STREAM = (
     'data: {"text": "BRAF mutations "}\n\n'
     'data: {"text": "are common in melanoma."}\n\n'
-    'data: {"citation_key": "c1", "title": "BRAF in melanoma", "authors": "Smith J",'
-    ' "journal": "Nature", "date": "2020", "doi": "10.1/abc", "url": "https://example.com/1",'
-    ' "reference_text": "BRAF V600E drives melanoma."}\n\n'
-    'data: {"citation_key": "c1", "title": "BRAF in melanoma", "authors": "Smith J",'
-    ' "journal": "Nature", "date": "2020", "doi": "10.1/abc", "url": "https://example.com/1",'
-    ' "reference_text": "Additional supporting passage."}\n\n'
-    "data: [DONE]\n\n"
+    f"data: {_NCCN_CITATION_EVENT}\n\n"
+    f"data: {_PSORIASIS_CITATION_EVENT}\n\n"
+    f"data: {_TABLE_EVENT}\n\n"
 )
 
 
@@ -45,14 +81,16 @@ async def _require_redis():
         pytest.skip(f"Redis not reachable: {exc}")
 
 
-def test_parse_sse_events_stops_at_done_marker():
+def test_parse_sse_events_parses_all_events_with_no_done_marker():
+    """There is no [DONE] sentinel in the real API — all 5 events parse
+    (2 text deltas + 2 citation events + 1 table event), nothing is skipped
+    or mistaken for a stream terminator."""
     events = _parse_sse_events(SSE_STREAM)
-    # Two text deltas + two citation events, [DONE] excluded.
-    assert len(events) == 4
+    assert len(events) == 5
 
 
 def test_parse_sse_events_skips_malformed_payload():
-    raw = 'data: {"text": "ok"}\n\ndata: not-json\n\ndata: [DONE]\n\n'
+    raw = 'data: {"text": "ok"}\n\ndata: not-json\n\n'
     events = _parse_sse_events(raw)
     assert events == [{"text": "ok"}]
 
@@ -65,39 +103,95 @@ def test_iter_sse_payloads_joins_multiline_data_with_newline_not_concatenation()
     the original payload's semantics — which can turn a JSON payload that was
     validly split across physical lines into something that fails to parse
     or parses to the wrong value."""
-    raw = "data: first line\ndata: second line\n\ndata: [DONE]\n\n"
+    raw = "data: first line\ndata: second line\n\n"
     payloads = _iter_sse_payloads(raw)
-    assert payloads == ["first line\nsecond line", "[DONE]"]
+    assert payloads == ["first line\nsecond line"]
 
 
 def test_parse_sse_events_reassembles_multiline_json_payload():
     """A single JSON event split across two `data:` lines (e.g. a
     pretty-printed payload) must reassemble into one JSON object via the
     "\\n" join, not into unparseable or merged text via concatenation."""
-    raw = 'data: {"text":\ndata: "hello"}\n\ndata: [DONE]\n\n'
+    raw = 'data: {"text":\ndata: "hello"}\n\n'
     events = _parse_sse_events(raw)
     assert events == [{"text": "hello"}]
 
 
-def test_build_analysis_accumulates_text_and_dedupes_citations():
+def test_build_analysis_accumulates_text_from_all_events_including_citations():
+    """Per the official docs, concatenating every event's `text` field
+    produces the full analysis text — including citation-bearing events,
+    whose `text` is an inline marker like "[[1]]", not just plain message
+    events."""
     events = _parse_sse_events(SSE_STREAM)
     analysis = _build_analysis("What about BRAF?", events)
 
     assert analysis.question == "What about BRAF?"
-    assert analysis.text == "BRAF mutations are common in melanoma."
-    assert len(analysis.citations) == 1
+    assert analysis.text == "BRAF mutations are common in melanoma.[[1]][[2]]"
 
-    citation = analysis.citations[0]
-    assert citation.citation_key == "c1"
-    assert citation.title == "BRAF in melanoma"
-    assert citation.journal == "Nature"
-    assert citation.doi == "10.1/abc"
-    assert citation.url == "https://example.com/1"
-    # Both source_texts merged, deduplicated, order preserved.
-    assert citation.source_texts == [
-        "BRAF V600E drives melanoma.",
-        "Additional supporting passage.",
+
+def test_build_analysis_extracts_citations_from_real_nested_shape():
+    """Citation fields are nested under event["reference"]["reference_detail"],
+    not flat top-level fields — this is the real, confirmed shape."""
+    events = _parse_sse_events(SSE_STREAM)
+    analysis = _build_analysis("What about BRAF?", events)
+
+    assert len(analysis.citations) == 2
+    by_key = {c.citation_key: c for c in analysis.citations}
+
+    nccn = by_key["1"]
+    assert nccn.title == "Melanoma: Cutaneous"
+    assert nccn.authors == "National Comprehensive Cancer Network"
+    assert nccn.journal == ""  # no journal_name/journal_short_name in this fixture
+    assert nccn.date == "2026-09-02"
+    assert nccn.doi == ""  # no doi in this fixture
+    assert nccn.url == "https://www.nccn.org/professionals/physician_gls/pdf/cutaneous_melanoma.pdf#page=77"
+    assert nccn.source_texts == []
+
+    psoriasis = by_key["2"]
+    assert psoriasis.title == "Psoriasis Treatment: Traditional Therapy"
+    assert psoriasis.authors == "Lebwohl M, Ting PT, Koo JY."
+    assert psoriasis.journal == "Annals of the Rheumatic Diseases"  # journal_name preferred
+    assert psoriasis.date == "2005-03-01"
+    assert psoriasis.doi == "10.1136/ard.2004.030791"
+    assert psoriasis.url == "https://pubmed.ncbi.nlm.nih.gov/15708945"
+    assert psoriasis.source_texts == [
+        "Even before the recent development of biological agents, a long list "
+        "of effective treatments has been available for patients with psoriasis..."
     ]
+
+
+def test_build_analysis_dedupes_repeated_citation_key_merging_source_texts():
+    second_occurrence = (
+        '{"text": "[[2]]", "reference": {"citation_key": 2, "reference_text": "x", '
+        '"reference_detail": {"title": "Psoriasis Treatment: Traditional Therapy"}, '
+        '"source_texts": ["A second supporting passage."]}}'
+    )
+    events = _parse_sse_events(
+        f"data: {_PSORIASIS_CITATION_EVENT}\n\n" f"data: {second_occurrence}\n\n"
+    )
+    analysis = _build_analysis("q", events)
+
+    assert len(analysis.citations) == 1
+    citation = analysis.citations[0]
+    assert citation.source_texts == [
+        "Even before the recent development of biological agents, a long list "
+        "of effective treatments has been available for patients with psoriasis...",
+        "A second supporting passage.",
+    ]
+
+
+def test_build_analysis_ignores_table_events_without_crashing():
+    """`table` events are an intentional v1 limitation — dropped entirely,
+    never crash parsing, never pollute accumulated text or citations."""
+    events = _parse_sse_events(
+        'data: {"text": "before "}\n\n'
+        f"data: {_TABLE_EVENT}\n\n"
+        'data: {"text": "after"}\n\n'
+    )
+    analysis = _build_analysis("q", events)
+
+    assert analysis.text == "before after"
+    assert analysis.citations == []
 
 
 @pytest.mark.asyncio
@@ -123,9 +217,8 @@ async def test_get_gene_analysis_parses_mocked_stream():
         analysis = await client.get_gene_analysis("BRAF", tumor_type="melanoma", client=http_client)
 
     assert len(requests) == 1
-    assert analysis.text == "BRAF mutations are common in melanoma."
-    assert len(analysis.citations) == 1
-    assert analysis.citations[0].citation_key == "c1"
+    assert analysis.text == "BRAF mutations are common in melanoma.[[1]][[2]]"
+    assert {c.citation_key for c in analysis.citations} == {"1", "2"}
 
 
 @pytest.mark.asyncio
@@ -146,35 +239,42 @@ async def test_get_gene_analysis_caches_across_calls(_require_redis):
 
 
 @pytest.mark.asyncio
-async def test_get_gene_analysis_retries_on_transient_failure():
-    attempts = {"count": 0}
+async def test_get_gene_analysis_clean_stream_with_no_done_marker_is_cached(_require_redis):
+    """Round 4 fix: there is no [DONE] sentinel in the real API (confirmed
+    absent from the official docs and a live capture). A stream that simply
+    ends normally — the HTTP body finishes, no transport exception — must be
+    treated as a complete, valid, CACHEABLE result. (Round 3 had this
+    backwards: it required seeing a literal "[DONE]" payload, which would
+    have caused every real production call to be treated as incomplete and
+    exhaust its retries.)"""
+    requests = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            return httpx.Response(503, text="temporarily unavailable")
-        return httpx.Response(200, text=SSE_STREAM)
+        requests.append(request)
+        return httpx.Response(200, text=SSE_STREAM)  # ends cleanly, no [DONE]
 
     client = OpenEvidenceClient(api_key="test-key")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
-        analysis = await client.get_gene_analysis("BRAF", client=http_client)
+        first = await client.get_gene_analysis("BRAF", client=http_client)
+        second = await client.get_gene_analysis("BRAF", client=http_client)
 
-    assert attempts["count"] == 2
-    assert analysis.text == "BRAF mutations are common in melanoma."
+    assert first == second
+    assert len(first.citations) == 2
+    assert len(requests) == 1  # cached after the first successful (DONE-less) call
 
 
 @pytest.mark.asyncio
-async def test_get_gene_analysis_incomplete_stream_retries_and_is_not_cached(_require_redis):
-    """A stream that never reaches [DONE] (e.g. connection dropped mid-response)
-    must not be treated as a successful result: it should exhaust retries and
-    raise, and must never be cached — otherwise a partial/empty analysis would
-    be served from cache for the full TTL, suppressing any future retry."""
+async def test_get_gene_analysis_transport_error_retries_and_is_not_cached(_require_redis):
+    """A genuinely dropped/reset connection mid-stream is how an incomplete
+    response actually surfaces against the real API — httpx itself raises a
+    transport exception, which the retry predicate treats as transient. This
+    is the "transport-exception-based incompleteness detection" that
+    replaces the old (incorrect) [DONE]-sentinel check."""
     attempts = {"count": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         attempts["count"] += 1
-        # Always partial — never emits a [DONE] marker.
-        return httpx.Response(200, text='data: {"text": "partial"}\n\n')
+        raise httpx.ReadError("connection reset mid-stream", request=request)
 
     client = OpenEvidenceClient(api_key="test-key")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
@@ -192,6 +292,24 @@ async def test_get_gene_analysis_incomplete_stream_retries_and_is_not_cached(_re
 
 
 @pytest.mark.asyncio
+async def test_get_gene_analysis_retries_on_transient_failure():
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return httpx.Response(503, text="temporarily unavailable")
+        return httpx.Response(200, text=SSE_STREAM)
+
+    client = OpenEvidenceClient(api_key="test-key")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        analysis = await client.get_gene_analysis("BRAF", client=http_client)
+
+    assert attempts["count"] == 2
+    assert analysis.text == "BRAF mutations are common in melanoma.[[1]][[2]]"
+
+
+@pytest.mark.asyncio
 async def test_get_gene_analysis_does_not_retry_permanent_4xx():
     """A 401 (bad API key) can never succeed on retry — it must fail fast on
     the first attempt rather than burning the retry budget."""
@@ -204,6 +322,27 @@ async def test_get_gene_analysis_does_not_retry_permanent_4xx():
     client = OpenEvidenceClient(api_key="bad-key")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
         with pytest.raises(httpx.HTTPStatusError):
+            await client.get_gene_analysis("BRAF", client=http_client)
+
+    assert attempts["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_gene_analysis_does_not_retry_on_timeout():
+    """OpenEvidence's real-world latency can run into minutes for a complex
+    question (a live smoke test ran ~220s without finishing). Retrying a
+    slow-but-functioning server would only multiply an already multi-minute
+    wait for what's meant to be a quick, best-effort lookup — a timeout must
+    fail fast: single attempt, no retry."""
+    attempts = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["count"] += 1
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    client = OpenEvidenceClient(api_key="test-key")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        with pytest.raises(httpx.ReadTimeout):
             await client.get_gene_analysis("BRAF", client=http_client)
 
     assert attempts["count"] == 1
