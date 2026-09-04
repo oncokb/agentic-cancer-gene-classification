@@ -1,12 +1,17 @@
 """Tests wiring OpenEvidence supplementary evidence into synthesis/orchestrator.
 
 Covers the acceptance contract for the integration:
-  (a) OPENEVIDENCE_ENABLED=False is a zero-behavior-change path.
+  (a) OPENEVIDENCE_ENABLED=False is a zero-behavior-change path — including
+      the SYSTEM_PROMPT/CORE_SYSTEM_PROMPT constants themselves, not just the
+      user prompt.
   (b) OpenEvidence citations never flow through citation verification as if
-      they were verified PMID citations.
+      they were verified PMID citations — enforced structurally by
+      provenance (citation_key/DOI/URL), not only by PMID-format rejection.
 """
 
 from __future__ import annotations
+
+import hashlib
 
 from src.models.schema import (
     LiteratureRecord,
@@ -34,6 +39,28 @@ FAKE_ANALYSIS = OpenEvidenceAnalysis(
         )
     ],
 )
+
+# SHA-256 of SYSTEM_PROMPT / CORE_SYSTEM_PROMPT exactly as they existed on
+# origin/main (commit ef6fc07, before this OpenEvidence integration existed —
+# extracted via `git show origin/main:src/pipeline/synthesis.py`). A
+# regression guard independent of the current module state: if someone bakes
+# an OpenEvidence-specific instruction back into these shared constants
+# (rather than appending it dynamically only when openevidence_context is
+# supplied), this catches it even though comparing the constant to itself
+# would not.
+_PRE_INTEGRATION_SYSTEM_PROMPT_SHA256 = "b6699bfe7c74a2c8ce744d4adb18fbeae81c5bb0fc774efb5a7890006404a461"
+_PRE_INTEGRATION_CORE_SYSTEM_PROMPT_SHA256 = "ef24453a8f3eec2ceea0c37be02e26afd8106fba2ba9a7b5d06a4062e11e2754"
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_system_prompt_constants_match_pre_integration_hash():
+    assert _sha256(synthesis.SYSTEM_PROMPT) == _PRE_INTEGRATION_SYSTEM_PROMPT_SHA256
+    assert _sha256(synthesis.CORE_SYSTEM_PROMPT) == _PRE_INTEGRATION_CORE_SYSTEM_PROMPT_SHA256
+    assert "OpenEvidence" not in synthesis.SYSTEM_PROMPT
+    assert "OpenEvidence" not in synthesis.CORE_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +105,104 @@ async def test_synthesize_gene_annotation_prompt_unchanged_when_no_context(monke
 
     assert "OpenEvidence" not in seen["user"]
     assert result["citations"] == ["1"]
+
+
+async def test_synthesize_gene_annotation_system_prompt_unchanged_when_no_context(monkeypatch):
+    """The exact `system` string passed to complete_with_tool must be
+    byte-identical to the pre-integration SYSTEM_PROMPT when
+    openevidence_context is None — not just the user prompt (full mode)."""
+    seen = {}
+
+    async def fake_complete_with_tool(**kwargs):
+        seen.update(kwargs)
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Supported by a retrieved PMID.",
+            "gene_summary": "GENE is associated with cancer (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(synthesis.settings, "synthesis_model_escalation", False)
+
+    await synthesis.synthesize_gene_annotation(
+        gene="GENE",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=RECORDS,
+        retrieval_tier=1,
+    )
+
+    assert seen["system"] == synthesis.SYSTEM_PROMPT
+    assert _sha256(seen["system"]) == _PRE_INTEGRATION_SYSTEM_PROMPT_SHA256
+
+
+async def test_core_synthesize_gene_annotation_system_prompt_unchanged_when_no_context(monkeypatch):
+    """Same guarantee as above, for CORE_SYSTEM_PROMPT (mode="core")."""
+    seen = {}
+
+    async def fake_complete_with_tool(**kwargs):
+        seen.update(kwargs)
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Supported by a retrieved PMID.",
+            "gene_summary": "GENE is associated with cancer (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(synthesis.settings, "synthesis_model_escalation", False)
+
+    await synthesis.synthesize_gene_annotation(
+        gene="GENE",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=RECORDS,
+        retrieval_tier=1,
+        mode="core",
+    )
+
+    assert seen["system"] == synthesis.CORE_SYSTEM_PROMPT
+    assert _sha256(seen["system"]) == _PRE_INTEGRATION_CORE_SYSTEM_PROMPT_SHA256
+
+
+async def test_synthesize_gene_annotation_appends_instruction_only_when_context_present(monkeypatch):
+    """When openevidence_context IS supplied, the OpenEvidence-handling
+    instruction is appended dynamically on top of the untouched base
+    constant — proving the two states (context / no context) genuinely
+    differ only by that dynamic append."""
+    seen = {}
+
+    async def fake_complete_with_tool(**kwargs):
+        seen.update(kwargs)
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Supported by a retrieved PMID.",
+            "gene_summary": "GENE is associated with cancer (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(synthesis.settings, "synthesis_model_escalation", False)
+
+    await synthesis.synthesize_gene_annotation(
+        gene="GENE",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=RECORDS,
+        retrieval_tier=1,
+        openevidence_context=FAKE_ANALYSIS,
+    )
+
+    assert seen["system"] != synthesis.SYSTEM_PROMPT
+    assert seen["system"].startswith(synthesis.SYSTEM_PROMPT)
+    assert "OpenEvidence" in seen["system"]
 
 
 async def test_annotate_gene_never_calls_openevidence_when_disabled(monkeypatch):
@@ -172,6 +297,70 @@ async def test_synthesize_gene_annotation_does_not_verify_openevidence_citations
     assert "OpenEvidence" in seen["user"]
     # oe-99 was rejected by verification since it isn't a retrieved PMID.
     assert result["citations"] == ["1"]
+
+
+def test_verify_citations_strips_by_openevidence_provenance_even_on_pmid_collision():
+    """Provenance-based enforcement, not just format-based: an OpenEvidence
+    citation_key that happens to be the SAME string as a real retrieved PMID
+    must still be excluded, because it did not come from the retrieved
+    PubMed set — it came from OpenEvidence. (A non-colliding key like
+    'oe-99' only proves 'wrong format' gets rejected; this proves 'wrong
+    provenance' gets rejected even when the format/retrieved-set check alone
+    would have let it through.)"""
+    records = [LiteratureRecord(pmid="1", title="GENE cancer", abstract="GENE mutation in cancer.")]
+    colliding_analysis = OpenEvidenceAnalysis(
+        question="q",
+        citations=[OpenEvidenceCitation(citation_key="1", title="Colliding OpenEvidence source")],
+    )
+
+    verified = synthesis._verify_citations(
+        "GENE",
+        ["1"],
+        records,
+        max_citations=4,
+        openevidence_context=colliding_analysis,
+    )
+
+    assert verified == []
+
+
+async def test_synthesize_gene_annotation_rejects_openevidence_citation_key_colliding_with_real_pmid(
+    monkeypatch,
+):
+    """End-to-end version of the collision test above, through
+    synthesize_gene_annotation: "1" is a genuinely retrieved PMID (RECORDS
+    has pmid="1"), so a retrieved-PMID-set check alone would accept it. It
+    must still be stripped because this call's OpenEvidence citation_key is
+    also "1"."""
+    colliding_analysis = OpenEvidenceAnalysis(
+        question="q",
+        text="OpenEvidence text.",
+        citations=[OpenEvidenceCitation(citation_key="1", title="Colliding OpenEvidence source")],
+    )
+
+    async def fake_complete_with_tool(**kwargs):
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Supported by a retrieved PMID.",
+            "gene_summary": "GENE is associated with cancer (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(synthesis.settings, "synthesis_model_escalation", False)
+
+    result = await synthesis.synthesize_gene_annotation(
+        gene="GENE",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=RECORDS,
+        retrieval_tier=1,
+        openevidence_context=colliding_analysis,
+    )
+
+    assert result["citations"] == []
 
 
 def test_build_gene_annotation_surfaces_openevidence_without_touching_citations():

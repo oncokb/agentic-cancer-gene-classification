@@ -10,7 +10,7 @@ Enforces three invariants:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from src.config import settings
 from src.models.schema import (
@@ -49,7 +49,6 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 - Do NOT invent, guess, or recall PMIDs from memory. If a fact cannot be grounded in the retrieved set, omit it.
 - A fabricated PMID will cause patient safety errors. Treat citation fabrication as the most critical failure mode.
 - Prefer citation precision over citation volume. Do not cite loosely related background papers just because they were retrieved.
-- If a "Supplementary AI-synthesized evidence (unverified, from OpenEvidence)" section is present, treat it strictly as unverified background context. Never copy its citation_keys, DOIs, or URLs into `citations` — that field must only ever contain PMIDs from the retrieved PubMed abstracts above.
 - Use the HGNC identity to avoid same-symbol ambiguity. Do not cite papers that use the same symbol
   for a different entity, such as an lncRNA/circRNA/transcript name unrelated to the HGNC gene.
 - If the retrieved evidence is insufficient to make a determination, set `insufficient_evidence: true` and leave classification fields null. This is a valid, preferred output over hallucination.
@@ -96,6 +95,15 @@ If evidence is insufficient but abstracts were retrieved, still summarize what t
 and why they do not support a confident cancer annotation.
 Prefer a precise short answer over a broad answer.
 """
+
+# Appended to the system prompt ONLY when openevidence_context is actually supplied
+# (see synthesize_gene_annotation) — never baked into SYSTEM_PROMPT/CORE_SYSTEM_PROMPT
+# themselves, so the disabled path's system prompt stays byte-identical to before
+# this integration existed.
+_OPENEVIDENCE_SYSTEM_INSTRUCTION = """
+
+## Supplementary evidence handling:
+- If a "Supplementary AI-synthesized evidence (unverified, from OpenEvidence)" section is present below, treat it strictly as unverified background context. Never copy its citation_keys, DOIs, or URLs into `citations` — that field must only ever contain PMIDs from the retrieved PubMed abstracts above it."""
 
 ANNOTATE_TOOL: dict = {
     "name": "annotate_gene",
@@ -312,17 +320,58 @@ def _build_user_prompt(
     return "\n".join(lines)
 
 
+def _openevidence_excluded_identifiers(
+    openevidence_context: Optional[OpenEvidenceAnalysis],
+) -> Set[str]:
+    """Identifiers (citation_key, DOI, URL) belonging to this call's OpenEvidence
+    supplementary evidence.
+
+    Used to structurally strip those values out of `citations` before PMID
+    verification even runs — enforced by provenance, not merely by whether the
+    value happens to look like an unretrieved PMID. This matters because an
+    OpenEvidence citation_key could coincidentally be a numeric string that
+    collides with a real retrieved PMID; format-based verification alone would
+    let it through.
+    """
+    if openevidence_context is None:
+        return set()
+    identifiers: Set[str] = set()
+    for citation in openevidence_context.citations:
+        if citation.citation_key:
+            identifiers.add(citation.citation_key)
+        if citation.doi:
+            identifiers.add(citation.doi)
+        if citation.url:
+            identifiers.add(citation.url)
+    return identifiers
+
+
 def _verify_citations(
     gene: str,
     citations: List[str],
     records: List[LiteratureRecord],
     max_citations: int,
     gene_identity: Optional[str] = None,
+    openevidence_context: Optional[OpenEvidenceAnalysis] = None,
 ) -> List[str]:
     """
     Remove ambiguous or unretrieved PMIDs from the LLM's citation list, then rank.
     An identifier that was not retrieved is a rejection, not a warning.
+
+    Any value matching this call's OpenEvidence citation_key/DOI/URL is stripped
+    first, unconditionally — see _openevidence_excluded_identifiers.
     """
+    excluded_identifiers = _openevidence_excluded_identifiers(openevidence_context)
+    openevidence_collisions = excluded_identifiers.intersection(citations)
+    if openevidence_collisions:
+        logger.warning(
+            "Stripped %d citation(s) matching this call's OpenEvidence provenance "
+            "(citation_key/DOI/URL) — rejected regardless of PMID-format overlap: %s",
+            len(openevidence_collisions),
+            openevidence_collisions,
+        )
+    citations = [c for c in citations if c not in excluded_identifiers]
+
     retrieved_pmids = {record.pmid for record in records}
     verified = filter_and_rank_citations(
         gene=gene,
@@ -354,6 +403,7 @@ def _postprocess_synthesis_output(
     tool_input: Dict,
     records: List[LiteratureRecord],
     gene_identity: Optional[str],
+    openevidence_context: Optional[OpenEvidenceAnalysis] = None,
 ) -> Dict:
     """Apply deterministic citation verification to a raw synthesis tool response."""
     records = _filter_retracted_records(records)
@@ -364,6 +414,7 @@ def _postprocess_synthesis_output(
             records,
             settings.max_citations_per_annotation,
             gene_identity,
+            openevidence_context,
         )
     return tool_input
 
@@ -667,6 +718,8 @@ async def synthesize_gene_annotation(
     )
     tool = CORE_ANNOTATE_TOOL if mode == "core" else ANNOTATE_TOOL
     system_prompt = CORE_SYSTEM_PROMPT if mode == "core" else SYSTEM_PROMPT
+    if openevidence_context is not None:
+        system_prompt = system_prompt + _OPENEVIDENCE_SYSTEM_INSTRUCTION
     max_tokens = settings.core_synthesis_max_tokens if mode == "core" else 2048
 
     fast_model = settings.synthesis_fast_model if settings.synthesis_model_escalation else settings.synthesis_model
@@ -691,6 +744,7 @@ async def synthesize_gene_annotation(
         tool_input=tool_input,
         records=prompt_records,
         gene_identity=gene_identity,
+        openevidence_context=openevidence_context,
     )
     tool_input["_synthesis_escalated"] = False
     tool_input["_synthesis_escalation_reason"] = None
@@ -724,6 +778,7 @@ async def synthesize_gene_annotation(
                 tool_input=deep_input,
                 records=prompt_records,
                 gene_identity=gene_identity,
+                openevidence_context=openevidence_context,
             )
             tool_input["_synthesis_escalated"] = True
             tool_input["_synthesis_escalation_reason"] = reason
