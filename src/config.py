@@ -140,7 +140,15 @@ class Settings(BaseSettings):
     openevidence_api_key: str = ""
     openevidence_base_url: str = "https://api.openevidence.com"
     openevidence_model: str = "darwin"
-    openevidence_timeout_seconds: float = 30.0
+    # A live-verified smoke test against the real API took ~220s and still
+    # hadn't finished a single moderately complex clinical question — 60s is
+    # a more realistic floor than the old 30s default, but OpenEvidence may
+    # still frequently exceed even this for complex questions. That's an
+    # accepted tradeoff: this lookup is explicitly best-effort/supplementary
+    # (see orchestrator.py's _maybe_fetch_openevidence_context), a timeout
+    # is not retried (see openevidence.py's _is_transient_openevidence_error),
+    # and it never blocks or fails the core gene annotation either way.
+    openevidence_timeout_seconds: float = 60.0
     openevidence_cache_ttl_seconds: int = 604800
 
     log_level: str = "INFO"

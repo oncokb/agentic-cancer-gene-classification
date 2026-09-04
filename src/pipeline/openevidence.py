@@ -29,7 +29,6 @@ from src.pipeline.cache import cached_call
 logger = logging.getLogger(__name__)
 
 STREAMING_ANALYSIS_PATH = "/streaming/analysis"
-_DONE_MARKER = "[DONE]"
 
 # HTTP statuses worth retrying: request timeout, rate limit, and 5xx. Any other
 # 4xx (e.g. 401 bad API key, 404) can never succeed on retry, so fail fast.
@@ -40,24 +39,34 @@ class OpenEvidenceConfigurationError(RuntimeError):
     """Raised when OpenEvidence lookups are requested without required configuration."""
 
 
-class OpenEvidenceIncompleteStreamError(RuntimeError):
-    """Raised when an OpenEvidence SSE stream ends without a [DONE] marker —
-    e.g. a dropped connection mid-response. Never treated as a successful
-    result: callers must retry rather than cache a partial/empty output."""
-
-
 def _is_transient_openevidence_error(exc: BaseException) -> bool:
-    """Retry predicate: only network/connection errors and 408/429/5xx are
-    transient. A permanent 4xx (e.g. 401 bad API key) can never succeed on
-    retry, so it must fail fast instead of burning the retry budget."""
-    if isinstance(exc, OpenEvidenceIncompleteStreamError):
-        return True
+    """Retry predicate: network/connection errors and 408/429/5xx are
+    transient and worth retrying. A permanent 4xx (e.g. 401 bad API key) can
+    never succeed on retry, so it fails fast instead of burning the retry
+    budget.
+
+    A read/connect/pool timeout is deliberately NOT retried either, even
+    though it's "transient" in the usual sense: a live-verified smoke test
+    against the real API took ~220s and still hadn't finished a single
+    moderately complex clinical question. Retrying a slow-but-functioning
+    server would only multiply an already multi-minute wait for what is
+    meant to be a quick, best-effort supplementary lookup — a timeout is
+    treated as "no supplementary evidence available this time", the same
+    normal, non-alarming outcome as any other best-effort lookup failure
+    (see orchestrator.py's _maybe_fetch_openevidence_context).
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return False
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         return status in _RETRYABLE_HTTP_STATUSES or status >= 500
     if isinstance(exc, httpx.HTTPError):
-        # Any other HTTPError subclass here is a connection/timeout/network
-        # failure (HTTPStatusError is already handled above), always transient.
+        # Any other HTTPError subclass here is a connection/network failure
+        # (HTTPStatusError and TimeoutException are already handled above),
+        # always transient — e.g. a dropped/reset connection mid-stream,
+        # which is how an incomplete stream actually surfaces against the
+        # real API (there is no application-level completion sentinel to
+        # check for; see _post_streaming_analysis).
         return True
     return False
 
@@ -92,26 +101,19 @@ def _iter_sse_payloads(raw: str) -> List[str]:
     return payloads
 
 
-def _stream_saw_done_marker(raw: str) -> bool:
-    """Whether this SSE stream body actually reached its [DONE] terminator.
-
-    A stream that never emits [DONE] (e.g. a connection dropped mid-response)
-    must never be treated as a complete, cacheable result.
-    """
-    return any(payload == _DONE_MARKER for payload in _iter_sse_payloads(raw))
-
-
 def _parse_sse_events(raw: str) -> List[dict]:
     """Parse an SSE stream body into a list of JSON event payloads.
 
-    A payload of exactly "[DONE]" ends the stream. Malformed payloads are
-    skipped rather than failing the whole parse, since a single bad delta
-    shouldn't discard everything accumulated so far.
+    There is no application-level stream-termination sentinel in the real
+    OpenEvidence API (confirmed absent from both the official docs and a
+    live-captured response) — completion is signalled entirely by the HTTP
+    response body ending normally, which the transport layer (httpx) is
+    responsible for detecting; see _post_streaming_analysis. Malformed
+    payloads are skipped rather than failing the whole parse, since a single
+    bad delta shouldn't discard everything accumulated so far.
     """
     events: List[dict] = []
     for payload in _iter_sse_payloads(raw):
-        if payload == _DONE_MARKER:
-            break
         try:
             event = json.loads(payload)
         except json.JSONDecodeError:
@@ -123,30 +125,65 @@ def _parse_sse_events(raw: str) -> List[dict]:
 
 
 def _citation_from_event(event: dict) -> Optional[OpenEvidenceCitation]:
-    citation_key = event.get("citation_key")
-    if not citation_key:
+    """Extract citation metadata from a citation-bearing event.
+
+    Confirmed against the real API (official docs + a live-captured
+    response): citation data is nested under event["reference"], with
+    bibliographic fields a further level deep under
+    event["reference"]["reference_detail"] — NOT flat top-level event
+    fields. citation_key is an integer on the wire; cast to str for
+    OpenEvidenceCitation.citation_key. journal_name is preferred over the
+    abbreviated journal_short_name when both are present.
+    """
+    reference = event.get("reference")
+    if not isinstance(reference, dict):
         return None
-    source_texts = event.get("source_texts")
-    if not source_texts:
-        reference_text = event.get("reference_text")
-        source_texts = [reference_text] if reference_text else []
+    citation_key = reference.get("citation_key")
+    if citation_key is None:
+        return None
+    detail = reference.get("reference_detail")
+    if not isinstance(detail, dict):
+        detail = {}
+    source_texts = reference.get("source_texts") or []
     return OpenEvidenceCitation(
         citation_key=str(citation_key),
-        title=event.get("title") or "",
-        authors=event.get("authors") or "",
-        journal=event.get("journal") or "",
-        date=event.get("date") or "",
-        doi=event.get("doi") or "",
-        url=event.get("url") or "",
+        title=detail.get("title") or "",
+        authors=detail.get("authors_string") or "",
+        journal=detail.get("journal_name") or detail.get("journal_short_name") or "",
+        date=detail.get("publication_date") or "",
+        doi=detail.get("doi") or "",
+        url=detail.get("url") or "",
         source_texts=[text for text in source_texts if text],
     )
 
 
 def _build_analysis(question: str, events: List[dict]) -> OpenEvidenceAnalysis:
+    """Accumulate prose text and dedupe citations across all events.
+
+    Per the official docs, "concatenating together the text fields from the
+    data messages will produce the full analysis text" — this includes
+    citation-bearing events, whose `text` is typically an inline marker like
+    "[[1]]", not just plain message events. So every event's `text` is
+    appended when present, citation or not.
+
+    `table` events (top-level key "table") are a v1 limitation: they
+    represent the full current state of a table, not prose or a PMID-style
+    citation, and this supplementary-text integration has no rendering for
+    them. They're intentionally and silently ignored here — no crash, no
+    attempt to flatten tabular content into text, nothing added to
+    `citations` either. A future iteration could add real table rendering.
+    """
     text_parts: List[str] = []
     citations_by_key: Dict[str, OpenEvidenceCitation] = {}
 
     for event in events:
+        if "table" in event:
+            continue
+
+        delta = event.get("text")
+        if delta:
+            text_parts.append(delta)
+
         citation = _citation_from_event(event)
         if citation is not None:
             existing = citations_by_key.get(citation.citation_key)
@@ -159,10 +196,6 @@ def _build_analysis(question: str, events: List[dict]) -> OpenEvidenceAnalysis:
                 citations_by_key[citation.citation_key] = existing.model_copy(
                     update={"source_texts": merged_source_texts}
                 )
-            continue
-        delta = event.get("text")
-        if delta:
-            text_parts.append(delta)
 
     return OpenEvidenceAnalysis(
         question=question,
@@ -185,19 +218,17 @@ async def _post_streaming_analysis(question: str, api_key: str, client: httpx.As
     }
     payload = {"text": question, "model": settings.openevidence_model}
 
+    # No [DONE]-style completion sentinel exists in the real API — a stream
+    # that ends because the connection was dropped/reset mid-response raises
+    # from within aiter_text() itself (an httpx transport exception), which
+    # the retry predicate above already treats as transient. A stream that
+    # finishes this loop without raising is, by definition, complete.
     async with client.stream(
         "POST", url, json=payload, headers=headers, timeout=settings.openevidence_timeout_seconds
     ) as response:
         response.raise_for_status()
         chunks = [chunk async for chunk in response.aiter_text()]
-    raw = "".join(chunks)
-
-    if not _stream_saw_done_marker(raw):
-        raise OpenEvidenceIncompleteStreamError(
-            "OpenEvidence stream ended without a [DONE] marker "
-            "(connection dropped mid-response) — refusing to treat as complete"
-        )
-    return raw
+    return "".join(chunks)
 
 
 class OpenEvidenceClient:
@@ -246,10 +277,11 @@ class OpenEvidenceClient:
             payload = await cached_call(
                 cache_key, _compute, ttl_seconds=settings.openevidence_cache_ttl_seconds
             )
-        except (httpx.HTTPError, OpenEvidenceIncompleteStreamError, RetryError) as exc:
+        except (httpx.HTTPError, RetryError) as exc:
             # cached_call only caches a successful compute() result (see
-            # src.pipeline.cache) — an exception here, including a retry-
-            # exhausted incomplete stream, is never cached.
+            # src.pipeline.cache) — an exception here (including a
+            # retry-exhausted transient failure, or a fail-fast timeout) is
+            # never cached.
             logger.error("OpenEvidence lookup failed for %s: %s", gene, exc)
             raise
         return OpenEvidenceAnalysis(**payload)
