@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
 AnnotationMode = Literal["full", "core"]
@@ -202,6 +202,35 @@ class FusionPositionContext(BaseModel):
     error: Optional[str] = None
 
 
+class OpenEvidenceCitation(BaseModel):
+    """One bibliographic source cited by an OpenEvidence analysis.
+
+    Unverified — these citation_keys are not guaranteed to correspond to
+    PMIDs in the retrieved LiteratureRecord set, so they must never be
+    merged into GeneAnnotation.citations or run through PMID verification.
+    """
+
+    citation_key: str
+    title: str = ""
+    authors: str = ""
+    journal: str = ""
+    date: str = ""
+    doi: str = ""
+    url: str = ""
+    source_texts: List[str] = Field(default_factory=list)
+
+
+class OpenEvidenceAnalysis(BaseModel):
+    """Supplementary AI-synthesized evidence from OpenEvidence for one gene
+    question. Unverified: `text` and `citations` are not grounded against the
+    retrieved PubMed set and must always be surfaced as clearly-labeled
+    supplementary context, never as verified citations."""
+
+    question: str
+    text: str = ""
+    citations: List[OpenEvidenceCitation] = Field(default_factory=list)
+
+
 class GeneAnnotation(BaseModel):
     """One row in Nicole's spreadsheet, keyed by gene."""
 
@@ -220,6 +249,19 @@ class GeneAnnotation(BaseModel):
     evidence_cards: List[EvidenceCard] = Field(default_factory=list)
     clinical_actionability: Optional[ClinicalActionability] = None
     quality_flags: List[QualityFlag] = Field(default_factory=list)
+    # Supplementary AI-synthesized evidence from OpenEvidence, only populated
+    # when OPENEVIDENCE_ENABLED=true. Unverified — never counted among the
+    # verified PMID `citations` above.
+    openevidence_supplementary: Optional[OpenEvidenceAnalysis] = None
+    # When OpenEvidence was last checked for this annotation (only set when
+    # OPENEVIDENCE_ENABLED=true at synthesis time — see orchestrator.py).
+    # None means "never checked" (feature disabled, or not yet synthesized
+    # since it was enabled), regardless of whether openevidence_supplementary
+    # itself ended up populated (a checked-but-not-found lookup still sets
+    # this). Used by the gene-annotation reuse/staleness check to detect
+    # OpenEvidence data that became available after this annotation was
+    # synthesized without it.
+    openevidence_checked_at: Optional[str] = None
     date_annotated: str = Field(
         default_factory=lambda: date.today().strftime("%-m/%-d/%y")
     )
@@ -253,6 +295,24 @@ class GeneAnnotation(BaseModel):
     last_pubmed_checked_at: Optional[str] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+
+    # Fields omitted from serialized output entirely (not present-as-null)
+    # when None, so the OPENEVIDENCE_ENABLED=false path has zero new keys in
+    # any serialized GeneAnnotation — API responses, exports, and persisted
+    # run/gene-cache JSON — matching current main's shape exactly.
+    # Deliberately scoped to just these two OpenEvidence-specific fields:
+    # this is NOT a model-wide exclude_none, so every other None-valued
+    # field (e.g. clinical_actionability) still serializes as null,
+    # unchanged.
+    _OMIT_WHEN_NONE = ("openevidence_supplementary", "openevidence_checked_at")
+
+    @model_serializer(mode="wrap")
+    def _omit_openevidence_fields_when_absent(self, handler):
+        data = handler(self)
+        for field_name in self._OMIT_WHEN_NONE:
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
+        return data
 
 
 class FusionInput(BaseModel):
