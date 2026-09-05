@@ -1,0 +1,1718 @@
+{
+  "per_gene": [
+    {
+      "gene": "ACACB",
+      "reference_pmids": [
+        "41415479",
+        "41755790",
+        "42304923"
+      ],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 47,
+        "citations": [
+          "38211832",
+          "40084144",
+          "40281115",
+          "41752148"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": 0.0,
+        "synthesis_tokens": {
+          "input_tokens": 4223,
+          "output_tokens": 989,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 4223,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 6635,
+          "output_tokens": 1044,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6635,
+          "calls": 2
+        },
+        "latency_seconds": 14.72392,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 47,
+        "citations": [
+          "38211832",
+          "40084144",
+          "40281115",
+          "41752148"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": 0.0,
+        "synthesis_tokens": {
+          "input_tokens": 9168,
+          "output_tokens": 1061,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 9168,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 11580,
+          "output_tokens": 1126,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 11580,
+          "calls": 2
+        },
+        "latency_seconds": 211.92236,
+        "openevidence_seconds": 195.89494349999586,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 29,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "ACACB (acetyl-CoA carboxylase beta, also termed ACC2) is a rate-limiting enzyme in fatty acid metabolism that is significantly downregulated across multiple human cancers, including ovarian, papillary thyroid, and pancreatic cancer (PMID 38211832, 41752148, 40281115). In ovarian cancer, MARCH5-mediated downregulation of ACC2 promotes fatty acid oxidation and tumorigenesis, with reduced ACC2 associated with larger tumors, metastases, and worse prognosis (PMID 38211832). In papillary thyroid cancer, ACACB downregulation is particularly evident in aggressive subtypes and is identified as a key component of a fatty acid metabolism-related prognostic signature (PMID 40084144). In pancreatic cancer, ACACB reduction is linked to worse survival outcomes and recognized as a potential therapeutic biomarker (PMID 40281115). These findings collectively indicate ACACB as a cancer-associated gene with roles in metabolic reprogramming and tumor progression. (Literature sourced via Tier 1 direct PubMed query.)",
+          "ACACB (acetyl-CoA carboxylase beta/ACC2) encodes a mitochondrial enzyme that catalyzes acetyl-CoA to malonyl-CoA, locally inhibiting fatty acid oxidation (FAO) at the mitochondrial membrane. Downregulation or loss of ACACB is associated with enhanced FAO and tumor progression across multiple cancer types (PMID 38211832). In ovarian cancer, MARCH5-mediated ubiquitin-dependent degradation of ACC2 enhances FAO and promotes proliferation and metastasis both in vitro and in vivo (PMID 38211832). Expression profiling studies in papillary thyroid cancer identified ACACB as a downregulated gene in aggressive tumors, particularly in BRAF-mutated and metastatic disease, and as one of three key fatty acid metabolism-related genes associated with prognosis (PMID 41752148, PMID 40084144). Similarly, in pancreatic cancer, ACACB was identified as one of seven macrophage- and lipid-metabolism-related biomarkers, with reduced expression in tumor tissue correlating with worse clinical outcomes (PMID 40281115). These findings position ACACB as a context-dependent metabolic regulator whose reduction facilitates tumor cell adaptation to metabolic stress, though clinical validation and therapeutic targeting remain limited. (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Expression/downregulation evidence: ACACB is significantly downregulated in ovarian cancer, papillary thyroid cancer, and pancreatic cancer tissues compared to normal controls. In ovarian cancer, ACC2 downregulation promotes fatty acid oxidation and tumor progression. In papillary thyroid cancer and pancreatic cancer, reduced ACACB expression is associated with worse prognosis and identified as a prognostic biomarker in multi-gene signatures. The gene plays a key role in lipid metabolic reprogramming, a hallmark of cancer.",
+          "Expression-based association with tumor progression and prognosis in ovarian, thyroid (papillary and anaplastic), and pancreatic cancers; ACACB downregulation correlates with worse outcomes, larger tumors, metastases, and aggressive disease features. Mechanistic evidence shows that ACC2 loss or degradation promotes fatty acid oxidation and enhances proliferation/metastasis. No somatic mutations, amplifications, or focal deletions are reported as recurrent cancer drivers; the evidence is primarily transcriptomic and mechanistic."
+        ],
+        "gene_class": [
+          "Lipid metabolism enzyme; fatty acid oxidation regulator",
+          "Mitochondrial membrane-tethered acetyl-CoA carboxylase; metabolic regulator of fatty acid oxidation"
+        ],
+        "signaling_pathways": [
+          "Fatty acid oxidation, lipid metabolism, cell cycle",
+          "Fatty acid oxidation, lipid metabolism, AMPK signaling, malonyl-CoA homeostasis"
+        ]
+      },
+      "citations_added": [],
+      "citations_removed": [],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "AIRE",
+      "reference_pmids": [
+        "38060995",
+        "42069146"
+      ],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 48,
+        "citations": [],
+        "citation_count": 0,
+        "reference_hits": [],
+        "reference_recall": 0.0,
+        "synthesis_tokens": {
+          "input_tokens": 2659,
+          "output_tokens": 451,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 2659,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 5089,
+          "output_tokens": 491,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 5089,
+          "calls": 2
+        },
+        "latency_seconds": 19.650380000000002,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": false,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 48,
+        "citations": [
+          "30510552"
+        ],
+        "citation_count": 1,
+        "reference_hits": [],
+        "reference_recall": 0.0,
+        "synthesis_tokens": {
+          "input_tokens": 7792,
+          "output_tokens": 594,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 7792,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 10222,
+          "output_tokens": 634,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 10222,
+          "calls": 2
+        },
+        "latency_seconds": 265.29496,
+        "openevidence_seconds": 254.2434208750201,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 40,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {
+        "cancer_associated": [
+          false,
+          true
+        ]
+      },
+      "text_changes": {
+        "gene_summary": [
+          "AIRE is an autoimmune regulator gene whose mutations cause autoimmune polyendocrinopathy candidiasis ectodermal dystrophy (APECED), an autosomal recessive disorder characterized by chronic mucocutaneous candidiasis, hypoparathyroidism, and adrenal insufficiency (PMID 30510552). While the retrieved abstract notes that chronic candidiasis can be complicated by oral squamous cell carcinoma, this represents a secondary complication of chronic infection rather than direct transformative activity of AIRE itself. The literature does not provide evidence of AIRE mutations driving cancer development through molecular mechanisms such as mutation, expression dysregulation, or copy-number alteration in neoplastic tissue. (Literature sourced via Tier 1 direct PubMed query.)",
+          "AIRE (autoimmune regulator) is a transcription factor whose germline mutations cause autoimmune polyendocrinopathy candidiasis ectodermal dystrophy (APECED). While not a somatic oncogenic driver, AIRE loss-of-function confers marked susceptibility to oral and esophageal squamous cell carcinoma in APECED patients, with pathogenesis driven by chronic mucosal candidiasis and associated inflammation rather than impaired tumor surveillance (PMID 30510552). Additionally, ~95% of thymomas lack AIRE expression, contributing to paraneoplastic autoimmunity and exceptional susceptibility to severe immune-related adverse events with checkpoint inhibitor therapy\u2014a clinically actionable distinction that informs treatment decisions in thymic epithelial malignancies. (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "No direct cancer-associated mutations, expression changes, or structural variants identified. The single retrieved abstract mentions oral squamous cell carcinoma as a potential complication of chronic Candida infection in APECED patients, but this reflects an indirect predisposition through immunosuppression and chronic infection rather than intrinsic oncogenic function of AIRE.",
+          "Germline loss-of-function mutations in AIRE cause autoimmune polyendocrine syndrome type 1 (APS-1/APECED), which confers substantially elevated risk of oral and esophageal squamous cell carcinoma, driven by chronic mucosal candidiasis and inflammation. The retrieved abstract documents this association and notes that systemic candidiasis can lead to oral squamous cell carcinoma complication in APECED patients."
+        ],
+        "gene_class": [
+          "Transcription factor; autoimmune regulator",
+          "Transcription factor (zinc-finger nuclear protein)"
+        ],
+        "signaling_pathways": [
+          "Immune tolerance, Th17 cell differentiation",
+          "Immune tolerance, antigen presentation, thymic central tolerance"
+        ]
+      },
+      "citations_added": [
+        "30510552"
+      ],
+      "citations_removed": [],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": true
+    },
+    {
+      "gene": "ALK",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "34175504",
+          "38039964",
+          "40055571",
+          "40702700"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 5561,
+          "output_tokens": 985,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 5561,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 8108,
+          "output_tokens": 1060,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 8108,
+          "calls": 2
+        },
+        "latency_seconds": 15.61598,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "34175504",
+          "38039964",
+          "40055571",
+          "40702700"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 11277,
+          "output_tokens": 1079,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 11277,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 13824,
+          "output_tokens": 1154,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 13824,
+          "calls": 2
+        },
+        "latency_seconds": 243.96895,
+        "openevidence_seconds": 228.51610633402015,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 36,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "ALK is a receptor tyrosine kinase that acts as an oncogenic driver in both solid and hematological malignancies through multiple mechanisms, including recurrent gene fusions and aberrant expression (PMID 40055571). In anaplastic large cell lymphoma, NPM1-ALK fusion drives malignant T-cell transformation, and ALK tyrosine kinase inhibitors show clinical benefit but resistance develops over time (PMID 40702700). ALK fusions are similarly prevalent in non-small cell lung cancer, particularly EML4-ALK variants that account for approximately 85% of ALK-positive NSCLC cases, with variant-specific responses to ALK inhibitors (PMID 34175504). In neuroblastoma, ALK functions as an oncogenic driver and is expressed by most tumors, making it an attractive therapeutic target (PMID 38039964). ALK-rearranged renal cell carcinoma represents a distinct molecular subtype with diverse fusion partners and variable clinical outcomes (PMID 41071329). Despite initial therapeutic responses to ALK-directed therapies, resistance mechanisms remain a major clinical challenge across multiple cancer types. (Literature sourced via Tier 1 direct PubMed query.)",
+          "ALK is a receptor tyrosine kinase that acts as a potent oncogenic driver through chromosomal rearrangement, activating point mutations, and amplification across multiple solid and hematologic malignancies (PMID 40055571). The strongest validated evidence is in ALK-rearranged non-small-cell lung cancer (NSCLC), where ALK inhibitors produce durable responses with 7-year progression-free survival of 55% on lorlatinib and disease-free survival of 88.7% at 3 years with adjuvant alectinib in resected disease (PMID 34175504). ALK is also an established driver in neuroblastoma, where ALK inhibitors sensitize ALK.CAR-T cell efficacy (PMID 38039964), and in hematologic malignancies including anaplastic large cell lymphoma where ALK fusions arise from NPM1 translocations (PMID 40702700). ALK-rearranged renal cell carcinoma and inflammatory myofibroblastic tumors represent additional recognized ALK-driven entities, though ALK overexpression alone without structural rearrangement or activating mutation shows limited prognostic or therapeutic impact (PMID 37522200). (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Structural-variant (fusion): ALK is a key oncogenic receptor tyrosine kinase driver in multiple cancer types through fusion events (NPM1-ALK in anaplastic large cell lymphoma, EML4-ALK in lung adenocarcinoma, and various partners in renal cell carcinoma). Expression/mutation evidence: ALK is aberrantly expressed and mutated in solid and hematological malignancies. The gene's oncogenic signaling through RTK activation and downstream PI3K/AKT and RAS/MAPK pathways is well-established across pediatric and adult cancers.",
+          "Structural variant (ALK fusion across multiple cancer types); mutation (activating kinase-domain mutations in neuroblastoma and other malignancies); copy-number alteration (ALK amplification in neuroblastoma and NSCLC); expression (ALK overexpression in ovarian cancer and ALCL). Strongest evidence for fusions, particularly EML4-ALK in NSCLC and NPM1-ALK in ALCL. Mutation and amplification are validated oncogenic drivers in neuroblastoma. ALK overexpression alone lacks clear therapeutic biomarker status."
+        ],
+        "gene_class": [
+          "Receptor tyrosine kinase (RTK)",
+          "Receptor tyrosine kinase"
+        ],
+        "signaling_pathways": [
+          "PI3K/AKT, RAS/MAPK, JAK/STAT",
+          "RAS/MAPK, PI3K/AKT, JAK/STAT3"
+        ]
+      },
+      "citations_added": [],
+      "citations_removed": [],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": true
+    },
+    {
+      "gene": "ANKRD13A",
+      "reference_pmids": [
+        "39059493",
+        "40465099",
+        "40975168"
+      ],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 9,
+        "citations": [
+          "31985874",
+          "34694569",
+          "34839354"
+        ],
+        "citation_count": 3,
+        "reference_hits": [],
+        "reference_recall": 0.0,
+        "synthesis_tokens": {
+          "input_tokens": 4242,
+          "output_tokens": 878,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 4242,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 6626,
+          "output_tokens": 933,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6626,
+          "calls": 2
+        },
+        "latency_seconds": 11.5994,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 9,
+        "citations": [
+          "31985874",
+          "34694569",
+          "34839354",
+          "40975168"
+        ],
+        "citation_count": 4,
+        "reference_hits": [
+          "40975168"
+        ],
+        "reference_recall": 0.3333333333333333,
+        "synthesis_tokens": {
+          "input_tokens": 6687,
+          "output_tokens": 1016,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6687,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 9071,
+          "output_tokens": 1071,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 9071,
+          "calls": 2
+        },
+        "latency_seconds": 142.71649,
+        "openevidence_seconds": 130.65243083398673,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 7,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "ANKRD13A is a ubiquitin-binding protein containing ankyrin repeats that has multiple roles in cancer biology. In acute myeloid leukemia (AML), ANKRD13A is cis-regulated by the lncRNA USP30-AS1 and promotes HLA-I internalization, facilitating immune escape of AML cells (PMID 34694569). ANKRD13A also functions as a gatekeeper of the early cell-death checkpoint by interacting with RIP1; high ANKRD13A expression is inversely correlated with apoptotic phenotypes in ovarian cancer tissues and is associated with poor prognosis (PMID 34839354). Additionally, ANKRD13A acts as a molecular scaffold that regulates EGFR endocytic sorting in complex with E3 ligases, modulating receptor trafficking and signaling (PMID 31985874). (Literature sourced via Tier 1 direct PubMed query.)",
+          "ANKRD13A is a ubiquitin-binding protein that functions as a regulator of cell-death checkpoints and receptor trafficking with emerging links to cancer survival and immune evasion. In ovarian cancer tissue, high ANKRD13A expression correlates inversely with apoptotic phenotype and is associated with poor prognosis, potentially reflecting its role as a component of TNF complex-II that suppresses death signaling by limiting FADD and caspase-8 association with ubiquitinated RIP1 (PMID 34839354). ANKRD13A also participates in immune evasion in acute myeloid leukemia (AML) by mediating HLA-I internalization when upregulated via the lncRNA USP30-AS1, contributing to immune escape (PMID 34694569). Additionally, ANKRD13A forms a transient complex with the E3 ligase RNF11 and activated EGFR during receptor endocytosis, where it acts as a molecular scaffold that regulates EGFR sorting for lysosomal degradation (PMID 31985874). (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Expression and methylation evidence in acute myeloid leukemia (AML); protein\u2013protein interaction studies linking ANKRD13A to cell-death checkpoint control and immune escape mechanisms. High ANKRD13A expression is inversely correlated with apoptotic phenotypes in ovarian cancer and associated with poor prognosis (PMID 34839354). In AML, ANKRD13A is cis-regulated by lncRNA USP30-AS1 and promotes HLA-I internalization, facilitating immune escape (PMID 34694569). ANKRD13A also serves as a molecular scaffold in EGFR endocytic sorting, relevant to receptor signaling dysregulation in cancer (PMID 31985874).",
+          "Expression-based and functional evidence: high ANKRD13A expression in ovarian cancer inversely correlates with apoptotic phenotype and poor prognosis via suppression of TNF-induced death signaling (PMID 34839354); upregulation in AML via lncRNA USP30-AS1 promotes cell survival and immune escape through HLA-I internalization (PMID 34694569); molecular scaffold function in EGFR trafficking and degradation pathway involves interaction with oncogenic and tumor-suppressive E3 ligases (PMID 31985874). Additional mechanistic evidence links ANKRD13A to mitochondrial quality control and PINK1/Parkin-mediated mitophagy (PMID 40975168), linking it to cellular survival and energetics in the tumor microenvironment."
+        ],
+        "gene_class": [
+          "Ubiquitin-binding protein; ankyrin repeat-containing protein",
+          "Ubiquitin-interacting motif (UIM) adaptor protein"
+        ],
+        "signaling_pathways": [
+          "TNF/NF-\u03baB, EGFR/endocytosis, mitophagy (PINK1/Parkin)",
+          "TNF/RIPK1 signaling, EGFR trafficking and endocytosis, ubiquitin-dependent protein sorting"
+        ]
+      },
+      "citations_added": [
+        "40975168"
+      ],
+      "citations_removed": [],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": true
+    },
+    {
+      "gene": "BRAF",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "38372057",
+          "39727691",
+          "39961465",
+          "41543354"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 6190,
+          "output_tokens": 1006,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6190,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 8645,
+          "output_tokens": 1081,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 8645,
+          "calls": 2
+        },
+        "latency_seconds": 17.98696,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "35761499",
+          "38372057",
+          "39727691",
+          "39961465"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 12200,
+          "output_tokens": 964,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 12200,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 14655,
+          "output_tokens": 1039,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 14655,
+          "calls": 2
+        },
+        "latency_seconds": 237.14257,
+        "openevidence_seconds": 222.76202475000173,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 64,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "BRAF, a serine/threonine kinase component of the RAS/RAF/MEK/ERK (MAPK) pathway, is one of the most frequently altered genes in cancer. BRAF mutations\u2014particularly the V600E substitution and other class 1 point mutations\u2014confer constitutive kinase activation leading to dysregulated downstream signaling and promotion of cellular proliferation, survival, and angiogenesis (PMID 39961465). BRAF mutations occur in approximately 40\u201350% of melanomas (PMID 39727691), 10% of colorectal cancers (PMID 38372057), and 68% of papillary thyroid cancers (PMID 41543354), with lower frequencies in lung and brain tumors. The clinical importance of BRAF alterations is underscored by the development and FDA approval of multiple direct BRAF inhibitors (vemurafenib, dabrafenib, encorafenib) that have significantly improved survival in patients with BRAF-mutant unresectable or metastatic melanoma (PMID 39727691). (Literature sourced via Tier 1 direct PubMed query.)",
+          "BRAF is a serine/threonine kinase mutated in 40\u201350% of melanomas and 35\u201375% of papillary thyroid cancers, with V600E as the predominant hotspot substitution (PMID 39727691, PMID 35761499). The V600E mutation confers constitutive activation of MAPK signaling and drives cell proliferation, survival, and angiogenesis independent of extracellular stimuli (PMID 39961465). BRAF mutations also occur frequently in colorectal cancer, glioblastoma, and myeloid neoplasms, with Class I V600E mutations in CRC associating with worse prognosis (median 19.43 months) compared to Class II/III alterations (47.57 months) (PMID 38372057). BRAF-mutated papillary thyroid cancer demonstrates higher PD-L1 expression and IFN\u03b3 signaling, indicating a proinflammatory tumor microenvironment (PMID 41543354). (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Mutation (particularly V600E and other class 1 mutations) is the primary evidence type. BRAF mutations are found across multiple cancer types: 40\u201350% of melanomas (predominantly V600E); ~10% of colorectal cancers with associations to high tumor mutational burden and microsatellite instability; 68% of papillary thyroid cancers in a large cohort; ~1% of non-small cell lung adenocarcinomas; and reported in glioblastoma. BRAF mutations confer constitutive activation of the MAPK/ERK signaling pathway and drive cellular proliferation, survival, and angiogenesis. Multiple FDA-approved BRAF inhibitors (vemurafenib, dabrafenib, encorafenib) demonstrate clinical benefit in BRAF-mutant melanoma and have activity in other BRAF-mutant cancers, confirming functional relevance to cancer biology.",
+          "Mutation and copy-number alteration. BRAF harbors recurrent hotspot mutations across multiple cancer types, most commonly V600E substitutions that constitute activating driver alterations in melanoma (40\u201350% prevalence), thyroid cancer (35\u201375% in papillary histology), colorectal cancer (8\u201312%), and other solid malignancies. The V600E mutation results in constitutively active kinase domain leading to dysregulated MAPK/ERK signaling independent of upstream RAS activation. Non-V600 mutations (Class II/III alterations including in-frame insertions, deletions, and fusions) also drive tumorigenesis in subset of patients. BRAF amplification and splice variants represent acquired resistance mechanisms to targeted therapy."
+        ],
+        "signaling_pathways": [
+          "MAPK/ERK, PI3K/AKT/mTOR, TP53, DNA damage response, WNT/\u03b2-catenin",
+          "RAS/MAPK, PI3K/AKT/mTOR, WNT/\u03b2-catenin, TP53 pathway, DNA damage response"
+        ]
+      },
+      "citations_added": [
+        "35761499"
+      ],
+      "citations_removed": [
+        "41543354"
+      ],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "BRCA1",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 48,
+        "citations": [
+          "39265497",
+          "41359628",
+          "41498327",
+          "42323326"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 6092,
+          "output_tokens": 948,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6092,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 8646,
+          "output_tokens": 1023,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 8646,
+          "calls": 2
+        },
+        "latency_seconds": 15.51939,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 48,
+        "citations": [
+          "39265497",
+          "40202107",
+          "41498327",
+          "42323326"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 11009,
+          "output_tokens": 1216,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 11009,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 13563,
+          "output_tokens": 1286,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 13563,
+          "calls": 2
+        },
+        "latency_seconds": 209.92162,
+        "openevidence_seconds": 192.7217423330003,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 46,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "BRCA1 is a critical breast and ovarian tumor suppressor whose inactivation through mutation or promoter methylation drives genomic instability and cancer risk, particularly in luminal progenitor cells where replication stress compounds tumorigenesis (PMID 41498327). Beyond its canonical role in homologous recombination DNA repair, BRCA1 regulates ferroptosis susceptibility (PMID 39265497), metabolic pathways including choline uptake that promote metastasis (PMID 42323326), and antioxidant defense through NRF2 interaction in prostate cancer (PMID 41047927). BRCA1 protein stability is controlled through K11-linked ubiquitination by the APC/C\u2013Ube2S axis and antagonized by the deubiquitinase Cezanne; dysregulation of this pathway creates a \"BRCAness\" phenotype responsive to PARP inhibitors (PMID 41359628). BRCA1 promoter methylation, a common alternative mechanism of HR deficiency, is associated with poor prognosis and may predict PARPi response (PMID 40202107, PMID 39643918). (Literature sourced via Tier 1 direct NCBI structured query \u2014 abundant indexed literature.)",
+          "BRCA1 is a well-characterized tumor suppressor whose loss or silencing drives cancer through impaired homologous recombination DNA repair and genomic instability. Germline pathogenic variants confer high lifetime risks for breast cancer (cumulative ~72% by age 80) and ovarian cancer (~44%) (PMID 41498327). In sporadic cancers, BRCA1 promoter hypermethylation silences the gene in approximately 25\u201330% of triple-negative breast cancers and is associated with poor prognosis (PMID 40202107). Beyond canonical DNA repair roles, BRCA1 deficiency activates metastatic pathways via choline metabolism and ferroptosis resistance, offering therapeutic targets (PMID 42323326, PMID 39265497). BRCA1 expression is dynamically regulated by androgen receptor signaling in prostate cancer and modulates antioxidant defense through NRF2 (PMID 41047927). BRCA1-deficient cancers show synthetic lethality to PARP inhibitors and platinum agents, though resistance emerges through reversion mutations, loss of HR regulators (53BP1, RIF1), and promoter demethylation. Recent evidence indicates replication stress in luminal progenitors drives BRCA1-associated breast tumorigenesis through ELF3 upregulation (PMID 41498327). (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Mutation, promoter methylation, and expression dysregulation across multiple cancer types. BRCA1 is a well-established tumor suppressor gene with evidence from loss-of-function mutations (breast, ovarian, prostate cancers), promoter hypermethylation associated with homologous recombination deficiency and poor prognosis (ovarian cancer), and altered protein stability affecting ferroptosis and oxidative stress responses (breast, ovarian, prostate cancers).",
+          "BRCA1 is a tumor suppressor with extensive evidence of cancer association spanning multiple alteration types. Germline pathogenic variants cause hereditary breast and ovarian cancer (evidence: mutation, familial clustering). Somatic mutations are less common but documented. Promoter hypermethylation is a major silencing mechanism in ~25\u201330% of triple-negative breast cancer and ~9\u201320% of high-grade serous ovarian cancer (methylation). Loss of BRCA1 impairs homologous recombination DNA repair, driving genomic instability and conferring sensitivity to PARP inhibitors and platinum agents (functional/expression evidence). BRCA1 deficiency also regulates metabolic pathways (choline metabolism), ferroptosis resistance, and replication stress in luminal progenitors during tumorigenesis (expression/functional). Prostate cancer association exists but remains less clear; BRCA1 mutations are less frequent in prostate cancer than BRCA2, though evidence suggests higher aggressiveness in carriers."
+        ],
+        "gene_class": [
+          "DNA repair protein, tumor suppressor, homologous recombination factor, E3 ubiquitin-protein ligase (RNF53)",
+          "DNA repair protein; ubiquitin ligase (RING domain); tumor suppressor"
+        ],
+        "signaling_pathways": [
+          "Homologous recombination DNA repair, ferroptosis, NRF2-mediated antioxidant defense, androgen receptor signaling, APC/C-mediated ubiquitination",
+          "Homologous recombination (HR) DNA repair, DNA damage response (ATM/ATR), ferroptosis pathway, antioxidant defense (NRF2), choline metabolism"
+        ]
+      },
+      "citations_added": [
+        "40202107"
+      ],
+      "citations_removed": [
+        "41359628"
+      ],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "CLCN3P1",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 2,
+        "retrieved_count": 21,
+        "citations": [],
+        "citation_count": 0,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 2393,
+          "output_tokens": 164,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 2393,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 7563,
+          "output_tokens": 727,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 7563,
+          "calls": 4
+        },
+        "latency_seconds": 13.90663,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": false,
+          "in_oncokb": false,
+          "insufficient_evidence": true
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 2,
+        "retrieved_count": 29,
+        "citations": [],
+        "citation_count": 0,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 4225,
+          "output_tokens": 366,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 4225,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 9405,
+          "output_tokens": 926,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 9405,
+          "calls": 4
+        },
+        "latency_seconds": 107.88944000000001,
+        "openevidence_seconds": 93.55432170798304,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 13,
+        "classification": {
+          "cancer_associated": false,
+          "in_oncokb": false,
+          "insufficient_evidence": true
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "CLCN3P1 is a pseudogene (HGNC:49775) with no retrieved literature linking it to cancer biology. As a non-coding pseudogenic sequence with no functional protein product, and absent from OncoKB, there is currently insufficient peer-reviewed evidence to establish a cancer association. (Literature sourced via Tier 2 Claude agentic retrieval \u2014 sparse initial results required expanded search.)",
+          "CLCN3P1 is a pseudogene derived from the CLCN3 locus and has not been systematically studied in cancer genomics. No peer-reviewed evidence of differential expression, mutation, copy-number alteration, or functional involvement in any malignancy was identified in the indexed literature. While transcribed pseudogenes can act as competitive endogenous RNAs (ceRNAs) in some cancers (exemplified by BRAFP1 and PTENP1), transcription and cancer relevance of CLCN3P1 specifically remain undemonstrated. The existing cancer literature in this gene family pertains to the parent protein-coding gene CLCN3 (encoding the chloride channel ClC-3), which is a distinct entity; properties of the ClC-3 protein cannot be extrapolated to a pseudogene without direct evidence. Any signal implicating a CLCN3 pseudogene would require orthogonal validation (pseudogene-specific detection, miRNA response element mapping, and functional rescue) to distinguish it from a mapping artifact. (Literature sourced via Tier 2 Claude agentic retrieval \u2014 sparse initial results required expanded search; no PubMed abstracts were retrieved.)"
+        ]
+      },
+      "citations_added": [],
+      "citations_removed": [],
+      "identical_retrieval_pool": false,
+      "identical_selected_pmids": true
+    },
+    {
+      "gene": "CRACD",
+      "reference_pmids": [
+        "30361697",
+        "41353272"
+      ],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 14,
+        "citations": [
+          "30361697",
+          "33006362",
+          "38796854",
+          "41353272"
+        ],
+        "citation_count": 4,
+        "reference_hits": [
+          "30361697",
+          "41353272"
+        ],
+        "reference_recall": 1.0,
+        "synthesis_tokens": {
+          "input_tokens": 4856,
+          "output_tokens": 968,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 4856,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 7378,
+          "output_tokens": 1038,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 7378,
+          "calls": 2
+        },
+        "latency_seconds": 10.32472,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 14,
+        "citations": [
+          "30361697",
+          "35172140",
+          "38796854",
+          "41353272"
+        ],
+        "citation_count": 4,
+        "reference_hits": [
+          "30361697",
+          "41353272"
+        ],
+        "reference_recall": 1.0,
+        "synthesis_tokens": {
+          "input_tokens": 7827,
+          "output_tokens": 1233,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 7827,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 10349,
+          "output_tokens": 1303,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 10349,
+          "calls": 2
+        },
+        "latency_seconds": 208.22639,
+        "openevidence_seconds": 190.96561295900028,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 9,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "CRACD (capping protein inhibiting regulator of actin dynamics) is an actin-regulating protein with context-dependent cancer roles across multiple malignancies. In SCLC, CRACD is frequently inactivated; its loss drives neuroendocrine cell plasticity and immune evasion through disruption of actin organization, suppression of YAP1-NOTCH signaling, and EZH2-mediated repression of MHC-I genes (PMID 41353272). Similarly, in LUAD, CRACD loss promotes neuroendocrine cell plasticity, de-differentiation, and stemness activation (PMID 38796854). In colorectal cancer, CRACD acts as a tumor suppressor; its inactivation disrupts the cadherin-catenin-actin complex, releasing \u03b2-catenin and hyperactivating Wnt signaling, leading to mucinous adenoma development (PMID 30361697). In contrast, CRACD expression is upregulated in NSCLC, where it promotes cell survival and proliferation through repression of Claudin 4 (PMID 33006362). (Literature sourced via Tier 1 direct PubMed query.)",
+          "CRACD (capping protein inhibiting regulator of actin dynamics) is a tumor suppressor whose inactivation promotes actin cytoskeletal dysregulation in multiple epithelial cancers. In colorectal cancer, CRACD loss disrupts F-actin polymerization and destabilizes the cadherin-catenin-actin complex, releasing \u03b2-catenin and hyperactivating WNT signaling to initiate mucinous adenoma development (PMID 30361697). In small cell lung cancer, CRACD mutations occur in 11\u201316% of tumors; functionally, CRACD depletion drives neuroendocrine cell plasticity through suppression of NOTCH signaling via nuclear actin disruption, while simultaneously silencing MHC-I genes through EZH2-dependent H3K27 methylation, resulting in profound CD8+ T-cell exclusion and immune evasion (PMID 41353272). Similarly, in lung adenocarcinoma, CRACD knockout induces neuroendocrine plasticity associated with cell de-differentiation and stemness pathway activation (PMID 38796854). These findings identify CRACD as a multi-context tumor suppressor, though currently without established prognostic or predictive biomarker status or clinical-grade assays. (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Structural-variant, expression, and mutation evidence across multiple cancer types. CRACD is frequently inactivated (downregulated/mutated) in small cell lung cancer (SCLC) and lung adenocarcinoma (LUAD), where loss drives neuroendocrine plasticity and immune evasion. CRACD is also frequently mutated or transcriptionally downregulated in colorectal cancer (CRC), where inactivation disrupts the cadherin-catenin-actin complex and hyperactivates Wnt signaling. In non-small cell lung cancer (NSCLC), CRACD upregulation promotes cancer cell survival and proliferation.",
+          "CRACD functions as a tumor suppressor whose loss drives cancer phenotypes via two mechanistically distinct pathways. In colorectal cancer, CRACD inactivation (via mutation or transcriptional downregulation) disrupts F-actin polymerization, destabilizes the cadherin-catenin-actin complex, and liberates \u03b2-catenin to hyperactivate WNT signaling, initiating mucinous adenoma development that is accelerated by concurrent APC mutation (mutation, copy-number/expression). In small cell lung cancer, CRACD loss similarly disrupts actin organization but primarily drives neuroendocrine cell plasticity via NOTCH pathway suppression and simultaneously silences MHC-I genes through EZH2-mediated H3K27 methylation, leading to CD8+ T-cell exclusion and immune evasion (mutation, expression, methylation). Both contexts show frequent CRACD inactivation in patient tumors and functional evidence from engineered mouse models."
+        ],
+        "gene_class": [
+          "Actin-regulating protein; capping protein inhibitor",
+          "Actin cytoskeletal regulator; capping protein inhibitor"
+        ],
+        "signaling_pathways": [
+          "Wnt/\u03b2-catenin signaling, YAP1/NOTCH signaling, EZH2-mediated histone methylation, mechanotransduction, epithelial-mesenchymal transition (EMT)",
+          "WNT/\u03b2-catenin, NOTCH, YAP/Hippo, EZH2-mediated epigenetic silencing, actin dynamics"
+        ]
+      },
+      "citations_added": [
+        "35172140"
+      ],
+      "citations_removed": [
+        "33006362"
+      ],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "DENND2C",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 2,
+        "retrieved_count": 2,
+        "citations": [
+          "24129055",
+          "39519032"
+        ],
+        "citation_count": 2,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 5623,
+          "output_tokens": 1391,
+          "cache_creation_input_tokens": 2622,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 8245,
+          "calls": 2
+        },
+        "all_llm_tokens": {
+          "input_tokens": 8302,
+          "output_tokens": 1970,
+          "cache_creation_input_tokens": 2622,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 10924,
+          "calls": 4
+        },
+        "latency_seconds": 31.64846,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": false,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 2,
+        "retrieved_count": 23,
+        "citations": [],
+        "citation_count": 0,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 4905,
+          "output_tokens": 439,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 4905,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 10187,
+          "output_tokens": 1041,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 10187,
+          "calls": 4
+        },
+        "latency_seconds": 123.19827000000001,
+        "openevidence_seconds": 110.25931487500202,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 19,
+        "classification": {
+          "cancer_associated": false,
+          "in_oncokb": false,
+          "insufficient_evidence": true
+        },
+        "error": null
+      },
+      "classification_changes": {
+        "insufficient_evidence": [
+          false,
+          true
+        ]
+      },
+      "text_changes": {
+        "gene_summary": [
+          "DENND2C encodes a DENN-domain protein that functions as a putative guanine nucleotide exchange factor for Rab GTPases. The only functional study retrieved shows that Dennd2c negatively regulates osteoclast multinucleation and differentiation by modulating actin polymerization and Cdc42/Rac1-dependent protrusion formation in macrophages (PMID 39519032). A separate candidate-gene polymorphism study included DENND2C among loci examined in rotator cuff disease but did not identify a significant DENND2C association (PMID 24129055). No retrieved evidence links DENND2C to tumorigenesis, cancer-associated mutations, expression changes, or structural variants. (Literature sourced via Tier 2 Claude agentic retrieval \u2014 sparse initial results required expanded search.)",
+          "DENND2C is a DENN domain-containing Rab GTPase exchange factor with presumptive roles in Rab9-dependent endosomal trafficking and actin filament organization based on family-level biochemical characterization, but no peer-reviewed primary literature directly characterizes DENND2C in cancer. No studies on DENND2C-specific expression, mutation, methylation, copy number, or functional manipulation in tumors or tumor cell lines were identified in the retrieved literature. Evidence from its paralogs (DENND2B, DENND2D) is not transferable, as DENN family members exhibit distinct Rab substrates and divergent functional roles in cancer. (Literature sourced via Tier 2 Claude agentic retrieval \u2014 sparse initial results required expanded search.)"
+        ],
+        "cancer_association_rationale": [
+          "No retrieved abstract links DENND2C to cancer. Available literature describes a role as a putative Rab GEF regulating osteoclast differentiation via actin/Cdc42/Rac1 signaling (PMID 39519032) and a candidate polymorphism study in rotator cuff disease (PMID 24129055). Neither provides structural-variant, expression, mutation, methylation, or copy-number evidence in a cancer context.",
+          "No credible cancer-specific evidence types (mutation, expression, methylation, copy-number, structural variant) were identified in peer-reviewed literature for DENND2C. Paralog-level biochemistry and cancer associations do not establish DENND2C's own role in oncogenesis."
+        ],
+        "gene_class": [
+          "Putative Rab guanine nucleotide exchange factor (DENN domain protein)",
+          "Rab GTPase exchange factor (GEF)"
+        ],
+        "signaling_pathways": [
+          "Rab GTPase signaling, Cdc42/Rac1 actin cytoskeleton regulation",
+          "Rab9-dependent endosomal trafficking, Rab15 mitochondrial recruitment"
+        ]
+      },
+      "citations_added": [],
+      "citations_removed": [
+        "24129055",
+        "39519032"
+      ],
+      "identical_retrieval_pool": false,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "EGFR",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "29124875",
+          "40088580",
+          "41763064",
+          "42237450"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 6916,
+          "output_tokens": 1205,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6916,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 9526,
+          "output_tokens": 1280,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 9526,
+          "calls": 2
+        },
+        "latency_seconds": 14.13179,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "29124875",
+          "36482474",
+          "40384482",
+          "42237450"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 12802,
+          "output_tokens": 1235,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 12802,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 15412,
+          "output_tokens": 1310,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 15412,
+          "calls": 2
+        },
+        "latency_seconds": 256.09824,
+        "openevidence_seconds": 238.95321066700853,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 51,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "EGFR is a well-established oncogenic driver in epithelial malignancies, particularly NSCLC, breast cancer, and glioblastoma, where tumorigenic activation results primarily from activating point mutations (19-Del, L858R, L747X, L833, H835) and gene amplification (PMID 29124875). EGFR mutations confer sensitivity to tyrosine kinase inhibitors (TKIs), with mutation type and concurrent amplification status influencing drug response and prognosis (PMID 42237450, 41763064, 40886084, 40834500). Beyond canonical ligand-induced signaling, EGFR engages noncanonical functions in stress-induced trafficking, autophagy, and energy metabolism, and its expression level modulates downstream MAPK signaling activity and adaptive immune responses in EGFR-mutated lung adenocarcinoma (PMID 29124875, 40088580). EGFR is also overexpressed in gynecologic malignancies and squamous cell lung cancer, supporting development of CAR-T and targeted therapies (PMID 40384482, 40193238). (Literature sourced via Tier 1 direct PubMed query.)",
+          "EGFR is a receptor tyrosine kinase with well-established oncogenic roles across multiple solid cancers. In non-small cell lung cancer (NSCLC), activating mutations (particularly exon 19 deletions and L858R) drive tumorigenesis, with osimertinib and other EGFR tyrosine kinase inhibitors producing marked survival benefits (median OS ~38\u201348 months) (PMID 36482474, PMID 42237450). EGFR amplification or secondary mutations frequently arise under drug pressure, identifying the tumor's continued dependence on this pathway (PMID 29124875, PMID 42237450). In colorectal cancer, wild-type EGFR inhibition with monoclonal antibodies confers benefit primarily in RAS/BRAF wild-type, left-sided metastatic disease. EGFR is overexpressed in gynecologic malignancies and head and neck cancers; CAR-T cell approaches targeting EGFR show preclinical and early clinical promise in ovarian, endometrial, and cervical cancers (PMID 40384482). However, EGFR targeting has failed in glioblastoma and pancreatic adenocarcinoma despite EGFR alterations or overexpression in these malignancies. (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Mutations, amplification, and expression alterations are well-documented as oncogenic drivers across multiple cancer types. EGFR mutations (19-Del, L858R, L747X, L833, H835) drive tumorigenesis in NSCLC, with mutations conferring TKI sensitivity (PMID 29124875, 42237450, 41763064, 40886084, 40834500). EGFR amplification occurs as a primary driver and secondary resistance mechanism in lung adenocarcinoma (PMID 41763064, 40088580). Copy-number gain and expression dysregulation are implicated in glioblastoma and breast cancer (PMID 29124875). EGFR expression levels modulate EGFR signaling dependency and immune status in EGFR-mutated lung adenocarcinoma (PMID 40088580). EGFR overexpression is prevalent in gynecologic malignancies (ovarian, endometrial, cervical cancer) and squamous cell lung carcinoma, supporting therapeutic targeting (PMID 40384482, 40193238).",
+          "Mutation, amplification, overexpression, and gene fusion evidence across multiple cancer types. In NSCLC, recurrent hotspot mutations (exon 19 deletions, L858R, exon 20 insertions, G719X, L861Q, S768I) confer constitutive kinase activation and dependence on EGFR signaling; acquired resistance mutations (T790M, C797S) emerge under TKI pressure. In colorectal cancer, wild-type EGFR blockade shows benefit in genetically defined subsets (KRAS/NRAS/BRAF wild-type, left-sided tumors). EGFR is overexpressed in gynecologic and head and neck cancers, with preclinical and emerging clinical evidence for CAR-T targeting. Expression and copy-number alterations correlate with treatment response and resistance outcomes in multiple contexts."
+        ],
+        "gene_class": [
+          "Receptor tyrosine kinase (RTK); transmembrane growth factor receptor",
+          "Receptor tyrosine kinase"
+        ],
+        "signaling_pathways": [
+          "MAPK/ERK, PI3K/AKT, JAK/STAT, PLC\u03b3",
+          "RAS/MAPK, PI3K/AKT, PLC\u03b3/PKC, JAK-STAT"
+        ]
+      },
+      "citations_added": [
+        "36482474",
+        "40384482"
+      ],
+      "citations_removed": [
+        "40088580",
+        "41763064"
+      ],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "FAM117A",
+      "reference_pmids": [
+        "35280504",
+        "36809467",
+        "41542087"
+      ],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 5,
+        "citations": [
+          "35280504",
+          "36809467",
+          "41542087",
+          "41692823"
+        ],
+        "citation_count": 4,
+        "reference_hits": [
+          "35280504",
+          "36809467",
+          "41542087"
+        ],
+        "reference_recall": 1.0,
+        "synthesis_tokens": {
+          "input_tokens": 4339,
+          "output_tokens": 943,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 4339,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 4339,
+          "output_tokens": 943,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 4339,
+          "calls": 1
+        },
+        "latency_seconds": 11.56185,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 5,
+        "citations": [
+          "35280504",
+          "36809467",
+          "41542087",
+          "41692823"
+        ],
+        "citation_count": 4,
+        "reference_hits": [
+          "35280504",
+          "36809467",
+          "41542087"
+        ],
+        "reference_recall": 1.0,
+        "synthesis_tokens": {
+          "input_tokens": 6641,
+          "output_tokens": 983,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6641,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 6641,
+          "output_tokens": 983,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6641,
+          "calls": 1
+        },
+        "latency_seconds": 157.78759,
+        "openevidence_seconds": 145.6092959170055,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 7,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "FAM117A is a DYRK1A-interacting cell-cycle regulator that functions as a tumor suppressor in lung adenocarcinoma and gastric cancer. Decreased FAM117A expression is associated with poor overall and progression-free survival in LUAD patients (PMID 35280504, 36809467). FAM117A suppresses G1/S transition; loss of FAM117A increases cell proliferation and enhances macrophage-epithelial communication networks associated with decreased cytotoxic T cell activity and poor prognosis (PMID 41692823). In gastric cancer, FAM117A regulates p53 signaling and cell adhesion molecules (N-cadherin/E-cadherin) during tumor progression (PMID 41542087). CDK4/6 inhibition can reverse the growth effects of FAM117A loss, suggesting therapeutic potential. (Literature sourced via Tier 1 direct PubMed query.)",
+          "FAM117A is a cell-cycle regulator and DYRK1A-interacting protein implicated in both lung adenocarcinoma and gastric cancer. In lung adenocarcinoma, decreased FAM117A expression is associated with poor overall survival (PMID 35280504), and FAM117A suppresses tumor-promoting communication between SPP1+ macrophages and basal epithelial cells, with loss of FAM117A promoting cell proliferation and enhanced tumor growth (PMID 41692823). FAM117A expression correlates with infiltration of immune cells including B cells, CD4+ T cells, and dendritic cells in lung adenocarcinoma (PMID 36809467). In gastric cancer, FAM117A is identified as a key regulator of carcinogenesis progression, modulating p53 signaling and cell adhesion molecules (PMID 41542087). (Literature sourced via Tier 1 direct NCBI structured query \u2014 abundant indexed literature.)"
+        ],
+        "cancer_association_rationale": [
+          "Expression and survival-association evidence across lung adenocarcinoma and gastric cancer. FAM117A loss/decreased expression is associated with poor overall and progression-free survival in LUAD (PMID 35280504, 36809467). Functional studies demonstrate FAM117A acts as a cell-cycle regulator and tumor suppressor; decreased FAM117A expression correlates with enhanced macrophage-epithelial crosstalk, increased proliferation, and poor prognosis in LUAD (PMID 41692823). In gastric cancer, FAM117A functions as a regulatory factor in the p53 pathway and cell adhesion modulation during carcinogenesis progression (PMID 41542087). Evidence types: expression (downregulation in LUAD and GC), mutation/survival-association (TCGA analysis), functional studies (cell cycle, proliferation, pathway involvement).",
+          "FAM117A has been identified in multiple studies as a gene associated with lung adenocarcinoma and gastric cancer through distinct evidence types. In lung adenocarcinoma, decreased FAM117A expression correlates with poor survival outcomes (PMID 35280504, 36809467), and FAM117A acts as a suppressor of tumor-promoting epithelial-macrophage crosstalk (PMID 41692823). Expression analysis shows FAM117A is correlated with immune cell infiltration patterns (PMID 36809467). In gastric cancer, FAM117A is identified as a key regulatory factor in carcinogenesis via integrative transcriptomic and chromatin-accessibility analysis, with functional validation linking it to p53 signaling and cadherin modulation (PMID 41542087). Evidence types include expression, mutation/survival correlation, and functional characterization in cell-cycle regulation."
+        ],
+        "signaling_pathways": [
+          "Cell cycle (G1/S checkpoint), p53 signaling, CDK4/6",
+          "Cell cycle (G1/S transition, CDK4/6), p53 signaling, macrophage-epithelial crosstalk"
+        ]
+      },
+      "citations_added": [],
+      "citations_removed": [],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": true
+    },
+    {
+      "gene": "KRAS",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "40240366",
+          "40473213",
+          "40780213",
+          "42202789"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 6156,
+          "output_tokens": 1017,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6156,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 8734,
+          "output_tokens": 1092,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 8734,
+          "calls": 2
+        },
+        "latency_seconds": 14.998629999999999,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "40240366",
+          "40340861",
+          "40780213",
+          "42202789"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 12856,
+          "output_tokens": 1007,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 12856,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 15434,
+          "output_tokens": 1082,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 15434,
+          "calls": 2
+        },
+        "latency_seconds": 265.94659,
+        "openevidence_seconds": 249.73463562500547,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 53,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "KRAS is one of the most frequently activated driver oncogenes across human malignancies (PMID 40473213), with activating mutations particularly prevalent in pancreatic, colorectal, and lung tumors (PMID 40473213). The protein is tightly regulated through ubiquitin-mediated proteasomal degradation, with deubiquitinases USP25 and JOSD2 stabilizing KRAS mutants and offering indirect therapeutic targets (PMID 40473213, PMID 40240366). Recent structural studies have identified pan-KRAS inhibitors (MCB-294) and degraders (MCB-36) capable of targeting both active and inactive KRAS conformations, with efficacy against therapy-resistant tumors (PMID 40780213). Additionally, farnesylation-driven liquid-liquid phase separation represents a regulatory mechanism linking KRAS activation to membrane translocation and downstream signaling amplification in colon cancer, addressable by statins (PMID 42202789). Specific KRAS mutations\u2014notably G12D and G13D\u2014drive distinct oncogenic circuits in pancreatic and colorectal cancers, responsive to combination targeting of effector pathways (PMID 38124228, PMID 40340861, PMID 39810420). (Literature sourced via Tier 1 direct PubMed query.)",
+          "KRAS is one of the most frequently activated oncogenic drivers across human cancers, with mutations occurring in up to 90% of pancreatic ductal adenocarcinomas and significant prevalence in colorectal and lung cancers (PMID 38686056, 40240366). Oncogenic KRAS mutations (particularly G12D, G12V, G12R, G12C) promote constitutive GTPase signaling and activate downstream RAF-MEK-ERK and PI3K-AKT pathways. Recent mechanistic insights reveal that KRAS forms liquid-liquid phase separation condensates in the cytoplasm, driven by farnesylation, which amplifies its signaling and associates with advanced stages and poor outcomes in colon cancer (PMID 42202789). KRAS is not only an oncogenic initiator but also a validated therapeutic target, with multiple inhibitor classes now in clinical use targeting different KRAS alleles and nucleotide states (PMID 40780213, 38686056). (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Mutation, structural activation, and expression-level modulation. KRAS is one of the most frequently mutated oncogenes across human cancers, with activating mutations (particularly G12D, G12C, G13D) documented in pancreatic, colorectal, lung, and hepatocellular carcinomas. Evidence includes gain-of-function mutations, dysregulated protein stability through ubiquitination/deubiquitination cycles, subcellular localization via farnesylation-driven phase separation, and activation of downstream signaling pathways (ERK/MAPK, mTOR).",
+          "KRAS mutations are well-established oncogenic drivers across multiple cancer types. Evidence spans multiple alteration types: gain-of-function mutations (G12D, G12V, G12R, G12C, G13D) that promote constitutive signaling (PMID 40780213, 40240366, 40340861, 38686056), amplification in therapy-resistant disease (PMID 40780213), and deregulation via post-translational modifications affecting membrane translocation and signaling efficiency (PMID 42202789). Cancer types include colorectal cancer (PMID 40240366, 40340861, 42202789), pancreatic ductal adenocarcinoma (PMID 40569151, 38124228, 38686056), hepatocellular carcinoma (PMID 38124228), and non-small-cell lung cancer (PMID 40780213)."
+        ],
+        "gene_class": [
+          "Small GTPase (Ras family GTPase, guanine nucleotide-binding protein)",
+          "Small GTPase; proto-oncogene"
+        ],
+        "signaling_pathways": [
+          "RAS/MAPK (ERK/MEK), PI3K/AKT, mTOR",
+          "RAS/MAPK (RAF-MEK-ERK), PI3K/AKT/mTOR, RAS/RAL"
+        ]
+      },
+      "citations_added": [
+        "40340861"
+      ],
+      "citations_removed": [
+        "40473213"
+      ],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "RFX7",
+      "reference_pmids": [
+        "38661126",
+        "39181888",
+        "41888523"
+      ],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 10,
+        "citations": [
+          "34197623",
+          "42206447",
+          "42225953"
+        ],
+        "citation_count": 3,
+        "reference_hits": [],
+        "reference_recall": 0.0,
+        "synthesis_tokens": {
+          "input_tokens": 4251,
+          "output_tokens": 878,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 4251,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 6762,
+          "output_tokens": 938,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6762,
+          "calls": 2
+        },
+        "latency_seconds": 20.99972,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 10,
+        "citations": [
+          "30926791",
+          "34197623",
+          "42206447",
+          "42225953"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": 0.0,
+        "synthesis_tokens": {
+          "input_tokens": 7397,
+          "output_tokens": 1075,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 7397,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 9908,
+          "output_tokens": 1140,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 9908,
+          "calls": 2
+        },
+        "latency_seconds": 145.49538,
+        "openevidence_seconds": 131.19107283299672,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 12,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "RFX7 is a transcription factor that functions as a tumor suppressor in lymphoid and other malignancies. Nonsense mutations and loss-of-function alterations of RFX7 have been identified in human B cell malignancies including diffuse large B cell lymphoma (DLBCL), and low RFX7 expression correlates with worse DLBCL prognosis (PMID 42225953). RFX7 acts as a key node in the p53 tumor suppressor pathway, directly controlling multiple established tumor suppressors including PDCD4, PIK3IP1, MXD4, and PNRC1, and its target gene expression correlates with better prognosis across numerous cancer types (PMID 34197623). In glioblastoma, RFX7 expression is reduced due to promoter hypermethylation, and restoration of RFX7 suppresses PI3K/AKT signaling and malignant progression (PMID 42206447). (Literature sourced via Tier 1 direct PubMed query.)",
+          "RFX7 is an emerging tumor suppressor predominantly linked to B-cell malignancies. Nonsense mutations and loss-of-function alterations have been recurrently identified in diffuse large B-cell lymphoma (DLBCL) and other B-cell lymphomas (PMID 42225953). RFX7 acts as a key node in the p53 transcriptional program, directly activating multiple established tumor suppressors including PDCD4, PIK3IP1, MXD4, and PNRC1 in response to stress (PMID 34197623). Low RFX7 mRNA levels correlate with worse DLBCL prognosis, and Rfx7 deletion in murine B cells accelerates lymphomagenesis in Bcl6 and p53-loss models by increasing MYC activity (PMID 42225953). In glioblastoma, RFX7 is epigenetically silenced via promoter hypermethylation, and restoration of RFX7 suppresses PI3K/AKT activation and malignant progression (PMID 42206447). (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Structural variants/mutations (nonsense mutations in B cell malignancies), expression (low mRNA levels correlate with DLBCL prognosis; epigenetic silencing via promoter hypermethylation in glioblastoma), and functional studies demonstrating loss-of-function effects on tumor suppression. RFX7 acts as a negative regulator of Myc activity and is part of the p53 transcriptional program controlling multiple tumor suppressors.",
+          "Mutation, expression, and methylation evidence in lymphoid and solid tumors. Recurrent nonsense and truncating mutations in DLBCL and other B-cell lymphomas cause loss-of-function and dominant-negative effects (PMID 42225953). Low RFX7 expression associates with worse DLBCL prognosis (PMID 42225953). Epigenetic silencing via promoter hypermethylation occurs in glioblastoma (PMID 42206447). Genome-wide CRISPR screening identified RFX7 as a modulator of chemotherapy response in DLBCL (PMID 33847741). Transgenic and knockout studies show Rfx7 deletion accelerates lymphomagenesis in p53 and Bcl6-driven mouse models (PMID 42225953, PMID 30926791)."
+        ],
+        "signaling_pathways": [
+          "p53 tumor suppression, PI3K/AKT, lactate metabolism",
+          "p53, mTORC1/mTORC2, PI3K/AKT, MYC"
+        ]
+      },
+      "citations_added": [
+        "30926791"
+      ],
+      "citations_removed": [],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "RP1",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [],
+        "citation_count": 0,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 4641,
+          "output_tokens": 725,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 2622,
+          "total_input_tokens": 7263,
+          "calls": 2
+        },
+        "all_llm_tokens": {
+          "input_tokens": 7155,
+          "output_tokens": 765,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 2622,
+          "total_input_tokens": 9777,
+          "calls": 3
+        },
+        "latency_seconds": 16.48123,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": false,
+          "in_oncokb": false,
+          "insufficient_evidence": true
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [],
+        "citation_count": 0,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 13155,
+          "output_tokens": 918,
+          "cache_creation_input_tokens": 2743,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 15898,
+          "calls": 2
+        },
+        "all_llm_tokens": {
+          "input_tokens": 15669,
+          "output_tokens": 958,
+          "cache_creation_input_tokens": 2743,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 18412,
+          "calls": 3
+        },
+        "latency_seconds": 179.83223999999998,
+        "openevidence_seconds": 165.08276337501593,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 21,
+        "classification": {
+          "cancer_associated": false,
+          "in_oncokb": false,
+          "insufficient_evidence": true
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "RP1 (HGNC:10263) encodes a photoreceptor-specific axonemal microtubule-associated protein primarily known for its role in retinitis pigmentosa. The only retrieved abstract (PMID 40627813) refers to \"RP1\" as the code name for vusolimogene oderparepvec, an HSV-1-based oncolytic immunotherapy tested with nivolumab in anti-PD-1-failed melanoma, and is unrelated to the HGNC RP1 gene product. No retrieved literature provides direct evidence linking the RP1 gene itself to cancer biology through mutations, fusions, expression, methylation, or copy-number alterations. (Literature sourced via Tier 1 direct PubMed query.)",
+          "The only retrieved abstract using the term \"RP1\" refers to vusolimogene oderparepvec, an engineered oncolytic herpes simplex virus type 1 evaluated in combination with nivolumab in anti-PD-1-failed advanced melanoma, and is unrelated to the HGNC-defined RP1 gene (RP1 axonemal microtubule associated) (PMID 40627813). No retrieved literature provides evidence that the human RP1 gene itself harbors recurrent cancer-associated mutations, fusions, copy-number changes, or expression alterations. Given the same-symbol ambiguity flagged by HGNC identity checks, the retrieved evidence cannot be used to support a cancer association for the RP1 gene locus. (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "The single retrieved abstract uses \"RP1\" as the trade name for vusolimogene oderparepvec, an HSV-1-based oncolytic immunotherapy, not the human RP1 axonemal microtubule associated gene (HGNC:10263). No retrieved literature addresses the HGNC RP1 gene in a cancer context (no structural-variant, expression, mutation, methylation, or copy-number evidence).",
+          "The single retrieved abstract (PMID 40627813) describes \"RP1\" as vusolimogene oderparepvec, an oncolytic HSV-1-based immunotherapy, not the human RP1 gene (HGNC:10263, RP1 axonemal microtubule associated). No retrieved evidence links the RP1 photoreceptor/axonemal gene itself to cancer via structural variants, expression, mutation, methylation, or copy-number alterations."
+        ],
+        "gene_class": [
+          null,
+          "Axonemal microtubule-associated protein (photoreceptor-associated structural protein)"
+        ],
+        "signaling_pathways": [
+          null,
+          ""
+        ]
+      },
+      "citations_added": [],
+      "citations_removed": [],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": true
+    },
+    {
+      "gene": "TP53",
+      "reference_pmids": [],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "41128012",
+          "41335402",
+          "41493644",
+          "41592087"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 6279,
+          "output_tokens": 1141,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6279,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 8735,
+          "output_tokens": 1216,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 8735,
+          "calls": 2
+        },
+        "latency_seconds": 18.14723,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 50,
+        "citations": [
+          "41128012",
+          "41335402",
+          "41493644",
+          "41592087"
+        ],
+        "citation_count": 4,
+        "reference_hits": [],
+        "reference_recall": null,
+        "synthesis_tokens": {
+          "input_tokens": 13248,
+          "output_tokens": 1447,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 13248,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 15746,
+          "output_tokens": 1522,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 15746,
+          "calls": 2
+        },
+        "latency_seconds": 275.24171,
+        "openevidence_seconds": 255.92849754198687,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 51,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": true,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {},
+      "text_changes": {
+        "gene_summary": [
+          "TP53 is a well-established tumor suppressor gene whose mutations are associated with poor prognosis across multiple cancer types. In acute leukemias, TP53 mutations confer significantly worse overall survival: in ALL, TP53 VAF (variant allele frequency) \u226545% is independently prognostic in patients aged \u226560 years and is associated with higher relapse risk (PMID 41335402); in AML, TP53 mutations or defective TP53-mediated apoptosis despite wild-type status result in dismal 4-year survival rates of 6\u201319% (PMID 41592087). In triple-negative breast cancer, TP53-mutant cells exhibit unique vulnerabilities including sensitivity to ferroptosis induction, suggesting potential therapeutic targeting strategies (PMID 41493644). In non-small cell lung cancer, TP53 mutations\u2014particularly gain-of-function variants\u2014show altered immune checkpoint expression and differential responses to immunotherapy and targeted therapies, with improved immunotherapy outcomes but poorer ROS1-TKI efficacy in gain-of-function mutants (PMID 41128012). In myelodysplastic syndromes, TP53 mutations occur in ~9% of patients and are associated with elevated bone marrow blasts, complex karyotype, and higher risk of AML transformation (PMID 40755402). Germline TP53 pathogenic variants cause Li-Fraumeni Syndrome, a hereditary cancer predisposition syndrome characterized by early-onset cancers across multiple tissues, with neoantigenic properties of variants influencing phenotypic heterogeneity and cancer risk (PMID 41370968). (Literature sourced via Tier 1 direct NCBI structured query \u2014 abundant indexed literature.)",
+          "TP53 is a canonical tumor suppressor transcription factor governing cell-cycle arrest, apoptosis, DNA repair, and metabolism across all cancer types. Somatic TP53 mutations occur in ~17% of newly diagnosed ALL (PMID 41335402), with VAF \u226545% independently predicting poor outcomes in older patients; in AML, TP53 mutations associate with dismal survival and defective p53-mediated apoptosis even when TP53 is wild-type (PMID 41592087, 40993965). In MDS, biallelic TP53 alterations (point mutations, deletions, copy-neutral loss of heterozygosity) elevate bone marrow blasts and increase AML transformation risk (PMID 40755402). TP53-mutant triple-negative breast cancer cells exhibit unique ferroptosis vulnerability distinct from wild-type or null genotypes (PMID 41493644). In NSCLC, TP53 gain-of-function mutations associate with elevated mutation burden, altered immune checkpoint expression, and improved immunotherapy response but worse tyrosine kinase inhibitor outcomes (PMID 41128012). Germline pathogenic TP53 variants cause Li-Fraumeni syndrome with lifetime cancer risk ~90%, with neoantigenicity of specific missense variants correlating with age at cancer onset and cancer spectrum (PMID 41370968). In mantle cell lymphoma, TP53 mutations serve as a significant negative prognostic factor and correlate with altered p53 immunohistochemical expression patterns (PMID 40851047). (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Mutations in TP53 are strongly associated with multiple cancer types across diverse evidence types: mutation (frequent in hematologic malignancies, NSCLC, and MDS); expression alterations and functional defects (loss-of-function and gain-of-function mutations affecting survival pathways); and prognostic significance. TP53 alterations are observed in acute lymphoblastic leukemia (ALL), acute myeloid leukemia (AML), triple-negative breast cancer (TNBC), non-small cell lung cancer (NSCLC), myelodysplastic syndromes (MDS), and as germline pathogenic variants in Li-Fraumeni Syndrome predisposing to multiple cancer types.",
+          "Mutation, loss-of-function, and copy-number alterations (del(17p)). Evidence types include: (1) somatic TP53 mutations in AML, ALL, MDS, NSCLC, triple-negative breast cancer, mantle cell lymphoma (PMID 41335402, 41592087, 41493644, 40993965, 40755402, 40851047); (2) deletions and copy-number loss affecting TP53 (PMID 40755402); (3) germline pathogenic variants in Li-Fraumeni syndrome predisposing to multiple cancer types (PMID 41370968); (4) gain-of-function missense mutations with distinct molecular profiles in NSCLC (PMID 41128012). TP53 alterations consistently associate with aggressive disease, poor prognosis, and therapy resistance across hematologic and solid malignancies."
+        ],
+        "gene_class": [
+          "Tumor suppressor; transcription factor",
+          "Tumor suppressor transcription factor"
+        ],
+        "signaling_pathways": [
+          "TP53-mediated apoptosis, p53 response, DNA damage response",
+          "p53-mediated apoptosis, cell-cycle arrest, DNA damage response (DDR), MDM2/p53 regulation"
+        ]
+      },
+      "citations_added": [],
+      "citations_removed": [],
+      "identical_retrieval_pool": false,
+      "identical_selected_pmids": false
+    },
+    {
+      "gene": "TRARG1",
+      "reference_pmids": [
+        "23302999",
+        "31157375"
+      ],
+      "disabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 12,
+        "citations": [
+          "23302999",
+          "26240143",
+          "31157375"
+        ],
+        "citation_count": 3,
+        "reference_hits": [
+          "23302999",
+          "31157375"
+        ],
+        "reference_recall": 1.0,
+        "synthesis_tokens": {
+          "input_tokens": 3672,
+          "output_tokens": 884,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 3672,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 6198,
+          "output_tokens": 934,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6198,
+          "calls": 2
+        },
+        "latency_seconds": 16.52666,
+        "openevidence_seconds": 0,
+        "openevidence_succeeded": false,
+        "supplementary_citation_count": 0,
+        "classification": {
+          "cancer_associated": true,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "enabled": {
+        "retrieval_tier": 1,
+        "retrieved_count": 12,
+        "citations": [
+          "23302999",
+          "26240143",
+          "31157375"
+        ],
+        "citation_count": 3,
+        "reference_hits": [
+          "23302999",
+          "31157375"
+        ],
+        "reference_recall": 1.0,
+        "synthesis_tokens": {
+          "input_tokens": 6627,
+          "output_tokens": 1022,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 6627,
+          "calls": 1
+        },
+        "all_llm_tokens": {
+          "input_tokens": 9153,
+          "output_tokens": 1072,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "total_input_tokens": 9153,
+          "calls": 2
+        },
+        "latency_seconds": 166.35004999999998,
+        "openevidence_seconds": 151.62285616601002,
+        "openevidence_succeeded": true,
+        "supplementary_citation_count": 21,
+        "classification": {
+          "cancer_associated": false,
+          "in_oncokb": false,
+          "insufficient_evidence": false
+        },
+        "error": null
+      },
+      "classification_changes": {
+        "cancer_associated": [
+          true,
+          false
+        ]
+      },
+      "text_changes": {
+        "gene_summary": [
+          "TRARG1 (also known as TUSC5, tumor suppressor candidate 5) is a GLUT4 storage vesicle protein with emerging evidence of tumor suppressor function across multiple cancer types. In breast cancer, TRARG1 undergoes aberrant DNA hypermethylation of its promoter region, leading to downregulation of gene expression in invasive adenocarcinoma specimens compared to normal tissue (PMID 23302999). In hepatocellular carcinoma, TRARG1 expression is significantly reduced and functions as a direct target of oncogenic miR-484; restoration of TRARG1 expression suppresses malignant phenotypes and is associated with improved patient prognosis (PMID 31157375). Mechanistically, TRARG1 regulates insulin-stimulated glucose uptake through GLUT4 trafficking in adipocytes, linking its loss to metabolic dysregulation that may contribute to cancer progression (PMID 26240143). (Literature sourced via Tier 1 direct PubMed query.)",
+          "TRARG1 (also known by its legacy alias TUSC5, \"tumor suppressor candidate 5\") is a tissue-restricted metabolic protein abundant in adipose tissue and peripheral neurons that functions primarily as a positive regulator of insulin-stimulated glucose transport through GLUT4 trafficking, not as a tumor suppressor (PMID 26240143). The \"tumor suppressor candidate\" designation originated from its location within a recurrently deleted chromosomal region (17p13.3) near TP53, where reduced expression and promoter methylation were observed in small cell lung cancer, but without recurrent somatic mutations or functional tumor-suppression assays (PMID 23302999). In hepatocellular carcinoma, TUSC5 was reported as downregulated and targeted by upregulated miR-484, with gain-of-function studies suggesting potential tumor-suppressive activity, but this evidence comes from cell-line experiments without confirmation of tumor-intrinsic expression or independent validation (PMID 31157375). No endogenous proliferative, apoptotic, or genomic-stability functions have been demonstrated, and the apparent downregulation in bulk tumor comparisons may partly reflect stromal adipose content rather than tumor-cell-intrinsic changes. TRARG1 is not currently validated as a cancer gene, biomarker, or therapeutic target. (Literature sourced via Tier 1 direct PubMed query.)"
+        ],
+        "cancer_association_rationale": [
+          "Methylation (breast cancer \u2014 promoter hypermethylation leading to downregulation), expression/miRNA regulation (hepatocellular carcinoma \u2014 downregulation via miR-484 targeting). Evidence supports tumor suppressor role in both methylation-driven silencing and post-transcriptional regulation contexts.",
+          "Expression downregulation and promoter methylation reported in lung cancer (guilt-by-association with 17p13.3 deletion region rather than functional evidence); expression association and miR-484 targeting observed in hepatocellular carcinoma cell lines without confirmation of tumor-intrinsic expression or independent validation. No somatic mutations, copy-number alterations, or functional tumor-suppression assays documented. Primary molecular role is metabolic (GLUT4 trafficking and insulin signaling) in adipocytes and neurons."
+        ],
+        "gene_class": [
+          "Trafficking regulator / GLUT4 trafficking protein",
+          "Glucose transporter trafficking regulator; GLUT4 storage vesicle protein"
+        ],
+        "signaling_pathways": [
+          "Insulin signaling, GLUT4 trafficking, PPAR-\u03b3 pathway",
+          "Insulin signaling, GLUT4 trafficking, PI3K/AKT (as a GSK3 substrate), PPAR\u03b3 signaling"
+        ]
+      },
+      "citations_added": [],
+      "citations_removed": [],
+      "identical_retrieval_pool": true,
+      "identical_selected_pmids": true
+    }
+  ],
+  "wall_seconds": {
+    "disabled": 98.89373883299413,
+    "enabled": 1159.188253750006
+  }
+}
