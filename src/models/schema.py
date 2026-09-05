@@ -253,6 +253,15 @@ class GeneAnnotation(BaseModel):
     # when OPENEVIDENCE_ENABLED=true. Unverified — never counted among the
     # verified PMID `citations` above.
     openevidence_supplementary: Optional[OpenEvidenceAnalysis] = None
+    # When OpenEvidence was last checked for this annotation (only set when
+    # OPENEVIDENCE_ENABLED=true at synthesis time — see orchestrator.py).
+    # None means "never checked" (feature disabled, or not yet synthesized
+    # since it was enabled), regardless of whether openevidence_supplementary
+    # itself ended up populated (a checked-but-not-found lookup still sets
+    # this). Used by the gene-annotation reuse/staleness check to detect
+    # OpenEvidence data that became available after this annotation was
+    # synthesized without it.
+    openevidence_checked_at: Optional[str] = None
     date_annotated: str = Field(
         default_factory=lambda: date.today().strftime("%-m/%-d/%y")
     )
@@ -287,19 +296,22 @@ class GeneAnnotation(BaseModel):
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
 
+    # Fields omitted from serialized output entirely (not present-as-null)
+    # when None, so the OPENEVIDENCE_ENABLED=false path has zero new keys in
+    # any serialized GeneAnnotation — API responses, exports, and persisted
+    # run/gene-cache JSON — matching current main's shape exactly.
+    # Deliberately scoped to just these two OpenEvidence-specific fields:
+    # this is NOT a model-wide exclude_none, so every other None-valued
+    # field (e.g. clinical_actionability) still serializes as null,
+    # unchanged.
+    _OMIT_WHEN_NONE = ("openevidence_supplementary", "openevidence_checked_at")
+
     @model_serializer(mode="wrap")
-    def _omit_openevidence_supplementary_when_absent(self, handler):
-        """Omit `openevidence_supplementary` entirely (not present-as-null)
-        when it's None, so the OPENEVIDENCE_ENABLED=false path has zero new
-        keys in any serialized GeneAnnotation — API responses, exports, and
-        persisted run/gene-cache JSON — matching current main's shape
-        exactly. Deliberately scoped to this one field only: this is NOT a
-        model-wide exclude_none, so every other None-valued field (e.g.
-        clinical_actionability) still serializes as null, unchanged.
-        """
+    def _omit_openevidence_fields_when_absent(self, handler):
         data = handler(self)
-        if self.openevidence_supplementary is None:
-            data.pop("openevidence_supplementary", None)
+        for field_name in self._OMIT_WHEN_NONE:
+            if getattr(self, field_name) is None:
+                data.pop(field_name, None)
         return data
 
 

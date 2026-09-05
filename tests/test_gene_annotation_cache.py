@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from src.models.schema import FusionInput, GeneAnnotation, ResolvedGene
+from src.models.schema import FusionInput, GeneAnnotation, OpenEvidenceAnalysis, ResolvedGene
 from src.pipeline import orchestrator
 from src.pipeline.orchestrator import run_pipeline
 
@@ -373,3 +373,218 @@ async def test_run_pipeline_force_refresh_bypasses_cache(monkeypatch):
     assert result.annotations[0].cache_status == "refreshed"
     assert result.annotations[0].cache_reason == "force_refresh"
     assert store.saved[0][0].gene == "BRAF"
+
+
+# ---------------------------------------------------------------------------
+# OpenEvidence-freshness staleness check: analogous to the PubMed-freshness
+# check above, but for OpenEvidence supplementary evidence. If OpenEvidence
+# data lands in cache AFTER a gene was already annotated (e.g. via
+# benchmarks/warm_openevidence_cache.py, or a slow live call that finished
+# after synthesis had already proceeded without it), the next read of that
+# gene should pick up the more pertinent, OpenEvidence-informed annotation
+# rather than serving the stale one — even if the cached annotation is
+# otherwise still well within its normal age-based freshness window.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_pipeline_refreshes_cached_annotation_when_openevidence_becomes_available(monkeypatch):
+    """A cached annotation with no openevidence_supplementary, well within
+    its normal freshness window (10 days old, high support), must still be
+    refreshed when OPENEVIDENCE_ENABLED=true and an OpenEvidence cache entry
+    has newly appeared for this gene — proving the check fires independent
+    of and ahead of the ordinary age-based freshness windows."""
+    updated_at = datetime.now(timezone.utc) - timedelta(days=1)
+    cached_annotation = GeneAnnotation(
+        gene="BRAF",
+        fusions=["OLD::BRAF"],
+        in_oncokb=False,
+        cancer_associated=True,
+        citations=["12345", "67890", "24680"],
+        insufficient_evidence=False,
+        evidence_support_score=0.9,
+        evidence_support_explanation="High support.",
+    )
+    assert cached_annotation.openevidence_supplementary is None
+    store = FakeGeneStore(
+        {
+            "BRAF": {
+                "annotation": cached_annotation.model_dump(),
+                "updated_at": updated_at,
+                "last_pubmed_checked_at": updated_at,
+            }
+        }
+    )
+
+    async def fake_normalize_fusions(_fusions):
+        return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
+
+    async def fake_has_cached_analysis(gene, tumor_type=None):
+        assert gene == "BRAF"
+        return True
+
+    async def fake_annotate_gene(**kwargs):
+        return GeneAnnotation(
+            gene=kwargs["gene"],
+            fusions=kwargs["fusions"],
+            in_oncokb=False,
+            cancer_associated=True,
+            citations=["12345", "67890", "24680"],
+            insufficient_evidence=False,
+            evidence_support_score=0.9,
+            evidence_support_explanation="High support, now OpenEvidence-informed.",
+            openevidence_supplementary=OpenEvidenceAnalysis(
+                question="q", text="OpenEvidence-informed synthesis text."
+            ),
+            cache_status="refreshed",
+        )
+
+    monkeypatch.setattr(orchestrator.settings, "openevidence_enabled", True)
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "has_cached_analysis", fake_has_cached_analysis)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
+
+    result = await run_pipeline(["TP53::BRAF"], run_store=store)
+
+    assert result.annotations[0].cache_status == "refreshed"
+    assert result.annotations[0].openevidence_supplementary is not None
+    assert store.saved[0][0].gene == "BRAF"
+
+
+async def test_run_pipeline_reuses_cache_when_no_new_openevidence_data_available(monkeypatch):
+    """No OpenEvidence cache entry exists yet — nothing changed, so the
+    freshness check must NOT fire: the cache is reused normally, exactly as
+    it would be without the OpenEvidence check existing at all."""
+    updated_at = datetime.now(timezone.utc) - timedelta(days=1)
+    cached_annotation = GeneAnnotation(
+        gene="BRAF",
+        fusions=["OLD::BRAF"],
+        in_oncokb=False,
+        cancer_associated=True,
+        citations=["12345", "67890", "24680"],
+        insufficient_evidence=False,
+        evidence_support_score=0.9,
+        evidence_support_explanation="High support.",
+    )
+    store = FakeGeneStore(
+        {
+            "BRAF": {
+                "annotation": cached_annotation.model_dump(),
+                "updated_at": updated_at,
+                "last_pubmed_checked_at": updated_at,
+            }
+        }
+    )
+
+    async def fake_normalize_fusions(_fusions):
+        return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
+
+    async def fake_has_cached_analysis(gene, tumor_type=None):
+        return False
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("no new OpenEvidence data should avoid recomputation")
+
+    monkeypatch.setattr(orchestrator.settings, "openevidence_enabled", True)
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "has_cached_analysis", fake_has_cached_analysis)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fail_if_called)
+
+    result = await run_pipeline(["TP53::BRAF"], run_store=store)
+
+    assert result.annotations[0].cache_status == "reused"
+    assert result.annotations[0].cache_reason == "fresh_high_evidence_support"
+    assert store.saved == []
+
+
+async def test_run_pipeline_does_not_recheck_openevidence_already_present_on_cached_annotation(monkeypatch):
+    """The cached annotation already carries OpenEvidence supplementary
+    evidence — there's nothing new to pick up, so the freshness check must
+    not even bother peeking the cache (and certainly must not trigger
+    recomputation)."""
+    updated_at = datetime.now(timezone.utc) - timedelta(days=1)
+    cached_annotation = GeneAnnotation(
+        gene="BRAF",
+        fusions=["OLD::BRAF"],
+        in_oncokb=False,
+        cancer_associated=True,
+        citations=["12345"],
+        insufficient_evidence=False,
+        evidence_support_score=0.9,
+        evidence_support_explanation="High support, already OpenEvidence-informed.",
+        openevidence_supplementary=OpenEvidenceAnalysis(question="q", text="Already have this."),
+    )
+    store = FakeGeneStore(
+        {
+            "BRAF": {
+                "annotation": cached_annotation.model_dump(),
+                "updated_at": updated_at,
+                "last_pubmed_checked_at": updated_at,
+            }
+        }
+    )
+
+    async def fake_normalize_fusions(_fusions):
+        return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
+
+    async def fail_has_cached_analysis(gene, tumor_type=None):
+        raise AssertionError(
+            "should not peek the OpenEvidence cache when the annotation already has supplementary evidence"
+        )
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("already-present OpenEvidence evidence should avoid recomputation")
+
+    monkeypatch.setattr(orchestrator.settings, "openevidence_enabled", True)
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "has_cached_analysis", fail_has_cached_analysis)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fail_if_called)
+
+    result = await run_pipeline(["TP53::BRAF"], run_store=store)
+
+    assert result.annotations[0].cache_status == "reused"
+    assert store.saved == []
+
+
+async def test_run_pipeline_never_checks_openevidence_freshness_when_feature_disabled(monkeypatch):
+    """OPENEVIDENCE_ENABLED=false must add zero overhead to the reuse check:
+    it must not even call has_cached_analysis, let alone treat anything as
+    stale because of it."""
+    updated_at = datetime.now(timezone.utc) - timedelta(days=1)
+    cached_annotation = GeneAnnotation(
+        gene="BRAF",
+        fusions=["OLD::BRAF"],
+        in_oncokb=False,
+        cancer_associated=True,
+        citations=["12345"],
+        insufficient_evidence=False,
+        evidence_support_score=0.9,
+        evidence_support_explanation="High support.",
+    )
+    store = FakeGeneStore(
+        {
+            "BRAF": {
+                "annotation": cached_annotation.model_dump(),
+                "updated_at": updated_at,
+                "last_pubmed_checked_at": updated_at,
+            }
+        }
+    )
+
+    async def fake_normalize_fusions(_fusions):
+        return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
+
+    async def fail_has_cached_analysis(gene, tumor_type=None):
+        raise AssertionError("should not check OpenEvidence freshness when the feature is disabled")
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("fresh cache should avoid recomputation")
+
+    monkeypatch.setattr(orchestrator.settings, "openevidence_enabled", False)
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "has_cached_analysis", fail_has_cached_analysis)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fail_if_called)
+
+    result = await run_pipeline(["TP53::BRAF"], run_store=store)
+
+    assert result.annotations[0].cache_status == "reused"
+    assert store.saved == []

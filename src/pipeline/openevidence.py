@@ -24,7 +24,7 @@ from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, 
 
 from src.config import settings
 from src.models.schema import OpenEvidenceAnalysis, OpenEvidenceCitation
-from src.pipeline.cache import cached_call
+from src.pipeline.cache import _get_client, cached_call
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,42 @@ def _is_transient_openevidence_error(exc: BaseException) -> bool:
         # check for; see _post_streaming_analysis).
         return True
     return False
+
+
+def _cache_key(gene: str, tumor_type: Optional[str] = None) -> str:
+    """Shared cache-key derivation, used both to fetch/store a live analysis
+    (OpenEvidenceClient.get_gene_analysis) and to passively peek whether one
+    already exists (has_cached_analysis), so the two paths can never drift
+    apart on key format."""
+    return "openevidence:" + json.dumps(
+        {
+            "gene": gene.strip().upper(),
+            "tumor_type": (tumor_type or "").strip().lower(),
+            "model": settings.openevidence_model,
+        },
+        sort_keys=True,
+    )
+
+
+async def has_cached_analysis(gene: str, tumor_type: Optional[str] = None) -> bool:
+    """Whether a Redis cache entry already exists for this gene/tumor_type —
+    a passive peek that makes no live HTTP call and needs no API key.
+
+    Used by the gene-annotation reuse/staleness check (see
+    orchestrator.py's _maybe_reuse_cached_annotation) to detect when
+    OpenEvidence data has become available since a stored annotation was
+    last synthesized without it — e.g. via benchmarks/warm_openevidence_cache.py,
+    or a slow live call that finished after that gene's synthesis had
+    already proceeded without it. Fails closed (returns False) if Redis is
+    unreachable, consistent with this being a best-effort supplementary
+    signal, never something that should block or error out a cache read.
+    """
+    key = _cache_key(gene, tumor_type)
+    try:
+        return bool(await _get_client().exists(key))
+    except Exception as exc:
+        logger.warning("OpenEvidence cache existence check failed for %s: %s", gene, exc)
+        return False
 
 
 def _build_question(gene: str, tumor_type: Optional[str] = None) -> str:
@@ -255,14 +291,7 @@ class OpenEvidenceClient:
             )
 
         question = _build_question(gene, tumor_type)
-        cache_key = "openevidence:" + json.dumps(
-            {
-                "gene": gene.strip().upper(),
-                "tumor_type": (tumor_type or "").strip().lower(),
-                "model": settings.openevidence_model,
-            },
-            sort_keys=True,
-        )
+        cache_key = _cache_key(gene, tumor_type)
 
         async def _compute() -> dict:
             if client is not None:

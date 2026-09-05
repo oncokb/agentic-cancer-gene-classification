@@ -32,7 +32,7 @@ from src.pipeline.literature import (
 )
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
-from src.pipeline.openevidence import OpenEvidenceClient
+from src.pipeline.openevidence import OpenEvidenceClient, has_cached_analysis
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
@@ -136,6 +136,29 @@ def _cached_annotation_for_request(
     return annotation
 
 
+async def _openevidence_became_available_since_synthesis(
+    annotation: GeneAnnotation,
+    gene: str,
+    tumor_type: Optional[str],
+) -> bool:
+    """Whether OpenEvidence supplementary evidence has newly become available
+    for this gene since `annotation` was last synthesized without it.
+
+    Only meaningful when OpenEvidence is currently enabled and the stored
+    annotation doesn't already carry supplementary evidence — if it does,
+    there's nothing to pick up. Otherwise, peek OpenEvidenceClient's Redis
+    cache (no live HTTP call) to see whether a cache entry has appeared
+    since — e.g. via benchmarks/warm_openevidence_cache.py, or a slow live
+    call that finished after this gene's synthesis had already proceeded
+    without it.
+    """
+    if not settings.openevidence_enabled:
+        return False
+    if annotation.openevidence_supplementary is not None:
+        return False
+    return await has_cached_analysis(gene, tumor_type=tumor_type)
+
+
 async def _maybe_reuse_cached_annotation(
     *,
     gene: str,
@@ -169,6 +192,20 @@ async def _maybe_reuse_cached_annotation(
             "Refreshing cached annotation for %s because referenced PMID(s) are retracted: %s",
             gene,
             ", ".join(sorted(retracted_pmids)),
+        )
+        return None
+
+    # Analogous to the PubMed-freshness check below, but for OpenEvidence:
+    # if supplementary evidence has landed in cache since this annotation
+    # was last synthesized without it, treat it as stale so re-synthesis
+    # picks up the more pertinent, OpenEvidence-informed result. Checked
+    # regardless of the age-based freshness windows below, since new
+    # OpenEvidence data can land at any time independent of annotation age.
+    if await _openevidence_became_available_since_synthesis(annotation, gene, tumor_type):
+        logger.info(
+            "Refreshing cached annotation for %s because OpenEvidence supplementary "
+            "evidence became available since it was last synthesized without it",
+            gene,
         )
         return None
 
@@ -637,6 +674,13 @@ async def run_pipeline(
             ):
                 annotation.cached_at = timestamp
                 annotation.last_pubmed_checked_at = timestamp
+                # Only recorded when OpenEvidence is actually enabled — mirrors
+                # the enabled-guard pattern used for the fetch itself, so a
+                # disabled-feature annotation still shows "never checked"
+                # (None) rather than a misleading checked-at timestamp for a
+                # lookup that never happened.
+                if settings.openevidence_enabled:
+                    annotation.openevidence_checked_at = timestamp
                 try:
                     await run_store.save_gene_annotation(
                         annotation,

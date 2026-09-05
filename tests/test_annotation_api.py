@@ -128,10 +128,41 @@ def test_single_gene_annotation_endpoint_omits_openevidence_supplementary_when_d
     assert response.status_code == 200
     payload = response.json()
     assert "openevidence_supplementary" not in payload
+    # openevidence_checked_at gets the same treatment for the same reason —
+    # it's None whenever the feature wasn't enabled at synthesis time, and
+    # must not add a new key to the disabled path's serialized output either.
+    assert "openevidence_checked_at" not in payload
     # Sanity check this isn't a global exclude_none: other None-valued fields
     # (e.g. clinical_actionability) still serialize as null, unchanged.
     assert "clinical_actionability" in payload
     assert payload["clinical_actionability"] is None
+
+
+def test_single_gene_annotation_endpoint_includes_openevidence_checked_at_when_set(monkeypatch):
+    """When OpenEvidence was checked for this annotation (whether or not it
+    found anything), openevidence_checked_at must be present in the
+    serialized output with its real value."""
+    main.app.state.run_store = FakeRunStore()
+
+    async def fake_run_pipeline(fusions, **kwargs):
+        return AnnotationResult(
+            run_id="run-1",
+            timestamp="2026-07-31T14:00:00+00:00",
+            fusions_processed=1,
+            genes_annotated=1,
+            annotations=[
+                GeneAnnotation(gene="ALK", openevidence_checked_at="2026-07-31T14:00:00+00:00")
+            ],
+        )
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    client = TestClient(main.app)
+
+    response = client.post("/v1/annotate/gene", json={"gene": "ALK"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["openevidence_checked_at"] == "2026-07-31T14:00:00+00:00"
 
 
 def test_single_gene_annotation_endpoint_includes_openevidence_supplementary_when_enabled(monkeypatch):
