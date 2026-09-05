@@ -27,6 +27,8 @@ from src.pipeline.openevidence import (
     _build_analysis,
     _iter_sse_payloads,
     _parse_sse_events,
+    mark_refresh_attempted,
+    was_refresh_recently_attempted,
 )
 
 # Verbatim (real, live-captured) NCCN guideline citation — note the absence
@@ -196,9 +198,41 @@ def test_build_analysis_ignores_table_events_without_crashing():
 
 @pytest.mark.asyncio
 async def test_get_gene_analysis_requires_api_key():
+    """On a genuine cache MISS, a live call is about to be made, so an API
+    key is genuinely required."""
     client = OpenEvidenceClient(api_key="")
     with pytest.raises(OpenEvidenceConfigurationError):
         await client.get_gene_analysis("BRAF")
+
+
+@pytest.mark.asyncio
+async def test_get_gene_analysis_cache_hit_is_consumable_without_api_key(_require_redis):
+    """A genuine Redis cache hit must be returned regardless of whether an
+    API key is configured on THIS client instance — a cache entry existing
+    does not depend on this process being able to make a NEW live call. It
+    may have been warmed by a different process (e.g.
+    benchmarks/warm_openevidence_cache.py) that did have a key. Before the
+    fix, the API-key check ran before the cache was even consulted, so a
+    keyless process could never consume an otherwise-valid cache entry."""
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=SSE_STREAM)
+
+    # First, warm the cache using a client that DOES have a key.
+    warming_client = OpenEvidenceClient(api_key="test-key")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        await warming_client.get_gene_analysis("BRAF", client=http_client)
+    assert len(requests) == 1
+
+    # Now a keyless client must still be able to consume that cache entry —
+    # no live call, no OpenEvidenceConfigurationError.
+    keyless_client = OpenEvidenceClient(api_key="")
+    analysis = await keyless_client.get_gene_analysis("BRAF")
+
+    assert analysis.text == "BRAF mutations are common in melanoma.[[1]][[2]]"
+    assert len(requests) == 1  # still just the one warming call, no new attempt
 
 
 @pytest.mark.asyncio
@@ -346,3 +380,36 @@ async def test_get_gene_analysis_does_not_retry_on_timeout():
             await client.get_gene_analysis("BRAF", client=http_client)
 
     assert attempts["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_was_refresh_recently_attempted_reflects_mark_refresh_attempted(_require_redis):
+    """The cooldown primitives used by the gene-annotation reuse check to
+    bound repeated freshness-driven re-synthesis attempts: unattempted by
+    default, True immediately after marking, for a distinct gene/tumor_type
+    only (not globally)."""
+    assert await was_refresh_recently_attempted("BRAF") is False
+
+    await mark_refresh_attempted("BRAF")
+
+    assert await was_refresh_recently_attempted("BRAF") is True
+    # A different gene, or the same gene with a different tumor_type, is a
+    # distinct cooldown key — unaffected by BRAF's mark.
+    assert await was_refresh_recently_attempted("TP53") is False
+    assert await was_refresh_recently_attempted("BRAF", tumor_type="melanoma") is False
+
+
+@pytest.mark.asyncio
+async def test_was_refresh_recently_attempted_expires_after_cooldown(_require_redis, monkeypatch):
+    """The cooldown is bounded, not permanent — once
+    OPENEVIDENCE_REFRESH_COOLDOWN_SECONDS elapses, another attempt is
+    allowed again."""
+    import asyncio
+
+    monkeypatch.setattr(settings, "openevidence_refresh_cooldown_seconds", 1)
+
+    await mark_refresh_attempted("BRAF")
+    assert await was_refresh_recently_attempted("BRAF") is True
+
+    await asyncio.sleep(1.2)  # let the 1-second TTL genuinely expire
+    assert await was_refresh_recently_attempted("BRAF") is False

@@ -155,6 +155,15 @@ class Settings(BaseSettings):
     # not live annotation traffic and can safely fan out wider than the
     # semaphore that gates concurrent per-gene annotation requests.
     openevidence_warmup_concurrency: int = 5
+    # Cooldown before the gene-annotation reuse check (see orchestrator.py's
+    # _maybe_reuse_cached_annotation) will re-trigger another OpenEvidence-
+    # freshness-driven re-synthesis for the same gene after one was already
+    # attempted. Without this, a refresh that keeps failing to actually
+    # populate openevidence_supplementary — e.g. a downstream synthesis
+    # error unrelated to OpenEvidence, which skips persisting the refreshed
+    # annotation entirely — would re-trigger a full re-synthesis attempt on
+    # every single subsequent read of that gene, forever.
+    openevidence_refresh_cooldown_seconds: int = 900
 
     log_level: str = "INFO"
 

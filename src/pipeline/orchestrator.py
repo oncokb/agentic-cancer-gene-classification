@@ -32,7 +32,12 @@ from src.pipeline.literature import (
 )
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
-from src.pipeline.openevidence import OpenEvidenceClient, has_cached_analysis
+from src.pipeline.openevidence import (
+    OpenEvidenceClient,
+    has_cached_analysis,
+    mark_refresh_attempted,
+    was_refresh_recently_attempted,
+)
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
@@ -146,15 +151,22 @@ async def _openevidence_became_available_since_synthesis(
 
     Only meaningful when OpenEvidence is currently enabled and the stored
     annotation doesn't already carry supplementary evidence — if it does,
-    there's nothing to pick up. Otherwise, peek OpenEvidenceClient's Redis
-    cache (no live HTTP call) to see whether a cache entry has appeared
-    since — e.g. via benchmarks/warm_openevidence_cache.py, or a slow live
-    call that finished after this gene's synthesis had already proceeded
-    without it.
+    there's nothing to pick up. Also gated by a cooldown
+    (was_refresh_recently_attempted): without it, a refresh that keeps
+    failing to actually populate openevidence_supplementary — e.g. a
+    downstream synthesis error unrelated to OpenEvidence, which skips
+    persisting the refreshed annotation entirely (see annotate_one) — would
+    re-trigger a full re-synthesis attempt on every single subsequent read
+    of that gene, forever. Otherwise, peek OpenEvidenceClient's Redis cache
+    (no live HTTP call) to see whether a cache entry has appeared since —
+    e.g. via benchmarks/warm_openevidence_cache.py, or a slow live call that
+    finished after this gene's synthesis had already proceeded without it.
     """
     if not settings.openevidence_enabled:
         return False
     if annotation.openevidence_supplementary is not None:
+        return False
+    if await was_refresh_recently_attempted(gene, tumor_type=tumor_type):
         return False
     return await has_cached_analysis(gene, tumor_type=tumor_type)
 
@@ -207,6 +219,12 @@ async def _maybe_reuse_cached_annotation(
             "evidence became available since it was last synthesized without it",
             gene,
         )
+        # Recorded here — the point where we DECIDE to trigger a refresh —
+        # regardless of what happens next, so the cooldown applies even if
+        # the refresh attempt itself never ends up persisting a
+        # supplementary-evidence-bearing annotation (see the docstring on
+        # _openevidence_became_available_since_synthesis).
+        await mark_refresh_attempted(gene, tumor_type=tumor_type)
         return None
 
     updated_at = cached.get("updated_at")

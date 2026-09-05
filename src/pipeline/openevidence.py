@@ -107,6 +107,46 @@ async def has_cached_analysis(gene: str, tumor_type: Optional[str] = None) -> bo
         return False
 
 
+def _refresh_attempt_key(gene: str, tumor_type: Optional[str] = None) -> str:
+    return "openevidence:refresh_attempt:" + json.dumps(
+        {"gene": gene.strip().upper(), "tumor_type": (tumor_type or "").strip().lower()},
+        sort_keys=True,
+    )
+
+
+async def mark_refresh_attempted(gene: str, tumor_type: Optional[str] = None) -> None:
+    """Record that a freshness-triggered refresh was just attempted for this
+    gene/tumor_type, so the gene-annotation reuse check won't re-trigger
+    another one until OPENEVIDENCE_REFRESH_COOLDOWN_SECONDS has passed —
+    even if the refresh attempt itself never ends up populating
+    openevidence_supplementary (e.g. a downstream synthesis error unrelated
+    to OpenEvidence skips persisting the refreshed annotation entirely).
+    Recorded via a self-expiring Redis key rather than a persisted
+    annotation field, since the cooldown must apply regardless of whether
+    the refreshed annotation gets persisted at all.
+    """
+    key = _refresh_attempt_key(gene, tumor_type)
+    try:
+        await _get_client().set(key, "1", ex=settings.openevidence_refresh_cooldown_seconds)
+    except Exception as exc:
+        logger.warning("Failed to record OpenEvidence refresh attempt for %s: %s", gene, exc)
+
+
+async def was_refresh_recently_attempted(gene: str, tumor_type: Optional[str] = None) -> bool:
+    """Whether a freshness-triggered refresh was attempted for this
+    gene/tumor_type within the cooldown window. Fails closed (returns
+    False, i.e. "safe to attempt") if Redis is unreachable — consistent
+    with has_cached_analysis, this is a best-effort signal, not something
+    that should itself block a cache read.
+    """
+    key = _refresh_attempt_key(gene, tumor_type)
+    try:
+        return bool(await _get_client().exists(key))
+    except Exception as exc:
+        logger.warning("OpenEvidence refresh-attempt check failed for %s: %s", gene, exc)
+        return False
+
+
 def _build_question(gene: str, tumor_type: Optional[str] = None) -> str:
     tumor_note = f" in {tumor_type}" if tumor_type else ""
     return (
@@ -281,19 +321,27 @@ class OpenEvidenceClient:
     ) -> OpenEvidenceAnalysis:
         """Return a supplementary, unverified OpenEvidence analysis for `gene`.
 
-        Raises OpenEvidenceConfigurationError if no API key is configured.
-        Pass a shared httpx.AsyncClient (e.g. for tests) or one will be
-        created and closed for this call.
+        A genuine cache hit is returned regardless of whether an API key is
+        configured — a Redis cache entry existing does not depend on THIS
+        process being able to make a new live call (it may have been warmed
+        by benchmarks/warm_openevidence_cache.py, or by a different process
+        that had a key configured). OpenEvidenceConfigurationError is only
+        raised on an actual cache MISS, when a live HTTP call is genuinely
+        about to be made and therefore genuinely needs a key. Pass a shared
+        httpx.AsyncClient (e.g. for tests) or one will be created and closed
+        for this call.
         """
-        if not self.api_key:
-            raise OpenEvidenceConfigurationError(
-                "OPENEVIDENCE_API_KEY is required when OPENEVIDENCE_ENABLED is true"
-            )
-
         question = _build_question(gene, tumor_type)
         cache_key = _cache_key(gene, tumor_type)
 
         async def _compute() -> dict:
+            # Only reached on a cache miss (cached_call checks Redis first) —
+            # this is where a live call is genuinely about to happen, so
+            # this is where the API key actually matters.
+            if not self.api_key:
+                raise OpenEvidenceConfigurationError(
+                    "OPENEVIDENCE_API_KEY is required when OPENEVIDENCE_ENABLED is true"
+                )
             if client is not None:
                 raw = await _post_streaming_analysis(question, self.api_key, client)
             else:
@@ -306,11 +354,11 @@ class OpenEvidenceClient:
             payload = await cached_call(
                 cache_key, _compute, ttl_seconds=settings.openevidence_cache_ttl_seconds
             )
-        except (httpx.HTTPError, RetryError) as exc:
+        except (httpx.HTTPError, RetryError, OpenEvidenceConfigurationError) as exc:
             # cached_call only caches a successful compute() result (see
             # src.pipeline.cache) — an exception here (including a
-            # retry-exhausted transient failure, or a fail-fast timeout) is
-            # never cached.
+            # retry-exhausted transient failure, a fail-fast timeout, or a
+            # missing-API-key cache miss) is never cached.
             logger.error("OpenEvidence lookup failed for %s: %s", gene, exc)
             raise
         return OpenEvidenceAnalysis(**payload)
