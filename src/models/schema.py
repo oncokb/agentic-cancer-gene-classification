@@ -297,17 +297,20 @@ class AnnotateRequest(BaseModel):
         description="Bypass stored gene annotations and recompute results.",
     )
     skip_literature_for_oncokb: bool = Field(
-        default=False,
+        default=True,
         description=(
             "When true, genes confirmed present in OncoKB return a deterministic "
-            "OncoKB-based annotation without PubMed retrieval or LLM synthesis."
+            "OncoKB-based annotation without PubMed retrieval or LLM synthesis. "
+            "Enabled by default; set to false to opt back into full literature "
+            "retrieval for OncoKB genes."
         ),
     )
     mode: AnnotationMode = Field(
-        default="full",
+        default="core",
         description=(
-            "Use 'core' to prioritize cancer association, rationale, summary, citations, "
-            "and evidence support."
+            "Annotation mode. Defaults to 'core' (faster latency-sensitive fields); "
+            "use 'full' for exhaustive synthesis with deep-model escalation and "
+            "evidence cards."
         ),
     )
 
@@ -340,17 +343,20 @@ class GeneAnnotateRequest(BaseModel):
         description="Bypass stored gene annotations and recompute results.",
     )
     skip_literature_for_oncokb: bool = Field(
-        default=False,
+        default=True,
         description=(
             "When true, a gene confirmed present in OncoKB returns a deterministic "
-            "OncoKB-based annotation without PubMed retrieval or LLM synthesis."
+            "OncoKB-based annotation without PubMed retrieval or LLM synthesis. "
+            "Enabled by default; set to false to opt back into full literature "
+            "retrieval for OncoKB genes."
         ),
     )
     mode: AnnotationMode = Field(
-        default="full",
+        default="core",
         description=(
-            "Use 'core' to prioritize cancer association, rationale, summary, citations, "
-            "and evidence support."
+            "Annotation mode. Defaults to 'core' (faster latency-sensitive fields); "
+            "use 'full' for exhaustive synthesis with deep-model escalation and "
+            "evidence cards."
         ),
     )
 

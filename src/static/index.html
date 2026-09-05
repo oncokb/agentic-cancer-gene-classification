@@ -137,18 +137,21 @@
                 </select>
               </label>
 
-              <label class="field">
+              <label class="field" style="grid-column: 1 / -1">
                 <span>Annotation Mode</span>
                 <select id="annotate-mode">
+                  <option value="core" selected>Core</option>
                   <option value="full">Full</option>
-                  <option value="core">Core</option>
                 </select>
+                <span class="field-hint" id="annotate-mode-hint">
+                  Core (default): faster and cheaper — fewer papers, shorter abstracts, tighter token budget, no deep-model escalation, no evidence cards. Full: exhaustive synthesis with more papers, deep-model escalation on ambiguous evidence, and evidence cards. Opt into Full for genes needing deeper review.
+                </span>
               </label>
 
               <label class="field checkbox-field">
                 <span>OncoKB Fast Path</span>
                 <span class="checkbox-control">
-                  <input id="skip-literature-oncokb" type="checkbox" />
+                  <input id="skip-literature-oncokb" type="checkbox" checked />
                   <span>Skip PubMed for OncoKB genes</span>
                 </span>
               </label>

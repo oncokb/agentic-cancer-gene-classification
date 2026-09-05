@@ -134,6 +134,142 @@ def test_batch_annotation_endpoint_returns_annotation_result_json(monkeypatch):
     assert seen["skip_literature_for_oncokb"] is True
 
 
+def test_batch_annotation_endpoint_defaults_to_core_and_oncokb_skip(monkeypatch):
+    seen = {}
+    main.app.state.run_store = FakeRunStore()
+
+    async def fake_run_pipeline(
+        fusions,
+        local_backend=None,
+        run_store=None,
+        force_refresh=False,
+        **kwargs,
+    ):
+        seen["mode"] = kwargs.get("mode")
+        seen["skip_literature_for_oncokb"] = kwargs.get("skip_literature_for_oncokb")
+        return AnnotationResult(
+            run_id="run-defaults",
+            timestamp="2026-08-01T00:00:00+00:00",
+            fusions_processed=len(fusions),
+            genes_annotated=1,
+            annotations=[GeneAnnotation(gene="BRAF")],
+        )
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    client = TestClient(main.app)
+
+    response = client.post("/v1/annotate", json={"fusions": ["BRAF"]})
+
+    assert response.status_code == 200
+    assert seen["mode"] == "core"
+    assert seen["skip_literature_for_oncokb"] is True
+
+
+def test_batch_annotation_endpoint_supports_full_mode_and_full_literature_opt_out(
+    monkeypatch,
+):
+    seen = {}
+    main.app.state.run_store = FakeRunStore()
+
+    async def fake_run_pipeline(
+        fusions,
+        local_backend=None,
+        run_store=None,
+        force_refresh=False,
+        **kwargs,
+    ):
+        seen["mode"] = kwargs.get("mode")
+        seen["skip_literature_for_oncokb"] = kwargs.get("skip_literature_for_oncokb")
+        return AnnotationResult(
+            run_id="run-full",
+            timestamp="2026-08-01T00:00:00+00:00",
+            fusions_processed=len(fusions),
+            genes_annotated=1,
+            annotations=[GeneAnnotation(gene="BRAF")],
+        )
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/annotate",
+        json={
+            "fusions": ["BRAF"],
+            "mode": "full",
+            "skip_literature_for_oncokb": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert seen["mode"] == "full"
+    assert seen["skip_literature_for_oncokb"] is False
+
+
+def test_single_gene_endpoint_defaults_to_core_and_oncokb_skip(monkeypatch):
+    seen = {}
+    main.app.state.run_store = FakeRunStore()
+
+    async def fake_run_pipeline(
+        fusions,
+        local_backend=None,
+        run_store=None,
+        force_refresh=False,
+        **kwargs,
+    ):
+        seen["mode"] = kwargs.get("mode")
+        seen["skip_literature_for_oncokb"] = kwargs.get("skip_literature_for_oncokb")
+        return AnnotationResult(
+            run_id="run-gene-defaults",
+            timestamp="2026-08-01T00:00:00+00:00",
+            fusions_processed=1,
+            genes_annotated=1,
+            annotations=[GeneAnnotation(gene="ALK")],
+        )
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    client = TestClient(main.app)
+
+    response = client.post("/v1/annotate/gene", json={"gene": "ALK"})
+
+    assert response.status_code == 200
+    assert seen["mode"] == "core"
+    assert seen["skip_literature_for_oncokb"] is True
+
+
+def test_single_gene_endpoint_supports_full_mode_opt_out(monkeypatch):
+    seen = {}
+    main.app.state.run_store = FakeRunStore()
+
+    async def fake_run_pipeline(
+        fusions,
+        local_backend=None,
+        run_store=None,
+        force_refresh=False,
+        **kwargs,
+    ):
+        seen["mode"] = kwargs.get("mode")
+        seen["skip_literature_for_oncokb"] = kwargs.get("skip_literature_for_oncokb")
+        return AnnotationResult(
+            run_id="run-gene-full",
+            timestamp="2026-08-01T00:00:00+00:00",
+            fusions_processed=1,
+            genes_annotated=1,
+            annotations=[GeneAnnotation(gene="ALK")],
+        )
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/annotate/gene",
+        json={"gene": "ALK", "mode": "full", "skip_literature_for_oncokb": False},
+    )
+
+    assert response.status_code == 200
+    assert seen["mode"] == "full"
+    assert seen["skip_literature_for_oncokb"] is False
+
+
 def test_enrichment_job_endpoint_streams_enriched_annotations(monkeypatch):
     async def fake_enrich_gene_annotations(
         annotations,

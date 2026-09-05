@@ -720,11 +720,15 @@ async function runAnnotation() {
 
   try {
     const localBackend = elements.annotateLocalBackend.value || undefined;
-    const body = { fusions: annotationInputs, mode: elements.annotateMode.value || "full" };
+    const body = {
+      fusions: annotationInputs,
+      mode: elements.annotateMode.value || "core",
+      // Always send the OncoKB fast-path flag explicitly so a user can opt BACK
+      // into full literature retrieval for OncoKB genes by unchecking the box
+      // (the server default is also to skip, but we must not rely on omission).
+      skip_literature_for_oncokb: elements.skipLiteratureOncokb.checked,
+    };
     if (localBackend) body.local_backend = localBackend;
-    if (elements.skipLiteratureOncokb.checked) {
-      body.skip_literature_for_oncokb = true;
-    }
     const response = await fetch("/v1/annotate/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -829,7 +833,7 @@ async function startFusionEvidenceJob(inputs, runId) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       fusions,
-      mode: elements.annotateMode.value || "full",
+      mode: elements.annotateMode.value || "core",
       run_id: runId || null,
     }),
   });
