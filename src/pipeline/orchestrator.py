@@ -397,29 +397,51 @@ async def _annotate_gene(
         # Citation selection pass: filter broad retrieval corpus down to the
         # most directly relevant papers before synthesis to improve precision
         # without shrinking the recall pool.
-        selected_records = await _timed(
-            "paper_selection",
-            timings,
-            select_papers_for_synthesis(
-                gene,
-                ranked_records,
-                settings.max_papers_for_synthesis,
-                gene_identity=gene_identity,
-                local_mode=local_mode,
-                local_backend=local_backend,
-            ),
-        )
-
+        #
+        # The OpenEvidence lookup depends only on gene+tumor_type (not on
+        # paper_selection's output), so when enabled it runs CONCURRENTLY
+        # with paper_selection rather than serially after it — this was
+        # previously a fully serial extra hop between selection and
+        # synthesis, adding its full latency to the critical path even
+        # though nothing about it required waiting for selection to finish.
+        #
         # Guard on the flag here (not just inside the helper) so the disabled
-        # path adds nothing to timings_ms either — zero behavior change from
-        # current main when OPENEVIDENCE_ENABLED=false.
-        openevidence_context = None
+        # path adds nothing to timings_ms and awaits nothing extra — zero
+        # behavior change from current main when OPENEVIDENCE_ENABLED=false.
         if settings.openevidence_enabled:
-            openevidence_context = await _timed(
-                "openevidence",
-                timings,
-                _maybe_fetch_openevidence_context(gene, tumor_type),
+            selected_records, openevidence_context = await asyncio.gather(
+                _timed(
+                    "paper_selection",
+                    timings,
+                    select_papers_for_synthesis(
+                        gene,
+                        ranked_records,
+                        settings.max_papers_for_synthesis,
+                        gene_identity=gene_identity,
+                        local_mode=local_mode,
+                        local_backend=local_backend,
+                    ),
+                ),
+                _timed(
+                    "openevidence",
+                    timings,
+                    _maybe_fetch_openevidence_context(gene, tumor_type),
+                ),
             )
+        else:
+            selected_records = await _timed(
+                "paper_selection",
+                timings,
+                select_papers_for_synthesis(
+                    gene,
+                    ranked_records,
+                    settings.max_papers_for_synthesis,
+                    gene_identity=gene_identity,
+                    local_mode=local_mode,
+                    local_backend=local_backend,
+                ),
+            )
+            openevidence_context = None
 
         try:
             synthesis = await _timed(

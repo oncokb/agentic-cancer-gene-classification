@@ -11,7 +11,9 @@ Covers the acceptance contract for the integration:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+from time import perf_counter
 
 from src.models.schema import (
     LiteratureRecord,
@@ -477,3 +479,125 @@ async def test_annotate_gene_treats_openevidence_failure_as_supplementary_only(m
 
     assert annotation.citations == ["1"]
     assert annotation.openevidence_supplementary is None
+
+
+# ---------------------------------------------------------------------------
+# Parallelization: the OpenEvidence fetch must run concurrently with
+# paper_selection, not serially after it — while preserving exact
+# best-effort/never-fail-gene/timeout semantics and zero behavior change on
+# the disabled path.
+# ---------------------------------------------------------------------------
+
+_SLEEP_SECONDS = 0.1
+
+
+async def test_annotate_gene_runs_openevidence_concurrently_with_paper_selection(monkeypatch):
+    """Both paper_selection and the OpenEvidence fetch sleep for
+    _SLEEP_SECONDS. If they ran serially, total wall time would be roughly
+    2x _SLEEP_SECONDS; running concurrently, it's roughly 1x. This proves the
+    parallelization actually overlaps the two calls rather than just
+    reordering them."""
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, client=None):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        return FAKE_ANALYSIS
+
+    async def fake_check_oncokb_membership(gene, lookup=None):
+        return False
+
+    async def fake_retrieve_literature(*args, **kwargs):
+        return (RECORDS, 1)
+
+    async def fake_select_papers(*args, **kwargs):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        return args[1]
+
+    async def fake_synthesize_gene_annotation(*args, **kwargs):
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Retrieved literature supports a cancer association.",
+            "gene_summary": "GENE has retrieved cancer evidence (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(orchestrator.settings, "openevidence_enabled", True)
+    monkeypatch.setattr(OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+    monkeypatch.setattr(orchestrator, "check_oncokb_membership", fake_check_oncokb_membership)
+    monkeypatch.setattr(orchestrator, "retrieve_literature", fake_retrieve_literature)
+    monkeypatch.setattr(orchestrator, "select_papers_for_synthesis", fake_select_papers)
+    monkeypatch.setattr(orchestrator, "synthesize_gene_annotation", fake_synthesize_gene_annotation)
+
+    start = perf_counter()
+    annotation = await orchestrator._annotate_gene(
+        gene="GENE",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="GENE", canonical_symbol="GENE", resolved=True),
+        unresolvable=False,
+        skip_literature_for_oncokb=False,
+    )
+    elapsed = perf_counter() - start
+
+    # Well under 2x _SLEEP_SECONDS (which serial execution would require),
+    # comfortably above 1x (which concurrent execution requires) with margin
+    # for scheduling overhead.
+    assert elapsed < _SLEEP_SECONDS * 1.8
+    assert annotation.citations == ["1"]
+    assert annotation.openevidence_supplementary == FAKE_ANALYSIS
+
+
+async def test_annotate_gene_disabled_path_behavior_and_timing_unaffected(monkeypatch):
+    """With OPENEVIDENCE_ENABLED=false, the parallelization change must not
+    alter the disabled path at all: no OpenEvidence call, no extra
+    asyncio.gather overhead, and total wall time reflects only
+    paper_selection's own latency (not, e.g., some accidental double-await or
+    a gather wrapping a no-op that adds scheduling overhead)."""
+
+    async def fail_get_gene_analysis(self, gene, tumor_type=None, client=None):
+        raise AssertionError("OpenEvidence must not be called when OPENEVIDENCE_ENABLED=false")
+
+    async def fake_check_oncokb_membership(gene, lookup=None):
+        return False
+
+    async def fake_retrieve_literature(*args, **kwargs):
+        return (RECORDS, 1)
+
+    async def fake_select_papers(*args, **kwargs):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        return args[1]
+
+    async def fake_synthesize_gene_annotation(*args, **kwargs):
+        assert kwargs.get("openevidence_context") is None
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Retrieved literature supports a cancer association.",
+            "gene_summary": "GENE has retrieved cancer evidence (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(orchestrator.settings, "openevidence_enabled", False)
+    monkeypatch.setattr(OpenEvidenceClient, "get_gene_analysis", fail_get_gene_analysis)
+    monkeypatch.setattr(orchestrator, "check_oncokb_membership", fake_check_oncokb_membership)
+    monkeypatch.setattr(orchestrator, "retrieve_literature", fake_retrieve_literature)
+    monkeypatch.setattr(orchestrator, "select_papers_for_synthesis", fake_select_papers)
+    monkeypatch.setattr(orchestrator, "synthesize_gene_annotation", fake_synthesize_gene_annotation)
+
+    start = perf_counter()
+    annotation = await orchestrator._annotate_gene(
+        gene="GENE",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="GENE", canonical_symbol="GENE", resolved=True),
+        unresolvable=False,
+        skip_literature_for_oncokb=False,
+    )
+    elapsed_ms = (perf_counter() - start) * 1000
+
+    assert annotation.citations == ["1"]
+    assert annotation.openevidence_supplementary is None
+    assert "openevidence" not in annotation.timings_ms
+    # paper_selection's own timing entry reflects its real latency — proves
+    # the disabled path wasn't accidentally wrapped in an extra gather/await
+    # layer that would inflate it.
+    assert annotation.timings_ms["paper_selection"] >= _SLEEP_SECONDS * 1000 * 0.9
+    assert elapsed_ms < _SLEEP_SECONDS * 1000 * 1.8
