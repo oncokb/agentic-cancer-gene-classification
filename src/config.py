@@ -150,6 +150,11 @@ class Settings(BaseSettings):
     # and it never blocks or fails the core gene annotation either way.
     openevidence_timeout_seconds: float = 60.0
     openevidence_cache_ttl_seconds: int = 604800
+    # Concurrency for benchmarks/warm_openevidence_cache.py, deliberately
+    # independent of ANNOTATION_GENE_CONCURRENCY — an offline warmup pass is
+    # not live annotation traffic and can safely fan out wider than the
+    # semaphore that gates concurrent per-gene annotation requests.
+    openevidence_warmup_concurrency: int = 5
 
     log_level: str = "INFO"
 
