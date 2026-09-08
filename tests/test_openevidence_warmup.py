@@ -56,7 +56,7 @@ async def test_warm_openevidence_cache_fans_out_over_gene_map(monkeypatch):
     seen = []
 
     class FakeClient:
-        async def get_gene_analysis(self, gene, tumor_type=None):
+        async def get_gene_analysis(self, gene, tumor_type=None, fusion=None):
             seen.append((gene, tumor_type))
             return _FakeAnalysis(citations=[object()])
 
@@ -83,7 +83,7 @@ async def test_warm_openevidence_cache_reports_gene_errors(monkeypatch):
         }
 
     class FakeClient:
-        async def get_gene_analysis(self, gene, tumor_type=None):
+        async def get_gene_analysis(self, gene, tumor_type=None, fusion=None):
             if gene == "TP53":
                 raise RuntimeError("OpenEvidence unavailable")
             return _FakeAnalysis()
@@ -116,7 +116,7 @@ async def test_warm_openevidence_cache_uses_own_concurrency_not_annotation_gene_
     max_active = 0
 
     class FakeClient:
-        async def get_gene_analysis(self, gene, tumor_type=None):
+        async def get_gene_analysis(self, gene, tumor_type=None, fusion=None):
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
@@ -192,3 +192,56 @@ async def test_warm_openevidence_cache_rerun_against_warm_cache_is_safe_noop(_re
     assert second_report["genes_warmed"] == 1
     assert second_report["genes_failed"] == 0
     assert call_count["n"] == 1  # second warmup pass was a cache hit, no duplicate live call
+
+
+async def test_warm_openevidence_cache_warms_fusion_specific_question_for_fusion_gene(
+    _require_redis, monkeypatch
+):
+    """Regression test: get_gene_analysis's cache key does not vary by
+    fusion (by design — see openevidence.py's _cache_key), so it holds
+    whatever question was actually asked when the entry was populated. If
+    warmup asked the generic "is ALK an oncogene..." question here while a
+    live annotation request for the same ALK::EML4 fusion would ask the
+    fusion-specific "is the EML4::ALK fusion oncogenic..." question, the
+    live request would silently get a cache HIT on warmup's stale
+    generic-question answer and never actually compute (or cache) the
+    fusion-specific one — with no visible error.
+
+    Warms via the warmup path with the same raw fusion input a live request
+    would submit, then simulates the live annotate path's lookup for that
+    same gene+fusion and confirms it's a cache HIT on the FUSION-SPECIFIC
+    question, not a silent hit on a generic-question cache entry. Fails
+    before threading `fusion` through warm_one() (the generic question would
+    have been sent/cached instead), passes after.
+    """
+
+    async def fake_normalize_fusions(inputs):
+        assert inputs == ["EML4::ALK"]
+        return {"ALK": (_resolved_gene("ALK"), ["EML4::ALK"])}
+
+    questions_sent = []
+
+    async def fake_post_streaming_analysis(question, api_key, client):
+        questions_sent.append(question)
+        return _SSE_STREAM
+
+    monkeypatch.setattr(openevidence_warmup, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(openevidence_module, "_post_streaming_analysis", fake_post_streaming_analysis)
+
+    real_client = OpenEvidenceClient(api_key="test-key")
+    report = await openevidence_warmup.warm_openevidence_cache(["EML4::ALK"], client=real_client)
+    assert report["genes_warmed"] == 1
+
+    # Exactly one live HTTP call so far, and it must have been the
+    # fusion-specific question — not the generic "is ALK an oncogene..."
+    # question a fusion-unaware warmup would have sent instead.
+    assert len(questions_sent) == 1
+    assert "EML4::ALK" in questions_sent[0]
+
+    # The live annotate path's lookup for the same gene+fusion must be a
+    # cache HIT (no second live call) returning that same fusion-specific
+    # analysis, not a mismatched generic one.
+    live_analysis = await real_client.get_gene_analysis("ALK", fusion="EML4::ALK")
+    assert len(questions_sent) == 1  # cache hit, no new live call
+    assert live_analysis.question == questions_sent[0]
+    assert "EML4::ALK" in live_analysis.question

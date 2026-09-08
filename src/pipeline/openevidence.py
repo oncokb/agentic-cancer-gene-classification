@@ -2,8 +2,10 @@
 OpenEvidence supplementary evidence lookup.
 
 Off by default (settings.openevidence_enabled). When enabled, this posts a
-gene (+ optional tumor type) question to OpenEvidence's streaming analysis
-endpoint and returns accumulated prose plus a deduplicated citation list.
+closed, targeted question — gene classification (+ optional tumor type), or
+fusion-partner oncogenicity when the gene is part of a fusion — to
+OpenEvidence's streaming analysis endpoint and returns accumulated prose plus
+a deduplicated citation list.
 
 This is a SUPPLEMENTARY input to synthesis, not a LiteratureRecord
 replacement: OpenEvidence citations are not guaranteed to be PMIDs in the
@@ -25,6 +27,7 @@ from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, 
 from src.config import settings
 from src.models.schema import OpenEvidenceAnalysis, OpenEvidenceCitation
 from src.pipeline.cache import _get_client, cached_call
+from src.pipeline.normalization import split_fusion
 
 logger = logging.getLogger(__name__)
 
@@ -147,11 +150,38 @@ async def was_refresh_recently_attempted(gene: str, tumor_type: Optional[str] = 
         return False
 
 
-def _build_question(gene: str, tumor_type: Optional[str] = None) -> str:
-    tumor_note = f" in {tumor_type}" if tumor_type else ""
+def _build_question(gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None) -> str:
+    """Build a closed, targeted question rather than an open-ended
+    "summarize everything" ask — a live benchmark (see
+    benchmarks/openevidence_value_report.md on the
+    agcg-openevidence-benchmark branch) found the previous open-ended
+    phrasing attached ungrounded specific statistics to cited PMIDs and cost
+    far more synthesis tokens/latency for little citation benefit.
+
+    `fusion` (a raw "GENE1::GENE2"-style input string, see
+    normalization.is_fusion_input) asks a fusion-specific oncogenicity
+    question instead of the general classification question, so the two
+    partner genes of a fusion get a question about the fusion itself rather
+    than each partner gene in isolation.
+
+    `tumor_type`, when present, replaces the generic "cancer" context rather
+    than being appended after it (avoiding an awkward "...in cancer in
+    breast cancer?" double-up) — tumor_type names are already
+    cancer-specific (e.g. "breast cancer", "melanoma", "NSCLC").
+    """
+    cancer_context = tumor_type if tumor_type else "cancer"
+    if fusion:
+        gene1, gene2 = split_fusion(fusion)
+        if gene1 and gene2:
+            return (
+                f"Based on peer-reviewed evidence, is the {gene1}::{gene2} fusion "
+                f"oncogenic in {cancer_context}? State the classification and the "
+                "strongest supporting evidence."
+            )
     return (
-        f"What does the peer-reviewed evidence show about {gene}'s role in "
-        f"cancer{tumor_note}? Summarize the key clinical and molecular evidence."
+        f"Based on peer-reviewed evidence, is {gene} an oncogene or tumor "
+        f"suppressor in {cancer_context}? State the classification and the "
+        "strongest supporting evidence."
     )
 
 
@@ -317,9 +347,15 @@ class OpenEvidenceClient:
         self,
         gene: str,
         tumor_type: Optional[str] = None,
+        fusion: Optional[str] = None,
         client: Optional[httpx.AsyncClient] = None,
     ) -> OpenEvidenceAnalysis:
         """Return a supplementary, unverified OpenEvidence analysis for `gene`.
+
+        `fusion`, when the gene is part of a fusion (a raw "GENE1::GENE2"
+        input string — see orchestrator.py's _annotate_gene), makes the
+        question fusion-specific via _build_question instead of asking about
+        `gene` in isolation.
 
         A genuine cache hit is returned regardless of whether an API key is
         configured — a Redis cache entry existing does not depend on THIS
@@ -330,8 +366,12 @@ class OpenEvidenceClient:
         about to be made and therefore genuinely needs a key. Pass a shared
         httpx.AsyncClient (e.g. for tests) or one will be created and closed
         for this call.
+
+        The cache key intentionally still derives only from gene/tumor_type/
+        model (see _cache_key), not from `fusion` — cache-key shape is
+        explicitly out of scope for this question-text change.
         """
-        question = _build_question(gene, tumor_type)
+        question = _build_question(gene, tumor_type, fusion=fusion)
         cache_key = _cache_key(gene, tumor_type)
 
         async def _compute() -> dict:

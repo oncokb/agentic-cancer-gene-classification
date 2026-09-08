@@ -208,7 +208,7 @@ async def test_synthesize_gene_annotation_appends_instruction_only_when_context_
 
 
 async def test_annotate_gene_never_calls_openevidence_when_disabled(monkeypatch):
-    async def fail_get_gene_analysis(self, gene, tumor_type=None, client=None):
+    async def fail_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
         raise AssertionError("OpenEvidence must not be called when OPENEVIDENCE_ENABLED=false")
 
     async def fake_check_oncokb_membership(gene, lookup=None):
@@ -392,7 +392,7 @@ def test_build_gene_annotation_surfaces_openevidence_without_touching_citations(
 
 
 async def test_annotate_gene_wires_openevidence_context_when_enabled(monkeypatch):
-    async def fake_get_gene_analysis(self, gene, tumor_type=None, client=None):
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
         return FAKE_ANALYSIS
 
     async def fake_check_oncokb_membership(gene, lookup=None):
@@ -437,10 +437,63 @@ async def test_annotate_gene_wires_openevidence_context_when_enabled(monkeypatch
     assert "openevidence" in annotation.timings_ms
 
 
+async def test_annotate_gene_threads_fusion_partner_into_openevidence_lookup(monkeypatch):
+    """`fusions` here is a real "GENE1::GENE2" input string — exactly the
+    shape orchestrator.py's annotate_one() derives as associated_fusions via
+    normalization.is_fusion_input() and passes into _annotate_gene, not a
+    hand-waved value. This proves that string actually reaches
+    OpenEvidenceClient.get_gene_analysis as `fusion`, making the question
+    fusion-specific rather than about ALK in isolation."""
+
+    captured_fusion = {}
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        captured_fusion["gene"] = gene
+        captured_fusion["fusion"] = fusion
+        return FAKE_ANALYSIS
+
+    async def fake_check_oncokb_membership(gene, lookup=None):
+        return False
+
+    async def fake_retrieve_literature(*args, **kwargs):
+        return (RECORDS, 1)
+
+    async def fake_select_papers(*args, **kwargs):
+        return args[1]
+
+    async def fake_synthesize_gene_annotation(*args, **kwargs):
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Retrieved literature supports a cancer association.",
+            "gene_summary": "ALK has retrieved cancer evidence (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(orchestrator.settings, "openevidence_enabled", True)
+    monkeypatch.setattr(OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+    monkeypatch.setattr(orchestrator, "check_oncokb_membership", fake_check_oncokb_membership)
+    monkeypatch.setattr(orchestrator, "retrieve_literature", fake_retrieve_literature)
+    monkeypatch.setattr(orchestrator, "select_papers_for_synthesis", fake_select_papers)
+    monkeypatch.setattr(orchestrator, "synthesize_gene_annotation", fake_synthesize_gene_annotation)
+
+    annotation = await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=["EML4::ALK"],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+        unresolvable=False,
+        tumor_type="NSCLC",
+        skip_literature_for_oncokb=False,
+    )
+
+    assert captured_fusion == {"gene": "ALK", "fusion": "EML4::ALK"}
+    assert annotation.openevidence_supplementary == FAKE_ANALYSIS
+
+
 async def test_annotate_gene_treats_openevidence_failure_as_supplementary_only(monkeypatch):
     """A failing OpenEvidence lookup must not break the core annotation."""
 
-    async def failing_get_gene_analysis(self, gene, tumor_type=None, client=None):
+    async def failing_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
         raise RuntimeError("boom")
 
     async def fake_check_oncokb_membership(gene, lookup=None):
@@ -498,7 +551,7 @@ async def test_annotate_gene_runs_openevidence_concurrently_with_paper_selection
     parallelization actually overlaps the two calls rather than just
     reordering them."""
 
-    async def fake_get_gene_analysis(self, gene, tumor_type=None, client=None):
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
         await asyncio.sleep(_SLEEP_SECONDS)
         return FAKE_ANALYSIS
 
@@ -553,7 +606,7 @@ async def test_annotate_gene_disabled_path_behavior_and_timing_unaffected(monkey
     paper_selection's own latency (not, e.g., some accidental double-await or
     a gather wrapping a no-op that adds scheduling overhead)."""
 
-    async def fail_get_gene_analysis(self, gene, tumor_type=None, client=None):
+    async def fail_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
         raise AssertionError("OpenEvidence must not be called when OPENEVIDENCE_ENABLED=false")
 
     async def fake_check_oncokb_membership(gene, lookup=None):
