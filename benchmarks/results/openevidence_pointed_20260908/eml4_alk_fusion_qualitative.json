@@ -1,0 +1,2557 @@
+{
+  "run_id": "6d2179d5-8b08-4df9-97c0-c3ee20af1085",
+  "timestamp": "2026-09-08T19:34:04.411953+00:00",
+  "fusions_processed": 1,
+  "genes_annotated": 2,
+  "annotations": [
+    {
+      "gene": "ALK",
+      "fusions": [
+        "EML4::ALK"
+      ],
+      "in_oncokb": true,
+      "cancer_associated": true,
+      "cancer_association_rationale": "ALK is a receptor tyrosine kinase implicated in cancer primarily through rearrangements (structural variants) that generate oncogenic fusion proteins. The most prevalent fusion in NSCLC is EML4-ALK, which occurs via paracentric inversion of chromosome 2p and retains the ALK kinase domain fused to EML4 coiled-coil domains that drive constitutive oligomerization and activation of oncogenic signaling. EML4-ALK variants (V1, V2, V3, and others) show differential clinical responses to ALK tyrosine kinase inhibitors (crizotinib, ceritinib, lorlatinib, alectinib), with compound ALK mutations conferring resistance to sequential inhibitor therapy. ALK rearrangements also occur in renal cell carcinoma and represent an emerging therapeutic target in that context. Evidence types include structural variants (fusion proteins), differential expression and signaling dependent on fusion variant, and resistance mutations arising during targeted therapy.",
+      "cancer_type_prevalence": "- Non-small cell lung cancer (EML4-ALK fusion)\n- Anaplastic lymphoma kinase-rearranged renal cell carcinoma (ALK fusion with EML4, NUMA1, ARNT, VCL, TPM3)\n- Clear cell renal cell carcinoma (EML4-ALK fusion)\n- Anaplastic large cell lymphoma (ALK rearrangements)",
+      "gene_class": "Receptor tyrosine kinase",
+      "signaling_pathways": "RAS/MAPK, PI3K/AKT, JAK/STAT, PLCγ",
+      "gene_summary": "ALK is a receptor tyrosine kinase that functions as an oncogenic driver when rearranged into fusion proteins, most commonly EML4-ALK in NSCLC (PMID 27573755). EML4-ALK fusions result from paracrine inversion of chromosome 2p that fuses the ALK kinase domain to EML4 coiled-coil domains, generating constitutively active signaling complexes that orchestrate oncogenic output through MAPK, PI3K, and PLCγ pathways (PMID 34661367). Multiple EML4-ALK variants (V1, V3, V2, and others) exist with distinct clinical responses to ALK inhibitors; sequential therapy with increasingly potent inhibitors can select for compound ALK mutations conferring high-level resistance (PMID 29650534). ALK rearrangements have been identified as drivers in renal cell carcinoma, with EML4-ALK fusion demonstrating tumorigenic capacity that is reversed by ALK-specific inhibitor crizotinib (PMID 32020234). (Literature sourced via Tier 1 direct PubMed query.)",
+      "citations": [
+        "27573755",
+        "34661367",
+        "29650534",
+        "32020234"
+      ],
+      "supporting_quotes": [
+        {
+          "pmid": "27573755",
+          "quote": "A wide variety of ALK fusions, in which the kinase domain of ALK and the amino-terminal portion of various protein partners are fused, occur in cancer, with echinoderm microtubule-associated protein-like 4 (EML4)-ALK being the most prevalent in non-small-cell lung cancer (NSCLC). Different ALK fusion proteins can mediate different signalling outputs, depending on properties such as subcellular localisation and protein stability."
+        },
+        {
+          "pmid": "34661367",
+          "quote": "EML4-ALK V1 and V3 proteins form cytoplasmic foci that contain components of the MAPK, PLCγ and PI3K signalling pathways...EML4-ALK foci formation occurs as a result of transient association of stable EML4-ALK trimers mediated through an active conformation of the ALK kinase domain."
+        },
+        {
+          "pmid": "29650534",
+          "quote": "Sequential ALK inhibitors can foster the emergence of compound ALK mutations that confer high-level resistance to ALK-targeted therapies. Treatment with sequential first-, second-, and third-generation ALK inhibitors can select for compound ALK mutations that confer high-level resistance to ALK-targeted therapies."
+        }
+      ],
+      "evidence_cards": [
+        {
+          "pmid": "27573755",
+          "title": "The role of the ALK receptor in cancer biology.",
+          "journal": "Ann Oncol",
+          "evidence_type": "clinical",
+          "selected_reason": "Verified PMID selected as clinical evidence. High-impact journal signal.",
+          "quote": "A wide variety of ALK fusions, in which the kinase domain of ALK and the amino-terminal portion of various protein partners are fused, occur in cancer, with echinoderm microtubule-associated protein-like 4 (EML4)-ALK being the most prevalent in non-small-cell lung cancer (NSCLC). Different ALK fusion proteins can mediate different signalling outputs, depending on properties such as subcellular localisation and protein stability."
+        },
+        {
+          "pmid": "34661367",
+          "title": "Phase-separated foci of EML4-ALK facilitate signalling and depend upon an active kinase conformation.",
+          "journal": "EMBO Rep",
+          "evidence_type": "structural_variant",
+          "selected_reason": "Verified PMID selected as structural variant evidence.",
+          "quote": "EML4-ALK V1 and V3 proteins form cytoplasmic foci that contain components of the MAPK, PLCγ and PI3K signalling pathways...EML4-ALK foci formation occurs as a result of transient association of stable EML4-ALK trimers mediated through an active conformation of the ALK kinase domain."
+        },
+        {
+          "pmid": "29650534",
+          "title": "Sequential ALK Inhibitors Can Select for Lorlatinib-Resistant Compound ALK Mutations in ALK-Positive Lung Cancer.",
+          "journal": "Cancer Discov",
+          "evidence_type": "clinical",
+          "selected_reason": "Verified PMID selected as clinical evidence. High-impact journal signal.",
+          "quote": "Sequential ALK inhibitors can foster the emergence of compound ALK mutations that confer high-level resistance to ALK-targeted therapies. Treatment with sequential first-, second-, and third-generation ALK inhibitors can select for compound ALK mutations that confer high-level resistance to ALK-targeted therapies."
+        },
+        {
+          "pmid": "32020234",
+          "title": "Identification of anaplastic lymphoma kinase fusions in clear cell renal cell carcinoma.",
+          "journal": "Oncol Rep",
+          "evidence_type": "clinical",
+          "selected_reason": "Verified PMID selected as clinical evidence.",
+          "quote": "As one of the most common types of renal cancer, clear cell renal cell carcinoma (ccRCC) in advanced stages constitutes a continued major challenge for uro‑oncologists, as the identification of novel driver mutations and the development of novel targeted therapies against them remain an unmet need."
+        }
+      ],
+      "clinical_actionability": {
+        "confidence_score": 0.95,
+        "confidence_level": "high",
+        "summary": "High-confidence literature-derived therapeutic precedent for ALK: crizotinib, ceritinib, Lorlatinib, alectinib. This is not a treatment recommendation.",
+        "confidence_explanation": "Clinical actionability confidence 0.95: Direct human clinical evidence; Drug/domain/actionability language tied to gene; Two or more independent supporting PMIDs; OncoKB membership corroboration. Score is deterministic, citation-bound, and only shown at >= 0.85.",
+        "pmids": [
+          "27573755",
+          "32020234",
+          "29650534",
+          "34661367"
+        ],
+        "score_components": [
+          {
+            "code": "clinical_evidence",
+            "label": "Direct human clinical evidence",
+            "delta": 0.35,
+            "pmids": [
+              "32020234",
+              "29650534"
+            ],
+            "detail": "At least one verified cited abstract has patient/cohort/trial language."
+          },
+          {
+            "code": "direct_actionability_language",
+            "label": "Drug/domain/actionability language tied to gene",
+            "delta": 0.25,
+            "pmids": [
+              "27573755",
+              "32020234",
+              "29650534",
+              "34661367"
+            ],
+            "detail": "Matched therapies: crizotinib, ceritinib, Lorlatinib, alectinib; matched domains: which the kinase domain, alk kinase domain, kinase domain, encompassing the kinase domain, of the catalytic domain."
+          },
+          {
+            "code": "multiple_pmids",
+            "label": "Two or more independent supporting PMIDs",
+            "delta": 0.15,
+            "pmids": [
+              "27573755",
+              "32020234",
+              "29650534",
+              "34661367"
+            ],
+            "detail": "Therapeutic precedent is supported by multiple verified cited abstracts."
+          },
+          {
+            "code": "oncokb_corroboration",
+            "label": "OncoKB membership corroboration",
+            "delta": 0.2,
+            "pmids": [],
+            "detail": "The queried gene is present in OncoKB; this corroborates gene context, not therapy selection."
+          }
+        ],
+        "evidence": [
+          {
+            "pmid": "27573755",
+            "title": "The role of the ALK receptor in cancer biology.",
+            "evidence_type": "review",
+            "therapies": [
+              "crizotinib",
+              "ceritinib"
+            ],
+            "domains": [
+              "which the kinase domain",
+              "alk kinase domain",
+              "kinase domain"
+            ],
+            "matched_terms": [
+              "therapeutic_language",
+              "domain_language",
+              "alteration_language",
+              "named_drug"
+            ],
+            "quote": "Therefore, there is a need to better understand the role of ALK in cancer biology in order to optimise treatment strategies."
+          },
+          {
+            "pmid": "32020234",
+            "title": "Identification of anaplastic lymphoma kinase fusions in clear cell renal cell carcinoma.",
+            "evidence_type": "clinical",
+            "therapies": [
+              "crizotinib"
+            ],
+            "domains": [],
+            "matched_terms": [
+              "therapeutic_language",
+              "alteration_language",
+              "named_drug"
+            ],
+            "quote": "Aberrations in anaplastic lymphoma kinase (ALK), a rational therapeutic target, as verified in lung cancer with ALK rearrangement, have been implicated in the pathogenesis of multiple human cancers."
+          },
+          {
+            "pmid": "29650534",
+            "title": "Sequential ALK Inhibitors Can Select for Lorlatinib-Resistant Compound ALK Mutations in ALK-Positive Lung Cancer.",
+            "evidence_type": "clinical",
+            "therapies": [
+              "Lorlatinib",
+              "crizotinib"
+            ],
+            "domains": [],
+            "matched_terms": [
+              "therapeutic_language",
+              "alteration_language",
+              "named_drug"
+            ],
+            "quote": "The cornerstone of treatment for advanced ALK-positive lung cancer is sequential therapy with increasingly potent and selective ALK inhibitors."
+          },
+          {
+            "pmid": "34661367",
+            "title": "Phase-separated foci of EML4-ALK facilitate signalling and depend upon an active kinase conformation.",
+            "evidence_type": "other",
+            "therapies": [
+              "ceritinib",
+              "lorlatinib",
+              "alectinib"
+            ],
+            "domains": [
+              "encompassing the kinase domain",
+              "alk kinase domain",
+              "of the catalytic domain",
+              "kinase domain"
+            ],
+            "matched_terms": [
+              "therapeutic_language",
+              "domain_language",
+              "alteration_language",
+              "named_drug"
+            ],
+            "quote": "Variants of the oncogenic EML4-ALK fusion protein contain a similar region of ALK encompassing the kinase domain, but different portions of EML4."
+          }
+        ]
+      },
+      "quality_flags": [
+        {
+          "code": "literature_preranked",
+          "label": "Pre-ranked literature",
+          "severity": "info",
+          "detail": "Retrieval pool pre-ranked by composite heuristic before selection (top score 0.92, PMID 41071329)."
+        }
+      ],
+      "openevidence_supplementary": {
+        "question": "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic in cancer? State the classification and the strongest supporting evidence.",
+        "text": "REACTCOMPONENT!:!InlineGenerationStep!:!{\"steps\": [{\"kind\": \"reasoning\", \"label\": \"Analyzing query\", \"active\": true, \"children\": [], \"paragraphindex\": 0, \"metadata\": {}}, {\"callid\": \"2f294f6d-2bb4-4256-8161-e3655c191488\", \"kind\": \"search\", \"label\": \"Searching published medical literature, guidelines, FDA, CDC, and more\", \"id\": \"searchmedicalliterature\", \"active\": true, \"children\": [], \"paragraphindex\": 0, \"metadata\": {}, \"queries\": []}, {\"callid\": \"ff6c6da7-b184-4b67-b65e-24aa5001e62d\", \"kind\": \"search\", \"label\": \"Searching full-text sources from NEJM, JAMA, Nature, NCCN, Cochrane, Wiley, and more\", \"id\": \"searchmedicalliterature\", \"active\": true, \"children\": [], \"paragraphindex\": 0, \"metadata\": {}, \"queries\": []}, {\"callid\": \"ec14a65e-2fa0-423f-8ffc-b5733e7d15b2\", \"kind\": \"search\", \"label\": \"Searching published medical literature, guidelines, FDA, CDC, and more\", \"id\": \"searchmedicalliterature\", \"active\": true, \"children\": [], \"paragraphindex\": 0, \"metadata\": {}, \"queries\": []}], \"done\": true, \"summary\": \"Analyzed query, searched for evidence\"}\n\n\nYes — EML4::ALK is a definitively oncogenic, gain-of-function driver fusion, not a variant of uncertain significance. Two distinct classification axes apply, and they should not be conflated:\n- Biological oncogenicity: Oncogenic (highest tier) under somatic oncogenicity frameworks (ClinGen/CGC/VICC). It is an activating structural rearrangement of a proto-oncogene with demonstrated transforming capacity in vitro and tumor-initiating capacity in vivo.[[1]][[2]][[3]]\n- Clinical actionability: In NSCLC, AMP/ASCO/CAP Tier I, Level A — a biomarker predicting response to an FDA-approved therapy with FDA-approved companion diagnostics[[4]]. Equivalently OncoKB Level 1 and ESCAT tier I. This designation is disease-context–specific to ALK-positive NSCLC and does not extend automatically to other tum[[5]][[6]][[7]]or types.\nMechanism\nA paracentric inversion of chromosome 2p, inv(2)(p21p23), joins 5′ EML4 to 3′ ALK, retaining the entire ALK tyrosine kinase domain.[[8]][[9]] The ALK breakpoint is canonically in intron 19; EML4 breakpoints vary, generating variants V1 (E13;A20), V3a/b (E6;A20), V2 (E20;A20) and others, with V1 and V3 accounting for 75–80%.[[10]][[11]] All retain the EML4 trimerization/coiled-coil domain, which drives ligand-independent oligomerization, ALK autophosphorylation, and constitutive signaling through RAS/MAPK, PI3K–AKT and JAK–STAT.[[8]][[12]][[13]] EML4-ALK also forms cytoplasmic condensates via phase separation, which is required for full downstream signaling and tumorigenesis.[[13]][[14]]\nStrongest supporting evidence, by strength of causal inference\n[[1]][[2]][[3]][[11]][[15]][[16]][[17]][[18]][[19]][[20]][[21]]\nThe functional and murine genetic data establish causation (the fusion is sufficient to initiate lung adenocarcinoma); the randomized trials establish continued dependency in humans. Note that the phase 3 trials enrolled patients by ALK IHC/FISH positivity rather than transcript-level EML4 confirmation, so they demonstrate ALK-fusion dependency broadly, with EML4 as the partner in roughly 83% of ALK-rearranged NSCLC.[[22]] Six ALK TKIs are FDA-approved in ALK-positive NSCLC, and NCCN lists alectinib, brigatinib, ensartinib and lorlatinib as preferred category 1 first-line options.[[23]][[24]]\nImportant qualifiers\n- Oncogenicity requires a productive fusion. The alteration must be in-frame, expressed, and retain both the ALK kinase domain and the 5′ partner's oligomerization domain. A break-apart FISH signal or a DNA-level rearrangement call alone does not establish this.[[5]][[25]] NCCN notes that any variant classified as a VUS should not be used as the basis for targeted therapy selection, and that RNA-based NGS is recommended when DNA-based profiling identifies no driver, since it directly demonstrates the fusion transcript. D5F3 IHC confirms ALK protein expression but does not identify the partner or the exact breakpoint.[[23]]\n- Variants are not biologically uniform. A 2025 meta-analysis of 30 studies (n=2,737) found V3 associated with shorter PFS on ALK TKIs than V1 (HR 1.53, 95% CI 1.17–1.99), with no significant difference in OS or ORR. V3 is en[[26]]riched for ALK G1202R at resistance and, in the GuardantINFORM real-world cohort, the V3/TP53-mutant combination had the shortest time to first-line TKI discontinuation (median 7.4 mo). In autochthonous mouse models V3 was more oncogenic than V1, with variant-specific tumor suppressor interactions. Findings are heterogeneous across cohorts and confounded by T[[27]][[28]][[29]]KI generation and co-alterations, so variant status is not currently a basis for altering first-line therapy.\n- Non-canonical breakpoints in ALK intron 17 or 18 yield less stable, more weakly signaling fusion proteins with reduced TKI sensitivity — an argument for transcript-level characterization when an atypical fusion is reported.[[25]]\n- Outside NSCLC, ALK fusions are drivers in ALCL (usually NPM1::ALK, 50–80%) and [inflammatory myofibroblastic tumor](/rare-disease/inflammatory-myofibroblastic-tumor) (~50%), but EML4 is the partner in only ~31% of non-NSCLC ALK-rearranged tumors, and ALK rearrangement overall occurs in ~0.2% of non-NSCLC cancers. There is no tumor-agnostic ALK approval; the NCI-M[[22]][[30]]ATCH subprotocol F experience was very small.[[31]]\n\n\nWould you like to explore how to resolve discordant or equivocal ALK results between IHC, FISH, and DNA-based NGS?",
+        "citations": [
+          {
+            "citation_key": "1",
+            "title": "Identification of the Transforming EML4-ALK Fusion Gene in Non-Small-Cell Lung Cancer",
+            "authors": "Soda M, Choi YL, Enomoto M, et al.",
+            "journal": "Nature",
+            "date": "2007-08-02",
+            "doi": "10.1038/nature05945",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/17625570",
+            "source_texts": []
+          },
+          {
+            "citation_key": "2",
+            "title": "A Mouse Model for EML4-ALK-positive Lung Cancer",
+            "authors": "Soda M, Takada S, Takeuchi K, et al.",
+            "journal": "Proceedings of the National Academy of Sciences of the United States of America",
+            "date": "2008-12-16",
+            "doi": "10.1073/pnas.0805381105",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/19064915",
+            "source_texts": []
+          },
+          {
+            "citation_key": "3",
+            "title": "In vivo engineering of oncogenic chromosomal rearrangements with the CRISPR/Cas9 system",
+            "authors": "Maddalo D, Manchado E, Concepcion CP, et al.",
+            "journal": "Nature",
+            "date": "2014-12-18",
+            "doi": "10.1038/nature13902",
+            "url": "https://doi.org/10.1038/nature13902",
+            "source_texts": []
+          },
+          {
+            "citation_key": "4",
+            "title": "Standards and Guidelines for the Interpretation and Reporting of Sequence Variants in Cancer: A Joint Consensus Recommendation of the Association for Molecular Pathology, American Society of Clinical Oncology, and College of American Pathologists",
+            "authors": "Li MM, Datto M, Duncavage EJ, et al.",
+            "journal": "The Journal of Molecular Diagnostics : JMD",
+            "date": "2017-01-01",
+            "doi": "10.1016/j.jmoldx.2016.10.002",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/27993330",
+            "source_texts": []
+          },
+          {
+            "citation_key": "5",
+            "title": "Detection of known and novel ALK fusion transcripts in lung cancer patients using next-generation sequencing approaches",
+            "authors": "Vendrell JA, Taviaux S, Béganton B, et al.",
+            "journal": "Scientific Reports",
+            "date": "2017-10-02",
+            "doi": "10.1038/s41598-017-12679-8",
+            "url": "https://doi.org/10.1038/s41598-017-12679-8",
+            "source_texts": []
+          },
+          {
+            "citation_key": "6",
+            "title": "At the crossroads of immunotherapy for oncogene-addicted subsets of NSCLC",
+            "authors": "Otano I, Ucero AC, Zugazagoitia J, Paz-Ares L.",
+            "journal": "Nature Reviews. Clinical Oncology",
+            "date": "2023-03-01",
+            "doi": "10.1038/s41571-022-00718-x",
+            "url": "https://doi.org/10.1038/s41571-022-00718-x",
+            "source_texts": []
+          },
+          {
+            "citation_key": "7",
+            "title": "Expert opinion on NSCLC small specimen biomarker testing — Part 2: Analysis, reporting, and quality assessment",
+            "authors": "Penault-Llorca F, Kerr KM, Garrido P, et al.",
+            "journal": "Virchows Archiv : An International Journal of Pathology",
+            "date": "2022-09-01",
+            "doi": "10.1007/s00428-022-03344-1",
+            "url": "https://doi.org/10.1007/s00428-022-03344-1",
+            "source_texts": []
+          },
+          {
+            "citation_key": "8",
+            "title": "ALK rearrangements and resistance mutations in non-small cell lung cancer: molecular mechanisms and therapeutic implications",
+            "authors": "Bharath P, Iyer S, Velu AV, Kumar DT.",
+            "journal": "Cancer Chemotherapy and Pharmacology",
+            "date": "2026-06-29",
+            "doi": "10.1007/s00280-026-04910-z",
+            "url": "https://doi.org/10.1007/s00280-026-04910-z",
+            "source_texts": []
+          },
+          {
+            "citation_key": "9",
+            "title": "Detecting anaplastic lymphoma kinase (ALK) gene rearrangements with next-generation sequencing remains a reliable approach in patients with non-small-cell lung cancer",
+            "authors": "Ding Y, Sun C, Su W, et al.",
+            "journal": "Virchows Archiv : An International Journal of Pathology",
+            "date": "2022-09-01",
+            "doi": "10.1007/s00428-022-03339-y",
+            "url": "https://doi.org/10.1007/s00428-022-03339-y",
+            "source_texts": []
+          },
+          {
+            "citation_key": "10",
+            "title": "Going Beneath the Tip of the Iceberg. Identifying and Understanding EML4-ALK Variants and TP53 Mutations to Optimize Treatment of ALK Fusion Positive (ALK+) NSCLC",
+            "authors": "Zhang SS, Nagasaka M, Zhu VW, Ou SI.",
+            "journal": "Lung Cancer ",
+            "date": "2021-08-01",
+            "doi": "10.1016/j.lungcan.2021.06.012",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/34175504",
+            "source_texts": []
+          },
+          {
+            "citation_key": "11",
+            "title": "Three decades of anaplastic lymphoma kinase: from physiological roles to cancer and immune evasion",
+            "authors": "Amin HM, Aminnia S, Saber MM, Kannan MK, Hung J.",
+            "journal": "Cancer Metastasis Reviews",
+            "date": "2026-08-19",
+            "doi": "10.1007/s10555-026-10364-9",
+            "url": "https://doi.org/10.1007/s10555-026-10364-9",
+            "source_texts": []
+          },
+          {
+            "citation_key": "12",
+            "title": "EML4-ALK Mutations in Lung Cancer That Confer Resistance to ALK Inhibitors",
+            "authors": "Choi YL, Soda M, Yamashita Y, et al.",
+            "journal": "The New England Journal of Medicine",
+            "date": "2010-10-28",
+            "doi": "10.1056/NEJMoa1007478",
+            "url": "https://www.nejm.org/doi/full/10.1056/nejmoa1007478",
+            "source_texts": []
+          },
+          {
+            "citation_key": "13",
+            "title": "Oncogenic EML4-ALK assemblies suppress growth factor perception and modulate drug tolerance",
+            "authors": "Gonzalez-Martinez D, Roth L, Mumford TR, et al.",
+            "journal": "Nature Communications",
+            "date": "2024-11-02",
+            "doi": "10.1038/s41467-024-53451-7",
+            "url": "https://doi.org/10.1038/s41467-024-53451-7",
+            "source_texts": []
+          },
+          {
+            "citation_key": "14",
+            "title": "Phase Separation of EML4-ALK in Firing Downstream Signaling and Promoting Lung Tumorigenesis",
+            "authors": "Qin Z, Sun H, Yue M, et al.",
+            "journal": "Cell Discovery",
+            "date": "2021-05-11",
+            "doi": "10.1038/s41421-021-00270-5",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/33976114",
+            "source_texts": []
+          },
+          {
+            "citation_key": "15",
+            "title": "Club cells employ regeneration mechanisms during lung tumorigenesis",
+            "authors": "Chen Y, Toth R, Chocarro S, et al.",
+            "journal": "Nature Communications",
+            "date": "2022-08-05",
+            "doi": "10.1038/s41467-022-32052-2",
+            "url": "https://doi.org/10.1038/s41467-022-32052-2",
+            "source_texts": []
+          },
+          {
+            "citation_key": "16",
+            "title": "Inhibition of ALK, PI3K/MEK, and HSP90 in Murine Lung Adenocarcinoma Induced by EML4-ALK Fusion Oncogene",
+            "authors": "Chen Z, Sasaki T, Tan X, et al.",
+            "journal": "Cancer Research",
+            "date": "2010-12-01",
+            "doi": "10.1158/0008-5472.CAN-10-1671",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/20952506",
+            "source_texts": []
+          },
+          {
+            "citation_key": "17",
+            "title": "Systemic Therapy for Locally Advanced and Metastatic Non–Small Cell Lung Cancer",
+            "authors": "Arbour KC, Riely GJ.",
+            "journal": "The Journal of the American Medical Association",
+            "date": "2019-08-27",
+            "doi": "10.1001/jama.2019.11058",
+            "url": "https://jamanetwork.com/journals/jama/fullarticle/10.1001/jama.2019.11058?utm_source=openevidence&utm_medium=referral",
+            "source_texts": []
+          },
+          {
+            "citation_key": "18",
+            "title": "Emerging therapeutic agents for advanced non-small cell lung cancer",
+            "authors": "Chen R, Manochakian R, James L, et al.",
+            "journal": "Journal of Hematology & Oncology",
+            "date": "2020-05-24",
+            "doi": "10.1186/s13045-020-00881-7",
+            "url": "https://doi.org/10.1186/s13045-020-00881-7",
+            "source_texts": []
+          },
+          {
+            "citation_key": "19",
+            "title": "Alectinib in Resected ALK-Positive Non–Small-Cell Lung Cancer",
+            "authors": "Wu YL, Dziadziuszko R, Ahn JS, et al.",
+            "journal": "The New England Journal of Medicine",
+            "date": "2024-04-11",
+            "doi": "10.1056/NEJMoa2310532",
+            "url": "https://www.nejm.org/doi/full/10.1056/nejmoa2310532",
+            "source_texts": []
+          },
+          {
+            "citation_key": "20",
+            "title": "Adjuvant alectinib improves outcomes in ALK-mutant NSCLC",
+            "authors": "Romero D.",
+            "journal": "Nature Reviews. Clinical Oncology",
+            "date": "2024-07-01",
+            "doi": "10.1038/s41571-024-00899-7",
+            "url": "https://doi.org/10.1038/s41571-024-00899-7",
+            "source_texts": []
+          },
+          {
+            "citation_key": "21",
+            "title": "Best Practices for the Multidisciplinary Care of Patients With Early‐Stage Driver‐Mutated Non‐Small Cell Lung Cancer",
+            "authors": "Sabari J, Stiles BM.",
+            "journal": "Journal of Surgical Oncology",
+            "date": "2026-05-01",
+            "doi": "10.1002/jso.70214",
+            "url": "https://onlinelibrary.wiley.com/doi/10.1002/jso.70214",
+            "source_texts": []
+          },
+          {
+            "citation_key": "22",
+            "title": "ALK fusions in the pan-cancer setting: another tumor-agnostic target?",
+            "authors": "Shreenivas A, Janku F, Gouda MA, et al.",
+            "journal": "NPJ Precision Oncology",
+            "date": "2023-09-29",
+            "doi": "10.1038/s41698-023-00449-x",
+            "url": "https://doi.org/10.1038/s41698-023-00449-x",
+            "source_texts": []
+          },
+          {
+            "citation_key": "23",
+            "title": "Non-Small Cell Lung Cancer",
+            "authors": "National Comprehensive Cancer Network",
+            "journal": "",
+            "date": "2026-08-07",
+            "doi": "",
+            "url": "https://www.nccn.org/professionals/physician_gls/pdf/nscl.pdf#page=53",
+            "source_texts": []
+          },
+          {
+            "citation_key": "24",
+            "title": "FDA Orange Book",
+            "authors": "",
+            "journal": "FDA Orange Book",
+            "date": "2026-09-08",
+            "doi": "",
+            "url": "https://www.fda.gov/drugs/drug-approvals-and-databases/approved-drug-products-therapeutic-equivalence-evaluations-orange-book",
+            "source_texts": []
+          },
+          {
+            "citation_key": "25",
+            "title": "ALK in cancer: from function to therapeutic targeting",
+            "authors": "Voena C, Ambrogio C, Iannelli F, Chiarle R.",
+            "journal": "Nature Reviews. Cancer",
+            "date": "2025-05-01",
+            "doi": "10.1038/s41568-025-00797-9",
+            "url": "https://doi.org/10.1038/s41568-025-00797-9",
+            "source_texts": []
+          },
+          {
+            "citation_key": "26",
+            "title": "A Meta-Analysis of the Impact of Different ALK Variants on Targeted Therapy Efficacy in Advanced Non-Small Cell Lung Cancer",
+            "authors": "Gu Z, Chen Z, Lai Q, Lin D.",
+            "journal": "Frontiers in Oncology",
+            "date": "2025-11-28",
+            "doi": "10.3389/fonc.2026.1756464",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/41959926",
+            "source_texts": []
+          },
+          {
+            "citation_key": "27",
+            "title": "Impact of EML4-ALK Variant on Resistance Mechanisms and Clinical Outcomes in ALK-Positive Lung Cancer",
+            "authors": "Lin JJ, Zhu VW, Yoda S, et al.",
+            "journal": "Journal of Clinical Oncology : Official Journal of the American Society of Clinical Oncology",
+            "date": "2018-04-20",
+            "doi": "10.1200/JCO.2017.76.2294",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/29373100",
+            "source_texts": []
+          },
+          {
+            "citation_key": "28",
+            "title": "Impact of EML4-ALK Variants and Co-Occurring TP53 Mutations on Duration of First-Line ALK Tyrosine Kinase Inhibitor Treatment and Overall Survival in ALK Fusion-Positive NSCLC: Real-World Outcomes From the GuardantINFORM Database",
+            "authors": "Parikh K, Dimou A, Leventakos K, et al.",
+            "journal": "Journal of Thoracic Oncology : Official Publication of the International Association for the Study of Lung Cancer",
+            "date": "2024-11-01",
+            "doi": "10.1016/j.jtho.2024.07.009",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/39019326",
+            "source_texts": []
+          },
+          {
+            "citation_key": "29",
+            "title": "EML4-ALK Variant-Specific Genetic Interactions Shape Lung Tumorigenesis",
+            "authors": "Diaz-Jimenez A, Shuldiner EG, Somogyi K, et al.",
+            "journal": "Cancer Discovery",
+            "date": "2025-09-23",
+            "doi": "10.1158/2159-8290.CD-24-1417",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/40986428",
+            "source_texts": []
+          },
+          {
+            "citation_key": "30",
+            "title": "Tumour-agnostic kinase inhibitors",
+            "authors": "Adashek JJ, Nikanjam M, Kurzrock R.",
+            "journal": "Nature Reviews. Drug Discovery",
+            "date": "2025-07-01",
+            "doi": "10.1038/s41573-025-01147-y",
+            "url": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC12221794/",
+            "source_texts": []
+          },
+          {
+            "citation_key": "31",
+            "title": "Tissue-agnostic biomarkers in solid tumors: current approvals and emerging candidates",
+            "authors": "Kim J, Kim HS, Nam M, Chae YK.",
+            "journal": "Cancer Metastasis Reviews",
+            "date": "2025-06-27",
+            "doi": "10.1007/s10555-025-10274-2",
+            "url": "https://doi.org/10.1007/s10555-025-10274-2",
+            "source_texts": []
+          }
+        ]
+      },
+      "date_annotated": "9/8/26",
+      "retrieval_count": 50,
+      "retrieved_pmids": [
+        "31462708",
+        "27573755",
+        "27432227",
+        "41071329",
+        "39257160",
+        "37522200",
+        "35438749",
+        "35212154",
+        "34250410",
+        "34175504",
+        "34036223",
+        "33887544",
+        "32102128",
+        "31887093",
+        "28426485",
+        "28326957",
+        "27756333",
+        "36064579",
+        "33411331",
+        "40387841",
+        "36423211",
+        "36029175",
+        "35478149",
+        "35113459",
+        "32132036",
+        "32020234",
+        "30790327",
+        "25857825",
+        "38039964",
+        "29650534",
+        "28910456",
+        "40702700",
+        "40055571",
+        "39237383",
+        "34661367",
+        "33034056",
+        "32878782",
+        "32564377",
+        "31677810",
+        "31542727",
+        "30857967",
+        "30077013",
+        "29794871",
+        "28665006",
+        "28549458",
+        "27469327",
+        "27002760",
+        "24750504",
+        "24419423",
+        "22808292"
+      ],
+      "retrieval_ranking": [
+        {
+          "pmid": "31462708",
+          "citation_composite_score": 0.6692,
+          "context_composite_score": 0.5642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "27573755",
+          "citation_composite_score": 0.7031,
+          "context_composite_score": 0.9131,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.4204,
+          "publication_type_citation_score": 0.4,
+          "publication_type_context_score": 1.0,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2016,
+          "pool": "context_supplement"
+        },
+        {
+          "pmid": "27432227",
+          "citation_composite_score": 0.6431,
+          "context_composite_score": 0.5381,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.4204,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2016,
+          "pool": null
+        },
+        {
+          "pmid": "41071329",
+          "citation_composite_score": 0.9176,
+          "context_composite_score": 0.8126,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": "citation"
+        },
+        {
+          "pmid": "39257160",
+          "citation_composite_score": 0.7061,
+          "context_composite_score": 0.6011,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.8409,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2024,
+          "pool": null
+        },
+        {
+          "pmid": "37522200",
+          "citation_composite_score": 0.6957,
+          "context_composite_score": 0.5907,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7711,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2023,
+          "pool": null
+        },
+        {
+          "pmid": "35438749",
+          "citation_composite_score": 0.6861,
+          "context_composite_score": 0.5811,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7071,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2022,
+          "pool": null
+        },
+        {
+          "pmid": "35212154",
+          "citation_composite_score": 0.5811,
+          "context_composite_score": 0.5111,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7071,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2022,
+          "pool": null
+        },
+        {
+          "pmid": "34250410",
+          "citation_composite_score": 0.6773,
+          "context_composite_score": 0.5723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "34175504",
+          "citation_composite_score": 0.7373,
+          "context_composite_score": 0.9473,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.4,
+          "publication_type_context_score": 1.0,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": "context_supplement"
+        },
+        {
+          "pmid": "34036223",
+          "citation_composite_score": 0.6773,
+          "context_composite_score": 0.5723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "33887544",
+          "citation_composite_score": 0.6773,
+          "context_composite_score": 0.5723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "32102128",
+          "citation_composite_score": 0.5642,
+          "context_composite_score": 0.4942,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "31887093",
+          "citation_composite_score": 0.6692,
+          "context_composite_score": 0.5642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "28426485",
+          "citation_composite_score": 0.6488,
+          "context_composite_score": 0.5438,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.4585,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2017,
+          "pool": null
+        },
+        {
+          "pmid": "28326957",
+          "citation_composite_score": 0.6488,
+          "context_composite_score": 0.5438,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.4585,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2017,
+          "pool": null
+        },
+        {
+          "pmid": "27756333",
+          "citation_composite_score": 0.8431,
+          "context_composite_score": 0.7381,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.4204,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2016,
+          "pool": "citation"
+        },
+        {
+          "pmid": "36064579",
+          "citation_composite_score": 0.6861,
+          "context_composite_score": 0.5811,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7071,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2022,
+          "pool": null
+        },
+        {
+          "pmid": "33411331",
+          "citation_composite_score": 0.6773,
+          "context_composite_score": 0.5723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "40387841",
+          "citation_composite_score": 0.7176,
+          "context_composite_score": 0.6126,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": null
+        },
+        {
+          "pmid": "36423211",
+          "citation_composite_score": 0.6957,
+          "context_composite_score": 0.5907,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7711,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2023,
+          "pool": null
+        },
+        {
+          "pmid": "36029175",
+          "citation_composite_score": 0.6861,
+          "context_composite_score": 0.5811,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7071,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2022,
+          "pool": null
+        },
+        {
+          "pmid": "35478149",
+          "citation_composite_score": 0.6861,
+          "context_composite_score": 0.5811,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7071,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2022,
+          "pool": null
+        },
+        {
+          "pmid": "35113459",
+          "citation_composite_score": 0.5811,
+          "context_composite_score": 0.5111,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7071,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2022,
+          "pool": null
+        },
+        {
+          "pmid": "32132036",
+          "citation_composite_score": 0.6692,
+          "context_composite_score": 0.5642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "32020234",
+          "citation_composite_score": 0.8692,
+          "context_composite_score": 0.7642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": "citation"
+        },
+        {
+          "pmid": "30790327",
+          "citation_composite_score": 0.6618,
+          "context_composite_score": 0.5568,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5453,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2019,
+          "pool": null
+        },
+        {
+          "pmid": "25857825",
+          "citation_composite_score": 0.6378,
+          "context_composite_score": 0.5328,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.3856,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2015,
+          "pool": null
+        },
+        {
+          "pmid": "38039964",
+          "citation_composite_score": 0.6957,
+          "context_composite_score": 0.5907,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.7711,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2023,
+          "pool": null
+        },
+        {
+          "pmid": "29650534",
+          "citation_composite_score": 0.855,
+          "context_composite_score": 0.75,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": "citation"
+        },
+        {
+          "pmid": "28910456",
+          "citation_composite_score": 0.655,
+          "context_composite_score": 0.55,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "40702700",
+          "citation_composite_score": 0.7176,
+          "context_composite_score": 0.6126,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": null
+        },
+        {
+          "pmid": "40055571",
+          "citation_composite_score": 0.5776,
+          "context_composite_score": 0.7876,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.4,
+          "publication_type_context_score": 1.0,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": null
+        },
+        {
+          "pmid": "39237383",
+          "citation_composite_score": 0.7061,
+          "context_composite_score": 0.6011,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.8409,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2024,
+          "pool": null
+        },
+        {
+          "pmid": "34661367",
+          "citation_composite_score": 0.8773,
+          "context_composite_score": 0.7723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": "citation"
+        },
+        {
+          "pmid": "33034056",
+          "citation_composite_score": 0.6773,
+          "context_composite_score": 0.5723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "32878782",
+          "citation_composite_score": 0.8692,
+          "context_composite_score": 0.7642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": "citation"
+        },
+        {
+          "pmid": "32564377",
+          "citation_composite_score": 0.6692,
+          "context_composite_score": 0.5642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "31677810",
+          "citation_composite_score": 0.6618,
+          "context_composite_score": 0.5568,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5453,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2019,
+          "pool": null
+        },
+        {
+          "pmid": "31542727",
+          "citation_composite_score": 0.6692,
+          "context_composite_score": 0.5642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "30857967",
+          "citation_composite_score": 0.6618,
+          "context_composite_score": 0.5568,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5453,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2019,
+          "pool": null
+        },
+        {
+          "pmid": "30077013",
+          "citation_composite_score": 0.655,
+          "context_composite_score": 0.55,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "29794871",
+          "citation_composite_score": 0.6618,
+          "context_composite_score": 0.5568,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5453,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2019,
+          "pool": null
+        },
+        {
+          "pmid": "28665006",
+          "citation_composite_score": 0.55,
+          "context_composite_score": 0.48,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "28549458",
+          "citation_composite_score": 0.8488,
+          "context_composite_score": 0.7438,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.4585,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2017,
+          "pool": "citation"
+        },
+        {
+          "pmid": "27469327",
+          "citation_composite_score": 0.6431,
+          "context_composite_score": 0.5381,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.4204,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2016,
+          "pool": null
+        },
+        {
+          "pmid": "27002760",
+          "citation_composite_score": 0.6431,
+          "context_composite_score": 0.5381,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.4204,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2016,
+          "pool": null
+        },
+        {
+          "pmid": "24750504",
+          "citation_composite_score": 0.833,
+          "context_composite_score": 0.728,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.3536,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2014,
+          "pool": "citation"
+        },
+        {
+          "pmid": "24419423",
+          "citation_composite_score": 0.833,
+          "context_composite_score": 0.728,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.3536,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2014,
+          "pool": null
+        },
+        {
+          "pmid": "22808292",
+          "citation_composite_score": 0.4846,
+          "context_composite_score": 0.6946,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.2973,
+          "publication_type_citation_score": 0.4,
+          "publication_type_context_score": 1.0,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2012,
+          "pool": null
+        }
+      ],
+      "insufficient_evidence": false,
+      "evidence_support_score": 0.8,
+      "evidence_support_explanation": "Evidence support score 0.80: 4 verified PMID citation(s); 3+ verified PMIDs; human clinical evidence signal; high-impact journal signal; summary, rationale, and citations are all present. This score estimates literature grounding, not biological truth or clinical actionability.",
+      "cache_status": "refreshed",
+      "cache_reason": "computed_new_annotation",
+      "cached_at": null,
+      "last_pubmed_checked_at": null,
+      "error": null,
+      "timings_ms": {
+        "prevalence": 0.0,
+        "literature_retrieval": 42.17,
+        "oncokb": 54.62,
+        "paper_selection": 1431.13,
+        "openevidence": 151449.63,
+        "synthesis": 12876.24,
+        "total": 164413.28
+      }
+    },
+    {
+      "gene": "EML4",
+      "fusions": [
+        "EML4::ALK"
+      ],
+      "in_oncokb": true,
+      "cancer_associated": true,
+      "cancer_association_rationale": "Structural variant (fusion): EML4-ALK is a recurrent oncogenic fusion arising from paracentric inversion of chromosome 2p, joining the 5′ EML4 trimerization domain to the 3′ ALK tyrosine kinase domain. Multiple EML4-ALK variants (V1, V2, V3, etc.) differ by exon breakpoints and show variant-specific effects on oncogenicity, protein stability, and drug sensitivity. The fusion drives constitutive ALK kinase activity and is the dominant ALK fusion partner (~85% of ALK+ NSCLC). Clinical dependence is established across multiple randomized trials (ALEX, CROWN) showing durable responses to ALK tyrosine kinase inhibitors, with median progression-free survival exceeding 5 years in metastatic NSCLC and adjuvant benefit in resected stage IB–IIIA disease.",
+      "cancer_type_prevalence": "- Non-small cell lung cancer / lung adenocarcinoma (fusion)",
+      "gene_class": "Microtubule-associated protein",
+      "signaling_pathways": "ALK receptor tyrosine kinase signaling, PI3K/AKT, RAS/MAPK",
+      "gene_summary": "EML4 encodes an echinoderm microtubule-associated protein-like 4 that is recurrently fused to the anaplastic lymphoma kinase (ALK) gene in non-small cell lung cancer (NSCLC) through a paracentric chromosome 2 inversion (PMID 40986428). The EML4-ALK fusion protein retains the EML4 trimerization domain and functional ALK tyrosine kinase domain, driving constitutive RTK signaling through biomolecular condensate formation that enhances ligand-independent kinase activity (PMID 40875402). Multiple EML4-ALK variants exist with distinct breakpoints; variant 3 (V3) is more oncogenic than variant 1 (V1) in autochthonous mouse models and is associated with worse prognosis and higher metastatic risk in patients (PMID 40986428, PMID 37149843). EML4-ALK-positive NSCLC shows durable clinical responses to ALK tyrosine kinase inhibitors (e.g., alectinib, brigatinib, lorlatinib), with median progression-free survival of 34.8 months with alectinib versus 10.9 months with crizotinib in the ALEX trial, superior across all EML4-ALK variants (PMID 30902613). Resistance can emerge through ALK kinase domain point mutations (e.g., G1202R), with V3 showing higher propensity for developing this solvent-front mutation (PMID 37149843). Co-occurring TP53 mutations further influence treatment response and prognosis (PMID 39019326). (Literature sourced via Tier 1 direct PubMed query.)",
+      "citations": [
+        "37149843",
+        "30902613",
+        "40986428",
+        "40875402"
+      ],
+      "supporting_quotes": [
+        {
+          "pmid": "40986428",
+          "quote": "Diverse fusions of echinoderm microtubule-associated protein-like 4 (EML4) and anaplastic lymphoma kinase (ALK) are oncogenic drivers in lung adenocarcinoma. EML4-ALK variants have distinct breakpoints within EML4, but their functional differences remain poorly understood... we show that variant 3 (V3) is more oncogenic than variant 1 (V1)."
+        },
+        {
+          "pmid": "40875402",
+          "quote": "A prominent example is the cancer-causing EML4-ALK fusion protein, which spontaneously forms biomolecular condensates that significantly enhance receptor tyrosine kinase (RTK) signaling within the condensate microenvironment."
+        },
+        {
+          "pmid": "30902613",
+          "quote": "Investigator-assessed PFS was longer for alectinib than for crizotinib across EML4-ALK variants 1, 2, and 3a/b in plasma and tissue. Alectinib continues to demonstrate superior investigator-assessed PFS versus crizotinib in untreated ALK-positive NSCLC, irrespective of EML4-ALK variant. The median PFS times were 34.8 months with alectinib and 10.9 months with crizotinib."
+        }
+      ],
+      "evidence_cards": [
+        {
+          "pmid": "37149843",
+          "title": "EML4-ALK biology and drug resistance in non-small cell lung cancer: a new phase of discoveries.",
+          "journal": "Mol Oncol",
+          "evidence_type": "clinical",
+          "selected_reason": "Verified PMID selected as clinical evidence.",
+          "quote": "Anaplastic lymphoma kinase (ALK) can be driven to oncogenic activity by different types of mutational events such as point-mutations, for example F1174L in neuroblastoma, and gene fusions, for example with echinoderm microtubule-associated protein-like 4 (EML4) in non-small cell lung cancer (NSCLC)."
+        },
+        {
+          "pmid": "30902613",
+          "title": "Updated Efficacy and Safety Data and Impact of the EML4-ALK Fusion Variant on the Efficacy of Alectinib in Untreated ALK-Positive Advanced Non-Small Cell Lung Cancer in the Global Phase III ALEX Study.",
+          "journal": "J Thorac Oncol",
+          "evidence_type": "clinical",
+          "selected_reason": "Verified PMID selected as clinical evidence.",
+          "quote": "Investigator-assessed PFS was longer for alectinib than for crizotinib across EML4-ALK variants 1, 2, and 3a/b in plasma and tissue. Alectinib continues to demonstrate superior investigator-assessed PFS versus crizotinib in untreated ALK-positive NSCLC, irrespective of EML4-ALK variant. The median PFS times were 34.8 months with alectinib and 10.9 months with crizotinib."
+        },
+        {
+          "pmid": "40986428",
+          "title": "EML4-ALK Variant-Specific Genetic Interactions Shape Lung Tumorigenesis.",
+          "journal": "Cancer Discov",
+          "evidence_type": "clinical",
+          "selected_reason": "Verified PMID selected as clinical evidence. High-impact journal signal.",
+          "quote": "Diverse fusions of echinoderm microtubule-associated protein-like 4 (EML4) and anaplastic lymphoma kinase (ALK) are oncogenic drivers in lung adenocarcinoma. EML4-ALK variants have distinct breakpoints within EML4, but their functional differences remain poorly understood... we show that variant 3 (V3) is more oncogenic than variant 1 (V1)."
+        },
+        {
+          "pmid": "40875402",
+          "title": "Trimerization domain-interfering peptide inhibits EML4-ALK condensate formation, fusion-dependent signaling, and cell growth.",
+          "journal": "Mol Biol Cell",
+          "evidence_type": "clinical",
+          "selected_reason": "Verified PMID selected as clinical evidence.",
+          "quote": "A prominent example is the cancer-causing EML4-ALK fusion protein, which spontaneously forms biomolecular condensates that significantly enhance receptor tyrosine kinase (RTK) signaling within the condensate microenvironment."
+        }
+      ],
+      "clinical_actionability": {
+        "confidence_score": 0.95,
+        "confidence_level": "high",
+        "summary": "High-confidence literature-derived therapeutic precedent for EML4: Alectinib, crizotinib. This is not a treatment recommendation.",
+        "confidence_explanation": "Clinical actionability confidence 0.95: Direct human clinical evidence; Drug/domain/actionability language tied to gene; Two or more independent supporting PMIDs; OncoKB membership corroboration. Score is deterministic, citation-bound, and only shown at >= 0.85.",
+        "pmids": [
+          "37149843",
+          "30902613",
+          "40986428"
+        ],
+        "score_components": [
+          {
+            "code": "clinical_evidence",
+            "label": "Direct human clinical evidence",
+            "delta": 0.35,
+            "pmids": [
+              "30902613",
+              "40986428"
+            ],
+            "detail": "At least one verified cited abstract has patient/cohort/trial language."
+          },
+          {
+            "code": "direct_actionability_language",
+            "label": "Drug/domain/actionability language tied to gene",
+            "delta": 0.25,
+            "pmids": [
+              "37149843",
+              "30902613",
+              "40986428"
+            ],
+            "detail": "Matched therapies: Alectinib, crizotinib; matched domains: probably misfolded beta-propeller domain, within the kinase domain, kinase domain."
+          },
+          {
+            "code": "multiple_pmids",
+            "label": "Two or more independent supporting PMIDs",
+            "delta": 0.15,
+            "pmids": [
+              "37149843",
+              "30902613",
+              "40986428"
+            ],
+            "detail": "Therapeutic precedent is supported by multiple verified cited abstracts."
+          },
+          {
+            "code": "oncokb_corroboration",
+            "label": "OncoKB membership corroboration",
+            "delta": 0.2,
+            "pmids": [],
+            "detail": "The queried gene is present in OncoKB; this corroborates gene context, not therapy selection."
+          }
+        ],
+        "evidence": [
+          {
+            "pmid": "37149843",
+            "title": "EML4-ALK biology and drug resistance in non-small cell lung cancer: a new phase of discoveries.",
+            "evidence_type": "review",
+            "therapies": [],
+            "domains": [
+              "probably misfolded beta-propeller domain",
+              "within the kinase domain",
+              "kinase domain"
+            ],
+            "matched_terms": [
+              "therapeutic_language",
+              "domain_language",
+              "alteration_language"
+            ],
+            "quote": "However, resistance to ALK inhibitors can occur via point-mutations within the kinase domain of the EML4-ALK fusion, for example G1202R, reducing inhibitor effectiveness."
+          },
+          {
+            "pmid": "30902613",
+            "title": "Updated Efficacy and Safety Data and Impact of the EML4-ALK Fusion Variant on the Efficacy of Alectinib in Untreated ALK-Positive Advanced Non-Small Cell Lung Cancer in the Global Phase III ALEX Study.",
+            "evidence_type": "clinical",
+            "therapies": [
+              "Alectinib",
+              "crizotinib"
+            ],
+            "domains": [],
+            "matched_terms": [
+              "therapeutic_language",
+              "alteration_language",
+              "named_drug"
+            ],
+            "quote": "Retrospective analyses suggest that the echinoderm microtubule-associated protein-like 4 gene-ALK variant (EML4-ALK) may influence ALK-inhibitor treatment benefit."
+          },
+          {
+            "pmid": "40986428",
+            "title": "EML4-ALK Variant-Specific Genetic Interactions Shape Lung Tumorigenesis.",
+            "evidence_type": "clinical",
+            "therapies": [],
+            "domains": [],
+            "matched_terms": [
+              "therapeutic_language",
+              "alteration_language"
+            ],
+            "quote": "EML4-ALK-driven lung cancer is treated as a uniform disease despite the presence of distinct fusion variants in patients."
+          }
+        ]
+      },
+      "quality_flags": [
+        {
+          "code": "literature_preranked",
+          "label": "Pre-ranked literature",
+          "severity": "info",
+          "detail": "Retrieval pool pre-ranked by composite heuristic before selection (top score 0.93, PMID 30902613)."
+        }
+      ],
+      "openevidence_supplementary": {
+        "question": "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic in cancer? State the classification and the strongest supporting evidence.",
+        "text": "REACTCOMPONENT!:!InlineGenerationStep!:!{\"steps\": [{\"kind\": \"reasoning\", \"label\": \"Analyzing query\", \"active\": true, \"children\": [], \"paragraphindex\": 0, \"metadata\": {}}, {\"callid\": \"667bde26-bde9-4af5-a559-f60224d5ea10\", \"kind\": \"search\", \"label\": \"Searching published medical literature, guidelines, FDA, CDC, and more\", \"id\": \"searchmedicalliterature\", \"active\": true, \"children\": [], \"paragraphindex\": 0, \"metadata\": {}, \"queries\": []}, {\"callid\": \"2a484a71-efa8-415c-80c4-22ab6c57f8d6\", \"kind\": \"search\", \"label\": \"Searching full-text sources from NEJM, JAMA, Nature, NCCN, Cochrane, Wiley, and more\", \"id\": \"searchmedicalliterature\", \"active\": true, \"children\": [], \"paragraphindex\": 0, \"metadata\": {}, \"queries\": []}], \"done\": true, \"summary\": \"Analyzed query, searched for evidence\"}\n\n\nEML4::ALK is a definitively oncogenic, gain-of-function driver alteration — not a variant of uncertain significance. The canonical fusion arises from a paracentric inversion of chromosome 2p (inv(2)(p21p23)) joining the 5′ portion of EML4 to the 3′ portion of ALK containing the intact tyrosine kinase domain, producing a chimeric kinase that oligomerizes through the retained EML4 trimerization/coiled-coil domain and signals constitutively in a ligand-independent fashion[[1]].[[2]][[3]] Functionally it satisfies every criterion for a bona fide oncogene: transforming in vitro, sufficient to initiate tumors in vivo at endogenous expression levels, and required for tumor maintenance. Clinically it is a Tier I / level A predictive biomarker in NSCLC (OncoKB \"Oncogenic,\" highest therapeutic level), with FDA-approved matched therapies, companion diagnostics, and NCCN category 1 first-line recommendations.[[4]] The classification applies to in-frame, expressed fusion products retaining both the EML4 oligomerization region and a functional ALK kinase domain — a DNA-level rearrangement that is out of frame or non-productive is not automatically oncogenic and warrants RNA-based confirmation.[[5]]\nStrongest supporting evidence, by tier\n[[2]][[4]][[6]][[7]][[8]][[9]][[10]][[11]][[12]][[13]][[14]]\nClinical dependence in humans\nRandomized trials enroll by ALK positivity (IHC/FISH/NGS) rather than by partner gene, so they formally establish dependence for ALK-rearranged NSCLC — a population in which EML4 is the partner in roughly 85% of cases.[[11]]\n- ALEX (alectinib vs crizotinib, treatment-naive): median PFS 34.8 vs 10.9 months (HR 0.43, 95% CI 0.32–0.58); 5-year OS 62.5% vs 45.5%; final analysis median OS 81.1 vs 54.2 months (HR 0.78, 95% CI 0.56–1.08).[[13]][[15]]\n- CROWN (lorlatinib vs crizotinib): 5-year PFS rate 60% with median PFS still not reached at 60.2 months' follow-up (HR 0.19, 95% CI 0.13–0.27) — a median PFS exceeding 5 years in metastatic disease.[[14]]\n- ALINA (adjuvant alectinib vs platinum chemotherapy in resected stage IB ≥4 cm–IIIA): significant disease-free survival benefit, now a standard of care.[[16]][[17]]\n- Guideline codification: NCCN lists alectinib, brigatinib, ensartinib, and lorlatinib as preferred category 1 first-line options; ASCO guidelines recommend offering alectinib, brigatinib, or lorlatinib first-line (evidence strength high, strong recommendation)[[4]].[[18]]\nThat a molecularly defined subgroup comprising ~5% of lung adenocarcinoma converts from a median survival of months to a median PFS beyond 5 years on a single oral agent directed at the fusion product is the strongest possible human evidence of causal dependence.[[1]][[14]]\nCaveats on scope of the classification\n- Variant-level biology is not uniform. V1 (E13;A20) and V3 (E6a/b;A20) differ in condensate properties, HSP90 dependence, protein stability, and TKI sensitivity; V3 has been associated with poorer TKI response and worse prognosis in several analyses. An autochthonous mouse study[[5]][[19]] using somatic genome editing found V3 more oncogenic than V1, with variant-specific tumor suppressor gene interactions, arguing the variants behave as distinct oncogenes rather than one entity. Countering this, the ALEX biomarker subgroup analysis found PFS, ORR, and DOR were not affected by variant 1, 2, or [[20]]3a/b, and alectinib outperformed crizotinib across all variants. Treatment selection remains variant-agnostic in[[21]] practice.[[11]]\n- Non-canonical breakpoints. Rare fusions with breakpoints in ALK intron 17 or 18 rather than intron 19 show lower fusion protein stability, weaker phosphorylation and downstream signaling, and reduced TKI sensitivity.[[5]]\n- Novel partners require functional validation. Oncogenicity of newly described ALK fusions should be confirmed by transformation assays and demonstrated ALK-TKI sensitivity rather than assumed from the rearrangement call alone.[[5]]\n\n\nWould you like to explore how to resolve discordant ALK IHC, FISH, and NGS results when the functional significance of a rearrangement is unclear?",
+        "citations": [
+          {
+            "citation_key": "1",
+            "title": "ALK rearrangements and resistance mutations in non-small cell lung cancer: molecular mechanisms and therapeutic implications",
+            "authors": "Bharath P, Iyer S, Velu AV, Kumar DT.",
+            "journal": "Cancer Chemotherapy and Pharmacology",
+            "date": "2026-06-29",
+            "doi": "10.1007/s00280-026-04910-z",
+            "url": "https://doi.org/10.1007/s00280-026-04910-z",
+            "source_texts": []
+          },
+          {
+            "citation_key": "2",
+            "title": "EML4-ALK Mutations in Lung Cancer That Confer Resistance to ALK Inhibitors",
+            "authors": "Choi YL, Soda M, Yamashita Y, et al.",
+            "journal": "The New England Journal of Medicine",
+            "date": "2010-10-28",
+            "doi": "10.1056/NEJMoa1007478",
+            "url": "https://www.nejm.org/doi/full/10.1056/nejmoa1007478",
+            "source_texts": []
+          },
+          {
+            "citation_key": "3",
+            "title": "Detecting anaplastic lymphoma kinase (ALK) gene rearrangements with next-generation sequencing remains a reliable approach in patients with non-small-cell lung cancer",
+            "authors": "Ding Y, Sun C, Su W, et al.",
+            "journal": "Virchows Archiv : An International Journal of Pathology",
+            "date": "2022-09-01",
+            "doi": "10.1007/s00428-022-03339-y",
+            "url": "https://doi.org/10.1007/s00428-022-03339-y",
+            "source_texts": []
+          },
+          {
+            "citation_key": "4",
+            "title": "Non-Small Cell Lung Cancer",
+            "authors": "National Comprehensive Cancer Network",
+            "journal": "",
+            "date": "2026-08-07",
+            "doi": "",
+            "url": "https://www.nccn.org/professionals/physician_gls/pdf/nscl.pdf#page=53",
+            "source_texts": []
+          },
+          {
+            "citation_key": "5",
+            "title": "ALK in cancer: from function to therapeutic targeting",
+            "authors": "Voena C, Ambrogio C, Iannelli F, Chiarle R.",
+            "journal": "Nature Reviews. Cancer",
+            "date": "2025-05-01",
+            "doi": "10.1038/s41568-025-00797-9",
+            "url": "https://doi.org/10.1038/s41568-025-00797-9",
+            "source_texts": []
+          },
+          {
+            "citation_key": "6",
+            "title": "Identification of the Transforming EML4-ALK Fusion Gene in Non-Small-Cell Lung Cancer",
+            "authors": "Soda M, Choi YL, Enomoto M, et al.",
+            "journal": "Nature",
+            "date": "2007-08-02",
+            "doi": "10.1038/nature05945",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/17625570",
+            "source_texts": []
+          },
+          {
+            "citation_key": "7",
+            "title": "A Mouse Model for EML4-ALK-positive Lung Cancer",
+            "authors": "Soda M, Takada S, Takeuchi K, et al.",
+            "journal": "Proceedings of the National Academy of Sciences of the United States of America",
+            "date": "2008-12-16",
+            "doi": "10.1073/pnas.0805381105",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/19064915",
+            "source_texts": []
+          },
+          {
+            "citation_key": "8",
+            "title": "In vivo engineering of oncogenic chromosomal rearrangements with the CRISPR/Cas9 system",
+            "authors": "Maddalo D, Manchado E, Concepcion CP, et al.",
+            "journal": "Nature",
+            "date": "2014-12-18",
+            "doi": "10.1038/nature13902",
+            "url": "https://doi.org/10.1038/nature13902",
+            "source_texts": []
+          },
+          {
+            "citation_key": "9",
+            "title": "Inhibition of ALK, PI3K/MEK, and HSP90 in Murine Lung Adenocarcinoma Induced by EML4-ALK Fusion Oncogene",
+            "authors": "Chen Z, Sasaki T, Tan X, et al.",
+            "journal": "Cancer Research",
+            "date": "2010-12-01",
+            "doi": "10.1158/0008-5472.CAN-10-1671",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/20952506",
+            "source_texts": []
+          },
+          {
+            "citation_key": "10",
+            "title": "Establishment of a Conditional Transgenic Mouse Model Recapitulating EML4-ALK-Positive Human Non-Small Cell Lung Cancer",
+            "authors": "Pyo KH, Lim SM, Kim HR, et al.",
+            "journal": "Journal of Thoracic Oncology : Official Publication of the International Association for the Study of Lung Cancer",
+            "date": "2017-03-01",
+            "doi": "10.1016/j.jtho.2016.10.022",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/27836576",
+            "source_texts": []
+          },
+          {
+            "citation_key": "11",
+            "title": "ALK-positive lung cancer: a moving target",
+            "authors": "Schneider JL, Lin JJ, Shaw AT.",
+            "journal": "Nature Cancer",
+            "date": "2023-03-01",
+            "doi": "10.1038/s43018-023-00515-0",
+            "url": "https://doi.org/10.1038/s43018-023-00515-0",
+            "source_texts": []
+          },
+          {
+            "citation_key": "12",
+            "title": "Phase Separation of EML4-ALK in Firing Downstream Signaling and Promoting Lung Tumorigenesis",
+            "authors": "Qin Z, Sun H, Yue M, et al.",
+            "journal": "Cell Discovery",
+            "date": "2021-05-11",
+            "doi": "10.1038/s41421-021-00270-5",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/33976114",
+            "source_texts": []
+          },
+          {
+            "citation_key": "13",
+            "title": "Updated Overall Survival and Final Progression-Free Survival Data for Patients With Treatment-Naive Advanced ALK-positive Non-Small-Cell Lung Cancer in the ALEX Study",
+            "authors": "Mok T, Camidge DR, Gadgeel SM, et al.",
+            "journal": "Annals of Oncology : Official Journal of the European Society for Medical Oncology",
+            "date": "2020-08-01",
+            "doi": "10.1016/j.annonc.2020.04.478",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/32418886",
+            "source_texts": []
+          },
+          {
+            "citation_key": "14",
+            "title": "A new benchmark for targeted therapies in lung cancer - median PFS for Lorlatinib in advanced ALK+ NSCLC surpasses 5 years",
+            "authors": "Lovly CM.",
+            "journal": "Journal of Clinical Oncology : Official Journal of the American Society of Clinical Oncology",
+            "date": "2024-10-10",
+            "doi": "10.1200/JCO.24.01147",
+            "url": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC11521153/",
+            "source_texts": []
+          },
+          {
+            "citation_key": "15",
+            "title": "\\zaAlectinib Versus Crizotinib in Previously Untreated ALK-positive Advanced Non-Small Cell Lung Cancer: Final Overall Survival Analysis of the Phase III ALEX Study",
+            "authors": "Peters S, Camidge R, Dziadziuszko R, et al.",
+            "journal": "Annals of Oncology : Official Journal of the European Society for Medical Oncology",
+            "date": "2025-10-17",
+            "doi": "10.1016/j.annonc.2025.09.018",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/41110693",
+            "source_texts": []
+          },
+          {
+            "citation_key": "16",
+            "title": "Alectinib in Resected ALK-Positive Non–Small-Cell Lung Cancer",
+            "authors": "Wu YL, Dziadziuszko R, Ahn JS, et al.",
+            "journal": "The New England Journal of Medicine",
+            "date": "2024-04-11",
+            "doi": "10.1056/NEJMoa2310532",
+            "url": "https://www.nejm.org/doi/full/10.1056/nejmoa2310532",
+            "source_texts": []
+          },
+          {
+            "citation_key": "17",
+            "title": "Adjuvant Alectinib Versus Chemotherapy in Resected ALK-positive Non-Small-Cell Lung Cancer (ALINA): Health-Related Quality-of-Life and Safety Outcomes From a Randomised, Open-Label, Phase 3 Trial",
+            "authors": "Dziadziuszko R, Ahn JS, Barlesi F, et al.",
+            "journal": "The Lancet. Oncology",
+            "date": "2026-09-01",
+            "doi": "10.1016/S1470-2045(26)00283-4",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/42636834",
+            "source_texts": []
+          },
+          {
+            "citation_key": "18",
+            "title": "Therapy for Stage IV NSCLC with Driver Alterations",
+            "authors": "",
+            "journal": "",
+            "date": "2026-05-26",
+            "doi": "10.1200/JCO-26-00843",
+            "url": "https://ascopubs.org/doi/10.1200/JCO-26-00843",
+            "source_texts": []
+          },
+          {
+            "citation_key": "19",
+            "title": "EML4-ALK Biology and Drug Resistance in Non-Small Cell Lung Cancer: A New Phase of Discoveries",
+            "authors": "Elshatlawy M, Sampson J, Clarke K, Bayliss R.",
+            "journal": "Molecular Oncology",
+            "date": "2023-06-01",
+            "doi": "10.1002/1878-0261.13446",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/37149843",
+            "source_texts": []
+          },
+          {
+            "citation_key": "20",
+            "title": "EML4-ALK Variant-Specific Genetic Interactions Shape Lung Tumorigenesis",
+            "authors": "Diaz-Jimenez A, Shuldiner EG, Somogyi K, et al.",
+            "journal": "Cancer Discovery",
+            "date": "2025-09-23",
+            "doi": "10.1158/2159-8290.CD-24-1417",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/40986428",
+            "source_texts": []
+          },
+          {
+            "citation_key": "21",
+            "title": "Updated Efficacy and Safety Data and Impact of the EML4-ALK Fusion Variant on the Efficacy of Alectinib in Untreated ALK-Positive Advanced Non-Small Cell Lung Cancer in the Global Phase III ALEX Study",
+            "authors": "Camidge DR, Dziadziuszko R, Peters S, et al.",
+            "journal": "Journal of Thoracic Oncology : Official Publication of the International Association for the Study of Lung Cancer",
+            "date": "2019-07-01",
+            "doi": "10.1016/j.jtho.2019.03.007",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/30902613",
+            "source_texts": []
+          }
+        ]
+      },
+      "date_annotated": "9/8/26",
+      "retrieval_count": 49,
+      "retrieved_pmids": [
+        "41483402",
+        "41071329",
+        "40875402",
+        "40106998",
+        "39840587",
+        "39019326",
+        "38829559",
+        "37541389",
+        "37149843",
+        "34378283",
+        "34175504",
+        "33878728",
+        "32128622",
+        "31160357",
+        "31098955",
+        "30902613",
+        "27045755",
+        "23714228",
+        "38922581",
+        "37940761",
+        "34090412",
+        "32558295",
+        "32020234",
+        "30068733",
+        "29774063",
+        "29596910",
+        "29304828",
+        "26168728",
+        "24972969",
+        "21368458",
+        "40986428",
+        "17625570",
+        "41214145",
+        "34661367",
+        "33425389",
+        "32878782",
+        "30679319",
+        "30069772",
+        "29739898",
+        "29661733",
+        "29327716",
+        "29099503",
+        "28638113",
+        "28573389",
+        "26295973",
+        "24756793",
+        "24419423",
+        "20228600",
+        "20075203"
+      ],
+      "retrieval_ranking": [
+        {
+          "pmid": "41483402",
+          "citation_composite_score": 0.825,
+          "context_composite_score": 0.755,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 1.0,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2026,
+          "pool": null
+        },
+        {
+          "pmid": "41071329",
+          "citation_composite_score": 0.9176,
+          "context_composite_score": 0.8126,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": "citation"
+        },
+        {
+          "pmid": "40875402",
+          "citation_composite_score": 0.9176,
+          "context_composite_score": 0.8126,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": "citation"
+        },
+        {
+          "pmid": "40106998",
+          "citation_composite_score": 0.8126,
+          "context_composite_score": 0.7426,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": null
+        },
+        {
+          "pmid": "39840587",
+          "citation_composite_score": 0.9176,
+          "context_composite_score": 0.8126,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": "citation"
+        },
+        {
+          "pmid": "39019326",
+          "citation_composite_score": 0.9061,
+          "context_composite_score": 0.8011,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.8409,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2024,
+          "pool": "citation"
+        },
+        {
+          "pmid": "38829559",
+          "citation_composite_score": 0.9061,
+          "context_composite_score": 0.8011,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.8409,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2024,
+          "pool": "citation"
+        },
+        {
+          "pmid": "37541389",
+          "citation_composite_score": 0.8957,
+          "context_composite_score": 0.7907,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.7711,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2023,
+          "pool": null
+        },
+        {
+          "pmid": "37149843",
+          "citation_composite_score": 0.7557,
+          "context_composite_score": 0.9657,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.7711,
+          "publication_type_citation_score": 0.4,
+          "publication_type_context_score": 1.0,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2023,
+          "pool": "context_supplement"
+        },
+        {
+          "pmid": "34378283",
+          "citation_composite_score": 0.8773,
+          "context_composite_score": 0.7723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "34175504",
+          "citation_composite_score": 0.7373,
+          "context_composite_score": 0.9473,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.4,
+          "publication_type_context_score": 1.0,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": "context_supplement"
+        },
+        {
+          "pmid": "33878728",
+          "citation_composite_score": 0.8773,
+          "context_composite_score": 0.7723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "32128622",
+          "citation_composite_score": 0.8692,
+          "context_composite_score": 0.7642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "31160357",
+          "citation_composite_score": 0.7568,
+          "context_composite_score": 0.6868,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5453,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2019,
+          "pool": null
+        },
+        {
+          "pmid": "31098955",
+          "citation_composite_score": 0.8618,
+          "context_composite_score": 0.7568,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5453,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2019,
+          "pool": null
+        },
+        {
+          "pmid": "30902613",
+          "citation_composite_score": 0.9318,
+          "context_composite_score": 0.7918,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5453,
+          "publication_type_citation_score": 1.0,
+          "publication_type_context_score": 0.6,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2019,
+          "pool": "citation"
+        },
+        {
+          "pmid": "27045755",
+          "citation_composite_score": 0.8431,
+          "context_composite_score": 0.7381,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.4204,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2016,
+          "pool": null
+        },
+        {
+          "pmid": "23714228",
+          "citation_composite_score": 0.7236,
+          "context_composite_score": 0.6536,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.3242,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2013,
+          "pool": null
+        },
+        {
+          "pmid": "38922581",
+          "citation_composite_score": 0.7061,
+          "context_composite_score": 0.6011,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.8409,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2024,
+          "pool": null
+        },
+        {
+          "pmid": "37940761",
+          "citation_composite_score": 0.9061,
+          "context_composite_score": 0.8011,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.8409,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2024,
+          "pool": null
+        },
+        {
+          "pmid": "34090412",
+          "citation_composite_score": 0.8773,
+          "context_composite_score": 0.7723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "32558295",
+          "citation_composite_score": 0.8692,
+          "context_composite_score": 0.7642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "32020234",
+          "citation_composite_score": 0.8692,
+          "context_composite_score": 0.7642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "30068733",
+          "citation_composite_score": 0.75,
+          "context_composite_score": 0.68,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "29774063",
+          "citation_composite_score": 0.855,
+          "context_composite_score": 0.75,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "29596910",
+          "citation_composite_score": 0.855,
+          "context_composite_score": 0.75,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "29304828",
+          "citation_composite_score": 0.855,
+          "context_composite_score": 0.75,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "26168728",
+          "citation_composite_score": 0.8378,
+          "context_composite_score": 0.7328,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.3856,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2015,
+          "pool": null
+        },
+        {
+          "pmid": "24972969",
+          "citation_composite_score": 0.833,
+          "context_composite_score": 0.728,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.3536,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2014,
+          "pool": null
+        },
+        {
+          "pmid": "21368458",
+          "citation_composite_score": 0.8209,
+          "context_composite_score": 0.7159,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.2726,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2011,
+          "pool": null
+        },
+        {
+          "pmid": "40986428",
+          "citation_composite_score": 0.93,
+          "context_composite_score": 0.825,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 1.0,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2026,
+          "pool": "citation"
+        },
+        {
+          "pmid": "17625570",
+          "citation_composite_score": 0.8089,
+          "context_composite_score": 0.7039,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.1928,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2007,
+          "pool": null
+        },
+        {
+          "pmid": "41214145",
+          "citation_composite_score": 0.9176,
+          "context_composite_score": 0.8126,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.917,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2025,
+          "pool": "citation"
+        },
+        {
+          "pmid": "34661367",
+          "citation_composite_score": 0.8773,
+          "context_composite_score": 0.7723,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.6484,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2021,
+          "pool": null
+        },
+        {
+          "pmid": "33425389",
+          "citation_composite_score": 0.8692,
+          "context_composite_score": 0.7642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "32878782",
+          "citation_composite_score": 0.8692,
+          "context_composite_score": 0.7642,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5946,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2020,
+          "pool": null
+        },
+        {
+          "pmid": "30679319",
+          "citation_composite_score": 0.7568,
+          "context_composite_score": 0.6868,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5453,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2019,
+          "pool": null
+        },
+        {
+          "pmid": "30069772",
+          "citation_composite_score": 0.715,
+          "context_composite_score": 0.925,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.4,
+          "publication_type_context_score": 1.0,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "29739898",
+          "citation_composite_score": 0.75,
+          "context_composite_score": 0.68,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "29661733",
+          "citation_composite_score": 0.855,
+          "context_composite_score": 0.75,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "29327716",
+          "citation_composite_score": 0.855,
+          "context_composite_score": 0.75,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "29099503",
+          "citation_composite_score": 0.655,
+          "context_composite_score": 0.55,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 0.0,
+          "recency_score": 0.5,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2018,
+          "pool": null
+        },
+        {
+          "pmid": "28638113",
+          "citation_composite_score": 0.8488,
+          "context_composite_score": 0.7438,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.4585,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2017,
+          "pool": null
+        },
+        {
+          "pmid": "28573389",
+          "citation_composite_score": 0.8488,
+          "context_composite_score": 0.7438,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.4585,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2017,
+          "pool": null
+        },
+        {
+          "pmid": "26295973",
+          "citation_composite_score": 0.8378,
+          "context_composite_score": 0.7328,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.3856,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2015,
+          "pool": null
+        },
+        {
+          "pmid": "24756793",
+          "citation_composite_score": 0.693,
+          "context_composite_score": 0.903,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.3536,
+          "publication_type_citation_score": 0.4,
+          "publication_type_context_score": 1.0,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2014,
+          "pool": null
+        },
+        {
+          "pmid": "24419423",
+          "citation_composite_score": 0.833,
+          "context_composite_score": 0.728,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.3536,
+          "publication_type_citation_score": 0.8,
+          "publication_type_context_score": 0.5,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2014,
+          "pool": null
+        },
+        {
+          "pmid": "20228600",
+          "citation_composite_score": 0.7125,
+          "context_composite_score": 0.6425,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.25,
+          "publication_type_citation_score": 0.5,
+          "publication_type_context_score": 0.3,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2010,
+          "pool": null
+        },
+        {
+          "pmid": "20075203",
+          "citation_composite_score": 0.6075,
+          "context_composite_score": 0.59,
+          "query_tier_score": 1.0,
+          "fusion_cooccurrence_score": 1.0,
+          "recency_score": 0.25,
+          "publication_type_citation_score": 0.2,
+          "publication_type_context_score": 0.15,
+          "matched_query_tiers": [
+            "mesh_gene_name"
+          ],
+          "publication_year": 2010,
+          "pool": null
+        }
+      ],
+      "insufficient_evidence": false,
+      "evidence_support_score": 0.8,
+      "evidence_support_explanation": "Evidence support score 0.80: 4 verified PMID citation(s); 3+ verified PMIDs; human clinical evidence signal; high-impact journal signal; summary, rationale, and citations are all present. This score estimates literature grounding, not biological truth or clinical actionability.",
+      "cache_status": "refreshed",
+      "cache_reason": "computed_new_annotation",
+      "cached_at": null,
+      "last_pubmed_checked_at": null,
+      "error": null,
+      "timings_ms": {
+        "prevalence": 0.0,
+        "oncokb": 43.5,
+        "literature_retrieval": 100.57,
+        "paper_selection": 1565.9,
+        "openevidence": 146255.74,
+        "synthesis": 13585.84,
+        "total": 159965.61
+      }
+    }
+  ],
+  "fusion_evidence": [],
+  "timings_ms": {
+    "normalization": 323.7,
+    "annotation": 164413.93,
+    "total": 164737.68
+  }
+}

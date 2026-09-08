@@ -147,7 +147,10 @@ question asks. Narrower phrasing did not touch that mechanism.
 None of the 16 genes above exercise PR #76's new fusion-aware question path
 (`_build_question(gene, fusion=...)`), so this is a separate, single,
 enabled-only run of `EML4::ALK` via `python -m src.cli --fusions "EML4::ALK"`.
-It is **not** included in any aggregate or table above.
+It is **not** included in any aggregate or table above. Raw output (both
+genes' full annotations, including the OpenEvidence supplementary text and
+`supporting_quotes` referenced below) is committed at
+[`eml4_alk_fusion_qualitative.json`](results/openevidence_pointed_20260908/eml4_alk_fusion_qualitative.json).
 
 - **Default 60s OpenEvidence timeout was insufficient.** A first attempt at the
   default `openevidence_timeout_seconds=60` failed for both partner genes with
@@ -286,5 +289,6 @@ OPENEVIDENCE_ENABLED=true OPENEVIDENCE_TIMEOUT_SECONDS=900 uv run python -m src.
 - [This run's enabled arm](results/openevidence_pointed_20260908/enabled.json)
 - [This run's comparison](results/openevidence_pointed_20260908/comparison.json)
 - [This run's runtime versions/settings](results/openevidence_pointed_20260908/environment.json)
+- [EML4::ALK fusion qualitative case, raw output](results/openevidence_pointed_20260908/eml4_alk_fusion_qualitative.json)
 - [PR #75's report](openevidence_value_report.md) and its
   [historical comparison](results/openevidence_live_20260904/comparison.json)
