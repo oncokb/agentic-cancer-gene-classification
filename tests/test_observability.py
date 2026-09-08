@@ -324,5 +324,5 @@ def test_annotate_endpoint_records_user_header(monkeypatch):
     assert response.status_code == 200
     assert seen == {
         "user_id": "curator@example.com",
-        "tags": ["mode:core", "local_backend:sdk", "skip_literature_for_oncokb:False"],
+        "tags": ["mode:core", "local_backend:sdk", "skip_literature_for_oncokb:True"],
     }
