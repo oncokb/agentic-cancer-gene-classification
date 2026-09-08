@@ -214,9 +214,11 @@ def test_build_question_plain_gene_no_tumor_type():
 
 
 def test_build_question_plain_gene_with_tumor_type():
+    """tumor_type replaces the generic "cancer" context rather than being
+    appended after it — no awkward "...in cancer in breast cancer?" double-up."""
     assert _build_question("BRCA1", tumor_type="breast cancer") == (
         "Based on peer-reviewed evidence, is BRCA1 an oncogene or tumor "
-        "suppressor in cancer in breast cancer? State the classification and "
+        "suppressor in breast cancer? State the classification and "
         "the strongest supporting evidence."
     )
 
@@ -236,7 +238,7 @@ def test_build_question_fusion_gene():
 def test_build_question_fusion_gene_with_tumor_type():
     assert _build_question("ALK", tumor_type="NSCLC", fusion="EML4::ALK") == (
         "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
-        "in cancer in NSCLC? State the classification and the strongest "
+        "in NSCLC? State the classification and the strongest "
         "supporting evidence."
     )
 
@@ -260,7 +262,7 @@ async def test_get_gene_analysis_sends_fusion_specific_question_in_request_paylo
 
     assert captured["payload"]["text"] == (
         "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
-        "in cancer in NSCLC? State the classification and the strongest "
+        "in NSCLC? State the classification and the strongest "
         "supporting evidence."
     )
 

@@ -163,19 +163,24 @@ def _build_question(gene: str, tumor_type: Optional[str] = None, fusion: Optiona
     question instead of the general classification question, so the two
     partner genes of a fusion get a question about the fusion itself rather
     than each partner gene in isolation.
+
+    `tumor_type`, when present, replaces the generic "cancer" context rather
+    than being appended after it (avoiding an awkward "...in cancer in
+    breast cancer?" double-up) — tumor_type names are already
+    cancer-specific (e.g. "breast cancer", "melanoma", "NSCLC").
     """
-    tumor_note = f" in {tumor_type}" if tumor_type else ""
+    cancer_context = tumor_type if tumor_type else "cancer"
     if fusion:
         gene1, gene2 = split_fusion(fusion)
         if gene1 and gene2:
             return (
                 f"Based on peer-reviewed evidence, is the {gene1}::{gene2} fusion "
-                f"oncogenic in cancer{tumor_note}? State the classification and the "
+                f"oncogenic in {cancer_context}? State the classification and the "
                 "strongest supporting evidence."
             )
     return (
         f"Based on peer-reviewed evidence, is {gene} an oncogene or tumor "
-        f"suppressor in cancer{tumor_note}? State the classification and the "
+        f"suppressor in {cancer_context}? State the classification and the "
         "strongest supporting evidence."
     )
 
