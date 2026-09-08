@@ -81,8 +81,15 @@ async def _timed(name: str, timings: Dict[str, float], awaitable):
         timings[name] = _elapsed_ms(start)
 
 
-async def _maybe_fetch_openevidence_context(gene: str, tumor_type: Optional[str]):
+async def _maybe_fetch_openevidence_context(
+    gene: str, tumor_type: Optional[str], fusion: Optional[str] = None
+):
     """Fetch a supplementary OpenEvidence analysis when explicitly enabled.
+
+    `fusion` (the raw "GENE1::GENE2" input string this gene is a partner in,
+    if any — see _annotate_gene's call site) makes the question
+    fusion-specific rather than about `gene` in isolation; see
+    openevidence.py's _build_question.
 
     Returns None (never raises) when disabled or on any lookup failure — this
     is a best-effort supplementary input, not part of the core annotation
@@ -92,7 +99,9 @@ async def _maybe_fetch_openevidence_context(gene: str, tumor_type: Optional[str]
     if not settings.openevidence_enabled:
         return None
     try:
-        return await OpenEvidenceClient().get_gene_analysis(gene, tumor_type=tumor_type)
+        return await OpenEvidenceClient().get_gene_analysis(
+            gene, tumor_type=tumor_type, fusion=fusion
+        )
     except Exception as exc:
         logger.warning("OpenEvidence supplementary lookup failed for %s: %s", gene, exc)
         return None
@@ -453,17 +462,22 @@ async def _annotate_gene(
         # most directly relevant papers before synthesis to improve precision
         # without shrinking the recall pool.
         #
-        # The OpenEvidence lookup depends only on gene+tumor_type (not on
-        # paper_selection's output), so when enabled it runs CONCURRENTLY
-        # with paper_selection rather than serially after it — this was
-        # previously a fully serial extra hop between selection and
-        # synthesis, adding its full latency to the critical path even
-        # though nothing about it required waiting for selection to finish.
+        # The OpenEvidence lookup depends only on gene+tumor_type+the gene's
+        # associated fusion partner, if any (not on paper_selection's
+        # output), so when enabled it runs CONCURRENTLY with paper_selection
+        # rather than serially after it — this was previously a fully serial
+        # extra hop between selection and synthesis, adding its full latency
+        # to the critical path even though nothing about it required waiting
+        # for selection to finish.
         #
         # Guard on the flag here (not just inside the helper) so the disabled
         # path adds nothing to timings_ms and awaits nothing extra — zero
         # behavior change from current main when OPENEVIDENCE_ENABLED=false.
         if settings.openevidence_enabled:
+            # A gene can in principle appear in more than one submitted
+            # fusion; the question only needs one fusion-partner context, so
+            # the first is used deterministically.
+            fusion = fusions[0] if fusions else None
             selected_records, openevidence_context = await asyncio.gather(
                 _timed(
                     "paper_selection",
@@ -480,7 +494,7 @@ async def _annotate_gene(
                 _timed(
                     "openevidence",
                     timings,
-                    _maybe_fetch_openevidence_context(gene, tumor_type),
+                    _maybe_fetch_openevidence_context(gene, tumor_type, fusion=fusion),
                 ),
             )
         else:

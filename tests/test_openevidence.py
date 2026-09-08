@@ -25,6 +25,7 @@ from src.pipeline.openevidence import (
     OpenEvidenceClient,
     OpenEvidenceConfigurationError,
     _build_analysis,
+    _build_question,
     _iter_sse_payloads,
     _parse_sse_events,
     mark_refresh_attempted,
@@ -194,6 +195,74 @@ def test_build_analysis_ignores_table_events_without_crashing():
 
     assert analysis.text == "before after"
     assert analysis.citations == []
+
+
+# ---------------------------------------------------------------------------
+# _build_question: closed/pointed, gene-type-aware question text (replacing
+# the old open-ended "summarize the key clinical and molecular evidence" ask
+# — see benchmarks/openevidence_value_report.md on the
+# agcg-openevidence-benchmark branch for why that phrasing was a problem).
+# ---------------------------------------------------------------------------
+
+
+def test_build_question_plain_gene_no_tumor_type():
+    assert _build_question("TP53") == (
+        "Based on peer-reviewed evidence, is TP53 an oncogene or tumor "
+        "suppressor in cancer? State the classification and the strongest "
+        "supporting evidence."
+    )
+
+
+def test_build_question_plain_gene_with_tumor_type():
+    assert _build_question("BRCA1", tumor_type="breast cancer") == (
+        "Based on peer-reviewed evidence, is BRCA1 an oncogene or tumor "
+        "suppressor in cancer in breast cancer? State the classification and "
+        "the strongest supporting evidence."
+    )
+
+
+def test_build_question_fusion_gene():
+    """`fusion` is a raw "GENE1::GENE2" input string — the exact shape
+    orchestrator.py's _annotate_gene threads through from its
+    already-validated `fusions` list (see normalization.is_fusion_input),
+    not a hand-picked tuple of gene names."""
+    assert _build_question("ALK", fusion="EML4::ALK") == (
+        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
+        "in cancer? State the classification and the strongest supporting "
+        "evidence."
+    )
+
+
+def test_build_question_fusion_gene_with_tumor_type():
+    assert _build_question("ALK", tumor_type="NSCLC", fusion="EML4::ALK") == (
+        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
+        "in cancer in NSCLC? State the classification and the strongest "
+        "supporting evidence."
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_gene_analysis_sends_fusion_specific_question_in_request_payload():
+    """End-to-end: the fusion-aware question actually reaches the outgoing
+    HTTP request payload, not just _build_question's return value in
+    isolation."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, text=SSE_STREAM)
+
+    client = OpenEvidenceClient(api_key="test-key")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        await client.get_gene_analysis(
+            "ALK", tumor_type="NSCLC", fusion="EML4::ALK", client=http_client
+        )
+
+    assert captured["payload"]["text"] == (
+        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
+        "in cancer in NSCLC? State the classification and the strongest "
+        "supporting evidence."
+    )
 
 
 @pytest.mark.asyncio
