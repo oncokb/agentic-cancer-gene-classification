@@ -254,6 +254,23 @@ def require_dev_mode() -> None:
         raise HTTPException(status_code=404, detail="Not found")
 
 
+# Caps concurrent live OpenEvidence calls across ALL requests to
+# GET /v1/genes/{gene}/openevidence. OpenEvidence was deliberately removed
+# from annotation_gene_concurrency's gated critical path (see orchestrator.py's
+# _annotate_gene) — without a limiter here, a single batch-result page can
+# fire one call per rendered gene card the instant it loads (e.g. 20
+# concurrent 130-185s calls), with nothing left to throttle it. Keyed by the
+# effective limit (mirrors llm_client.py's _llm_semaphores pattern) so tests
+# that monkeypatch settings.openevidence_sidecar_concurrency get a fresh
+# semaphore for the new limit rather than reusing a stale one.
+_openevidence_sidecar_semaphores: Dict[int, asyncio.Semaphore] = {}
+
+
+def _openevidence_sidecar_semaphore() -> asyncio.Semaphore:
+    limit = max(1, settings.openevidence_sidecar_concurrency)
+    return _openevidence_sidecar_semaphores.setdefault(limit, asyncio.Semaphore(limit))
+
+
 _annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
 _annotation_jobs_lock = asyncio.Lock()
 _enrichment_jobs: Dict[str, EnrichmentJobStatusResponse] = {}
@@ -755,8 +772,11 @@ async def get_gene_openevidence(
 
     OpenEvidenceClient.get_gene_analysis already checks its Redis cache
     before making a live call, so a cache hit here returns immediately; a
-    miss executes the live call, caches the raw analysis, then this
-    endpoint deterministically distills it (no LLM call) before returning.
+    miss executes the live call (gated by _openevidence_sidecar_semaphore,
+    capping concurrent live calls across all requests to this endpoint —
+    see settings.openevidence_sidecar_concurrency), caches the raw analysis,
+    then this endpoint deterministically distills it (no LLM call) before
+    returning.
 
     Returns {"available": false} (never a 4xx/5xx) when OpenEvidence is
     disabled or the lookup fails, so the UI card can hide/gray itself out
@@ -765,9 +785,10 @@ async def get_gene_openevidence(
     if not settings.openevidence_enabled:
         return OpenEvidenceSidecarResponse(available=False)
     try:
-        analysis = await OpenEvidenceClient().get_gene_analysis(
-            gene, tumor_type=tumor_type, fusion=fusion
-        )
+        async with _openevidence_sidecar_semaphore():
+            analysis = await OpenEvidenceClient().get_gene_analysis(
+                gene, tumor_type=tumor_type, fusion=fusion
+            )
     except Exception as exc:
         logger.warning("OpenEvidence sidecar lookup failed for %s: %s", gene, exc)
         return OpenEvidenceSidecarResponse(available=False, error=str(exc))

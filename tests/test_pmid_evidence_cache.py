@@ -9,10 +9,12 @@ synthesis._build_user_prompt and need no external services.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from src.models.schema import LiteratureRecord, PMIDEvidenceRecord
-from src.pipeline import synthesis
+from src.models.schema import LiteratureRecord, PMIDEvidenceRecord, ResolvedGene
+from src.pipeline import orchestrator, synthesis
 from src.pipeline.run_store import RunStore
 
 _RAW_ABSTRACT = (
@@ -246,3 +248,195 @@ def test_build_user_prompt_mixes_cached_and_uncached_papers():
 
     assert "Summary: ALEX trial" in prompt
     assert "Abstract: This abstract has not been distilled yet." in prompt
+
+
+# ---------------------------------------------------------------------------
+# orchestrator._annotate_gene: fire-and-forget pmid_evidence distillation
+# ---------------------------------------------------------------------------
+
+
+class _FakeGeneStoreForDistillation:
+    def __init__(self, cached_evidence=None):
+        self.cached_evidence = cached_evidence or {}
+        self.saved_batches = []
+
+    async def get_pmid_evidence_batch(self, pmids):
+        return {pmid: self.cached_evidence[pmid] for pmid in pmids if pmid in self.cached_evidence}
+
+    async def save_pmid_evidence_batch(self, records):
+        self.saved_batches.append(records)
+
+
+def _fake_pipeline_functions(monkeypatch):
+    async def fake_check_oncokb_membership(gene, lookup=None):
+        return False
+
+    async def fake_retrieve_literature(*args, **kwargs):
+        return (
+            [
+                LiteratureRecord(
+                    pmid="30902613", title="Cached paper", abstract="abstract", journal="J"
+                ),
+                LiteratureRecord(
+                    pmid="11111111", title="Uncached paper", abstract="abstract", journal="J"
+                ),
+            ],
+            1,
+        )
+
+    async def fake_select_papers(*args, **kwargs):
+        return args[1]
+
+    async def fake_synthesize_gene_annotation(*args, **kwargs):
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Retrieved literature supports a cancer association.",
+            "gene_summary": "ALK has retrieved cancer evidence.",
+            "citations": ["30902613"],
+        }
+
+    monkeypatch.setattr(orchestrator, "check_oncokb_membership", fake_check_oncokb_membership)
+    monkeypatch.setattr(orchestrator, "retrieve_literature", fake_retrieve_literature)
+    monkeypatch.setattr(orchestrator, "select_papers_for_synthesis", fake_select_papers)
+    monkeypatch.setattr(
+        orchestrator, "synthesize_gene_annotation", fake_synthesize_gene_annotation
+    )
+
+
+async def test_annotate_gene_fires_distillation_only_for_uncached_pmids(monkeypatch):
+    _fake_pipeline_functions(monkeypatch)
+    calls = []
+
+    async def fake_distill_and_save(run_store, records):
+        calls.append([r.pmid for r in records])
+
+    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", fake_distill_and_save)
+    store = _FakeGeneStoreForDistillation(
+        cached_evidence={"30902613": PMIDEvidenceRecord(
+            pmid="30902613", title="t", journal="j", distilled_takeaway="already cached"
+        )}
+    )
+
+    await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+        unresolvable=False,
+        run_store=store,
+    )
+    await asyncio.sleep(0)  # let the fire-and-forget task get scheduled
+
+    assert calls == [["11111111"]]
+
+
+async def test_annotate_gene_skips_distillation_when_all_pmids_cached(monkeypatch):
+    _fake_pipeline_functions(monkeypatch)
+    calls = []
+
+    async def fake_distill_and_save(run_store, records):
+        calls.append(records)
+
+    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", fake_distill_and_save)
+    store = _FakeGeneStoreForDistillation(
+        cached_evidence={
+            "30902613": PMIDEvidenceRecord(pmid="30902613", title="t", journal="j", distilled_takeaway="x"),
+            "11111111": PMIDEvidenceRecord(pmid="11111111", title="t", journal="j", distilled_takeaway="y"),
+        }
+    )
+
+    await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+        unresolvable=False,
+        run_store=store,
+    )
+    await asyncio.sleep(0)
+
+    assert calls == []
+
+
+async def test_annotate_gene_skips_distillation_in_local_mode(monkeypatch):
+    _fake_pipeline_functions(monkeypatch)
+
+    async def fail_if_called(run_store, records):
+        raise AssertionError("distillation should be skipped in local_mode")
+
+    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", fail_if_called)
+    store = _FakeGeneStoreForDistillation()
+
+    await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+        unresolvable=False,
+        run_store=store,
+        local_mode=True,
+    )
+    await asyncio.sleep(0)
+
+
+async def test_annotate_gene_skips_distillation_when_run_store_none(monkeypatch):
+    _fake_pipeline_functions(monkeypatch)
+
+    async def fail_if_called(run_store, records):
+        raise AssertionError("distillation should be skipped without a run_store")
+
+    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", fail_if_called)
+
+    await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+        unresolvable=False,
+        run_store=None,
+    )
+    await asyncio.sleep(0)
+
+
+async def test_annotate_gene_skips_distillation_when_disabled_via_settings(monkeypatch):
+    _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", False)
+
+    async def fail_if_called(run_store, records):
+        raise AssertionError("distillation should be skipped when disabled")
+
+    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", fail_if_called)
+    store = _FakeGeneStoreForDistillation()
+
+    await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+        unresolvable=False,
+        run_store=store,
+    )
+    await asyncio.sleep(0)
+
+
+async def test_annotate_gene_returns_without_waiting_for_distillation_to_finish(monkeypatch):
+    """The distillation task must be fire-and-forget: _annotate_gene returns
+    even though the fake distillation below never completes on its own."""
+    _fake_pipeline_functions(monkeypatch)
+    never_finishes = asyncio.Event()
+
+    async def hanging_distill(run_store, records):
+        await never_finishes.wait()
+
+    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", hanging_distill)
+    store = _FakeGeneStoreForDistillation()
+
+    annotation = await asyncio.wait_for(
+        orchestrator._annotate_gene(
+            gene="ALK",
+            fusions=[],
+            resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+            unresolvable=False,
+            run_store=store,
+        ),
+        timeout=2,
+    )
+
+    assert annotation.gene == "ALK"
+    never_finishes.set()  # let the background task clean up rather than leak

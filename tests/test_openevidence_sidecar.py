@@ -12,6 +12,8 @@ returned.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi.testclient import TestClient
 
 from src import main
@@ -259,3 +261,79 @@ async def test_annotate_gene_never_touches_openevidence_even_when_enabled(monkey
 
     assert "openevidence" not in annotation.timings_ms
     assert annotation.timings_ms["total"] < 15000
+
+
+# ---------------------------------------------------------------------------
+# Sidecar endpoint concurrency limiter: a batch result page can render one
+# card per gene, each firing its own request the instant it mounts. Without
+# a limiter, that's N concurrent live OpenEvidence calls with nothing left
+# to throttle them once OpenEvidence was taken off annotation_gene_concurrency's
+# gated path (see orchestrator.py's _annotate_gene). settings.openevidence_
+# sidecar_concurrency caps concurrent live calls across ALL requests to this
+# endpoint (see main.py's _openevidence_sidecar_semaphore).
+# ---------------------------------------------------------------------------
+
+
+async def test_openevidence_sidecar_endpoint_caps_concurrent_live_calls(monkeypatch):
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+    monkeypatch.setattr(main.settings, "openevidence_sidecar_concurrency", 1)
+    # Force a fresh semaphore for this test's limit value rather than reusing
+    # one created (at a different limit) by an earlier test in this process.
+    main._openevidence_sidecar_semaphores.clear()
+
+    active = 0
+    max_observed_active = 0
+    release = asyncio.Event()
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        nonlocal active, max_observed_active
+        active += 1
+        max_observed_active = max(max_observed_active, active)
+        await release.wait()
+        active -= 1
+        return _ALK_ANALYSIS
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+
+    calls = asyncio.gather(
+        main.get_gene_openevidence("ALK"),
+        main.get_gene_openevidence("BRAF"),
+        main.get_gene_openevidence("EGFR"),
+    )
+    await asyncio.sleep(0.05)  # let all three requests reach the semaphore
+    assert max_observed_active == 1  # never more than the configured cap of 1
+    release.set()
+    results = await calls
+
+    assert all(result.available for result in results)
+
+
+async def test_openevidence_sidecar_endpoint_allows_concurrency_up_to_the_configured_cap(
+    monkeypatch,
+):
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+    monkeypatch.setattr(main.settings, "openevidence_sidecar_concurrency", 2)
+    main._openevidence_sidecar_semaphores.clear()
+
+    active = 0
+    max_observed_active = 0
+    release = asyncio.Event()
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        nonlocal active, max_observed_active
+        active += 1
+        max_observed_active = max(max_observed_active, active)
+        await release.wait()
+        active -= 1
+        return _ALK_ANALYSIS
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+
+    calls = asyncio.gather(
+        main.get_gene_openevidence("ALK"),
+        main.get_gene_openevidence("BRAF"),
+    )
+    await asyncio.sleep(0.05)
+    assert max_observed_active == 2  # both allowed through at once, matching the cap
+    release.set()
+    await calls

@@ -33,6 +33,7 @@ from src.pipeline.literature import (
 )
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
+from src.pipeline.pmid_distillation import distill_and_save_pmid_evidence
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
@@ -40,6 +41,19 @@ from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annota
 logger = logging.getLogger(__name__)
 AnnotationProgressCallback = Callable[[GeneAnnotation], Union[Awaitable[None], None]]
 AnnotationTotalCallback = Callable[[int], Union[Awaitable[None], None]]
+
+# asyncio.create_task() only keeps a weak reference via the event loop — an
+# unreferenced task can be garbage-collected mid-execution. This set holds a
+# strong reference for the life of each fire-and-forget pmid_evidence
+# distillation task (see _annotate_gene), with the done-callback removing it
+# once finished so the set doesn't grow unbounded.
+_pmid_distillation_tasks: set[asyncio.Task] = set()
+
+
+def _track_pmid_distillation_task(coro) -> None:
+    task = asyncio.create_task(coro)
+    _pmid_distillation_tasks.add(task)
+    task.add_done_callback(_pmid_distillation_tasks.discard)
 
 
 def _elapsed_ms(start: float) -> float:
@@ -421,6 +435,22 @@ async def _annotate_gene(
         pmid_evidence = await _fetch_pmid_evidence(
             run_store, [record.pmid for record in selected_records]
         )
+
+        # Populate the pmid_evidence cache for next time — fired here (not
+        # awaited) so distillation runs concurrently with synthesis below and
+        # never adds latency to this annotation. Only for papers this call
+        # didn't already find cached; a distillation is a one-time cost per
+        # PMID that every future gene/fusion retrieving it then skips.
+        # Skipped in local_mode (dev/benchmark runs) to avoid spamming the
+        # shared cache with dev-only LLM output.
+        if run_store is not None and not local_mode and settings.pmid_distillation_enabled:
+            uncached_records = [
+                record for record in selected_records if record.pmid not in pmid_evidence
+            ]
+            if uncached_records:
+                _track_pmid_distillation_task(
+                    distill_and_save_pmid_evidence(run_store, uncached_records)
+                )
 
         try:
             synthesis = await _timed(

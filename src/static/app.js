@@ -1856,6 +1856,35 @@ function renderDomainsAndTreatments(annotation) {
 // rendering the core annotation card above it — see applyResultsViewMode.
 // ---------------------------------------------------------------------------
 
+// Caps how many /v1/genes/{gene}/openevidence fetches run at once from this
+// page. Without this, rendering a large batch result fires one fetch per
+// gene card the instant the list mounts — the server has its own limiter
+// (settings.openevidence_sidecar_concurrency) protecting the vendor call
+// itself, but queuing client-side too avoids opening a pile of simultaneous
+// requests (and showing every card's spinner at once) for no benefit.
+const OPENEVIDENCE_MAX_CONCURRENT_FETCHES = 3;
+let openEvidenceActiveFetchCount = 0;
+const openEvidenceFetchQueue = [];
+
+function runOpenEvidenceFetchQueue() {
+  while (
+    openEvidenceActiveFetchCount < OPENEVIDENCE_MAX_CONCURRENT_FETCHES &&
+    openEvidenceFetchQueue.length
+  ) {
+    const job = openEvidenceFetchQueue.shift();
+    openEvidenceActiveFetchCount += 1;
+    job().finally(() => {
+      openEvidenceActiveFetchCount -= 1;
+      runOpenEvidenceFetchQueue();
+    });
+  }
+}
+
+function enqueueOpenEvidenceFetch(job) {
+  openEvidenceFetchQueue.push(job);
+  runOpenEvidenceFetchQueue();
+}
+
 function fetchGeneOpenEvidence(gene, tumorType) {
   const key = `${gene}|${tumorType || ""}`;
   if (state.openEvidenceByGene[key]) {
@@ -1972,9 +2001,11 @@ function renderOpenEvidenceCard(annotation) {
   const body = card.querySelector(".openevidence-card-body");
   body.appendChild(renderLoadingState("Checking OpenEvidence…"));
 
-  fetchGeneOpenEvidence(annotation.gene, tumorTypeForAnnotation(annotation))
-    .then((response) => renderOpenEvidenceCardBody(card, body, response))
-    .catch(() => card.remove());
+  enqueueOpenEvidenceFetch(() =>
+    fetchGeneOpenEvidence(annotation.gene, tumorTypeForAnnotation(annotation))
+      .then((response) => renderOpenEvidenceCardBody(card, body, response))
+      .catch(() => card.remove())
+  );
 
   return card;
 }
