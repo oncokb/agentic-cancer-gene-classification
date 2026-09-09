@@ -397,6 +397,7 @@ def _build_evidence_cards(
                 evidence_type=evidence_type,
                 selected_reason=selected_reason,
                 quote=quote_by_pmid.get(pmid) or _fallback_quote(record),
+                abstract=record.abstract or None,
             )
         )
     return cards

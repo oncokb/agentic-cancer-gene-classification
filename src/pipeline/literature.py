@@ -401,6 +401,7 @@ def _build_fusion_evidence_cards(
                 evidence_type=evidence_type,
                 selected_reason=selected_reason,
                 quote=_record_quote(record),
+                abstract=record.abstract or None,
             )
         )
     return cards
@@ -599,6 +600,7 @@ def _fusion_partner_evidence_cards(records: List[LiteratureRecord], limit: int =
                 evidence_type=evidence_type,
                 selected_reason=selected_reason,
                 quote=_record_quote(record),
+                abstract=record.abstract or None,
             )
         )
     return cards

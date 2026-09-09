@@ -69,6 +69,7 @@ class EvidenceCard(BaseModel):
     evidence_type: str = "other"
     selected_reason: str = ""
     quote: Optional[str] = None
+    abstract: Optional[str] = None
 
 
 class FusionEvidenceCard(EvidenceCard):

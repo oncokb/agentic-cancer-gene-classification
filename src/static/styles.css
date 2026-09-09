@@ -1367,6 +1367,53 @@ details[open] > .retrieval-summary::after {
   text-decoration: none;
 }
 
+.pmid-pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.pmid-abstract-tooltip {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 30;
+  width: 320px;
+  max-width: 80vw;
+  max-height: 260px;
+  overflow-y: auto;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  white-space: normal;
+  text-align: left;
+  cursor: text;
+}
+
+.pmid-abstract-tooltip-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.pmid-pill:hover .pmid-abstract-tooltip,
+.pmid-pill:focus-within .pmid-abstract-tooltip,
+.pmid-abstract-tooltip:hover {
+  display: block;
+}
+
 .evidence-card h5 {
   margin: 0 0 4px;
   font-size: 13px;
