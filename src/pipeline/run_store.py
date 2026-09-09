@@ -11,12 +11,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import aiomysql
 
 from src.config import settings
-from src.models.schema import GeneAnnotation
+from src.models.schema import GeneAnnotation, PMIDEvidenceRecord
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,24 @@ CREATE TABLE IF NOT EXISTS gene_annotations (
     INDEX idx_gene_annotations_gene (gene),
     INDEX idx_gene_annotations_updated_at (updated_at),
     INDEX idx_gene_annotations_last_pubmed_checked_at (last_pubmed_checked_at)
+)
+"""
+
+_CREATE_PMID_EVIDENCE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS pmid_evidence (
+    pmid VARCHAR(16) PRIMARY KEY,
+    doi VARCHAR(128) NULL,
+    title VARCHAR(512) NOT NULL,
+    journal VARCHAR(128) NOT NULL,
+    publication_year INT NULL,
+    evidence_type ENUM('clinical', 'preclinical', 'case_report', 'review', 'other') DEFAULT 'other',
+    oncogenic_role ENUM('oncogene', 'tumor_suppressor', 'resistance', 'neutral', 'unknown') DEFAULT 'unknown',
+    distilled_takeaway TEXT NOT NULL,
+    supporting_quote TEXT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_journal (journal),
+    INDEX idx_evidence_type (evidence_type)
 )
 """
 
@@ -136,6 +154,7 @@ class RunStore:
                 await cursor.execute(_CREATE_TABLE_SQL)
                 await cursor.execute(_CREATE_GENE_TABLE_SQL)
                 await self._ensure_gene_annotation_schema(cursor)
+                await cursor.execute(_CREATE_PMID_EVIDENCE_TABLE_SQL)
                 await cursor.execute(_CREATE_FEEDBACK_TABLE_SQL)
 
     async def _ensure_gene_annotation_schema(self, cursor) -> None:
@@ -298,6 +317,87 @@ class RunStore:
                         """,
                         (checked, json.dumps(payload), gene, cache_tumor_type),
                     )
+
+    async def get_pmid_evidence_batch(self, pmids: List[str]) -> Dict[str, PMIDEvidenceRecord]:
+        """Return cached distilled-abstract records for any of `pmids` that
+        have already been distilled, keyed by PMID. PMIDs with no cached
+        record are simply absent from the result — callers fall back to the
+        raw abstract for those (see synthesis.py's _build_user_prompt)."""
+        if not pmids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(pmids))
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    SELECT pmid, doi, title, journal, publication_year, evidence_type,
+                           oncogenic_role, distilled_takeaway, supporting_quote,
+                           created_at, updated_at
+                    FROM pmid_evidence
+                    WHERE pmid IN ({placeholders})
+                    """,
+                    tuple(pmids),
+                )
+                rows = await cursor.fetchall()
+        records: Dict[str, PMIDEvidenceRecord] = {}
+        for row in rows:
+            record = PMIDEvidenceRecord(
+                pmid=row[0],
+                doi=row[1],
+                title=row[2],
+                journal=row[3],
+                publication_year=row[4],
+                evidence_type=row[5],
+                oncogenic_role=row[6],
+                distilled_takeaway=row[7],
+                supporting_quote=row[8],
+                created_at=_from_mysql_datetime(row[9]),
+                updated_at=_from_mysql_datetime(row[10]),
+            )
+            records[record.pmid] = record
+        return records
+
+    async def save_pmid_evidence_batch(self, records: List[PMIDEvidenceRecord]) -> None:
+        """Upsert distilled-abstract records. Published papers are permanent
+        historical records, so — unlike the gene-annotation cache above —
+        there is no TTL/age-based eviction here; a record is only ever
+        overwritten by a fresher distillation of the same PMID."""
+        if not records:
+            return
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(
+                    """
+                    INSERT INTO pmid_evidence (
+                        pmid, doi, title, journal, publication_year, evidence_type,
+                        oncogenic_role, distilled_takeaway, supporting_quote
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        doi = VALUES(doi),
+                        title = VALUES(title),
+                        journal = VALUES(journal),
+                        publication_year = VALUES(publication_year),
+                        evidence_type = VALUES(evidence_type),
+                        oncogenic_role = VALUES(oncogenic_role),
+                        distilled_takeaway = VALUES(distilled_takeaway),
+                        supporting_quote = VALUES(supporting_quote)
+                    """,
+                    [
+                        (
+                            record.pmid,
+                            record.doi,
+                            record.title,
+                            record.journal,
+                            record.publication_year,
+                            record.evidence_type,
+                            record.oncogenic_role,
+                            record.distilled_takeaway,
+                            record.supporting_quote,
+                        )
+                        for record in records
+                    ],
+                )
 
     async def save_feedback(
         self,
