@@ -56,6 +56,10 @@ def test_high_confidence_actionability_requires_verified_clinical_support():
     assert "crizotinib" in direct_component.detail.lower()
     assert "kinase domain" in direct_component.detail.lower()
     assert result.evidence[0].domains == ["kinase domain"]
+    assert result.evidence[0].abstract == (
+        "Patients with lung adenocarcinoma harboring ALK fusion retained "
+        "the kinase domain and responded to crizotinib inhibitor therapy."
+    )
 
 
 def test_preclinical_only_actionability_stays_hidden_below_threshold():

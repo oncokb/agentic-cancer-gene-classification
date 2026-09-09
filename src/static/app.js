@@ -2493,14 +2493,21 @@ function renderClinicalActionability(annotation) {
   summary.textContent = actionability.summary || "";
   section.appendChild(summary);
 
+  // actionability.evidence carries each supporting pmid's abstract (see
+  // clinical_actionability.py's evidence_entries); reuse it for the same
+  // hover tooltip the "Cited on PubMed" pills use.
+  const abstractByPmid = new Map(
+    (actionability.evidence || []).filter((e) => e.abstract).map((e) => [e.pmid, e.abstract])
+  );
+
   if (actionability.pmids?.length) {
     const links = document.createElement("div");
     links.className = "citation-link-list";
-    actionability.pmids.forEach((pmid) => links.appendChild(makePubMedLink(pmid)));
+    actionability.pmids.forEach((pmid) => links.appendChild(makePubMedLink(pmid, abstractByPmid.get(pmid))));
     section.appendChild(links);
   }
 
-  const breakdown = renderClinicalActionabilityBreakdown(actionability);
+  const breakdown = renderClinicalActionabilityBreakdown(actionability, abstractByPmid);
   if (breakdown) section.appendChild(breakdown);
 
   if (actionability.confidence_explanation) {
@@ -2513,7 +2520,7 @@ function renderClinicalActionability(annotation) {
   return section;
 }
 
-function renderClinicalActionabilityBreakdown(actionability) {
+function renderClinicalActionabilityBreakdown(actionability, abstractByPmid) {
   const components = actionability.score_components || [];
   if (!components.length) return null;
 
@@ -2553,7 +2560,7 @@ function renderClinicalActionabilityBreakdown(actionability) {
     if (component.pmids?.length) {
       const pmids = document.createElement("div");
       pmids.className = "citation-link-list";
-      component.pmids.forEach((pmid) => pmids.appendChild(makePubMedLink(pmid)));
+      component.pmids.forEach((pmid) => pmids.appendChild(makePubMedLink(pmid, abstractByPmid.get(pmid))));
       body.appendChild(pmids);
     }
 
