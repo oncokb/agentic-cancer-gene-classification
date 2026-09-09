@@ -1493,10 +1493,7 @@ function renderFusionEvidenceView(fusionEvidence) {
         itemCard.className = "evidence-card";
         const evidenceType = String(evidenceCard.evidence_type || "fusion").replace(/_/g, " ");
         itemCard.innerHTML = `
-          <div class="evidence-card-topline">
-            <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(evidenceCard.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(evidenceCard.pmid)}</a>
-            <span class="review-badge context">${escapeHtml(evidenceType)}</span>
-          </div>
+          ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
           <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
           <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
           ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
@@ -1529,6 +1526,27 @@ function makePubMedLink(pmid) {
   a.className = "citation-link";
   a.textContent = pmid;
   return a;
+}
+
+// Evidence-card PMID link + evidence-type badge, with the paper's abstract
+// (when available) shown in a hover/focus tooltip so curators can read it
+// without leaving the page.
+function evidenceCardTopline(pmid, evidenceType, abstract) {
+  const abstractTooltip = abstract
+    ? `<span class="pmid-abstract-tooltip" role="tooltip">
+        <span class="pmid-abstract-tooltip-label">Abstract</span>
+        ${escapeHtml(abstract)}
+      </span>`
+    : "";
+  return `
+    <div class="evidence-card-topline">
+      <span class="pmid-pill">
+        <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(pmid)}</a>
+        ${abstractTooltip}
+      </span>
+      <span class="review-badge context">${escapeHtml(evidenceType)}</span>
+    </div>
+  `;
 }
 
 function renderSupportingEvidence(annotation) {
@@ -1607,10 +1625,7 @@ function renderSupportingEvidence(annotation) {
       item.className = "evidence-card";
       const evidenceType = String(card.evidence_type || "other").replace(/_/g, " ");
       item.innerHTML = `
-        <div class="evidence-card-topline">
-          <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(card.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(card.pmid)}</a>
-          <span class="review-badge context">${escapeHtml(evidenceType)}</span>
-        </div>
+        ${evidenceCardTopline(card.pmid, evidenceType, card.abstract)}
         <h5>${escapeHtml(card.title || "Untitled PubMed record")}</h5>
         <p class="evidence-card-meta">${escapeHtml(card.journal || "Journal unavailable")}</p>
         ${card.selected_reason ? `<p>${escapeHtml(card.selected_reason)}</p>` : ""}
@@ -1938,10 +1953,7 @@ function renderFusionPartnerResultBody(container, data) {
       itemCard.className = "evidence-card";
       const evidenceType = String(evidenceCard.evidence_type || "fusion").replace(/_/g, " ");
       itemCard.innerHTML = `
-        <div class="evidence-card-topline">
-          <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(evidenceCard.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(evidenceCard.pmid)}</a>
-          <span class="review-badge context">${escapeHtml(evidenceType)}</span>
-        </div>
+        ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
         <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
         <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
         ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}

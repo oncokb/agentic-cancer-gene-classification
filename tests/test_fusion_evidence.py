@@ -91,6 +91,11 @@ async def test_retrieve_fusion_evidence_uses_cache_and_marks_supported(monkeypat
     assert result.retrieved_count == 2
     assert set(result.pmids) == {"1", "2"}
     assert result.evidence_cards[0].fusion == "EML4::ALK"
+    cards_by_pmid = {card.pmid: card for card in result.evidence_cards}
+    assert (
+        cards_by_pmid["1"].abstract
+        == "Patients with EML4-ALK lung cancer respond to kinase inhibitors."
+    )
     assert cache_keys[0][0].startswith("fusion_evidence:")
     assert cache_keys[0][1] == 123
 

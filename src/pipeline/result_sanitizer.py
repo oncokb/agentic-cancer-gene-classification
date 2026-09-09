@@ -102,7 +102,7 @@ def _fusion_card_as_record(card) -> LiteratureRecord:
     return LiteratureRecord(
         pmid=card.pmid,
         title=card.title,
-        abstract=card.quote or "",
+        abstract=card.abstract or card.quote or "",
         journal=card.journal,
         publication_types=[],
     )
