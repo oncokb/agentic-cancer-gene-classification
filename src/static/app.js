@@ -124,6 +124,8 @@ const elements = {
   batchGridBody: document.querySelector("#batch-grid-body"),
   addRowBtn: document.querySelector("#add-row-btn"),
   batchHint: document.querySelector("#batch-hint"),
+  batchUploadBtn: document.querySelector("#batch-upload-btn"),
+  batchUploadInput: document.querySelector("#batch-upload-input"),
   // dev-mode annotation backend
   annotateBackendField: document.querySelector("#annotate-backend-field"),
   annotateLocalBackend: document.querySelector("#annotate-local-backend"),
@@ -589,6 +591,126 @@ function handleGridClick(event) {
   }
   state.batchRows.splice(rIdx, 1);
   renderGrid();
+}
+
+// A cell counts as a match for a GRID_COLUMNS entry if it equals that
+// column's machine key (e.g. "tumor_type") OR its on-screen label (e.g.
+// "Tumor Type"), letter/digit comparison only — so "5' Exon", "5′ Exon", and
+// "5 Exon" all match "5′ Exon" the same way.
+function normalizeHeaderCell(value) {
+  return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+const HEADER_ALIASES = new Map();
+GRID_COLUMNS.forEach((col) => {
+  HEADER_ALIASES.set(normalizeHeaderCell(col.key), col.key);
+  HEADER_ALIASES.set(normalizeHeaderCell(col.label), col.key);
+});
+
+// Real gene/fusion identifiers (ALK, EML4::ALK, HLA-A, ...) never contain
+// whitespace and are never this long. A parsed value that fails this is
+// almost certainly not one — most likely an unrecognized header cell that
+// fell through to positional parsing (see parseBatchFileText), or a wrong
+// file (binary, wrong delimiter) landing in this column. Caught here so it
+// doesn't get silently queued as a "gene" to annotate.
+const PLAUSIBLE_FUSION_PATTERN = /^\S{1,120}$/;
+
+// Parses uploaded TSV/CSV file text into grid rows. Tab-delimited when the
+// first line contains a tab, else comma. A header row is recognized when at
+// least one of its cells matches a known column (see HEADER_ALIASES); its
+// unrecognized cells are reported back as ignoredColumns so a superset of
+// fields degrades to "we only used the ones we needed" instead of silent
+// misalignment. With no recognized header, columns are read positionally in
+// the same order as the visible grid — the same fallback handleGridPaste
+// uses, so a genuinely headerless file still loads.
+function parseBatchFileText(text) {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length);
+  if (!lines.length) {
+    return { rows: [], headerDetected: false, ignoredColumns: [], missingRequiredColumn: false };
+  }
+
+  const hasTabs = lines[0].includes("\t");
+  const sep = hasTabs ? "\t" : ",";
+  const firstLineCells = lines[0].split(sep).map((v) => v.trim());
+  const firstLineKeys = firstLineCells.map((v) => HEADER_ALIASES.get(normalizeHeaderCell(v)) || null);
+  const headerDetected = firstLineKeys.some(Boolean);
+
+  let colMap;
+  let dataFrom;
+  let ignoredColumns = [];
+  if (headerDetected) {
+    colMap = firstLineKeys;
+    ignoredColumns = firstLineCells.filter((_, cIdx) => !firstLineKeys[cIdx]);
+    dataFrom = 1;
+  } else {
+    colMap = GRID_COLUMNS.map((c) => c.key);
+    dataFrom = 0;
+  }
+
+  const requiredKey = GRID_COLUMNS.find((c) => c.required).key;
+  const missingRequiredColumn = headerDetected && !colMap.includes(requiredKey);
+
+  const rows = lines.slice(dataFrom).map((line) => {
+    const cols = line.split(sep);
+    const row = emptyRow();
+    colMap.forEach((key, cIdx) => {
+      if (!key) return;
+      row[key] = (cols[cIdx] || "").trim();
+    });
+    if (row.fusion && !PLAUSIBLE_FUSION_PATTERN.test(row.fusion)) row.fusion = "";
+    return row;
+  });
+
+  return { rows, headerDetected, ignoredColumns, missingRequiredColumn };
+}
+
+function handleBatchFileUpload(event) {
+  const file = event.target.files?.[0];
+  event.target.value = ""; // allow re-selecting the same file later
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    const { rows, headerDetected, ignoredColumns, missingRequiredColumn } =
+      parseBatchFileText(String(reader.result || ""));
+    const requiredLabel = GRID_COLUMNS.find((c) => c.required).label;
+
+    if (missingRequiredColumn) {
+      elements.batchHint.textContent =
+        `${file.name}: no "${requiredLabel}" column found in the header — nothing loaded. ` +
+        `Rename that column to "${requiredLabel}" (or "fusion") and re-upload.`;
+      return;
+    }
+
+    const withFusion = rows.filter((row) => row.fusion.trim());
+    if (!withFusion.length) {
+      elements.batchHint.textContent = headerDetected
+        ? `${file.name}: header recognized, but no row had a "${requiredLabel}" value.`
+        : `No valid rows found in ${file.name}. If your columns aren't in the form's ` +
+          `default order, add a header row naming them (e.g. "fusion, tumor_type").`;
+      return;
+    }
+
+    state.batchRows = rows;
+    renderGrid();
+
+    const notes = [`Loaded ${withFusion.length} input${withFusion.length === 1 ? "" : "s"} from ${file.name}.`];
+    if (!headerDetected) {
+      notes.push(`No header row recognized — columns were read positionally, matching the grid's column order.`);
+    }
+    if (ignoredColumns.length) {
+      notes.push(`Ignored unrecognized column${ignoredColumns.length === 1 ? "" : "s"}: ${ignoredColumns.join(", ")}.`);
+    }
+    const droppedCount = rows.length - withFusion.length;
+    if (droppedCount > 0) {
+      notes.push(`Skipped ${droppedCount} row${droppedCount === 1 ? "" : "s"} missing a valid "${requiredLabel}" value.`);
+    }
+    elements.batchHint.textContent = notes.join(" ");
+  };
+  reader.onerror = () => {
+    elements.batchHint.textContent = `Could not read ${file.name}.`;
+  };
+  reader.readAsText(file);
 }
 
 function getGridData() {
@@ -2874,6 +2996,9 @@ function bindEvents() {
     state.batchRows.push(emptyRow());
     renderGrid({ row: state.batchRows.length - 1, col: 0 });
   });
+
+  elements.batchUploadBtn.addEventListener("click", () => elements.batchUploadInput.click());
+  elements.batchUploadInput.addEventListener("change", handleBatchFileUpload);
 
   elements.shareRun.addEventListener("click", copyShareLink);
   elements.clearResults.addEventListener("click", clearResults);
