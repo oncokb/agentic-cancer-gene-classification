@@ -124,6 +124,8 @@ const elements = {
   batchGridBody: document.querySelector("#batch-grid-body"),
   addRowBtn: document.querySelector("#add-row-btn"),
   batchHint: document.querySelector("#batch-hint"),
+  batchUploadBtn: document.querySelector("#batch-upload-btn"),
+  batchUploadInput: document.querySelector("#batch-upload-input"),
   // dev-mode annotation backend
   annotateBackendField: document.querySelector("#annotate-backend-field"),
   annotateLocalBackend: document.querySelector("#annotate-local-backend"),
@@ -589,6 +591,67 @@ function handleGridClick(event) {
   }
   state.batchRows.splice(rIdx, 1);
   renderGrid();
+}
+
+// Parses uploaded TSV/CSV file text into grid rows, using the same
+// header-detection and delimiter-detection rules as handleGridPaste (a known
+// header row matching GRID_COLUMNS keys, else positional columns in grid
+// order; tab-delimited when the first line contains a tab, else comma).
+function parseBatchFileText(text) {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length);
+  if (!lines.length) return [];
+
+  const hasTabs = lines[0].includes("\t");
+  const sep = hasTabs ? "\t" : ",";
+  const firstLineParts = lines[0].split(sep).map((v) => v.trim().toLowerCase());
+  const isHeader = firstLineParts.some((v) => GRID_COLUMNS.some((c) => c.key === v));
+
+  let colMap;
+  let dataFrom;
+  if (isHeader) {
+    colMap = firstLineParts.map((v) => {
+      const col = GRID_COLUMNS.find((c) => c.key === v);
+      return col ? col.key : null;
+    });
+    dataFrom = 1;
+  } else {
+    colMap = GRID_COLUMNS.map((c) => c.key);
+    dataFrom = 0;
+  }
+
+  return lines.slice(dataFrom).map((line) => {
+    const cols = line.split(sep);
+    const row = emptyRow();
+    colMap.forEach((key, cIdx) => {
+      if (!key) return;
+      row[key] = (cols[cIdx] || "").trim();
+    });
+    return row;
+  });
+}
+
+function handleBatchFileUpload(event) {
+  const file = event.target.files?.[0];
+  event.target.value = ""; // allow re-selecting the same file later
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    const rows = parseBatchFileText(String(reader.result || ""));
+    const withFusion = rows.filter((row) => row.fusion.trim());
+    if (!withFusion.length) {
+      elements.batchHint.textContent = `No valid rows found in ${file.name}.`;
+      return;
+    }
+    state.batchRows = rows;
+    renderGrid();
+    elements.batchHint.textContent =
+      `Loaded ${withFusion.length} input${withFusion.length === 1 ? "" : "s"} from ${file.name}.`;
+  };
+  reader.onerror = () => {
+    elements.batchHint.textContent = `Could not read ${file.name}.`;
+  };
+  reader.readAsText(file);
 }
 
 function getGridData() {
@@ -2866,6 +2929,9 @@ function bindEvents() {
     state.batchRows.push(emptyRow());
     renderGrid({ row: state.batchRows.length - 1, col: 0 });
   });
+
+  elements.batchUploadBtn.addEventListener("click", () => elements.batchUploadInput.click());
+  elements.batchUploadInput.addEventListener("change", handleBatchFileUpload);
 
   elements.shareRun.addEventListener("click", copyShareLink);
   elements.clearResults.addEventListener("click", clearResults);
