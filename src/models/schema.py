@@ -135,6 +135,7 @@ class ClinicalActionabilityEvidence(BaseModel):
     domains: List[str] = Field(default_factory=list)
     matched_terms: List[str] = Field(default_factory=list)
     quote: Optional[str] = None
+    abstract: Optional[str] = None
 
 
 class ClinicalActionabilityScoreComponent(BaseModel):
