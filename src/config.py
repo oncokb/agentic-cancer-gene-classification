@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     selection_model: str = "claude-haiku-4-5-20251001"
     feedback_model: str = "claude-haiku-4-5-20251001"
     retrieval_model: str = "claude-haiku-4-5-20251001"
+
+    # Background (fire-and-forget, never blocking annotation) distillation of
+    # retrieved abstracts into the permanent pmid_evidence cache — see
+    # src/pipeline/pmid_distillation.py and orchestrator.py's _annotate_gene.
+    pmid_distillation_enabled: bool = True
+    pmid_distillation_model: str = "claude-haiku-4-5-20251001"
     bedrock_synthesis_model: str = ""
     bedrock_synthesis_fast_model: str = ""
     bedrock_selection_model: str = ""
@@ -164,6 +170,13 @@ class Settings(BaseSettings):
     # annotation entirely — would re-trigger a full re-synthesis attempt on
     # every single subsequent read of that gene, forever.
     openevidence_refresh_cooldown_seconds: int = 900
+    # Caps concurrent live OpenEvidence calls across ALL requests to
+    # GET /v1/genes/{gene}/openevidence (see main.py). Without this, a single
+    # batch-result page can fire one call per rendered gene card the moment
+    # it loads — e.g. 20 concurrent 130-185s calls — with nothing left to
+    # throttle it once OpenEvidence was taken out of annotation_gene_concurrency's
+    # gated critical path (see orchestrator.py's _annotate_gene).
+    openevidence_sidecar_concurrency: int = 3
 
     log_level: str = "INFO"
 

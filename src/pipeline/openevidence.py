@@ -19,13 +19,20 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Dict, List, Optional
 
 import httpx
 from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.config import settings
-from src.models.schema import OpenEvidenceAnalysis, OpenEvidenceCitation
+from src.models.schema import (
+    DistilledOpenEvidence,
+    OpenEvidenceAnalysis,
+    OpenEvidenceCitation,
+    OpenEvidenceGuideline,
+    OpenEvidenceTrialMention,
+)
 from src.pipeline.cache import _get_client, cached_call
 from src.pipeline.normalization import split_fusion
 
@@ -307,6 +314,88 @@ def _build_analysis(question: str, events: List[dict]) -> OpenEvidenceAnalysis:
         question=question,
         text="".join(text_parts),
         citations=list(citations_by_key.values()),
+    )
+
+
+# Domains that identify a citation as a clinical practice guideline rather
+# than a journal article, per Task 2's distillation spec.
+_GUIDELINE_URL_DOMAINS = ("nccn.org", "asco.org", "esmo.org")
+
+# Non-exhaustive seed list of well-known trial acronyms — a sentence naming
+# one of these OR an outcome statistic (PFS/OS/HR/ORR/DFS) is surfaced as a
+# trial mention even without a recognized acronym, so this list only needs
+# to catch named trials that don't otherwise report a statistic in the same
+# sentence.
+_KNOWN_TRIAL_ACRONYMS = (
+    "ALEX", "FLAURA", "ADAURA", "CROWN", "J-ALEX", "ALTA", "ALTA-1L",
+    "ASCEND", "PROFILE", "PALOMA", "MONALEESA", "KEYNOTE", "CHECKMATE",
+    "IMPOWER", "OAK", "FLEX", "eXalt3", "LIBRETTO", "ARROW",
+)
+_TRIAL_ACRONYM_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(name) for name in _KNOWN_TRIAL_ACRONYMS) + r")\b"
+)
+_OUTCOME_STAT_PATTERN = re.compile(r"\b(PFS|OS|HR|ORR|DFS)\b")
+_CITATION_MARKER_PATTERN = re.compile(r"\[\[\d+\]\]")
+_SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_sentences(text: str) -> List[str]:
+    cleaned = _CITATION_MARKER_PATTERN.sub("", text)
+    return [sentence.strip() for sentence in _SENTENCE_SPLIT_PATTERN.split(cleaned) if sentence.strip()]
+
+
+def _extract_guidelines(citations: List[OpenEvidenceCitation]) -> List[OpenEvidenceGuideline]:
+    """Clinical practice guideline references — citations whose URL points
+    at NCCN, ASCO, or ESMO, per Task 2's distillation spec."""
+    guidelines: List[OpenEvidenceGuideline] = []
+    for citation in citations:
+        url = citation.url or ""
+        if not url or not any(domain in url.lower() for domain in _GUIDELINE_URL_DOMAINS):
+            continue
+        page_anchor = url.split("#", 1)[1] if "#" in url else None
+        guidelines.append(
+            OpenEvidenceGuideline(
+                title=citation.title or citation.citation_key,
+                url=url,
+                page_anchor=page_anchor or None,
+            )
+        )
+    return guidelines
+
+
+def _extract_trial_mentions(text: str) -> List[OpenEvidenceTrialMention]:
+    """Sentences naming a known clinical trial acronym or an outcome
+    statistic (PFS/OS/HR/ORR/DFS), per Task 2's distillation spec."""
+    mentions: List[OpenEvidenceTrialMention] = []
+    for sentence in _split_sentences(text):
+        trial_match = _TRIAL_ACRONYM_PATTERN.search(sentence)
+        if trial_match is None and _OUTCOME_STAT_PATTERN.search(sentence) is None:
+            continue
+        mentions.append(
+            OpenEvidenceTrialMention(
+                trial=trial_match.group(1) if trial_match else None,
+                sentence=sentence,
+            )
+        )
+    return mentions
+
+
+def distill_openevidence(analysis: OpenEvidenceAnalysis) -> DistilledOpenEvidence:
+    """Deterministically extract the pieces of an OpenEvidenceAnalysis worth
+    surfacing as an independent, non-blocking clinical reference card:
+    clinical practice guideline references, trial/outcome-statistic
+    sentences, and the opening classification statement (the "consensus
+    role"). Purely rule-based (regex over analysis.text/citations, no LLM
+    call) — safe to run synchronously inside the sidecar endpoint's request
+    path (see GET /v1/genes/{gene}/openevidence in main.py).
+    """
+    sentences = _split_sentences(analysis.text)
+    return DistilledOpenEvidence(
+        question=analysis.question,
+        consensus_role=sentences[0] if sentences else None,
+        guidelines=_extract_guidelines(analysis.citations),
+        trial_mentions=_extract_trial_mentions(analysis.text),
+        citation_count=len(analysis.citations),
     )
 
 

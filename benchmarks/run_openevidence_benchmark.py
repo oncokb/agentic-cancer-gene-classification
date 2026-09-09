@@ -70,7 +70,6 @@ async def run(arm: str, output: Path, timeout: float) -> None:
     original_usage = llm_client.record_llm_usage
     original_retrieve = orchestrator.retrieve_literature
     original_synthesize = orchestrator.synthesize_gene_annotation
-    original_oe = orchestrator._maybe_fetch_openevidence_context
 
     async def reference_cache(key, compute, ttl_seconds=None):
         if key not in cache:
@@ -113,17 +112,6 @@ async def run(arm: str, output: Path, timeout: float) -> None:
         ]
         return await original_synthesize(*args, **kwargs)
 
-    async def oe(*args, **kwargs):
-        started = perf_counter()
-        context = await original_oe(*args, **kwargs)
-        data["per_gene"][CURRENT_GENE.get()].update(
-            openevidence_succeeded=context is not None and bool(context.text),
-            openevidence_seconds=perf_counter() - started,
-            openevidence_analysis=context.model_dump() if context else None,
-        )
-        write_json(target, data)
-        return context
-
     async def checkpoint(annotation):
         data["per_gene"][annotation.gene]["annotation"] = annotation.model_dump()
         write_json(target, data)
@@ -143,7 +131,6 @@ async def run(arm: str, output: Path, timeout: float) -> None:
         for name, replacement in (
             ("_annotate_gene", annotate), ("retrieve_literature", retrieve),
             ("synthesize_gene_annotation", synthesize),
-            ("_maybe_fetch_openevidence_context", oe),
         ):
             stack.enter_context(patch.object(orchestrator, name, replacement))
         try:

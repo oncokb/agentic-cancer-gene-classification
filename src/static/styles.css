@@ -543,6 +543,43 @@ textarea {
   font-size: 13px;
 }
 
+.openevidence-card {
+  border-left: 3px solid var(--accent);
+  background: #f6fbfa;
+}
+
+.openevidence-card-body {
+  display: grid;
+  gap: 10px;
+}
+
+.openevidence-consensus-role {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.openevidence-section {
+  display: grid;
+  gap: 4px;
+}
+
+.openevidence-guideline-list,
+.openevidence-trial-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.openevidence-guideline-list a {
+  color: var(--accent-strong);
+}
+
+.openevidence-footnote {
+  font-size: 12px;
+}
+
 .fusion-evidence-list .field-row-highlight {
   margin-bottom: 12px;
 }

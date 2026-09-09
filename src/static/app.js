@@ -63,6 +63,11 @@ const state = {
   // gene|tumorType|agnostic, so re-expanding a "Check fusion partner
   // precedent" disclosure never re-fetches.
   fusionPartnerEvidenceByKey: {},
+  // In-flight/completed GET /v1/genes/{gene}/openevidence lookups, keyed by
+  // gene|tumorType, so re-rendering the results list never re-fetches. This
+  // sidecar is fetched independently of the core annotation result and
+  // never blocks rendering the rest of the page (see renderOpenEvidenceCard).
+  openEvidenceByGene: {},
 };
 
 const elements = {
@@ -1358,6 +1363,12 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
     if (domainsSection) fields.appendChild(domainsSection);
 
     list.appendChild(card);
+
+    // Independent, non-blocking sidecar card — fetched asynchronously from
+    // GET /v1/genes/{gene}/openevidence and never delays the core card
+    // above. Removed from the DOM (not shown broken/empty) when
+    // OpenEvidence is disabled server-side or the lookup fails.
+    list.appendChild(renderOpenEvidenceCard(annotation));
   });
 
   elements.resultsWindow.replaceChildren(list);
@@ -1836,6 +1847,167 @@ function renderDomainsAndTreatments(annotation) {
   });
 
   return details;
+}
+
+// ---------------------------------------------------------------------------
+// OpenEvidence sidecar card — an independent, non-blocking clinical
+// reference card fetched from GET /v1/genes/{gene}/openevidence. Always
+// starts loading immediately (no click-to-expand), but never blocks
+// rendering the core annotation card above it — see applyResultsViewMode.
+// ---------------------------------------------------------------------------
+
+// Caps how many /v1/genes/{gene}/openevidence fetches run at once from this
+// page. Without this, rendering a large batch result fires one fetch per
+// gene card the instant the list mounts — the server has its own limiter
+// (settings.openevidence_sidecar_concurrency) protecting the vendor call
+// itself, but queuing client-side too avoids opening a pile of simultaneous
+// requests (and showing every card's spinner at once) for no benefit.
+const OPENEVIDENCE_MAX_CONCURRENT_FETCHES = 3;
+let openEvidenceActiveFetchCount = 0;
+const openEvidenceFetchQueue = [];
+
+function runOpenEvidenceFetchQueue() {
+  while (
+    openEvidenceActiveFetchCount < OPENEVIDENCE_MAX_CONCURRENT_FETCHES &&
+    openEvidenceFetchQueue.length
+  ) {
+    const job = openEvidenceFetchQueue.shift();
+    openEvidenceActiveFetchCount += 1;
+    job().finally(() => {
+      openEvidenceActiveFetchCount -= 1;
+      runOpenEvidenceFetchQueue();
+    });
+  }
+}
+
+function enqueueOpenEvidenceFetch(job) {
+  openEvidenceFetchQueue.push(job);
+  runOpenEvidenceFetchQueue();
+}
+
+function fetchGeneOpenEvidence(gene, tumorType) {
+  const key = `${gene}|${tumorType || ""}`;
+  if (state.openEvidenceByGene[key]) {
+    return state.openEvidenceByGene[key];
+  }
+  const params = new URLSearchParams();
+  if (tumorType) params.set("tumor_type", tumorType);
+  const query = params.toString();
+  const promise = fetch(`/v1/genes/${encodeURIComponent(gene)}/openevidence${query ? `?${query}` : ""}`)
+    .then((response) => {
+      if (!response.ok) throw new Error(response.statusText || "Request failed");
+      return response.json();
+    })
+    .catch((error) => {
+      delete state.openEvidenceByGene[key]; // allow retry on next render
+      throw error;
+    });
+  state.openEvidenceByGene[key] = promise;
+  return promise;
+}
+
+function renderOpenEvidenceGuidelines(distilled) {
+  if (!distilled.guidelines?.length) return null;
+  const section = document.createElement("div");
+  section.className = "openevidence-section";
+  const heading = document.createElement("div");
+  heading.className = "field-row-label";
+  heading.textContent = "Clinical practice guidelines";
+  section.appendChild(heading);
+
+  const list = document.createElement("ul");
+  list.className = "openevidence-guideline-list";
+  distilled.guidelines.forEach((guideline) => {
+    const item = document.createElement("li");
+    const link = document.createElement("a");
+    link.href = guideline.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = guideline.title || guideline.url;
+    item.appendChild(link);
+    list.appendChild(item);
+  });
+  section.appendChild(list);
+  return section;
+}
+
+function renderOpenEvidenceTrialMentions(distilled) {
+  if (!distilled.trial_mentions?.length) return null;
+  const section = document.createElement("div");
+  section.className = "openevidence-section";
+  const heading = document.createElement("div");
+  heading.className = "field-row-label";
+  heading.textContent = "Trial & outcome evidence";
+  section.appendChild(heading);
+
+  const list = document.createElement("ul");
+  list.className = "openevidence-trial-list";
+  distilled.trial_mentions.forEach((mention) => {
+    const item = document.createElement("li");
+    item.textContent = mention.trial ? `[${mention.trial}] ${mention.sentence}` : mention.sentence;
+    list.appendChild(item);
+  });
+  section.appendChild(list);
+  return section;
+}
+
+function renderOpenEvidenceCardBody(card, body, response) {
+  if (!response?.available || !response.distilled) {
+    card.remove(); // not enabled / not found — hide rather than show a broken card
+    return;
+  }
+  const distilled = response.distilled;
+  body.replaceChildren();
+
+  if (distilled.consensus_role) {
+    const role = document.createElement("p");
+    role.className = "openevidence-consensus-role";
+    role.textContent = distilled.consensus_role;
+    body.appendChild(role);
+  }
+
+  const guidelines = renderOpenEvidenceGuidelines(distilled);
+  if (guidelines) body.appendChild(guidelines);
+
+  const trials = renderOpenEvidenceTrialMentions(distilled);
+  if (trials) body.appendChild(trials);
+
+  if (!distilled.consensus_role && !guidelines && !trials) {
+    const empty = document.createElement("div");
+    empty.className = "subtle";
+    empty.textContent = "OpenEvidence found no clinical guidelines or trial evidence for this gene.";
+    body.appendChild(empty);
+  }
+
+  const footnote = document.createElement("div");
+  footnote.className = "subtle openevidence-footnote";
+  footnote.textContent = "Unverified supplementary evidence from OpenEvidence — not PMID-verified.";
+  body.appendChild(footnote);
+}
+
+function renderOpenEvidenceCard(annotation) {
+  const card = document.createElement("article");
+  card.className = "annotation-card openevidence-card";
+  card.id = `openevidence-${annotation.gene}`;
+  card.innerHTML = `
+    <header>
+      <div class="annotation-heading">
+        <h3>OpenEvidence</h3>
+        <div class="subtle">Clinical practice guidelines &amp; external trial evidence for ${escapeHtml(annotation.gene)}</div>
+      </div>
+    </header>
+    <div class="openevidence-card-body"></div>
+  `;
+  const body = card.querySelector(".openevidence-card-body");
+  body.appendChild(renderLoadingState("Checking OpenEvidence…"));
+
+  enqueueOpenEvidenceFetch(() =>
+    fetchGeneOpenEvidence(annotation.gene, tumorTypeForAnnotation(annotation))
+      .then((response) => renderOpenEvidenceCardBody(card, body, response))
+      .catch(() => card.remove())
+  );
+
+  return card;
 }
 
 // ---------------------------------------------------------------------------
