@@ -61,17 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=("full", "core"),
-        default="core",
-        help="Annotation mode. Defaults to 'core' (fast, latency-sensitive fields); use 'full' for exhaustive synthesis.",
+        default="full",
+        help="Use 'core' to prioritize the latency-sensitive annotation fields.",
     )
     parser.add_argument(
         "--skip-literature-for-oncokb",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        action="store_true",
         help=(
             "For genes confirmed present in OncoKB, skip PubMed retrieval and LLM "
-            "synthesis to save compute. Enabled by default; pass "
-            "--no-skip-literature-for-oncokb to opt back into full literature retrieval."
+            "synthesis to save compute."
         ),
     )
     return parser.parse_args()

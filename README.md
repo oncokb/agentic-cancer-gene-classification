@@ -138,20 +138,17 @@ Then run the CLI:
 ```bash
 python -m src.cli \
   --fusions "ALK" \
-  --no-skip-literature-for-oncokb \
-  --output results.json
+  --output results.json \
+  --output-csv results.csv
 ```
 
-Core mode is the default. It prioritizes the latency-sensitive fields
-(`cancer_associated`, rationale, gene summary, citations, and evidence support),
-returning faster and cheaper results (fewer papers, shorter abstracts, tighter
-token budget, no deep-model escalation, no evidence cards). Only opt into full
-mode when a gene needs deeper review:
+To prioritize the latency-sensitive fields (`cancer_associated`, rationale,
+gene summary, citations, and evidence support), run in core mode:
 
 ```bash
 python -m src.cli \
   --fusions "TP53::BRAF" \
-  --mode full \
+  --mode core \
   --output results.json
 ```
 
@@ -208,17 +205,15 @@ curl -X POST http://127.0.0.1:8000/v1/annotate \
   -d '{"fusions":["ALK",{"fusion":"EML4::ALK","tumor_type":"LUAD"}],"mode":"core"}'
 ```
 
-`skip_literature_for_oncokb` is enabled by default. Genes confirmed present in
-OncoKB return a deterministic OncoKB-based annotation without PubMed retrieval
-or LLM synthesis; genes absent from OncoKB continue through the normal
-literature retrieval path. Only when you need the full literature sweep for an
-OncoKB gene — e.g. it needs deeper review — opt back out by setting it to
-`false`:
+To save compute for known curated genes, set `skip_literature_for_oncokb` to
+`true`. Genes confirmed present in OncoKB return a deterministic OncoKB-based
+annotation without PubMed retrieval or LLM synthesis; genes absent from OncoKB
+continue through the normal literature retrieval path.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/annotate \
   -H "Content-Type: application/json" \
-  -d '{"fusions":["BRAF","TP53"],"skip_literature_for_oncokb":false}'
+  -d '{"fusions":["BRAF","TP53"],"skip_literature_for_oncokb":true}'
 ```
 
 For progressive delivery, create an annotation job and poll its status. The
