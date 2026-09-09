@@ -1274,7 +1274,14 @@ body.batch-active .app-shell {
 .batch-grid-footer-actions {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 14px;
+}
+
+#batch-upload-btn {
+  min-height: 30px;
+  padding: 4px 12px;
+  font-size: 13px;
 }
 
 .batch-legend {
