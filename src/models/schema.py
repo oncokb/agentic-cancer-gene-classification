@@ -297,20 +297,17 @@ class AnnotateRequest(BaseModel):
         description="Bypass stored gene annotations and recompute results.",
     )
     skip_literature_for_oncokb: bool = Field(
-        default=True,
+        default=False,
         description=(
             "When true, genes confirmed present in OncoKB return a deterministic "
-            "OncoKB-based annotation without PubMed retrieval or LLM synthesis. "
-            "Enabled by default; set to false to opt back into full literature "
-            "retrieval for OncoKB genes."
+            "OncoKB-based annotation without PubMed retrieval or LLM synthesis."
         ),
     )
     mode: AnnotationMode = Field(
-        default="core",
+        default="full",
         description=(
-            "Annotation mode. Defaults to 'core' (faster latency-sensitive fields); "
-            "use 'full' for exhaustive synthesis with deep-model escalation and "
-            "evidence cards."
+            "Use 'core' to prioritize cancer association, rationale, summary, citations, "
+            "and evidence support."
         ),
     )
 
@@ -343,20 +340,17 @@ class GeneAnnotateRequest(BaseModel):
         description="Bypass stored gene annotations and recompute results.",
     )
     skip_literature_for_oncokb: bool = Field(
-        default=True,
+        default=False,
         description=(
             "When true, a gene confirmed present in OncoKB returns a deterministic "
-            "OncoKB-based annotation without PubMed retrieval or LLM synthesis. "
-            "Enabled by default; set to false to opt back into full literature "
-            "retrieval for OncoKB genes."
+            "OncoKB-based annotation without PubMed retrieval or LLM synthesis."
         ),
     )
     mode: AnnotationMode = Field(
-        default="core",
+        default="full",
         description=(
-            "Annotation mode. Defaults to 'core' (faster latency-sensitive fields); "
-            "use 'full' for exhaustive synthesis with deep-model escalation and "
-            "evidence cards."
+            "Use 'core' to prioritize cancer association, rationale, summary, citations, "
+            "and evidence support."
         ),
     )
 
