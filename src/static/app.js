@@ -1636,31 +1636,51 @@ function cssSafeId(value) {
   return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 
-function makePubMedLink(pmid) {
-  const a = document.createElement("a");
-  a.href = `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/`;
-  a.target = "_blank";
-  a.rel = "noreferrer";
-  a.className = "citation-link";
-  a.textContent = pmid;
-  return a;
+// Shared hover/focus tooltip markup for a PMID pill, so a curator can read
+// the paper's abstract without leaving the page. Returns "" when there's no
+// abstract to show, so callers can splice it in unconditionally.
+function pmidAbstractTooltipHtml(abstract) {
+  if (!abstract) return "";
+  return `
+    <span class="pmid-abstract-tooltip" role="tooltip">
+      <span class="pmid-abstract-tooltip-label">Abstract</span>
+      ${escapeHtml(abstract)}
+    </span>
+  `;
+}
+
+// A plain PMID link, used throughout for "Retrieved PMIDs"/"Cited on
+// PubMed"/etc. lists. Pass `abstract` (when known for that pmid) to get the
+// same hover tooltip evidence cards show; omit it for an ordinary pill.
+function makePubMedLink(pmid, abstract) {
+  const href = `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/`;
+  if (!abstract) {
+    const a = document.createElement("a");
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noreferrer";
+    a.className = "citation-link";
+    a.textContent = pmid;
+    return a;
+  }
+  const wrapper = document.createElement("span");
+  wrapper.className = "pmid-pill";
+  wrapper.innerHTML = `
+    <a href="${href}" target="_blank" rel="noreferrer" class="citation-link">${escapeHtml(pmid)}</a>
+    ${pmidAbstractTooltipHtml(abstract)}
+  `;
+  return wrapper;
 }
 
 // Evidence-card PMID link + evidence-type badge, with the paper's abstract
 // (when available) shown in a hover/focus tooltip so curators can read it
 // without leaving the page.
 function evidenceCardTopline(pmid, evidenceType, abstract) {
-  const abstractTooltip = abstract
-    ? `<span class="pmid-abstract-tooltip" role="tooltip">
-        <span class="pmid-abstract-tooltip-label">Abstract</span>
-        ${escapeHtml(abstract)}
-      </span>`
-    : "";
   return `
     <div class="evidence-card-topline">
       <span class="pmid-pill">
         <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(pmid)}</a>
-        ${abstractTooltip}
+        ${pmidAbstractTooltipHtml(abstract)}
       </span>
       <span class="review-badge context">${escapeHtml(evidenceType)}</span>
     </div>
@@ -1707,8 +1727,12 @@ function renderSupportingEvidence(annotation) {
     section.appendChild(details);
   }
 
-  // Cited PMIDs as PubMed links
+  // Cited PMIDs as PubMed links. evidence_cards (when loaded) already carry
+  // each cited pmid's abstract, so reuse it here for the same hover tooltip.
   if (citations.length) {
+    const abstractByPmid = new Map(
+      evidenceCards.filter((card) => card.abstract).map((card) => [card.pmid, card.abstract])
+    );
     const citBlock = document.createElement("div");
     citBlock.className = "citation-links";
     const label = document.createElement("span");
@@ -1717,7 +1741,7 @@ function renderSupportingEvidence(annotation) {
     citBlock.appendChild(label);
     const linkRow = document.createElement("div");
     linkRow.className = "citation-link-list";
-    citations.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
+    citations.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid, abstractByPmid.get(pmid))));
     citBlock.appendChild(linkRow);
     section.appendChild(citBlock);
   }
