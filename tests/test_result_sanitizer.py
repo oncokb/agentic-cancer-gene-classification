@@ -254,10 +254,77 @@ async def test_sanitize_fusion_evidence_recomputes_stale_alias_labels(monkeypatc
         ],
     )
 
-    sanitized, _changed = await sanitize_annotation_result(result)
+    sanitized, changed = await sanitize_annotation_result(result)
 
     cards_by_pmid = {card.pmid: card for card in sanitized.fusion_evidence[0].evidence_cards}
     assert cards_by_pmid["111"].matched_via_alias is True
     assert {m.alias for m in cards_by_pmid["111"].alias_matches} == {"MOZ", "CBP"}
     assert cards_by_pmid["222"].matched_via_alias is False
     assert cards_by_pmid["222"].alias_matches == []
+    # A label-only correction (no card dropped, no pmid list change) must
+    # still surface as changed=True so callers relying on that signal to
+    # decide whether to persist the correction aren't misled.
+    assert changed is True
+
+
+async def test_sanitize_fusion_evidence_verifies_duplicate_pmid_cards_independently(monkeypatch):
+    """Reviewer repro: two cards share one PMID, but only one of them
+    textually discusses the requested fusion. Re-verification must judge
+    each card by its OWN title/abstract text, not via a PMID-keyed lookup
+    that would let one card's match result leak onto the other — the
+    schema does not guarantee PMIDs are unique across cards."""
+
+    async def fake_find_retracted_pmids(_pmids):
+        return set()
+
+    async def fake_resolve_fusion_partner_aliases(five_prime, three_prime):
+        assert (five_prime, three_prime) == ("KAT6A", "CREBBP")
+        return ["MOZ", "MYST3", "ZNF220"], ["CBP", "RSTS"]
+
+    monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", fake_find_retracted_pmids)
+    monkeypatch.setattr(
+        result_sanitizer, "resolve_fusion_partner_aliases", fake_resolve_fusion_partner_aliases
+    )
+
+    result = AnnotationResult(
+        run_id="run-5",
+        timestamp="2026-08-31T00:00:00+00:00",
+        fusions_processed=1,
+        genes_annotated=0,
+        annotations=[],
+        fusion_evidence=[
+            FusionEvidenceResult(
+                fusion="KAT6A::CREBBP",
+                retrieved_count=2,
+                pmids=["555", "555"],
+                evidence_cards=[
+                    # Card A: shares PMID 555 but its own text has nothing
+                    # to do with KAT6A::CREBBP — must be dropped.
+                    FusionEvidenceCard(
+                        fusion="KAT6A::CREBBP",
+                        pmid="555",
+                        title="BCR-ABL1 fusion",
+                        abstract="A BCR-ABL1 fusion transcript was detected by RT-PCR.",
+                    ),
+                    # Card B: same PMID, but its own text genuinely
+                    # discusses KAT6A::CREBBP via the MOZ/CBP aliases —
+                    # must be kept and alias-labeled.
+                    FusionEvidenceCard(
+                        fusion="KAT6A::CREBBP",
+                        pmid="555",
+                        title="MOZ-CBP fusion",
+                        abstract="A MOZ-CBP fusion transcript was detected by RT-PCR.",
+                    ),
+                ],
+            )
+        ],
+    )
+
+    sanitized, changed = await sanitize_annotation_result(result)
+
+    assert changed is True
+    kept_titles = [card.title for card in sanitized.fusion_evidence[0].evidence_cards]
+    assert kept_titles == ["MOZ-CBP fusion"]
+    kept_card = sanitized.fusion_evidence[0].evidence_cards[0]
+    assert kept_card.matched_via_alias is True
+    assert {m.alias for m in kept_card.alias_matches} == {"MOZ", "CBP"}

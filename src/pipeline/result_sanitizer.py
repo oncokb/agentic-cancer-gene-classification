@@ -16,7 +16,7 @@ from src.models.schema import (
 )
 from src.pipeline.literature import (
     find_retracted_pmids,
-    fusion_evidence_alias_matches,
+    fusion_evidence_alias_match,
     resolve_fusion_partner_aliases,
 )
 from src.pipeline.normalization import split_fusion
@@ -119,7 +119,7 @@ async def sanitize_fusion_evidence_result(
     retracted_pmids: Set[str],
 ) -> bool:
     original_pmids = list(result.pmids)
-    cards_by_pmid = {card.pmid: card for card in result.evidence_cards}
+    original_card_count = len(result.evidence_cards)
 
     # Re-resolve HGNC aliases fresh rather than trusting whatever alias_matches
     # a card claims. A card's stored alias_matches is not verified ground
@@ -136,16 +136,17 @@ async def sanitize_fusion_evidence_result(
     if non_retracted_cards and five_prime and three_prime:
         five_aliases, three_aliases = await resolve_fusion_partner_aliases(five_prime, three_prime)
 
-    matches = fusion_evidence_alias_matches(
-        [_fusion_card_as_record(card) for card in non_retracted_cards],
-        result.fusion,
-        five_aliases,
-        three_aliases,
-    )
-
+    # Verify each card against its OWN title/abstract text individually
+    # (fusion_evidence_alias_match, not the PMID-keyed batch helper) — the
+    # schema does not guarantee PMIDs are unique across cards, and a
+    # PMID-keyed lookup would let one card's match result leak onto a
+    # different card that happens to share its PMID but has unrelated text.
     kept_cards = []
+    label_changed = False
     for card in non_retracted_cards:
-        match = matches.get(card.pmid)
+        match = fusion_evidence_alias_match(
+            _fusion_card_as_record(card), result.fusion, five_aliases, three_aliases
+        )
         if match is None:
             continue
         # Recompute matched_via_alias/alias_matches from this fresh
@@ -153,8 +154,12 @@ async def sanitize_fusion_evidence_result(
         # stored — covers both a stale matched_via_alias=False on a genuine
         # alias-only match (so the UI badge is never silently missing) and a
         # forged/incorrect claim (so the UI badge is never wrong).
-        card.matched_via_alias = bool(match)
-        card.alias_matches = [AliasMatch(gene=gene, alias=alias) for gene, alias in match]
+        new_matched_via_alias = bool(match)
+        new_alias_matches = [AliasMatch(gene=gene, alias=alias) for gene, alias in match]
+        if card.matched_via_alias != new_matched_via_alias or card.alias_matches != new_alias_matches:
+            label_changed = True
+        card.matched_via_alias = new_matched_via_alias
+        card.alias_matches = new_alias_matches
         kept_cards.append(card)
 
     kept_pmids = {card.pmid for card in kept_cards}
@@ -162,9 +167,7 @@ async def sanitize_fusion_evidence_result(
     result.pmids = [
         pmid
         for pmid in result.pmids
-        if pmid in kept_pmids
-        and pmid not in retracted_pmids
-        and pmid in cards_by_pmid
+        if pmid in kept_pmids and pmid not in retracted_pmids
     ]
     result.retrieved_count = len(result.pmids)
     result.well_supported = result.retrieved_count >= settings.min_papers_for_strong_association
@@ -179,7 +182,11 @@ async def sanitize_fusion_evidence_result(
             f"{result.fusion} has {result.retrieved_count} non-retracted PubMed record(s) "
             "that explicitly discuss the exact fusion pair."
         )
-    return result.pmids != original_pmids or len(result.evidence_cards) != len(cards_by_pmid)
+    return (
+        result.pmids != original_pmids
+        or len(result.evidence_cards) != original_card_count
+        or label_changed
+    )
 
 
 async def sanitize_annotation_result(result: AnnotationResult) -> tuple[AnnotationResult, bool]:

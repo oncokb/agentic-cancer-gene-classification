@@ -517,6 +517,25 @@ def record_discusses_exact_fusion(
     return _match_fusion_evidence(record, fusion, five_aliases, three_aliases) is not None
 
 
+def fusion_evidence_alias_match(
+    record: LiteratureRecord,
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> Optional[List[Tuple[str, str]]]:
+    """Alias-match detail for a SINGLE record's own text (see
+    _match_fusion_evidence): None for no match, [] for a literal match, a
+    non-empty list of (gene, alias) pairs for an alias match.
+
+    Use this — not the PMID-keyed fusion_evidence_alias_matches below —
+    whenever correctness must not assume PMID uniqueness across the records
+    being checked (e.g. re-verifying stored evidence cards one at a time),
+    since two different records can legitimately or erroneously share a
+    PMID and must each be judged on their own title/abstract text.
+    """
+    return _match_fusion_evidence(record, fusion, five_aliases, three_aliases)
+
+
 def _filter_exact_fusion_records(
     records: List[LiteratureRecord],
     fusion: str,
@@ -545,9 +564,18 @@ def fusion_evidence_alias_matches(
     three_aliases: Optional[List[str]] = None,
 ) -> Dict[str, List[Tuple[str, str]]]:
     """pmid -> alias-match detail (as returned by _match_fusion_evidence) for
-    every record that matches, so callers can label alias-only matches (or
-    re-verify/relabel an already-stored card against freshly-resolved
-    aliases) without re-running the matcher one record at a time."""
+    every record that matches, so callers can label alias-only matches
+    without re-running the matcher one record at a time.
+
+    CAUTION: keyed by PMID, so this collapses to one result per PMID — only
+    safe when `records` is already known to have unique PMIDs (true for a
+    fresh PubMed retrieval, which dedupes PMIDs before fetching). For
+    anything that can't guarantee PMID uniqueness (e.g. re-verifying already-
+    stored evidence cards, where the schema permits duplicate PMIDs across
+    cards), use fusion_evidence_alias_match per record instead — a shared
+    PMID must never let one record's match result leak onto another
+    record's differing title/abstract text.
+    """
     matches: Dict[str, List[Tuple[str, str]]] = {}
     for record in records:
         match = _match_fusion_evidence(record, fusion, five_aliases, three_aliases)
