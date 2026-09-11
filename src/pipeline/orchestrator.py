@@ -32,6 +32,12 @@ from src.pipeline.literature import (
 )
 from src.pipeline.llm_client import resolve_local_backend
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
+from src.pipeline.openevidence import (
+    OpenEvidenceClient,
+    has_cached_analysis,
+    mark_refresh_attempted,
+    was_refresh_recently_attempted,
+)
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
 from src.pipeline.synthesis import build_gene_annotation, synthesize_gene_annotation
@@ -73,6 +79,23 @@ async def _timed(name: str, timings: Dict[str, float], awaitable):
         return await awaitable
     finally:
         timings[name] = _elapsed_ms(start)
+
+
+async def _maybe_fetch_openevidence_context(gene: str, tumor_type: Optional[str]):
+    """Fetch a supplementary OpenEvidence analysis when explicitly enabled.
+
+    Returns None (never raises) when disabled or on any lookup failure — this
+    is a best-effort supplementary input, not part of the core annotation
+    guarantee. Zero behavior change from current main when disabled, since
+    this makes no HTTP call at all in that case.
+    """
+    if not settings.openevidence_enabled:
+        return None
+    try:
+        return await OpenEvidenceClient().get_gene_analysis(gene, tumor_type=tumor_type)
+    except Exception as exc:
+        logger.warning("OpenEvidence supplementary lookup failed for %s: %s", gene, exc)
+        return None
 
 
 def _isoformat(value: Optional[datetime]) -> Optional[str]:
@@ -118,6 +141,36 @@ def _cached_annotation_for_request(
     return annotation
 
 
+async def _openevidence_became_available_since_synthesis(
+    annotation: GeneAnnotation,
+    gene: str,
+    tumor_type: Optional[str],
+) -> bool:
+    """Whether OpenEvidence supplementary evidence has newly become available
+    for this gene since `annotation` was last synthesized without it.
+
+    Only meaningful when OpenEvidence is currently enabled and the stored
+    annotation doesn't already carry supplementary evidence — if it does,
+    there's nothing to pick up. Also gated by a cooldown
+    (was_refresh_recently_attempted): without it, a refresh that keeps
+    failing to actually populate openevidence_supplementary — e.g. a
+    downstream synthesis error unrelated to OpenEvidence, which skips
+    persisting the refreshed annotation entirely (see annotate_one) — would
+    re-trigger a full re-synthesis attempt on every single subsequent read
+    of that gene, forever. Otherwise, peek OpenEvidenceClient's Redis cache
+    (no live HTTP call) to see whether a cache entry has appeared since —
+    e.g. via benchmarks/warm_openevidence_cache.py, or a slow live call that
+    finished after this gene's synthesis had already proceeded without it.
+    """
+    if not settings.openevidence_enabled:
+        return False
+    if annotation.openevidence_supplementary is not None:
+        return False
+    if await was_refresh_recently_attempted(gene, tumor_type=tumor_type):
+        return False
+    return await has_cached_analysis(gene, tumor_type=tumor_type)
+
+
 async def _maybe_reuse_cached_annotation(
     *,
     gene: str,
@@ -152,6 +205,26 @@ async def _maybe_reuse_cached_annotation(
             gene,
             ", ".join(sorted(retracted_pmids)),
         )
+        return None
+
+    # Analogous to the PubMed-freshness check below, but for OpenEvidence:
+    # if supplementary evidence has landed in cache since this annotation
+    # was last synthesized without it, treat it as stale so re-synthesis
+    # picks up the more pertinent, OpenEvidence-informed result. Checked
+    # regardless of the age-based freshness windows below, since new
+    # OpenEvidence data can land at any time independent of annotation age.
+    if await _openevidence_became_available_since_synthesis(annotation, gene, tumor_type):
+        logger.info(
+            "Refreshing cached annotation for %s because OpenEvidence supplementary "
+            "evidence became available since it was last synthesized without it",
+            gene,
+        )
+        # Recorded here — the point where we DECIDE to trigger a refresh —
+        # regardless of what happens next, so the cooldown applies even if
+        # the refresh attempt itself never ends up persisting a
+        # supplementary-evidence-bearing annotation (see the docstring on
+        # _openevidence_became_available_since_synthesis).
+        await mark_refresh_attempted(gene, tumor_type=tumor_type)
         return None
 
     updated_at = cached.get("updated_at")
@@ -379,18 +452,51 @@ async def _annotate_gene(
         # Citation selection pass: filter broad retrieval corpus down to the
         # most directly relevant papers before synthesis to improve precision
         # without shrinking the recall pool.
-        selected_records = await _timed(
-            "paper_selection",
-            timings,
-            select_papers_for_synthesis(
-                gene,
-                ranked_records,
-                settings.max_papers_for_synthesis,
-                gene_identity=gene_identity,
-                local_mode=local_mode,
-                local_backend=local_backend,
-            ),
-        )
+        #
+        # The OpenEvidence lookup depends only on gene+tumor_type (not on
+        # paper_selection's output), so when enabled it runs CONCURRENTLY
+        # with paper_selection rather than serially after it — this was
+        # previously a fully serial extra hop between selection and
+        # synthesis, adding its full latency to the critical path even
+        # though nothing about it required waiting for selection to finish.
+        #
+        # Guard on the flag here (not just inside the helper) so the disabled
+        # path adds nothing to timings_ms and awaits nothing extra — zero
+        # behavior change from current main when OPENEVIDENCE_ENABLED=false.
+        if settings.openevidence_enabled:
+            selected_records, openevidence_context = await asyncio.gather(
+                _timed(
+                    "paper_selection",
+                    timings,
+                    select_papers_for_synthesis(
+                        gene,
+                        ranked_records,
+                        settings.max_papers_for_synthesis,
+                        gene_identity=gene_identity,
+                        local_mode=local_mode,
+                        local_backend=local_backend,
+                    ),
+                ),
+                _timed(
+                    "openevidence",
+                    timings,
+                    _maybe_fetch_openevidence_context(gene, tumor_type),
+                ),
+            )
+        else:
+            selected_records = await _timed(
+                "paper_selection",
+                timings,
+                select_papers_for_synthesis(
+                    gene,
+                    ranked_records,
+                    settings.max_papers_for_synthesis,
+                    gene_identity=gene_identity,
+                    local_mode=local_mode,
+                    local_backend=local_backend,
+                ),
+            )
+            openevidence_context = None
 
         try:
             synthesis = await _timed(
@@ -407,6 +513,7 @@ async def _annotate_gene(
                     local_mode=local_mode,
                     local_backend=local_backend,
                     mode=mode,
+                    openevidence_context=openevidence_context,
                 ),
             )
         except Exception as e:
@@ -442,6 +549,7 @@ async def _annotate_gene(
             mode=mode,
             retrieval_ranking=retrieval_scores,
             tumor_type=tumor_type,
+            openevidence_context=openevidence_context,
         )
         timings["total"] = _elapsed_ms(total_start)
         annotation.timings_ms = timings
@@ -584,6 +692,13 @@ async def run_pipeline(
             ):
                 annotation.cached_at = timestamp
                 annotation.last_pubmed_checked_at = timestamp
+                # Only recorded when OpenEvidence is actually enabled — mirrors
+                # the enabled-guard pattern used for the fetch itself, so a
+                # disabled-feature annotation still shows "never checked"
+                # (None) rather than a misleading checked-at timestamp for a
+                # lookup that never happened.
+                if settings.openevidence_enabled:
+                    annotation.openevidence_checked_at = timestamp
                 try:
                     await run_store.save_gene_annotation(
                         annotation,
