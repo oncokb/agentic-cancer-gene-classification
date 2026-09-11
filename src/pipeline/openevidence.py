@@ -158,18 +158,32 @@ async def was_refresh_recently_attempted(gene: str, tumor_type: Optional[str] = 
 
 
 def _build_question(gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None) -> str:
-    """Build a closed, targeted question rather than an open-ended
-    "summarize everything" ask — a live benchmark (see
-    benchmarks/openevidence_value_report.md on the
-    agcg-openevidence-benchmark branch) found the previous open-ended
-    phrasing attached ungrounded specific statistics to cited PMIDs and cost
-    far more synthesis tokens/latency for little citation benefit.
+    """Build a closed, targeted question aimed at the one content type our
+    own PubMed-abstract-only retrieval structurally cannot ever produce:
+    clinical practice guideline (NCCN/ASCO/ESMO) and trial-level treatment
+    evidence, rather than re-asking the oncogene/tumor-suppressor
+    classification our own synthesis prompt already derives from retrieved
+    abstracts.
+
+    This replaces an earlier classification question ("is GENE an oncogene
+    or tumor suppressor... state the classification") — see
+    benchmarks/openevidence_value_report.md and
+    benchmarks/openevidence_vendor_assessment.md on the
+    agcg-openevidence-vendor-assessment branch. That benchmark found two
+    things: (1) on genes our own retrieval already supported well (BRAF,
+    EGFR, KRAS, TP53, BRCA1, ALK), OpenEvidence's verified-citation count was
+    literally unchanged (4→4) — the classification question was redundant
+    with what our own pipeline already does; (2) OpenEvidence's citation set
+    included an NCCN guideline reference for 10 of 16 genes regardless of
+    how well our own retrieval already supported the gene — content
+    genuinely orthogonal to a PubMed-abstract corpus, since guidelines
+    aren't indexed in PubMed at all. Asking directly for that content (guidelines/
+    trials), instead of a classification restatement, concentrates the
+    130-250s call on the evidence type it has demonstrated unique value for.
 
     `fusion` (a raw "GENE1::GENE2"-style input string, see
-    normalization.is_fusion_input) asks a fusion-specific oncogenicity
-    question instead of the general classification question, so the two
-    partner genes of a fusion get a question about the fusion itself rather
-    than each partner gene in isolation.
+    normalization.is_fusion_input) asks about guideline/trial evidence for
+    the fusion itself rather than each partner gene in isolation.
 
     `tumor_type`, when present, replaces the generic "cancer" context rather
     than being appended after it (avoiding an awkward "...in cancer in
@@ -181,14 +195,15 @@ def _build_question(gene: str, tumor_type: Optional[str] = None, fusion: Optiona
         gene1, gene2 = split_fusion(fusion)
         if gene1 and gene2:
             return (
-                f"Based on peer-reviewed evidence, is the {gene1}::{gene2} fusion "
-                f"oncogenic in {cancer_context}? State the classification and the "
-                "strongest supporting evidence."
+                "What NCCN, ASCO, or ESMO clinical practice guideline "
+                "recommendations or clinical trial evidence address targeted "
+                f"therapy for the {gene1}::{gene2} fusion in {cancer_context}? "
+                "Cite the specific guideline or trial."
             )
     return (
-        f"Based on peer-reviewed evidence, is {gene} an oncogene or tumor "
-        f"suppressor in {cancer_context}? State the classification and the "
-        "strongest supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        f"or clinical trial evidence address targeted therapy for {gene} "
+        f"alterations in {cancer_context}? Cite the specific guideline or trial."
     )
 
 
@@ -384,10 +399,13 @@ def distill_openevidence(analysis: OpenEvidenceAnalysis) -> DistilledOpenEvidenc
     """Deterministically extract the pieces of an OpenEvidenceAnalysis worth
     surfacing as an independent, non-blocking clinical reference card:
     clinical practice guideline references, trial/outcome-statistic
-    sentences, and the opening classification statement (the "consensus
-    role"). Purely rule-based (regex over analysis.text/citations, no LLM
-    call) — safe to run synchronously inside the sidecar endpoint's request
-    path (see GET /v1/genes/{gene}/openevidence in main.py).
+    sentences, and the opening summary sentence (`consensus_role`) — now a
+    guideline/trial-recommendation lead-in rather than an oncogene/tumor-
+    suppressor classification statement, since _build_question no longer
+    asks for the latter (our own synthesis already derives it from retrieved
+    abstracts). Purely rule-based (regex over analysis.text/citations, no
+    LLM call) — safe to run synchronously inside the sidecar endpoint's
+    request path (see GET /v1/genes/{gene}/openevidence in main.py).
     """
     sentences = _split_sentences(analysis.text)
     return DistilledOpenEvidence(

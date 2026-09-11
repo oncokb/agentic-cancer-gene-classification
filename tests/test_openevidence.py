@@ -207,9 +207,9 @@ def test_build_analysis_ignores_table_events_without_crashing():
 
 def test_build_question_plain_gene_no_tumor_type():
     assert _build_question("TP53") == (
-        "Based on peer-reviewed evidence, is TP53 an oncogene or tumor "
-        "suppressor in cancer? State the classification and the strongest "
-        "supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for TP53 "
+        "alterations in cancer? Cite the specific guideline or trial."
     )
 
 
@@ -217,9 +217,9 @@ def test_build_question_plain_gene_with_tumor_type():
     """tumor_type replaces the generic "cancer" context rather than being
     appended after it — no awkward "...in cancer in breast cancer?" double-up."""
     assert _build_question("BRCA1", tumor_type="breast cancer") == (
-        "Based on peer-reviewed evidence, is BRCA1 an oncogene or tumor "
-        "suppressor in breast cancer? State the classification and "
-        "the strongest supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for BRCA1 "
+        "alterations in breast cancer? Cite the specific guideline or trial."
     )
 
 
@@ -229,17 +229,17 @@ def test_build_question_fusion_gene():
     already-validated `fusions` list (see normalization.is_fusion_input),
     not a hand-picked tuple of gene names."""
     assert _build_question("ALK", fusion="EML4::ALK") == (
-        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
-        "in cancer? State the classification and the strongest supporting "
-        "evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for the "
+        "EML4::ALK fusion in cancer? Cite the specific guideline or trial."
     )
 
 
 def test_build_question_fusion_gene_with_tumor_type():
     assert _build_question("ALK", tumor_type="NSCLC", fusion="EML4::ALK") == (
-        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
-        "in NSCLC? State the classification and the strongest "
-        "supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for the "
+        "EML4::ALK fusion in NSCLC? Cite the specific guideline or trial."
     )
 
 
@@ -261,9 +261,9 @@ async def test_get_gene_analysis_sends_fusion_specific_question_in_request_paylo
         )
 
     assert captured["payload"]["text"] == (
-        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
-        "in NSCLC? State the classification and the strongest "
-        "supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for the "
+        "EML4::ALK fusion in NSCLC? Cite the specific guideline or trial."
     )
 
 

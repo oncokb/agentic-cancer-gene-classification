@@ -186,6 +186,98 @@ def test_openevidence_sidecar_endpoint_returns_distilled_result_when_enabled(mon
     assert any(m["trial"] == "ALEX" for m in payload["distilled"]["trial_mentions"])
 
 
+def test_openevidence_sidecar_endpoint_skips_live_call_when_confidently_not_cancer_associated(
+    monkeypatch,
+):
+    """cancer_associated=False and insufficient_evidence=False (our own
+    pipeline's confident conclusion) means the guideline/trial-focused
+    question has nothing plausible to find — see the live value benchmark's
+    RP1/CLCN3P1/DENND2C cases, all of which had cancer_associated=False and
+    zero measurable OpenEvidence improvement. The call is skipped entirely,
+    never reaching OpenEvidenceClient."""
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+
+    async def fail_if_called(self, *args, **kwargs):
+        raise AssertionError("OpenEvidence should be skipped, not called")
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fail_if_called)
+    client = TestClient(main.app)
+
+    response = client.get(
+        "/v1/genes/RP1/openevidence",
+        params={"cancer_associated": "false", "insufficient_evidence": "false"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is False
+
+
+def test_openevidence_sidecar_endpoint_still_calls_when_not_cancer_associated_but_evidence_insufficient(
+    monkeypatch,
+):
+    """cancer_associated=False paired with insufficient_evidence=True means
+    our own pipeline's "not cancer-associated" conclusion is itself weakly
+    supported (sparse/no retrieved literature) — not the confident case the
+    gate is meant to catch — so the live call still proceeds."""
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        return _ALK_ANALYSIS
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+    client = TestClient(main.app)
+
+    response = client.get(
+        "/v1/genes/AIRE/openevidence",
+        params={"cancer_associated": "false", "insufficient_evidence": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["available"] is True
+
+
+def test_openevidence_sidecar_endpoint_calls_when_cancer_associated_true(monkeypatch):
+    """cancer_associated=True always proceeds — guideline/trial evidence is
+    orthogonal value regardless of how well-supported the classification
+    already is (see _build_question's docstring: BRAF/EGFR/KRAS/etc. still
+    benefit from guideline citations despite already having strong verified
+    citations of their own)."""
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        return _ALK_ANALYSIS
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+    client = TestClient(main.app)
+
+    response = client.get(
+        "/v1/genes/BRAF/openevidence",
+        params={"cancer_associated": "true"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["available"] is True
+
+
+def test_openevidence_sidecar_endpoint_calls_when_cancer_associated_omitted(monkeypatch):
+    """A caller without an annotation in hand yet (or an older client) omits
+    cancer_associated entirely — the gate must not trigger on that default,
+    so the live call proceeds exactly as before this change."""
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        return _ALK_ANALYSIS
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+    client = TestClient(main.app)
+
+    response = client.get("/v1/genes/ALK/openevidence")
+
+    assert response.status_code == 200
+    assert response.json()["available"] is True
+
+
 def test_openevidence_sidecar_endpoint_returns_unavailable_on_lookup_failure(monkeypatch):
     monkeypatch.setattr(main.settings, "openevidence_enabled", True)
 

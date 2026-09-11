@@ -1366,9 +1366,11 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
 
     // Independent, non-blocking sidecar card — fetched asynchronously from
     // GET /v1/genes/{gene}/openevidence and never delays the core card
-    // above. Removed from the DOM (not shown broken/empty) when
-    // OpenEvidence is disabled server-side or the lookup fails.
-    list.appendChild(renderOpenEvidenceCard(annotation));
+    // above. Omitted entirely (not shown broken/empty) when OpenEvidence is
+    // disabled, gated out client-side (see renderOpenEvidenceCard), or the
+    // lookup fails.
+    const openEvidenceCard = renderOpenEvidenceCard(annotation);
+    if (openEvidenceCard) list.appendChild(openEvidenceCard);
   });
 
   elements.resultsWindow.replaceChildren(list);
@@ -1885,13 +1887,21 @@ function enqueueOpenEvidenceFetch(job) {
   runOpenEvidenceFetchQueue();
 }
 
-function fetchGeneOpenEvidence(gene, tumorType) {
+function fetchGeneOpenEvidence(gene, tumorType, { cancerAssociated, insufficientEvidence } = {}) {
   const key = `${gene}|${tumorType || ""}`;
   if (state.openEvidenceByGene[key]) {
     return state.openEvidenceByGene[key];
   }
   const params = new URLSearchParams();
   if (tumorType) params.set("tumor_type", tumorType);
+  // Lets the server skip the live call for a gene it's already confident has
+  // no cancer association — see GET /v1/genes/{gene}/openevidence's gating
+  // docstring in main.py. Omitted (undefined/null) rather than sent as
+  // "false" when unknown, so the server's default (never skip) applies.
+  if (cancerAssociated !== undefined && cancerAssociated !== null) {
+    params.set("cancer_associated", String(cancerAssociated));
+  }
+  if (insufficientEvidence) params.set("insufficient_evidence", "true");
   const query = params.toString();
   const promise = fetch(`/v1/genes/${encodeURIComponent(gene)}/openevidence${query ? `?${query}` : ""}`)
     .then((response) => {
@@ -1986,6 +1996,18 @@ function renderOpenEvidenceCardBody(card, body, response) {
 }
 
 function renderOpenEvidenceCard(annotation) {
+  // Mirrors the server-side gate in GET /v1/genes/{gene}/openevidence: skip
+  // entirely (no card, no fetch, no "Checking OpenEvidence…" flash) when our
+  // own pipeline is already confident this gene has no cancer association —
+  // OpenEvidence's guideline/trial-focused question has nothing plausible to
+  // find there (see that endpoint's docstring for the benchmark evidence).
+  // The server enforces this independently too, since it's the only guard
+  // for any other caller of that endpoint; checking here too just spares a
+  // round-trip and a loading flicker for the common case.
+  if (annotation.cancer_associated === false && !annotation.insufficient_evidence) {
+    return null;
+  }
+
   const card = document.createElement("article");
   card.className = "annotation-card openevidence-card";
   card.id = `openevidence-${annotation.gene}`;
@@ -2002,7 +2024,10 @@ function renderOpenEvidenceCard(annotation) {
   body.appendChild(renderLoadingState("Checking OpenEvidence…"));
 
   enqueueOpenEvidenceFetch(() =>
-    fetchGeneOpenEvidence(annotation.gene, tumorTypeForAnnotation(annotation))
+    fetchGeneOpenEvidence(annotation.gene, tumorTypeForAnnotation(annotation), {
+      cancerAssociated: annotation.cancer_associated,
+      insufficientEvidence: annotation.insufficient_evidence,
+    })
       .then((response) => renderOpenEvidenceCardBody(card, body, response))
       .catch(() => card.remove())
   );
