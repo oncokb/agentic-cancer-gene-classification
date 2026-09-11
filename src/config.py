@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     fusion_partner_evidence_cache_ttl_seconds: int = 604800
     min_papers_for_strong_association: int = 4
     max_papers_for_synthesis: int = 8
-    max_citations_per_annotation: int = 4
+    max_citations_per_annotation: int = 8
     annotation_gene_concurrency: int = 3
     llm_concurrency: int = 2
     pubmed_staged_retrieval: bool = True
