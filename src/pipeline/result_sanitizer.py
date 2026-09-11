@@ -14,6 +14,7 @@ from src.models.schema import (
     QualityFlag,
 )
 from src.pipeline.literature import find_retracted_pmids, record_discusses_exact_fusion
+from src.pipeline.normalization import split_fusion
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +115,19 @@ def sanitize_fusion_evidence_result(
 ) -> bool:
     original_pmids = list(result.pmids)
     cards_by_pmid = {card.pmid: card for card in result.evidence_cards}
+    five_prime, three_prime = split_fusion(result.fusion)
     kept_cards = []
     for card in result.evidence_cards:
         if card.pmid in retracted_pmids:
             continue
-        if not record_discusses_exact_fusion(_fusion_card_as_record(card), result.fusion):
+        # Re-verify against the same alias(es) the card says it was matched
+        # via, so an alias-only match (e.g. "MOZ-CBP" for KAT6A::CREBBP) isn't
+        # dropped here as if it were a literal-symbol check.
+        five_aliases = [m.alias for m in card.alias_matches if m.gene == five_prime]
+        three_aliases = [m.alias for m in card.alias_matches if m.gene == three_prime]
+        if not record_discusses_exact_fusion(
+            _fusion_card_as_record(card), result.fusion, five_aliases, three_aliases
+        ):
             continue
         kept_cards.append(card)
 

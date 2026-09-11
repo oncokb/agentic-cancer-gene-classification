@@ -72,8 +72,24 @@ class EvidenceCard(BaseModel):
     abstract: Optional[str] = None
 
 
+class AliasMatch(BaseModel):
+    """One fusion-partner gene matched in a record's text only via an HGNC
+    alias/synonym symbol (e.g. gene=KAT6A, alias=MOZ) rather than its
+    submitted/current HGNC symbol."""
+
+    gene: str
+    alias: str
+
+
 class FusionEvidenceCard(EvidenceCard):
     fusion: str = ""
+    # True when this record was found/matched only through an HGNC alias form
+    # of one (or both) fusion partners rather than the literal submitted/
+    # current symbol — e.g. a paper describing "MOZ-CBP" for a submitted
+    # KAT6A::CREBBP query. False (with alias_matches empty) for a fully
+    # literal match, which behaves exactly as before this field existed.
+    matched_via_alias: bool = False
+    alias_matches: List[AliasMatch] = Field(default_factory=list)
 
 
 class FusionEvidenceResult(BaseModel):

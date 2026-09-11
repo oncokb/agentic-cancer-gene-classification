@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from src.models.schema import (
+    AliasMatch,
     AnnotationResult,
     EvidenceCard,
     FusionEvidenceCard,
@@ -71,3 +72,52 @@ async def test_sanitize_annotation_result_removes_retracted_and_bad_fusion_evide
     assert sanitized.annotations[0].quality_flags[0].code == "retracted_citations_removed"
     assert sanitized.fusion_evidence[0].pmids == ["222"]
     assert [card.pmid for card in sanitized.fusion_evidence[0].evidence_cards] == ["222"]
+
+
+async def test_sanitize_fusion_evidence_keeps_alias_matched_card(monkeypatch):
+    """An evidence card found only via an HGNC alias (e.g. 'MOZ-CBP' for
+    KAT6A::CREBBP) must survive re-verification — the sanitizer must check it
+    against the same alias the card says it was matched via, not the literal
+    submitted symbols only."""
+
+    async def fake_find_retracted_pmids(_pmids):
+        return set()
+
+    monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", fake_find_retracted_pmids)
+
+    result = AnnotationResult(
+        run_id="run-2",
+        timestamp="2026-08-31T00:00:00+00:00",
+        fusions_processed=1,
+        genes_annotated=0,
+        annotations=[],
+        fusion_evidence=[
+            FusionEvidenceResult(
+                fusion="KAT6A::CREBBP",
+                retrieved_count=1,
+                pmids=["555"],
+                evidence_cards=[
+                    FusionEvidenceCard(
+                        fusion="KAT6A::CREBBP",
+                        pmid="555",
+                        title="A recurrent MOZ-CBP fusion identified in pediatric AML",
+                        abstract=(
+                            "We report a novel MOZ-CBP fusion transcript detected by "
+                            "RT-PCR in a pediatric AML patient."
+                        ),
+                        matched_via_alias=True,
+                        alias_matches=[
+                            AliasMatch(gene="KAT6A", alias="MOZ"),
+                            AliasMatch(gene="CREBBP", alias="CBP"),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    sanitized, changed = await sanitize_annotation_result(result)
+
+    assert changed is False
+    assert sanitized.fusion_evidence[0].pmids == ["555"]
+    assert [card.pmid for card in sanitized.fusion_evidence[0].evidence_cards] == ["555"]
