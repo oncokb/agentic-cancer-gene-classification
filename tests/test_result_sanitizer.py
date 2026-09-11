@@ -196,3 +196,68 @@ async def test_sanitize_fusion_evidence_ignores_forged_alias_matches(monkeypatch
     assert changed is True
     assert sanitized.fusion_evidence[0].pmids == []
     assert sanitized.fusion_evidence[0].evidence_cards == []
+
+
+async def test_sanitize_fusion_evidence_recomputes_stale_alias_labels(monkeypatch):
+    """Re-verification recomputes matched_via_alias/alias_matches on every
+    surviving card from its own fresh HGNC-backed match detail, rather than
+    only deciding keep/drop — covering both a genuine alias-only match
+    stored with a stale matched_via_alias=False (so the UI badge is never
+    silently missing) and a literal match stored with a stale/bogus
+    matched_via_alias=True claim (so the UI badge is never wrong)."""
+
+    async def fake_find_retracted_pmids(_pmids):
+        return set()
+
+    async def fake_resolve_fusion_partner_aliases(five_prime, three_prime):
+        return ["MOZ", "MYST3", "ZNF220"], ["CBP", "RSTS"]
+
+    monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", fake_find_retracted_pmids)
+    monkeypatch.setattr(
+        result_sanitizer, "resolve_fusion_partner_aliases", fake_resolve_fusion_partner_aliases
+    )
+
+    result = AnnotationResult(
+        run_id="run-4",
+        timestamp="2026-08-31T00:00:00+00:00",
+        fusions_processed=1,
+        genes_annotated=0,
+        annotations=[],
+        fusion_evidence=[
+            FusionEvidenceResult(
+                fusion="KAT6A::CREBBP",
+                retrieved_count=2,
+                pmids=["111", "222"],
+                evidence_cards=[
+                    # Genuinely matched only via aliases, but stored with a
+                    # stale matched_via_alias=False and no alias_matches.
+                    FusionEvidenceCard(
+                        fusion="KAT6A::CREBBP",
+                        pmid="111",
+                        title="A recurrent MOZ-CBP fusion identified in pediatric AML",
+                        abstract="A novel MOZ-CBP fusion transcript was detected by RT-PCR.",
+                        matched_via_alias=False,
+                        alias_matches=[],
+                    ),
+                    # Genuinely a literal match, but stored with a stale,
+                    # bogus matched_via_alias=True claim.
+                    FusionEvidenceCard(
+                        fusion="KAT6A::CREBBP",
+                        pmid="222",
+                        title="KAT6A-CREBBP fusion in AML",
+                        abstract="A KAT6A-CREBBP fusion transcript was detected by RT-PCR.",
+                        matched_via_alias=True,
+                        alias_matches=[AliasMatch(gene="KAT6A", alias="BOGUS")],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    sanitized, _changed = await sanitize_annotation_result(result)
+
+    cards_by_pmid = {card.pmid: card for card in sanitized.fusion_evidence[0].evidence_cards}
+    assert cards_by_pmid["111"].matched_via_alias is True
+    assert {m.alias for m in cards_by_pmid["111"].alias_matches} == {"MOZ", "CBP"}
+    assert cards_by_pmid["222"].matched_via_alias is False
+    assert cards_by_pmid["222"].alias_matches == []

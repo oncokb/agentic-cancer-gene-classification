@@ -7,6 +7,7 @@ from typing import Iterable, List, Set
 
 from src.config import settings
 from src.models.schema import (
+    AliasMatch,
     AnnotationResult,
     FusionEvidenceResult,
     GeneAnnotation,
@@ -15,7 +16,7 @@ from src.models.schema import (
 )
 from src.pipeline.literature import (
     find_retracted_pmids,
-    record_discusses_exact_fusion,
+    fusion_evidence_alias_matches,
     resolve_fusion_partner_aliases,
 )
 from src.pipeline.normalization import split_fusion
@@ -131,17 +132,29 @@ async def sanitize_fusion_evidence_result(
     five_prime, three_prime = split_fusion(result.fusion)
     five_aliases: List[str] = []
     three_aliases: List[str] = []
-    if result.evidence_cards and five_prime and three_prime:
+    non_retracted_cards = [card for card in result.evidence_cards if card.pmid not in retracted_pmids]
+    if non_retracted_cards and five_prime and three_prime:
         five_aliases, three_aliases = await resolve_fusion_partner_aliases(five_prime, three_prime)
 
+    matches = fusion_evidence_alias_matches(
+        [_fusion_card_as_record(card) for card in non_retracted_cards],
+        result.fusion,
+        five_aliases,
+        three_aliases,
+    )
+
     kept_cards = []
-    for card in result.evidence_cards:
-        if card.pmid in retracted_pmids:
+    for card in non_retracted_cards:
+        match = matches.get(card.pmid)
+        if match is None:
             continue
-        if not record_discusses_exact_fusion(
-            _fusion_card_as_record(card), result.fusion, five_aliases, three_aliases
-        ):
-            continue
+        # Recompute matched_via_alias/alias_matches from this fresh
+        # re-verification rather than leaving whatever the card previously
+        # stored — covers both a stale matched_via_alias=False on a genuine
+        # alias-only match (so the UI badge is never silently missing) and a
+        # forged/incorrect claim (so the UI badge is never wrong).
+        card.matched_via_alias = bool(match)
+        card.alias_matches = [AliasMatch(gene=gene, alias=alias) for gene, alias in match]
         kept_cards.append(card)
 
     kept_pmids = {card.pmid for card in kept_cards}
