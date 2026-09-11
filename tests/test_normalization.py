@@ -146,6 +146,43 @@ async def test_resolve_gene_caches_hgnc_fetch_across_calls():
 
 
 @pytest.mark.asyncio
+async def test_resolve_gene_parses_alias_symbol_and_prev_symbol_as_separate_fields():
+    """HGNC's real KAT6A record (https://rest.genenames.org/fetch/symbol/KAT6A)
+    files MOZ under `alias_symbol` but MYST3/ZNF220 under the SEPARATE
+    `prev_symbol` field. This fixture keeps them separate — not
+    pre-combined — to prove resolve_gene actually parses both fields into
+    ResolvedGene rather than only alias_symbol (which would silently drop
+    MYST3/ZNF220 from anything downstream that only reads alias_symbols)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith(HGNC_FETCH_URL.format(symbol="KAT6A"))
+        return httpx.Response(
+            200,
+            json={
+                "response": {
+                    "docs": [
+                        {
+                            "symbol": "KAT6A",
+                            "hgnc_id": "HGNC:13013",
+                            "name": "lysine acetyltransferase 6A",
+                            "alias_symbol": ["MOZ"],
+                            "prev_symbol": ["MYST3", "ZNF220"],
+                            "locus_type": "gene with protein product",
+                        }
+                    ]
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        resolved = await resolve_gene("KAT6A", client)
+
+    assert resolved.canonical_symbol == "KAT6A"
+    assert resolved.alias_symbols == ["MOZ"]
+    assert resolved.prev_symbols == ["MYST3", "ZNF220"]
+
+
+@pytest.mark.asyncio
 async def test_resolve_gene_continues_when_hgnc_lookup_fails():
     class FailingClient:
         async def get(self, *args, **kwargs):

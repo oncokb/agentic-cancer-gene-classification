@@ -8,6 +8,7 @@ unannotated loci are routed to the insufficient-evidence path.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from typing import Dict, Iterable, Optional, Set, Tuple
 
@@ -15,6 +16,8 @@ import httpx
 
 from src.models.schema import ResolvedGene
 from src.pipeline.cache import cached_call
+
+logger = logging.getLogger(__name__)
 
 HGNC_FETCH_URL = "https://rest.genenames.org/fetch/symbol/{symbol}"
 HGNC_SEARCH_URL = "https://rest.genenames.org/search/symbol/{symbol}"
@@ -144,10 +147,12 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
                 hgnc_id=doc.get("hgnc_id"),
                 name=doc.get("name"),
                 alias_symbols=doc.get("alias_symbol", []) or [],
+                prev_symbols=doc.get("prev_symbol", []) or [],
                 locus_type=doc.get("locus_type"),
                 resolved=True,
             )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.warning("HGNC fetch lookup failed for %s: %s", symbol, exc)
         lookup_failed = True
 
     # Try search as fallback (handles minor capitalisation differences)
@@ -168,10 +173,12 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
                 hgnc_id=doc.get("hgnc_id"),
                 name=doc.get("name"),
                 alias_symbols=doc.get("alias_symbol", []) or [],
+                prev_symbols=doc.get("prev_symbol", []) or [],
                 locus_type=doc.get("locus_type"),
                 resolved=True,
             )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.warning("HGNC search lookup failed for %s: %s", symbol, exc)
         lookup_failed = True
 
     if lookup_failed:
