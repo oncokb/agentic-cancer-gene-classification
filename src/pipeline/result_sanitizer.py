@@ -13,7 +13,11 @@ from src.models.schema import (
     LiteratureRecord,
     QualityFlag,
 )
-from src.pipeline.literature import find_retracted_pmids, record_discusses_exact_fusion
+from src.pipeline.literature import (
+    find_retracted_pmids,
+    record_discusses_exact_fusion,
+    resolve_fusion_partner_aliases,
+)
 from src.pipeline.normalization import split_fusion
 
 logger = logging.getLogger(__name__)
@@ -109,22 +113,31 @@ def _fusion_card_as_record(card) -> LiteratureRecord:
     )
 
 
-def sanitize_fusion_evidence_result(
+async def sanitize_fusion_evidence_result(
     result: FusionEvidenceResult,
     retracted_pmids: Set[str],
 ) -> bool:
     original_pmids = list(result.pmids)
     cards_by_pmid = {card.pmid: card for card in result.evidence_cards}
+
+    # Re-resolve HGNC aliases fresh rather than trusting whatever alias_matches
+    # a card claims. A card's stored alias_matches is not verified ground
+    # truth — it could be malformed or wrong (bad data, a bug elsewhere, a
+    # future code path) — and trusting it would let a forged/incorrect entry
+    # (e.g. {"gene": "KAT6A", "alias": "BCR"}) make a card describing a
+    # completely unrelated fusion (e.g. BCR-ABL1) survive this safety net
+    # undetected. Re-verification always uses the genuinely-resolved alias
+    # set for result.fusion, independent of anything the card says.
     five_prime, three_prime = split_fusion(result.fusion)
+    five_aliases: List[str] = []
+    three_aliases: List[str] = []
+    if result.evidence_cards and five_prime and three_prime:
+        five_aliases, three_aliases = await resolve_fusion_partner_aliases(five_prime, three_prime)
+
     kept_cards = []
     for card in result.evidence_cards:
         if card.pmid in retracted_pmids:
             continue
-        # Re-verify against the same alias(es) the card says it was matched
-        # via, so an alias-only match (e.g. "MOZ-CBP" for KAT6A::CREBBP) isn't
-        # dropped here as if it were a literal-symbol check.
-        five_aliases = [m.alias for m in card.alias_matches if m.gene == five_prime]
-        three_aliases = [m.alias for m in card.alias_matches if m.gene == three_prime]
         if not record_discusses_exact_fusion(
             _fusion_card_as_record(card), result.fusion, five_aliases, three_aliases
         ):
@@ -173,7 +186,7 @@ async def sanitize_annotation_result(result: AnnotationResult) -> tuple[Annotati
     for annotation in result.annotations:
         changed = strip_retracted_pmids_from_annotation(annotation, retracted_pmids) or changed
     for fusion_result in result.fusion_evidence:
-        changed = sanitize_fusion_evidence_result(fusion_result, retracted_pmids) or changed
+        changed = await sanitize_fusion_evidence_result(fusion_result, retracted_pmids) or changed
 
     if changed:
         logger.info("Sanitized stored annotation result %s", result.run_id)

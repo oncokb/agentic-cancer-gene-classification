@@ -17,7 +17,13 @@ async def test_sanitize_annotation_result_removes_retracted_and_bad_fusion_evide
     async def fake_find_retracted_pmids(_pmids):
         return {"12345"}
 
+    async def fake_resolve_fusion_partner_aliases(five_prime, three_prime):
+        return [], []
+
     monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", fake_find_retracted_pmids)
+    monkeypatch.setattr(
+        result_sanitizer, "resolve_fusion_partner_aliases", fake_resolve_fusion_partner_aliases
+    )
 
     result = AnnotationResult(
         run_id="run-1",
@@ -76,14 +82,22 @@ async def test_sanitize_annotation_result_removes_retracted_and_bad_fusion_evide
 
 async def test_sanitize_fusion_evidence_keeps_alias_matched_card(monkeypatch):
     """An evidence card found only via an HGNC alias (e.g. 'MOZ-CBP' for
-    KAT6A::CREBBP) must survive re-verification — the sanitizer must check it
-    against the same alias the card says it was matched via, not the literal
-    submitted symbols only."""
+    KAT6A::CREBBP) must survive re-verification. The sanitizer re-resolves
+    HGNC aliases fresh (never trusting the card's own alias_matches as ground
+    truth) and re-checks the card's text against that genuinely-resolved
+    alias set."""
 
     async def fake_find_retracted_pmids(_pmids):
         return set()
 
+    async def fake_resolve_fusion_partner_aliases(five_prime, three_prime):
+        assert (five_prime, three_prime) == ("KAT6A", "CREBBP")
+        return ["MOZ", "MYST3", "ZNF220"], ["CBP", "RSTS"]
+
     monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", fake_find_retracted_pmids)
+    monkeypatch.setattr(
+        result_sanitizer, "resolve_fusion_partner_aliases", fake_resolve_fusion_partner_aliases
+    )
 
     result = AnnotationResult(
         run_id="run-2",
@@ -121,3 +135,64 @@ async def test_sanitize_fusion_evidence_keeps_alias_matched_card(monkeypatch):
     assert changed is False
     assert sanitized.fusion_evidence[0].pmids == ["555"]
     assert [card.pmid for card in sanitized.fusion_evidence[0].evidence_cards] == ["555"]
+
+
+async def test_sanitize_fusion_evidence_ignores_forged_alias_matches(monkeypatch):
+    """A card's stored alias_matches is NOT trusted as ground truth. If it
+    falsely claims a match via symbols that aren't genuine HGNC aliases for
+    the stated fusion (e.g. bad data, or a bug elsewhere), the card must
+    still be dropped by re-verification, since re-verification always
+    re-resolves the real alias set rather than trusting the card's claim."""
+
+    async def fake_find_retracted_pmids(_pmids):
+        return set()
+
+    async def fake_resolve_fusion_partner_aliases(five_prime, three_prime):
+        # Genuine HGNC aliases for KAT6A / CREBBP — BCR and ABL1 are not
+        # among them, unlike what the forged card below claims.
+        assert (five_prime, three_prime) == ("KAT6A", "CREBBP")
+        return ["MOZ", "MYST3", "ZNF220"], ["CBP", "RSTS"]
+
+    monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", fake_find_retracted_pmids)
+    monkeypatch.setattr(
+        result_sanitizer, "resolve_fusion_partner_aliases", fake_resolve_fusion_partner_aliases
+    )
+
+    result = AnnotationResult(
+        run_id="run-3",
+        timestamp="2026-08-31T00:00:00+00:00",
+        fusions_processed=1,
+        genes_annotated=0,
+        annotations=[],
+        fusion_evidence=[
+            FusionEvidenceResult(
+                fusion="KAT6A::CREBBP",
+                retrieved_count=1,
+                pmids=["999"],
+                evidence_cards=[
+                    FusionEvidenceCard(
+                        fusion="KAT6A::CREBBP",
+                        pmid="999",
+                        title="Recurrent BCR-ABL1 fusion in chronic myeloid leukemia",
+                        abstract=(
+                            "BCR-ABL1 fusion transcripts were detected by RT-PCR in all cases."
+                        ),
+                        # Forged: BCR/ABL1 are not real HGNC aliases of
+                        # KAT6A/CREBBP. A sanitizer that trusted this field
+                        # would wrongly keep a card about an unrelated fusion.
+                        matched_via_alias=True,
+                        alias_matches=[
+                            AliasMatch(gene="KAT6A", alias="BCR"),
+                            AliasMatch(gene="CREBBP", alias="ABL1"),
+                        ],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    sanitized, changed = await sanitize_annotation_result(result)
+
+    assert changed is True
+    assert sanitized.fusion_evidence[0].pmids == []
+    assert sanitized.fusion_evidence[0].evidence_cards == []

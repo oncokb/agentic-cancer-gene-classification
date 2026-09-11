@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import httpx
+
 from src.models.schema import LiteratureRecord, ResolvedGene
 from src.pipeline import literature
 from src.pipeline.literature import (
@@ -137,6 +139,80 @@ def test_record_discusses_exact_fusion_alias_guard_rejects_different_fusion():
         five_aliases=_KAT6A_ALIASES,
         three_aliases=_CREBBP_ALIASES,
     ) is False
+
+
+def test_record_discusses_exact_fusion_literal_contextual_match_unaffected_by_alias_expansion():
+    """Regression: the false-positive guard must be computed over ONLY the
+    literal requested pair for the literal path, exactly like the original
+    literal-only matcher — never over the alias-expanded symbol universe.
+    An unrelated fusion notation that overlaps an ALIAS (not the literal
+    symbol) of one partner must not retroactively reject an otherwise-valid
+    literal contextual match of the submitted pair."""
+    record = LiteratureRecord(
+        pmid="888",
+        title="KAT6A rearrangements in AML",
+        abstract=(
+            "We describe a case with a KAT6A and CREBBP fusion detected by FISH. "
+            "In an unrelated cohort a distinct MOZ-TIF2 fusion was also characterized."
+        ),
+        publication_types=["Journal Article"],
+    )
+
+    # Literal-only baseline: matches via the contextual pattern.
+    assert record_discusses_exact_fusion(record, "KAT6A::CREBBP") is True
+
+    # With aliases supplied, the literal path must behave identically. Before
+    # the fix, MOZ (an alias of KAT6A) co-occurring with the unrelated TIF2
+    # in "MOZ-TIF2" made the false-positive guard fire against the *literal*
+    # KAT6A::CREBBP match too, even though MOZ was never a literal symbol and
+    # the original guard would never have looked at it.
+    assert record_discusses_exact_fusion(
+        record,
+        "KAT6A::CREBBP",
+        five_aliases=_KAT6A_ALIASES,
+        three_aliases=_CREBBP_ALIASES,
+    ) is True
+
+
+def test_fusion_query_variants_caps_alias_cross_product():
+    """A gene with an unusually long HGNC alias history must not blow up the
+    query's alias cross-product — variants are capped per partner."""
+    many_aliases = [f"ALIAS{i}" for i in range(20)]
+
+    variants = _fusion_query_variants(
+        "KAT6A::CREBBP", five_aliases=many_aliases, three_aliases=[]
+    )
+
+    # 1 canonical + capped aliases on the five-prime side, times 1 (no
+    # aliases) on the three-prime side, times 4 notation forms.
+    capped_five_options = 1 + literature._MAX_QUERY_ALIASES_PER_PARTNER
+    assert len(variants) == capped_five_options * 4
+    assert "ALIAS19-CREBBP" not in variants
+    assert "ALIAS0-CREBBP" in variants
+
+
+async def test_resolve_fusion_partner_aliases_is_independent_per_partner(monkeypatch):
+    """One partner's HGNC lookup failure must not discard the other,
+    still-resolvable partner's alias coverage."""
+
+    async def flaky_resolve_gene(symbol, client):
+        if symbol == "KAT6A":
+            raise httpx.ConnectError("HGNC unreachable", request=None)
+        return ResolvedGene(
+            input_symbol=symbol,
+            canonical_symbol=symbol,
+            resolved=True,
+            alias_symbols=_CREBBP_ALIASES if symbol == "CREBBP" else [],
+        )
+
+    monkeypatch.setattr(literature, "resolve_gene", flaky_resolve_gene)
+
+    five_aliases, three_aliases = await literature.resolve_fusion_partner_aliases(
+        "KAT6A", "CREBBP"
+    )
+
+    assert five_aliases == []
+    assert three_aliases == _CREBBP_ALIASES
 
 
 async def test_retrieve_fusion_evidence_uses_cache_and_marks_supported(monkeypatch):
