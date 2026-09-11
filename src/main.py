@@ -762,6 +762,8 @@ async def get_gene_openevidence(
     gene: str,
     tumor_type: Optional[str] = None,
     fusion: Optional[str] = None,
+    cancer_associated: Optional[bool] = None,
+    insufficient_evidence: bool = False,
 ) -> OpenEvidenceSidecarResponse:
     """
     On-demand, non-blocking OpenEvidence lookup for a single gene, rendered
@@ -778,11 +780,32 @@ async def get_gene_openevidence(
     then this endpoint deterministically distills it (no LLM call) before
     returning.
 
+    `cancer_associated`/`insufficient_evidence` are the caller's already-
+    computed GeneAnnotation fields (the normal UI flow — see
+    fetchGeneOpenEvidence in app.js — has these in hand before calling this
+    endpoint). When our own pipeline is confident a gene has NO cancer
+    association (`cancer_associated is False` and evidence wasn't
+    insufficient — i.e. that conclusion is itself well-supported), this
+    endpoint skips the live OpenEvidence call entirely: _build_question now
+    asks specifically for clinical practice guideline/trial evidence
+    supporting targeted therapy, and no such guideline plausibly exists for
+    a gene with no cancer relevance. The live value benchmark confirmed this
+    empirically — RP1, CLCN3P1, and DENND2C all had cancer_associated=False
+    in both arms, and OpenEvidence's citations yielded zero measurable
+    improvement for any of them (see
+    benchmarks/openevidence_value_report.md). Skipping avoids a 90-250s
+    vendor call and a slot in the shared concurrency semaphore for
+    essentially zero expected benefit. Both params default to values that
+    never trigger the skip, so a caller without an annotation in hand yet
+    (or an older client) still gets the normal live-call behavior.
+
     Returns {"available": false} (never a 4xx/5xx) when OpenEvidence is
-    disabled or the lookup fails, so the UI card can hide/gray itself out
-    rather than show a broken component.
+    disabled, skipped by the gate above, or the lookup fails, so the UI card
+    can hide/gray itself out rather than show a broken component.
     """
     if not settings.openevidence_enabled:
+        return OpenEvidenceSidecarResponse(available=False)
+    if cancer_associated is False and not insufficient_evidence:
         return OpenEvidenceSidecarResponse(available=False)
     try:
         async with _openevidence_sidecar_semaphore():
