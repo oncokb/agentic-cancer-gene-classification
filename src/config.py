@@ -141,6 +141,15 @@ class Settings(BaseSettings):
     datadog_statsd_host: str = ""
     datadog_statsd_port: int = 0
     datadog_user_id_header: str = "x-user-id"
+    # Fixed, low-cardinality watchlist for per-gene latency breakdowns.
+    # Tagging gene.total_duration_ms with the raw gene symbol would make it a
+    # high-cardinality custom metric (one tag value per unique gene queried);
+    # bucketing to this list plus "other" keeps cardinality bounded while still
+    # surfacing latency for the recurrent fusion partners that matter most.
+    datadog_gene_latency_watchlist: str = (
+        "ALK,ROS1,RET,NTRK1,NTRK2,NTRK3,BRAF,EGFR,MET,FGFR1,FGFR2,FGFR3,"
+        "ABL1,KMT2A,ETV6,EWSR1,TMPRSS2,ERG,PAX3,PAX7,FOXO1,DDIT3,NUTM1,BCR"
+    )
 
 
 settings = Settings()

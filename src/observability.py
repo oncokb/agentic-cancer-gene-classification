@@ -82,6 +82,23 @@ def stable_user_key(user_id: str) -> str:
     return hashlib.sha256(user_id.strip().lower().encode("utf-8")).hexdigest()
 
 
+def gene_latency_tag(gene: str) -> str:
+    """Bucket a gene into the fixed watchlist (or "other") for latency tags.
+
+    Tagging by raw gene symbol would make gene.total_duration_ms a
+    high-cardinality custom metric; bucketing keeps cardinality bounded to
+    the watchlist size + 1 while still surfacing per-gene latency for the
+    recurrent fusion partners operators care about most.
+    """
+    watchlist = {
+        symbol.strip().upper()
+        for symbol in settings.datadog_gene_latency_watchlist.split(",")
+        if symbol.strip()
+    }
+    symbol = gene.strip().upper()
+    return f"gene:{symbol}" if symbol in watchlist else "gene:other"
+
+
 def record_user_seen(user_id: str | None, tags: Iterable[str] | None = None) -> None:
     if user_id:
         set_metric("users.active", stable_user_key(user_id), tags=tags)
