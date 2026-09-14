@@ -561,13 +561,6 @@ def _needs_synthesis_escalation(
         return False, "disabled"
     if not records:
         return False, "no_retrieved_literature"
-    tier2_escalation = (
-        settings.core_synthesis_escalation_tier2
-        if mode == "core"
-        else settings.synthesis_escalation_tier2
-    )
-    if retrieval_tier == 2 and tier2_escalation:
-        return True, "tier2_retrieval"
     if not tool_input:
         return True, "empty_synthesis"
     if not tool_input.get("gene_summary"):
@@ -576,12 +569,6 @@ def _needs_synthesis_escalation(
         return True, "missing_rationale"
 
     citations = tool_input.get("citations", []) or []
-    if (
-        len(records) >= settings.min_papers_for_strong_association
-        and len(citations) < settings.synthesis_escalation_min_citations
-    ):
-        return True, "too_few_verified_citations"
-
     score, _ = _evidence_support(
         citations=citations,
         records=records,
@@ -589,6 +576,28 @@ def _needs_synthesis_escalation(
         cancer_association_rationale=tool_input.get("cancer_association_rationale"),
         gene_summary=tool_input.get("gene_summary"),
     )
+    sufficient_score = (
+        settings.core_synthesis_escalation_sufficient_score
+        if mode == "core"
+        else settings.synthesis_escalation_sufficient_score
+    )
+    if score >= sufficient_score:
+        return False, f"evidence_already_sufficient_{score:.2f}"
+
+    tier2_escalation = (
+        settings.core_synthesis_escalation_tier2
+        if mode == "core"
+        else settings.synthesis_escalation_tier2
+    )
+    if retrieval_tier == 2 and tier2_escalation:
+        return True, "tier2_retrieval"
+
+    if (
+        len(records) >= settings.min_papers_for_strong_association
+        and len(citations) < settings.synthesis_escalation_min_citations
+    ):
+        return True, "too_few_verified_citations"
+
     min_support_score = (
         settings.core_synthesis_escalation_min_support_score
         if mode == "core"
