@@ -23,7 +23,7 @@ from src.models.schema import (
     QualityFlag,
     ResolvedGene,
 )
-from src.observability import distribution, increment, trace
+from src.observability import distribution, gene_latency_tag, increment, trace
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import (
     rank_literature_for_synthesis,
@@ -600,6 +600,7 @@ async def run_pipeline(
             + [
                 f"cache_status:{annotation.cache_status or 'unknown'}",
                 f"is_fusion:{bool(associated_fusions)}",
+                gene_latency_tag(canonical),
             ],
         )
         return annotation
