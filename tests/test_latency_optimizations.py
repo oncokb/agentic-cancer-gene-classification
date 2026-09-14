@@ -323,6 +323,89 @@ async def test_synthesis_escalates_weak_fast_result(monkeypatch):
     assert calls == [("fast-model", "synthesis_fast"), ("deep-model", "synthesis")]
 
 
+async def test_synthesis_skips_escalation_when_fast_result_already_sufficient(monkeypatch):
+    calls = []
+
+    async def fake_complete_with_tool(**kwargs):
+        calls.append((kwargs["model"], kwargs["model_purpose"]))
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Supported by multiple retrieved PMIDs.",
+            "gene_summary": "GENE is a well-established oncogenic driver (PMID 1).",
+            "citations": ["1", "2", "3"],
+        }
+
+    monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(synthesis.settings, "synthesis_model_escalation", True)
+    monkeypatch.setattr(synthesis.settings, "synthesis_fast_model", "fast-model")
+    monkeypatch.setattr(synthesis.settings, "synthesis_model", "deep-model")
+    monkeypatch.setattr(synthesis.settings, "synthesis_escalation_tier2", True)
+    records = [
+        LiteratureRecord(
+            pmid="1",
+            title="Case report of GENE-driven cancer",
+            abstract="A case report describing GENE alterations in a patient tumor.",
+            journal="Nature",
+        ),
+        LiteratureRecord(pmid="2", title="Paper 2", abstract="GENE cancer"),
+        LiteratureRecord(pmid="3", title="Paper 3", abstract="GENE cancer"),
+        LiteratureRecord(pmid="4", title="Paper 4", abstract="GENE cancer"),
+    ]
+
+    result = await synthesis.synthesize_gene_annotation(
+        gene="GENE",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=records,
+        # Tier-2 retrieval would previously force escalation unconditionally;
+        # a sufficiently strong fast-pass result should now short-circuit it.
+        retrieval_tier=2,
+    )
+
+    assert result["cancer_association_rationale"] == "Supported by multiple retrieved PMIDs."
+    assert calls == [("fast-model", "synthesis_fast")]
+
+
+async def test_synthesis_still_escalates_tier2_when_fast_result_is_weak(monkeypatch):
+    calls = []
+
+    async def fake_complete_with_tool(**kwargs):
+        calls.append((kwargs["model"], kwargs["model_purpose"]))
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Weak single-source support.",
+            "gene_summary": "GENE has limited cancer evidence (PMID 1).",
+            "citations": ["1"],
+        }
+
+    monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
+    monkeypatch.setattr(synthesis.settings, "synthesis_model_escalation", True)
+    monkeypatch.setattr(synthesis.settings, "synthesis_fast_model", "fast-model")
+    monkeypatch.setattr(synthesis.settings, "synthesis_model", "deep-model")
+    monkeypatch.setattr(synthesis.settings, "synthesis_escalation_tier2", True)
+    records = [
+        LiteratureRecord(pmid=str(index), title=f"Paper {index}", abstract="GENE cancer")
+        for index in range(1, 5)
+    ]
+
+    await synthesis.synthesize_gene_annotation(
+        gene="GENE",
+        fusions=[],
+        in_oncokb=False,
+        cancer_type_prevalence=None,
+        records=records,
+        retrieval_tier=2,
+    )
+
+    # Only 1 citation and no clinical/high-impact-journal signal keeps the
+    # fast-pass score well below the "already sufficient" bar, so tier2
+    # escalation must still fire as before.
+    assert calls == [("fast-model", "synthesis_fast"), ("deep-model", "synthesis")]
+
+
 async def test_core_synthesis_accepts_complete_low_support_fast_result(monkeypatch):
     calls = []
 

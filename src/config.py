@@ -17,11 +17,21 @@ class Settings(BaseSettings):
     synthesis_escalation_min_support_score: float = 0.5
     synthesis_escalation_min_citations: int = 1
     synthesis_escalation_tier2: bool = True
+    # When the fast pass's evidence-support score already meets this bar, skip
+    # escalation entirely — including the tier2/citations checks below — since
+    # a second, slower deep-model call adds latency without adding confidence
+    # once the evidence is already this strong.
+    synthesis_escalation_sufficient_score: float = 0.75
     core_synthesis_max_tokens: int = 640
     core_synthesis_abstract_chars: int = 500
     core_synthesis_max_papers: int = 6
     core_synthesis_escalation_min_support_score: float = 0.0
     core_synthesis_escalation_tier2: bool = False
+    # Core mode already escalates on evidence quality far less than full mode
+    # (min_support_score 0.0, tier2 escalation off), so default this high
+    # enough that the new short-circuit doesn't change core mode's existing
+    # too_few_verified_citations behavior.
+    core_synthesis_escalation_sufficient_score: float = 1.01
     selection_model: str = "claude-haiku-4-5-20251001"
     feedback_model: str = "claude-haiku-4-5-20251001"
     retrieval_model: str = "claude-haiku-4-5-20251001"
