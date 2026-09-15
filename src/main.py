@@ -19,7 +19,7 @@ from typing import Any, Coroutine, Dict, List, Literal, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,7 +51,11 @@ from src.pipeline.fusion_context import annotate_fusion_position_contexts, parse
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline.normalization import is_fusion_input
-from src.pipeline.openevidence import OpenEvidenceClient, distill_openevidence
+from src.pipeline.openevidence import (
+    OpenEvidenceClient,
+    distill_additive_openevidence,
+    distilled_openevidence_has_additive_content,
+)
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.result_sanitizer import sanitize_annotation_result
 from src.pipeline.run_store import RunStore
@@ -764,6 +768,8 @@ async def get_gene_openevidence(
     fusion: Optional[str] = None,
     cancer_associated: Optional[bool] = None,
     insufficient_evidence: bool = False,
+    core_pmids: List[str] = Query(default=[]),
+    core_titles: List[str] = Query(default=[]),
 ) -> OpenEvidenceSidecarResponse:
     """
     On-demand, non-blocking OpenEvidence lookup for a single gene, rendered
@@ -799,9 +805,20 @@ async def get_gene_openevidence(
     never trigger the skip, so a caller without an annotation in hand yet
     (or an older client) still gets the normal live-call behavior.
 
+    `core_pmids`/`core_titles` are the same caller's already-computed
+    GeneAnnotation.citations (verified PMIDs) and evidence_cards titles for
+    this gene — used to drop OpenEvidence citations that are redundant with
+    what our own PubMed-abstract-only retrieval already surfaced (see
+    distill_additive_openevidence). A guideline/trial-registry citation is
+    never dropped this way, since that content type is structurally
+    unreachable by our own retrieval regardless of overlap. Omitted (an
+    older client, or no annotation in hand yet) simply means nothing gets
+    filtered out as redundant.
+
     Returns {"available": false} (never a 4xx/5xx) when OpenEvidence is
-    disabled, skipped by the gate above, or the lookup fails, so the UI card
-    can hide/gray itself out rather than show a broken component.
+    disabled, skipped by the gate above, the lookup fails, or nothing
+    additive survives the redundancy filter, so the UI card can hide/gray
+    itself out rather than show a broken or empty-looking component.
     """
     if not settings.openevidence_enabled:
         return OpenEvidenceSidecarResponse(available=False)
@@ -815,7 +832,21 @@ async def get_gene_openevidence(
     except Exception as exc:
         logger.warning("OpenEvidence sidecar lookup failed for %s: %s", gene, exc)
         return OpenEvidenceSidecarResponse(available=False, error=str(exc))
-    return OpenEvidenceSidecarResponse(available=True, distilled=distill_openevidence(analysis))
+    # core_pmids/core_titles use Query(default=[]) so FastAPI correctly binds
+    # repeated query params through the ASGI path; a handful of existing
+    # tests call this endpoint function directly (bypassing ASGI/dependency
+    # resolution entirely) without passing them, which leaves the raw
+    # fastapi.params.Query sentinel — not a plain list — as the value. Guard
+    # against that here rather than relaxing those tests to always go
+    # through TestClient.
+    safe_core_pmids = core_pmids if isinstance(core_pmids, list) else []
+    safe_core_titles = core_titles if isinstance(core_titles, list) else []
+    distilled = distill_additive_openevidence(
+        analysis, core_pmids=safe_core_pmids, core_titles=safe_core_titles
+    )
+    if not distilled_openevidence_has_additive_content(distilled):
+        return OpenEvidenceSidecarResponse(available=False)
+    return OpenEvidenceSidecarResponse(available=True, distilled=distilled)
 
 
 @app.post("/v1/fusion-partner-evidence", response_model=FusionPartnerEvidenceResult)
