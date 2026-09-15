@@ -236,6 +236,8 @@ class OpenEvidenceCitation(BaseModel):
     """
 
     citation_key: str
+    reference_text: Optional[str] = None
+    publication_info_string: Optional[str] = None
     title: str = ""
     authors: str = ""
     journal: str = ""
