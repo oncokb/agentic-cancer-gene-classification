@@ -418,10 +418,12 @@ def distill_openevidence(analysis: OpenEvidenceAnalysis) -> DistilledOpenEvidenc
 
 
 # Domains that identify a citation as coming from a trial registry rather
-# than a journal article. Distinct from _GUIDELINE_URL_DOMAINS (clinical
-# practice guidelines) but grouped with it below since both are content our
-# own PubMed-abstract-only retrieval structurally cannot produce, regardless
-# of whether it overlaps anything the core pipeline already found.
+# than a journal article. A trial-registry record (a protocol/results entry,
+# not a journal article) genuinely cannot appear in a PubMed-abstract search
+# no matter what — unlike a clinical practice guideline (see
+# _GUIDELINE_ORGANIZATION_NAMES below), which our own retrieval treats as
+# always-additive by POLICY rather than because it's unreachable; guidelines
+# CAN be PubMed-indexed, as the ASCO Living Guideline example there shows.
 _TRIAL_REGISTRY_URL_DOMAINS = ("clinicaltrials.gov",)
 
 # A citation whose URL matches any of these domains is "non-PubMed-sourced":
@@ -431,17 +433,19 @@ _TRIAL_REGISTRY_URL_DOMAINS = ("clinicaltrials.gov",)
 # a doi.org redirect, or a publisher site like nejm.org/wiley — is a
 # PubMed-indexable journal article: the kind of content our own retrieval
 # could in principle have found, even if it happened not to for this
-# specific paper. Only guideline/trial-registry domains name a source type
-# retrieval can never reach at all. ascopubs.org (ASCO's own publishing
-# platform, hosting Journal of Clinical Oncology among others) is included
-# alongside asco.org because a live-captured ASCO Living Guideline citation
-# (benchmarks/results/openevidence_live_20260904/enabled.json, citation_key
-# "37": "Therapy for Stage IV NSCLC with Driver Alterations", doi
-# 10.1200/JCO-26-00843) was linked via an ascopubs.org URL rather than
-# asco.org — see is_non_pubmed_sourced_citation's docstring for the second,
-# domain-independent signal that same guideline needed on a different
-# citation of itself.
-_NON_PUBMED_SOURCE_URL_DOMAINS = _GUIDELINE_URL_DOMAINS + _TRIAL_REGISTRY_URL_DOMAINS + ("ascopubs.org",)
+# specific paper.
+#
+# Deliberately NOT included here: ascopubs.org (ASCO's general journal
+# publishing platform, hosting ALL of JCO/JCO-OP/etc., guideline or not). A
+# real, ordinary, non-guideline PHAROS-study report (benchmarks/results/
+# openevidence_live_20260904/enabled.json, citation_key "35") is published
+# in the same journal as the ASCO Living Guideline below and would just as
+# plausibly be linked via an ascopubs.org URL instead of a
+# pubmed.ncbi.nlm.nih.gov one — trusting that domain unconditionally would
+# misclassify it as "always additive" too. See
+# is_non_pubmed_sourced_citation's docstring for the narrower, title/author
+# based signals used instead for a guideline hosted off this domain list.
+_NON_PUBMED_SOURCE_URL_DOMAINS = _GUIDELINE_URL_DOMAINS + _TRIAL_REGISTRY_URL_DOMAINS
 
 # Matches a PMID out of a pubmed.ncbi.nlm.nih.gov citation URL, e.g.
 # "https://pubmed.ncbi.nlm.nih.gov/38211832" -> "38211832". This is the only
@@ -451,23 +455,55 @@ _PUBMED_CITATION_URL_PATTERN = re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)")
 
 _TITLE_NORMALIZATION_PATTERN = re.compile(r"[^a-z0-9]+")
 
+# citation.authors exactly equal to a guideline-issuing organization's full
+# name — the real NCCN citation shape (authors="National Comprehensive
+# Cancer Network", no individual names at all) already relies on this
+# alongside its nccn.org domain. Exact-match (not substring) on purpose: a
+# real paper's author LIST could plausibly mention one of these
+# organizations among several individual co-authors or an acknowledgment,
+# which is not the same as the citation's sole "author" BEING the
+# organization itself.
+_GUIDELINE_ISSUING_ORGANIZATIONS = frozenset(
+    {
+        "national comprehensive cancer network",
+        "american society of clinical oncology",
+        "european society for medical oncology",
+    }
+)
+
 # A clinical practice guideline can be published as an ordinary journal
 # article and therefore linked exactly like any other paper — a
 # live-captured citation (benchmarks/results/openevidence_live_20260904/
 # enabled.json, citation_key "16": "Therapy for Stage IV Non-Small-Cell Lung
-# Cancer With Driver Alterations: ASCO Living Guideline", journal "Journal
-# of Clinical Oncology", url "https://pubmed.ncbi.nlm.nih.gov/35816666") has
-# a pubmed.ncbi.nlm.nih.gov URL indistinguishable by domain from any regular
-# JCO clinical trial report (e.g. that same file's citation_key "35", a
-# PHAROS-study report, same journal, same pubmed.ncbi.nlm.nih.gov URL
-# shape). So domain alone cannot catch this case — the title wording
-# ("...Guideline") is the only signal available on OpenEvidenceCitation
-# today that does. A regular paper whose title happens to mention
-# "guideline" (e.g. discussing adherence to one) would be a false positive
-# here, but the failure mode of over-including as "always additive" is far
-# safer than the alternative of silently dropping real guideline content as
-# if it were redundant with the core pipeline's PubMed coverage.
-_GUIDELINE_TITLE_MARKER = "guideline"
+# Cancer With Driver Alterations: ASCO Living Guideline", authors "Singh N,
+# Temin S, Baker S, et al." — individual names, so the organization-authors
+# signal above doesn't catch it either — journal "Journal of Clinical
+# Oncology", url "https://pubmed.ncbi.nlm.nih.gov/35816666") has a
+# pubmed.ncbi.nlm.nih.gov URL indistinguishable BY DOMAIN from an ordinary
+# JCO clinical trial report (that same file's citation_key "35", a
+# PHAROS-study report, same journal, same URL shape).
+#
+# A bare "guideline" substring anywhere in the title is NOT specific enough
+# to fix this: a real cohort-validation research PAPER (same file,
+# citation_key "26": "Validation of the 5th edition of the World Health
+# Organization and International Consensus Classification guidelines for
+# TP53-mutated myeloid neoplasm in an independent international cohort") is
+# ordinary PubMed-indexed research ABOUT classification guidelines, not
+# itself an NCCN/ASCO/ESMO clinical practice guideline, yet contains the
+# word "guidelines" too. What actually distinguishes the two: citation "16"
+# names a specific guideline-issuing society (ASCO/NCCN/ESMO) directly
+# adjacent to "Guideline(s)" as the title's own trailing self-description
+# ("...: ASCO Living Guideline"), whereas citation "26"'s "guidelines"
+# appears mid-title, generically, with no society name anywhere near it (or
+# in the title at all). _GUIDELINE_TITLE_PATTERN requires both: one of the
+# three society names, followed (within a short span, to allow a qualifier
+# like "Living") by "Guideline"/"Guidelines" anchored at the end of the
+# title.
+_GUIDELINE_ORGANIZATION_NAMES = ("ASCO", "NCCN", "ESMO")
+_GUIDELINE_TITLE_PATTERN = re.compile(
+    r"\b(?:" + "|".join(_GUIDELINE_ORGANIZATION_NAMES) + r")\b[\w\s-]{0,40}\bGuidelines?\b\s*\Z",
+    re.IGNORECASE,
+)
 
 
 def _normalize_title_for_matching(title: str) -> str:
@@ -477,24 +513,34 @@ def _normalize_title_for_matching(title: str) -> str:
 
 
 def is_non_pubmed_sourced_citation(citation: OpenEvidenceCitation) -> bool:
-    """Whether `citation` is sourced from a clinical practice guideline
-    (NCCN/ASCO/ESMO) or a trial registry rather than a PubMed-indexable
-    journal article — content our own PubMed-abstract-only retrieval
-    structurally cannot ever produce, regardless of gene or overlap with
-    the core pipeline's own citations.
+    """Whether `citation` is a clinical practice guideline (NCCN/ASCO/ESMO)
+    or trial-registry citation, kept always-additive as a deliberate POLICY
+    regardless of whether it happens to be PubMed-indexed — not a claim
+    that this content type can never appear in PubMed (it can: a guideline
+    published as a journal article, like the ASCO Living Guideline example
+    below, gets its own PMID like any other paper). The policy exists
+    because our own retrieval is PubMed-*abstract*-only and, more
+    fundamentally, isn't oriented to surface a document AS a practice
+    guideline even on the rare occasion it happens to retrieve one — so a
+    curator gets no equivalent "this is the current guideline" signal from
+    it either way.
 
-    Checks two independent signals, either of which is enough: the URL
-    domain (_NON_PUBMED_SOURCE_URL_DOMAINS) and, as a fallback for a
-    guideline published as a regular journal article with an ordinary
-    pubmed.ncbi.nlm.nih.gov/doi.org URL, the citation title naming itself a
-    guideline (_GUIDELINE_TITLE_MARKER). See both constants' docstrings for
-    the real, live-captured citations that motivated each signal —
-    domain-only classification missed one of them.
+    Checks three independent signals, any of which is enough: the URL
+    domain (_NON_PUBMED_SOURCE_URL_DOMAINS), the authors field being
+    exactly a guideline-issuing organization's name
+    (_GUIDELINE_ISSUING_ORGANIZATIONS), or the title naming a specific
+    guideline-issuing society directly adjacent to "Guideline(s)"
+    (_GUIDELINE_TITLE_PATTERN). See that pattern's docstring for the real,
+    live-captured citations (an ASCO Living Guideline vs. a same-journal
+    trial report vs. an unrelated paper that merely discusses guidelines)
+    that separate a specific, anchored signal from an over-broad one.
     """
     url = (citation.url or "").lower()
     if url and any(domain in url for domain in _NON_PUBMED_SOURCE_URL_DOMAINS):
         return True
-    return _GUIDELINE_TITLE_MARKER in (citation.title or "").lower()
+    if (citation.authors or "").strip().lower() in _GUIDELINE_ISSUING_ORGANIZATIONS:
+        return True
+    return bool(_GUIDELINE_TITLE_PATTERN.search((citation.title or "").strip()))
 
 
 def _citation_overlaps_core_pipeline_evidence(
@@ -518,8 +564,11 @@ def is_additive_citation(
     citation: OpenEvidenceCitation, core_pmids: frozenset, core_titles: frozenset
 ) -> bool:
     """Whether `citation` is worth surfacing in the sidecar at all: a
-    guideline/trial-registry citation always is (our own retrieval
-    structurally cannot produce that content); a PubMed-sourced (journal
+    guideline/trial-registry citation always is (by policy for a guideline,
+    since our retrieval isn't oriented to surface one as such even on the
+    rare occasion it's PubMed-indexed; structurally, for a trial-registry
+    record, which cannot appear in a PubMed-abstract search at all — see
+    is_non_pubmed_sourced_citation's docstring); a PubMed-sourced (journal
     article) citation only is when it doesn't overlap the core pipeline's
     own verified citations/evidence_cards for this gene — otherwise showing
     it adds vendor-call latency for content the curator already has."""
@@ -534,38 +583,62 @@ def is_additive_citation(
 # _split_sentences_with_citation_keys's marker-to-sentence linkage below.
 _CITATION_KEY_PATTERN = re.compile(r"\[\[(\d+)\]\]")
 
-# Splits `analysis.text` into (sentence, citation_keys) the same way
-# _split_sentences does (sentence-ending punctuation followed by
-# whitespace), but WITHOUT stripping citation markers first — instead
-# capturing the marker run trailing each sentence as that sentence's
-# supporting citation key(s), non-greedily up to the next [.!?]. Verified
-# against real OpenEvidence prose structure (tests/test_openevidence_sidecar.py's
-# _ALK_ANALYSIS fixture): "...median PFS of 34.8 months versus 10.9 months
-# for crizotinib. [[4]] NCCN guidelines recommend..." — the "[[4]]" marker
-# sits between the PFS sentence and the next one, i.e. it backs the
-# PRECEDING sentence, which is exactly what this pattern's non-greedy
-# `sentence` group followed by a `markers` group captures.
+# Splits `analysis.text` into sentences the same way _split_sentences does
+# (sentence-ending punctuation followed by whitespace), but WITHOUT
+# stripping citation markers first, and treating end-of-string as an
+# implicit sentence boundary too (the `\Z` alternative in the `sentence`
+# group) so trailing text with no terminal punctuation still becomes its
+# own segment instead of vanishing — real OpenEvidence prose is not
+# guaranteed to end mid-thought with a period.
+#
+# Two separate places a marker can appear relative to a sentence, both of
+# which _split_sentences_with_citation_keys below reads keys from:
+#   1. ANYWHERE inside the `sentence` span itself. Real captured prose
+#      (benchmarks/results/) has markers mid-clause between words
+#      ("...limited benefit from[[12]][[34]][[40]] subsequent PARPi"),
+#      inside parentheses ("...with added platinum–pemetrexed
+#      (HR 0.77[[20]]) at the cost of..."), even splitting a single word
+#      ("...a matched Japanese registry found sh[[44]]orter 10-year
+#      IDFS..."), or directly before the sentence's own terminal
+#      punctuation with a preceding space ("ALEX improved PFS [[1]]."). The
+#      non-greedy `sentence` group naturally swallows all of these as
+#      ordinary characters (none of them contain a [.!?]), so reading keys
+#      out of the whole captured span (not a separate sub-group) is what
+#      catches them.
+#   2. The `trailing_markers` group: a marker run appearing AFTER a
+#      sentence's own terminal punctuation but before the next sentence
+#      starts — the convention _build_analysis's docstring describes and
+#      tests/test_openevidence_sidecar.py's _ALK_ANALYSIS fixture uses:
+#      "...median PFS of 34.8 months versus 10.9 months for crizotinib.
+#      [[4]] NCCN guidelines recommend...". Case 1 alone would NOT catch
+#      this, since "[[4]]" falls after the sentence's own period, i.e.
+#      outside the `sentence` group's captured span.
 _SENTENCE_WITH_CITATION_KEYS_PATTERN = re.compile(
-    r"(?P<sentence>.+?[.!?])(?P<markers>(?:\s*\[\[\d+\]\])*)(?:\s+|$)",
+    r"(?P<sentence>.+?(?:[.!?]|\Z))(?P<trailing_markers>(?:\s*\[\[\d+\]\])*)(?:\s+|\Z)",
     re.DOTALL,
 )
 
 
 def _split_sentences_with_citation_keys(text: str) -> List[Tuple[str, List[str]]]:
     """Like _split_sentences, but pairs each sentence with the citation
-    key(s) (e.g. ["4"]) backing it in the original, unstripped text, instead
-    of discarding that association. Used only by the additive trial-mention
-    filter below (_filter_additive_trial_mentions) — _split_sentences and
+    key(s) (e.g. ["4"]) associated with it — either embedded anywhere
+    within its own span, or trailing immediately after it — in the
+    original, unstripped text, instead of discarding that association (see
+    _SENTENCE_WITH_CITATION_KEYS_PATTERN's docstring for both cases). Used
+    only by the additive trial-mention filter below
+    (_filter_additive_trial_mentions) — _split_sentences and
     _extract_trial_mentions themselves are unchanged, so a sentence with no
-    trailing marker at all (can't be linked to any citation) is simply
-    reported with an empty key list rather than dropped."""
+    marker at all (can't be linked to any citation) is simply reported with
+    an empty key list rather than dropped."""
     pairs: List[Tuple[str, List[str]]] = []
     for match in _SENTENCE_WITH_CITATION_KEYS_PATTERN.finditer(text):
-        sentence = match.group("sentence").strip()
-        if not sentence:
+        raw_sentence = match.group("sentence")
+        trailing_markers = match.group("trailing_markers") or ""
+        keys = _CITATION_KEY_PATTERN.findall(raw_sentence) + _CITATION_KEY_PATTERN.findall(trailing_markers)
+        cleaned_sentence = _CITATION_MARKER_PATTERN.sub("", raw_sentence).strip()
+        if not cleaned_sentence:
             continue
-        keys = _CITATION_KEY_PATTERN.findall(match.group("markers") or "")
-        pairs.append((sentence, keys))
+        pairs.append((cleaned_sentence, keys))
     return pairs
 
 

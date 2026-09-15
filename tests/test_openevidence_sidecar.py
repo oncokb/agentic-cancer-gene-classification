@@ -25,6 +25,7 @@ from src.models.schema import (
 )
 from src.pipeline import orchestrator
 from src.pipeline.openevidence import (
+    _split_sentences_with_citation_keys,
     distill_additive_openevidence,
     distill_openevidence,
     distilled_openevidence_has_additive_content,
@@ -63,14 +64,17 @@ _JOURNAL_CITATION = OpenEvidenceCitation(
     url="https://pubmed.ncbi.nlm.nih.gov/30902613",
 )
 
-# Two real, live-captured citations of the SAME ASCO Living Guideline from
-# benchmarks/results/openevidence_live_20260904/enabled.json — cited twice
-# in one analysis with different metadata completeness. Neither is
-# classifiable by URL domain alone: citation_key "16" links via a plain
-# pubmed.ncbi.nlm.nih.gov URL indistinguishable by domain from any other JCO
-# clinical trial report, and citation_key "37" links via ascopubs.org (not
-# previously in the domain allowlist). These ground the additivity-filter
-# regression tests for the guideline-misclassification fix below.
+# Three real, live-captured citations from
+# benchmarks/results/openevidence_live_20260904/enabled.json that ground the
+# guideline-misclassification regression tests below: a genuine ASCO Living
+# Guideline (citation_key "16"), a genuine non-guideline JCO clinical trial
+# report from the SAME journal (citation_key "35"), and a genuine
+# non-guideline cohort-validation research PAPER that merely discusses
+# classification guidelines in its title (citation_key "26"). None of the
+# three is classifiable correctly by URL domain alone: "16" links via a
+# plain pubmed.ncbi.nlm.nih.gov URL indistinguishable by domain from "35",
+# and a bare "guideline" substring in the title would wrongly sweep up "26"
+# too (it isn't itself a clinical practice guideline).
 _ASCO_LIVING_GUIDELINE_VIA_PUBMED_URL = OpenEvidenceCitation(
     citation_key="16",
     title="Therapy for Stage IV Non-Small-Cell Lung Cancer With Driver Alterations: ASCO Living Guideline",
@@ -80,20 +84,6 @@ _ASCO_LIVING_GUIDELINE_VIA_PUBMED_URL = OpenEvidenceCitation(
     doi="10.1200/JCO.22.00824",
     url="https://pubmed.ncbi.nlm.nih.gov/35816666",
 )
-_ASCO_LIVING_GUIDELINE_VIA_ASCOPUBS_URL = OpenEvidenceCitation(
-    citation_key="37",
-    title="Therapy for Stage IV NSCLC with Driver Alterations",
-    authors="",
-    journal="",
-    date="2026-05-26",
-    doi="10.1200/JCO-26-00843",
-    url="https://ascopubs.org/doi/10.1200/JCO-26-00843",
-)
-
-# A real, non-guideline JCO clinical trial report from the same fixture file
-# (citation_key "35" there), used to prove the guideline-title fallback
-# signal doesn't just treat every Journal of Clinical Oncology paper as a
-# guideline — only ones whose title actually says so.
 _JCO_TRIAL_REPORT_CITATION = OpenEvidenceCitation(
     citation_key="35",
     title=(
@@ -106,6 +96,19 @@ _JCO_TRIAL_REPORT_CITATION = OpenEvidenceCitation(
     date="2025-12-10",
     doi="10.1200/JCO-25-02023",
     url="https://pubmed.ncbi.nlm.nih.gov/41109959",
+)
+_COHORT_VALIDATION_CITATION = OpenEvidenceCitation(
+    citation_key="26",
+    title=(
+        "Validation of the 5th edition of the World Health Organization and "
+        "International Consensus Classification guidelines for TP53-mutated "
+        "myeloid neoplasm in an independent international cohort"
+    ),
+    authors="Shah MV, Hung K, Baranwal A, et al.",
+    journal="Blood Cancer Journal",
+    date="2025-05-07",
+    doi="10.1038/s41408-025-01290-0",
+    url="https://doi.org/10.1038/s41408-025-01290-0",
 )
 
 _ALK_ANALYSIS = OpenEvidenceAnalysis(
@@ -296,55 +299,93 @@ def test_distill_additive_openevidence_with_no_core_evidence_keeps_all_citations
 
 
 # ---------------------------------------------------------------------------
-# Guideline misclassification regression (real fixtures from
-# benchmarks/results/openevidence_live_20260904/enabled.json): a guideline
-# can be published as an ordinary journal article and cited via a plain
-# pubmed.ncbi.nlm.nih.gov URL, or via ascopubs.org rather than asco.org —
-# neither is catchable by the original NCCN/ASCO/ESMO/clinicaltrials.gov
-# domain-only allowlist.
+# Guideline misclassification regression, round 2 (real fixtures from
+# benchmarks/results/openevidence_live_20260904/enabled.json): a bare
+# "guideline" title substring was too broad (it wrongly swept up
+# _COHORT_VALIDATION_CITATION, a real research paper that merely discusses
+# classification guidelines) and unconditionally trusting the ascopubs.org
+# domain was too broad the other direction (it wrongly exempted an ordinary
+# JCO paper whenever its URL happened to be publisher-hosted rather than a
+# pubmed.ncbi.nlm.nih.gov link). The fix requires a specific
+# guideline-issuing society name (ASCO/NCCN/ESMO) anchored directly against
+# "Guideline(s)" at the title's end, or the authors field being exactly a
+# guideline-issuing organization's name — see _GUIDELINE_TITLE_PATTERN's
+# docstring.
 # ---------------------------------------------------------------------------
 
 
-def test_asco_guideline_via_pubmed_url_is_classified_non_pubmed_sourced_by_title():
+def test_asco_living_guideline_via_pubmed_url_is_classified_non_pubmed_sourced_by_title():
     """citation_key '16': linked via a plain pubmed.ncbi.nlm.nih.gov URL,
-    indistinguishable by domain from _JCO_TRIAL_REPORT_CITATION below — only
-    the title's 'ASCO Living Guideline' wording identifies it."""
+    domain-indistinguishable from _JCO_TRIAL_REPORT_CITATION below — only
+    the anchored 'ASCO ... Guideline' title pattern identifies it."""
     assert is_non_pubmed_sourced_citation(_ASCO_LIVING_GUIDELINE_VIA_PUBMED_URL) is True
 
 
-def test_asco_guideline_via_ascopubs_url_is_classified_non_pubmed_sourced_by_domain():
-    """citation_key '37': the same guideline, cited again via ascopubs.org —
-    now in the domain allowlist."""
-    assert is_non_pubmed_sourced_citation(_ASCO_LIVING_GUIDELINE_VIA_ASCOPUBS_URL) is True
-
-
-def test_regular_jco_trial_report_is_not_classified_as_guideline():
-    """A real, non-guideline JCO clinical trial report (same journal as the
-    guideline above, also a pubmed.ncbi.nlm.nih.gov URL) must NOT be swept
-    up by the title-based fallback — only a title that actually says
-    'guideline' triggers it."""
+def test_real_jco_trial_report_is_droppable_on_overlap_not_always_additive():
+    """citation_key '35': a genuine non-guideline JCO clinical trial report,
+    same journal and URL shape as the guideline above. Must NOT be treated
+    as always-additive — it's an ordinary PubMed-sourced paper, subject to
+    the normal overlap check like any other."""
     assert is_non_pubmed_sourced_citation(_JCO_TRIAL_REPORT_CITATION) is False
 
 
-def test_distill_additive_openevidence_keeps_asco_guideline_citations_regardless_of_pmid_overlap():
-    """Both real ASCO Living Guideline citations stay additive even when
-    their own PMID/title is passed as core_pmids/core_titles — a
-    guideline/trial-registry citation is always additive regardless of
-    overlap (see is_additive_citation)."""
+def test_real_jco_trial_report_does_not_flip_when_hosted_via_ascopubs_url():
+    """The same PHAROS trial report, but linked via ascopubs.org (ASCO's
+    general journal-hosting platform) instead of pubmed.ncbi.nlm.nih.gov.
+    Trusting ascopubs.org as a blanket guideline-domain signal would flip
+    this to non-PubMed-sourced even though it is still an ordinary trial
+    report — reproduces and guards against that regression."""
+    citation_via_ascopubs = _JCO_TRIAL_REPORT_CITATION.model_copy(
+        update={"url": "https://ascopubs.org/doi/10.1200/JCO-25-02023"}
+    )
+    assert is_non_pubmed_sourced_citation(citation_via_ascopubs) is False
+
+
+def test_cohort_validation_paper_discussing_guidelines_is_not_classified_as_guideline():
+    """citation_key '26': a real cohort-validation research paper whose
+    title contains the word 'guidelines' (discussing WHO/ICC classification
+    guidelines) without being an NCCN/ASCO/ESMO clinical practice guideline
+    itself. A bare 'guideline' substring match would wrongly keep this as
+    always-additive; the anchored society-name pattern correctly excludes
+    it, leaving it subject to the normal overlap check."""
+    assert is_non_pubmed_sourced_citation(_COHORT_VALIDATION_CITATION) is False
+
+
+def test_distill_additive_openevidence_keeps_asco_living_guideline_regardless_of_pmid_overlap():
+    """The real ASCO Living Guideline citation stays additive even when its
+    own PMID is passed as core_pmids — a guideline citation is always
+    additive regardless of overlap (see is_additive_citation)."""
     analysis = OpenEvidenceAnalysis(
         question="q",
-        text="See guideline citations. [[16]][[37]]",
-        citations=[_ASCO_LIVING_GUIDELINE_VIA_PUBMED_URL, _ASCO_LIVING_GUIDELINE_VIA_ASCOPUBS_URL],
+        text="See the guideline citation. [[16]]",
+        citations=[_ASCO_LIVING_GUIDELINE_VIA_PUBMED_URL],
+    )
+
+    distilled = distill_additive_openevidence(analysis, core_pmids=["35816666"])
+
+    assert distilled.citation_count == 1
+    assert distilled.redundant_citation_count == 0
+
+
+def test_distill_additive_openevidence_drops_real_jco_trial_report_and_cohort_validation_paper_on_overlap():
+    """Both real non-guideline citations (the PHAROS trial report and the
+    cohort-validation paper) are dropped as redundant once their own
+    PMID/title is passed as core evidence — confirming neither is
+    incorrectly treated as always-additive."""
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text="See these papers. [[35]][[26]]",
+        citations=[_JCO_TRIAL_REPORT_CITATION, _COHORT_VALIDATION_CITATION],
     )
 
     distilled = distill_additive_openevidence(
         analysis,
-        core_pmids=["35816666"],
-        core_titles=["Therapy for Stage IV NSCLC with Driver Alterations"],
+        core_pmids=["41109959"],
+        core_titles=[_COHORT_VALIDATION_CITATION.title],
     )
 
-    assert distilled.citation_count == 2
-    assert distilled.redundant_citation_count == 0
+    assert distilled.citation_count == 0
+    assert distilled.redundant_citation_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +451,90 @@ def test_distill_additive_openevidence_keeps_trial_mention_backed_by_guideline_c
     distilled = distill_additive_openevidence(analysis)
 
     assert [m.trial for m in distilled.trial_mentions] == ["FLAURA"]
+
+
+# ---------------------------------------------------------------------------
+# Marker-to-sentence association regression, round 2: the original linkage
+# only recognized a citation marker immediately trailing a sentence's own
+# terminal punctuation. Real captured prose (benchmarks/results/) places
+# markers anywhere in a sentence's span — mid-clause, inside parentheses, or
+# with a preceding space right before the period — and the association must
+# also handle a final sentence with no terminal punctuation at all.
+# ---------------------------------------------------------------------------
+
+
+def test_split_sentences_with_citation_keys_finds_marker_immediately_before_terminal_punctuation():
+    """'ALEX improved PFS [[1]].' — the marker sits before the sentence's own
+    period (with a preceding space), not after it. Must still be recognized
+    as backing this sentence."""
+    pairs = _split_sentences_with_citation_keys("ALEX improved PFS [[1]].")
+
+    assert len(pairs) == 1
+    sentence, keys = pairs[0]
+    assert keys == ["1"]
+    assert "[[1]]" not in sentence
+
+
+def test_split_sentences_with_citation_keys_finds_internal_mid_sentence_marker():
+    """'ALEX [[2]] improved PFS. [[1]]' — key 2 is embedded mid-sentence
+    (before the sentence's own terminal punctuation), key 1 trails after it.
+    Both must be recognized as backing this one sentence."""
+    pairs = _split_sentences_with_citation_keys("ALEX [[2]] improved PFS. [[1]]")
+
+    assert len(pairs) == 1
+    sentence, keys = pairs[0]
+    assert set(keys) == {"1", "2"}
+    assert "[[" not in sentence
+
+
+def test_split_sentences_with_citation_keys_finds_marker_inside_parentheses_real_flaura_shape():
+    """Real captured FLAURA/FLAURA2 prose (benchmarks/results/
+    openevidence_pointed_20260908/enabled.json): an internal marker sits
+    inside a parenthetical HR statistic, nowhere near the sentence's own
+    terminal punctuation, which comes much later in the same sentence."""
+    text = (
+        "FLAURA established osimertinib over first-generation TKIs (median PFS "
+        "18.9 vs 10.2 months; median OS 38.6 vs 31.8 months), and FLAURA2 "
+        "reported median OS 47.5 vs 37.6 months with added platinum–pemetrexed "
+        "(HR 0.77[[20]]) at the cost of grade ≥3 adverse events in 70% vs 34%."
+    )
+
+    pairs = _split_sentences_with_citation_keys(text)
+
+    assert len(pairs) == 1
+    sentence, keys = pairs[0]
+    assert keys == ["20"]
+    assert "[[20]]" not in sentence
+    assert "FLAURA2" in sentence
+
+
+def test_split_sentences_with_citation_keys_includes_trailing_text_with_no_terminal_punctuation():
+    """'ALEX improved PFS' (no '.', '!', or '?') must still produce a
+    sentence segment — treating end-of-string as an implicit boundary —
+    rather than vanishing entirely."""
+    pairs = _split_sentences_with_citation_keys("ALEX improved PFS")
+
+    assert pairs == [("ALEX improved PFS", [])]
+
+
+def test_distill_additive_openevidence_keeps_uncited_trial_mention_with_no_terminal_punctuation():
+    """End-to-end: a trial mention with no terminal punctuation and no
+    citation marker must survive distill_additive_openevidence and keep the
+    sidecar available, even when unrelated citations elsewhere in the same
+    analysis are dropped as redundant. Before the end-of-string fix, this
+    mention would silently vanish (zero sentence pairs found at all),
+    which could wrongly flip the whole response to unavailable."""
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text="A pharmacokinetic study of alectinib was published. [[4]] ALEX improved PFS",
+        citations=[_JOURNAL_CITATION],
+    )
+
+    distilled = distill_additive_openevidence(analysis, core_pmids=["30902613"])
+
+    assert distilled.redundant_citation_count == 1
+    assert [m.trial for m in distilled.trial_mentions] == ["ALEX"]
+    assert distilled_openevidence_has_additive_content(distilled)
 
 
 # ---------------------------------------------------------------------------
