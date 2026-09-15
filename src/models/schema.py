@@ -17,6 +17,13 @@ class ResolvedGene(BaseModel):
     hgnc_id: Optional[str] = None
     name: Optional[str] = None
     alias_symbols: List[str] = Field(default_factory=list)
+    # HGNC's separate "prev_symbol" field: retired/superseded HUGO symbols
+    # for this gene (distinct from alias_symbol, which is a synonym HGNC
+    # never formally assigned as the gene's own symbol). For KAT6A, HGNC
+    # lists MOZ under alias_symbol but MYST3/ZNF220 under prev_symbol —
+    # legacy fusion literature uses both kinds of name interchangeably, so
+    # callers wanting full legacy-nomenclature coverage should union both.
+    prev_symbols: List[str] = Field(default_factory=list)
     locus_type: Optional[str] = None
     resolved: bool
     unresolvable: bool = False  # bare Ensembl ID or unannotated locus
@@ -72,8 +79,24 @@ class EvidenceCard(BaseModel):
     abstract: Optional[str] = None
 
 
+class AliasMatch(BaseModel):
+    """One fusion-partner gene matched in a record's text only via an HGNC
+    alias/synonym symbol (e.g. gene=KAT6A, alias=MOZ) rather than its
+    submitted/current HGNC symbol."""
+
+    gene: str
+    alias: str
+
+
 class FusionEvidenceCard(EvidenceCard):
     fusion: str = ""
+    # True when this record was found/matched only through an HGNC alias form
+    # of one (or both) fusion partners rather than the literal submitted/
+    # current symbol — e.g. a paper describing "MOZ-CBP" for a submitted
+    # KAT6A::CREBBP query. False (with alias_matches empty) for a fully
+    # literal match, which behaves exactly as before this field existed.
+    matched_via_alias: bool = False
+    alias_matches: List[AliasMatch] = Field(default_factory=list)
 
 
 class FusionEvidenceResult(BaseModel):
