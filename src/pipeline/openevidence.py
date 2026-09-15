@@ -275,6 +275,10 @@ def _citation_from_event(event: dict) -> Optional[OpenEvidenceCitation]:
     source_texts = reference.get("source_texts") or []
     return OpenEvidenceCitation(
         citation_key=str(citation_key),
+        reference_text=reference.get("reference_text"),
+        publication_info_string=(
+            reference.get("publication_info_string") or detail.get("publication_info_string")
+        ),
         title=detail.get("title") or "",
         authors=detail.get("authors_string") or "",
         journal=detail.get("journal_name") or detail.get("journal_short_name") or "",
@@ -283,6 +287,27 @@ def _citation_from_event(event: dict) -> Optional[OpenEvidenceCitation]:
         url=detail.get("url") or "",
         source_texts=[text for text in source_texts if text],
     )
+
+
+def _strip_generation_step_prefix(text: str) -> str:
+    """Remove the frontend widget prefix after joining potentially split deltas.
+
+    Decode JSON to find its exact end, including nested props and braces in
+    strings, without consuming any following analysis prose. Leave malformed
+    or unrelated text unchanged rather than guessing where the prose begins.
+    """
+    marker = "REACTCOMPONENT!:!InlineGenerationStep!:!"
+    decoder = json.JSONDecoder()
+    while text.lstrip().startswith(marker):
+        payload = text.lstrip()[len(marker):].lstrip()
+        if not payload.startswith("{"):
+            break
+        try:
+            _, end = decoder.raw_decode(payload)
+        except json.JSONDecodeError:
+            break
+        text = payload[end:].lstrip()
+    return text
 
 
 def _build_analysis(question: str, events: List[dict]) -> OpenEvidenceAnalysis:
@@ -327,7 +352,7 @@ def _build_analysis(question: str, events: List[dict]) -> OpenEvidenceAnalysis:
 
     return OpenEvidenceAnalysis(
         question=question,
-        text="".join(text_parts),
+        text=_strip_generation_step_prefix("".join(text_parts)),
         citations=list(citations_by_key.values()),
     )
 
