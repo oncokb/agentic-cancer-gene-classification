@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, wait_exponential
@@ -432,8 +432,16 @@ _TRIAL_REGISTRY_URL_DOMAINS = ("clinicaltrials.gov",)
 # PubMed-indexable journal article: the kind of content our own retrieval
 # could in principle have found, even if it happened not to for this
 # specific paper. Only guideline/trial-registry domains name a source type
-# retrieval can never reach at all.
-_NON_PUBMED_SOURCE_URL_DOMAINS = _GUIDELINE_URL_DOMAINS + _TRIAL_REGISTRY_URL_DOMAINS
+# retrieval can never reach at all. ascopubs.org (ASCO's own publishing
+# platform, hosting Journal of Clinical Oncology among others) is included
+# alongside asco.org because a live-captured ASCO Living Guideline citation
+# (benchmarks/results/openevidence_live_20260904/enabled.json, citation_key
+# "37": "Therapy for Stage IV NSCLC with Driver Alterations", doi
+# 10.1200/JCO-26-00843) was linked via an ascopubs.org URL rather than
+# asco.org — see is_non_pubmed_sourced_citation's docstring for the second,
+# domain-independent signal that same guideline needed on a different
+# citation of itself.
+_NON_PUBMED_SOURCE_URL_DOMAINS = _GUIDELINE_URL_DOMAINS + _TRIAL_REGISTRY_URL_DOMAINS + ("ascopubs.org",)
 
 # Matches a PMID out of a pubmed.ncbi.nlm.nih.gov citation URL, e.g.
 # "https://pubmed.ncbi.nlm.nih.gov/38211832" -> "38211832". This is the only
@@ -442,6 +450,24 @@ _NON_PUBMED_SOURCE_URL_DOMAINS = _GUIDELINE_URL_DOMAINS + _TRIAL_REGISTRY_URL_DO
 _PUBMED_CITATION_URL_PATTERN = re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)")
 
 _TITLE_NORMALIZATION_PATTERN = re.compile(r"[^a-z0-9]+")
+
+# A clinical practice guideline can be published as an ordinary journal
+# article and therefore linked exactly like any other paper — a
+# live-captured citation (benchmarks/results/openevidence_live_20260904/
+# enabled.json, citation_key "16": "Therapy for Stage IV Non-Small-Cell Lung
+# Cancer With Driver Alterations: ASCO Living Guideline", journal "Journal
+# of Clinical Oncology", url "https://pubmed.ncbi.nlm.nih.gov/35816666") has
+# a pubmed.ncbi.nlm.nih.gov URL indistinguishable by domain from any regular
+# JCO clinical trial report (e.g. that same file's citation_key "35", a
+# PHAROS-study report, same journal, same pubmed.ncbi.nlm.nih.gov URL
+# shape). So domain alone cannot catch this case — the title wording
+# ("...Guideline") is the only signal available on OpenEvidenceCitation
+# today that does. A regular paper whose title happens to mention
+# "guideline" (e.g. discussing adherence to one) would be a false positive
+# here, but the failure mode of over-including as "always additive" is far
+# safer than the alternative of silently dropping real guideline content as
+# if it were redundant with the core pipeline's PubMed coverage.
+_GUIDELINE_TITLE_MARKER = "guideline"
 
 
 def _normalize_title_for_matching(title: str) -> str:
@@ -455,10 +481,20 @@ def is_non_pubmed_sourced_citation(citation: OpenEvidenceCitation) -> bool:
     (NCCN/ASCO/ESMO) or a trial registry rather than a PubMed-indexable
     journal article — content our own PubMed-abstract-only retrieval
     structurally cannot ever produce, regardless of gene or overlap with
-    the core pipeline's own citations. See module-level
-    _NON_PUBMED_SOURCE_URL_DOMAINS for the grounding of this classification."""
+    the core pipeline's own citations.
+
+    Checks two independent signals, either of which is enough: the URL
+    domain (_NON_PUBMED_SOURCE_URL_DOMAINS) and, as a fallback for a
+    guideline published as a regular journal article with an ordinary
+    pubmed.ncbi.nlm.nih.gov/doi.org URL, the citation title naming itself a
+    guideline (_GUIDELINE_TITLE_MARKER). See both constants' docstrings for
+    the real, live-captured citations that motivated each signal —
+    domain-only classification missed one of them.
+    """
     url = (citation.url or "").lower()
-    return bool(url) and any(domain in url for domain in _NON_PUBMED_SOURCE_URL_DOMAINS)
+    if url and any(domain in url for domain in _NON_PUBMED_SOURCE_URL_DOMAINS):
+        return True
+    return _GUIDELINE_TITLE_MARKER in (citation.title or "").lower()
 
 
 def _citation_overlaps_core_pipeline_evidence(
@@ -492,6 +528,86 @@ def is_additive_citation(
     return not _citation_overlaps_core_pipeline_evidence(citation, core_pmids, core_titles)
 
 
+# Matches one inline citation marker and captures its numeric key, e.g.
+# "[[4]]" -> "4". Distinct from _CITATION_MARKER_PATTERN (which only needs
+# to detect/strip markers, not read their keys) — this one backs
+# _split_sentences_with_citation_keys's marker-to-sentence linkage below.
+_CITATION_KEY_PATTERN = re.compile(r"\[\[(\d+)\]\]")
+
+# Splits `analysis.text` into (sentence, citation_keys) the same way
+# _split_sentences does (sentence-ending punctuation followed by
+# whitespace), but WITHOUT stripping citation markers first — instead
+# capturing the marker run trailing each sentence as that sentence's
+# supporting citation key(s), non-greedily up to the next [.!?]. Verified
+# against real OpenEvidence prose structure (tests/test_openevidence_sidecar.py's
+# _ALK_ANALYSIS fixture): "...median PFS of 34.8 months versus 10.9 months
+# for crizotinib. [[4]] NCCN guidelines recommend..." — the "[[4]]" marker
+# sits between the PFS sentence and the next one, i.e. it backs the
+# PRECEDING sentence, which is exactly what this pattern's non-greedy
+# `sentence` group followed by a `markers` group captures.
+_SENTENCE_WITH_CITATION_KEYS_PATTERN = re.compile(
+    r"(?P<sentence>.+?[.!?])(?P<markers>(?:\s*\[\[\d+\]\])*)(?:\s+|$)",
+    re.DOTALL,
+)
+
+
+def _split_sentences_with_citation_keys(text: str) -> List[Tuple[str, List[str]]]:
+    """Like _split_sentences, but pairs each sentence with the citation
+    key(s) (e.g. ["4"]) backing it in the original, unstripped text, instead
+    of discarding that association. Used only by the additive trial-mention
+    filter below (_filter_additive_trial_mentions) — _split_sentences and
+    _extract_trial_mentions themselves are unchanged, so a sentence with no
+    trailing marker at all (can't be linked to any citation) is simply
+    reported with an empty key list rather than dropped."""
+    pairs: List[Tuple[str, List[str]]] = []
+    for match in _SENTENCE_WITH_CITATION_KEYS_PATTERN.finditer(text):
+        sentence = match.group("sentence").strip()
+        if not sentence:
+            continue
+        keys = _CITATION_KEY_PATTERN.findall(match.group("markers") or "")
+        pairs.append((sentence, keys))
+    return pairs
+
+
+def _filter_additive_trial_mentions(
+    analysis: OpenEvidenceAnalysis, redundant_citation_keys: frozenset
+) -> List[OpenEvidenceTrialMention]:
+    """Drop a trial/outcome-statistic mention only when EVERY citation
+    marker backing its sentence was itself dropped as redundant with the
+    core pipeline's own evidence — i.e. the mention purely restates a paper
+    the curator already has, the exact leak this function closes (a trial
+    stat sentence describing the same dropped PubMed paper as a citation
+    would otherwise still surface unfiltered). A mention with no citation
+    marker at all is always kept (nothing to attribute it to, so no basis
+    to call it redundant), and a mention backed by even one still-additive
+    marker (a guideline/trial-registry citation, which is always additive,
+    or a non-redundant PubMed one) is always kept too — see
+    tests/test_openevidence_sidecar.py for real fixture-grounded cases of
+    each: a mention solely backed by a redundant citation (dropped), one
+    with no marker at all (kept), and one backed by a guideline citation
+    (kept).
+
+    Duplicates _extract_trial_mentions's acronym/outcome-statistic matching
+    rather than calling it, because that function consumes
+    _split_sentences's marker-STRIPPED sentences and this one needs the
+    marker-preserving _split_sentences_with_citation_keys instead.
+    """
+    mentions: List[OpenEvidenceTrialMention] = []
+    for sentence, keys in _split_sentences_with_citation_keys(analysis.text):
+        trial_match = _TRIAL_ACRONYM_PATTERN.search(sentence)
+        if trial_match is None and _OUTCOME_STAT_PATTERN.search(sentence) is None:
+            continue
+        if keys and all(key in redundant_citation_keys for key in keys):
+            continue
+        mentions.append(
+            OpenEvidenceTrialMention(
+                trial=trial_match.group(1) if trial_match else None,
+                sentence=sentence,
+            )
+        )
+    return mentions
+
+
 def distill_additive_openevidence(
     analysis: OpenEvidenceAnalysis,
     core_pmids: Optional[List[str]] = None,
@@ -504,26 +620,38 @@ def distill_additive_openevidence(
     GET /v1/genes/{gene}/openevidence in main.py, which has the
     already-computed GeneAnnotation in hand for the same gene).
 
-    Only affects `guidelines` and `citation_count` (both derived from
-    analysis.citations) plus the new `redundant_citation_count` (how many
-    citations were dropped). `consensus_role` and `trial_mentions` are
-    derived from analysis.text, not analysis.citations, so are unaffected —
-    see is_additive_citation's docstring for why a guideline/trial-registry
+    Affects `guidelines` and `citation_count` (both derived from
+    analysis.citations), the new `redundant_citation_count` (how many
+    citations were dropped), and `trial_mentions`: a mention is also
+    dropped when every citation marker backing its sentence was dropped as
+    redundant — see _filter_additive_trial_mentions's docstring for why
+    (otherwise a trial-outcome sentence describing the very paper just
+    dropped as a citation would leak the same information back in
+    unfiltered). `consensus_role` is derived from analysis.text with no
+    citation-marker linkage at all, so is unaffected — see
+    is_additive_citation's docstring for why a guideline/trial-registry
     citation is always additive regardless of overlap.
     """
     normalized_pmids = frozenset(pmid.strip() for pmid in (core_pmids or []) if pmid and pmid.strip())
     normalized_titles = frozenset(
         _normalize_title_for_matching(title) for title in (core_titles or []) if title and title.strip()
     )
-    additive_citations = [
-        citation
-        for citation in analysis.citations
-        if is_additive_citation(citation, normalized_pmids, normalized_titles)
-    ]
-    redundant_count = len(analysis.citations) - len(additive_citations)
+    additive_citations = []
+    redundant_citation_keys = set()
+    for citation in analysis.citations:
+        if is_additive_citation(citation, normalized_pmids, normalized_titles):
+            additive_citations.append(citation)
+        else:
+            redundant_citation_keys.add(citation.citation_key)
     filtered_analysis = analysis.model_copy(update={"citations": additive_citations})
     distilled = distill_openevidence(filtered_analysis)
-    return distilled.model_copy(update={"redundant_citation_count": redundant_count})
+    additive_trial_mentions = _filter_additive_trial_mentions(analysis, frozenset(redundant_citation_keys))
+    return distilled.model_copy(
+        update={
+            "redundant_citation_count": len(redundant_citation_keys),
+            "trial_mentions": additive_trial_mentions,
+        }
+    )
 
 
 def distilled_openevidence_has_additive_content(distilled: DistilledOpenEvidence) -> bool:

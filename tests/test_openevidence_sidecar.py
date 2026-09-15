@@ -28,6 +28,7 @@ from src.pipeline.openevidence import (
     distill_additive_openevidence,
     distill_openevidence,
     distilled_openevidence_has_additive_content,
+    is_non_pubmed_sourced_citation,
 )
 
 # Real, live-captured citation shapes (see tests/test_openevidence.py) reused
@@ -60,6 +61,51 @@ _JOURNAL_CITATION = OpenEvidenceCitation(
     date="2019-03-01",
     doi="10.1000/example",
     url="https://pubmed.ncbi.nlm.nih.gov/30902613",
+)
+
+# Two real, live-captured citations of the SAME ASCO Living Guideline from
+# benchmarks/results/openevidence_live_20260904/enabled.json — cited twice
+# in one analysis with different metadata completeness. Neither is
+# classifiable by URL domain alone: citation_key "16" links via a plain
+# pubmed.ncbi.nlm.nih.gov URL indistinguishable by domain from any other JCO
+# clinical trial report, and citation_key "37" links via ascopubs.org (not
+# previously in the domain allowlist). These ground the additivity-filter
+# regression tests for the guideline-misclassification fix below.
+_ASCO_LIVING_GUIDELINE_VIA_PUBMED_URL = OpenEvidenceCitation(
+    citation_key="16",
+    title="Therapy for Stage IV Non-Small-Cell Lung Cancer With Driver Alterations: ASCO Living Guideline",
+    authors="Singh N, Temin S, Baker S, et al.",
+    journal="Journal of Clinical Oncology : Official Journal of the American Society of Clinical Oncology",
+    date="2022-10-01",
+    doi="10.1200/JCO.22.00824",
+    url="https://pubmed.ncbi.nlm.nih.gov/35816666",
+)
+_ASCO_LIVING_GUIDELINE_VIA_ASCOPUBS_URL = OpenEvidenceCitation(
+    citation_key="37",
+    title="Therapy for Stage IV NSCLC with Driver Alterations",
+    authors="",
+    journal="",
+    date="2026-05-26",
+    doi="10.1200/JCO-26-00843",
+    url="https://ascopubs.org/doi/10.1200/JCO-26-00843",
+)
+
+# A real, non-guideline JCO clinical trial report from the same fixture file
+# (citation_key "35" there), used to prove the guideline-title fallback
+# signal doesn't just treat every Journal of Clinical Oncology paper as a
+# guideline — only ones whose title actually says so.
+_JCO_TRIAL_REPORT_CITATION = OpenEvidenceCitation(
+    citation_key="35",
+    title=(
+        "Updated Overall Survival Analysis From the Phase II PHAROS Study of "
+        "Encorafenib Plus Binimetinib in Patients With BRAF V600e-Mutant "
+        "Metastatic Non-Small Cell Lung Cancer"
+    ),
+    authors="Johnson ML, Smit EF, Felip E, et al.",
+    journal="Journal of Clinical Oncology : Official Journal of the American Society of Clinical Oncology",
+    date="2025-12-10",
+    doi="10.1200/JCO-25-02023",
+    url="https://pubmed.ncbi.nlm.nih.gov/41109959",
 )
 
 _ALK_ANALYSIS = OpenEvidenceAnalysis(
@@ -250,6 +296,123 @@ def test_distill_additive_openevidence_with_no_core_evidence_keeps_all_citations
 
 
 # ---------------------------------------------------------------------------
+# Guideline misclassification regression (real fixtures from
+# benchmarks/results/openevidence_live_20260904/enabled.json): a guideline
+# can be published as an ordinary journal article and cited via a plain
+# pubmed.ncbi.nlm.nih.gov URL, or via ascopubs.org rather than asco.org —
+# neither is catchable by the original NCCN/ASCO/ESMO/clinicaltrials.gov
+# domain-only allowlist.
+# ---------------------------------------------------------------------------
+
+
+def test_asco_guideline_via_pubmed_url_is_classified_non_pubmed_sourced_by_title():
+    """citation_key '16': linked via a plain pubmed.ncbi.nlm.nih.gov URL,
+    indistinguishable by domain from _JCO_TRIAL_REPORT_CITATION below — only
+    the title's 'ASCO Living Guideline' wording identifies it."""
+    assert is_non_pubmed_sourced_citation(_ASCO_LIVING_GUIDELINE_VIA_PUBMED_URL) is True
+
+
+def test_asco_guideline_via_ascopubs_url_is_classified_non_pubmed_sourced_by_domain():
+    """citation_key '37': the same guideline, cited again via ascopubs.org —
+    now in the domain allowlist."""
+    assert is_non_pubmed_sourced_citation(_ASCO_LIVING_GUIDELINE_VIA_ASCOPUBS_URL) is True
+
+
+def test_regular_jco_trial_report_is_not_classified_as_guideline():
+    """A real, non-guideline JCO clinical trial report (same journal as the
+    guideline above, also a pubmed.ncbi.nlm.nih.gov URL) must NOT be swept
+    up by the title-based fallback — only a title that actually says
+    'guideline' triggers it."""
+    assert is_non_pubmed_sourced_citation(_JCO_TRIAL_REPORT_CITATION) is False
+
+
+def test_distill_additive_openevidence_keeps_asco_guideline_citations_regardless_of_pmid_overlap():
+    """Both real ASCO Living Guideline citations stay additive even when
+    their own PMID/title is passed as core_pmids/core_titles — a
+    guideline/trial-registry citation is always additive regardless of
+    overlap (see is_additive_citation)."""
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text="See guideline citations. [[16]][[37]]",
+        citations=[_ASCO_LIVING_GUIDELINE_VIA_PUBMED_URL, _ASCO_LIVING_GUIDELINE_VIA_ASCOPUBS_URL],
+    )
+
+    distilled = distill_additive_openevidence(
+        analysis,
+        core_pmids=["35816666"],
+        core_titles=["Therapy for Stage IV NSCLC with Driver Alterations"],
+    )
+
+    assert distilled.citation_count == 2
+    assert distilled.redundant_citation_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Trial-mention redundancy leak regression: a trial/outcome sentence whose
+# ONLY backing citation was dropped as redundant must not leak the same
+# information back in unfiltered. See _filter_additive_trial_mentions.
+# ---------------------------------------------------------------------------
+
+
+def test_distill_additive_openevidence_drops_trial_mention_solely_backed_by_redundant_citation():
+    """The ALEX trial/PFS sentence is backed only by citation [[4]]
+    (_JOURNAL_CITATION). When that citation is dropped as redundant (its
+    PMID matches a core_pmids entry), the mention describing the same paper
+    must be dropped too — otherwise the same information leaks back in via
+    trial_mentions even though the citation was correctly removed."""
+    distilled = distill_additive_openevidence(_ALK_ANALYSIS, core_pmids=["30902613"])
+
+    assert distilled.redundant_citation_count == 1
+    assert distilled.trial_mentions == []
+    # The 3 guideline citations (always additive) still keep the card
+    # available — this test isolates the trial-mention leak fix, not the
+    # "nothing additive at all" case (covered by the endpoint-level test
+    # test_openevidence_sidecar_endpoint_returns_unavailable_when_only_content_is_a_trial_mention_of_a_dropped_citation).
+    assert len(distilled.guidelines) == 3
+    assert distilled_openevidence_has_additive_content(distilled)
+
+
+def test_distill_additive_openevidence_keeps_trial_mention_with_no_citation_marker():
+    """A trial mention with NO inline citation marker at all can't be
+    attributed to any (redundant or additive) citation, so it is always
+    kept — even in the same analysis as a mention that IS dropped for being
+    solely backed by a redundant citation. This demonstrates the filter is
+    selective, not a blanket drop of every trial mention when any citation
+    is redundant."""
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text=(
+            "In the ALEX trial, alectinib demonstrated median PFS of 34.8 "
+            "months versus 10.9 months for crizotinib. [[4]] The CROWN trial "
+            "showed similar benefit with lorlatinib."
+        ),
+        citations=[_JOURNAL_CITATION],
+    )
+
+    distilled = distill_additive_openevidence(analysis, core_pmids=["30902613"])
+
+    assert distilled.redundant_citation_count == 1
+    assert [m.trial for m in distilled.trial_mentions] == ["CROWN"]
+    assert distilled_openevidence_has_additive_content(distilled)
+
+
+def test_distill_additive_openevidence_keeps_trial_mention_backed_by_guideline_citation():
+    """A trial mention backed by a guideline/trial-registry citation is kept
+    regardless of any overlap check, since that citation is always additive
+    — the mention is not 'redundant', it's guideline-sourced content our
+    own retrieval structurally can't produce either way."""
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text="In the FLAURA trial, osimertinib improved PFS. [[1]]",
+        citations=[_NCCN_CITATION],
+    )
+
+    distilled = distill_additive_openevidence(analysis)
+
+    assert [m.trial for m in distilled.trial_mentions] == ["FLAURA"]
+
+
+# ---------------------------------------------------------------------------
 # GET /v1/genes/{gene}/openevidence
 # ---------------------------------------------------------------------------
 
@@ -327,6 +490,44 @@ def test_openevidence_sidecar_endpoint_returns_unavailable_when_nothing_additive
     analysis = OpenEvidenceAnalysis(
         question="q",
         text="A pharmacokinetic study of alectinib was published.",
+        citations=[_JOURNAL_CITATION],
+    )
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        return analysis
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+    client = TestClient(main.app)
+
+    response = client.get(
+        "/v1/genes/ALK/openevidence",
+        params={"core_pmids": ["30902613"]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is False
+    assert payload["distilled"] is None
+
+
+def test_openevidence_sidecar_endpoint_returns_unavailable_when_only_content_is_a_trial_mention_of_a_dropped_citation(
+    monkeypatch,
+):
+    """Reproduces the trial-mention redundancy leak: one PubMed citation
+    that overlaps a core PMID (correctly dropped) plus a trial-mention
+    sentence describing that SAME paper (an ALEX trial/PFS statistic sourced
+    from citation [[4]], _JOURNAL_CITATION). Before the fix, this reported
+    available=true purely because trial_mentions was non-empty, even though
+    the only citation backing it had just been dropped as redundant. After
+    the fix, the mention is dropped along with its citation and nothing
+    additive remains."""
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text=(
+            "In the ALEX trial, alectinib demonstrated median PFS of 34.8 "
+            "months versus 10.9 months for crizotinib. [[4]]"
+        ),
         citations=[_JOURNAL_CITATION],
     )
 

@@ -280,13 +280,16 @@ class DistilledOpenEvidence(BaseModel):
     — never merged into GeneAnnotation or the synthesis prompt. See
     src.pipeline.openevidence.distill_openevidence.
 
-    `citation_count` and `guidelines` reflect all of the source analysis's
-    citations when built by distill_openevidence directly, or only the ones
-    judged additive (not redundant with the core pipeline's own PubMed
-    evidence) when built by src.pipeline.openevidence.distill_additive_openevidence
-    — see that function for the additivity rule. `redundant_citation_count`
-    is only ever populated by the latter (always 0 from distill_openevidence),
-    and counts citations dropped as redundant.
+    `citation_count`, `guidelines`, and `trial_mentions` reflect all of the
+    source analysis's citations/mentions when built by distill_openevidence
+    directly, or only the ones judged additive (not redundant with the core
+    pipeline's own PubMed evidence) when built by
+    src.pipeline.openevidence.distill_additive_openevidence — see that
+    function for the additivity rule, including why a trial mention is
+    dropped only when every citation backing it was itself dropped as
+    redundant. `redundant_citation_count` is only ever populated by the
+    latter (always 0 from distill_openevidence), and counts citations
+    dropped as redundant.
     """
 
     question: str
