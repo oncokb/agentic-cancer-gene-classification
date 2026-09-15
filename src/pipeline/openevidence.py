@@ -417,6 +417,124 @@ def distill_openevidence(analysis: OpenEvidenceAnalysis) -> DistilledOpenEvidenc
     )
 
 
+# Domains that identify a citation as coming from a trial registry rather
+# than a journal article. Distinct from _GUIDELINE_URL_DOMAINS (clinical
+# practice guidelines) but grouped with it below since both are content our
+# own PubMed-abstract-only retrieval structurally cannot produce, regardless
+# of whether it overlaps anything the core pipeline already found.
+_TRIAL_REGISTRY_URL_DOMAINS = ("clinicaltrials.gov",)
+
+# A citation whose URL matches any of these domains is "non-PubMed-sourced":
+# real-world OpenEvidence citation samples (benchmarks/results/
+# openevidence_pointed_20260908/enabled.json) show every other citation —
+# regardless of whether its URL happens to be a pubmed.ncbi.nlm.nih.gov link,
+# a doi.org redirect, or a publisher site like nejm.org/wiley — is a
+# PubMed-indexable journal article: the kind of content our own retrieval
+# could in principle have found, even if it happened not to for this
+# specific paper. Only guideline/trial-registry domains name a source type
+# retrieval can never reach at all.
+_NON_PUBMED_SOURCE_URL_DOMAINS = _GUIDELINE_URL_DOMAINS + _TRIAL_REGISTRY_URL_DOMAINS
+
+# Matches a PMID out of a pubmed.ncbi.nlm.nih.gov citation URL, e.g.
+# "https://pubmed.ncbi.nlm.nih.gov/38211832" -> "38211832". This is the only
+# reliable, regex-extractable PMID signal on OpenEvidenceCitation today (no
+# dedicated pmid field exists on the model).
+_PUBMED_CITATION_URL_PATTERN = re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d+)")
+
+_TITLE_NORMALIZATION_PATTERN = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_title_for_matching(title: str) -> str:
+    """Lowercase and strip all non-alphanumeric characters so titles that
+    differ only in punctuation/whitespace/case still compare equal."""
+    return _TITLE_NORMALIZATION_PATTERN.sub("", title.lower())
+
+
+def is_non_pubmed_sourced_citation(citation: OpenEvidenceCitation) -> bool:
+    """Whether `citation` is sourced from a clinical practice guideline
+    (NCCN/ASCO/ESMO) or a trial registry rather than a PubMed-indexable
+    journal article — content our own PubMed-abstract-only retrieval
+    structurally cannot ever produce, regardless of gene or overlap with
+    the core pipeline's own citations. See module-level
+    _NON_PUBMED_SOURCE_URL_DOMAINS for the grounding of this classification."""
+    url = (citation.url or "").lower()
+    return bool(url) and any(domain in url for domain in _NON_PUBMED_SOURCE_URL_DOMAINS)
+
+
+def _citation_overlaps_core_pipeline_evidence(
+    citation: OpenEvidenceCitation, core_pmids: frozenset, core_titles: frozenset
+) -> bool:
+    """Whether `citation` strongly matches something the core pipeline's own
+    GeneAnnotation already surfaced (its verified PMID citations or
+    evidence_cards), by PMID (extracted from a pubmed.ncbi.nlm.nih.gov URL)
+    or by normalized title. Either signal alone is enough — OpenEvidence's
+    citation_key is not a PMID, so PMID is only recoverable from the URL,
+    and not every citation has a pubmed.ncbi.nlm.nih.gov-shaped URL even when
+    it is the same paper the core pipeline already cited via PMID."""
+    match = _PUBMED_CITATION_URL_PATTERN.search(citation.url or "")
+    if match is not None and match.group(1) in core_pmids:
+        return True
+    normalized_title = _normalize_title_for_matching(citation.title or "")
+    return bool(normalized_title) and normalized_title in core_titles
+
+
+def is_additive_citation(
+    citation: OpenEvidenceCitation, core_pmids: frozenset, core_titles: frozenset
+) -> bool:
+    """Whether `citation` is worth surfacing in the sidecar at all: a
+    guideline/trial-registry citation always is (our own retrieval
+    structurally cannot produce that content); a PubMed-sourced (journal
+    article) citation only is when it doesn't overlap the core pipeline's
+    own verified citations/evidence_cards for this gene — otherwise showing
+    it adds vendor-call latency for content the curator already has."""
+    if is_non_pubmed_sourced_citation(citation):
+        return True
+    return not _citation_overlaps_core_pipeline_evidence(citation, core_pmids, core_titles)
+
+
+def distill_additive_openevidence(
+    analysis: OpenEvidenceAnalysis,
+    core_pmids: Optional[List[str]] = None,
+    core_titles: Optional[List[str]] = None,
+) -> DistilledOpenEvidence:
+    """Like distill_openevidence, but first drops citations that are
+    redundant with the core pipeline's own PubMed-derived evidence for this
+    gene — `core_pmids` (GeneAnnotation.citations) and `core_titles`
+    (GeneAnnotation.evidence_cards titles), passed in by the caller (see
+    GET /v1/genes/{gene}/openevidence in main.py, which has the
+    already-computed GeneAnnotation in hand for the same gene).
+
+    Only affects `guidelines` and `citation_count` (both derived from
+    analysis.citations) plus the new `redundant_citation_count` (how many
+    citations were dropped). `consensus_role` and `trial_mentions` are
+    derived from analysis.text, not analysis.citations, so are unaffected —
+    see is_additive_citation's docstring for why a guideline/trial-registry
+    citation is always additive regardless of overlap.
+    """
+    normalized_pmids = frozenset(pmid.strip() for pmid in (core_pmids or []) if pmid and pmid.strip())
+    normalized_titles = frozenset(
+        _normalize_title_for_matching(title) for title in (core_titles or []) if title and title.strip()
+    )
+    additive_citations = [
+        citation
+        for citation in analysis.citations
+        if is_additive_citation(citation, normalized_pmids, normalized_titles)
+    ]
+    redundant_count = len(analysis.citations) - len(additive_citations)
+    filtered_analysis = analysis.model_copy(update={"citations": additive_citations})
+    distilled = distill_openevidence(filtered_analysis)
+    return distilled.model_copy(update={"redundant_citation_count": redundant_count})
+
+
+def distilled_openevidence_has_additive_content(distilled: DistilledOpenEvidence) -> bool:
+    """Whether `distilled` has anything genuinely worth rendering as its own
+    card: a guideline reference, a trial/outcome-statistic mention, or at
+    least one additive (non-redundant) citation. Used by the sidecar
+    endpoint to return {"available": false} instead of a card with nothing
+    in it — see distill_additive_openevidence."""
+    return bool(distilled.guidelines or distilled.trial_mentions or distilled.citation_count)
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=8),

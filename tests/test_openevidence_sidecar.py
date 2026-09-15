@@ -24,7 +24,11 @@ from src.models.schema import (
     ResolvedGene,
 )
 from src.pipeline import orchestrator
-from src.pipeline.openevidence import distill_openevidence
+from src.pipeline.openevidence import (
+    distill_additive_openevidence,
+    distill_openevidence,
+    distilled_openevidence_has_additive_content,
+)
 
 # Real, live-captured citation shapes (see tests/test_openevidence.py) reused
 # here to keep the distillation fixtures realistic.
@@ -145,6 +149,107 @@ def test_distill_openevidence_handles_empty_analysis():
 
 
 # ---------------------------------------------------------------------------
+# distill_additive_openevidence / distilled_openevidence_has_additive_content
+#
+# The additivity filter: a guideline/trial-registry citation is always kept
+# (our own PubMed-abstract-only retrieval structurally cannot produce that
+# content), but a PubMed-sourced (journal article) citation is dropped when
+# it strongly matches (by PMID extracted from a pubmed.ncbi.nlm.nih.gov URL,
+# or by normalized title) something the core pipeline's own GeneAnnotation
+# already surfaced for this gene.
+# ---------------------------------------------------------------------------
+
+
+def test_distill_additive_openevidence_filters_out_pubmed_citation_overlapping_core_evidence():
+    """A PubMed-sourced citation whose PMID matches the core pipeline's own
+    verified citations is pure redundancy — dropped entirely, and counted."""
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text="A pharmacokinetic study of alectinib was published. [[4]]",
+        citations=[_JOURNAL_CITATION],
+    )
+
+    distilled = distill_additive_openevidence(analysis, core_pmids=["30902613"])
+
+    assert distilled.citation_count == 0
+    assert distilled.redundant_citation_count == 1
+    assert distilled.guidelines == []
+    assert not distilled_openevidence_has_additive_content(distilled)
+
+
+def test_distill_additive_openevidence_keeps_non_pubmed_guideline_citation_regardless_of_overlap():
+    """A guideline citation is always additive, even if its title happens to
+    match a core-pipeline title — guideline content is structurally
+    unreachable by PubMed-abstract retrieval, so overlap is impossible in
+    practice and irrelevant to the rule."""
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text="NCCN guidelines recommend targeted therapy. [[1]]",
+        citations=[_NCCN_CITATION],
+    )
+
+    distilled = distill_additive_openevidence(
+        analysis, core_pmids=[], core_titles=[_NCCN_CITATION.title]
+    )
+
+    assert distilled.citation_count == 1
+    assert distilled.redundant_citation_count == 0
+    assert len(distilled.guidelines) == 1
+    assert distilled_openevidence_has_additive_content(distilled)
+
+
+def test_distill_additive_openevidence_mixed_case_keeps_guideline_drops_overlapping_journal_citation():
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text=(
+            "NCCN guidelines recommend alectinib as first-line therapy. [[1]] "
+            "A pharmacokinetic study of alectinib was published. [[4]]"
+        ),
+        citations=[_NCCN_CITATION, _JOURNAL_CITATION],
+    )
+
+    distilled = distill_additive_openevidence(analysis, core_pmids=["30902613"])
+
+    assert distilled.citation_count == 1
+    assert distilled.redundant_citation_count == 1
+    assert [g.url for g in distilled.guidelines] == [_NCCN_CITATION.url]
+    assert distilled_openevidence_has_additive_content(distilled)
+
+
+def test_distill_additive_openevidence_matches_overlap_by_normalized_title_when_no_pmid_url():
+    """A citation without a pubmed.ncbi.nlm.nih.gov-shaped URL (e.g. a doi.org
+    link) can still be recognized as redundant via a normalized title match
+    against the core pipeline's evidence_cards titles."""
+    citation = OpenEvidenceCitation(
+        citation_key="9",
+        title="Acetyl-CoA metabolism in cancer",
+        journal="Nature Reviews. Cancer",
+        date="2023-03-01",
+        doi="10.1038/s41568-022-00543-5",
+        url="https://doi.org/10.1038/s41568-022-00543-5",
+    )
+    analysis = OpenEvidenceAnalysis(question="q", text="See [[9]].", citations=[citation])
+
+    distilled = distill_additive_openevidence(
+        analysis, core_titles=["Acetyl-CoA Metabolism In Cancer!"]
+    )
+
+    assert distilled.citation_count == 0
+    assert distilled.redundant_citation_count == 1
+
+
+def test_distill_additive_openevidence_with_no_core_evidence_keeps_all_citations():
+    """No core_pmids/core_titles supplied (an older client, or no annotation
+    in hand yet) means nothing is filtered out as redundant — identical to
+    calling distill_openevidence directly."""
+    distilled = distill_additive_openevidence(_ALK_ANALYSIS)
+
+    assert distilled.citation_count == 4
+    assert distilled.redundant_citation_count == 0
+    assert len(distilled.guidelines) == 3
+
+
+# ---------------------------------------------------------------------------
 # GET /v1/genes/{gene}/openevidence
 # ---------------------------------------------------------------------------
 
@@ -184,6 +289,62 @@ def test_openevidence_sidecar_endpoint_returns_distilled_result_when_enabled(mon
     assert payload["distilled"]["citation_count"] == 4
     assert len(payload["distilled"]["guidelines"]) == 3
     assert any(m["trial"] == "ALEX" for m in payload["distilled"]["trial_mentions"])
+
+
+def test_openevidence_sidecar_endpoint_filters_redundant_citations_via_core_pmids(monkeypatch):
+    """The endpoint's own core_pmids/core_titles params (the caller's
+    already-computed GeneAnnotation evidence) drop the one PubMed-sourced
+    citation that overlaps, while the three guideline citations survive."""
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        return _ALK_ANALYSIS
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+    client = TestClient(main.app)
+
+    response = client.get(
+        "/v1/genes/ALK/openevidence",
+        params={"core_pmids": ["30902613"]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is True
+    assert payload["distilled"]["citation_count"] == 3
+    assert payload["distilled"]["redundant_citation_count"] == 1
+    assert len(payload["distilled"]["guidelines"]) == 3
+
+
+def test_openevidence_sidecar_endpoint_returns_unavailable_when_nothing_additive_survives_filter(
+    monkeypatch,
+):
+    """When every citation is PubMed-sourced and overlaps the core pipeline's
+    own evidence, and the analysis text has no trial/outcome-statistic
+    mention, nothing additive remains — the endpoint reports unavailable
+    rather than rendering an empty-looking card."""
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+    analysis = OpenEvidenceAnalysis(
+        question="q",
+        text="A pharmacokinetic study of alectinib was published.",
+        citations=[_JOURNAL_CITATION],
+    )
+
+    async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
+        return analysis
+
+    monkeypatch.setattr(main.OpenEvidenceClient, "get_gene_analysis", fake_get_gene_analysis)
+    client = TestClient(main.app)
+
+    response = client.get(
+        "/v1/genes/ALK/openevidence",
+        params={"core_pmids": ["30902613"]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["available"] is False
+    assert payload["distilled"] is None
 
 
 def test_openevidence_sidecar_endpoint_skips_live_call_when_confidently_not_cancer_associated(
