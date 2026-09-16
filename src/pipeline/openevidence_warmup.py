@@ -68,7 +68,24 @@ async def warm_openevidence_cache(
     fusion-specific one. Deriving the same fusion context here that
     annotate_one() would derive keeps the two paths asking, and therefore
     caching, the same question for the same gene.
+
+    No-op when settings.openevidence_enabled is false: the feature flag is
+    supposed to make OpenEvidence off end-to-end, not just skipped in the
+    live annotation path, so warmup must not make any OpenEvidenceClient
+    calls (or construct one) while it's off either.
     """
+    if not settings.openevidence_enabled:
+        return {
+            "inputs_processed": 0,
+            "genes_total": 0,
+            "genes_warmed": 0,
+            "genes_failed": 0,
+            "warmed": [],
+            "errors": [],
+            "timings_ms": {"total": 0.0},
+            "skipped_reason": "openevidence_enabled is false",
+        }
+
     total_start = perf_counter()
     input_strings, tumor_type_by_input = _normalize_inputs(inputs)
     gene_map = await normalize_fusions(input_strings)

@@ -19,7 +19,7 @@ from typing import Any, Coroutine, Dict, List, Literal, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,7 +51,11 @@ from src.pipeline.fusion_context import annotate_fusion_position_contexts, parse
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline.normalization import is_fusion_input
-from src.pipeline.openevidence import OpenEvidenceClient, distill_openevidence
+from src.pipeline.openevidence import (
+    OpenEvidenceClient,
+    distill_additive_openevidence,
+    distilled_openevidence_has_additive_content,
+)
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.result_sanitizer import sanitize_annotation_result
 from src.pipeline.run_store import RunStore
@@ -132,6 +136,7 @@ async def no_cache_static(request: Request, call_next):
 
 class DevStatusResponse(BaseModel):
     enabled: bool
+    openevidence_enabled: bool
 
 
 class AnnotationJobCreateResponse(BaseModel):
@@ -431,7 +436,15 @@ async def health() -> dict:
 
 @app.get("/v1/dev/status", response_model=DevStatusResponse)
 async def dev_status() -> DevStatusResponse:
-    return DevStatusResponse(enabled=settings.acgc_dev_mode)
+    # Piggybacks on the existing page-load bootstrap call rather than adding
+    # a new endpoint, so the frontend can gate the OpenEvidence sidecar card
+    # (and its GET /v1/genes/{gene}/openevidence fetch) off before ever
+    # rendering it, instead of relying on the server's runtime
+    # available:false fallback after a wasted round-trip.
+    return DevStatusResponse(
+        enabled=settings.acgc_dev_mode,
+        openevidence_enabled=settings.openevidence_enabled,
+    )
 
 
 @app.post("/v1/annotate", response_model=AnnotationResult)
@@ -762,6 +775,10 @@ async def get_gene_openevidence(
     gene: str,
     tumor_type: Optional[str] = None,
     fusion: Optional[str] = None,
+    cancer_associated: Optional[bool] = None,
+    insufficient_evidence: bool = False,
+    core_pmids: List[str] = Query(default=[]),
+    core_titles: List[str] = Query(default=[]),
 ) -> OpenEvidenceSidecarResponse:
     """
     On-demand, non-blocking OpenEvidence lookup for a single gene, rendered
@@ -778,11 +795,43 @@ async def get_gene_openevidence(
     then this endpoint deterministically distills it (no LLM call) before
     returning.
 
+    `cancer_associated`/`insufficient_evidence` are the caller's already-
+    computed GeneAnnotation fields (the normal UI flow — see
+    fetchGeneOpenEvidence in app.js — has these in hand before calling this
+    endpoint). When our own pipeline is confident a gene has NO cancer
+    association (`cancer_associated is False` and evidence wasn't
+    insufficient — i.e. that conclusion is itself well-supported), this
+    endpoint skips the live OpenEvidence call entirely: _build_question now
+    asks specifically for clinical practice guideline/trial evidence
+    supporting targeted therapy, and no such guideline plausibly exists for
+    a gene with no cancer relevance. The live value benchmark confirmed this
+    empirically — RP1, CLCN3P1, and DENND2C all had cancer_associated=False
+    in both arms, and OpenEvidence's citations yielded zero measurable
+    improvement for any of them (see
+    benchmarks/openevidence_value_report.md). Skipping avoids a 90-250s
+    vendor call and a slot in the shared concurrency semaphore for
+    essentially zero expected benefit. Both params default to values that
+    never trigger the skip, so a caller without an annotation in hand yet
+    (or an older client) still gets the normal live-call behavior.
+
+    `core_pmids`/`core_titles` are the same caller's already-computed
+    GeneAnnotation.citations (verified PMIDs) and evidence_cards titles for
+    this gene — used to drop OpenEvidence citations that are redundant with
+    what our own PubMed-abstract-only retrieval already surfaced (see
+    distill_additive_openevidence). A guideline/trial-registry citation is
+    never dropped this way, since that content type is structurally
+    unreachable by our own retrieval regardless of overlap. Omitted (an
+    older client, or no annotation in hand yet) simply means nothing gets
+    filtered out as redundant.
+
     Returns {"available": false} (never a 4xx/5xx) when OpenEvidence is
-    disabled or the lookup fails, so the UI card can hide/gray itself out
-    rather than show a broken component.
+    disabled, skipped by the gate above, the lookup fails, or nothing
+    additive survives the redundancy filter, so the UI card can hide/gray
+    itself out rather than show a broken or empty-looking component.
     """
     if not settings.openevidence_enabled:
+        return OpenEvidenceSidecarResponse(available=False)
+    if cancer_associated is False and not insufficient_evidence:
         return OpenEvidenceSidecarResponse(available=False)
     try:
         async with _openevidence_sidecar_semaphore():
@@ -792,7 +841,21 @@ async def get_gene_openevidence(
     except Exception as exc:
         logger.warning("OpenEvidence sidecar lookup failed for %s: %s", gene, exc)
         return OpenEvidenceSidecarResponse(available=False, error=str(exc))
-    return OpenEvidenceSidecarResponse(available=True, distilled=distill_openevidence(analysis))
+    # core_pmids/core_titles use Query(default=[]) so FastAPI correctly binds
+    # repeated query params through the ASGI path; a handful of existing
+    # tests call this endpoint function directly (bypassing ASGI/dependency
+    # resolution entirely) without passing them, which leaves the raw
+    # fastapi.params.Query sentinel — not a plain list — as the value. Guard
+    # against that here rather than relaxing those tests to always go
+    # through TestClient.
+    safe_core_pmids = core_pmids if isinstance(core_pmids, list) else []
+    safe_core_titles = core_titles if isinstance(core_titles, list) else []
+    distilled = distill_additive_openevidence(
+        analysis, core_pmids=safe_core_pmids, core_titles=safe_core_titles
+    )
+    if not distilled_openevidence_has_additive_content(distilled):
+        return OpenEvidenceSidecarResponse(available=False)
+    return OpenEvidenceSidecarResponse(available=True, distilled=distilled)
 
 
 @app.post("/v1/fusion-partner-evidence", response_model=FusionPartnerEvidenceResult)
