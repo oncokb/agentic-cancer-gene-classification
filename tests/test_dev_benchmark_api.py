@@ -8,12 +8,24 @@ from src.main import app
 
 def test_dev_status_reflects_config(monkeypatch):
     monkeypatch.setattr(main.settings, "acgc_dev_mode", True)
+    monkeypatch.setattr(main.settings, "openevidence_enabled", False)
     client = TestClient(app)
 
     response = client.get("/v1/dev/status")
 
     assert response.status_code == 200
-    assert response.json() == {"enabled": True}
+    assert response.json() == {"enabled": True, "openevidence_enabled": False}
+
+
+def test_dev_status_reflects_openevidence_flag(monkeypatch):
+    monkeypatch.setattr(main.settings, "acgc_dev_mode", False)
+    monkeypatch.setattr(main.settings, "openevidence_enabled", True)
+    client = TestClient(app)
+
+    response = client.get("/v1/dev/status")
+
+    assert response.status_code == 200
+    assert response.json() == {"enabled": False, "openevidence_enabled": True}
 
 
 def test_benchmark_endpoint_hidden_when_dev_mode_disabled(monkeypatch):
