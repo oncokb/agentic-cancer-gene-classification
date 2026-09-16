@@ -205,11 +205,12 @@ def test_build_user_prompt_reduces_prompt_length_substantially_when_cached(monke
     assert len(cached_prompt) <= len(uncached_prompt) * 0.3
 
 
-def test_build_user_prompt_only_uses_cache_for_pmids_with_a_takeaway():
+def test_build_user_prompt_only_uses_cache_for_pmids_with_a_takeaway(monkeypatch):
     """A pmid_evidence entry with an empty distilled_takeaway (shouldn't
     happen given the NOT NULL column, but defends against a stray empty
     string) must still fall back to the raw abstract rather than injecting
     an empty summary line."""
+    monkeypatch.setattr(synthesis.settings, "pmid_distillation_enabled", True)
     empty_takeaway_record = PMIDEvidenceRecord(
         pmid="30902613",
         title="Alectinib versus crizotinib in untreated ALK-positive NSCLC",
