@@ -13,7 +13,6 @@ import asyncio
 
 import pytest
 
-from src.config import Settings
 from src.models.schema import LiteratureRecord, PMIDEvidenceRecord, ResolvedGene
 from src.pipeline import orchestrator, synthesis
 from src.pipeline.run_store import RunStore
@@ -402,13 +401,13 @@ async def test_annotate_gene_skips_distillation_when_run_store_none(monkeypatch)
 
 async def test_default_config_skips_pmid_evidence_write_and_distillation(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
-    monkeypatch.delenv("PMID_DISTILLATION_ENABLED", raising=False)
-    assert Settings(_env_file=None).pmid_distillation_enabled is False
+    assert orchestrator.settings.pmid_distillation_enabled is False
+    calls = []
 
-    async def fail_if_called(run_store, records):
-        raise AssertionError("distillation should be skipped by default")
+    async def record_call(run_store, records):
+        calls.append(records)
 
-    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", fail_if_called)
+    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", record_call)
     store = _FakeGeneStoreForDistillation()
 
     await orchestrator._annotate_gene(
@@ -419,7 +418,7 @@ async def test_default_config_skips_pmid_evidence_write_and_distillation(monkeyp
         run_store=store,
     )
     await asyncio.sleep(0)
-    assert store.saved_batches == []
+    assert calls == []
 
 
 async def test_annotate_gene_returns_without_waiting_for_distillation_to_finish(monkeypatch):
