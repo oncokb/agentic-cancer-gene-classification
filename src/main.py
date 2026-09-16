@@ -136,6 +136,7 @@ async def no_cache_static(request: Request, call_next):
 
 class DevStatusResponse(BaseModel):
     enabled: bool
+    openevidence_enabled: bool
 
 
 class AnnotationJobCreateResponse(BaseModel):
@@ -435,7 +436,15 @@ async def health() -> dict:
 
 @app.get("/v1/dev/status", response_model=DevStatusResponse)
 async def dev_status() -> DevStatusResponse:
-    return DevStatusResponse(enabled=settings.acgc_dev_mode)
+    # Piggybacks on the existing page-load bootstrap call rather than adding
+    # a new endpoint, so the frontend can gate the OpenEvidence sidecar card
+    # (and its GET /v1/genes/{gene}/openevidence fetch) off before ever
+    # rendering it, instead of relying on the server's runtime
+    # available:false fallback after a wasted round-trip.
+    return DevStatusResponse(
+        enabled=settings.acgc_dev_mode,
+        openevidence_enabled=settings.openevidence_enabled,
+    )
 
 
 @app.post("/v1/annotate", response_model=AnnotationResult)

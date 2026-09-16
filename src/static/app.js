@@ -68,6 +68,11 @@ const state = {
   // sidecar is fetched independently of the core annotation result and
   // never blocks rendering the rest of the page (see renderOpenEvidenceCard).
   openEvidenceByGene: {},
+  // Server-side settings.openevidence_enabled, learned from GET
+  // /v1/dev/status on page load. Starts false (fail closed, matching the
+  // server default) so no card renders and no fetch fires before that call
+  // resolves — see loadDevStatus and renderOpenEvidenceCard.
+  openevidenceEnabled: false,
 };
 
 const elements = {
@@ -239,16 +244,31 @@ async function loadDevStatus() {
     if (!response.ok) {
       elements.navBenchmark.classList.add("hidden");
       elements.annotateBackendField.classList.add("hidden");
+      state.openevidenceEnabled = false;
       if (state.currentView === "benchmark") switchView("annotate");
       return;
     }
     const payload = await response.json();
     elements.navBenchmark.classList.toggle("hidden", !payload.enabled);
     elements.annotateBackendField.classList.toggle("hidden", !payload.enabled);
+    const openevidenceEnabled = Boolean(payload.openevidence_enabled);
+    state.openevidenceEnabled = openevidenceEnabled;
+    // Startup fires loadDevStatus() and loadSharedRun() concurrently (see
+    // bottom of file). If a shared run's results render first, they render
+    // with the fail-closed default (openevidenceEnabled: false) and get no
+    // OpenEvidence cards at all — nothing else re-triggers rendering for
+    // those genes afterward. Re-render once here so a flag that resolves to
+    // true after the fact still reconciles against whatever's already on
+    // the page, instead of the sidecar silently never appearing for that
+    // page load.
+    if (openevidenceEnabled && state.currentResult) {
+      renderAnnotationResult(state.currentResult);
+    }
     if (!payload.enabled && state.currentView === "benchmark") switchView("annotate");
   } catch {
     elements.navBenchmark.classList.add("hidden");
     elements.annotateBackendField.classList.add("hidden");
+    state.openevidenceEnabled = false;
     if (state.currentView === "benchmark") switchView("annotate");
   }
 }
@@ -1892,6 +1912,13 @@ function fetchGeneOpenEvidence(
   tumorType,
   { cancerAssociated, insufficientEvidence, corePmids, coreTitles } = {}
 ) {
+  // Defense in depth: renderOpenEvidenceCard is the only caller today and
+  // already gates on state.openevidenceEnabled before ever reaching this
+  // function, but this function issues the actual network request, so it
+  // must not fire regardless of how it gets called.
+  if (!state.openevidenceEnabled) {
+    return Promise.resolve({ available: false });
+  }
   const key = `${gene}|${tumorType || ""}`;
   if (state.openEvidenceByGene[key]) {
     return state.openEvidenceByGene[key];
@@ -2016,6 +2043,16 @@ function renderOpenEvidenceCardBody(card, body, response) {
 }
 
 function renderOpenEvidenceCard(annotation) {
+  // Feature-flag gate: settings.openevidence_enabled, learned from GET
+  // /v1/dev/status on page load (see loadDevStatus). When off, render no
+  // card at all and never call fetchGeneOpenEvidence, so the client issues
+  // no GET /v1/genes/{gene}/openevidence request — the server's
+  // available:false response is a runtime fallback for other callers, not a
+  // substitute for not asking at all.
+  if (!state.openevidenceEnabled) {
+    return null;
+  }
+
   // Mirrors the server-side gate in GET /v1/genes/{gene}/openevidence: skip
   // entirely (no card, no fetch, no "Checking OpenEvidence…" flash) when our
   // own pipeline is already confident this gene has no cancer association —
