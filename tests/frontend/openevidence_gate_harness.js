@@ -42,6 +42,19 @@ function loadedSource() {
   return `${declarations}\nglobalThis.state = state;\nglobalThis.elements = elements;\n`;
 }
 
+// Depth-first search through the FakeElement tree (as built by
+// appendChild/replaceChildren) for an element with the given id, mirroring
+// how a test would use document.getElementById against a real DOM.
+function findById(root, id) {
+  if (!root) return null;
+  if (root.id === id) return root;
+  for (const child of root.children || []) {
+    const found = findById(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+
 class FakeClassList {
   constructor() {
     this._set = new Set();
@@ -145,10 +158,18 @@ class FakeElement {
 }
 
 function buildSandbox({ fetchImpl }) {
+  // Every document.createElement call app.js makes gets recorded here so
+  // tests can assert nothing was created at all (not just "nothing
+  // fetched") for a given code path — see createdElementTags below.
+  const createdElements = [];
   const fakeDocument = {
     querySelector: (selector) => new FakeElement(selector),
     querySelectorAll: () => [],
-    createElement: (tag) => new FakeElement(tag),
+    createElement: (tag) => {
+      const el = new FakeElement(tag);
+      createdElements.push(el);
+      return el;
+    },
     getElementById: (id) => new FakeElement(`#${id}`),
     addEventListener: () => {},
     removeEventListener: () => {},
@@ -184,17 +205,22 @@ function buildSandbox({ fetchImpl }) {
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
-  return sandbox;
+  return { sandbox, createdElements };
 }
 
 // Loads app.js's declarations into a fresh sandbox and returns it, with the
 // module's own functions/state directly reachable as sandbox properties
-// (e.g. sandbox.state, sandbox.renderOpenEvidenceCard).
+// (e.g. sandbox.state, sandbox.renderOpenEvidenceCard), plus
+// `createdElementTags` — every tag name passed to document.createElement
+// during this sandbox's lifetime, for asserting nothing was created at all.
 function loadApp({ fetchImpl }) {
-  const sandbox = buildSandbox({ fetchImpl });
+  const { sandbox, createdElements } = buildSandbox({ fetchImpl });
   const script = new vm.Script(loadedSource(), { filename: "app.js" });
   script.runInContext(sandbox);
+  Object.defineProperty(sandbox, "createdElementTags", {
+    get: () => createdElements.map((el) => el.tagName),
+  });
   return sandbox;
 }
 
-module.exports = { loadApp, FakeElement };
+module.exports = { loadApp, FakeElement, findById };

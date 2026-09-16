@@ -251,7 +251,19 @@ async function loadDevStatus() {
     const payload = await response.json();
     elements.navBenchmark.classList.toggle("hidden", !payload.enabled);
     elements.annotateBackendField.classList.toggle("hidden", !payload.enabled);
-    state.openevidenceEnabled = Boolean(payload.openevidence_enabled);
+    const openevidenceEnabled = Boolean(payload.openevidence_enabled);
+    state.openevidenceEnabled = openevidenceEnabled;
+    // Startup fires loadDevStatus() and loadSharedRun() concurrently (see
+    // bottom of file). If a shared run's results render first, they render
+    // with the fail-closed default (openevidenceEnabled: false) and get no
+    // OpenEvidence cards at all — nothing else re-triggers rendering for
+    // those genes afterward. Re-render once here so a flag that resolves to
+    // true after the fact still reconciles against whatever's already on
+    // the page, instead of the sidecar silently never appearing for that
+    // page load.
+    if (openevidenceEnabled && state.currentResult) {
+      renderAnnotationResult(state.currentResult);
+    }
     if (!payload.enabled && state.currentView === "benchmark") switchView("annotate");
   } catch {
     elements.navBenchmark.classList.add("hidden");
