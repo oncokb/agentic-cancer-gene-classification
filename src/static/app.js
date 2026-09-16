@@ -1887,7 +1887,11 @@ function enqueueOpenEvidenceFetch(job) {
   runOpenEvidenceFetchQueue();
 }
 
-function fetchGeneOpenEvidence(gene, tumorType, { cancerAssociated, insufficientEvidence } = {}) {
+function fetchGeneOpenEvidence(
+  gene,
+  tumorType,
+  { cancerAssociated, insufficientEvidence, corePmids, coreTitles } = {}
+) {
   const key = `${gene}|${tumorType || ""}`;
   if (state.openEvidenceByGene[key]) {
     return state.openEvidenceByGene[key];
@@ -1902,6 +1906,11 @@ function fetchGeneOpenEvidence(gene, tumorType, { cancerAssociated, insufficient
     params.set("cancer_associated", String(cancerAssociated));
   }
   if (insufficientEvidence) params.set("insufficient_evidence", "true");
+  // The core pipeline's own verified PMIDs/evidence titles for this gene —
+  // lets the server drop OpenEvidence citations that just repeat what our
+  // own PubMed-abstract retrieval already found (see distill_additive_openevidence).
+  (corePmids || []).forEach((pmid) => pmid && params.append("core_pmids", pmid));
+  (coreTitles || []).forEach((title) => title && params.append("core_titles", title));
   const query = params.toString();
   const promise = fetch(`/v1/genes/${encodeURIComponent(gene)}/openevidence${query ? `?${query}` : ""}`)
     .then((response) => {
@@ -1989,9 +1998,20 @@ function renderOpenEvidenceCardBody(card, body, response) {
     body.appendChild(empty);
   }
 
+  if (distilled.redundant_citation_count > 0) {
+    const note = document.createElement("div");
+    note.className = "subtle openevidence-redundant-note";
+    note.textContent =
+      distilled.redundant_citation_count === 1
+        ? "1 additional OpenEvidence citation was omitted as already covered by this gene's own literature evidence."
+        : `${distilled.redundant_citation_count} additional OpenEvidence citations were omitted as already covered by this gene's own literature evidence.`;
+    body.appendChild(note);
+  }
+
   const footnote = document.createElement("div");
   footnote.className = "subtle openevidence-footnote";
-  footnote.textContent = "Unverified supplementary evidence from OpenEvidence — not PMID-verified.";
+  footnote.textContent =
+    "Unverified supplementary evidence from OpenEvidence, shown here only when it goes beyond this gene's own literature evidence — not PMID-verified.";
   body.appendChild(footnote);
 }
 
@@ -2027,6 +2047,8 @@ function renderOpenEvidenceCard(annotation) {
     fetchGeneOpenEvidence(annotation.gene, tumorTypeForAnnotation(annotation), {
       cancerAssociated: annotation.cancer_associated,
       insufficientEvidence: annotation.insufficient_evidence,
+      corePmids: annotation.citations,
+      coreTitles: (annotation.evidence_cards || []).map((card) => card.title).filter(Boolean),
     })
       .then((response) => renderOpenEvidenceCardBody(card, body, response))
       .catch(() => card.remove())
