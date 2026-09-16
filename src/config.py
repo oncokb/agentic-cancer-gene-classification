@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # Background (fire-and-forget, never blocking annotation) distillation of
     # retrieved abstracts into the permanent pmid_evidence cache — see
     # src/pipeline/pmid_distillation.py and orchestrator.py's _annotate_gene.
-    pmid_distillation_enabled: bool = True
+    pmid_distillation_enabled: bool = False
     pmid_distillation_model: str = "claude-haiku-4-5-20251001"
     bedrock_synthesis_model: str = ""
     bedrock_synthesis_fast_model: str = ""

@@ -277,7 +277,7 @@ def _build_user_prompt(
             impact_tag = " ★" if rec.journal in _HIGH_IMPACT_JOURNALS else ""
             cached = (pmid_evidence or {}).get(rec.pmid)
             lines.append("---")
-            if cached is not None and cached.distilled_takeaway:
+            if settings.pmid_distillation_enabled and cached is not None and cached.distilled_takeaway:
                 # Permanently-cached distillation (see run_store.py's
                 # pmid_evidence table) — a 25-40 word core takeaway in place
                 # of the ~450-word raw abstract, cutting abstract tokens by

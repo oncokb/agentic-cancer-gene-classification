@@ -160,7 +160,8 @@ def test_build_user_prompt_falls_back_to_raw_abstract_when_not_cached():
     assert _RAW_ABSTRACT in prompt
 
 
-def test_build_user_prompt_uses_distilled_takeaway_when_cached():
+def test_build_user_prompt_uses_distilled_takeaway_when_cached(monkeypatch):
+    monkeypatch.setattr(synthesis.settings, "pmid_distillation_enabled", True)
     prompt = synthesis._build_user_prompt(
         gene="ALK",
         fusions=[],
@@ -178,7 +179,8 @@ def test_build_user_prompt_uses_distilled_takeaway_when_cached():
     assert "[Annals of Oncology]" in prompt
 
 
-def test_build_user_prompt_reduces_prompt_length_substantially_when_cached():
+def test_build_user_prompt_reduces_prompt_length_substantially_when_cached(monkeypatch):
+    monkeypatch.setattr(synthesis.settings, "pmid_distillation_enabled", True)
     uncached_prompt = synthesis._build_user_prompt(
         gene="ALK",
         fusions=[],
@@ -203,11 +205,12 @@ def test_build_user_prompt_reduces_prompt_length_substantially_when_cached():
     assert len(cached_prompt) <= len(uncached_prompt) * 0.3
 
 
-def test_build_user_prompt_only_uses_cache_for_pmids_with_a_takeaway():
+def test_build_user_prompt_only_uses_cache_for_pmids_with_a_takeaway(monkeypatch):
     """A pmid_evidence entry with an empty distilled_takeaway (shouldn't
     happen given the NOT NULL column, but defends against a stray empty
     string) must still fall back to the raw abstract rather than injecting
     an empty summary line."""
+    monkeypatch.setattr(synthesis.settings, "pmid_distillation_enabled", True)
     empty_takeaway_record = PMIDEvidenceRecord(
         pmid="30902613",
         title="Alectinib versus crizotinib in untreated ALK-positive NSCLC",
@@ -228,7 +231,8 @@ def test_build_user_prompt_only_uses_cache_for_pmids_with_a_takeaway():
     assert "Summary:" not in prompt
 
 
-def test_build_user_prompt_mixes_cached_and_uncached_papers():
+def test_build_user_prompt_mixes_cached_and_uncached_papers(monkeypatch):
+    monkeypatch.setattr(synthesis.settings, "pmid_distillation_enabled", True)
     cached_record = _alex_trial_record()
     uncached_record = LiteratureRecord(
         pmid="99999999",
@@ -306,6 +310,7 @@ def _fake_pipeline_functions(monkeypatch):
 
 async def test_annotate_gene_fires_distillation_only_for_uncached_pmids(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
     calls = []
 
     async def fake_distill_and_save(run_store, records):
@@ -332,6 +337,7 @@ async def test_annotate_gene_fires_distillation_only_for_uncached_pmids(monkeypa
 
 async def test_annotate_gene_skips_distillation_when_all_pmids_cached(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
     calls = []
 
     async def fake_distill_and_save(run_store, records):
@@ -359,6 +365,7 @@ async def test_annotate_gene_skips_distillation_when_all_pmids_cached(monkeypatc
 
 async def test_annotate_gene_skips_distillation_in_local_mode(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
 
     async def fail_if_called(run_store, records):
         raise AssertionError("distillation should be skipped in local_mode")
@@ -379,6 +386,7 @@ async def test_annotate_gene_skips_distillation_in_local_mode(monkeypatch):
 
 async def test_annotate_gene_skips_distillation_when_run_store_none(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
 
     async def fail_if_called(run_store, records):
         raise AssertionError("distillation should be skipped without a run_store")
@@ -395,14 +403,15 @@ async def test_annotate_gene_skips_distillation_when_run_store_none(monkeypatch)
     await asyncio.sleep(0)
 
 
-async def test_annotate_gene_skips_distillation_when_disabled_via_settings(monkeypatch):
+async def test_default_config_skips_pmid_evidence_write_and_distillation(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
-    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", False)
+    assert orchestrator.settings.pmid_distillation_enabled is False
+    calls = []
 
-    async def fail_if_called(run_store, records):
-        raise AssertionError("distillation should be skipped when disabled")
+    async def record_call(run_store, records):
+        calls.append(records)
 
-    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", fail_if_called)
+    monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", record_call)
     store = _FakeGeneStoreForDistillation()
 
     await orchestrator._annotate_gene(
@@ -413,12 +422,66 @@ async def test_annotate_gene_skips_distillation_when_disabled_via_settings(monke
         run_store=store,
     )
     await asyncio.sleep(0)
+    assert calls == []
+
+
+async def test_disabled_distillation_uses_raw_abstract_despite_cached_evidence(monkeypatch):
+    _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", False)
+    prompts = []
+
+    async def capture_synthesis_prompt(**kwargs):
+        prompts.append(
+            synthesis._build_user_prompt(
+                gene=kwargs["gene"],
+                fusions=kwargs["fusions"],
+                in_oncokb=kwargs["in_oncokb"],
+                cancer_type_prevalence=kwargs["cancer_type_prevalence"],
+                records=kwargs["records"],
+                retrieval_tier=kwargs["retrieval_tier"],
+                gene_identity=kwargs["gene_identity"],
+                mode=kwargs["mode"],
+                pmid_evidence=kwargs["pmid_evidence"],
+            )
+        )
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Retrieved literature supports a cancer association.",
+            "gene_summary": "ALK has retrieved cancer evidence.",
+            "citations": ["30902613"],
+        }
+
+    monkeypatch.setattr(orchestrator, "synthesize_gene_annotation", capture_synthesis_prompt)
+    store = _FakeGeneStoreForDistillation(
+        cached_evidence={
+            "30902613": PMIDEvidenceRecord(
+                pmid="30902613",
+                title="Cached paper",
+                journal="J",
+                distilled_takeaway="Pre-existing cached takeaway",
+            )
+        }
+    )
+
+    await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+        unresolvable=False,
+        run_store=store,
+    )
+
+    assert len(prompts) == 1
+    assert "PMID: 30902613 [J]\nTitle: Cached paper\nAbstract: abstract" in prompts[0]
+    assert "Pre-existing cached takeaway" not in prompts[0]
 
 
 async def test_annotate_gene_returns_without_waiting_for_distillation_to_finish(monkeypatch):
     """The distillation task must be fire-and-forget: _annotate_gene returns
     even though the fake distillation below never completes on its own."""
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
     never_finishes = asyncio.Event()
 
     async def hanging_distill(run_store, records):
