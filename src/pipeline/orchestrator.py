@@ -102,7 +102,7 @@ async def _fetch_pmid_evidence(
     lookup itself fails — this is a token-savings optimization, never
     something that should block or degrade a core annotation run.
     """
-    if run_store is None or not pmids:
+    if not settings.pmid_distillation_enabled or run_store is None or not pmids:
         return {}
     try:
         return await run_store.get_pmid_evidence_batch(pmids)

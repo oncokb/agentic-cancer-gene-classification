@@ -160,7 +160,8 @@ def test_build_user_prompt_falls_back_to_raw_abstract_when_not_cached():
     assert _RAW_ABSTRACT in prompt
 
 
-def test_build_user_prompt_uses_distilled_takeaway_when_cached():
+def test_build_user_prompt_uses_distilled_takeaway_when_cached(monkeypatch):
+    monkeypatch.setattr(synthesis.settings, "pmid_distillation_enabled", True)
     prompt = synthesis._build_user_prompt(
         gene="ALK",
         fusions=[],
@@ -178,7 +179,8 @@ def test_build_user_prompt_uses_distilled_takeaway_when_cached():
     assert "[Annals of Oncology]" in prompt
 
 
-def test_build_user_prompt_reduces_prompt_length_substantially_when_cached():
+def test_build_user_prompt_reduces_prompt_length_substantially_when_cached(monkeypatch):
+    monkeypatch.setattr(synthesis.settings, "pmid_distillation_enabled", True)
     uncached_prompt = synthesis._build_user_prompt(
         gene="ALK",
         fusions=[],
@@ -228,7 +230,8 @@ def test_build_user_prompt_only_uses_cache_for_pmids_with_a_takeaway():
     assert "Summary:" not in prompt
 
 
-def test_build_user_prompt_mixes_cached_and_uncached_papers():
+def test_build_user_prompt_mixes_cached_and_uncached_papers(monkeypatch):
+    monkeypatch.setattr(synthesis.settings, "pmid_distillation_enabled", True)
     cached_record = _alex_trial_record()
     uncached_record = LiteratureRecord(
         pmid="99999999",
@@ -419,6 +422,58 @@ async def test_default_config_skips_pmid_evidence_write_and_distillation(monkeyp
     )
     await asyncio.sleep(0)
     assert calls == []
+
+
+async def test_disabled_distillation_uses_raw_abstract_despite_cached_evidence(monkeypatch):
+    _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", False)
+    prompts = []
+
+    async def capture_synthesis_prompt(**kwargs):
+        prompts.append(
+            synthesis._build_user_prompt(
+                gene=kwargs["gene"],
+                fusions=kwargs["fusions"],
+                in_oncokb=kwargs["in_oncokb"],
+                cancer_type_prevalence=kwargs["cancer_type_prevalence"],
+                records=kwargs["records"],
+                retrieval_tier=kwargs["retrieval_tier"],
+                gene_identity=kwargs["gene_identity"],
+                mode=kwargs["mode"],
+                pmid_evidence=kwargs["pmid_evidence"],
+            )
+        )
+        return {
+            "cancer_associated": True,
+            "insufficient_evidence": False,
+            "cancer_association_rationale": "Retrieved literature supports a cancer association.",
+            "gene_summary": "ALK has retrieved cancer evidence.",
+            "citations": ["30902613"],
+        }
+
+    monkeypatch.setattr(orchestrator, "synthesize_gene_annotation", capture_synthesis_prompt)
+    store = _FakeGeneStoreForDistillation(
+        cached_evidence={
+            "30902613": PMIDEvidenceRecord(
+                pmid="30902613",
+                title="Cached paper",
+                journal="J",
+                distilled_takeaway="Pre-existing cached takeaway",
+            )
+        }
+    )
+
+    await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=[],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+        unresolvable=False,
+        run_store=store,
+    )
+
+    assert len(prompts) == 1
+    assert "PMID: 30902613 [J]\nTitle: Cached paper\nAbstract: abstract" in prompts[0]
+    assert "Pre-existing cached takeaway" not in prompts[0]
 
 
 async def test_annotate_gene_returns_without_waiting_for_distillation_to_finish(monkeypatch):
