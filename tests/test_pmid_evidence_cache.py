@@ -13,6 +13,7 @@ import asyncio
 
 import pytest
 
+from src.config import Settings
 from src.models.schema import LiteratureRecord, PMIDEvidenceRecord, ResolvedGene
 from src.pipeline import orchestrator, synthesis
 from src.pipeline.run_store import RunStore
@@ -306,6 +307,7 @@ def _fake_pipeline_functions(monkeypatch):
 
 async def test_annotate_gene_fires_distillation_only_for_uncached_pmids(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
     calls = []
 
     async def fake_distill_and_save(run_store, records):
@@ -332,6 +334,7 @@ async def test_annotate_gene_fires_distillation_only_for_uncached_pmids(monkeypa
 
 async def test_annotate_gene_skips_distillation_when_all_pmids_cached(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
     calls = []
 
     async def fake_distill_and_save(run_store, records):
@@ -359,6 +362,7 @@ async def test_annotate_gene_skips_distillation_when_all_pmids_cached(monkeypatc
 
 async def test_annotate_gene_skips_distillation_in_local_mode(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
 
     async def fail_if_called(run_store, records):
         raise AssertionError("distillation should be skipped in local_mode")
@@ -379,6 +383,7 @@ async def test_annotate_gene_skips_distillation_in_local_mode(monkeypatch):
 
 async def test_annotate_gene_skips_distillation_when_run_store_none(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
 
     async def fail_if_called(run_store, records):
         raise AssertionError("distillation should be skipped without a run_store")
@@ -395,12 +400,13 @@ async def test_annotate_gene_skips_distillation_when_run_store_none(monkeypatch)
     await asyncio.sleep(0)
 
 
-async def test_annotate_gene_skips_distillation_when_disabled_via_settings(monkeypatch):
+async def test_default_config_skips_pmid_evidence_write_and_distillation(monkeypatch):
     _fake_pipeline_functions(monkeypatch)
-    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", False)
+    monkeypatch.delenv("PMID_DISTILLATION_ENABLED", raising=False)
+    assert Settings(_env_file=None).pmid_distillation_enabled is False
 
     async def fail_if_called(run_store, records):
-        raise AssertionError("distillation should be skipped when disabled")
+        raise AssertionError("distillation should be skipped by default")
 
     monkeypatch.setattr(orchestrator, "distill_and_save_pmid_evidence", fail_if_called)
     store = _FakeGeneStoreForDistillation()
@@ -413,12 +419,14 @@ async def test_annotate_gene_skips_distillation_when_disabled_via_settings(monke
         run_store=store,
     )
     await asyncio.sleep(0)
+    assert store.saved_batches == []
 
 
 async def test_annotate_gene_returns_without_waiting_for_distillation_to_finish(monkeypatch):
     """The distillation task must be fire-and-forget: _annotate_gene returns
     even though the fake distillation below never completes on its own."""
     _fake_pipeline_functions(monkeypatch)
+    monkeypatch.setattr(orchestrator.settings, "pmid_distillation_enabled", True)
     never_finishes = asyncio.Event()
 
     async def hanging_distill(run_store, records):
