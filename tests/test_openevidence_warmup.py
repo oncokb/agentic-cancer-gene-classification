@@ -197,15 +197,17 @@ async def test_warm_openevidence_cache_rerun_against_warm_cache_is_safe_noop(_re
 async def test_warm_openevidence_cache_warms_fusion_specific_question_for_fusion_gene(
     _require_redis, monkeypatch
 ):
-    """Regression test: get_gene_analysis's cache key does not vary by
-    fusion (by design — see openevidence.py's _cache_key), so it holds
-    whatever question was actually asked when the entry was populated. If
-    warmup asked the generic "is ALK an oncogene..." question here while a
-    live annotation request for the same ALK::EML4 fusion would ask the
-    fusion-specific "is the EML4::ALK fusion oncogenic..." question, the
-    live request would silently get a cache HIT on warmup's stale
-    generic-question answer and never actually compute (or cache) the
-    fusion-specific one — with no visible error.
+    """Regression test: get_gene_analysis's cache key includes `fusion`
+    whenever present (see openevidence.py's _cache_key), so a
+    fusion-specific answer and a generic gene-only answer live in separate
+    cache slots. If warmup asked the generic "is ALK an oncogene..."
+    question here while a live annotation request for the same ALK::EML4
+    fusion asks the fusion-specific "is the EML4::ALK fusion oncogenic..."
+    question, warmup would populate the WRONG cache slot and the live
+    request would still take a cache miss (no benefit from warming) — or,
+    before the cache key included fusion, would have silently gotten a
+    cache HIT on warmup's stale generic-question answer instead of its own
+    fusion-specific one.
 
     Warms via the warmup path with the same raw fusion input a live request
     would submit, then simulates the live annotate path's lookup for that
