@@ -81,35 +81,52 @@ def _is_transient_openevidence_error(exc: BaseException) -> bool:
     return False
 
 
-def _cache_key(gene: str, tumor_type: Optional[str] = None) -> str:
+def _cache_key(gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None) -> str:
     """Shared cache-key derivation, used both to fetch/store a live analysis
     (OpenEvidenceClient.get_gene_analysis) and to passively peek whether one
     already exists (has_cached_analysis), so the two paths can never drift
-    apart on key format."""
-    return "openevidence:" + json.dumps(
-        {
-            "gene": gene.strip().upper(),
-            "tumor_type": (tumor_type or "").strip().lower(),
-            "model": settings.openevidence_model,
-        },
-        sort_keys=True,
-    )
+    apart on key format.
+
+    `fusion` is included whenever it resolves to two real partner genes (the
+    same gating _build_question uses to decide whether to ask the
+    fusion-specific question) so that a fusion-specific answer and a
+    gene-only answer for the same gene/tumor_type never collide in the same
+    cache slot. Normalized via split_fusion (upper-cased, canonical "::"
+    separator) so equivalent fusion notations ("EML4::ALK", "EML4--ALK")
+    hash to the same key.
+    """
+    key: Dict[str, str] = {
+        "gene": gene.strip().upper(),
+        "tumor_type": (tumor_type or "").strip().lower(),
+        "model": settings.openevidence_model,
+    }
+    if fusion:
+        gene1, gene2 = split_fusion(fusion)
+        if gene1 and gene2:
+            key["fusion"] = f"{gene1.strip().upper()}::{gene2.strip().upper()}"
+    return "openevidence:" + json.dumps(key, sort_keys=True)
 
 
-async def has_cached_analysis(gene: str, tumor_type: Optional[str] = None) -> bool:
-    """Whether a Redis cache entry already exists for this gene/tumor_type —
-    a passive peek that makes no live HTTP call and needs no API key.
+async def has_cached_analysis(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> bool:
+    """Whether a Redis cache entry already exists for this gene/tumor_type/
+    fusion — a passive peek that makes no live HTTP call and needs no API
+    key.
 
     Used by the gene-annotation reuse/staleness check (see
     orchestrator.py's _maybe_reuse_cached_annotation) to detect when
     OpenEvidence data has become available since a stored annotation was
     last synthesized without it — e.g. via benchmarks/warm_openevidence_cache.py,
     or a slow live call that finished after that gene's synthesis had
-    already proceeded without it. Fails closed (returns False) if Redis is
-    unreachable, consistent with this being a best-effort supplementary
-    signal, never something that should block or error out a cache read.
+    already proceeded without it. `fusion` must match whatever fusion (if
+    any) the corresponding get_gene_analysis call would use, or this peeks
+    the wrong cache slot (see _cache_key). Fails closed (returns False) if
+    Redis is unreachable, consistent with this being a best-effort
+    supplementary signal, never something that should block or error out a
+    cache read.
     """
-    key = _cache_key(gene, tumor_type)
+    key = _cache_key(gene, tumor_type, fusion=fusion)
     try:
         return bool(await _get_client().exists(key))
     except Exception as exc:
@@ -117,39 +134,50 @@ async def has_cached_analysis(gene: str, tumor_type: Optional[str] = None) -> bo
         return False
 
 
-def _refresh_attempt_key(gene: str, tumor_type: Optional[str] = None) -> str:
-    return "openevidence:refresh_attempt:" + json.dumps(
-        {"gene": gene.strip().upper(), "tumor_type": (tumor_type or "").strip().lower()},
-        sort_keys=True,
-    )
+def _refresh_attempt_key(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> str:
+    key: Dict[str, str] = {"gene": gene.strip().upper(), "tumor_type": (tumor_type or "").strip().lower()}
+    if fusion:
+        gene1, gene2 = split_fusion(fusion)
+        if gene1 and gene2:
+            key["fusion"] = f"{gene1.strip().upper()}::{gene2.strip().upper()}"
+    return "openevidence:refresh_attempt:" + json.dumps(key, sort_keys=True)
 
 
-async def mark_refresh_attempted(gene: str, tumor_type: Optional[str] = None) -> None:
+async def mark_refresh_attempted(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> None:
     """Record that a freshness-triggered refresh was just attempted for this
-    gene/tumor_type, so the gene-annotation reuse check won't re-trigger
-    another one until OPENEVIDENCE_REFRESH_COOLDOWN_SECONDS has passed —
-    even if the refresh attempt itself never ends up populating
+    gene/tumor_type/fusion, so the gene-annotation reuse check won't
+    re-trigger another one until OPENEVIDENCE_REFRESH_COOLDOWN_SECONDS has
+    passed — even if the refresh attempt itself never ends up populating
     openevidence_supplementary (e.g. a downstream synthesis error unrelated
     to OpenEvidence skips persisting the refreshed annotation entirely).
     Recorded via a self-expiring Redis key rather than a persisted
     annotation field, since the cooldown must apply regardless of whether
-    the refreshed annotation gets persisted at all.
+    the refreshed annotation gets persisted at all. `fusion` is included so
+    a generic-question refresh attempt and a fusion-specific one for the
+    same gene/tumor_type get independent cooldowns, consistent with
+    _cache_key.
     """
-    key = _refresh_attempt_key(gene, tumor_type)
+    key = _refresh_attempt_key(gene, tumor_type, fusion=fusion)
     try:
         await _get_client().set(key, "1", ex=settings.openevidence_refresh_cooldown_seconds)
     except Exception as exc:
         logger.warning("Failed to record OpenEvidence refresh attempt for %s: %s", gene, exc)
 
 
-async def was_refresh_recently_attempted(gene: str, tumor_type: Optional[str] = None) -> bool:
+async def was_refresh_recently_attempted(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> bool:
     """Whether a freshness-triggered refresh was attempted for this
-    gene/tumor_type within the cooldown window. Fails closed (returns
+    gene/tumor_type/fusion within the cooldown window. Fails closed (returns
     False, i.e. "safe to attempt") if Redis is unreachable — consistent
     with has_cached_analysis, this is a best-effort signal, not something
     that should itself block a cache read.
     """
-    key = _refresh_attempt_key(gene, tumor_type)
+    key = _refresh_attempt_key(gene, tumor_type, fusion=fusion)
     try:
         return bool(await _get_client().exists(key))
     except Exception as exc:
@@ -818,12 +846,15 @@ class OpenEvidenceClient:
         httpx.AsyncClient (e.g. for tests) or one will be created and closed
         for this call.
 
-        The cache key intentionally still derives only from gene/tumor_type/
-        model (see _cache_key), not from `fusion` — cache-key shape is
-        explicitly out of scope for this question-text change.
+        The cache key also derives from `fusion` (see _cache_key) whenever
+        it resolves to two real partner genes — the fusion-specific question
+        built above is a different question than the gene-only one, so it
+        must live in a different cache slot, or a fusion-specific answer and
+        a gene-only answer for the same gene/tumor_type would silently
+        overwrite/return each other.
         """
         question = _build_question(gene, tumor_type, fusion=fusion)
-        cache_key = _cache_key(gene, tumor_type)
+        cache_key = _cache_key(gene, tumor_type, fusion=fusion)
 
         async def _compute() -> dict:
             # Only reached on a cache miss (cached_call checks Redis first) —
