@@ -26,6 +26,7 @@ from src.pipeline.openevidence import (
     OpenEvidenceConfigurationError,
     _build_analysis,
     _build_question,
+    _cache_key,
     _iter_sse_payloads,
     _parse_sse_events,
     mark_refresh_attempted,
@@ -241,6 +242,111 @@ def test_build_question_fusion_gene_with_tumor_type():
         "in NSCLC? State the classification and the strongest "
         "supporting evidence."
     )
+
+
+# ---------------------------------------------------------------------------
+# _cache_key fusion-awareness: a fusion-specific question (see
+# test_build_question_fusion_gene above) is a genuinely different question
+# than the plain gene-only one, so it must never collide in the same cache
+# slot as the gene-only answer or a different fusion's answer for the same
+# gene/tumor_type. This was previously an intentional, documented gap (the
+# cache key derived only from gene/tumor_type/model) — see the end-to-end
+# regression tests below for the observable consequence.
+# ---------------------------------------------------------------------------
+
+
+def test_cache_key_differs_by_fusion_presence():
+    plain = _cache_key("ALK", tumor_type="NSCLC")
+    fusion_specific = _cache_key("ALK", tumor_type="NSCLC", fusion="EML4::ALK")
+    assert plain != fusion_specific
+
+
+def test_cache_key_differs_between_distinct_fusions_for_same_gene():
+    eml4_alk = _cache_key("ALK", tumor_type="NSCLC", fusion="EML4::ALK")
+    tfg_alk = _cache_key("ALK", tumor_type="NSCLC", fusion="TFG::ALK")
+    assert eml4_alk != tfg_alk
+
+
+def test_cache_key_matches_across_equivalent_fusion_separators():
+    """"::"-, "--"-, and "/"-delimited notations for the same fusion (see
+    normalization.split_fusion) must hash to the same key, not fragment the
+    cache by input spelling."""
+    double_colon = _cache_key("ALK", fusion="EML4::ALK")
+    double_dash = _cache_key("ALK", fusion="EML4--ALK")
+    slash = _cache_key("ALK", fusion="EML4/ALK")
+    assert double_colon == double_dash == slash
+
+
+def test_cache_key_unchanged_when_fusion_omitted():
+    """No behavior change for existing non-fusion callers/cache entries:
+    omitting `fusion` (or passing None) produces the exact same key shape as
+    before this fix."""
+    assert _cache_key("BRAF", tumor_type="melanoma") == "openevidence:" + json.dumps(
+        {"gene": "BRAF", "tumor_type": "melanoma", "model": settings.openevidence_model},
+        sort_keys=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_gene_analysis_fusion_specific_call_does_not_reuse_plain_gene_cache_entry(
+    _require_redis,
+):
+    """End-to-end regression for the cache-collision bug: a plain gene-only
+    call and a fusion-specific call for the same gene/tumor_type must live in
+    separate cache slots, so neither silently returns the other's answer."""
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = json.loads(request.content)
+        if "fusion" in payload["text"] or "EML4::ALK" in payload["text"]:
+            return httpx.Response(200, text='data: {"text": "Fusion-specific answer."}\n\n')
+        return httpx.Response(200, text='data: {"text": "Plain gene answer."}\n\n')
+
+    client = OpenEvidenceClient(api_key="test-key")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        plain = await client.get_gene_analysis("ALK", tumor_type="NSCLC", client=http_client)
+        fusion_specific = await client.get_gene_analysis(
+            "ALK", tumor_type="NSCLC", fusion="EML4::ALK", client=http_client
+        )
+
+    # Two distinct live calls were made — the second was NOT a cache hit on
+    # the first's (wrong) entry.
+    assert len(requests) == 2
+    assert plain.text == "Plain gene answer."
+    assert fusion_specific.text == "Fusion-specific answer."
+    assert "EML4::ALK" in fusion_specific.question
+    assert "EML4::ALK" not in plain.question
+
+
+@pytest.mark.asyncio
+async def test_get_gene_analysis_plain_gene_call_does_not_reuse_fusion_specific_cache_entry(
+    _require_redis,
+):
+    """The reverse ordering of the above: warming the fusion-specific slot
+    first must not cause a subsequent plain gene-only call to reuse it.
+    Uses a different gene/fusion than the previous test so the two tests'
+    cache entries can never collide with each other within a shared Redis
+    instance."""
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = json.loads(request.content)
+        if "CD74::ROS1" in payload["text"]:
+            return httpx.Response(200, text='data: {"text": "Fusion-specific answer."}\n\n')
+        return httpx.Response(200, text='data: {"text": "Plain gene answer."}\n\n')
+
+    client = OpenEvidenceClient(api_key="test-key")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        fusion_specific = await client.get_gene_analysis(
+            "ROS1", tumor_type="NSCLC", fusion="CD74::ROS1", client=http_client
+        )
+        plain = await client.get_gene_analysis("ROS1", tumor_type="NSCLC", client=http_client)
+
+    assert len(requests) == 2
+    assert fusion_specific.text == "Fusion-specific answer."
+    assert plain.text == "Plain gene answer."
 
 
 @pytest.mark.asyncio

@@ -154,6 +154,7 @@ async def _openevidence_became_available_since_synthesis(
     annotation: GeneAnnotation,
     gene: str,
     tumor_type: Optional[str],
+    fusion: Optional[str] = None,
 ) -> bool:
     """Whether OpenEvidence supplementary evidence has newly become available
     for this gene since `annotation` was last synthesized without it.
@@ -170,14 +171,21 @@ async def _openevidence_became_available_since_synthesis(
     (no live HTTP call) to see whether a cache entry has appeared since —
     e.g. via benchmarks/warm_openevidence_cache.py, or a slow live call that
     finished after this gene's synthesis had already proceeded without it.
+
+    `fusion` must be the same fusion (if any) that a resulting re-synthesis
+    would pass to get_gene_analysis (see _maybe_reuse_cached_annotation's
+    call site and _annotate_gene) — has_cached_analysis and
+    was_refresh_recently_attempted key off gene/tumor_type/fusion (see
+    openevidence.py's _cache_key), so a mismatched fusion here would peek
+    the wrong cache slot.
     """
     if not settings.openevidence_enabled:
         return False
     if annotation.openevidence_supplementary is not None:
         return False
-    if await was_refresh_recently_attempted(gene, tumor_type=tumor_type):
+    if await was_refresh_recently_attempted(gene, tumor_type=tumor_type, fusion=fusion):
         return False
-    return await has_cached_analysis(gene, tumor_type=tumor_type)
+    return await has_cached_analysis(gene, tumor_type=tumor_type, fusion=fusion)
 
 
 async def _maybe_reuse_cached_annotation(
@@ -222,7 +230,13 @@ async def _maybe_reuse_cached_annotation(
     # picks up the more pertinent, OpenEvidence-informed result. Checked
     # regardless of the age-based freshness windows below, since new
     # OpenEvidence data can land at any time independent of annotation age.
-    if await _openevidence_became_available_since_synthesis(annotation, gene, tumor_type):
+    #
+    # `fusion` mirrors _annotate_gene's own derivation (first of possibly
+    # several associated fusions, deterministically) so this peek checks the
+    # exact same cache slot a resulting re-synthesis would populate — see
+    # openevidence.py's _cache_key.
+    fusion = fusions[0] if fusions else None
+    if await _openevidence_became_available_since_synthesis(annotation, gene, tumor_type, fusion=fusion):
         logger.info(
             "Refreshing cached annotation for %s because OpenEvidence supplementary "
             "evidence became available since it was last synthesized without it",
@@ -233,7 +247,7 @@ async def _maybe_reuse_cached_annotation(
         # the refresh attempt itself never ends up persisting a
         # supplementary-evidence-bearing annotation (see the docstring on
         # _openevidence_became_available_since_synthesis).
-        await mark_refresh_attempted(gene, tumor_type=tumor_type)
+        await mark_refresh_attempted(gene, tumor_type=tumor_type, fusion=fusion)
         return None
 
     updated_at = cached.get("updated_at")
