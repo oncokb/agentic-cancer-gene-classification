@@ -806,9 +806,44 @@ def _fallback_feedback_issue(payload: FeedbackRequest) -> dict:
     }
 
 
+# Claim terms the LLM draft must not introduce unless the curator's message already has them.
+_FEEDBACK_CLAIM_TERMS = frozenset({
+    "security", "secure", "insecure", "vulnerability", "vulnerabilities", "vuln",
+    "finding", "findings", "breach", "breached", "exploit", "exploited", "exploitable",
+    "pentest", "penetration", "cve", "compromise", "compromised", "attack", "attacker",
+    "malicious", "leak", "leaked", "xss", "injection", "rce", "unauthorized",
+    "credential", "credentials", "password",
+})
+
+
+def _claim_terms_in(text: str) -> set[str]:
+    """Claim terms found inside any word token (so `cybersecurity` hits `security`).
+
+    Three-letter terms (cve, rce, xss) must be a whole token, so `source` or
+    `force` don't read as `rce`; `CVE-2024-1234` still tokenizes to `cve`.
+    """
+    tokens = set(re.findall(r"\w+", text.casefold()))
+    return {
+        term
+        for term in _FEEDBACK_CLAIM_TERMS
+        if (term in tokens if len(term) <= 3 else any(term in token for token in tokens))
+    }
+
+
+def _normalize_acceptance_criteria(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = (str(item).strip() for item in value if item is not None)
+        return [item for item in items if item]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [str(value)]
+
+
 def _feedback_issue_body(payload: FeedbackRequest, draft: dict, feedback_id: str) -> str:
-    criteria = draft.get("acceptance_criteria") or []
-    criteria_lines = "\n".join(f"- [ ] {item}" for item in criteria if str(item).strip())
+    criteria = _normalize_acceptance_criteria(draft.get("acceptance_criteria"))
+    criteria_lines = "\n".join(f"- [ ] {item}" for item in criteria)
     context_lines = [
         f"- Feedback ID: {feedback_id}",
         f"- Category: {payload.category}",
@@ -878,15 +913,12 @@ async def _draft_feedback_issue(
             logger.exception("Feedback issue LLM draft failed; using fallback draft")
             increment("feedback.llm_draft_failed", tags=[f"category:{payload.category}"])
 
-    claim_words = {"security", "vulnerability", "vulnerabilities", "finding", "findings", "breach"}
-    message_words = set(re.findall(r"\w+", payload.message.casefold()))
     # Check every LLM-drafted field that reaches the public issue, not just the title.
     drafted = draft or {}
     drafted_fields = [drafted.get(key) or "" for key in ("title", "problem_summary", "suggested_solution")]
-    criteria = drafted.get("acceptance_criteria") or []
-    drafted_fields += criteria if isinstance(criteria, list) else [criteria]
-    drafted_words = set(re.findall(r"\w+", " ".join(map(str, drafted_fields)).casefold()))
-    if not draft or (drafted_words & claim_words) - message_words:
+    drafted_fields += _normalize_acceptance_criteria(drafted.get("acceptance_criteria"))
+    drafted_text = " ".join(map(str, drafted_fields))
+    if not draft or _claim_terms_in(drafted_text) - _claim_terms_in(payload.message):
         draft = _fallback_feedback_issue(payload)
 
     title = str(draft.get("title") or "Curator feedback").strip() or "Curator feedback"

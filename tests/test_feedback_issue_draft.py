@@ -462,3 +462,54 @@ def test_fabricated_acceptance_criterion_falls_back(intake):
     body = github.call_args.args[1]
     assert "security" not in body.casefold()
     assert "Keep the export dropdown clickable." not in body
+
+
+CLEAN_DRAFT = {
+    "title": "Clarify export dropdown behavior",
+    "problem_summary": "The export dropdown is confusing.",
+    "suggested_solution": "Keep the export dropdown clickable.",
+    "acceptance_criteria": ["Export dropdown remains clickable."],
+}
+
+
+@pytest.mark.parametrize("claim", ["pentest", "exploit", "CVE-2024-1234", "compromised", "cybersecurity"])
+def test_drafted_only_claim_terms_fall_back(intake, claim):
+    client, store, llm, github = intake
+    llm.return_value = {**CLEAN_DRAFT, "suggested_solution": f"Review the {claim} report."}
+    response = client.post("/v1/feedback", json={"category": "bug", "message": CLEAN_MESSAGE})
+    assert response.json()["issue_title"] == f"Feedback: {CLEAN_MESSAGE}"
+    assert claim not in github.call_args.args[1]
+
+
+def test_claim_term_in_message_is_allowed(intake):
+    client, store, llm, github = intake
+    message = "The password reset link on the export page never arrives for curators."
+    llm.return_value = {**CLEAN_DRAFT, "problem_summary": "Password reset email is not delivered."}
+    response = client.post("/v1/feedback", json={"category": "bug", "message": message})
+    assert response.json()["issue_title"] == "Feedback: Clarify export dropdown behavior"
+    assert "Password reset email is not delivered." in github.call_args.args[1]
+
+
+def test_short_claim_terms_need_whole_token(intake):
+    client, store, llm, github = intake
+    llm.return_value = {**CLEAN_DRAFT, "suggested_solution": "Check the export source and force a refresh."}
+    response = client.post("/v1/feedback", json={"category": "bug", "message": CLEAN_MESSAGE})
+    assert response.json()["issue_title"] == "Feedback: Clarify export dropdown behavior"
+
+
+@pytest.mark.parametrize("criteria,expected", [
+    (5, "- [ ] 5"),
+    (None, "- [ ] Review and resolve this feedback."),
+    ("  ", "- [ ] Review and resolve this feedback."),
+    ("single string", "- [ ] single string"),
+    ({"item": "clickable"}, "- [ ] {'item': 'clickable'}"),
+    ([None, " ", " Export dropdown remains clickable. "], "- [ ] Export dropdown remains clickable.\n\n"),
+])
+def test_malformed_acceptance_criteria_render(intake, criteria, expected):
+    client, store, llm, github = intake
+    llm.return_value = {**CLEAN_DRAFT, "acceptance_criteria": criteria}
+    response = client.post("/v1/feedback", json={"category": "bug", "message": CLEAN_MESSAGE})
+    assert response.status_code == 201
+    body = response.json()["issue_body"]
+    assert f"## Acceptance Criteria\n{expected}" in body
+    assert response.json()["issue_title"] == "Feedback: Clarify export dropdown behavior"
