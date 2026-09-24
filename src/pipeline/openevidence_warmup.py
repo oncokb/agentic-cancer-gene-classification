@@ -58,16 +58,16 @@ async def warm_openevidence_cache(
     Mirrors orchestrator.py's annotate_one() in deriving each gene's
     associated fusion (if any) from its own raw `gene_inputs` and passing it
     into get_gene_analysis as `fusion`. This matters because
-    get_gene_analysis's cache key does not vary by fusion (see
-    openevidence.py's _cache_key) — the cached entry is keyed only by
-    gene/tumor_type/model, so it holds whatever QUESTION was actually asked
-    when it was populated. If warmup asked the generic question here while a
-    live annotation request for the same gene asks the fusion-specific
-    question, the live request would get a cache HIT on warmup's
-    generic-question answer and never actually ask (or cache) the
-    fusion-specific one. Deriving the same fusion context here that
-    annotate_one() would derive keeps the two paths asking, and therefore
-    caching, the same question for the same gene.
+    get_gene_analysis's cache key (see openevidence.py's _cache_key) now
+    includes `fusion` whenever present, so a generic-question warmup and a
+    fusion-specific live request occupy separate cache slots — if warmup
+    derived a different (or no) fusion here than a live annotation request
+    for the same gene would use, it would warm the WRONG slot: the live
+    request would still take a cache miss and pay full live-call latency,
+    silently defeating the point of warming ahead of it. Deriving the same
+    fusion context here that annotate_one() would derive keeps the two paths
+    asking, and therefore caching, the same question under the same key for
+    the same gene.
     """
     total_start = perf_counter()
     input_strings, tumor_type_by_input = _normalize_inputs(inputs)

@@ -32,6 +32,7 @@ from src.models.schema import (
     AnnotateRequest,
     AnnotationMode,
     AnnotationResult,
+    DistilledOpenEvidence,
     FeedbackRequest,
     FeedbackResponse,
     FusionEvidenceResult,
@@ -50,6 +51,7 @@ from src.pipeline.fusion_context import annotate_fusion_position_contexts, parse
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline.normalization import is_fusion_input
+from src.pipeline.openevidence import OpenEvidenceClient, distill_openevidence
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.result_sanitizer import sanitize_annotation_result
 from src.pipeline.run_store import RunStore
@@ -164,6 +166,12 @@ class _TransientFusionContextError(Exception):
         self.context = context
 
 
+class OpenEvidenceSidecarResponse(BaseModel):
+    available: bool
+    distilled: Optional[DistilledOpenEvidence] = None
+    error: Optional[str] = None
+
+
 class EnrichmentJobCreateResponse(BaseModel):
     job_id: str
     status_url: str
@@ -244,6 +252,23 @@ class BenchmarkRequest(BaseModel):
 def require_dev_mode() -> None:
     if not settings.acgc_dev_mode:
         raise HTTPException(status_code=404, detail="Not found")
+
+
+# Caps concurrent live OpenEvidence calls across ALL requests to
+# GET /v1/genes/{gene}/openevidence. OpenEvidence was deliberately removed
+# from annotation_gene_concurrency's gated critical path (see orchestrator.py's
+# _annotate_gene) — without a limiter here, a single batch-result page can
+# fire one call per rendered gene card the instant it loads (e.g. 20
+# concurrent 130-185s calls), with nothing left to throttle it. Keyed by the
+# effective limit (mirrors llm_client.py's _llm_semaphores pattern) so tests
+# that monkeypatch settings.openevidence_sidecar_concurrency get a fresh
+# semaphore for the new limit rather than reusing a stale one.
+_openevidence_sidecar_semaphores: Dict[int, asyncio.Semaphore] = {}
+
+
+def _openevidence_sidecar_semaphore() -> asyncio.Semaphore:
+    limit = max(1, settings.openevidence_sidecar_concurrency)
+    return _openevidence_sidecar_semaphores.setdefault(limit, asyncio.Semaphore(limit))
 
 
 _annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
@@ -730,6 +755,44 @@ async def fusion_context(request: FusionInput) -> FusionContextResponse:
         return FusionContextResponse(available=True, context=exc.context)
 
     return FusionContextResponse(available=True, context=FusionPositionContext(**cached))
+
+
+@app.get("/v1/genes/{gene}/openevidence", response_model=OpenEvidenceSidecarResponse)
+async def get_gene_openevidence(
+    gene: str,
+    tumor_type: Optional[str] = None,
+    fusion: Optional[str] = None,
+) -> OpenEvidenceSidecarResponse:
+    """
+    On-demand, non-blocking OpenEvidence lookup for a single gene, rendered
+    as an independent "Clinical Practice Guidelines & External Trial
+    Evidence" card in the UI. Deliberately NOT part of POST /v1/annotate or
+    /v1/annotate/gene — OpenEvidence's 130-185s call latency must never
+    block core gene annotation (see orchestrator.py's _annotate_gene).
+
+    OpenEvidenceClient.get_gene_analysis already checks its Redis cache
+    before making a live call, so a cache hit here returns immediately; a
+    miss executes the live call (gated by _openevidence_sidecar_semaphore,
+    capping concurrent live calls across all requests to this endpoint —
+    see settings.openevidence_sidecar_concurrency), caches the raw analysis,
+    then this endpoint deterministically distills it (no LLM call) before
+    returning.
+
+    Returns {"available": false} (never a 4xx/5xx) when OpenEvidence is
+    disabled or the lookup fails, so the UI card can hide/gray itself out
+    rather than show a broken component.
+    """
+    if not settings.openevidence_enabled:
+        return OpenEvidenceSidecarResponse(available=False)
+    try:
+        async with _openevidence_sidecar_semaphore():
+            analysis = await OpenEvidenceClient().get_gene_analysis(
+                gene, tumor_type=tumor_type, fusion=fusion
+            )
+    except Exception as exc:
+        logger.warning("OpenEvidence sidecar lookup failed for %s: %s", gene, exc)
+        return OpenEvidenceSidecarResponse(available=False, error=str(exc))
+    return OpenEvidenceSidecarResponse(available=True, distilled=distill_openevidence(analysis))
 
 
 @app.post("/v1/fusion-partner-evidence", response_model=FusionPartnerEvidenceResult)

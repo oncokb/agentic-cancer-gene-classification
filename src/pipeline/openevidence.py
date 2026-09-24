@@ -19,13 +19,20 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Dict, List, Optional
 
 import httpx
 from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.config import settings
-from src.models.schema import OpenEvidenceAnalysis, OpenEvidenceCitation
+from src.models.schema import (
+    DistilledOpenEvidence,
+    OpenEvidenceAnalysis,
+    OpenEvidenceCitation,
+    OpenEvidenceGuideline,
+    OpenEvidenceTrialMention,
+)
 from src.pipeline.cache import _get_client, cached_call
 from src.pipeline.normalization import split_fusion
 
@@ -74,35 +81,52 @@ def _is_transient_openevidence_error(exc: BaseException) -> bool:
     return False
 
 
-def _cache_key(gene: str, tumor_type: Optional[str] = None) -> str:
+def _cache_key(gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None) -> str:
     """Shared cache-key derivation, used both to fetch/store a live analysis
     (OpenEvidenceClient.get_gene_analysis) and to passively peek whether one
     already exists (has_cached_analysis), so the two paths can never drift
-    apart on key format."""
-    return "openevidence:" + json.dumps(
-        {
-            "gene": gene.strip().upper(),
-            "tumor_type": (tumor_type or "").strip().lower(),
-            "model": settings.openevidence_model,
-        },
-        sort_keys=True,
-    )
+    apart on key format.
+
+    `fusion` is included whenever it resolves to two real partner genes (the
+    same gating _build_question uses to decide whether to ask the
+    fusion-specific question) so that a fusion-specific answer and a
+    gene-only answer for the same gene/tumor_type never collide in the same
+    cache slot. Normalized via split_fusion (upper-cased, canonical "::"
+    separator) so equivalent fusion notations ("EML4::ALK", "EML4--ALK")
+    hash to the same key.
+    """
+    key: Dict[str, str] = {
+        "gene": gene.strip().upper(),
+        "tumor_type": (tumor_type or "").strip().lower(),
+        "model": settings.openevidence_model,
+    }
+    if fusion:
+        gene1, gene2 = split_fusion(fusion)
+        if gene1 and gene2:
+            key["fusion"] = f"{gene1.strip().upper()}::{gene2.strip().upper()}"
+    return "openevidence:" + json.dumps(key, sort_keys=True)
 
 
-async def has_cached_analysis(gene: str, tumor_type: Optional[str] = None) -> bool:
-    """Whether a Redis cache entry already exists for this gene/tumor_type —
-    a passive peek that makes no live HTTP call and needs no API key.
+async def has_cached_analysis(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> bool:
+    """Whether a Redis cache entry already exists for this gene/tumor_type/
+    fusion — a passive peek that makes no live HTTP call and needs no API
+    key.
 
     Used by the gene-annotation reuse/staleness check (see
     orchestrator.py's _maybe_reuse_cached_annotation) to detect when
     OpenEvidence data has become available since a stored annotation was
     last synthesized without it — e.g. via benchmarks/warm_openevidence_cache.py,
     or a slow live call that finished after that gene's synthesis had
-    already proceeded without it. Fails closed (returns False) if Redis is
-    unreachable, consistent with this being a best-effort supplementary
-    signal, never something that should block or error out a cache read.
+    already proceeded without it. `fusion` must match whatever fusion (if
+    any) the corresponding get_gene_analysis call would use, or this peeks
+    the wrong cache slot (see _cache_key). Fails closed (returns False) if
+    Redis is unreachable, consistent with this being a best-effort
+    supplementary signal, never something that should block or error out a
+    cache read.
     """
-    key = _cache_key(gene, tumor_type)
+    key = _cache_key(gene, tumor_type, fusion=fusion)
     try:
         return bool(await _get_client().exists(key))
     except Exception as exc:
@@ -110,39 +134,50 @@ async def has_cached_analysis(gene: str, tumor_type: Optional[str] = None) -> bo
         return False
 
 
-def _refresh_attempt_key(gene: str, tumor_type: Optional[str] = None) -> str:
-    return "openevidence:refresh_attempt:" + json.dumps(
-        {"gene": gene.strip().upper(), "tumor_type": (tumor_type or "").strip().lower()},
-        sort_keys=True,
-    )
+def _refresh_attempt_key(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> str:
+    key: Dict[str, str] = {"gene": gene.strip().upper(), "tumor_type": (tumor_type or "").strip().lower()}
+    if fusion:
+        gene1, gene2 = split_fusion(fusion)
+        if gene1 and gene2:
+            key["fusion"] = f"{gene1.strip().upper()}::{gene2.strip().upper()}"
+    return "openevidence:refresh_attempt:" + json.dumps(key, sort_keys=True)
 
 
-async def mark_refresh_attempted(gene: str, tumor_type: Optional[str] = None) -> None:
+async def mark_refresh_attempted(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> None:
     """Record that a freshness-triggered refresh was just attempted for this
-    gene/tumor_type, so the gene-annotation reuse check won't re-trigger
-    another one until OPENEVIDENCE_REFRESH_COOLDOWN_SECONDS has passed —
-    even if the refresh attempt itself never ends up populating
+    gene/tumor_type/fusion, so the gene-annotation reuse check won't
+    re-trigger another one until OPENEVIDENCE_REFRESH_COOLDOWN_SECONDS has
+    passed — even if the refresh attempt itself never ends up populating
     openevidence_supplementary (e.g. a downstream synthesis error unrelated
     to OpenEvidence skips persisting the refreshed annotation entirely).
     Recorded via a self-expiring Redis key rather than a persisted
     annotation field, since the cooldown must apply regardless of whether
-    the refreshed annotation gets persisted at all.
+    the refreshed annotation gets persisted at all. `fusion` is included so
+    a generic-question refresh attempt and a fusion-specific one for the
+    same gene/tumor_type get independent cooldowns, consistent with
+    _cache_key.
     """
-    key = _refresh_attempt_key(gene, tumor_type)
+    key = _refresh_attempt_key(gene, tumor_type, fusion=fusion)
     try:
         await _get_client().set(key, "1", ex=settings.openevidence_refresh_cooldown_seconds)
     except Exception as exc:
         logger.warning("Failed to record OpenEvidence refresh attempt for %s: %s", gene, exc)
 
 
-async def was_refresh_recently_attempted(gene: str, tumor_type: Optional[str] = None) -> bool:
+async def was_refresh_recently_attempted(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> bool:
     """Whether a freshness-triggered refresh was attempted for this
-    gene/tumor_type within the cooldown window. Fails closed (returns
+    gene/tumor_type/fusion within the cooldown window. Fails closed (returns
     False, i.e. "safe to attempt") if Redis is unreachable — consistent
     with has_cached_analysis, this is a best-effort signal, not something
     that should itself block a cache read.
     """
-    key = _refresh_attempt_key(gene, tumor_type)
+    key = _refresh_attempt_key(gene, tumor_type, fusion=fusion)
     try:
         return bool(await _get_client().exists(key))
     except Exception as exc:
@@ -310,6 +345,88 @@ def _build_analysis(question: str, events: List[dict]) -> OpenEvidenceAnalysis:
     )
 
 
+# Domains that identify a citation as a clinical practice guideline rather
+# than a journal article, per Task 2's distillation spec.
+_GUIDELINE_URL_DOMAINS = ("nccn.org", "asco.org", "esmo.org")
+
+# Non-exhaustive seed list of well-known trial acronyms — a sentence naming
+# one of these OR an outcome statistic (PFS/OS/HR/ORR/DFS) is surfaced as a
+# trial mention even without a recognized acronym, so this list only needs
+# to catch named trials that don't otherwise report a statistic in the same
+# sentence.
+_KNOWN_TRIAL_ACRONYMS = (
+    "ALEX", "FLAURA", "ADAURA", "CROWN", "J-ALEX", "ALTA", "ALTA-1L",
+    "ASCEND", "PROFILE", "PALOMA", "MONALEESA", "KEYNOTE", "CHECKMATE",
+    "IMPOWER", "OAK", "FLEX", "eXalt3", "LIBRETTO", "ARROW",
+)
+_TRIAL_ACRONYM_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(name) for name in _KNOWN_TRIAL_ACRONYMS) + r")\b"
+)
+_OUTCOME_STAT_PATTERN = re.compile(r"\b(PFS|OS|HR|ORR|DFS)\b")
+_CITATION_MARKER_PATTERN = re.compile(r"\[\[\d+\]\]")
+_SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_sentences(text: str) -> List[str]:
+    cleaned = _CITATION_MARKER_PATTERN.sub("", text)
+    return [sentence.strip() for sentence in _SENTENCE_SPLIT_PATTERN.split(cleaned) if sentence.strip()]
+
+
+def _extract_guidelines(citations: List[OpenEvidenceCitation]) -> List[OpenEvidenceGuideline]:
+    """Clinical practice guideline references — citations whose URL points
+    at NCCN, ASCO, or ESMO, per Task 2's distillation spec."""
+    guidelines: List[OpenEvidenceGuideline] = []
+    for citation in citations:
+        url = citation.url or ""
+        if not url or not any(domain in url.lower() for domain in _GUIDELINE_URL_DOMAINS):
+            continue
+        page_anchor = url.split("#", 1)[1] if "#" in url else None
+        guidelines.append(
+            OpenEvidenceGuideline(
+                title=citation.title or citation.citation_key,
+                url=url,
+                page_anchor=page_anchor or None,
+            )
+        )
+    return guidelines
+
+
+def _extract_trial_mentions(text: str) -> List[OpenEvidenceTrialMention]:
+    """Sentences naming a known clinical trial acronym or an outcome
+    statistic (PFS/OS/HR/ORR/DFS), per Task 2's distillation spec."""
+    mentions: List[OpenEvidenceTrialMention] = []
+    for sentence in _split_sentences(text):
+        trial_match = _TRIAL_ACRONYM_PATTERN.search(sentence)
+        if trial_match is None and _OUTCOME_STAT_PATTERN.search(sentence) is None:
+            continue
+        mentions.append(
+            OpenEvidenceTrialMention(
+                trial=trial_match.group(1) if trial_match else None,
+                sentence=sentence,
+            )
+        )
+    return mentions
+
+
+def distill_openevidence(analysis: OpenEvidenceAnalysis) -> DistilledOpenEvidence:
+    """Deterministically extract the pieces of an OpenEvidenceAnalysis worth
+    surfacing as an independent, non-blocking clinical reference card:
+    clinical practice guideline references, trial/outcome-statistic
+    sentences, and the opening classification statement (the "consensus
+    role"). Purely rule-based (regex over analysis.text/citations, no LLM
+    call) — safe to run synchronously inside the sidecar endpoint's request
+    path (see GET /v1/genes/{gene}/openevidence in main.py).
+    """
+    sentences = _split_sentences(analysis.text)
+    return DistilledOpenEvidence(
+        question=analysis.question,
+        consensus_role=sentences[0] if sentences else None,
+        guidelines=_extract_guidelines(analysis.citations),
+        trial_mentions=_extract_trial_mentions(analysis.text),
+        citation_count=len(analysis.citations),
+    )
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=8),
@@ -367,12 +484,15 @@ class OpenEvidenceClient:
         httpx.AsyncClient (e.g. for tests) or one will be created and closed
         for this call.
 
-        The cache key intentionally still derives only from gene/tumor_type/
-        model (see _cache_key), not from `fusion` — cache-key shape is
-        explicitly out of scope for this question-text change.
+        The cache key also derives from `fusion` (see _cache_key) whenever
+        it resolves to two real partner genes — the fusion-specific question
+        built above is a different question than the gene-only one, so it
+        must live in a different cache slot, or a fusion-specific answer and
+        a gene-only answer for the same gene/tumor_type would silently
+        overwrite/return each other.
         """
         question = _build_question(gene, tumor_type, fusion=fusion)
-        cache_key = _cache_key(gene, tumor_type)
+        cache_key = _cache_key(gene, tumor_type, fusion=fusion)
 
         async def _compute() -> dict:
             # Only reached on a cache miss (cached_call checks Redis first) —

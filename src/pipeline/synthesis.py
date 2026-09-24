@@ -19,7 +19,7 @@ from src.models.schema import (
     GeneAnnotation,
     LiteraturePaperScore,
     LiteratureRecord,
-    OpenEvidenceAnalysis,
+    PMIDEvidenceRecord,
     QualityFlag,
 )
 from src.pipeline.citation_precision import filter_and_rank_citations
@@ -95,15 +95,6 @@ If evidence is insufficient but abstracts were retrieved, still summarize what t
 and why they do not support a confident cancer annotation.
 Prefer a precise short answer over a broad answer.
 """
-
-# Appended to the system prompt ONLY when openevidence_context is actually supplied
-# (see synthesize_gene_annotation) — never baked into SYSTEM_PROMPT/CORE_SYSTEM_PROMPT
-# themselves, so the disabled path's system prompt stays byte-identical to before
-# this integration existed.
-_OPENEVIDENCE_SYSTEM_INSTRUCTION = """
-
-## Supplementary evidence handling:
-- If a "Supplementary AI-synthesized evidence (unverified, from OpenEvidence)" section is present below, treat it strictly as unverified background context. Never copy its citation_keys, DOIs, or URLs into `citations` — that field must only ever contain PMIDs from the retrieved PubMed abstracts above it."""
 
 ANNOTATE_TOOL: dict = {
     "name": "annotate_gene",
@@ -241,29 +232,6 @@ CORE_ANNOTATE_TOOL: dict = {
 }
 
 
-def _format_openevidence_section(openevidence_context: OpenEvidenceAnalysis) -> List[str]:
-    """Render OpenEvidence supplementary evidence as a clearly-labeled, unverified
-    section — never merged with the retrieved PubMed abstracts above it."""
-    lines = [
-        "",
-        "### Supplementary AI-synthesized evidence (unverified, from OpenEvidence):",
-        "This section is NOT part of the retrieved PubMed set above and has not been "
-        "PMID-verified. Use it only as background context — never copy its sources "
-        "into `citations`.",
-    ]
-    if openevidence_context.text:
-        lines.append(openevidence_context.text)
-    if openevidence_context.citations:
-        lines.append("OpenEvidence-cited sources (unverified):")
-        for citation in openevidence_context.citations:
-            descriptor = ", ".join(
-                part for part in (citation.journal, citation.date) if part
-            )
-            suffix = f" ({descriptor})" if descriptor else ""
-            lines.append(f"- {citation.title or citation.citation_key}{suffix}")
-    return lines
-
-
 def _build_user_prompt(
     gene: str,
     fusions: List[str],
@@ -273,7 +241,7 @@ def _build_user_prompt(
     retrieval_tier: int,
     gene_identity: Optional[str] = None,
     mode: AnnotationMode = "full",
-    openevidence_context: Optional[OpenEvidenceAnalysis] = None,
+    pmid_evidence: Optional[Dict[str, PMIDEvidenceRecord]] = None,
 ) -> str:
     tier_label = (
         "Tier 1 (direct NCBI structured query — abundant indexed literature)"
@@ -307,15 +275,23 @@ def _build_user_prompt(
         for rec in records:
             journal_tag = f" [{rec.journal}]" if rec.journal else ""
             impact_tag = " ★" if rec.journal in _HIGH_IMPACT_JOURNALS else ""
-            lines += [
-                "---",
-                f"PMID: {rec.pmid}{journal_tag}{impact_tag}",
-                f"Title: {rec.title}",
-                f"Abstract: {rec.abstract[:settings.core_synthesis_abstract_chars] if mode == 'core' else rec.abstract}",
-            ]
-
-    if openevidence_context is not None:
-        lines += _format_openevidence_section(openevidence_context)
+            cached = (pmid_evidence or {}).get(rec.pmid)
+            lines.append("---")
+            if cached is not None and cached.distilled_takeaway:
+                # Permanently-cached distillation (see run_store.py's
+                # pmid_evidence table) — a 25-40 word core takeaway in place
+                # of the ~450-word raw abstract, cutting abstract tokens by
+                # 70-80% for papers that have already been distilled once.
+                lines.append(
+                    f"PMID: {rec.pmid}{journal_tag}{impact_tag} "
+                    f"Summary: {cached.distilled_takeaway}"
+                )
+            else:
+                lines += [
+                    f"PMID: {rec.pmid}{journal_tag}{impact_tag}",
+                    f"Title: {rec.title}",
+                    f"Abstract: {rec.abstract[:settings.core_synthesis_abstract_chars] if mode == 'core' else rec.abstract}",
+                ]
 
     return "\n".join(lines)
 
@@ -330,17 +306,6 @@ def _verify_citations(
     """
     Remove ambiguous or unretrieved PMIDs from the LLM's citation list, then rank.
     An identifier that was not retrieved is a rejection, not a warning.
-
-    This is the sole gate for OpenEvidence citation isolation too: an
-    OpenEvidence-only identifier (citation_key/DOI/URL) is, by construction,
-    never a member of `records` (the retrieved LiteratureRecord set for this
-    gene), so filter_and_rank_citations already rejects it here — no separate
-    value-based blocklist is needed or wanted. A string that DOES match a
-    retrieved PMID is a legitimate, verified citation regardless of whether an
-    OpenEvidence citation_key/DOI/URL for this call happens to share that same
-    string value; provenance cannot be inferred from string collision alone
-    with the current flat citations: List[str] shape, and rejecting it would
-    incorrectly drop a real citation.
     """
     retrieved_pmids = {record.pmid for record in records}
     verified = filter_and_rank_citations(
@@ -657,16 +622,17 @@ async def synthesize_gene_annotation(
     local_mode: bool = False,
     local_backend: Optional[str] = None,
     mode: AnnotationMode = "full",
-    openevidence_context: Optional[OpenEvidenceAnalysis] = None,
+    pmid_evidence: Optional[Dict[str, PMIDEvidenceRecord]] = None,
 ) -> Dict:
     """
     Call Claude to produce a structured annotation. Returns raw tool-use input dict.
     Raises on API error.
 
-    openevidence_context, when supplied, is a supplementary, unverified
-    OpenEvidence analysis (see src.pipeline.openevidence) appended to the
-    prompt as a clearly labeled extra section. It is never run through
-    citation verification and never contributes to the returned `citations`.
+    pmid_evidence, when supplied, is a PMID -> PMIDEvidenceRecord map of
+    permanently-cached abstract distillations (see run_store.py's
+    pmid_evidence table); any retrieved paper with a cached entry is
+    rendered in the prompt via its short distilled_takeaway instead of its
+    full raw abstract (see _build_user_prompt).
     """
     prompt_records = (
         records[: settings.core_synthesis_max_papers]
@@ -682,12 +648,10 @@ async def synthesize_gene_annotation(
         retrieval_tier,
         gene_identity,
         mode,
-        openevidence_context,
+        pmid_evidence,
     )
     tool = CORE_ANNOTATE_TOOL if mode == "core" else ANNOTATE_TOOL
     system_prompt = CORE_SYSTEM_PROMPT if mode == "core" else SYSTEM_PROMPT
-    if openevidence_context is not None:
-        system_prompt = system_prompt + _OPENEVIDENCE_SYSTEM_INSTRUCTION
     max_tokens = settings.core_synthesis_max_tokens if mode == "core" else 2048
 
     fast_model = settings.synthesis_fast_model if settings.synthesis_model_escalation else settings.synthesis_model
@@ -768,14 +732,8 @@ def build_gene_annotation(
     mode: AnnotationMode = "full",
     retrieval_ranking: Optional[List[LiteraturePaperScore]] = None,
     tumor_type: Optional[str] = None,
-    openevidence_context: Optional[OpenEvidenceAnalysis] = None,
 ) -> GeneAnnotation:
-    """Merge synthesis output with deterministic facts into a GeneAnnotation.
-
-    openevidence_context is surfaced as-is on the returned annotation's
-    openevidence_supplementary field — supplementary/unverified, never
-    merged into `citations`.
-    """
+    """Merge synthesis output with deterministic facts into a GeneAnnotation."""
     records = _filter_retracted_records(records)
     citations = synthesis_result.get("citations", [])
     insufficient_evidence = synthesis_result.get("insufficient_evidence", False)
@@ -838,5 +796,4 @@ def build_gene_annotation(
         evidence_support_explanation=evidence_support_explanation,
         cache_status="refreshed",
         cache_reason="computed_new_annotation",
-        openevidence_supplementary=openevidence_context,
     )

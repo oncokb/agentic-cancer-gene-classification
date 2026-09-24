@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_serializer, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
 AnnotationMode = Literal["full", "core"]
 CacheStatus = Literal["miss", "reused", "refreshed", "bypassed"]
+PMIDEvidenceType = Literal["clinical", "preclinical", "case_report", "review", "other"]
+PMIDOncogenicRole = Literal["oncogene", "tumor_suppressor", "resistance", "neutral", "unknown"]
 
 
 class ResolvedGene(BaseModel):
@@ -35,6 +37,29 @@ class LiteratureRecord(BaseModel):
     # "free_text", "tier2_agentic") — a PMID can be found by more than one query.
     # Feeds the query-tier precision signal in the citation pre-ranking heuristic.
     matched_query_tiers: List[str] = Field(default_factory=list)
+
+
+class PMIDEvidenceRecord(BaseModel):
+    """A permanent, MySQL-persisted distillation of one published abstract.
+
+    Published papers are immutable historical records, so — unlike the
+    Redis-backed literature/OpenEvidence caches, which carry TTLs — this is
+    never expired. Once a PMID has been distilled into a short
+    `distilled_takeaway`, every future synthesis run across every gene that
+    retrieves this PMID can reuse it instead of re-spending ~450 words of
+    raw abstract tokens on it (see synthesis.py's _build_user_prompt)."""
+
+    pmid: str
+    doi: Optional[str] = None
+    title: str
+    journal: str
+    publication_year: Optional[int] = None
+    evidence_type: PMIDEvidenceType = "other"
+    oncogenic_role: PMIDOncogenicRole = "unknown"
+    distilled_takeaway: str
+    supporting_quote: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class SupportingQuote(BaseModel):
@@ -231,6 +256,37 @@ class OpenEvidenceAnalysis(BaseModel):
     citations: List[OpenEvidenceCitation] = Field(default_factory=list)
 
 
+class OpenEvidenceGuideline(BaseModel):
+    """One clinical practice guideline reference (NCCN/ASCO/ESMO) extracted
+    from an OpenEvidenceAnalysis by distill_openevidence."""
+
+    title: str
+    url: str
+    page_anchor: Optional[str] = None
+
+
+class OpenEvidenceTrialMention(BaseModel):
+    """One sentence from an OpenEvidenceAnalysis naming a clinical trial
+    acronym or a trial outcome statistic (PFS/OS/HR), extracted by
+    distill_openevidence."""
+
+    trial: Optional[str] = None
+    sentence: str
+
+
+class DistilledOpenEvidence(BaseModel):
+    """Deterministic distillation of an OpenEvidenceAnalysis into the pieces
+    worth surfacing as an independent, non-blocking clinical reference card
+    — never merged into GeneAnnotation or the synthesis prompt. See
+    src.pipeline.openevidence.distill_openevidence."""
+
+    question: str
+    consensus_role: Optional[str] = None
+    guidelines: List[OpenEvidenceGuideline] = Field(default_factory=list)
+    trial_mentions: List[OpenEvidenceTrialMention] = Field(default_factory=list)
+    citation_count: int = 0
+
+
 class GeneAnnotation(BaseModel):
     """One row in Nicole's spreadsheet, keyed by gene."""
 
@@ -249,19 +305,6 @@ class GeneAnnotation(BaseModel):
     evidence_cards: List[EvidenceCard] = Field(default_factory=list)
     clinical_actionability: Optional[ClinicalActionability] = None
     quality_flags: List[QualityFlag] = Field(default_factory=list)
-    # Supplementary AI-synthesized evidence from OpenEvidence, only populated
-    # when OPENEVIDENCE_ENABLED=true. Unverified — never counted among the
-    # verified PMID `citations` above.
-    openevidence_supplementary: Optional[OpenEvidenceAnalysis] = None
-    # When OpenEvidence was last checked for this annotation (only set when
-    # OPENEVIDENCE_ENABLED=true at synthesis time — see orchestrator.py).
-    # None means "never checked" (feature disabled, or not yet synthesized
-    # since it was enabled), regardless of whether openevidence_supplementary
-    # itself ended up populated (a checked-but-not-found lookup still sets
-    # this). Used by the gene-annotation reuse/staleness check to detect
-    # OpenEvidence data that became available after this annotation was
-    # synthesized without it.
-    openevidence_checked_at: Optional[str] = None
     date_annotated: str = Field(
         default_factory=lambda: date.today().strftime("%-m/%-d/%y")
     )
@@ -295,24 +338,6 @@ class GeneAnnotation(BaseModel):
     last_pubmed_checked_at: Optional[str] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
-
-    # Fields omitted from serialized output entirely (not present-as-null)
-    # when None, so the OPENEVIDENCE_ENABLED=false path has zero new keys in
-    # any serialized GeneAnnotation — API responses, exports, and persisted
-    # run/gene-cache JSON — matching current main's shape exactly.
-    # Deliberately scoped to just these two OpenEvidence-specific fields:
-    # this is NOT a model-wide exclude_none, so every other None-valued
-    # field (e.g. clinical_actionability) still serializes as null,
-    # unchanged.
-    _OMIT_WHEN_NONE = ("openevidence_supplementary", "openevidence_checked_at")
-
-    @model_serializer(mode="wrap")
-    def _omit_openevidence_fields_when_absent(self, handler):
-        data = handler(self)
-        for field_name in self._OMIT_WHEN_NONE:
-            if getattr(self, field_name) is None:
-                data.pop(field_name, None)
-        return data
 
 
 class FusionInput(BaseModel):
