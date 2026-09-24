@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import contextmanager
 
 from fastapi.testclient import TestClient
@@ -148,6 +149,120 @@ async def test_run_pipeline_tags_gene_metrics_with_cache_status_and_fusion(monke
         and call[3] == non_fusion_gene_tags + [gene_latency_tag("MYH9")]
         for call in metric_calls
     )
+
+
+async def test_gene_total_duration_excludes_concurrency_slot_wait(monkeypatch):
+    """With N genes and a concurrency limit below N, genes that queue for a
+    slot must not have that wait folded into gene.total_duration_ms."""
+    metric_calls = []
+    genes = [f"GENE{i}" for i in range(6)]
+    work_s = 0.1
+
+    async def fake_normalize_fusions(inputs):
+        return {
+            gene: (ResolvedGene(input_symbol=gene, canonical_symbol=gene, resolved=True), [gene])
+            for gene in genes
+        }
+
+    async def fake_annotate_gene(*, gene, fusions, **kwargs):
+        await asyncio.sleep(work_s)
+        return GeneAnnotation(gene=gene, fusions=list(fusions), cache_status="refreshed")
+
+    monkeypatch.setattr(orchestrator.settings, "annotation_gene_concurrency", 2)
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
+    monkeypatch.setattr(orchestrator, "increment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "distribution",
+        lambda metric, value, tags=None: metric_calls.append((metric, value, tags)),
+    )
+    monkeypatch.setattr(orchestrator, "trace", noop_trace)
+
+    await orchestrator.run_pipeline(genes, mode="core")
+
+    totals = [value for metric, value, _ in metric_calls if metric == "gene.total_duration_ms"]
+    waits = sorted(value for metric, value, _ in metric_calls if metric == "gene.queue_wait_ms")
+    assert len(totals) == len(genes)
+    assert len(waits) == len(genes)
+    # 6 genes / 2 slots = 3 waves of ~100ms. Previously the last wave reported
+    # ~300ms; each gene's own work is ~100ms regardless of its position.
+    for total in totals:
+        assert work_s * 1000 * 0.9 <= total < work_s * 1000 * 1.8
+    # Wait time is still captured: 2 genes start immediately, 2 wait ~1 wave, 2 wait ~2 waves.
+    assert waits[0] < 20 and waits[1] < 20
+    assert all(wait >= work_s * 1000 * 0.9 for wait in waits[2:4])
+    assert all(wait >= work_s * 1000 * 1.8 for wait in waits[4:6])
+    # Queue wait uses the same tags as total duration.
+    total_tags = sorted(tuple(tags) for metric, _, tags in metric_calls if metric == "gene.total_duration_ms")
+    wait_tags = sorted(tuple(tags) for metric, _, tags in metric_calls if metric == "gene.queue_wait_ms")
+    assert total_tags == wait_tags
+
+
+async def test_cache_hit_gene_emits_no_queue_wait(monkeypatch):
+    metric_calls = []
+
+    async def fake_normalize_fusions(inputs):
+        return {
+            "BRAF": (ResolvedGene(input_symbol="BRAF", canonical_symbol="BRAF", resolved=True), ["BRAF"]),
+        }
+
+    async def fake_reuse_cached_annotation(*, gene, fusions, **kwargs):
+        return GeneAnnotation(gene=gene, fusions=list(fusions), cache_status="reused")
+
+    async def fail_annotate_gene(**kwargs):
+        raise AssertionError("cache hit should not annotate")
+
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "_maybe_reuse_cached_annotation", fake_reuse_cached_annotation)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fail_annotate_gene)
+    monkeypatch.setattr(orchestrator, "increment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "distribution",
+        lambda metric, value, tags=None: metric_calls.append((metric, value, tags)),
+    )
+    monkeypatch.setattr(orchestrator, "trace", noop_trace)
+
+    await orchestrator.run_pipeline(["BRAF"], mode="core")
+
+    metrics = [metric for metric, _, _ in metric_calls]
+    assert "gene.total_duration_ms" in metrics
+    assert "gene.queue_wait_ms" not in metrics
+
+
+async def test_gene_annotation_duration_tagged_with_cache_status_fusion_and_gene(monkeypatch):
+    metric_calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "distribution",
+        lambda metric, value, tags=None: metric_calls.append((metric, value, tags)),
+    )
+    monkeypatch.setattr(observability.settings, "datadog_gene_latency_watchlist", "ALK")
+
+    await orchestrator._annotate_gene(
+        gene="ALK",
+        fusions=["EML4::ALK"],
+        resolved_gene=ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=False),
+        unresolvable=True,
+        mode="core",
+    )
+
+    assert metric_calls == [
+        (
+            "gene.annotation.duration_ms",
+            metric_calls[0][1],
+            [
+                "mode:core",
+                "local_backend:sdk",
+                "tumor_type_present:False",
+                "skip_literature_for_oncokb:False",
+                "cache_status:bypassed",
+                "is_fusion:True",
+                "gene:ALK",
+            ],
+        )
+    ]
 
 
 def test_gene_latency_tag_buckets_watchlisted_gene(monkeypatch):

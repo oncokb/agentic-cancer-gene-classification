@@ -304,6 +304,25 @@ def _oncokb_literature_skipped_annotation(
     )
 
 
+def _record_annotation_duration(
+    annotation: GeneAnnotation,
+    gene: str,
+    fusions: List[str],
+    metric_tags: List[str],
+) -> None:
+    """Emit gene.annotation.duration_ms with the same per-gene tags as gene.total_duration_ms."""
+    distribution(
+        "gene.annotation.duration_ms",
+        annotation.timings_ms["total"],
+        tags=metric_tags
+        + [
+            f"cache_status:{annotation.cache_status or 'unknown'}",
+            f"is_fusion:{bool(fusions)}",
+            gene_latency_tag(gene),
+        ],
+    )
+
+
 async def _annotate_gene(
     gene: str,
     fusions: List[str],
@@ -344,7 +363,7 @@ async def _annotate_gene(
             error="Unresolvable gene symbol — bare Ensembl ID or unannotated locus",
         )
         annotation.timings_ms["total"] = _elapsed_ms(total_start)
-        distribution("gene.annotation.duration_ms", annotation.timings_ms["total"], tags=metric_tags)
+        _record_annotation_duration(annotation, gene, fusions, metric_tags)
         return annotation
 
     with trace(
@@ -378,7 +397,7 @@ async def _annotate_gene(
                 )
                 timings["total"] = _elapsed_ms(total_start)
                 annotation.timings_ms = timings
-                distribution("gene.annotation.duration_ms", timings["total"], tags=metric_tags)
+                _record_annotation_duration(annotation, gene, fusions, metric_tags)
                 return annotation
             records, retrieval_tier = await _timed(
                 "literature_retrieval",
@@ -490,7 +509,7 @@ async def _annotate_gene(
             )
             timings["total"] = _elapsed_ms(total_start)
             annotation.timings_ms = timings
-            distribution("gene.annotation.duration_ms", timings["total"], tags=metric_tags)
+            _record_annotation_duration(annotation, gene, fusions, metric_tags)
             return annotation
 
         annotation = build_gene_annotation(
@@ -507,7 +526,7 @@ async def _annotate_gene(
         )
         timings["total"] = _elapsed_ms(total_start)
         annotation.timings_ms = timings
-        distribution("gene.annotation.duration_ms", timings["total"], tags=metric_tags)
+        _record_annotation_duration(annotation, gene, fusions, metric_tags)
         return annotation
 
 
@@ -618,8 +637,15 @@ async def run_pipeline(
             force_refresh=force_refresh,
             local_mode=local_mode,
         )
+        # Time spent waiting for a gene_semaphore slot (i.e. for other genes in
+        # this batch) is reported separately as gene.queue_wait_ms and excluded
+        # from gene.total_duration_ms, so the latter measures only this gene's
+        # own work: cache lookup + annotation + persistence.
+        queue_wait_ms: Optional[float] = None
         if annotation is None:
+            wait_start = perf_counter()
             async with gene_semaphore:
+                queue_wait_ms = _elapsed_ms(wait_start)
                 annotation = await _annotate_gene(
                     gene=canonical,
                     fusions=associated_fusions,
@@ -656,16 +682,18 @@ async def run_pipeline(
                 except Exception:
                     logger.exception("Failed to persist cached gene annotation for %s", canonical)
 
+        gene_tags = metric_tags + [
+            f"cache_status:{annotation.cache_status or 'unknown'}",
+            f"is_fusion:{bool(associated_fusions)}",
+            gene_latency_tag(canonical),
+        ]
         distribution(
             "gene.total_duration_ms",
-            _elapsed_ms(gene_start),
-            tags=metric_tags
-            + [
-                f"cache_status:{annotation.cache_status or 'unknown'}",
-                f"is_fusion:{bool(associated_fusions)}",
-                gene_latency_tag(canonical),
-            ],
+            _elapsed_ms(gene_start) - (queue_wait_ms or 0.0),
+            tags=gene_tags,
         )
+        if queue_wait_ms is not None:
+            distribution("gene.queue_wait_ms", queue_wait_ms, tags=gene_tags)
         return annotation
 
     tasks = [
