@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from src import main, observability
 from src.main import app
 from src.models.schema import AnnotationResult, GeneAnnotation, ResolvedGene
-from src.observability import NoopSpan, record_user_seen, stable_user_key
+from src.observability import NoopSpan, gene_latency_tag, record_user_seen, stable_user_key
 from src.pipeline import llm_client, orchestrator
 
 
@@ -139,12 +139,27 @@ async def test_run_pipeline_tags_gene_metrics_with_cache_status_and_fusion(monke
     assert ("increment", "genes.annotated", 1, fusion_gene_tags) in metric_calls
     assert ("increment", "genes.annotated", 1, non_fusion_gene_tags) in metric_calls
     assert any(
-        call[1] == "gene.total_duration_ms" and call[3] == fusion_gene_tags for call in metric_calls
-    )
-    assert any(
-        call[1] == "gene.total_duration_ms" and call[3] == non_fusion_gene_tags
+        call[1] == "gene.total_duration_ms"
+        and call[3] == fusion_gene_tags + [gene_latency_tag("BRAF")]
         for call in metric_calls
     )
+    assert any(
+        call[1] == "gene.total_duration_ms"
+        and call[3] == non_fusion_gene_tags + [gene_latency_tag("MYH9")]
+        for call in metric_calls
+    )
+
+
+def test_gene_latency_tag_buckets_watchlisted_gene(monkeypatch):
+    monkeypatch.setattr(observability.settings, "datadog_gene_latency_watchlist", "ALK,ROS1")
+
+    assert gene_latency_tag("alk") == "gene:ALK"
+
+
+def test_gene_latency_tag_buckets_unlisted_gene_as_other(monkeypatch):
+    monkeypatch.setattr(observability.settings, "datadog_gene_latency_watchlist", "ALK,ROS1")
+
+    assert gene_latency_tag("MYH9") == "gene:other"
 
 
 def test_record_llm_usage_emits_request_count_and_token_distributions(monkeypatch):

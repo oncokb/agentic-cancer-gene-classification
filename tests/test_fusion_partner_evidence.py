@@ -70,6 +70,10 @@ async def test_retrieve_fusion_partner_evidence_scopes_to_tumor_type(monkeypatch
     assert result.retrieved_count == 1
     assert result.pmids == ["1"]
     assert result.evidence_cards[0].pmid == "1"
+    assert (
+        result.evidence_cards[0].abstract
+        == "Patients with ALK fusion lung cancer respond to crizotinib."
+    )
     assert cache_keys[0][0].startswith("fusion_partner_evidence:")
     assert cache_keys[0][1] == 456
 

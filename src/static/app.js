@@ -134,6 +134,8 @@ const elements = {
   batchGridBody: document.querySelector("#batch-grid-body"),
   addRowBtn: document.querySelector("#add-row-btn"),
   batchHint: document.querySelector("#batch-hint"),
+  batchUploadBtn: document.querySelector("#batch-upload-btn"),
+  batchUploadInput: document.querySelector("#batch-upload-input"),
   // dev-mode annotation backend
   annotateBackendField: document.querySelector("#annotate-backend-field"),
   annotateLocalBackend: document.querySelector("#annotate-local-backend"),
@@ -614,6 +616,126 @@ function handleGridClick(event) {
   }
   state.batchRows.splice(rIdx, 1);
   renderGrid();
+}
+
+// A cell counts as a match for a GRID_COLUMNS entry if it equals that
+// column's machine key (e.g. "tumor_type") OR its on-screen label (e.g.
+// "Tumor Type"), letter/digit comparison only — so "5' Exon", "5′ Exon", and
+// "5 Exon" all match "5′ Exon" the same way.
+function normalizeHeaderCell(value) {
+  return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+const HEADER_ALIASES = new Map();
+GRID_COLUMNS.forEach((col) => {
+  HEADER_ALIASES.set(normalizeHeaderCell(col.key), col.key);
+  HEADER_ALIASES.set(normalizeHeaderCell(col.label), col.key);
+});
+
+// Real gene/fusion identifiers (ALK, EML4::ALK, HLA-A, ...) never contain
+// whitespace and are never this long. A parsed value that fails this is
+// almost certainly not one — most likely an unrecognized header cell that
+// fell through to positional parsing (see parseBatchFileText), or a wrong
+// file (binary, wrong delimiter) landing in this column. Caught here so it
+// doesn't get silently queued as a "gene" to annotate.
+const PLAUSIBLE_FUSION_PATTERN = /^\S{1,120}$/;
+
+// Parses uploaded TSV/CSV file text into grid rows. Tab-delimited when the
+// first line contains a tab, else comma. A header row is recognized when at
+// least one of its cells matches a known column (see HEADER_ALIASES); its
+// unrecognized cells are reported back as ignoredColumns so a superset of
+// fields degrades to "we only used the ones we needed" instead of silent
+// misalignment. With no recognized header, columns are read positionally in
+// the same order as the visible grid — the same fallback handleGridPaste
+// uses, so a genuinely headerless file still loads.
+function parseBatchFileText(text) {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length);
+  if (!lines.length) {
+    return { rows: [], headerDetected: false, ignoredColumns: [], missingRequiredColumn: false };
+  }
+
+  const hasTabs = lines[0].includes("\t");
+  const sep = hasTabs ? "\t" : ",";
+  const firstLineCells = lines[0].split(sep).map((v) => v.trim());
+  const firstLineKeys = firstLineCells.map((v) => HEADER_ALIASES.get(normalizeHeaderCell(v)) || null);
+  const headerDetected = firstLineKeys.some(Boolean);
+
+  let colMap;
+  let dataFrom;
+  let ignoredColumns = [];
+  if (headerDetected) {
+    colMap = firstLineKeys;
+    ignoredColumns = firstLineCells.filter((_, cIdx) => !firstLineKeys[cIdx]);
+    dataFrom = 1;
+  } else {
+    colMap = GRID_COLUMNS.map((c) => c.key);
+    dataFrom = 0;
+  }
+
+  const requiredKey = GRID_COLUMNS.find((c) => c.required).key;
+  const missingRequiredColumn = headerDetected && !colMap.includes(requiredKey);
+
+  const rows = lines.slice(dataFrom).map((line) => {
+    const cols = line.split(sep);
+    const row = emptyRow();
+    colMap.forEach((key, cIdx) => {
+      if (!key) return;
+      row[key] = (cols[cIdx] || "").trim();
+    });
+    if (row.fusion && !PLAUSIBLE_FUSION_PATTERN.test(row.fusion)) row.fusion = "";
+    return row;
+  });
+
+  return { rows, headerDetected, ignoredColumns, missingRequiredColumn };
+}
+
+function handleBatchFileUpload(event) {
+  const file = event.target.files?.[0];
+  event.target.value = ""; // allow re-selecting the same file later
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    const { rows, headerDetected, ignoredColumns, missingRequiredColumn } =
+      parseBatchFileText(String(reader.result || ""));
+    const requiredLabel = GRID_COLUMNS.find((c) => c.required).label;
+
+    if (missingRequiredColumn) {
+      elements.batchHint.textContent =
+        `${file.name}: no "${requiredLabel}" column found in the header — nothing loaded. ` +
+        `Rename that column to "${requiredLabel}" (or "fusion") and re-upload.`;
+      return;
+    }
+
+    const withFusion = rows.filter((row) => row.fusion.trim());
+    if (!withFusion.length) {
+      elements.batchHint.textContent = headerDetected
+        ? `${file.name}: header recognized, but no row had a "${requiredLabel}" value.`
+        : `No valid rows found in ${file.name}. If your columns aren't in the form's ` +
+          `default order, add a header row naming them (e.g. "fusion, tumor_type").`;
+      return;
+    }
+
+    state.batchRows = rows;
+    renderGrid();
+
+    const notes = [`Loaded ${withFusion.length} input${withFusion.length === 1 ? "" : "s"} from ${file.name}.`];
+    if (!headerDetected) {
+      notes.push(`No header row recognized — columns were read positionally, matching the grid's column order.`);
+    }
+    if (ignoredColumns.length) {
+      notes.push(`Ignored unrecognized column${ignoredColumns.length === 1 ? "" : "s"}: ${ignoredColumns.join(", ")}.`);
+    }
+    const droppedCount = rows.length - withFusion.length;
+    if (droppedCount > 0) {
+      notes.push(`Skipped ${droppedCount} row${droppedCount === 1 ? "" : "s"} missing a valid "${requiredLabel}" value.`);
+    }
+    elements.batchHint.textContent = notes.join(" ");
+  };
+  reader.onerror = () => {
+    elements.batchHint.textContent = `Could not read ${file.name}.`;
+  };
+  reader.readAsText(file);
 }
 
 function getGridData() {
@@ -1522,12 +1644,10 @@ function renderFusionEvidenceView(fusionEvidence) {
         itemCard.className = "evidence-card";
         const evidenceType = String(evidenceCard.evidence_type || "fusion").replace(/_/g, " ");
         itemCard.innerHTML = `
-          <div class="evidence-card-topline">
-            <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(evidenceCard.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(evidenceCard.pmid)}</a>
-            <span class="review-badge context">${escapeHtml(evidenceType)}</span>
-          </div>
+          ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
           <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
           <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
+          ${aliasMatchNoticeHtml(evidenceCard)}
           ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
           ${evidenceCard.quote ? `<blockquote>${escapeHtml(evidenceCard.quote)}</blockquote>` : ""}
         `;
@@ -1550,14 +1670,71 @@ function cssSafeId(value) {
   return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 
-function makePubMedLink(pmid) {
-  const a = document.createElement("a");
-  a.href = `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/`;
-  a.target = "_blank";
-  a.rel = "noreferrer";
-  a.className = "citation-link";
-  a.textContent = pmid;
-  return a;
+// Shared hover/focus tooltip markup for a PMID pill, so a curator can read
+// the paper's abstract without leaving the page. Returns "" when there's no
+// abstract to show, so callers can splice it in unconditionally.
+function pmidAbstractTooltipHtml(abstract) {
+  if (!abstract) return "";
+  return `
+    <span class="pmid-abstract-tooltip" role="tooltip">
+      <span class="pmid-abstract-tooltip-label">Abstract</span>
+      ${escapeHtml(abstract)}
+    </span>
+  `;
+}
+
+// A plain PMID link, used throughout for "Retrieved PMIDs"/"Cited on
+// PubMed"/etc. lists. Pass `abstract` (when known for that pmid) to get the
+// same hover tooltip evidence cards show; omit it for an ordinary pill.
+function makePubMedLink(pmid, abstract) {
+  const href = `https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/`;
+  if (!abstract) {
+    const a = document.createElement("a");
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noreferrer";
+    a.className = "citation-link";
+    a.textContent = pmid;
+    return a;
+  }
+  const wrapper = document.createElement("span");
+  wrapper.className = "pmid-pill";
+  wrapper.innerHTML = `
+    <a href="${href}" target="_blank" rel="noreferrer" class="citation-link">${escapeHtml(pmid)}</a>
+    ${pmidAbstractTooltipHtml(abstract)}
+  `;
+  return wrapper;
+}
+
+// Evidence-card PMID link + evidence-type badge, with the paper's abstract
+// (when available) shown in a hover/focus tooltip so curators can read it
+// without leaving the page.
+function evidenceCardTopline(pmid, evidenceType, abstract) {
+  return `
+    <div class="evidence-card-topline">
+      <span class="pmid-pill">
+        <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(pmid)}</a>
+        ${pmidAbstractTooltipHtml(abstract)}
+      </span>
+      <span class="review-badge context">${escapeHtml(evidenceType)}</span>
+    </div>
+  `;
+}
+
+// Visible callout for a fusion evidence card matched only through an HGNC
+// alias/legacy gene symbol (e.g. KAT6A found via "MOZ"), so a clinician
+// reading the paper knows it was retrieved under legacy nomenclature rather
+// than assuming an unambiguous literal match. Returns "" for a literal match.
+function aliasMatchNoticeHtml(evidenceCard) {
+  const matches = evidenceCard.alias_matches || [];
+  if (!evidenceCard.matched_via_alias || !matches.length) return "";
+  const detail = matches.map((m) => `${escapeHtml(m.alias)} (${escapeHtml(m.gene)})`).join(", ");
+  return `
+    <p class="evidence-alias-notice">
+      <span class="review-badge alias-match">Found via alias</span>
+      <span class="evidence-alias-notice-detail">${detail}</span>
+    </p>
+  `;
 }
 
 function renderSupportingEvidence(annotation) {
@@ -1600,8 +1777,12 @@ function renderSupportingEvidence(annotation) {
     section.appendChild(details);
   }
 
-  // Cited PMIDs as PubMed links
+  // Cited PMIDs as PubMed links. evidence_cards (when loaded) already carry
+  // each cited pmid's abstract, so reuse it here for the same hover tooltip.
   if (citations.length) {
+    const abstractByPmid = new Map(
+      evidenceCards.filter((card) => card.abstract).map((card) => [card.pmid, card.abstract])
+    );
     const citBlock = document.createElement("div");
     citBlock.className = "citation-links";
     const label = document.createElement("span");
@@ -1610,7 +1791,7 @@ function renderSupportingEvidence(annotation) {
     citBlock.appendChild(label);
     const linkRow = document.createElement("div");
     linkRow.className = "citation-link-list";
-    citations.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
+    citations.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid, abstractByPmid.get(pmid))));
     citBlock.appendChild(linkRow);
     section.appendChild(citBlock);
   }
@@ -1636,10 +1817,7 @@ function renderSupportingEvidence(annotation) {
       item.className = "evidence-card";
       const evidenceType = String(card.evidence_type || "other").replace(/_/g, " ");
       item.innerHTML = `
-        <div class="evidence-card-topline">
-          <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(card.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(card.pmid)}</a>
-          <span class="review-badge context">${escapeHtml(evidenceType)}</span>
-        </div>
+        ${evidenceCardTopline(card.pmid, evidenceType, card.abstract)}
         <h5>${escapeHtml(card.title || "Untitled PubMed record")}</h5>
         <p class="evidence-card-meta">${escapeHtml(card.journal || "Journal unavailable")}</p>
         ${card.selected_reason ? `<p>${escapeHtml(card.selected_reason)}</p>` : ""}
@@ -2190,10 +2368,7 @@ function renderFusionPartnerResultBody(container, data) {
       itemCard.className = "evidence-card";
       const evidenceType = String(evidenceCard.evidence_type || "fusion").replace(/_/g, " ");
       itemCard.innerHTML = `
-        <div class="evidence-card-topline">
-          <a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(evidenceCard.pmid)}/" target="_blank" rel="noreferrer">PMID ${escapeHtml(evidenceCard.pmid)}</a>
-          <span class="review-badge context">${escapeHtml(evidenceType)}</span>
-        </div>
+        ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
         <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
         <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
         ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
@@ -2591,14 +2766,21 @@ function renderClinicalActionability(annotation) {
   summary.textContent = actionability.summary || "";
   section.appendChild(summary);
 
+  // actionability.evidence carries each supporting pmid's abstract (see
+  // clinical_actionability.py's evidence_entries); reuse it for the same
+  // hover tooltip the "Cited on PubMed" pills use.
+  const abstractByPmid = new Map(
+    (actionability.evidence || []).filter((e) => e.abstract).map((e) => [e.pmid, e.abstract])
+  );
+
   if (actionability.pmids?.length) {
     const links = document.createElement("div");
     links.className = "citation-link-list";
-    actionability.pmids.forEach((pmid) => links.appendChild(makePubMedLink(pmid)));
+    actionability.pmids.forEach((pmid) => links.appendChild(makePubMedLink(pmid, abstractByPmid.get(pmid))));
     section.appendChild(links);
   }
 
-  const breakdown = renderClinicalActionabilityBreakdown(actionability);
+  const breakdown = renderClinicalActionabilityBreakdown(actionability, abstractByPmid);
   if (breakdown) section.appendChild(breakdown);
 
   if (actionability.confidence_explanation) {
@@ -2611,7 +2793,7 @@ function renderClinicalActionability(annotation) {
   return section;
 }
 
-function renderClinicalActionabilityBreakdown(actionability) {
+function renderClinicalActionabilityBreakdown(actionability, abstractByPmid) {
   const components = actionability.score_components || [];
   if (!components.length) return null;
 
@@ -2651,7 +2833,7 @@ function renderClinicalActionabilityBreakdown(actionability) {
     if (component.pmids?.length) {
       const pmids = document.createElement("div");
       pmids.className = "citation-link-list";
-      component.pmids.forEach((pmid) => pmids.appendChild(makePubMedLink(pmid)));
+      component.pmids.forEach((pmid) => pmids.appendChild(makePubMedLink(pmid, abstractByPmid.get(pmid))));
       body.appendChild(pmids);
     }
 
@@ -3118,6 +3300,9 @@ function bindEvents() {
     state.batchRows.push(emptyRow());
     renderGrid({ row: state.batchRows.length - 1, col: 0 });
   });
+
+  elements.batchUploadBtn.addEventListener("click", () => elements.batchUploadInput.click());
+  elements.batchUploadInput.addEventListener("change", handleBatchFileUpload);
 
   elements.shareRun.addEventListener("click", copyShareLink);
   elements.clearResults.addEventListener("click", clearResults);

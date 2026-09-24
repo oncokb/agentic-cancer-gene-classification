@@ -210,6 +210,10 @@ def test_build_gene_annotation_adds_lazy_evidence_cards_and_quality_flags():
     assert annotation.evidence_cards[0].pmid == "12345"
     assert annotation.evidence_cards[0].evidence_type == "clinical"
     assert annotation.evidence_cards[0].quote == "Patient cohort data."
+    assert (
+        annotation.evidence_cards[0].abstract
+        == "Patient cohort data link TP53 mutation to cancer prognosis."
+    )
     assert {flag.code for flag in annotation.quality_flags} == {
         "tier2_retrieval_used",
         "deep_model_escalated",

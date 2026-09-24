@@ -332,12 +332,15 @@ clinical-actionability counts, deep-model escalation counts, and per-gene
 deltas between the smallest and largest paper-count arms.
 
 Initial smoke benchmark on `EML4::ALK` and `HAPSTR1::ABAT` supported keeping
-full-mode synthesis context at 8 selected papers while leaving the final
-curator-facing citation cap at 4. Moving from 4 to 8 synthesis papers improved
-average evidence-support score from 0.65 to 0.75 and average verified citation
-count from 3.5 to 3.75, with no change in high-confidence clinical-actionability
-count. Increasing `MAX_CITATIONS_PER_ANNOTATION` should be evaluated separately,
-because that changes final output volume rather than only synthesis context.
+full-mode synthesis context at 8 selected papers. Moving from 4 to 8 synthesis
+papers improved average evidence-support score from 0.65 to 0.75 and average
+verified citation count from 3.5 to 3.75, with no change in high-confidence
+clinical-actionability count — most genes in that sample didn't have many
+strong candidates beyond ~4, so raising the synthesis-context size alone had
+a modest effect on citation count. `MAX_CITATIONS_PER_ANNOTATION` now defaults
+to 8, matching `MAX_PAPERS_FOR_SYNTHESIS`, so a gene that genuinely does have
+more than 4 strong supporting papers isn't artificially capped below what was
+retrieved and considered.
 
 ## Output Files
 

@@ -278,6 +278,7 @@ def assess_clinical_actionability(
                 domains=domains,
                 matched_terms=matched_terms,
                 quote=_fallback_quote(record, gene),
+                abstract=record.abstract or None,
             )
         )
 

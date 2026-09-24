@@ -17,11 +17,21 @@ class Settings(BaseSettings):
     synthesis_escalation_min_support_score: float = 0.5
     synthesis_escalation_min_citations: int = 1
     synthesis_escalation_tier2: bool = True
+    # When the fast pass's evidence-support score already meets this bar, skip
+    # escalation entirely — including the tier2/citations checks below — since
+    # a second, slower deep-model call adds latency without adding confidence
+    # once the evidence is already this strong.
+    synthesis_escalation_sufficient_score: float = 0.75
     core_synthesis_max_tokens: int = 640
     core_synthesis_abstract_chars: int = 500
     core_synthesis_max_papers: int = 6
     core_synthesis_escalation_min_support_score: float = 0.0
     core_synthesis_escalation_tier2: bool = False
+    # Core mode already escalates on evidence quality far less than full mode
+    # (min_support_score 0.0, tier2 escalation off), so default this high
+    # enough that the new short-circuit doesn't change core mode's existing
+    # too_few_verified_citations behavior.
+    core_synthesis_escalation_sufficient_score: float = 1.01
     selection_model: str = "claude-haiku-4-5-20251001"
     feedback_model: str = "claude-haiku-4-5-20251001"
     retrieval_model: str = "claude-haiku-4-5-20251001"
@@ -53,7 +63,7 @@ class Settings(BaseSettings):
     fusion_partner_evidence_cache_ttl_seconds: int = 604800
     min_papers_for_strong_association: int = 4
     max_papers_for_synthesis: int = 8
-    max_citations_per_annotation: int = 4
+    max_citations_per_annotation: int = 8
     annotation_gene_concurrency: int = 3
     llm_concurrency: int = 2
     pubmed_staged_retrieval: bool = True
@@ -190,6 +200,15 @@ class Settings(BaseSettings):
     datadog_statsd_host: str = ""
     datadog_statsd_port: int = 0
     datadog_user_id_header: str = "x-user-id"
+    # Fixed, low-cardinality watchlist for per-gene latency breakdowns.
+    # Tagging gene.total_duration_ms with the raw gene symbol would make it a
+    # high-cardinality custom metric (one tag value per unique gene queried);
+    # bucketing to this list plus "other" keeps cardinality bounded while still
+    # surfacing latency for the recurrent fusion partners that matter most.
+    datadog_gene_latency_watchlist: str = (
+        "ALK,ROS1,RET,NTRK1,NTRK2,NTRK3,BRAF,EGFR,MET,FGFR1,FGFR2,FGFR3,"
+        "ABL1,KMT2A,ETV6,EWSR1,TMPRSS2,ERG,PAX3,PAX7,FOXO1,DDIT3,NUTM1,BCR"
+    )
 
 
 settings = Settings()
