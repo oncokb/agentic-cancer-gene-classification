@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Union
 
 from src.config import settings
 from src.models.schema import FusionInput
-from src.pipeline.normalization import normalize_fusions
+from src.pipeline.normalization import is_fusion_input, normalize_fusions
 from src.pipeline.openevidence import OpenEvidenceClient
 
 
@@ -54,7 +54,38 @@ async def warm_openevidence_cache(
     Idempotent: OpenEvidenceClient.get_gene_analysis is itself backed by
     cached_call (see src.pipeline.cache), so re-running this against genes
     that are already warm is a cache hit — no duplicate live HTTP call.
+
+    Mirrors orchestrator.py's annotate_one() in deriving each gene's
+    associated fusion (if any) from its own raw `gene_inputs` and passing it
+    into get_gene_analysis as `fusion`. This matters because
+    get_gene_analysis's cache key (see openevidence.py's _cache_key) now
+    includes `fusion` whenever present, so a generic-question warmup and a
+    fusion-specific live request occupy separate cache slots — if warmup
+    derived a different (or no) fusion here than a live annotation request
+    for the same gene would use, it would warm the WRONG slot: the live
+    request would still take a cache miss and pay full live-call latency,
+    silently defeating the point of warming ahead of it. Deriving the same
+    fusion context here that annotate_one() would derive keeps the two paths
+    asking, and therefore caching, the same question under the same key for
+    the same gene.
+
+    No-op when settings.openevidence_enabled is false: the feature flag is
+    supposed to make OpenEvidence off end-to-end, not just skipped in the
+    live annotation path, so warmup must not make any OpenEvidenceClient
+    calls (or construct one) while it's off either.
     """
+    if not settings.openevidence_enabled:
+        return {
+            "inputs_processed": 0,
+            "genes_total": 0,
+            "genes_warmed": 0,
+            "genes_failed": 0,
+            "warmed": [],
+            "errors": [],
+            "timings_ms": {"total": 0.0},
+            "skipped_reason": "openevidence_enabled is false",
+        }
+
     total_start = perf_counter()
     input_strings, tumor_type_by_input = _normalize_inputs(inputs)
     gene_map = await normalize_fusions(input_strings)
@@ -66,9 +97,11 @@ async def warm_openevidence_cache(
             (tumor_type_by_input[value] for value in gene_inputs if value in tumor_type_by_input),
             None,
         )
+        associated_fusions = [value for value in gene_inputs if is_fusion_input(value)]
+        fusion = associated_fusions[0] if associated_fusions else None
         start = perf_counter()
         async with semaphore:
-            analysis = await oe_client.get_gene_analysis(gene, tumor_type=tumor_type)
+            analysis = await oe_client.get_gene_analysis(gene, tumor_type=tumor_type, fusion=fusion)
         return {
             "gene": gene,
             "citation_count": len(analysis.citations),

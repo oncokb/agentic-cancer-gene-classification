@@ -46,6 +46,8 @@ class _FakeAnalysis:
 
 
 async def test_warm_openevidence_cache_fans_out_over_gene_map(monkeypatch):
+    monkeypatch.setattr(openevidence_warmup.settings, "openevidence_enabled", True)
+
     async def fake_normalize_fusions(inputs):
         assert inputs == ["TP53::BRAF"]
         return {
@@ -56,7 +58,7 @@ async def test_warm_openevidence_cache_fans_out_over_gene_map(monkeypatch):
     seen = []
 
     class FakeClient:
-        async def get_gene_analysis(self, gene, tumor_type=None):
+        async def get_gene_analysis(self, gene, tumor_type=None, fusion=None):
             seen.append((gene, tumor_type))
             return _FakeAnalysis(citations=[object()])
 
@@ -76,6 +78,8 @@ async def test_warm_openevidence_cache_fans_out_over_gene_map(monkeypatch):
 
 
 async def test_warm_openevidence_cache_reports_gene_errors(monkeypatch):
+    monkeypatch.setattr(openevidence_warmup.settings, "openevidence_enabled", True)
+
     async def fake_normalize_fusions(_inputs):
         return {
             "BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"]),
@@ -83,7 +87,7 @@ async def test_warm_openevidence_cache_reports_gene_errors(monkeypatch):
         }
 
     class FakeClient:
-        async def get_gene_analysis(self, gene, tumor_type=None):
+        async def get_gene_analysis(self, gene, tumor_type=None, fusion=None):
             if gene == "TP53":
                 raise RuntimeError("OpenEvidence unavailable")
             return _FakeAnalysis()
@@ -99,11 +103,54 @@ async def test_warm_openevidence_cache_reports_gene_errors(monkeypatch):
     assert report["errors"] == [{"gene": "TP53", "error": "OpenEvidence unavailable"}]
 
 
+async def test_warm_openevidence_cache_is_noop_when_disabled(monkeypatch):
+    """settings.openevidence_enabled is supposed to make OpenEvidence off
+    end-to-end (see GET /v1/genes/{gene}/openevidence's own disabled-gate
+    test in test_openevidence_sidecar.py), not just skipped in the live
+    annotation path — warmup must not touch normalize_fusions or the
+    OpenEvidence client at all while it's off."""
+    monkeypatch.setattr(openevidence_warmup.settings, "openevidence_enabled", False)
+
+    async def fail_if_called(_inputs):
+        raise AssertionError("normalize_fusions should never be called when disabled")
+
+    monkeypatch.setattr(openevidence_warmup, "normalize_fusions", fail_if_called)
+
+    class FailClient:
+        async def get_gene_analysis(self, gene, tumor_type=None, fusion=None):
+            raise AssertionError("OpenEvidenceClient should never be called when disabled")
+
+    report = await openevidence_warmup.warm_openevidence_cache(["TP53::BRAF"], client=FailClient())
+
+    assert report["genes_total"] == 0
+    assert report["genes_warmed"] == 0
+    assert report["genes_failed"] == 0
+    assert report["warmed"] == []
+    assert report["errors"] == []
+
+
+async def test_warm_openevidence_cache_is_noop_when_disabled_without_explicit_client(monkeypatch):
+    """Same as above, but without passing `client=` — proves warmup doesn't
+    even construct a default OpenEvidenceClient() while disabled."""
+    monkeypatch.setattr(openevidence_warmup.settings, "openevidence_enabled", False)
+
+    def fail_if_constructed(*_args, **_kwargs):
+        raise AssertionError("OpenEvidenceClient should never be constructed when disabled")
+
+    monkeypatch.setattr(openevidence_warmup, "OpenEvidenceClient", fail_if_constructed)
+
+    report = await openevidence_warmup.warm_openevidence_cache(["TP53::BRAF"])
+
+    assert report["genes_total"] == 0
+    assert report["genes_warmed"] == 0
+
+
 async def test_warm_openevidence_cache_uses_own_concurrency_not_annotation_gene_concurrency(monkeypatch):
     """Warmup must gate on its OWN OPENEVIDENCE_WARMUP_CONCURRENCY setting,
     never ANNOTATION_GENE_CONCURRENCY — proven by setting them to different
     values and observing the warmup semaphore actually allows the wider
     fan-out."""
+    monkeypatch.setattr(openevidence_warmup.settings, "openevidence_enabled", True)
 
     async def fake_normalize_fusions(inputs):
         return {
@@ -116,7 +163,7 @@ async def test_warm_openevidence_cache_uses_own_concurrency_not_annotation_gene_
     max_active = 0
 
     class FakeClient:
-        async def get_gene_analysis(self, gene, tumor_type=None):
+        async def get_gene_analysis(self, gene, tumor_type=None, fusion=None):
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
@@ -139,6 +186,7 @@ async def test_warm_openevidence_cache_uses_own_concurrency_not_annotation_gene_
 async def test_warm_openevidence_cache_populates_redis_cache(_require_redis, monkeypatch):
     """Exercises the real OpenEvidenceClient.get_gene_analysis cached_call
     path (not a mocked client) to prove warmup actually writes into Redis."""
+    monkeypatch.setattr(openevidence_warmup.settings, "openevidence_enabled", True)
 
     async def fake_normalize_fusions(inputs):
         return {"BRAF": (_resolved_gene("BRAF"), ["BRAF"])}
@@ -170,6 +218,7 @@ async def test_warm_openevidence_cache_rerun_against_warm_cache_is_safe_noop(_re
     """Re-running warmup against a gene that's already warm must not make a
     second live call — it should be a Redis cache hit, exactly like a live
     annotation request would get."""
+    monkeypatch.setattr(openevidence_warmup.settings, "openevidence_enabled", True)
 
     async def fake_normalize_fusions(inputs):
         return {"BRAF": (_resolved_gene("BRAF"), ["BRAF"])}
@@ -192,3 +241,59 @@ async def test_warm_openevidence_cache_rerun_against_warm_cache_is_safe_noop(_re
     assert second_report["genes_warmed"] == 1
     assert second_report["genes_failed"] == 0
     assert call_count["n"] == 1  # second warmup pass was a cache hit, no duplicate live call
+
+
+async def test_warm_openevidence_cache_warms_fusion_specific_question_for_fusion_gene(
+    _require_redis, monkeypatch
+):
+    """Regression test: get_gene_analysis's cache key includes `fusion`
+    whenever present (see openevidence.py's _cache_key), so a
+    fusion-specific answer and a generic gene-only answer live in separate
+    cache slots. If warmup asked the generic "is ALK an oncogene..."
+    question here while a live annotation request for the same ALK::EML4
+    fusion asks the fusion-specific "is the EML4::ALK fusion oncogenic..."
+    question, warmup would populate the WRONG cache slot and the live
+    request would still take a cache miss (no benefit from warming) — or,
+    before the cache key included fusion, would have silently gotten a
+    cache HIT on warmup's stale generic-question answer instead of its own
+    fusion-specific one.
+
+    Warms via the warmup path with the same raw fusion input a live request
+    would submit, then simulates the live annotate path's lookup for that
+    same gene+fusion and confirms it's a cache HIT on the FUSION-SPECIFIC
+    question, not a silent hit on a generic-question cache entry. Fails
+    before threading `fusion` through warm_one() (the generic question would
+    have been sent/cached instead), passes after.
+    """
+    monkeypatch.setattr(openevidence_warmup.settings, "openevidence_enabled", True)
+
+    async def fake_normalize_fusions(inputs):
+        assert inputs == ["EML4::ALK"]
+        return {"ALK": (_resolved_gene("ALK"), ["EML4::ALK"])}
+
+    questions_sent = []
+
+    async def fake_post_streaming_analysis(question, api_key, client):
+        questions_sent.append(question)
+        return _SSE_STREAM
+
+    monkeypatch.setattr(openevidence_warmup, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(openevidence_module, "_post_streaming_analysis", fake_post_streaming_analysis)
+
+    real_client = OpenEvidenceClient(api_key="test-key")
+    report = await openevidence_warmup.warm_openevidence_cache(["EML4::ALK"], client=real_client)
+    assert report["genes_warmed"] == 1
+
+    # Exactly one live HTTP call so far, and it must have been the
+    # fusion-specific question — not the generic "is ALK an oncogene..."
+    # question a fusion-unaware warmup would have sent instead.
+    assert len(questions_sent) == 1
+    assert "EML4::ALK" in questions_sent[0]
+
+    # The live annotate path's lookup for the same gene+fusion must be a
+    # cache HIT (no second live call) returning that same fusion-specific
+    # analysis, not a mismatched generic one.
+    live_analysis = await real_client.get_gene_analysis("ALK", fusion="EML4::ALK")
+    assert len(questions_sent) == 1  # cache hit, no new live call
+    assert live_analysis.question == questions_sent[0]
+    assert "EML4::ALK" in live_analysis.question
