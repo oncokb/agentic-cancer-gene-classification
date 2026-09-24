@@ -411,3 +411,54 @@ def test_contact_email_in_public_content_keeps_submission_internal(intake, locat
     assert store.saved_feedback[0]["contact_email"] == email
     assert response.json()["issue_body"] is None
     github.assert_not_awaited()
+
+
+CLEAN_MESSAGE = "Export dropdown is confusing and should remain clickable there okay now."
+
+
+def test_fabricated_body_claims_fall_back(intake):
+    client, store, llm, github = intake
+    llm.return_value = {
+        "title": "Clarify export dropdown behavior",
+        "problem_summary": "TP53 has a security vulnerability confirmed by our pentest",
+        "suggested_solution": "A breach occurred and the findings must be disclosed.",
+        "acceptance_criteria": ["Export dropdown remains clickable."],
+    }
+    response = client.post("/v1/feedback", json={"category": "bug", "message": CLEAN_MESSAGE})
+    assert response.status_code == 201
+    assert response.json()["issue_title"] == f"Feedback: {CLEAN_MESSAGE}"
+    body = github.call_args.args[1].casefold()
+    for word in ("security", "vulnerability", "pentest", "breach", "findings"):
+        assert word not in body
+    llm.assert_awaited_once()
+
+
+def test_clean_body_fields_are_kept(intake):
+    client, store, llm, github = intake
+    llm.return_value = {
+        "title": "Clarify export dropdown behavior",
+        "problem_summary": "The export dropdown is confusing.",
+        "suggested_solution": "Keep the export dropdown clickable.",
+        "acceptance_criteria": ["Export dropdown remains clickable."],
+    }
+    response = client.post("/v1/feedback", json={"category": "bug", "message": CLEAN_MESSAGE})
+    assert response.json()["issue_title"] == "Feedback: Clarify export dropdown behavior"
+    body = github.call_args.args[1]
+    assert "## Parsed Feedback\nThe export dropdown is confusing." in body
+    assert "## Suggested Solution\nKeep the export dropdown clickable." in body
+    assert "- [ ] Export dropdown remains clickable." in body
+
+
+def test_fabricated_acceptance_criterion_falls_back(intake):
+    client, store, llm, github = intake
+    llm.return_value = {
+        "title": "Clarify export dropdown behavior",
+        "problem_summary": "The export dropdown is confusing.",
+        "suggested_solution": "Keep the export dropdown clickable.",
+        "acceptance_criteria": ["Export dropdown remains clickable.", "Security review is complete."],
+    }
+    response = client.post("/v1/feedback", json={"category": "bug", "message": CLEAN_MESSAGE})
+    assert response.json()["issue_title"] == f"Feedback: {CLEAN_MESSAGE}"
+    body = github.call_args.args[1]
+    assert "security" not in body.casefold()
+    assert "Keep the export dropdown clickable." not in body

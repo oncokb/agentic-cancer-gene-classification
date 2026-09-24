@@ -880,8 +880,13 @@ async def _draft_feedback_issue(
 
     claim_words = {"security", "vulnerability", "vulnerabilities", "finding", "findings", "breach"}
     message_words = set(re.findall(r"\w+", payload.message.casefold()))
-    title_words = set(re.findall(r"\w+", str((draft or {}).get("title", "")).casefold()))
-    if not draft or (title_words & claim_words) - message_words:
+    # Check every LLM-drafted field that reaches the public issue, not just the title.
+    drafted = draft or {}
+    drafted_fields = [drafted.get(key) or "" for key in ("title", "problem_summary", "suggested_solution")]
+    criteria = drafted.get("acceptance_criteria") or []
+    drafted_fields += criteria if isinstance(criteria, list) else [criteria]
+    drafted_words = set(re.findall(r"\w+", " ".join(map(str, drafted_fields)).casefold()))
+    if not draft or (drafted_words & claim_words) - message_words:
         draft = _fallback_feedback_issue(payload)
 
     title = str(draft.get("title") or "Curator feedback").strip() or "Curator feedback"
