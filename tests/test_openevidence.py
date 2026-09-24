@@ -20,6 +20,7 @@ import pytest
 from tenacity import RetryError
 
 from src.config import settings
+from src.models.schema import OpenEvidenceCitation
 from src.pipeline import cache as cache_module
 from src.pipeline.openevidence import (
     OpenEvidenceClient,
@@ -133,6 +134,45 @@ def test_build_analysis_accumulates_text_from_all_events_including_citations():
     assert analysis.text == "BRAF mutations are common in melanoma.[[1]][[2]]"
 
 
+@pytest.mark.parametrize("split_at", [None, 8, 43, 100])
+def test_build_analysis_strips_captured_style_widget_prefix(split_at):
+    props = {"steps": [{"title": 'Searching "guidelines" {and trials}', "done": True}]}
+    text = "REACTCOMPONENT!:!InlineGenerationStep!:!" + json.dumps(props) + "\n\nEvidence: "
+    deltas = [text] if split_at is None else [text[:split_at], text[split_at:]]
+    raw = "".join("data: " + json.dumps({"text": delta}) + "\n\n" for delta in deltas)
+    analysis = _build_analysis("q", _parse_sse_events(raw + SSE_STREAM))
+
+    assert analysis.text == "Evidence: BRAF mutations are common in melanoma.[[1]][[2]]"
+    assert len(analysis.citations) == 2
+
+
+@pytest.mark.parametrize("text", [
+    'REACTCOMPONENT!:!InlineGenerationStep!:!{"steps": [',
+    'REACTCOMPONENT!:!OtherWidget!:!{"steps": []}Prose.',
+    '  Prose with {braces} and [[1]].',
+])
+def test_build_analysis_preserves_text_without_valid_widget_prefix(text):
+    assert _build_analysis("q", [{"text": text}]).text == text
+
+
+def test_build_analysis_preserves_reference_level_formatted_citation_fields():
+    reference = json.loads(_PSORIASIS_CITATION_EVENT)["reference"]
+    reference["publication_info_string"] = "Journal. 2026;1:2. doi:example."
+    citation = _build_analysis("q", [{"reference": reference}]).citations[0]
+
+    assert citation.reference_text == reference["reference_text"]
+    assert citation.publication_info_string == reference["publication_info_string"]
+    assert OpenEvidenceCitation.model_validate(citation.model_dump()) == citation
+
+
+def test_formatted_citation_fields_default_to_none():
+    citation = OpenEvidenceCitation(citation_key="1")
+    parsed = _build_analysis("q", [{"reference": {"citation_key": 1}}]).citations[0]
+    for value in (citation, parsed):
+        assert value.reference_text is None
+        assert value.publication_info_string is None
+
+
 def test_build_analysis_extracts_citations_from_real_nested_shape():
     """Citation fields are nested under event["reference"]["reference_detail"],
     not flat top-level fields — this is the real, confirmed shape."""
@@ -143,6 +183,8 @@ def test_build_analysis_extracts_citations_from_real_nested_shape():
     by_key = {c.citation_key: c for c in analysis.citations}
 
     nccn = by_key["1"]
+    assert nccn.reference_text == json.loads(_NCCN_CITATION_EVENT)["reference"]["reference_text"]
+    assert nccn.publication_info_string == "Updated 2026-09-02"
     assert nccn.title == "Melanoma: Cutaneous"
     assert nccn.authors == "National Comprehensive Cancer Network"
     assert nccn.journal == ""  # no journal_name/journal_short_name in this fixture
@@ -152,6 +194,9 @@ def test_build_analysis_extracts_citations_from_real_nested_shape():
     assert nccn.source_texts == []
 
     psoriasis = by_key["2"]
+    reference = json.loads(_PSORIASIS_CITATION_EVENT)["reference"]
+    assert psoriasis.reference_text == reference["reference_text"]
+    assert psoriasis.publication_info_string == reference["reference_detail"]["publication_info_string"]
     assert psoriasis.title == "Psoriasis Treatment: Traditional Therapy"
     assert psoriasis.authors == "Lebwohl M, Ting PT, Koo JY."
     assert psoriasis.journal == "Annals of the Rheumatic Diseases"  # journal_name preferred
@@ -208,9 +253,9 @@ def test_build_analysis_ignores_table_events_without_crashing():
 
 def test_build_question_plain_gene_no_tumor_type():
     assert _build_question("TP53") == (
-        "Based on peer-reviewed evidence, is TP53 an oncogene or tumor "
-        "suppressor in cancer? State the classification and the strongest "
-        "supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for TP53 "
+        "alterations in cancer? Cite the specific guideline or trial."
     )
 
 
@@ -218,9 +263,9 @@ def test_build_question_plain_gene_with_tumor_type():
     """tumor_type replaces the generic "cancer" context rather than being
     appended after it — no awkward "...in cancer in breast cancer?" double-up."""
     assert _build_question("BRCA1", tumor_type="breast cancer") == (
-        "Based on peer-reviewed evidence, is BRCA1 an oncogene or tumor "
-        "suppressor in breast cancer? State the classification and "
-        "the strongest supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for BRCA1 "
+        "alterations in breast cancer? Cite the specific guideline or trial."
     )
 
 
@@ -230,17 +275,17 @@ def test_build_question_fusion_gene():
     already-validated `fusions` list (see normalization.is_fusion_input),
     not a hand-picked tuple of gene names."""
     assert _build_question("ALK", fusion="EML4::ALK") == (
-        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
-        "in cancer? State the classification and the strongest supporting "
-        "evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for the "
+        "EML4::ALK fusion in cancer? Cite the specific guideline or trial."
     )
 
 
 def test_build_question_fusion_gene_with_tumor_type():
     assert _build_question("ALK", tumor_type="NSCLC", fusion="EML4::ALK") == (
-        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
-        "in NSCLC? State the classification and the strongest "
-        "supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for the "
+        "EML4::ALK fusion in NSCLC? Cite the specific guideline or trial."
     )
 
 
@@ -367,9 +412,9 @@ async def test_get_gene_analysis_sends_fusion_specific_question_in_request_paylo
         )
 
     assert captured["payload"]["text"] == (
-        "Based on peer-reviewed evidence, is the EML4::ALK fusion oncogenic "
-        "in NSCLC? State the classification and the strongest "
-        "supporting evidence."
+        "What NCCN, ASCO, or ESMO clinical practice guideline recommendations "
+        "or clinical trial evidence address targeted therapy for the "
+        "EML4::ALK fusion in NSCLC? Cite the specific guideline or trial."
     )
 
 
