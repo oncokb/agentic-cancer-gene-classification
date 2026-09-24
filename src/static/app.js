@@ -1614,6 +1614,7 @@ function renderFusionEvidenceView(fusionEvidence) {
           ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
           <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
           <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
+          ${aliasMatchNoticeHtml(evidenceCard)}
           ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
           ${evidenceCard.quote ? `<blockquote>${escapeHtml(evidenceCard.quote)}</blockquote>` : ""}
         `;
@@ -1684,6 +1685,22 @@ function evidenceCardTopline(pmid, evidenceType, abstract) {
       </span>
       <span class="review-badge context">${escapeHtml(evidenceType)}</span>
     </div>
+  `;
+}
+
+// Visible callout for a fusion evidence card matched only through an HGNC
+// alias/legacy gene symbol (e.g. KAT6A found via "MOZ"), so a clinician
+// reading the paper knows it was retrieved under legacy nomenclature rather
+// than assuming an unambiguous literal match. Returns "" for a literal match.
+function aliasMatchNoticeHtml(evidenceCard) {
+  const matches = evidenceCard.alias_matches || [];
+  if (!evidenceCard.matched_via_alias || !matches.length) return "";
+  const detail = matches.map((m) => `${escapeHtml(m.alias)} (${escapeHtml(m.gene)})`).join(", ");
+  return `
+    <p class="evidence-alias-notice">
+      <span class="review-badge alias-match">Found via alias</span>
+      <span class="evidence-alias-notice-detail">${detail}</span>
+    </p>
   `;
 }
 

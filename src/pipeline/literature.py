@@ -22,7 +22,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import anthropic
 import httpx
@@ -31,6 +31,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.config import settings
 from src.models.schema import (
+    AliasMatch,
     EvidenceCard,
     FusionEvidenceCard,
     FusionEvidenceResult,
@@ -38,7 +39,7 @@ from src.models.schema import (
     LiteraturePaperScore,
     LiteratureRecord,
 )
-from src.pipeline.normalization import split_fusion
+from src.pipeline.normalization import resolve_gene, split_fusion
 from src.pipeline.cache import cached_call
 from src.pipeline.llm_client import (
     complete_with_tool,
@@ -249,16 +250,88 @@ _NOVEL_FUSION_TERMS = (
 )
 
 
-def _fusion_query_variants(fusion: str) -> List[str]:
+def _partner_symbol_options(canonical: str, aliases: Optional[List[str]] = None) -> List[str]:
+    """canonical symbol first, then any HGNC aliases/synonyms, deduped in order."""
+    return list(dict.fromkeys([canonical, *(aliases or [])]))
+
+
+async def _resolve_one_partner_aliases(gene: str) -> List[str]:
+    """Resolve HGNC legacy-nomenclature symbols for a single gene: the union
+    of HGNC's `alias_symbol` (a synonym HGNC never formally assigned as the
+    gene's own symbol) and `prev_symbol` (a retired/superseded HUGO symbol)
+    fields. Both kinds of name show up interchangeably in older fusion
+    literature — e.g. for KAT6A, HGNC files MOZ under alias_symbol but
+    MYST3/ZNF220 under prev_symbol — so only unioning both fields recovers
+    every legacy name. Best-effort: a lookup failure for this gene logs the
+    real exception and falls back to no aliases for just this gene, rather
+    than raising."""
+    try:
+        async with httpx.AsyncClient() as hgnc_client:
+            resolved = await resolve_gene(gene, hgnc_client)
+    except Exception as exc:
+        logger.warning("HGNC alias resolution failed for fusion partner %s: %s", gene, exc)
+        return []
+    return list(dict.fromkeys([*(resolved.alias_symbols or []), *(resolved.prev_symbols or [])]))
+
+
+async def resolve_fusion_partner_aliases(
+    five_prime: str, three_prime: str
+) -> Tuple[List[str], List[str]]:
+    """Resolve HGNC alias/synonym + previous-symbol names for both fusion
+    partners.
+
+    Legacy nomenclature (e.g. KAT6A's former names MOZ, MYST3, ZNF220) is common
+    in older fusion literature but won't appear in a query/matcher built only
+    from the current HGNC symbol. Each partner is resolved independently and
+    best-effort, so an HGNC lookup failure for one partner falls back to no
+    aliases for just that partner — it never discards the other, still-
+    resolvable partner's alias coverage too — and never raises, so a down
+    HGNC service degrades to prior literal-only behavior instead of failing
+    fusion evidence retrieval.
+    """
+    five_aliases, three_aliases = await asyncio.gather(
+        _resolve_one_partner_aliases(five_prime),
+        _resolve_one_partner_aliases(three_prime),
+    )
+    return five_aliases, three_aliases
+
+
+# Upper bound on how many HGNC aliases per partner feed the PubMed query's
+# alias cross-product, so a gene with an unusually long HGNC alias history
+# can't blow up the query string/PubMed processing cost. The in-text matcher
+# (_match_fusion_evidence) is uncapped — it only runs regexes against already-
+# retrieved abstracts, which is cheap regardless of alias count.
+_MAX_QUERY_ALIASES_PER_PARTNER = 6
+
+
+def _fusion_query_variants(
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> List[str]:
+    """PubMed phrase variants for a fusion pair, covering both partners' current
+    HGNC symbol and (when supplied) their HGNC aliases, in every notation form.
+
+    With no aliases supplied this returns exactly the prior literal-only output.
+    """
     five_prime, three_prime = split_fusion(fusion)
     if not five_prime or not three_prime:
         return []
-    variants = [
-        f"{five_prime}::{three_prime}",
-        f"{five_prime}-{three_prime}",
-        f"{five_prime}/{three_prime}",
-        f"{five_prime} {three_prime}",
+    five_options = _partner_symbol_options(five_prime, five_aliases)[
+        : _MAX_QUERY_ALIASES_PER_PARTNER + 1
     ]
+    three_options = _partner_symbol_options(three_prime, three_aliases)[
+        : _MAX_QUERY_ALIASES_PER_PARTNER + 1
+    ]
+    variants: List[str] = []
+    for five in five_options:
+        for three in three_options:
+            variants.extend([
+                f"{five}::{three}",
+                f"{five}-{three}",
+                f"{five}/{three}",
+                f"{five} {three}",
+            ])
     return list(dict.fromkeys(variants))
 
 
@@ -276,29 +349,16 @@ def _fusion_notation_pairs(text: str) -> List[tuple[str, str]]:
     ]
 
 
-def record_discusses_exact_fusion(record: LiteratureRecord, fusion: str) -> bool:
-    """Require the cited record to explicitly connect both partners as one fusion."""
-    five_prime, three_prime = split_fusion(fusion)
-    if not five_prime or not three_prime:
-        return False
-
-    text = f"{record.title} {record.abstract}".upper()
-    left = _gene_boundary_pattern(five_prime)
-    right = _gene_boundary_pattern(three_prime)
+def _fusion_direct_match(text: str, five: str, three: str) -> bool:
+    left = _gene_boundary_pattern(five)
+    right = _gene_boundary_pattern(three)
     separator = r"\s*(?:::+|--|[-/])\s*"
-    direct_patterns = (
-        rf"{left}{separator}{right}",
-        rf"{right}{separator}{left}",
-    )
-    if any(re.search(pattern, text) for pattern in direct_patterns):
-        return True
+    return bool(re.search(rf"{left}{separator}{right}", text) or re.search(rf"{right}{separator}{left}", text))
 
-    requested_pair = {five_prime.strip().upper(), three_prime.strip().upper()}
-    for notation_pair in _fusion_notation_pairs(text):
-        pair = set(notation_pair)
-        if pair != requested_pair and pair.intersection(requested_pair):
-            return False
 
+def _fusion_contextual_match(text: str, five: str, three: str) -> bool:
+    left = _gene_boundary_pattern(five)
+    right = _gene_boundary_pattern(three)
     fusion_term = (
         r"(FUSION|FUSIONS|FUSED|CHIMERIC|REARRANGEMENT|REARRANGEMENTS|"
         r"REARRANGED|TRANSLOCATION|TRANSLOCATIONS)"
@@ -315,10 +375,178 @@ def record_discusses_exact_fusion(record: LiteratureRecord, fusion: str) -> bool
     return any(re.search(pattern, text) for pattern in contextual_patterns)
 
 
+def _pair_matches_identities(
+    pair: Set[str], five_identity: Set[str], three_identity: Set[str]
+) -> bool:
+    """True when a 2-symbol (or degenerate 1-symbol) notation pair is fully
+    explained as "one symbol belonging to the five-side gene identity"
+    paired with "one symbol belonging to the three-side gene identity" —
+    generalizes the original literal set-equality check
+    (`pair == {five_prime, three_prime}`) to identity sets that may contain
+    more than one symbol (aliases) and may be equal to each other
+    (five_prime == three_prime, i.e. a self-fusion query).
+    """
+    if len(pair) == 1:
+        (only,) = pair
+        # A degenerate single-symbol notation (e.g. "KAT6A-KAT6A") only
+        # represents the requested pair when that one symbol belongs to
+        # BOTH sides' identity — true self-fusion notation.
+        return only in five_identity and only in three_identity
+    a, b = tuple(pair)
+    return (a in five_identity and b in three_identity) or (
+        a in three_identity and b in five_identity
+    )
+
+
+def _notation_guard_rejects(
+    text: str, five_identity: Set[str], three_identity: Set[str]
+) -> bool:
+    """False-positive guard: True when the text contains an explicit fusion-
+    notation pair (e.g. "MYB-NFIB") that overlaps the five/three gene
+    identities but isn't itself a valid pairing of them — i.e. the record
+    explicitly names a different fusion involving one of these gene
+    identities, so a looser contextual co-occurrence match shouldn't be
+    trusted. `five_identity`/`three_identity` are each the full set of
+    symbols (literal + any aliases, as applicable) that refer to that ONE
+    gene, so an alias form (e.g. MOZ) is correctly recognized as the same
+    identity as its canonical symbol (KAT6A) when checking for conflicts —
+    a notation pairing MOZ with an unrelated third gene still flags a
+    conflict for KAT6A. Symbol sets are expected to be upper-cased already.
+    """
+    requested = five_identity | three_identity
+    for notation_pair in _fusion_notation_pairs(text):
+        pair = set(notation_pair)
+        if (pair & requested) and not _pair_matches_identities(pair, five_identity, three_identity):
+            return True
+    return False
+
+
+def _match_fusion_evidence(
+    record: LiteratureRecord,
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> Optional[List[Tuple[str, str]]]:
+    """Return alias-match detail if `record` explicitly connects both fusion
+    partners, else None.
+
+    The literal submitted/current HGNC symbols are always tried first, and
+    that literal path — direct match, false-positive guard, contextual match
+    — is evaluated using ONLY the literal pair as each side's identity
+    (never the alias-expanded identity), exactly reproducing the original
+    literal-only matcher's output and precedence regardless of whether
+    aliases were supplied — including correct handling of a self-fusion
+    query (five_prime == three_prime), where the guard must recognize an
+    unrelated notation pair like "KAT6A-TIF2" as conflicting rather than
+    treating it as satisfying "the requested pair" just because it shares
+    one symbol with both (identical) sides. An alias combination mentioned
+    elsewhere in the text (e.g. "MOZ-TIF2", an unrelated fusion) must never
+    affect whether the literal pair matches.
+
+    HGNC alias/synonym forms for either partner (e.g. legacy KAT6A names
+    MOZ/MYST3/ZNF220) are tried only as a fallback once the literal form
+    fails to match entirely. The false-positive guard for this fallback uses
+    each gene's FULL alias-expanded identity (all of five_options as one
+    identity, all of three_options as the other) — not just the specific
+    alias combination currently being attempted — so an unrelated notation
+    naming any alias of a partner (e.g. "MOZ-TIF2", where MOZ is KAT6A's
+    alias) is recognized as a conflict for that gene regardless of which
+    alias spelling the candidate combination under test happens to use.
+    Return value: None for no match, [] for a literal match, or a non-empty
+    list of (canonical_gene, alias_used) pairs for an alias match.
+    """
+    five_prime, three_prime = split_fusion(fusion)
+    if not five_prime or not three_prime:
+        return None
+
+    five_options = _partner_symbol_options(five_prime, five_aliases)
+    three_options = _partner_symbol_options(three_prime, three_aliases)
+
+    text = f"{record.title} {record.abstract}".upper()
+
+    # --- Literal path: identities are exactly the single literal symbol on
+    # each side, never the alias-expanded identity. ---
+    if _fusion_direct_match(text, five_prime, three_prime):
+        return []
+    literal_guard_rejects = _notation_guard_rejects(
+        text, {five_prime.strip().upper()}, {three_prime.strip().upper()}
+    )
+    if not literal_guard_rejects and _fusion_contextual_match(text, five_prime, three_prime):
+        return []
+
+    # --- Alias fallback: only reached once the literal path has fully
+    # failed to match. ---
+    def _alias_pairs(five: str, three: str) -> List[Tuple[str, str]]:
+        pairs: List[Tuple[str, str]] = []
+        if five != five_prime:
+            pairs.append((five_prime, five))
+        if three != three_prime:
+            pairs.append((three_prime, three))
+        return pairs
+
+    for five in five_options:
+        for three in three_options:
+            if five == five_prime and three == three_prime:
+                continue
+            if _fusion_direct_match(text, five, three):
+                return _alias_pairs(five, three)
+
+    five_identity = {s.strip().upper() for s in five_options}
+    three_identity = {s.strip().upper() for s in three_options}
+    alias_guard_rejects = _notation_guard_rejects(text, five_identity, three_identity)
+    if not alias_guard_rejects:
+        for five in five_options:
+            for three in three_options:
+                if five == five_prime and three == three_prime:
+                    continue
+                if _fusion_contextual_match(text, five, three):
+                    return _alias_pairs(five, three)
+
+    return None
+
+
+def record_discusses_exact_fusion(
+    record: LiteratureRecord,
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> bool:
+    """Require the cited record to explicitly connect both partners as one fusion,
+    checking literal HGNC symbols first and HGNC aliases (when supplied) as a
+    fallback."""
+    return _match_fusion_evidence(record, fusion, five_aliases, three_aliases) is not None
+
+
+def fusion_evidence_alias_match(
+    record: LiteratureRecord,
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> Optional[List[Tuple[str, str]]]:
+    """Alias-match detail for a SINGLE record's own text (see
+    _match_fusion_evidence): None for no match, [] for a literal match, a
+    non-empty list of (gene, alias) pairs for an alias match.
+
+    Use this — not the PMID-keyed fusion_evidence_alias_matches below —
+    whenever correctness must not assume PMID uniqueness across the records
+    being checked (e.g. re-verifying stored evidence cards one at a time),
+    since two different records can legitimately or erroneously share a
+    PMID and must each be judged on their own title/abstract text.
+    """
+    return _match_fusion_evidence(record, fusion, five_aliases, three_aliases)
+
+
 def _filter_exact_fusion_records(
-    records: List[LiteratureRecord], fusion: str
+    records: List[LiteratureRecord],
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
 ) -> List[LiteratureRecord]:
-    filtered = [record for record in records if record_discusses_exact_fusion(record, fusion)]
+    filtered = [
+        record
+        for record in records
+        if record_discusses_exact_fusion(record, fusion, five_aliases, three_aliases)
+    ]
     dropped = len(records) - len(filtered)
     if dropped:
         logger.info(
@@ -329,8 +557,40 @@ def _filter_exact_fusion_records(
     return filtered
 
 
-def _fusion_evidence_queries(fusion: str, tumor_type: Optional[str] = None) -> List[str]:
-    variants = _fusion_query_variants(fusion)
+def fusion_evidence_alias_matches(
+    records: List[LiteratureRecord],
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> Dict[str, List[Tuple[str, str]]]:
+    """pmid -> alias-match detail (as returned by _match_fusion_evidence) for
+    every record that matches, so callers can label alias-only matches
+    without re-running the matcher one record at a time.
+
+    CAUTION: keyed by PMID, so this collapses to one result per PMID — only
+    safe when `records` is already known to have unique PMIDs (true for a
+    fresh PubMed retrieval, which dedupes PMIDs before fetching). For
+    anything that can't guarantee PMID uniqueness (e.g. re-verifying already-
+    stored evidence cards, where the schema permits duplicate PMIDs across
+    cards), use fusion_evidence_alias_match per record instead — a shared
+    PMID must never let one record's match result leak onto another
+    record's differing title/abstract text.
+    """
+    matches: Dict[str, List[Tuple[str, str]]] = {}
+    for record in records:
+        match = _match_fusion_evidence(record, fusion, five_aliases, three_aliases)
+        if match is not None:
+            matches[record.pmid] = match
+    return matches
+
+
+def _fusion_evidence_queries(
+    fusion: str,
+    tumor_type: Optional[str] = None,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> List[str]:
+    variants = _fusion_query_variants(fusion, five_aliases, three_aliases)
     if not variants:
         return []
     variant_fragment = " OR ".join(f'"{variant}"' for variant in variants)
@@ -382,14 +642,21 @@ def _record_quote(record: LiteratureRecord) -> Optional[str]:
 def _build_fusion_evidence_cards(
     fusion: str,
     records: List[LiteratureRecord],
+    alias_matches: Optional[Dict[str, List[Tuple[str, str]]]] = None,
     limit: int = 5,
 ) -> List[FusionEvidenceCard]:
+    alias_matches = alias_matches or {}
     cards: List[FusionEvidenceCard] = []
     for record in records[:limit]:
         evidence_type = _fusion_evidence_type(record)
+        record_alias_matches = alias_matches.get(record.pmid, [])
+        matched_via_alias = bool(record_alias_matches)
         selected_reason = (
             f"Explicitly discussed the exact fusion pair as {evidence_type.replace('_', ' ')} evidence."
         )
+        if matched_via_alias:
+            alias_note = ", ".join(f"{alias} ({gene})" for gene, alias in record_alias_matches)
+            selected_reason += f" Matched via legacy/alias gene symbol: {alias_note}."
         if record.journal in _HIGH_IMPACT_JOURNALS:
             selected_reason += " High-impact journal signal."
         cards.append(
@@ -402,6 +669,10 @@ def _build_fusion_evidence_cards(
                 selected_reason=selected_reason,
                 quote=_record_quote(record),
                 abstract=record.abstract or None,
+                matched_via_alias=matched_via_alias,
+                alias_matches=[
+                    AliasMatch(gene=gene, alias=alias) for gene, alias in record_alias_matches
+                ],
             )
         )
     return cards
@@ -446,6 +717,7 @@ async def retrieve_fusion_evidence(
             "min_papers": settings.min_papers_for_strong_association,
             "exact_fusion_filter_version": 2,
             "retraction_filter_version": 2,
+            "alias_expansion_version": 1,
         },
         sort_keys=True,
     )
@@ -471,7 +743,13 @@ async def _retrieve_fusion_evidence_uncached(
     tumor_type: Optional[str],
     max_results: int,
 ) -> FusionEvidenceResult:
-    queries = _fusion_evidence_queries(fusion, tumor_type)
+    five_prime, three_prime = split_fusion(fusion)
+    five_aliases: List[str] = []
+    three_aliases: List[str] = []
+    if five_prime and three_prime:
+        five_aliases, three_aliases = await resolve_fusion_partner_aliases(five_prime, three_prime)
+
+    queries = _fusion_evidence_queries(fusion, tumor_type, five_aliases, three_aliases)
     if not queries:
         return FusionEvidenceResult(
             fusion=fusion,
@@ -490,7 +768,25 @@ async def _retrieve_fusion_evidence_uncached(
                 pmids.append(pmid)
     records = await _efetch(pmids, client)
 
-    records = _rank_records(_filter_exact_fusion_records(_filter_retracted_records(records), fusion))
+    records = _filter_retracted_records(records)
+    alias_matches = fusion_evidence_alias_matches(records, fusion, five_aliases, three_aliases)
+    matched_records = [record for record in records if record.pmid in alias_matches]
+    dropped = len(records) - len(matched_records)
+    if dropped:
+        logger.info(
+            "Filtered %d PubMed record(s) that did not explicitly discuss %s",
+            dropped,
+            fusion,
+        )
+    alias_only_count = sum(1 for match in alias_matches.values() if match)
+    if alias_only_count:
+        logger.info(
+            "%d of %d PubMed record(s) for %s matched only via an HGNC alias",
+            alias_only_count,
+            len(matched_records),
+            fusion,
+        )
+    records = _rank_records(matched_records)
     novelty_count = _novelty_record_count(records)
     well_supported = (
         len(records) >= settings.min_papers_for_strong_association
@@ -508,7 +804,7 @@ async def _retrieve_fusion_evidence_uncached(
             records=records,
             well_supported=well_supported,
         ),
-        evidence_cards=_build_fusion_evidence_cards(fusion, records),
+        evidence_cards=_build_fusion_evidence_cards(fusion, records, alias_matches),
     )
 
 
