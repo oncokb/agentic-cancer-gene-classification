@@ -154,7 +154,10 @@ class RunStore:
                 await cursor.execute(_CREATE_TABLE_SQL)
                 await cursor.execute(_CREATE_GENE_TABLE_SQL)
                 await self._ensure_gene_annotation_schema(cursor)
-                await cursor.execute(_CREATE_PMID_EVIDENCE_TABLE_SQL)
+                # Only provisioned when PMID distillation is on, so the
+                # default-off path makes no schema change beyond main's.
+                if settings.pmid_distillation_enabled:
+                    await cursor.execute(_CREATE_PMID_EVIDENCE_TABLE_SQL)
                 await cursor.execute(_CREATE_FEEDBACK_TABLE_SQL)
 
     async def _ensure_gene_annotation_schema(self, cursor) -> None:

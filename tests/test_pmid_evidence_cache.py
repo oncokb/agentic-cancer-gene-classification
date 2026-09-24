@@ -31,7 +31,9 @@ _RAW_ABSTRACT = (
 
 
 @pytest.fixture
-async def run_store():
+async def run_store(monkeypatch):
+    # RunStore only provisions the pmid_evidence table when distillation is on.
+    monkeypatch.setattr("src.pipeline.run_store.settings.pmid_distillation_enabled", True)
     try:
         store = await RunStore.create()
     except Exception as exc:
@@ -115,6 +117,25 @@ async def test_save_pmid_evidence_batch_handles_empty_list(run_store):
     await run_store.save_pmid_evidence_batch([])  # must not raise
 
     assert await run_store.get_pmid_evidence_batch(["30902613"]) == {}
+
+
+async def test_default_config_does_not_create_pmid_evidence_table(monkeypatch):
+    monkeypatch.setattr("src.pipeline.run_store.settings.pmid_distillation_enabled", False)
+    try:
+        store = await RunStore.create()
+    except Exception as exc:
+        pytest.skip(f"MySQL not reachable: {exc}")
+    try:
+        async with store._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("DROP TABLE IF EXISTS pmid_evidence")
+        await store._ensure_schema()
+        async with store._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SHOW TABLES LIKE 'pmid_evidence'")
+                assert await cursor.fetchall() == ()
+    finally:
+        await store.close()
 
 
 # ---------------------------------------------------------------------------
