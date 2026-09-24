@@ -495,7 +495,7 @@ FeedbackCategory = Literal["bug", "feature_request", "gene_annotation_issue", "o
 
 class FeedbackRequest(BaseModel):
     category: FeedbackCategory
-    message: str = Field(..., min_length=1, description="Free-text feedback from the curator")
+    message: str = Field(..., min_length=1, max_length=4000, description="Free-text feedback from the curator")
     contact_email: Optional[str] = Field(default=None, description="Optional email for follow-up")
     run_id: Optional[str] = Field(
         default=None, description="Run ID this feedback pertains to, so the run can be reproduced"
@@ -503,7 +503,9 @@ class FeedbackRequest(BaseModel):
     gene: Optional[str] = Field(
         default=None, description="Specific gene within the run this feedback pertains to, if any"
     )
-    page_url: Optional[str] = Field(default=None, description="URL of the page feedback was submitted from")
+    page_url: Optional[str] = Field(
+        default=None, max_length=2048, description="URL of the page feedback was submitted from"
+    )
 
 
 class FeedbackResponse(BaseModel):
