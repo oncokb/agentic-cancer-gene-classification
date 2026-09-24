@@ -81,8 +81,15 @@ async def _timed(name: str, timings: Dict[str, float], awaitable):
         timings[name] = _elapsed_ms(start)
 
 
-async def _maybe_fetch_openevidence_context(gene: str, tumor_type: Optional[str]):
+async def _maybe_fetch_openevidence_context(
+    gene: str, tumor_type: Optional[str], fusion: Optional[str] = None
+):
     """Fetch a supplementary OpenEvidence analysis when explicitly enabled.
+
+    `fusion` (the raw "GENE1::GENE2" input string this gene is a partner in,
+    if any — see _annotate_gene's call site) makes the question
+    fusion-specific rather than about `gene` in isolation; see
+    openevidence.py's _build_question.
 
     Returns None (never raises) when disabled or on any lookup failure — this
     is a best-effort supplementary input, not part of the core annotation
@@ -92,7 +99,9 @@ async def _maybe_fetch_openevidence_context(gene: str, tumor_type: Optional[str]
     if not settings.openevidence_enabled:
         return None
     try:
-        return await OpenEvidenceClient().get_gene_analysis(gene, tumor_type=tumor_type)
+        return await OpenEvidenceClient().get_gene_analysis(
+            gene, tumor_type=tumor_type, fusion=fusion
+        )
     except Exception as exc:
         logger.warning("OpenEvidence supplementary lookup failed for %s: %s", gene, exc)
         return None
@@ -145,6 +154,7 @@ async def _openevidence_became_available_since_synthesis(
     annotation: GeneAnnotation,
     gene: str,
     tumor_type: Optional[str],
+    fusion: Optional[str] = None,
 ) -> bool:
     """Whether OpenEvidence supplementary evidence has newly become available
     for this gene since `annotation` was last synthesized without it.
@@ -161,14 +171,21 @@ async def _openevidence_became_available_since_synthesis(
     (no live HTTP call) to see whether a cache entry has appeared since —
     e.g. via benchmarks/warm_openevidence_cache.py, or a slow live call that
     finished after this gene's synthesis had already proceeded without it.
+
+    `fusion` must be the same fusion (if any) that a resulting re-synthesis
+    would pass to get_gene_analysis (see _maybe_reuse_cached_annotation's
+    call site and _annotate_gene) — has_cached_analysis and
+    was_refresh_recently_attempted key off gene/tumor_type/fusion (see
+    openevidence.py's _cache_key), so a mismatched fusion here would peek
+    the wrong cache slot.
     """
     if not settings.openevidence_enabled:
         return False
     if annotation.openevidence_supplementary is not None:
         return False
-    if await was_refresh_recently_attempted(gene, tumor_type=tumor_type):
+    if await was_refresh_recently_attempted(gene, tumor_type=tumor_type, fusion=fusion):
         return False
-    return await has_cached_analysis(gene, tumor_type=tumor_type)
+    return await has_cached_analysis(gene, tumor_type=tumor_type, fusion=fusion)
 
 
 async def _maybe_reuse_cached_annotation(
@@ -213,7 +230,13 @@ async def _maybe_reuse_cached_annotation(
     # picks up the more pertinent, OpenEvidence-informed result. Checked
     # regardless of the age-based freshness windows below, since new
     # OpenEvidence data can land at any time independent of annotation age.
-    if await _openevidence_became_available_since_synthesis(annotation, gene, tumor_type):
+    #
+    # `fusion` mirrors _annotate_gene's own derivation (first of possibly
+    # several associated fusions, deterministically) so this peek checks the
+    # exact same cache slot a resulting re-synthesis would populate — see
+    # openevidence.py's _cache_key.
+    fusion = fusions[0] if fusions else None
+    if await _openevidence_became_available_since_synthesis(annotation, gene, tumor_type, fusion=fusion):
         logger.info(
             "Refreshing cached annotation for %s because OpenEvidence supplementary "
             "evidence became available since it was last synthesized without it",
@@ -224,7 +247,7 @@ async def _maybe_reuse_cached_annotation(
         # the refresh attempt itself never ends up persisting a
         # supplementary-evidence-bearing annotation (see the docstring on
         # _openevidence_became_available_since_synthesis).
-        await mark_refresh_attempted(gene, tumor_type=tumor_type)
+        await mark_refresh_attempted(gene, tumor_type=tumor_type, fusion=fusion)
         return None
 
     updated_at = cached.get("updated_at")
@@ -453,17 +476,22 @@ async def _annotate_gene(
         # most directly relevant papers before synthesis to improve precision
         # without shrinking the recall pool.
         #
-        # The OpenEvidence lookup depends only on gene+tumor_type (not on
-        # paper_selection's output), so when enabled it runs CONCURRENTLY
-        # with paper_selection rather than serially after it — this was
-        # previously a fully serial extra hop between selection and
-        # synthesis, adding its full latency to the critical path even
-        # though nothing about it required waiting for selection to finish.
+        # The OpenEvidence lookup depends only on gene+tumor_type+the gene's
+        # associated fusion partner, if any (not on paper_selection's
+        # output), so when enabled it runs CONCURRENTLY with paper_selection
+        # rather than serially after it — this was previously a fully serial
+        # extra hop between selection and synthesis, adding its full latency
+        # to the critical path even though nothing about it required waiting
+        # for selection to finish.
         #
         # Guard on the flag here (not just inside the helper) so the disabled
         # path adds nothing to timings_ms and awaits nothing extra — zero
         # behavior change from current main when OPENEVIDENCE_ENABLED=false.
         if settings.openevidence_enabled:
+            # A gene can in principle appear in more than one submitted
+            # fusion; the question only needs one fusion-partner context, so
+            # the first is used deterministically.
+            fusion = fusions[0] if fusions else None
             selected_records, openevidence_context = await asyncio.gather(
                 _timed(
                     "paper_selection",
@@ -480,7 +508,7 @@ async def _annotate_gene(
                 _timed(
                     "openevidence",
                     timings,
-                    _maybe_fetch_openevidence_context(gene, tumor_type),
+                    _maybe_fetch_openevidence_context(gene, tumor_type, fusion=fusion),
                 ),
             )
         else:

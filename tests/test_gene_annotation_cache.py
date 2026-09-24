@@ -418,7 +418,7 @@ async def test_run_pipeline_refreshes_cached_annotation_when_openevidence_become
     async def fake_normalize_fusions(_fusions):
         return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
 
-    async def fake_has_cached_analysis(gene, tumor_type=None):
+    async def fake_has_cached_analysis(gene, tumor_type=None, fusion=None):
         assert gene == "BRAF"
         return True
 
@@ -478,7 +478,7 @@ async def test_run_pipeline_reuses_cache_when_no_new_openevidence_data_available
     async def fake_normalize_fusions(_fusions):
         return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
 
-    async def fake_has_cached_analysis(gene, tumor_type=None):
+    async def fake_has_cached_analysis(gene, tumor_type=None, fusion=None):
         return False
 
     async def fail_if_called(**_kwargs):
@@ -526,7 +526,7 @@ async def test_run_pipeline_does_not_recheck_openevidence_already_present_on_cac
     async def fake_normalize_fusions(_fusions):
         return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
 
-    async def fail_has_cached_analysis(gene, tumor_type=None):
+    async def fail_has_cached_analysis(gene, tumor_type=None, fusion=None):
         raise AssertionError(
             "should not peek the OpenEvidence cache when the annotation already has supplementary evidence"
         )
@@ -573,7 +573,7 @@ async def test_run_pipeline_never_checks_openevidence_freshness_when_feature_dis
     async def fake_normalize_fusions(_fusions):
         return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
 
-    async def fail_has_cached_analysis(gene, tumor_type=None):
+    async def fail_has_cached_analysis(gene, tumor_type=None, fusion=None):
         raise AssertionError("should not check OpenEvidence freshness when the feature is disabled")
 
     async def fail_if_called(**_kwargs):
@@ -634,15 +634,15 @@ async def test_run_pipeline_does_not_repeat_openevidence_refresh_when_downstream
     async def fake_normalize_fusions(_fusions):
         return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
 
-    async def fake_has_cached_analysis(gene, tumor_type=None):
+    async def fake_has_cached_analysis(gene, tumor_type=None, fusion=None):
         return True  # OpenEvidence data genuinely exists in cache
 
     attempted = set()
 
-    async def fake_was_refresh_recently_attempted(gene, tumor_type=None):
+    async def fake_was_refresh_recently_attempted(gene, tumor_type=None, fusion=None):
         return (gene, tumor_type) in attempted
 
-    async def fake_mark_refresh_attempted(gene, tumor_type=None):
+    async def fake_mark_refresh_attempted(gene, tumor_type=None, fusion=None):
         attempted.add((gene, tumor_type))
 
     annotate_gene_calls = []
