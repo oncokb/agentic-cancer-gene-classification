@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,6 +34,8 @@ class Settings(BaseSettings):
     # too_few_verified_citations behavior.
     core_synthesis_escalation_sufficient_score: float = 1.01
     selection_model: str = "claude-haiku-4-5-20251001"
+    feedback_issue_creation_enabled: bool = True
+    feedback_rate_limit_per_hour: int = Field(default=10, ge=1)
     feedback_model: str = "claude-haiku-4-5-20251001"
     retrieval_model: str = "claude-haiku-4-5-20251001"
     bedrock_synthesis_model: str = ""
