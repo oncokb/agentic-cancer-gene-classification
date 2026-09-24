@@ -98,11 +98,12 @@ async def _fetch_pmid_evidence(
     distilled_takeaway instead of the full raw abstract for any paper that
     has already been distilled once (see synthesis.py's _build_user_prompt).
 
-    Fails open: returns {} (never raises) when run_store is None or the
-    lookup itself fails — this is a token-savings optimization, never
-    something that should block or degrade a core annotation run.
+    Fails open: returns {} (never raises) when PMID distillation is disabled,
+    run_store is None, or the lookup itself fails — this is a token-savings
+    optimization, never something that should block or degrade a core
+    annotation run.
     """
-    if run_store is None or not pmids:
+    if not settings.pmid_distillation_enabled or run_store is None or not pmids:
         return {}
     try:
         return await run_store.get_pmid_evidence_batch(pmids)
