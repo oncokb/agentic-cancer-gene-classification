@@ -101,6 +101,11 @@ class Settings(BaseSettings):
     citation_score_pubtype_case_report_weight: float = 0.5
     citation_score_pubtype_review_weight: float = 0.4
     citation_score_pubtype_editorial_weight: float = 0.2
+    # PubMed-indexed bioRxiv/medRxiv preprints (PublicationType "Preprint") have
+    # not been peer reviewed. Applied as a cap on whatever study-design weight the
+    # record otherwise earns, so a preprint never outranks the equivalent
+    # peer-reviewed paper; sits at case-report level, below original research.
+    citation_score_pubtype_preprint_weight: float = 0.5
 
     context_score_pubtype_review_weight: float = 1.0
     context_score_pubtype_meta_analysis_weight: float = 0.9
@@ -109,6 +114,7 @@ class Settings(BaseSettings):
     context_score_pubtype_original_research_weight: float = 0.5
     context_score_pubtype_case_report_weight: float = 0.3
     context_score_pubtype_editorial_weight: float = 0.15
+    context_score_pubtype_preprint_weight: float = 0.3
     annotation_job_ttl_seconds: int = 3600
     # Max entries accepted per gene query API request (POST /v1/genes/query[/jobs]).
     gene_query_max_genes: int = 50

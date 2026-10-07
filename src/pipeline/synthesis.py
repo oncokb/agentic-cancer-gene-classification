@@ -26,8 +26,10 @@ from src.pipeline.citation_precision import filter_and_rank_citations
 from src.pipeline.clinical_actionability import assess_clinical_actionability
 from src.pipeline.literature import (
     _HIGH_IMPACT_JOURNALS,
+    PREPRINT_MARKER,
     _filter_retracted_records,
     _publication_evidence_rank,
+    is_preprint_publication,
 )
 from src.pipeline.llm_client import complete_with_tool
 
@@ -68,6 +70,8 @@ Your task is to call the `annotate_gene` tool with a structured annotation.
 ## Literature quality signals:
 - Abstracts marked ★ are from high-impact journals (NEJM, Lancet, Nature, Cell, JCO, Cancer Cell, etc.).
   Weight these more heavily when the evidence they provide is directly relevant to the gene's cancer role.
+- Abstracts marked [PREPRINT – not peer-reviewed] are preprints that have not been peer reviewed.
+  Treat them as weaker, non-peer-reviewed support, and do not rely on a preprint alone for a strong classification.
 
 ## Retrieval provenance:
 The context will tell you which retrieval tier sourced the literature:
@@ -91,6 +95,8 @@ Return a compact annotation through the `annotate_gene` tool:
 
 Do not produce supporting quotes, pathways, prevalence, gene class, or extended background.
 Never invent PMIDs or use facts outside the provided abstracts.
+Abstracts marked [PREPRINT – not peer-reviewed] are weaker, non-peer-reviewed support; do not rely on a preprint
+alone for a strong classification.
 If evidence is insufficient but abstracts were retrieved, still summarize what those abstracts indicate
 and why they do not support a confident cancer annotation.
 Prefer a precise short answer over a broad answer.
@@ -275,6 +281,7 @@ def _build_user_prompt(
         for rec in records:
             journal_tag = f" [{rec.journal}]" if rec.journal else ""
             impact_tag = " ★" if rec.journal in _HIGH_IMPACT_JOURNALS else ""
+            impact_tag += f" {PREPRINT_MARKER}" if is_preprint_publication(rec.publication_types) else ""
             cached = (pmid_evidence or {}).get(rec.pmid)
             lines.append("---")
             if settings.pmid_distillation_enabled and cached is not None and cached.distilled_takeaway:
@@ -407,6 +414,8 @@ def _build_evidence_cards(
                 pmid=pmid,
                 title=record.title,
                 journal=record.journal,
+                publication_types=list(record.publication_types),
+                is_preprint=is_preprint_publication(record.publication_types),
                 evidence_type=evidence_type,
                 selected_reason=selected_reason,
                 quote=quote_by_pmid.get(pmid) or _fallback_quote(record),

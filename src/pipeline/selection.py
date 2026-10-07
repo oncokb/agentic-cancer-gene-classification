@@ -16,6 +16,7 @@ from typing import List, Optional
 
 from src.config import settings
 from src.models.schema import LiteratureRecord
+from src.pipeline.literature import PREPRINT_MARKER, is_preprint_publication
 from src.pipeline.llm_client import complete_with_tool
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,9 @@ Deprioritize abstracts that:
   that does not match the provided HGNC identity
 - Duplicate the finding of another selected abstract
 
+Abstracts marked [PREPRINT – not peer-reviewed] have not been peer reviewed; they may still be selected
+when directly relevant, but are weaker support than a peer-reviewed abstract reporting the same finding.
+
 Return up to the requested maximum. If no papers are truly directly relevant, return an empty
 list — do not pad with loosely related papers.
 """
@@ -90,7 +94,9 @@ async def select_papers_for_synthesis(
         return records[:max_papers]
 
     abstracts_text = "\n\n".join(
-        f"PMID {r.pmid}\nTitle: {r.title}\nAbstract: {r.abstract[:400]}"
+        f"PMID {r.pmid}{f' {PREPRINT_MARKER}' if is_preprint_publication(r.publication_types) else ''}\n"
+        f"Publication type: {', '.join(r.publication_types) or 'unknown'}\n"
+        f"Title: {r.title}\nAbstract: {r.abstract[:400]}"
         for r in records
     )
     prompt = (

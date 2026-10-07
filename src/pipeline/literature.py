@@ -109,6 +109,16 @@ _RETRACTION_COMMENT_REF_TYPES: frozenset[str] = frozenset({
     "retractedandrepublishedin",
     "retractedandrepublishedfrom",
 })
+# PubMed indexes some bioRxiv/medRxiv preprints with PublicationType "Preprint".
+# They are kept (not excluded) but labeled through ranking, prompts, and evidence cards.
+PREPRINT_MARKER = "[PREPRINT – not peer-reviewed]"
+
+
+def is_preprint_publication(publication_types: List[str]) -> bool:
+    """True when PubMed's PublicationType list includes "Preprint" (case-insensitive)."""
+    return any(value.strip().lower() == "preprint" for value in publication_types)
+
+
 _RETRACTION_QUERY_EXCLUSION = (
     '("Retracted Publication"[Publication Type] OR '
     '"Retraction of Publication"[Publication Type])'
@@ -665,6 +675,8 @@ def _build_fusion_evidence_cards(
                 pmid=record.pmid,
                 title=record.title,
                 journal=record.journal,
+                publication_types=list(record.publication_types),
+                is_preprint=is_preprint_publication(record.publication_types),
                 evidence_type=evidence_type,
                 selected_reason=selected_reason,
                 quote=_record_quote(record),
@@ -893,6 +905,8 @@ def _fusion_partner_evidence_cards(records: List[LiteratureRecord], limit: int =
                 pmid=record.pmid,
                 title=record.title,
                 journal=record.journal,
+                publication_types=list(record.publication_types),
+                is_preprint=is_preprint_publication(record.publication_types),
                 evidence_type=evidence_type,
                 selected_reason=selected_reason,
                 quote=_record_quote(record),
@@ -1757,6 +1771,7 @@ _PUBTYPE_CATEGORY_PATTERNS: Dict[str, tuple[str, ...]] = {
     "review": ("review", "systematic review"),
     "case_report": ("case reports",),
     "editorial": ("letter", "comment", "editorial", "news"),
+    "preprint": ("preprint",),
 }
 
 
@@ -1814,6 +1829,7 @@ def _pubtype_weight_table(profile: str) -> Dict[str, float]:
             "case_report": settings.context_score_pubtype_case_report_weight,
             "editorial": settings.context_score_pubtype_editorial_weight,
             "original_research": settings.context_score_pubtype_original_research_weight,
+            "preprint": settings.context_score_pubtype_preprint_weight,
         }
     return {
         "trial": settings.citation_score_pubtype_trial_weight,
@@ -1823,15 +1839,22 @@ def _pubtype_weight_table(profile: str) -> Dict[str, float]:
         "case_report": settings.citation_score_pubtype_case_report_weight,
         "editorial": settings.citation_score_pubtype_editorial_weight,
         "original_research": settings.citation_score_pubtype_original_research_weight,
+        "preprint": settings.citation_score_pubtype_preprint_weight,
     }
 
 
 def _pubtype_score(record: LiteratureRecord, profile: str) -> float:
     """profile is 'citation' (favors original research/trials) or 'context' (favors
-    reviews/meta-analyses). A paper can match multiple categories; take the max."""
+    reviews/meta-analyses). A paper can match multiple categories; take the max.
+    Preprint status is not a study design, so it caps the score instead of
+    competing in the max — a preprinted trial still ranks below a published one."""
     table = _pubtype_weight_table(profile)
     categories = _matched_pubtype_categories(record)
-    return max(table.get(category, table["original_research"]) for category in categories)
+    design_categories = [category for category in categories if category != "preprint"] or ["original_research"]
+    score = max(table.get(category, table["original_research"]) for category in design_categories)
+    if "preprint" in categories:
+        score = min(score, table["preprint"])
+    return score
 
 
 def _weighted_composite(signals: Dict[str, Optional[float]], weights: Dict[str, float]) -> float:
