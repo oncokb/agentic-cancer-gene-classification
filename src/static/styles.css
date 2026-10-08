@@ -677,6 +677,12 @@ textarea {
   color: #7c5a00;
 }
 
+.review-badge.preprint {
+  border-color: #e0b4a8;
+  background: #fdeee9;
+  color: #8a3b22;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -1485,6 +1491,10 @@ details[open] > .retrieval-summary::after {
 
 .evidence-card .evidence-card-meta {
   font-weight: 700;
+}
+
+.evidence-preprint-notice {
+  margin: 4px 0;
 }
 
 .evidence-alias-notice {

@@ -101,6 +101,11 @@ class EvidenceCard(BaseModel):
     pmid: str
     title: str = ""
     journal: str = ""
+    # PubMed PublicationType values for the record, and whether one of them is
+    # "Preprint" (a bioRxiv/medRxiv preprint, not peer reviewed). Optional and
+    # additive: cards cached before these fields existed load as not-preprint.
+    publication_types: List[str] = Field(default_factory=list)
+    is_preprint: bool = False
     evidence_type: str = "other"
     selected_reason: str = ""
     quote: Optional[str] = None
