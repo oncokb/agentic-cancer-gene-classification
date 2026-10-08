@@ -119,9 +119,14 @@ Turning on OpenEvidence also needs these (see `.env.example`):
 | `OPENEVIDENCE_API_KEY` | _(empty)_ | Required for live calls; org-provisioned access (see https://github.com/oncokb/oe-api-exp). Cached results are served without it. |
 | `OPENEVIDENCE_BASE_URL` | `https://api.openevidence.com` | API base URL. |
 | `OPENEVIDENCE_MODEL` | `osler` | OpenEvidence model name; also part of the cache key. |
-| `OPENEVIDENCE_TIMEOUT_SECONDS` | `60` | Per-call timeout; a timeout is not retried and just hides the card. |
+| `OPENEVIDENCE_TIMEOUT_SECONDS` | `60` | Per-read (inactivity) timeout on the upstream call. A timeout is not retried: the lookup answers `status: "failed"`, and the card shows a short failed note. It also floors the sidecar's overall lookup budget (see `OPENEVIDENCE_SIDECAR_LOOKUP_TIMEOUT_SECONDS`). |
 | `OPENEVIDENCE_CACHE_TTL_SECONDS` | `604800` | Redis TTL for cached analyses (one week). |
 | `OPENEVIDENCE_SIDECAR_CONCURRENCY` | `3` | Max concurrent live OpenEvidence calls across all sidecar requests. |
+| `OPENEVIDENCE_SIDECAR_PENDING_WAIT_SECONDS` | `2` | On a cache miss the lookup runs in the background; the request waits this long before answering `status: "pending"` with `Retry-After` and the card polls. Pending is HTTP 202 for clients that send `X-OpenEvidence-Poll: 1` (the current UI) and HTTP 503 for clients that don't (old cached UIs, which then retry instead of hiding the card for good). |
+| `OPENEVIDENCE_SIDECAR_RETRY_AFTER_SECONDS` | `10` | Poll hint (`retry_after_seconds` / `Retry-After`) sent with a pending answer. |
+| `OPENEVIDENCE_SIDECAR_INFLIGHT_TTL_SECONDS` | `600` | TTL of the Redis in-flight lease (heartbeat-renewed) that dedupes a lookup across workers/pods; bounds how long a pod that died mid-call can block a key. Dedupe is exact per worker and best-effort across pods: duplicates are possible during a Redis outage (logged as a warning) or after a lost lease. |
+| `OPENEVIDENCE_SIDECAR_FAILED_TTL_SECONDS` | `300` | How long a failed lookup answers `status: "failed"` instead of re-calling the paid API. Failures are never cached. |
+| `OPENEVIDENCE_SIDECAR_LOOKUP_TIMEOUT_SECONDS` | `900` | Overall budget for one background lookup, excluding queue time. It is never applied below `OPENEVIDENCE_TIMEOUT_SECONDS` × 1.25 (that setting is only a per-read inactivity timeout), and if both settings would make it ≤ 0 it falls back to 900s with a warning. Invariant: queue time behind `OPENEVIDENCE_SIDECAR_CONCURRENCY` + this budget must stay under the UI's polling deadline (1200s, `OPENEVIDENCE_POLL.totalCapMs` in `app.js`); otherwise the card shows its timeout note while the lookup still finishes and fills the cache. |
 | `OPENEVIDENCE_WARMUP_CONCURRENCY` | `5` | Concurrency for the offline `benchmarks/warm_openevidence_cache.py` warmup. |
 
 ## ACGC API Keys (for scripts)
@@ -150,8 +155,16 @@ ACGC API key instead of a browser session. (The section above is about
 - Admins (signed in via browser session) can list everyone's keys with
   `GET /v1/api-keys?all=true` and revoke any key.
 
-Create a key while signed in — e.g. from the browser devtools console on the
-ACGC page (uses your session cookie):
+**Get a key from the API keys page:** sign in, then click **API keys** under
+your name in the sidebar (or go to `/api-keys`, e.g.
+`https://acgc.oncokb.org/api-keys`). There you can create a key (name +
+expiry, default 90 days, capped at `API_KEY_MAX_EXPIRES_IN_DAYS`), copy it
+from the one-time dialog, see your keys' status and last use, and revoke them.
+Admins see every user's keys with their owners. The page also shows a ready
+`curl` example for `/v1/genes/query`.
+
+Fallback without the page — create a key from the browser devtools console on
+the ACGC page (uses your session cookie):
 
 ```js
 await (await fetch("/v1/api-keys", {
@@ -182,8 +195,8 @@ curl -s -X POST https://acgc.oncokb.org/v1/annotate \
   -d '{"fusions": ["EML4::ALK"]}'
 ```
 
-List (secrets are never returned) and revoke keys with your session, not the
-key itself:
+List (secrets are never returned) and revoke keys on the API keys page, or
+with your session (not the key itself):
 
 ```bash
 curl -s https://acgc.oncokb.org/v1/api-keys -H "Cookie: agcg_session=$ACGC_SESSION"
@@ -415,10 +428,12 @@ with, or `null` if none. When several inputs resolve to the same gene (an alias
 and its symbol, or an Ensembl ID and its symbol) with different tumor types,
 the pipeline picks one and the response reports that one.
 
-A symbol that HGNC/Ensembl confirm doesn't exist comes back in the batch
-`POST` with `error: "Gene symbol could not be resolved."`; `GET
-/v1/genes/{symbol}` returns 404 (`"Gene symbol not found."`) instead. If the
-lookup itself fails (e.g. an Ensembl timeout or 5xx), the batch `POST` reports
+A symbol with a successful HGNC lookup returning no match, or one that Ensembl
+confirms doesn't exist, comes back in the batch `POST` with
+`error: "Gene symbol could not be resolved."`; `GET /v1/genes/{symbol}` returns
+404 (`"Gene symbol not found."`) instead. If the
+lookup itself fails (e.g. an HGNC non-2xx response, timeout, or connection
+error, or an Ensembl timeout or 5xx), the batch `POST` reports
 `error: "Gene symbol lookup is temporarily unavailable; please retry."` and the
 `GET` returns 503 with that message, so a temporary outage is never reported
 as "not found". The run is saved in every case.

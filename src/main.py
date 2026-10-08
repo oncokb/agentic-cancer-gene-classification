@@ -17,19 +17,21 @@ from threading import Lock
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
+from html import escape as html_escape
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Literal, Optional
+from typing import Any, Coroutine, Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import parse_qs, quote
 
 import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
+from src.api.run_persistence import save_run_or_raise
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
     AuthenticatedUser,
@@ -81,6 +83,7 @@ from src.models.schema import (
     GeneAnnotation,
     GeneAnnotationWithRun,
     LocalBackend,
+    OpenEvidenceAnalysis,
 )
 from src.observability import (
     get_user_context,
@@ -100,8 +103,14 @@ from src.pipeline.llm_client import complete_with_tool
 from src.pipeline.normalization import is_fusion_input
 from src.pipeline.openevidence import (
     OpenEvidenceClient,
+    claim_lookup,
     distill_additive_openevidence,
     distilled_openevidence_has_additive_content,
+    get_cached_gene_analysis,
+    publish_failure_and_release,
+    release_inflight_marker,
+    renew_inflight_marker,
+    sidecar_cache_key,
 )
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.result_sanitizer import sanitize_annotation_result
@@ -164,6 +173,7 @@ async def lifespan(app: FastAPI):
         bool(settings.auth_secret_key.strip()),
     )
     yield
+    await _cancel_openevidence_sidecar_lookups()
     await app.state.run_store.close()
 
 
@@ -181,7 +191,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type", "Authorization"],
+    # X-OpenEvidence-Poll: sent by app.js on every OpenEvidence sidecar
+    # request (see get_gene_openevidence); without it a cross-origin
+    # frontend's preflight would fail and the card would silently vanish.
+    allow_headers=["Content-Type", "Authorization", "X-OpenEvidence-Poll"],
 )
 app.include_router(api_keys_router)
 
@@ -198,7 +211,7 @@ async def no_cache_static(request: Request, call_next):
     # app.js/styles.css after a deploy on a plain reload, not just a hard
     # refresh — force revalidation on every request for both.
     response = await call_next(request)
-    if request.url.path in ("/", "/login") or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/login", "/api-keys") or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -281,10 +294,24 @@ class _TransientFusionContextError(Exception):
         self.context = context
 
 
+OpenEvidenceSidecarStatus = Literal["ready", "pending", "failed", "unavailable"]
+
+
 class OpenEvidenceSidecarResponse(BaseModel):
+    """`available`/`distilled`/`error` keep their pre-"pending + poll"
+    meaning (available is true only when a distilled answer is attached).
+    `status` says why: "ready" (answer attached), "pending" (lookup running
+    in the background — poll again after `retry_after_seconds`), "failed"
+    (lookup failed recently; `error` set), "unavailable" (skipped by the
+    cancer-association gate, or nothing additive survived the redundancy
+    filter). With settings.openevidence_enabled off the endpoint returns the
+    old body unchanged — no `status` key at all, which means "disabled"."""
+
     available: bool
     distilled: Optional[DistilledOpenEvidence] = None
     error: Optional[str] = None
+    status: OpenEvidenceSidecarStatus = "unavailable"
+    retry_after_seconds: Optional[int] = None
 
 
 class EnrichmentJobCreateResponse(BaseModel):
@@ -386,13 +413,6 @@ def _openevidence_sidecar_semaphore() -> asyncio.Semaphore:
     return _openevidence_sidecar_semaphores.setdefault(limit, asyncio.Semaphore(limit))
 
 
-_annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
-_annotation_jobs_lock = asyncio.Lock()
-_enrichment_jobs: Dict[str, EnrichmentJobStatusResponse] = {}
-_enrichment_jobs_lock = asyncio.Lock()
-_fusion_evidence_jobs: Dict[str, FusionEvidenceJobStatusResponse] = {}
-_fusion_evidence_jobs_lock = asyncio.Lock()
-
 # asyncio.create_task() only keeps a weak reference to the task via the event
 # loop — an unreferenced task can be garbage-collected mid-execution. This set
 # holds a strong reference for the life of each background job, and the
@@ -401,12 +421,229 @@ _fusion_evidence_jobs_lock = asyncio.Lock()
 _background_tasks: set[asyncio.Task] = set()
 
 
-def _track_background_task(coro: Coroutine[Any, Any, None]) -> asyncio.Task:
+def _track_background_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
 
+
+# In-process state for the sidecar's background ("pending + poll") lookups,
+# all keyed by the OpenEvidence cache key (sidecar_cache_key — the same slot
+# OpenEvidenceClient.get_gene_analysis reads/writes).
+#
+# Dedupe semantics: EXACTLY one upstream (paid) call per key per worker —
+# guaranteed by the task registry below. ACROSS workers/pods it is
+# best-effort, via the Redis in-flight lease (claim_lookup): duplicates are
+# possible while Redis is unreachable (the claim and renewals fail open, with
+# a WARNING) or after a lookup loses its lease mid-call (the lease expired or
+# Redis dropped it, and another pod claimed it). That is a deliberate trade:
+# failing closed would hide every card whenever Redis blips, and prod runs a
+# single worker per pod and one replica, so cross-pod overlap is limited to
+# brief windows such as rolling restarts.
+# The two memos hold a finished lookup's outcome for polling clients: the
+# failure memo so polls answer "failed" instead of re-calling upstream for
+# openevidence_sidecar_failed_ttl_seconds, the result memo so a poll still
+# finds a finished answer even when Redis (the real cache) is unreachable.
+# Values are (monotonic expiry, payload); each memo is also capped at
+# _OPENEVIDENCE_SIDECAR_MEMO_MAX entries (oldest evicted first) so a burst of
+# distinct genes can't grow worker memory without bound before entries expire.
+_openevidence_sidecar_tasks: Dict[str, "asyncio.Task[Optional[str]]"] = {}
+_openevidence_sidecar_failures: Dict[str, Tuple[float, str]] = {}
+_openevidence_sidecar_results: Dict[str, Tuple[float, OpenEvidenceAnalysis]] = {}
+_OPENEVIDENCE_SIDECAR_MEMO_MAX = 256
+# The overall per-lookup budget never drops below the per-read httpx timeout
+# (openevidence_timeout_seconds, an inactivity timeout) plus this margin, so a
+# call the HTTP client would still let finish is never cut short by the budget.
+_OPENEVIDENCE_LOOKUP_BUDGET_READ_TIMEOUT_FACTOR = 1.25
+# Used when the configured settings derive a budget <= 0, which would
+# otherwise fail every lookup the instant it starts. Matches the default of
+# settings.openevidence_sidecar_lookup_timeout_seconds.
+_OPENEVIDENCE_LOOKUP_BUDGET_FALLBACK_SECONDS = 900.0
+
+
+def _openevidence_sidecar_lookup_budget_seconds() -> float:
+    """Overall wall-clock cap on one background lookup's upstream call:
+    settings.openevidence_sidecar_lookup_timeout_seconds, raised if needed
+    to openevidence_timeout_seconds x 1.25 (e.g. 600s read timeout -> at
+    least 750s). Falls back to 900s, with a warning, if both are
+    misconfigured so the result would be <= 0."""
+    budget = max(
+        float(settings.openevidence_sidecar_lookup_timeout_seconds),
+        float(settings.openevidence_timeout_seconds) * _OPENEVIDENCE_LOOKUP_BUDGET_READ_TIMEOUT_FACTOR,
+    )
+    if not budget > 0:  # also catches NaN
+        logger.warning(
+            "OpenEvidence sidecar lookup budget derived as %s from OPENEVIDENCE_SIDECAR_LOOKUP_TIMEOUT_SECONDS=%s "
+            "and OPENEVIDENCE_TIMEOUT_SECONDS=%s; using the %gs default instead",
+            budget,
+            settings.openevidence_sidecar_lookup_timeout_seconds,
+            settings.openevidence_timeout_seconds,
+            _OPENEVIDENCE_LOOKUP_BUDGET_FALLBACK_SECONDS,
+        )
+        return _OPENEVIDENCE_LOOKUP_BUDGET_FALLBACK_SECONDS
+    return budget
+
+
+def _reset_openevidence_sidecar_state() -> None:
+    """Forget all in-process sidecar lookup state, including the per-limit
+    semaphores (a lookup stranded on a closed event loop could otherwise
+    hold a slot forever). For tests."""
+    _openevidence_sidecar_tasks.clear()
+    _openevidence_sidecar_failures.clear()
+    _openevidence_sidecar_results.clear()
+    _openevidence_sidecar_semaphores.clear()
+
+
+def _openevidence_memo_get(memo: Dict[str, Tuple[float, Any]], key: str) -> Any:
+    entry = memo.get(key)
+    if entry is None:
+        return None
+    expires_at, value = entry
+    if expires_at <= time.monotonic():
+        memo.pop(key, None)
+        return None
+    return value
+
+
+def _openevidence_memo_prune(memo: Dict[str, Tuple[float, Any]]) -> None:
+    now = time.monotonic()
+    for key in [key for key, (expires_at, _) in memo.items() if expires_at <= now]:
+        memo.pop(key, None)
+
+
+def _openevidence_memo_put(memo: Dict[str, Tuple[float, Any]], key: str, ttl_seconds: float, value: Any) -> None:
+    _openevidence_memo_prune(memo)
+    memo.pop(key, None)  # re-insert so dict order stays oldest-first
+    memo[key] = (time.monotonic() + ttl_seconds, value)
+    while len(memo) > _OPENEVIDENCE_SIDECAR_MEMO_MAX:
+        memo.pop(next(iter(memo)))
+
+
+def _live_openevidence_sidecar_task(key: str) -> "Optional[asyncio.Task[Optional[str]]]":
+    task = _openevidence_sidecar_tasks.get(key)
+    if task is None:
+        return None
+    # A done task's outcome is already in the memos. A task bound to another
+    # (closed) event loop — only possible across tests — will never finish.
+    if task.done() or task.get_loop() is not asyncio.get_running_loop():
+        if _openevidence_sidecar_tasks.get(key) is task:
+            del _openevidence_sidecar_tasks[key]
+        return None
+    return task
+
+
+async def _keep_openevidence_lease_alive(key: str, token: str, lost: asyncio.Event) -> None:
+    """Renew this owner's in-flight lease every third of its TTL for as
+    long as the lookup lives (queued or calling upstream), so queue time
+    behind the concurrency cap can't let it lapse. On losing the lease it
+    sets `lost` — the lookup then discards its outcome — and stops."""
+    ttl = float(settings.openevidence_sidecar_inflight_ttl_seconds)
+    while True:
+        await asyncio.sleep(max(0.01, ttl / 3))
+        if not await renew_inflight_marker(key, token, ttl):
+            lost.set()
+            return
+
+
+async def _run_openevidence_sidecar_lookup(
+    key: str, token: str, gene: str, tumor_type: Optional[str], fusion: Optional[str]
+) -> Optional[str]:
+    """Background body of one sidecar lookup, run by the owner of the
+    in-flight lease `token`. Returns None on success (the analysis is then
+    in the normal cache and the result memo) or the error string on failure
+    (recorded as a short-lived failed marker — the failed answer itself is
+    never cached). Never raises for a lookup failure.
+
+    Losing the lease (to expiry or a Redis that dropped the key, after
+    which another pod may own the lookup) means this lookup no longer
+    speaks for the key: if lost before the paid call, the lookup is
+    abandoned; if lost mid-call, a failure is discarded rather than
+    published (publication is also atomically ownership-checked in Redis,
+    see publish_failure_and_release), and the call returns None with
+    nothing memoized, so polls answer "pending" until the new owner's
+    outcome lands. A *successful* analysis is still kept even then: it is
+    genuine data for this cache key (get_gene_analysis has already written
+    it to the shared cache by the time we know), equivalent to what the new
+    owner will write, and serving it sooner is strictly better."""
+    lease_lost = asyncio.Event()
+    heartbeat = asyncio.create_task(_keep_openevidence_lease_alive(key, token, lease_lost))
+    try:
+        async with _openevidence_sidecar_semaphore():
+            # Last ownership check right before the paid call: if the lease
+            # lapsed while queued and another pod claimed it, abandon rather
+            # than make a duplicate upstream call.
+            if not await renew_inflight_marker(key, token, settings.openevidence_sidecar_inflight_ttl_seconds):
+                logger.info("OpenEvidence sidecar lookup for %s abandoned: lease now held elsewhere", gene)
+                return None
+            # httpx's timeout is per read, so a slowly trickling stream could
+            # otherwise run forever; cap the whole call (not the queue time).
+            lookup_timeout = _openevidence_sidecar_lookup_budget_seconds()
+            try:
+                analysis = await asyncio.wait_for(
+                    OpenEvidenceClient().get_gene_analysis(gene, tumor_type=tumor_type, fusion=fusion),
+                    timeout=lookup_timeout,
+                )
+            except asyncio.TimeoutError:
+                raise TimeoutError(f"OpenEvidence lookup timed out after {lookup_timeout:g}s") from None
+    except Exception as exc:
+        error = str(exc) or exc.__class__.__name__
+        failed_ttl = settings.openevidence_sidecar_failed_ttl_seconds
+        if lease_lost.is_set() or not await publish_failure_and_release(key, token, error, failed_ttl):
+            logger.info("OpenEvidence sidecar lookup for %s failed after losing its lease (%s); discarded", gene, error)
+            return None
+        logger.warning("OpenEvidence sidecar lookup failed for %s: %s", gene, error)
+        _openevidence_memo_put(_openevidence_sidecar_failures, key, failed_ttl, error)
+        return error
+    else:
+        _openevidence_memo_put(
+            _openevidence_sidecar_results, key, settings.openevidence_sidecar_inflight_ttl_seconds, analysis
+        )
+        return None
+    finally:
+        heartbeat.cancel()
+        await release_inflight_marker(key, token)  # no-op unless this token still owns it
+
+
+def _start_openevidence_sidecar_lookup(
+    key: str, token: str, gene: str, tumor_type: Optional[str], fusion: Optional[str]
+) -> "asyncio.Task[Optional[str]]":
+    _openevidence_memo_prune(_openevidence_sidecar_failures)
+    _openevidence_memo_prune(_openevidence_sidecar_results)
+    # Not tied to the request: it keeps running (and caches its answer) if
+    # the client disconnects or the request returns "pending". Tracked like
+    # the annotation jobs' tasks; the per-key registry below adds dedupe.
+    task = _track_background_task(_run_openevidence_sidecar_lookup(key, token, gene, tumor_type, fusion))
+    _openevidence_sidecar_tasks[key] = task
+
+    def _forget(done: "asyncio.Task[Optional[str]]") -> None:
+        if _openevidence_sidecar_tasks.get(key) is done:
+            del _openevidence_sidecar_tasks[key]
+
+    task.add_done_callback(_forget)
+    return task
+
+
+async def _cancel_openevidence_sidecar_lookups() -> None:
+    """Cancel in-flight sidecar lookups at shutdown so no task outlives the
+    app (each one's `finally` still clears its Redis in-flight marker, so
+    another pod can pick the key up straight away)."""
+    loop = asyncio.get_running_loop()
+    # Only this loop's tasks can be awaited here (in prod there is one loop
+    # per worker; in tests a lookup may be stranded on a closed loop).
+    tasks = [task for task in _openevidence_sidecar_tasks.values() if not task.done() and task.get_loop() is loop]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+_annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
+_annotation_jobs_lock = asyncio.Lock()
+_enrichment_jobs: Dict[str, EnrichmentJobStatusResponse] = {}
+_enrichment_jobs_lock = asyncio.Lock()
+_fusion_evidence_jobs: Dict[str, FusionEvidenceJobStatusResponse] = {}
+_fusion_evidence_jobs_lock = asyncio.Lock()
 
 async def _store_annotation_job(job: AnnotationJobStatusResponse) -> None:
     async with _annotation_jobs_lock:
@@ -598,19 +835,39 @@ def _record_annotation_request_metrics(
         )
 
 
+def _login_redirect(request: Request) -> Optional[RedirectResponse]:
+    """Send a signed-out browser to /login, returning to this page afterwards."""
+    if not settings.auth_enabled or get_current_user(request):
+        return None
+    target = request.url.path
+    if request.url.query:
+        target += f"?{request.url.query}"
+    login_url = "/login"
+    if target != "/":
+        login_url += f"?redirect_to={quote(validate_redirect_to(target), safe='')}"
+    return RedirectResponse(url=login_url, status_code=303)
+
+
 @app.get("/")
 async def root(request: Request) -> Response:
-    if settings.auth_enabled:
-        user = get_current_user(request)
-        if not user:
-            target = request.url.path
-            if request.url.query:
-                target += f"?{request.url.query}"
-            login_url = "/login"
-            if target != "/":
-                login_url += f"?redirect_to={quote(validate_redirect_to(target), safe='')}"
-            return RedirectResponse(url=login_url, status_code=303)
+    redirect = _login_redirect(request)
+    if redirect:
+        return redirect
     return FileResponse(_STATIC_DIR / "index.html")
+
+
+@app.get("/api-keys")
+async def api_keys_page(request: Request) -> Response:
+    redirect = _login_redirect(request)
+    if redirect:
+        return redirect
+    public_base_url = (settings.public_app_base_url or str(request.base_url)).rstrip("/")
+    page = (_STATIC_DIR / "api-keys.html").read_text(encoding="utf-8")
+    page = page.replace("__ACGC_PUBLIC_BASE_URL__", html_escape(public_base_url, quote=True))
+    page = page.replace(
+        "__ACGC_API_KEY_MAX_EXPIRES_DAYS__", str(int(settings.api_key_max_expires_in_days))
+    )
+    return HTMLResponse(page)
 
 
 @app.get("/login")
@@ -1224,6 +1481,7 @@ async def _launch_annotation_job(
                 mode=request.mode,
                 on_annotation=on_annotation,
                 on_total_known=on_total_known,
+                **({"strict_gene_lookup": True} if kind == "gene_query" else {}),
             )
             if require_persistence:
                 await _save_run_result(http_request, request.model_dump(), result)
@@ -1454,7 +1712,7 @@ async def annotate_gene(
         logger.exception("Gene annotation pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    await _persist_run_result(http_request, request.model_dump(), result)
+    await save_run_or_raise(http_request, request.model_dump(), result)
 
     if not result.annotations:
         raise HTTPException(status_code=500, detail="No gene annotation was returned")
@@ -1544,17 +1802,24 @@ async def fusion_context(
     return FusionContextResponse(available=True, context=FusionPositionContext(**cached))
 
 
+# Sent by a sidecar client that understands status "pending" (the current
+# app.js) — see get_gene_openevidence's docstring for the 202/503 split.
+OPENEVIDENCE_POLL_HEADER = "X-OpenEvidence-Poll"
+
+
 @app.get("/v1/genes/{gene}/openevidence", response_model=OpenEvidenceSidecarResponse)
 async def get_gene_openevidence(
     gene: str,
+    response: Response = None,  # type: ignore[assignment]  # injected by FastAPI; None on direct calls
     tumor_type: Optional[str] = None,
     fusion: Optional[str] = None,
     cancer_associated: Optional[bool] = None,
     insufficient_evidence: bool = False,
     core_pmids: List[str] = Query(default=[]),
     core_titles: List[str] = Query(default=[]),
+    x_openevidence_poll: Optional[str] = Header(default=None, alias=OPENEVIDENCE_POLL_HEADER),
     current_user: AuthenticatedUser = Depends(require_auth),
-) -> OpenEvidenceSidecarResponse:
+) -> Union[OpenEvidenceSidecarResponse, JSONResponse]:
     """
     On-demand, non-blocking OpenEvidence lookup for a single gene, rendered
     as an independent "Clinical Practice Guidelines & External Trial
@@ -1562,13 +1827,37 @@ async def get_gene_openevidence(
     /v1/annotate/gene — OpenEvidence's 130-185s call latency must never
     block core gene annotation (see orchestrator.py's _annotate_gene).
 
-    OpenEvidenceClient.get_gene_analysis already checks its Redis cache
-    before making a live call, so a cache hit here returns immediately; a
-    miss executes the live call (gated by _openevidence_sidecar_semaphore,
-    capping concurrent live calls across all requests to this endpoint —
-    see settings.openevidence_sidecar_concurrency), caches the raw analysis,
-    then this endpoint deterministically distills it (no LLM call) before
-    returning.
+    "Pending + poll": a cold OpenEvidence call takes ~90-290s, longer than
+    the prod ingress's 300s request timeout allows reliably, so this
+    endpoint never holds a request open for one. A cache hit (including an
+    entry filled by the offline warmup) is distilled deterministically (no
+    LLM call) and returned immediately as status "ready". A miss starts the
+    lookup as a background task (gated by _openevidence_sidecar_semaphore,
+    capping concurrent live calls across all requests — see
+    settings.openevidence_sidecar_concurrency), waits up to
+    settings.openevidence_sidecar_pending_wait_seconds for it, and otherwise
+    answers status "pending" with `retry_after_seconds`; the client polls
+    this same URL until "ready"/"failed". The task outlives the request,
+    writes the normal cache on success, and is deduped per cache key (one
+    upstream call per key: an in-process registry, plus a short-TTL Redis
+    in-flight marker across workers/pods). A failure is never cached, but a
+    short-lived failed marker answers "failed" to polls for
+    settings.openevidence_sidecar_failed_ttl_seconds instead of re-calling
+    the paid API every poll.
+
+    A "pending" answer's HTTP status is negotiated (the JSON body, with
+    available=false, is the same either way, plus a Retry-After header):
+    - A client that sends `X-OpenEvidence-Poll: 1` (the current app.js)
+      understands "pending" and gets HTTP 202 Accepted — normal progress,
+      not a 5xx in ALB/Datadog error metrics, and not something an ingress
+      error-page middleware would rewrite.
+    - Any other client — notably old cached frontends (<= v0.3.12 app.js),
+      which don't know "status" — gets HTTP 503. They treat any non-2xx as a
+      transient fetch error, dropping the card for now but NOT memoizing
+      the answer, so their next render re-fetches; a 2xx available=false
+      would instead be memoized as a definitive "nothing here" for the life
+      of the page.
+    Responses carry `Vary: X-OpenEvidence-Poll` so no cache conflates them.
 
     `cancer_associated`/`insufficient_evidence` are the caller's already-
     computed GeneAnnotation fields (the normal UI flow — see
@@ -1599,23 +1888,23 @@ async def get_gene_openevidence(
     older client, or no annotation in hand yet) simply means nothing gets
     filtered out as redundant.
 
-    Returns {"available": false} (never a 4xx/5xx) when OpenEvidence is
-    disabled, skipped by the gate above, the lookup fails, or nothing
-    additive survives the redundancy filter, so the UI card can hide/gray
-    itself out rather than show a broken or empty-looking component.
+    Otherwise returns {"available": false} with HTTP 200 (never a 4xx/5xx)
+    when OpenEvidence is disabled (exactly the old body, no `status` key —
+    and no background task, Redis access, or client), skipped by the gate
+    above or nothing additive survives the redundancy filter
+    ("unavailable"), or the lookup failed or hit
+    settings.openevidence_sidecar_lookup_timeout_seconds ("failed", with
+    `error`). The UI hides the card for disabled/"unavailable" rather than
+    show an empty-looking component, and shows a short failed note for
+    "failed".
     """
     if not settings.openevidence_enabled:
-        return OpenEvidenceSidecarResponse(available=False)
+        # Byte-for-byte the pre-"pending + poll" flag-off body (no `status`
+        # key): flag off must behave exactly as before. A client reading
+        # `status` should treat its absence as "disabled".
+        return JSONResponse({"available": False, "distilled": None, "error": None})
     if cancer_associated is False and not insufficient_evidence:
-        return OpenEvidenceSidecarResponse(available=False)
-    try:
-        async with _openevidence_sidecar_semaphore():
-            analysis = await OpenEvidenceClient().get_gene_analysis(
-                gene, tumor_type=tumor_type, fusion=fusion
-            )
-    except Exception as exc:
-        logger.warning("OpenEvidence sidecar lookup failed for %s: %s", gene, exc)
-        return OpenEvidenceSidecarResponse(available=False, error=str(exc))
+        return OpenEvidenceSidecarResponse(available=False, status="unavailable")
     # core_pmids/core_titles use Query(default=[]) so FastAPI correctly binds
     # repeated query params through the ASGI path; a handful of existing
     # tests call this endpoint function directly (bypassing ASGI/dependency
@@ -1625,12 +1914,82 @@ async def get_gene_openevidence(
     # through TestClient.
     safe_core_pmids = core_pmids if isinstance(core_pmids, list) else []
     safe_core_titles = core_titles if isinstance(core_titles, list) else []
-    distilled = distill_additive_openevidence(
-        analysis, core_pmids=safe_core_pmids, core_titles=safe_core_titles
-    )
-    if not distilled_openevidence_has_additive_content(distilled):
-        return OpenEvidenceSidecarResponse(available=False)
-    return OpenEvidenceSidecarResponse(available=True, distilled=distilled)
+
+    def ready(analysis: OpenEvidenceAnalysis) -> OpenEvidenceSidecarResponse:
+        distilled = distill_additive_openevidence(
+            analysis, core_pmids=safe_core_pmids, core_titles=safe_core_titles
+        )
+        if not distilled_openevidence_has_additive_content(distilled):
+            return OpenEvidenceSidecarResponse(available=False, status="unavailable")
+        return OpenEvidenceSidecarResponse(available=True, distilled=distilled, status="ready")
+
+    def failed(error: str) -> OpenEvidenceSidecarResponse:
+        return OpenEvidenceSidecarResponse(available=False, error=error, status="failed")
+
+    def pending() -> OpenEvidenceSidecarResponse:
+        retry_after = max(1, int(settings.openevidence_sidecar_retry_after_seconds))
+        if response is not None:
+            understands_pending = isinstance(x_openevidence_poll, str) and x_openevidence_poll.strip() == "1"
+            response.status_code = 202 if understands_pending else 503
+            response.headers["Retry-After"] = str(retry_after)
+            response.headers["Vary"] = OPENEVIDENCE_POLL_HEADER
+        return OpenEvidenceSidecarResponse(
+            available=False, status="pending", retry_after_seconds=retry_after
+        )
+
+    key = sidecar_cache_key(gene, tumor_type, fusion)
+    analysis = _openevidence_memo_get(_openevidence_sidecar_results, key)
+    if analysis is None:
+        analysis = await get_cached_gene_analysis(gene, tumor_type=tumor_type, fusion=fusion)
+    if analysis is not None:
+        return ready(analysis)
+
+    task = _live_openevidence_sidecar_task(key)
+    if task is None:
+        error = _openevidence_memo_get(_openevidence_sidecar_failures, key)
+        if error is not None:
+            return failed(error)
+        # One atomic step (see claim_lookup): a failure on record — even one
+        # published a moment ago by another pod — is answered as "failed"
+        # rather than paid for again; otherwise claim the lease.
+        claim = await claim_lookup(key, settings.openevidence_sidecar_inflight_ttl_seconds)
+        if claim.failed is not None:
+            return failed(claim.failed)
+        token = claim.token
+        if token is None:
+            # Another worker/pod is already running this lookup — poll its
+            # result out of the shared cache instead of paying for a second.
+            return pending()
+        # Re-check after the awaits above: a concurrent request in this
+        # worker may have started the task meanwhile — or even started and
+        # finished it, leaving only its outcome in the memos (no await
+        # between these checks and registering a new task, so exactly one
+        # gets started and a fresh outcome is never paid for twice). That
+        # can only happen when Redis is unreachable (the claim is NX
+        # otherwise), so releasing the spare token is just tidiness.
+        task = _live_openevidence_sidecar_task(key)
+        if task is None:
+            analysis = _openevidence_memo_get(_openevidence_sidecar_results, key)
+            error = None if analysis is not None else _openevidence_memo_get(_openevidence_sidecar_failures, key)
+            if analysis is None and error is None:
+                task = _start_openevidence_sidecar_lookup(key, token, gene, tumor_type, fusion)
+            else:
+                await release_inflight_marker(key, token)
+                return ready(analysis) if analysis is not None else failed(error)
+        else:
+            await release_inflight_marker(key, token)
+
+    # asyncio.wait never cancels the task — if this request times out here,
+    # or the client disconnects, the lookup keeps running in the background.
+    await asyncio.wait({task}, timeout=max(0.0, settings.openevidence_sidecar_pending_wait_seconds))
+    if task.done() and not task.cancelled():
+        error = task.result()
+        if error is not None:
+            return failed(error)
+        analysis = _openevidence_memo_get(_openevidence_sidecar_results, key)
+        if analysis is not None:
+            return ready(analysis)
+    return pending()
 
 
 @app.post("/v1/fusion-partner-evidence", response_model=FusionPartnerEvidenceResult)

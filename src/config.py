@@ -203,6 +203,32 @@ class Settings(BaseSettings):
     # throttle it, since OpenEvidence is not part of annotation_gene_concurrency's
     # gated critical path (see orchestrator.py's _annotate_gene).
     openevidence_sidecar_concurrency: int = 3
+    # "Pending + poll" sidecar (see GET /v1/genes/{gene}/openevidence). A cold
+    # OpenEvidence call (~90-290s) can outlive the prod ingress's 300s request
+    # timeout, so a cache miss starts the lookup in the background and answers
+    # "pending" instead of holding the request open.
+    # How long a cache-miss request waits for the background lookup before
+    # answering "pending" (a fast lookup/failure still answers inline).
+    openevidence_sidecar_pending_wait_seconds: float = 2.0
+    # retry_after_seconds / Retry-After hint sent with a "pending" answer.
+    openevidence_sidecar_retry_after_seconds: int = 10
+    # TTL of the Redis "lookup in flight" marker that dedupes lookups across
+    # workers/pods. Longer than the slowest expected call (EGFR took 282s in
+    # prod) but short enough that a pod dying mid-call can't wedge a key.
+    openevidence_sidecar_inflight_ttl_seconds: int = 600
+    # How long a failed lookup answers "failed" (without re-calling the paid
+    # API) before a new request may retry it. Failed answers are never cached.
+    openevidence_sidecar_failed_ttl_seconds: int = 300
+    # Overall wall-clock budget for one background lookup's upstream call
+    # (queue time behind openevidence_sidecar_concurrency excluded); a lookup
+    # past it answers "failed". openevidence_timeout_seconds is only a
+    # per-read inactivity timeout, so a trickling stream needs this cap. It
+    # is never applied below openevidence_timeout_seconds x 1.25 (see main.py's
+    # _openevidence_sidecar_lookup_budget_seconds), and the in-flight lease is
+    # heartbeat-renewed throughout, so it may exceed the lease TTL. Keep it
+    # below the UI's 20-minute polling deadline (OPENEVIDENCE_POLL.totalCapMs
+    # in app.js), or the card gives up before the lookup does.
+    openevidence_sidecar_lookup_timeout_seconds: float = 900.0
 
     # Authentication & SSO Settings
     auth_enabled: bool = False

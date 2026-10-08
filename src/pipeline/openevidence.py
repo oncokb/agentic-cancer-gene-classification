@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+import uuid
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import httpx
 from tenacity import RetryError, retry, retry_if_exception, stop_after_attempt, wait_exponential
@@ -37,7 +38,7 @@ from src.models.schema import (
     OpenEvidenceGuideline,
     OpenEvidenceTrialMention,
 )
-from src.pipeline.cache import cached_call
+from src.pipeline.cache import _get_client, cached_call
 from src.pipeline.normalization import split_fusion
 
 logger = logging.getLogger(__name__)
@@ -945,9 +946,220 @@ class OpenEvidenceClient:
             # missing-API-key cache miss) is never cached.
             logger.error("OpenEvidence lookup failed for %s: %s", gene, exc)
             raise
-        analysis = OpenEvidenceAnalysis(**payload)
-        # Re-clean on every read, not just at _build_analysis time: entries
-        # cached before the widget fix still hold widget metadata (a headless
-        # leading widget tail and any mid-answer widgets), and this is the only
-        # read path for both the sidecar and warmup. Idempotent on clean text.
-        return analysis.model_copy(update={"text": _strip_generation_step_widgets(analysis.text)})
+        return _analysis_from_cached_payload(payload)
+
+
+def _analysis_from_cached_payload(payload: dict) -> OpenEvidenceAnalysis:
+    """Build an analysis from a cached payload, re-cleaning its text.
+
+    Re-clean on every read, not just at _build_analysis time: entries cached
+    before the widget fix still hold widget metadata (a headless leading
+    widget tail and any mid-answer widgets). Every read of a cached analysis
+    goes through here — get_gene_analysis (sidecar background lookups and
+    warmup) and the sidecar's cache-only peek, get_cached_gene_analysis — so
+    no path can serve a stale dirty entry. Idempotent on clean text."""
+    analysis = OpenEvidenceAnalysis(**payload)
+    return analysis.model_copy(update={"text": _strip_generation_step_widgets(analysis.text)})
+
+
+# ---------------------------------------------------------------------------
+# Sidecar "pending + poll" support (see GET /v1/genes/{gene}/openevidence in
+# main.py). A cold OpenEvidence call routinely outlives the prod ingress's
+# 300s request timeout, so the sidecar endpoint never holds a request open
+# for one: it reads the cache directly, and on a miss starts the lookup in
+# the background and answers "pending". These helpers are the cross-worker/
+# cross-pod half of that design — short-lived Redis markers keyed off the
+# same _cache_key the cache itself uses. All of them fail open (Redis down
+# behaves like "no marker"/"cache miss"), so they never break the endpoint;
+# main.py's in-process registry still dedupes within a worker either way.
+# ---------------------------------------------------------------------------
+
+_INFLIGHT_MARKER_PREFIX = "openevidence_inflight:"
+_FAILED_MARKER_PREFIX = "openevidence_failed:"
+
+
+def sidecar_cache_key(gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None) -> str:
+    """The exact cache slot OpenEvidenceClient.get_gene_analysis reads and
+    writes for these arguments — the sidecar's dedupe/pending/failed state
+    is keyed off it so warmed entries and sidecar lookups always agree."""
+    return _cache_key(gene, tumor_type, fusion=fusion)
+
+
+async def get_cached_gene_analysis(
+    gene: str, tumor_type: Optional[str] = None, fusion: Optional[str] = None
+) -> Optional[OpenEvidenceAnalysis]:
+    """Cache-only read of get_gene_analysis's slot: never makes a live call
+    and never needs an API key. Cleaned exactly like get_gene_analysis's
+    reads (see _analysis_from_cached_payload). Returns None on a miss, an
+    unreadable entry, or Redis being unreachable."""
+    key = _cache_key(gene, tumor_type, fusion=fusion)
+    try:
+        cached = await _get_client().get(key)
+    except Exception as exc:
+        logger.warning("OpenEvidence cache peek failed for %r: %s", key, exc)
+        return None
+    if cached is None:
+        return None
+    try:
+        return _analysis_from_cached_payload(json.loads(cached))
+    except Exception as exc:
+        logger.warning("Ignoring unreadable OpenEvidence cache entry %r: %s", key, exc)
+        return None
+
+
+# The in-flight marker is a lease: its value is the owner's unique token, so
+# only the owner can renew or release it. Renew/release are compare-and-act
+# Lua scripts (atomic on the Redis server): a pod whose lease expired (e.g.
+# while its lookup sat queued behind openevidence_sidecar_concurrency) can
+# never extend or delete the lease a newer owner has since claimed.
+_RENEW_LEASE_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+"""
+_RELEASE_LEASE_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+"""
+
+
+def _lease_ms(ttl_seconds: float) -> int:
+    return max(1, int(float(ttl_seconds) * 1000))
+
+
+# Claiming is atomic with the failure check: a poller that read "no
+# failure" and then claimed separately could slip in between an owner
+# publishing its failure (which also releases the lease) and its own claim,
+# and pay for a second lookup while the failure record is still live.
+_CLAIM_LEASE_SCRIPT = """
+local failed = redis.call("GET", KEYS[2])
+if failed then
+  return {"failed", failed}
+end
+if redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+  return {"claimed", ARGV[1]}
+end
+return {"held", ""}
+"""
+
+
+class LeaseClaim(NamedTuple):
+    """Outcome of claim_lookup: exactly one of `token` (this caller now owns
+    the lookup) or `failed` (a recent failure is on record — answer it, don't
+    look up again) is set; neither means another owner holds the lease."""
+
+    token: Optional[str] = None
+    failed: Optional[str] = None
+
+
+def _text(value) -> str:
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+
+
+async def claim_lookup(cache_key: str, ttl_seconds: float) -> LeaseClaim:
+    """Atomically: if a failed marker is on record for `cache_key`, return
+    it; otherwise SET NX the short-TTL "lookup in flight" lease with a
+    unique owner token. The TTL bounds how long a pod that died mid-call
+    can wedge the key.
+
+    Best-effort across pods by design: if Redis is unreachable a token is
+    still returned, so the lookup proceeds with only the in-process registry
+    deduping (exactly one call per key per worker) and another pod may make
+    a duplicate paid call. That is logged as a WARNING — failing closed
+    instead would hide every card whenever Redis blips."""
+    token = uuid.uuid4().hex
+    try:
+        outcome, value = await _get_client().eval(
+            _CLAIM_LEASE_SCRIPT,
+            2,
+            _INFLIGHT_MARKER_PREFIX + cache_key,
+            _FAILED_MARKER_PREFIX + cache_key,
+            token,
+            _lease_ms(ttl_seconds),
+        )
+    except Exception as exc:
+        logger.warning(
+            "OpenEvidence sidecar lease claim hit a Redis error for %r (%s); proceeding WITHOUT a "
+            "cross-pod lease, so another pod may make a duplicate upstream call",
+            cache_key,
+            exc,
+        )
+        return LeaseClaim(token=token)
+    outcome = _text(outcome)
+    if outcome == "claimed":
+        return LeaseClaim(token=token)
+    if outcome == "failed":
+        return LeaseClaim(failed=_text(value))
+    return LeaseClaim()
+
+
+async def claim_inflight_marker(cache_key: str, ttl_seconds: float) -> Optional[str]:
+    """claim_lookup's token alone: this owner's lease token, or None when
+    another owner holds the lease or a failure is on record."""
+    return (await claim_lookup(cache_key, ttl_seconds)).token
+
+
+async def renew_inflight_marker(cache_key: str, token: str, ttl_seconds: float) -> bool:
+    """Restart the lease's TTL iff `token` still owns it. False means the
+    lease expired or another owner holds it — the caller must not start the
+    paid call. Fails open (True) when Redis is unreachable — best-effort,
+    like claim_lookup, and logged as a WARNING."""
+    try:
+        renewed = await _get_client().eval(
+            _RENEW_LEASE_SCRIPT, 1, _INFLIGHT_MARKER_PREFIX + cache_key, token, _lease_ms(ttl_seconds)
+        )
+    except Exception as exc:
+        logger.warning(
+            "OpenEvidence sidecar lease renewal hit a Redis error for %r (%s); continuing WITHOUT a "
+            "confirmed cross-pod lease, so another pod may make a duplicate upstream call",
+            cache_key,
+            exc,
+        )
+        return True
+    return bool(renewed)
+
+
+async def release_inflight_marker(cache_key: str, token: str) -> None:
+    """Delete the lease iff `token` still owns it, so an old owner's cleanup
+    never removes a newer owner's lease."""
+    try:
+        await _get_client().eval(_RELEASE_LEASE_SCRIPT, 1, _INFLIGHT_MARKER_PREFIX + cache_key, token)
+    except Exception as exc:
+        logger.warning("OpenEvidence in-flight marker release failed for %r: %s", cache_key, exc)
+
+
+_PUBLISH_FAILURE_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  redis.call("SET", KEYS[2], ARGV[2], "PX", ARGV[3])
+  redis.call("DEL", KEYS[1])
+  return 1
+end
+return 0
+"""
+
+
+async def publish_failure_and_release(cache_key: str, token: str, error: str, ttl_seconds: float) -> bool:
+    """Atomically, iff `token` still owns the in-flight lease: record the
+    failed marker (so polling clients get "failed" and stop, instead of each
+    poll re-triggering a paid call) and release the lease. Returns False —
+    publishing nothing — when another owner holds the lease or it is gone:
+    a stale owner must never report a failure for the newer owner's lookup.
+    Fails open (True, nothing written) when Redis is unreachable. The failed
+    ANSWER itself is still never cached."""
+    try:
+        published = await _get_client().eval(
+            _PUBLISH_FAILURE_SCRIPT,
+            2,
+            _INFLIGHT_MARKER_PREFIX + cache_key,
+            _FAILED_MARKER_PREFIX + cache_key,
+            token,
+            error,
+            _lease_ms(ttl_seconds),
+        )
+    except Exception as exc:
+        logger.warning("OpenEvidence failed-marker publish failed for %r: %s", cache_key, exc)
+        return True
+    return bool(published)

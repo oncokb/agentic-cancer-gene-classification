@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 
 from src import main
@@ -31,6 +32,17 @@ from src.pipeline.openevidence import (
     distilled_openevidence_has_additive_content,
     is_non_pubmed_sourced_citation,
 )
+
+@pytest.fixture(autouse=True)
+def _isolated_sidecar_redis(fake_redis):
+    """The sidecar endpoint peeks the OpenEvidence cache and claims Redis
+    in-flight/failed markers. These tests drive it through TestClient, whose
+    request runs on its own event loop — keep it off the shared real Redis
+    client (bound to the test's loop, and flushed by other runs) by using
+    conftest's in-memory FakeRedis. conftest's _reset_openevidence_sidecar
+    clears the sidecar's module state between tests."""
+    return fake_redis
+
 
 # Real, live-captured citation shapes (see tests/test_openevidence.py) reused
 # here to keep the distillation fixtures realistic.
