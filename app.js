@@ -1735,6 +1735,7 @@ function renderFusionEvidenceView(fusionEvidence) {
           ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
           <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
           <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
+          ${preprintBadgeHtml(evidenceCard)}
           ${aliasMatchNoticeHtml(evidenceCard)}
           ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
           ${evidenceCard.quote ? `<blockquote>${escapeHtml(evidenceCard.quote)}</blockquote>` : ""}
@@ -1813,6 +1814,17 @@ function evidenceCardTopline(pmid, evidenceType, abstract) {
 // alias/legacy gene symbol (e.g. KAT6A found via "MOZ"), so a clinician
 // reading the paper knows it was retrieved under legacy nomenclature rather
 // than assuming an unambiguous literal match. Returns "" for a literal match.
+// is_preprint is optional on the API response: cards from cached annotations
+// computed before it existed simply render without the badge.
+function preprintBadgeHtml(evidenceCard) {
+  if (!evidenceCard.is_preprint) return "";
+  return `
+    <p class="evidence-preprint-notice">
+      <span class="review-badge preprint">Preprint – not peer-reviewed</span>
+    </p>
+  `;
+}
+
 function aliasMatchNoticeHtml(evidenceCard) {
   const matches = evidenceCard.alias_matches || [];
   if (!evidenceCard.matched_via_alias || !matches.length) return "";
@@ -1908,6 +1920,7 @@ function renderSupportingEvidence(annotation) {
         ${evidenceCardTopline(card.pmid, evidenceType, card.abstract)}
         <h5>${escapeHtml(card.title || "Untitled PubMed record")}</h5>
         <p class="evidence-card-meta">${escapeHtml(card.journal || "Journal unavailable")}</p>
+        ${preprintBadgeHtml(card)}
         ${card.selected_reason ? `<p>${escapeHtml(card.selected_reason)}</p>` : ""}
         ${card.quote ? `<blockquote>${escapeHtml(card.quote)}</blockquote>` : ""}
       `;
@@ -2753,6 +2766,7 @@ function renderFusionPartnerResultBody(container, data) {
         ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
         <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
         <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
+        ${preprintBadgeHtml(evidenceCard)}
         ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
         ${evidenceCard.quote ? `<blockquote>${escapeHtml(evidenceCard.quote)}</blockquote>` : ""}
       `;
