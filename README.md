@@ -2,6 +2,9 @@
 
 M0 annotation engine for candidate cancer genes and gene fusions. The pipeline accepts either singleton gene symbols or fusions, resolves HGNC symbols, retrieves PubMed literature, and asks an LLM to produce structured cancer-gene annotations with verified PMID citations.
 
+> **Calling ACGC from a script?** See the [API user guide](docs/api.md) for
+> getting an API key, querying genes, and reading the results.
+
 ## Setup
 
 ```bash
@@ -68,7 +71,12 @@ Similarly, when Claude's Tier 2 agentic retrieval emits several `search_pubmed`
 calls in one turn, they're dispatched concurrently rather than awaited one at a
 time.
 
-## API Keys
+## Third-Party API Keys (used by ACGC)
+
+These are keys for outside services that ACGC itself calls. To get a key for
+calling ACGC from your own scripts, see
+[ACGC API Keys (for scripts)](#acgc-api-keys-for-scripts) or the
+[API user guide](docs/api.md).
 
 Copy `.env.example` to `.env` and add only the keys you need for the mode you are
 running.
@@ -131,8 +139,12 @@ Turning on OpenEvidence also needs these (see `.env.example`):
 
 ## ACGC API Keys (for scripts)
 
+> For a step-by-step guide aimed at script writers, see the
+> [API user guide](docs/api.md). This section covers the same feature in more
+> operational detail.
+
 When `AUTH_ENABLED=true`, scripts can call the `/v1/*` API with a personal
-ACGC API key instead of a browser session. (The section above is about
+ACGC API key instead of a browser session. (The [Third-Party API Keys](#third-party-api-keys-used-by-acgc) section is about
 *third-party* keys ACGC itself uses; this one is about keys for calling ACGC.)
 
 - Keys look like `acgc_<43 random characters>` and are sent as
@@ -399,6 +411,10 @@ replaced with Bedrock model IDs via `BEDROCK_SYNTHESIS_MODEL`,
 directly.
 
 ## Gene query API
+
+> Script writers: the [API user guide](docs/api.md) walks through these
+> endpoints with examples, a field reference, error handling and a Python
+> client.
 
 Slim endpoints for scripts that only need a gene's classification and
 rationale. Each response links to the full report (evidence cards, abstracts,
