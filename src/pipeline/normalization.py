@@ -28,6 +28,7 @@ HGNC_TIMEOUT_SECONDS = 5.0
 ENSEMBL_TIMEOUT_SECONDS = 8.0
 NORMALIZATION_CONCURRENCY = 6
 
+
 # Separators used in fusion notation.
 FUSION_SEPARATORS = re.compile(r"[:]{2}|--|/")
 
@@ -200,6 +201,7 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
             hgnc_id=None,
             resolved=False,
             unresolvable=False,
+            lookup_failed=True,
         )
 
     # Could not resolve — treat as unknown locus (insufficient evidence)
@@ -222,6 +224,8 @@ async def _resolve_hgnc_symbols_concurrently(
 
 async def normalize_fusions(
     fusions: list[str],
+    *,
+    strict_gene_lookup: bool = False,
 ) -> Dict[str, Tuple[ResolvedGene, list[str]]]:
     """
     Given a list of gene or fusion strings, return a mapping of
@@ -245,6 +249,14 @@ async def normalize_fusions(
         resolved: Dict[str, ResolvedGene] = {}
         resolved.update(await _resolve_ensembl_ids(ensembl_symbols, client))
         resolved.update(await _resolve_hgnc_symbols_concurrently(hgnc_symbols, client))
+
+    if strict_gene_lookup:
+        # The gene query API must not classify or reuse a cached annotation
+        # when HGNC failed to establish the symbol's identity.
+        resolved = {
+            symbol: gene.model_copy(update={"unresolvable": True}) if gene.lookup_failed else gene
+            for symbol, gene in resolved.items()
+        }
 
     result: Dict[str, Tuple[ResolvedGene, list[str]]] = {}
     for symbol, rg in resolved.items():
