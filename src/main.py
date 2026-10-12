@@ -39,6 +39,7 @@ from src.auth import (
     AuthUserResponse,
     UserProfile,
     build_saml_authn_request,
+    can_curate,
     clear_session_cookie,
     create_oauth_state,
     create_session_token,
@@ -911,6 +912,7 @@ async def auth_me(request: Request) -> AuthMeResponse:
         jit_provisioning_enabled=settings.jit_provisioning_enabled,
         dev_login_enabled=settings.dev_login_enabled,
         keycloak_enabled=settings.keycloak_enabled,
+        can_curate=can_curate(user),
     )
 
 
@@ -1321,8 +1323,8 @@ async def auth_dev_login(
   <div class="card">
     <h2>SSO Dev Login Selector</h2>
     <p>Choose a mock identity to test domain verification (@mskcc.org and @openevidence.com):</p>
-    <a class="btn" href="/auth/dev/login?email=curator@mskcc.org&name=MSK%20Curator">Log in as curator@mskcc.org (MSK domain - Allowed)</a>
-    <a class="btn" href="/auth/dev/login?email=scientist@openevidence.com&name=OpenEvidence%20Scientist">Log in as scientist@openevidence.com (OpenEvidence domain - Allowed)</a>
+    <a class="btn" href="/auth/dev/login?email=curator@mskcc.org&name=MSK%20Curator&role=curator">Log in as curator@mskcc.org (MSK Curator - can edit overrides)</a>
+    <a class="btn" href="/auth/dev/login?email=scientist@openevidence.com&name=OpenEvidence%20Scientist">Log in as scientist@openevidence.com (OpenEvidence viewer - Allowed)</a>
     <a class="btn" href="/auth/dev/login?email=admin@mskcc.org&name=MSK%20Admin&role=admin">Log in as admin@mskcc.org (MSK Admin)</a>
     <a class="btn btn-denied" href="/auth/dev/login?email=unauthorized@gmail.com&name=Unauthorized%20User">Test Unauthorized domain (unauthorized@gmail.com - Blocked)</a>
   </div>
@@ -1342,12 +1344,13 @@ async def auth_dev_login(
         domain=clean_email.split("@")[-1],
         provider="dev",
         groups=["admin-group"] if role == "admin" else [],
+        role=role,
     )
     user = AuthenticatedUser(
         email=profile.email,
         name=profile.name,
         domain=profile.domain,
-        role=role or profile.role,
+        role=profile.role,
         status=profile.status,
         provider="dev",
         groups=profile.groups,
