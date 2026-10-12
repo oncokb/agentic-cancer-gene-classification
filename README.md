@@ -906,7 +906,15 @@ non-blocking `newer_pipeline_evidence` flag. If overrides cannot be loaded,
 results are served as pipeline output with a critical `curation_unavailable`
 flag and a response-level `curation_unavailable: true`, and the `/v1/curation`
 endpoints return 503. Each run stores the tumor type used per gene
-(`annotation_tumor_types`) so a shared link finds tumor-scoped overrides.
+(`annotation_tumor_types`) so a shared link finds tumor-scoped overrides; for
+runs saved before that, it is reconstructed from the saved request with the
+pipeline's own rule, and a gene whose context cannot be resolved gets no
+override (flagged `curation_unavailable`) until a later read resolves it.
+Reconstructed tumor context and fusion evidence are written to a run as
+atomic single-key JSON updates, and retraction write-backs compare-and-swap on
+the run's `revision`, so concurrent writers never overwrite each other.
+A save or revert returns 409 only when the override's version actually changed;
+persistent lock contention returns a retryable 503 (`Retry-After`).
 
 ```bash
 curl http://127.0.0.1:8000/v1/curation/gene/ALK?tumor_type=LUAD           # current override

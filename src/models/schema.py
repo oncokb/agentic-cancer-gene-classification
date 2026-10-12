@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Set
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
@@ -699,6 +699,11 @@ class AnnotationResult(BaseModel):
     # True when curator overrides could not be loaded, so some results show
     # pipeline output only (those carry a `curation_unavailable` quality flag).
     curation_unavailable: bool = False
+    # In-process only: genes whose tumor context could not be reconstructed
+    # for a legacy run (see curation.ensure_annotation_tumor_types). They are
+    # never put in annotation_tumor_types, so the map only holds confirmed
+    # entries and reconstruction is retried on a later read.
+    _unresolved_tumor_genes: Set[str] = PrivateAttr(default_factory=set)
 
 
 FeedbackCategory = Literal["bug", "feature_request", "gene_annotation_issue", "other"]

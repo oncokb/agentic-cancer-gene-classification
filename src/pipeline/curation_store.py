@@ -78,6 +78,11 @@ class CurationVersionConflict(Exception):
         self.current_version = current_version
 
 
+class CurationStorageContention(Exception):
+    """Lock errors persisted through every retry while the override was still
+    at the caller's version: nothing conflicts, the write should just be retried."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -96,6 +101,12 @@ def _loads(value: Any) -> Any:
     if value is None:
         return None
     return json.loads(value) if isinstance(value, (str, bytes)) else value
+
+
+def _json_member_path(*keys: str) -> str:
+    """A MySQL JSON path ($."a"."b") with each key quoted and escaped."""
+    quoted = ('"' + key.replace("\\", "\\\\").replace('"', '\\"') + '"' for key in keys)
+    return "$." + ".".join(quoted)
 
 
 def _override_from_row(row) -> CuratedOverride:
@@ -121,6 +132,11 @@ class CurationStoreMixin:
     async def _ensure_curation_schema(self, cursor) -> None:
         await cursor.execute(_CREATE_CURATED_OVERRIDES_TABLE_SQL)
         await cursor.execute(_CREATE_CURATION_HISTORY_TABLE_SQL)
+        # runs.revision: bumped by every result_json write, so whole-result
+        # rewrites can compare-and-swap instead of clobbering concurrent ones.
+        await cursor.execute("SHOW COLUMNS FROM runs LIKE 'revision'")
+        if await cursor.fetchone() is None:
+            await cursor.execute("ALTER TABLE runs ADD COLUMN revision INT NOT NULL DEFAULT 0")
 
     async def get_curated_override(
         self, subject_type: str, subject_key: str, tumor_type: str
@@ -161,12 +177,16 @@ class CurationStoreMixin:
                 row = await cursor.fetchone()
         return row[0] if row else 0
 
-    async def _with_lock_retry(self, attempt: Callable[[], Awaitable[T]], subject: SubjectId) -> T:
+    async def _with_lock_retry(
+        self, attempt: Callable[[], Awaitable[T]], subject: SubjectId, expected_version: Optional[int]
+    ) -> T:
         """Run a write transaction, retrying MySQL deadlocks/lock-wait timeouts.
 
         When retries are exhausted, or a concurrent first save won the insert
-        race (IntegrityError), the caller's view is stale: re-read the current
-        version and raise CurationVersionConflict (HTTP 409), never a 500."""
+        race (IntegrityError), re-read the current version: if it differs from
+        expected_version the caller's view is stale (CurationVersionConflict,
+        HTTP 409); otherwise it is plain contention (CurationStorageContention,
+        a retryable 503). Never a 500."""
         for attempt_number in range(1, _LOCK_RETRY_ATTEMPTS + 1):
             try:
                 return await attempt()
@@ -181,7 +201,10 @@ class CurationStoreMixin:
                 )
                 if attempt_number < _LOCK_RETRY_ATTEMPTS:
                     await asyncio.sleep(_LOCK_RETRY_BACKOFF_SECONDS * attempt_number)
-        raise CurationVersionConflict(await self._current_override_version(*subject))
+        current_version = await self._current_override_version(*subject)
+        if expected_version is not None and current_version != expected_version:
+            raise CurationVersionConflict(current_version)
+        raise CurationStorageContention(f"Curation write for {subject} kept hitting lock errors")
 
     async def save_curated_override(
         self,
@@ -211,6 +234,7 @@ class CurationStoreMixin:
                 note=note,
             ),
             (subject_type, subject_key, tumor_type),
+            expected_version,
         )
 
     async def _save_curated_override_once(
@@ -326,6 +350,7 @@ class CurationStoreMixin:
                 note=note,
             ),
             (subject_type, subject_key, tumor_type),
+            expected_version,
         )
 
     async def _delete_curated_override_once(
@@ -412,6 +437,67 @@ class CurationStoreMixin:
             )
             for row in rows
         ]
+
+    # -- runs: concurrency-safe result_json updates -------------------------
+
+    async def get_run_with_revision(self, run_id: str) -> Optional[Tuple[Dict[str, Any], int]]:
+        """A saved run's result plus its revision, for update_run_result_if_unchanged."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT result_json, revision FROM runs WHERE run_id = %s", (run_id,))
+                row = await cursor.fetchone()
+        return None if row is None else (_loads(row[0]), row[1])
+
+    async def update_run_result_if_unchanged(
+        self, run_id: str, result_payload: Dict[str, Any], expected_revision: int
+    ) -> bool:
+        """Replace result_json only if nobody wrote the run since it was read at
+        expected_revision (compare-and-swap). False means reload and retry."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "UPDATE runs SET result_json = %s, revision = revision + 1 "
+                    "WHERE run_id = %s AND revision = %s",
+                    (json.dumps(result_payload), run_id, expected_revision),
+                )
+                return cursor.rowcount == 1
+
+    async def set_run_annotation_tumor_types(self, run_id: str, entries: Dict[str, Optional[str]]) -> None:
+        """Atomically merge confirmed gene -> tumor type entries into the run's
+        annotation_tumor_types, touching no other part of result_json."""
+        if not entries:
+            return
+        assignments = ", ".join(["%s, %s"] * len(entries))
+        params: List[Any] = []
+        for gene, tumor_type in entries.items():
+            params.extend([_json_member_path("annotation_tumor_types", gene), tumor_type])
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    UPDATE runs SET
+                        result_json = JSON_SET(
+                            JSON_SET(
+                                result_json, '$.annotation_tumor_types',
+                                COALESCE(JSON_EXTRACT(result_json, '$.annotation_tumor_types'), JSON_OBJECT())
+                            ),
+                            {assignments}
+                        ),
+                        revision = revision + 1
+                    WHERE run_id = %s
+                    """,
+                    (*params, run_id),
+                )
+
+    async def set_run_fusion_evidence(self, run_id: str, fusion_evidence: List[Dict[str, Any]]) -> None:
+        """Atomically replace only the run's fusion_evidence."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "UPDATE runs SET result_json = JSON_SET(result_json, '$.fusion_evidence', CAST(%s AS JSON)), "
+                    "revision = revision + 1 WHERE run_id = %s",
+                    (json.dumps(fusion_evidence), run_id),
+                )
 
     async def get_run_request(self, run_id: str) -> Optional[Dict[str, Any]]:
         """The request a saved run was made with (used to recover per-gene
