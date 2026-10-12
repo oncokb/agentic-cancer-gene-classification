@@ -1,0 +1,240 @@
+{
+  "gene": {
+    "request": {
+      "subject_type": "gene",
+      "subject_key": "ALK",
+      "tumor_type": "LUAD",
+      "evidence_pmids": [
+        "123"
+      ],
+      "precedent_pmids": [
+        "789"
+      ]
+    },
+    "response": {
+      "status": "succeeded",
+      "error": null,
+      "invalid_pmids": null,
+      "draft": {
+        "gene": "ALK",
+        "fusions": [],
+        "in_oncokb": null,
+        "cancer_associated": true,
+        "cancer_association_rationale": "Suggested rationale from synthesis.",
+        "cancer_type_prevalence": null,
+        "gene_class": null,
+        "signaling_pathways": null,
+        "gene_summary": null,
+        "citations": [
+          "123"
+        ],
+        "supporting_quotes": [
+          {
+            "pmid": "123",
+            "quote": "Exact sentence from abstract."
+          }
+        ],
+        "evidence_cards": [
+          {
+            "pmid": "123",
+            "title": "Illustrative evidence paper",
+            "journal": "",
+            "publication_types": [],
+            "is_preprint": false,
+            "evidence_type": "other",
+            "selected_reason": "Curator-selected evidence; review the abstract for relevance to this subject.",
+            "quote": "Exact sentence from abstract.",
+            "abstract": "Exact sentence from abstract. More text."
+          }
+        ],
+        "clinical_actionability": {
+          "confidence_score": 1.0,
+          "confidence_level": "high",
+          "summary": "Suggested summary of curator-selected precedents.",
+          "confidence_explanation": "Curator-supplied PMIDs: threshold bypassed. Confidence denotes curator selection, not a calibrated evidence assessment.",
+          "pmids": [
+            "789"
+          ],
+          "score_components": [],
+          "evidence": [
+            {
+              "pmid": "789",
+              "title": "Illustrative precedent paper",
+              "evidence_type": "other",
+              "therapies": [
+                "imatinib"
+              ],
+              "domains": [
+                "paper the kinase domain",
+                "kinase domain"
+              ],
+              "matched_terms": [],
+              "quote": "The kinase domain was studied with imatinib.",
+              "abstract": "The kinase domain was studied with imatinib."
+            }
+          ]
+        },
+        "quality_flags": [
+          {
+            "code": "low_evidence_score",
+            "label": "Low evidence score",
+            "severity": "warning",
+            "detail": "Evidence support score is 0.10."
+          },
+          {
+            "code": "curator_pinned_draft",
+            "label": "Curator-selected draft",
+            "severity": "info",
+            "detail": "All supplied evidence PMIDs are included in curator order. Inclusion does not establish relevance; review this unpersisted suggestion."
+          }
+        ],
+        "date_annotated": "10/12/26",
+        "retrieval_count": 1,
+        "retrieved_pmids": [
+          "123"
+        ],
+        "retrieval_ranking": [],
+        "insufficient_evidence": false,
+        "evidence_support_score": 0.1,
+        "evidence_support_explanation": "Evidence support score 0.10: 1 verified PMID citation(s); sparse retrieval corpus. This score estimates literature grounding, not biological truth or clinical actionability.",
+        "cache_status": null,
+        "cache_reason": null,
+        "cached_at": null,
+        "last_pubmed_checked_at": null,
+        "error": null,
+        "timings_ms": {},
+        "model_info": {
+          "synthesis_model": "claude-opus-4-7",
+          "synthesis_escalated": false,
+          "suggestion_model": "claude-haiku-4-5-20251001"
+        },
+        "generated_at": "2026-10-12T18:00:00+00:00"
+      }
+    }
+  },
+  "fusion": {
+    "request": {
+      "subject_type": "fusion",
+      "subject_key": "EML4::ALK",
+      "tumor_type": "LUAD",
+      "evidence_pmids": [
+        "123"
+      ],
+      "precedent_pmids": [
+        "789"
+      ]
+    },
+    "response": {
+      "status": "succeeded",
+      "error": null,
+      "invalid_pmids": null,
+      "draft": {
+        "fusions": [
+          "EML4::ALK"
+        ],
+        "in_oncokb": null,
+        "cancer_associated": true,
+        "cancer_association_rationale": "Suggested rationale from synthesis.",
+        "cancer_type_prevalence": null,
+        "gene_class": null,
+        "signaling_pathways": null,
+        "gene_summary": null,
+        "citations": [
+          "123"
+        ],
+        "supporting_quotes": [
+          {
+            "pmid": "123",
+            "quote": "Exact sentence from abstract."
+          }
+        ],
+        "evidence_cards": [
+          {
+            "pmid": "123",
+            "title": "Illustrative evidence paper",
+            "journal": "",
+            "publication_types": [],
+            "is_preprint": false,
+            "evidence_type": "other",
+            "selected_reason": "Curator-selected evidence; review the abstract for relevance to this subject.",
+            "quote": "Exact sentence from abstract.",
+            "abstract": "Exact sentence from abstract. More text.",
+            "fusion": "EML4::ALK",
+            "matched_via_alias": false,
+            "alias_matches": []
+          }
+        ],
+        "clinical_actionability": {
+          "confidence_score": 1.0,
+          "confidence_level": "high",
+          "summary": "Suggested summary of curator-selected precedents.",
+          "confidence_explanation": "Curator-supplied PMIDs: threshold bypassed. Confidence denotes curator selection, not a calibrated evidence assessment.",
+          "pmids": [
+            "789"
+          ],
+          "score_components": [],
+          "evidence": [
+            {
+              "pmid": "789",
+              "title": "Illustrative precedent paper",
+              "evidence_type": "other",
+              "therapies": [
+                "imatinib"
+              ],
+              "domains": [
+                "paper the kinase domain",
+                "kinase domain"
+              ],
+              "matched_terms": [],
+              "quote": "The kinase domain was studied with imatinib.",
+              "abstract": "The kinase domain was studied with imatinib."
+            }
+          ]
+        },
+        "quality_flags": [
+          {
+            "code": "low_evidence_score",
+            "label": "Low evidence score",
+            "severity": "warning",
+            "detail": "Evidence support score is 0.10."
+          },
+          {
+            "code": "curator_pinned_draft",
+            "label": "Curator-selected draft",
+            "severity": "info",
+            "detail": "All supplied evidence PMIDs are included in curator order. Inclusion does not establish relevance; review this unpersisted suggestion."
+          }
+        ],
+        "date_annotated": "10/12/26",
+        "retrieval_count": 1,
+        "retrieved_pmids": [
+          "123"
+        ],
+        "retrieval_ranking": [],
+        "insufficient_evidence": false,
+        "evidence_support_score": 0.1,
+        "evidence_support_explanation": "Evidence support score 0.10: 1 verified PMID citation(s); sparse retrieval corpus. This score estimates literature grounding, not biological truth or clinical actionability.",
+        "cache_status": null,
+        "cache_reason": null,
+        "cached_at": null,
+        "last_pubmed_checked_at": null,
+        "error": null,
+        "timings_ms": {},
+        "fusion": "EML4::ALK",
+        "tumor_type": "LUAD",
+        "pmids": [
+          "123"
+        ],
+        "retrieved_count": 1,
+        "interpretation": "Suggested rationale from synthesis.",
+        "well_supported": true,
+        "model_info": {
+          "synthesis_model": "claude-opus-4-7",
+          "synthesis_escalated": false,
+          "suggestion_model": "claude-haiku-4-5-20251001"
+        },
+        "generated_at": "2026-10-12T18:00:00+00:00"
+      }
+    }
+  }
+}
