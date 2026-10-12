@@ -6,6 +6,7 @@ migrations."""
 from __future__ import annotations
 
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -377,6 +378,66 @@ def test_partner_request_validation(changes):
     values = {"subject_type": "fusion_partner", "subject_key": "ALK", "evidence_pmids": ["1"], **changes}
     with pytest.raises(ValueError):
         curator.ReevaluateRequest(**values)
+
+
+PARTNER_JOB = {"subject_type": "fusion_partner", "subject_key": "RP1", "evidence_pmids": ["1"]}
+
+
+@pytest.mark.parametrize("case", ["viewer", "other_users_job", "too_many_pmids", "third_inflight_job"])
+async def test_partner_job_rejections(case, monkeypatch):
+    import httpx
+
+    from src import auth
+    from src.api import curation_reevaluate_routes as routes
+    from src.auth import AuthenticatedUser
+
+    def user(email, role="curator"):
+        return AuthenticatedUser(email=email, name=email, domain="test", role=role)
+
+    routes._jobs.clear()
+    pending = []
+    monkeypatch.setattr(main, "_track_background_task", pending.append)
+    monkeypatch.setattr(routes, "reevaluate", AsyncMock(return_value={"pmids": ["1"]}))
+    identity = {"user": user("owner@test")}
+    if case == "viewer":
+        # The real require_curator, with an authenticated viewer.
+        async def viewer_auth(_request):
+            return user("viewer@test", role="viewer")
+
+        monkeypatch.setattr(auth, "require_auth", viewer_auth)
+        monkeypatch.setattr(auth.settings, "auth_enabled", True)
+    else:
+        main.app.dependency_overrides[routes._curator_dependency] = lambda: identity["user"]
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+            async def create(body=PARTNER_JOB):
+                return await client.post("/v1/curation/reevaluate/jobs", json=body)
+
+            if case == "viewer":
+                resp = await create()
+                assert resp.status_code == 403
+                assert resp.json()["detail"] == "Curator privileges required for this action."
+            elif case == "other_users_job":
+                url = (await create()).json()["status_url"]
+                identity["user"] = user("someone-else@test")
+                assert (await client.get(url)).status_code == 404
+            elif case == "too_many_pmids":
+                too_many = {**PARTNER_JOB, "evidence_pmids": [str(i) for i in range(1, 52)]}
+                resp = await create(too_many)
+                assert resp.status_code == 422
+                assert "at most 50" in resp.text
+            else:
+                assert (await create()).status_code == 200
+                assert (await create()).status_code == 200
+                assert (await create()).status_code == 429
+            if case != "third_inflight_job":
+                assert all(job.status == "queued" for job in routes._jobs.values())
+                assert len(routes._jobs) == (1 if case == "other_users_job" else 0)
+    finally:
+        for coro in pending:
+            coro.close()
+        main.app.dependency_overrides.pop(routes._curator_dependency, None)
+        routes._jobs.clear()
 
 
 async def test_partner_job_route_lifecycle(mocked, monkeypatch):
