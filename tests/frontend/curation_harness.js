@@ -213,17 +213,19 @@ class FakeElement {
   getBoundingClientRect() { return { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 }; }
 }
 
-function jsonResponse(status, body) {
+function jsonResponse(status, body, headers = {}) {
+  const lower = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v)]));
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText: String(status),
+    headers: { get: (name) => (lower.has(name.toLowerCase()) ? lower.get(name.toLowerCase()) : null) },
     json: async () => body,
     text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
   };
 }
 
-// routes: async (method, url, body) => [status, json] | undefined (-> 404).
+// routes: async (method, url, body) => [status, json, headers?] | undefined (-> 404).
 function loadCurationApp({ routes = async () => undefined, auth = { can_curate: true } } = {}) {
   const roots = new Map();
   const root = (id) => {
@@ -258,7 +260,7 @@ function loadCurationApp({ routes = async () => undefined, auth = { can_curate: 
     requests.push({ method, url, body });
     const result = await routes(method, url, body);
     if (!result) return jsonResponse(404, { detail: "Not found" });
-    return jsonResponse(result[0], result[1]);
+    return jsonResponse(result[0], result[1], result[2]);
   };
   const sandbox = {
     document: fakeDocument,

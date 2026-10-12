@@ -222,6 +222,28 @@ function curationDetailMessage(detail, fallback) {
   return detail.message || fallback;
 }
 
+// 503 on save/revert: lock contention (with Retry-After) or storage briefly
+// down. Both are retryable; nothing was saved.
+function curationRetryMessage(response, detail, action) {
+  const seconds = Number(response.headers && response.headers.get ? response.headers.get("Retry-After") : NaN);
+  const wait = Number.isFinite(seconds) && seconds > 0 ? ` in ${seconds} second${seconds === 1 ? "" : "s"}` : "";
+  const reason = curationDetailMessage(detail, "Curation storage is busy.");
+  return `Couldn't ${action} right now (${reason.replace(/[.;]?\s*please retry\.?$/i, "")}). Nothing was changed — please retry${wait}.`;
+}
+
+// A legacy shared run whose gene tumor context couldn't be reconstructed:
+// the server shows pipeline output (curation_unavailable) and a save would
+// target an unknown (gene, tumor type) subject, so editing is disabled.
+function curationTumorContextUnresolved(subject, record) {
+  if (subject.type !== "gene" || !record) return false;
+  const tumorTypes = state.currentResult?.annotation_tumor_types || {};
+  return !(subject.key in tumorTypes) &&
+    (record.quality_flags || []).some((flag) => flag.code === "curation_unavailable");
+}
+
+const CURATION_UNRESOLVED_TOOLTIP =
+  "Editing is unavailable: this run's tumor context for the gene couldn't be resolved, so a save would target an unknown subject. Re-run the annotation to edit it.";
+
 function formatCurationDate(value) {
   return value ? String(value).slice(0, 10) : "";
 }
@@ -766,6 +788,10 @@ async function saveCurationDraft(session) {
     });
     if (!response.ok) {
       const detail = await curationResponseDetail(response);
+      if (response.status === 503) {
+        session.message = { type: "error", text: curationRetryMessage(response, detail, "save"), retry: true };
+        return;
+      }
       handleCurationSaveError(session, response.status, detail);
       return;
     }
@@ -885,6 +911,8 @@ async function revertCuration(subject, version, errorNode, button) {
         errorNode.textContent =
           `Another curator saved changes${detail?.current_version ? ` (now v${detail.current_version})` : ""}. ` +
           "Close this and reload the results before reverting.";
+      } else if (response.status === 503) {
+        errorNode.textContent = curationRetryMessage(response, detail, "revert");
       } else if (response.status === 403) {
         errorNode.textContent = curationJobErrorMessage(403);
       } else {
@@ -977,6 +1005,11 @@ function curationEditButton(subject, focus, text) {
     }
   );
   button.dataset.curationSubject = curationSubjectId(subject);
+  if (curationTumorContextUnresolved(subject, findCurationRecord(subject))) {
+    button.disabled = true;
+    button.title = CURATION_UNRESOLVED_TOOLTIP;
+    button.setAttribute("aria-label", `${text} for ${subject.label} (unavailable: tumor context unresolved)`);
+  }
   return button;
 }
 
@@ -1050,7 +1083,7 @@ function renderCurationUnavailableBanner(result) {
 // ---------------------------------------------------------------------------
 
 function openCurationDialog(subject, { focus = "evidence", step } = {}) {
-  if (!canCurate()) return;
+  if (!canCurate() || curationTumorContextUnresolved(subject, findCurationRecord(subject))) return;
   const session = getCurationSession(subject, focus);
   if (step === "review" && session.draft) session.step = "review";
   if (!curationState.openSubjectId) curationState.returnFocus = document.activeElement || null;
@@ -1123,6 +1156,11 @@ function renderCurationStatus(session, node) {
       text: session.message.text,
       dataset: { curation: "message" },
     }));
+    if (session.message.retry) {
+      parts.push(curationButton("Retry save", () => saveCurationDraft(session), {
+        action: "retry-save", disabled: curationState.busy,
+      }));
+    }
     if (session.message.conflict) {
       parts.push(curationButton("Reload latest version", () => reloadAfterCurationConflict(session), {
         action: "reload-conflict",

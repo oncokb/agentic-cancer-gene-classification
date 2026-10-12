@@ -573,6 +573,72 @@ async function test_escape_closes_and_draft_survives_reopen() {
   await flush();
 }
 
+async function test_save_and_revert_503_contention_show_retry_message() {
+  const puts = [];
+  let deletes = 0;
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      extra: async (method, url, reqBody) => {
+        if (method === "PUT") {
+          puts.push(reqBody);
+          if (puts.length === 1) return [503, { detail: "Curation storage contention; please retry." }, { "Retry-After": "1" }];
+          return [200, { version: 1, override: { curator_email: "c@x", updated_at: "2026-10-12T00:00:00Z", payload: reqBody.payload } }];
+        }
+        if (method === "DELETE") {
+          deletes += 1;
+          return [503, { detail: "Curation storage contention; please retry." }, { "Retry-After": "2" }];
+        }
+        return undefined;
+      },
+    }),
+  });
+  render(app, geneResult());
+  await toDraft(app);
+  footerButton(app, "save").click();
+  await waitFor(() => byData(app.root("curation-status"), "curation", "retry-save").length, "retry offer");
+  assert.strictEqual(
+    oneByData(app.root("curation-status"), "curation", "message").textContent,
+    "Couldn't save right now (Curation storage contention). Nothing was changed — please retry in 1 second."
+  );
+  assert.ok(!app.root("curation-modal").classList.contains("hidden"), "draft kept open");
+  assert.strictEqual(app.curationState.sessions.get("gene|ALK|luad").baseVersion, 0, "version unchanged");
+  oneByData(app.root("curation-status"), "curation", "retry-save").click();
+  await waitFor(() => app.root("curation-modal").classList.contains("hidden"), "retried save");
+  assert.strictEqual(puts.length, 2);
+  assert.deepStrictEqual(puts[1], puts[0], "retry resends the same body");
+
+  oneByData(app.root("results-window"), "curation", "revert").click();
+  oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").click();
+  await waitFor(() => app.root("curation-aux-body").allText.includes("please retry"), "revert retry message");
+  assert.ok(app.root("curation-aux-body").allText.includes(
+    "Couldn't revert right now (Curation storage contention). Nothing was changed — please retry in 2 seconds."
+  ));
+  assert.ok(!app.root("curation-aux-modal").classList.contains("hidden"), "confirm stays open");
+  await waitFor(() => !oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").disabled, "re-enabled");
+  assert.strictEqual(deletes, 1);
+  assert.ok(app.state.currentResult.annotations[0].curated, "still curated");
+}
+
+async function test_unresolved_tumor_context_disables_edit() {
+  const app = loadCurationApp();
+  const flag = { code: "curation_unavailable", label: "Curator edits unavailable", severity: "critical", detail: "Curator edits could not be loaded; showing pipeline output." };
+  // Legacy shared link: ALK's tumor context couldn't be reconstructed (absent from the map).
+  const win = render(app, geneResult({ quality_flags: [flag] }, { annotation_tumor_types: {}, curation_unavailable: true }));
+  for (const action of ["edit-evidence", "edit-precedent"]) {
+    const button = oneByData(win, "curation", action);
+    assert.strictEqual(button.disabled, true, `${action} disabled`);
+    assert.match(button.title, /tumor context for the gene couldn't be resolved/);
+  }
+  assert.ok(oneByData(win, "flag", "curation_unavailable_banner"));
+  app.openCurationDialog(geneSubject(app));
+  assert.ok(app.root("curation-modal").classList.contains("hidden"), "editor refuses to open");
+
+  // A gene confirmed to have no tumor type (null in the map) stays editable.
+  const ok = loadCurationApp();
+  const okWin = render(ok, geneResult({ quality_flags: [flag] }, { annotation_tumor_types: { ALK: null } }));
+  assert.strictEqual(oneByData(okWin, "curation", "edit-evidence").disabled, false);
+}
+
 runTests("curation UI", [
   test_viewer_sees_no_edit_controls,
   test_curator_sees_controls_even_when_sections_empty,
@@ -587,4 +653,6 @@ runTests("curation UI", [
   test_curated_badge_flags_history_and_revert,
   test_fusion_flow,
   test_escape_closes_and_draft_survives_reopen,
+  test_save_and_revert_503_contention_show_retry_message,
+  test_unresolved_tumor_context_disables_edit,
 ]);
