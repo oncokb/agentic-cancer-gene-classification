@@ -158,6 +158,26 @@ def test_curated_call_served_on_runs_jobs_gene_query_and_csv(client, store, monk
     assert client.get(f"/v1/annotate/{run_id}").json()["annotations"][0]["cancer_associated"] is True
 
 
+def test_sole_call_removal_after_concurrent_save_is_409_and_retry_keeps_section(client, store):
+    url = "/v1/curation/gene/ALK?tumor_type=LUAD"
+    assert client.put(url, json={"payload": {"cancer_associated": False}}).json()["version"] == 1
+    # Curator A reads v1 (only the call) and will revert; curator B adds a section first.
+    seen = client.get(url).json()
+    saved = client.put(url, json={"expected_version": 1, "payload": {"cancer_associated": False, "citations": ["222"]}})
+    assert saved.status_code == 200 and saved.json()["version"] == 2
+
+    stale = client.delete(f"{url}&expected_version={seen['version']}")
+    assert stale.status_code == 409 and stale.json()["detail"]["current_version"] == 2
+    assert store.overrides[("gene", "ALK", "luad")].payload == {"cancer_associated": False, "citations": ["222"]}
+
+    # A's retry merges the call removal into the CURRENT override: B's section survives.
+    current = client.get(url).json()
+    payload = {k: v for k, v in current["override"]["payload"].items() if k != "cancer_associated"}
+    retried = client.put(url, json={"expected_version": current["version"], "payload": payload})
+    assert retried.status_code == 200 and retried.json()["version"] == 3
+    assert store.overrides[("gene", "ALK", "luad")].payload == {"citations": ["222"]}
+
+
 async def test_benchmarks_score_pipeline_calls_not_curated_ones():
     # The benchmark store has no curation support, so overrides never leak into
     # model-accuracy metrics (the curator call is closer to ground truth).

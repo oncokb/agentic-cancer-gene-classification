@@ -212,6 +212,28 @@ async def test_concurrent_first_saves_yield_one_winner_and_conflicts(mysql_store
     assert [e.version for e in history] == [1]
 
 
+async def test_removing_sole_call_races_concurrent_save_without_lost_update(mysql_store):
+    # Curator A removes the call (its only section, so the override is reverted)
+    # while curator B saves an edit; both read v1. Exactly one write wins, the
+    # other gets a version conflict, and the stored state is the winner's.
+    await _save(mysql_store, 0, {"cancer_associated": False})
+    b_payload = {"cancer_associated": False, "citations": ["222"]}
+    revert, save = await asyncio.gather(
+        mysql_store.delete_curated_override(**SUBJECT, curator_email="a@mskcc.org", expected_version=1),
+        _save(mysql_store, 1, b_payload),
+        return_exceptions=True,
+    )
+    current = await mysql_store.get_curated_override("gene", "CURTEST1", "luad")
+    history = await mysql_store.list_curation_history("gene", "CURTEST1", "luad")
+    assert [e.version for e in history] == [2, 1]
+    if isinstance(revert, CurationVersionConflict):
+        assert save.version == 2 and current.payload == b_payload  # B's edit survives
+        assert history[0].action == "save"
+    else:
+        assert revert == 1 and isinstance(save, CurationVersionConflict)
+        assert current is None and history[0].action == "revert"  # B must reload; nothing overwritten
+
+
 async def test_run_updates_are_key_scoped_and_compare_and_swap(mysql_store):
     run_id = "curtest-run-0001"
     async with mysql_store._pool.acquire() as conn:
