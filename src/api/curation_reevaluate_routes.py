@@ -16,7 +16,7 @@ from src.config import settings
 from src.observability import record_user_action
 from src.pipeline.curation_reevaluate import (
     InvalidPMIDs,
-    NCBIUnavailable,
+    UpstreamUnavailable,
     SubjectNotResolved,
     ReevaluateRequest,
     reevaluate,
@@ -47,48 +47,46 @@ _jobs: dict[str, JobStatus] = {}
 _jobs_lock = asyncio.Lock()
 
 
+def _audit(owner: str, action: str, details: dict):
+    try:
+        record_user_action(user_id=owner, action=action, details=details)
+    except Exception:
+        logger.exception("Failed to audit curator re-evaluation action %s", action)
+
+
 async def _run_job(job_id: str, request: ReevaluateRequest, run_store):
-    async with _jobs_lock:
-        owner = _jobs[job_id].owner_email
-        _jobs[job_id].status = "running"
-    record_user_action(
-        user_id=owner, action="curation_reevaluate_start", details={"job_id": job_id}
+    owner = _jobs[job_id].owner_email
+    result = JobStatus(
+        status="failed", error="Re-evaluation failed; please retry.", owner_email=owner
     )
     try:
-        draft = await reevaluate(request, run_store=run_store)
-        result = JobStatus(status="succeeded", draft=draft)
-    except InvalidPMIDs as exc:
-        result = JobStatus(status="failed", error=str(exc), invalid_pmids=exc.reasons)
-    except (SubjectNotResolved, NCBIUnavailable) as exc:
-        result = JobStatus(status="failed", error=str(exc))
-    except asyncio.CancelledError:
         async with _jobs_lock:
-            _jobs[job_id] = JobStatus(
-                status="failed",
-                error="Job cancelled",
-                owner_email=owner,
-                finished_at=time.monotonic(),
-            )
-        record_user_action(
-            user_id=owner,
-            action="curation_reevaluate_failure",
-            details={"job_id": job_id, "error": "Job cancelled"},
+            _jobs[job_id].status = "running"
+        _audit(owner, "curation_reevaluate_start", {"job_id": job_id})
+        draft = await reevaluate(request, run_store=run_store)
+        result = JobStatus(status="succeeded", draft=draft, owner_email=owner)
+    except InvalidPMIDs as exc:
+        result = JobStatus(
+            status="failed", error=str(exc), invalid_pmids=exc.reasons, owner_email=owner
         )
+    except (SubjectNotResolved, UpstreamUnavailable) as exc:
+        result = JobStatus(status="failed", error=str(exc), owner_email=owner)
+    except asyncio.CancelledError:
+        result.error = "Job cancelled"
         raise
     except Exception:
         logger.exception("Curator re-evaluation job %s failed", job_id)
-        result = JobStatus(status="failed", error="Re-evaluation failed; please retry.")
-    result.owner_email = owner
-    result.finished_at = time.monotonic()
-    record_user_action(
-        user_id=owner,
-        action="curation_reevaluate_success"
-        if result.status == "succeeded"
-        else "curation_reevaluate_failure",
-        details={"job_id": job_id, "error": result.error},
-    )
-    async with _jobs_lock:
-        _jobs[job_id] = result
+    finally:
+        result.finished_at = time.monotonic()
+        async with _jobs_lock:
+            _jobs[job_id] = result
+        _audit(
+            owner,
+            "curation_reevaluate_success"
+            if result.status == "succeeded"
+            else "curation_reevaluate_failure",
+            {"job_id": job_id, "error": result.error},
+        )
 
 
 @router.post("/jobs", response_model=JobCreated)

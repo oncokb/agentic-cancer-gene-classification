@@ -281,10 +281,10 @@ def test_request_validation(changes):
 
 
 async def test_efetch_omitted_no_abstract_is_not_unknown(mocked):
-    mocked[1].return_value = []
+    mocked[1].return_value = [paper("3")]
     curator.literature._esearch.return_value = ["1"]
     with pytest.raises(curator.InvalidPMIDs) as error:
-        await curator.validated_records(["1", "2"])
+        await curator.validated_records(["1", "2", "3"])
     assert error.value.reasons == {"unknown": ["2"], "retracted": [], "no_abstract": ["1"]}
 
 
@@ -430,10 +430,22 @@ async def test_model_citations_support_not_inflated_by_pinned_papers(mocked):
     assert len(result["citations"]) == 10
 
 
-async def test_all_unknown_is_upstream_error(mocked):
+async def test_all_unknown_is_invalid_pmids(mocked):
     mocked[1].return_value = []
-    with pytest.raises(curator.NCBIUnavailable, match="NCBI returned no verifiable PMIDs"):
+    with pytest.raises(curator.InvalidPMIDs) as error:
         await curator.validated_records(["99"])
+    assert error.value.reasons == {"unknown": ["99"], "retracted": [], "no_abstract": []}
+    assert curator.literature._esearch.call_args.kwargs == {
+        "use_cache": False,
+        "filter_retracted": False,
+    }
+
+
+async def test_empty_fetch_with_confirmed_ids_is_upstream_error(mocked):
+    mocked[1].return_value = []
+    curator.literature._esearch.return_value = ["1", "2"]
+    with pytest.raises(curator.NCBIUnavailable):
+        await curator.validated_records(["1", "2"])
 
 
 @pytest.mark.parametrize(
@@ -508,6 +520,7 @@ async def test_job_limits_ownership_admin_and_audits(monkeypatch):
     "error",
     [
         curator.SubjectNotResolved("Could not resolve subject: missing"),
+        curator.UpstreamUnavailable("Gene lookup is temporarily unavailable; please retry."),
         curator.NCBIUnavailable("NCBI returned no verifiable PMIDs; please retry."),
     ],
 )
@@ -560,3 +573,135 @@ def test_overlapping_lists_count_unique_ids(monkeypatch):
         curator.ReevaluateRequest(
             subject_type="gene", subject_key="RP1", evidence_pmids=["1", "2"], precedent_pmids=["3"]
         )
+
+
+def test_escaped_quote_matches_unescaped_abstract():
+    from html import escape
+
+    quote = 'The patient\'s response was < 10% & classified as "low".'
+    record = LiteratureRecord(pmid="1", title="Test", abstract="Introduction. " + quote)
+    assert curator.verbatim_quote(record, escape(quote)) == quote
+
+
+async def test_canonical_fusion_case_preserved(mocked):
+    curator.resolve_gene.side_effect = lambda symbol, client: ResolvedGene(
+        input_symbol=symbol,
+        canonical_symbol="C11orf95" if symbol == "C11ORF95" else "RELA",
+        resolved=True,
+    )
+    result = await curator.reevaluate(
+        curator.ReevaluateRequest(
+            subject_type="fusion", subject_key="c11orf95/rela", evidence_pmids=["1"]
+        )
+    )
+    assert result["fusion"] == "C11orf95::RELA"
+    assert result["evidence_cards"][0]["fusion"] == "C11orf95::RELA"
+
+
+@pytest.mark.parametrize("kind,subject", [("gene", "RP1"), ("fusion", "RP1::ALK")])
+async def test_lookup_outage_is_retryable(mocked, kind, subject):
+    curator.resolve_gene.side_effect = None
+    curator.resolve_gene.return_value = ResolvedGene(
+        input_symbol="RP1", canonical_symbol="RP1", resolved=False, lookup_failed=True
+    )
+    with pytest.raises(curator.UpstreamUnavailable, match="temporarily unavailable; please retry"):
+        await curator.reevaluate(
+            curator.ReevaluateRequest(subject_type=kind, subject_key=subject, evidence_pmids=["1"])
+        )
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+async def test_audit_failure_cannot_leak_slot(monkeypatch, outcome):
+    routes._jobs.clear()
+    routes._jobs["test"] = routes.JobStatus(owner_email="owner@test")
+    observed = []
+
+    def failed_audit(**kwargs):
+        observed.append(routes._jobs["test"].status)
+        raise RuntimeError("Audit unavailable")
+
+    monkeypatch.setattr(routes, "record_user_action", failed_audit)
+    error = {
+        "success": None,
+        "failure": RuntimeError("Upstream error"),
+        "cancelled": asyncio.CancelledError(),
+    }[outcome]
+    monkeypatch.setattr(routes, "reevaluate", AsyncMock(return_value={}, side_effect=error))
+    request = curator.ReevaluateRequest(
+        subject_type="gene", subject_key="RP1", evidence_pmids=["1"]
+    )
+    try:
+        if outcome == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await routes._run_job("test", request, None)
+        else:
+            await routes._run_job("test", request, None)
+        expected = "succeeded" if outcome == "success" else "failed"
+        assert routes._jobs["test"].status == expected
+        assert routes._jobs["test"].finished_at is not None
+        assert observed == ["running", expected]
+        assert not any(job.status in ("queued", "running") for job in routes._jobs.values())
+    finally:
+        routes._jobs.clear()
+
+
+def test_list_cap_reads_live_settings(monkeypatch):
+    monkeypatch.setattr(curator.settings, "curation_reevaluate_max_pmids", 60)
+    values = [str(i) for i in range(1, 61)]
+    assert (
+        len(
+            curator.ReevaluateRequest(
+                subject_type="gene", subject_key="RP1", evidence_pmids=values
+            ).evidence_pmids
+        )
+        == 60
+    )
+    monkeypatch.setattr(curator.settings, "curation_reevaluate_max_pmids", 3)
+    with pytest.raises(ValueError, match="Each PMID list"):
+        curator.ReevaluateRequest(subject_type="gene", subject_key="RP1", precedent_pmids=values)
+
+
+@pytest.mark.parametrize("abstract", ["A finding " * 60, "x" * 401])
+def test_fallback_quote_is_bounded_verbatim_prefix(abstract):
+    record = LiteratureRecord(pmid="1", title="Test", abstract=abstract)
+    quote = curator.verbatim_quote(record)
+    assert len(quote) <= 400
+    assert abstract.startswith(quote)
+    if abstract.startswith("A finding"):
+        assert quote.endswith("finding")
+
+
+async def test_existence_search_bypasses_cache(monkeypatch):
+    from unittest.mock import MagicMock
+
+    response = MagicMock()
+    response.json.return_value = {"esearchresult": {"idlist": ["99"]}}
+    client = AsyncMock()
+    client.get.return_value = response
+    cached = AsyncMock(side_effect=AssertionError("Existence lookup must be uncached"))
+    monkeypatch.setattr(curator.literature, "cached_call", cached)
+    found = await curator.literature._esearch(
+        "99[uid]", 1, client, use_cache=False, filter_retracted=False
+    )
+    assert found == ["99"]
+    assert client.get.call_args.kwargs["params"]["term"] == "99[uid]"
+    cached.assert_not_called()
+
+
+async def test_network_existence_error_is_generic_job_failure(mocked, monkeypatch):
+    mocked[1].return_value = []
+    curator.literature._esearch.side_effect = httpx.ConnectError("Private network detail")
+    monkeypatch.setattr(routes, "reevaluate", curator.reevaluate)
+    routes._jobs["test"] = routes.JobStatus(owner_email="owner@test")
+    try:
+        await routes._run_job(
+            "test",
+            curator.ReevaluateRequest(
+                subject_type="gene", subject_key="RP1", evidence_pmids=["99"]
+            ),
+            None,
+        )
+        assert routes._jobs["test"].error == "Re-evaluation failed; please retry."
+        assert routes._jobs["test"].invalid_pmids is None
+    finally:
+        routes._jobs.clear()

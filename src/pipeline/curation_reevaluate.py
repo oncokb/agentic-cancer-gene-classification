@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from html import escape
+from html import escape, unescape
 import re
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional, get_args
@@ -36,12 +36,8 @@ class ReevaluateRequest(BaseModel):
     subject_type: Literal["gene", "fusion"]
     subject_key: str = Field(min_length=1, max_length=128)
     tumor_type: Optional[str] = Field(default=None, max_length=256)
-    evidence_pmids: list[str] = Field(
-        default_factory=list, max_length=settings.curation_reevaluate_max_pmids
-    )
-    precedent_pmids: list[str] = Field(
-        default_factory=list, max_length=settings.curation_reevaluate_max_pmids
-    )
+    evidence_pmids: list[str] = Field(default_factory=list)
+    precedent_pmids: list[str] = Field(default_factory=list)
 
     @field_validator("subject_key", "tumor_type")
     @classmethod
@@ -65,6 +61,13 @@ class ReevaluateRequest(BaseModel):
             raise ValueError("subject_key must match subject_type (two partners for fusion)")
         if not self.evidence_pmids and not self.precedent_pmids:
             raise ValueError("Supply at least one evidence or precedent PMID")
+        if any(
+            len(values) > settings.curation_reevaluate_max_pmids
+            for values in (self.evidence_pmids, self.precedent_pmids)
+        ):
+            raise ValueError(
+                f"Each PMID list must contain at most {settings.curation_reevaluate_max_pmids} IDs"
+            )
         if (
             len(set(self.evidence_pmids + self.precedent_pmids))
             > settings.curation_reevaluate_max_pmids
@@ -79,7 +82,11 @@ class SubjectNotResolved(ValueError):
     pass
 
 
-class NCBIUnavailable(RuntimeError):
+class UpstreamUnavailable(RuntimeError):
+    pass
+
+
+class NCBIUnavailable(UpstreamUnavailable):
     pass
 
 
@@ -95,12 +102,14 @@ async def validated_records(pmids: list[str]) -> dict[str, LiteratureRecord]:
     # _efetch omits non-retracted articles with no abstract. Verify existence
     # of missing IDs so these are reported separately from unknown IDs.
     missing = [pmid for pmid in pmids if pmid not in by_pmid]
-    existing_without_abstract = (
+    existing_pmids = (
         set(
             await literature._esearch(
                 " OR ".join(f"{pmid}[uid]" for pmid in missing),
                 len(missing),
                 literature._get_ncbi_client(),
+                use_cache=False,
+                filter_retracted=False,
             )
         )
         if missing
@@ -110,13 +119,13 @@ async def validated_records(pmids: list[str]) -> dict[str, LiteratureRecord]:
     for pmid in pmids:
         record = by_pmid.get(pmid)
         if record is None:
-            reasons["no_abstract" if pmid in existing_without_abstract else "unknown"].append(pmid)
+            reasons["no_abstract" if pmid in existing_pmids else "unknown"].append(pmid)
         else:
             if literature._is_retracted_publication(record):
                 reasons["retracted"].append(pmid)
             if not record.abstract.strip():
                 reasons["no_abstract"].append(pmid)
-    if pmids and len(reasons["unknown"]) == len(pmids):
+    if not records and existing_pmids:
         raise NCBIUnavailable("NCBI returned no verifiable PMIDs; please retry.")
     if any(reasons.values()):
         raise InvalidPMIDs(reasons)
@@ -129,15 +138,22 @@ def bounded_text(value: Any, limit: int) -> Optional[str]:
 
 def verbatim_quote(record: LiteratureRecord, *candidates: Any) -> str:
     for candidate in candidates:
-        if (
-            isinstance(candidate, str)
-            and candidate.strip()
-            and 20 <= len(candidate) <= 400
-            and candidate in record.abstract
-        ):
-            return candidate
-    # Keep the fallback an exact substring, even for short first sentences.
-    return re.split(r"(?<=[.!?])\s+", record.abstract.strip(), maxsplit=1)[0]
+        if not isinstance(candidate, str):
+            continue
+        for text in (candidate, unescape(candidate)):
+            if text.strip() and 20 <= len(text) <= 400 and text in record.abstract:
+                return text
+    sentence = re.split(r"(?<=[.!?])\s+", record.abstract.strip(), maxsplit=1)[0]
+    if len(sentence) <= 400:
+        return sentence
+    prefix = sentence[:400]
+    if not sentence[400].isspace() and not prefix[-1].isspace():
+        # Avoid splitting a word; an exceptionally long single word uses the
+        # hard prefix limit because no earlier word boundary exists.
+        boundary = max((i for i, char in enumerate(prefix) if char.isspace()), default=-1)
+        if boundary > 0:
+            prefix = prefix[:boundary]
+    return prefix.rstrip()
 
 
 CARD_TOOL = {
@@ -206,6 +222,8 @@ async def suggest_cards(subject: str, records: list[LiteratureRecord], precedent
 async def gene_context(subject: str, tumor_type: Optional[str], run_store):
     async with httpx.AsyncClient() as client:
         resolved = await resolve_gene(subject, client)
+    if resolved.lookup_failed:
+        raise UpstreamUnavailable("Gene lookup is temporarily unavailable; please retry.")
     if not resolved.resolved:
         raise SubjectNotResolved(
             f"Could not resolve subject: {subject}. Check the gene symbol and retry."
@@ -246,11 +264,13 @@ async def reevaluate(request: ReevaluateRequest, run_store=None) -> dict:
             partners = await asyncio.gather(
                 resolve_gene(five.upper(), client), resolve_gene(three.upper(), client)
             )
+        if any(p.lookup_failed for p in partners):
+            raise UpstreamUnavailable("Gene lookup is temporarily unavailable; please retry.")
         if not all(p.resolved for p in partners):
             raise SubjectNotResolved(
                 f"Could not resolve subject: {request.subject_key}. Check the fusion partner symbols and retry."
             )
-        five, three = [p.canonical_symbol.upper() for p in partners]
+        five, three = [p.canonical_symbol for p in partners]
         subject, fusions, oncokb, prevalence, identity = (
             f"{five}::{three}",
             [f"{five}::{three}"],
