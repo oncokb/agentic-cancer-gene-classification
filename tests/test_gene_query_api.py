@@ -162,6 +162,11 @@ def test_slim_mapping_is_an_allowlist():
         "quality_flags",
         "cache_status",
         "cached_at",
+        "curated",
+        "curated_by",
+        "curated_at",
+        "curation_version",
+        "curated_fields",
         "error",
     }
     assert slim.rationale == "ALK is a known oncogenic kinase."

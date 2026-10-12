@@ -18,6 +18,7 @@ import aiomysql
 from src.api_keys import ApiKeyRecord
 from src.config import settings
 from src.models.schema import GeneAnnotation, PMIDEvidenceRecord
+from src.pipeline.curation_store import CurationStoreMixin
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +156,7 @@ def _mysql_connection_kwargs() -> Dict[str, Any]:
     }
 
 
-class RunStore:
+class RunStore(CurationStoreMixin):
     """Save/fetch runs and reusable gene annotations. Calling code never issues raw SQL."""
 
     def __init__(self, pool: aiomysql.Pool):
@@ -183,6 +184,7 @@ class RunStore:
                     await cursor.execute(_CREATE_PMID_EVIDENCE_TABLE_SQL)
                 await cursor.execute(_CREATE_FEEDBACK_TABLE_SQL)
                 await cursor.execute(_CREATE_API_KEYS_TABLE_SQL)
+                await self._ensure_curation_schema(cursor)
 
     async def _ensure_gene_annotation_schema(self, cursor) -> None:
         """Migrate older gene-only annotation caches to gene + tumor-type keys."""
@@ -228,7 +230,7 @@ class RunStore:
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
-                    "UPDATE runs SET result_json = %s WHERE run_id = %s",
+                    "UPDATE runs SET result_json = %s, revision = revision + 1 WHERE run_id = %s",
                     (json.dumps(result_payload), run_id),
                 )
 

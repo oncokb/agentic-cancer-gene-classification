@@ -2609,3 +2609,331 @@ body.api-keys-body {
     grid-template-columns: 1fr;
   }
 }
+
+/* Curator editing: edit controls, curated badge/flags, edit dialog,
+   job notifications and toasts. */
+
+.supporting-evidence-heading-row,
+.curation-panel-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.supporting-evidence-heading-row .supporting-evidence-heading {
+  margin-right: auto;
+}
+
+.curation-edit-button {
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent-strong);
+}
+
+.clinical-actionability.empty {
+  border-style: dashed;
+}
+
+.review-badge.curated-badge {
+  border-color: #b9d9d5;
+  background: #eef9f7;
+  color: var(--accent-strong);
+}
+
+.curation-panel {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.curation-flag {
+  border-left: 3px solid var(--warning);
+  border-radius: 0 6px 6px 0;
+  background: #fff6e0;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+
+.curation-flag .citation-link-list {
+  display: inline-flex;
+  margin: 0 8px 0 4px;
+}
+
+.curation-flag-critical {
+  border-left-color: var(--danger);
+  background: #fdecea;
+}
+
+.curation-unavailable-banner {
+  margin-bottom: 12px;
+}
+
+.curation-modal {
+  width: min(820px, 100%);
+  max-height: min(880px, 94vh);
+}
+
+.curation-status {
+  margin-top: 14px;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 6px 6px 0;
+  background: var(--surface-strong);
+  padding: 8px 12px;
+}
+
+.curation-status p {
+  margin: 4px 0;
+}
+
+.curation-progress::before {
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 8px;
+  border: 2px solid var(--accent);
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: curation-spin 0.9s linear infinite;
+}
+
+@keyframes curation-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.curation-error {
+  margin: 4px 0;
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.curation-error:empty {
+  display: none;
+}
+
+.curation-warning {
+  margin: 4px 0 0;
+  color: var(--warning);
+  font-size: 13px;
+}
+
+.curation-pmid-list {
+  margin: 14px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 14px 12px;
+}
+
+.curation-pmid-list.excluded .curation-pmid-rows,
+.curation-pmid-list.excluded .curation-add-row {
+  opacity: 0.55;
+}
+
+.curation-pmid-list legend {
+  padding: 0 6px;
+  font-weight: 700;
+}
+
+.curation-include {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+  font-size: 14px;
+}
+
+.curation-include input {
+  width: auto;
+}
+
+.curation-pmid-rows {
+  margin: 6px 0;
+  padding-left: 22px;
+}
+
+.curation-pmid-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 4px 0;
+}
+
+.curation-pmid-row.invalid .citation-link {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.curation-pmid-title {
+  flex: 1 1 240px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.curation-pmid-controls {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.icon-button.small {
+  width: 28px;
+  min-height: 28px;
+}
+
+.curation-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.curation-add-row label {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.curation-add-row input {
+  flex: 1 1 160px;
+  width: auto;
+}
+
+.curation-review-section {
+  margin-top: 18px;
+}
+
+.curation-review-section h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.curation-field label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.curation-review textarea {
+  min-height: 0;
+}
+
+.curation-draft-card {
+  margin-bottom: 12px;
+}
+
+.curation-quote-row {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.curation-abstract summary {
+  cursor: pointer;
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.curation-footer {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.curation-history-list {
+  padding-left: 20px;
+}
+
+.curation-history-list li {
+  margin: 8px 0;
+}
+
+.curation-notifications,
+.toast-region {
+  position: fixed;
+  right: 20px;
+  z-index: 30;
+  display: grid;
+  gap: 8px;
+  width: min(380px, calc(100% - 40px));
+}
+
+.curation-notifications {
+  bottom: 20px;
+  /* Below .modal-backdrop (20) so it never covers an open dialog's buttons. */
+  z-index: 15;
+}
+
+.toast-region {
+  top: 20px;
+}
+
+.curation-notification,
+.toast {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 10px 14px;
+  font-size: 14px;
+}
+
+.curation-notification p {
+  margin: 0 0 8px;
+}
+
+.curation-notification-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.curation-notification-failed,
+.toast-error {
+  border-left-color: var(--danger);
+}
+
+.toast-success,
+.curation-notification-succeeded {
+  border-left-color: var(--ok);
+}
+
+/* Reverted here but the pipeline version hasn't loaded: dim the stale content. */
+.annotation-card:has(.curation-pending-refresh) .annotation-fields,
+.annotation-card:has(.curation-pending-refresh) .fusion-supporting-evidence,
+.annotation-card:has(.curation-pending-refresh) .field-row {
+  opacity: 0.45;
+}
+
+.curation-override-preview-section {
+  margin: 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 8px 12px;
+}
+
+.curation-override-preview-section h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.curation-override-preview dt {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.curation-override-preview dd {
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+}

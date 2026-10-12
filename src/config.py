@@ -115,6 +115,8 @@ class Settings(BaseSettings):
     context_score_pubtype_case_report_weight: float = 0.3
     context_score_pubtype_editorial_weight: float = 0.15
     context_score_pubtype_preprint_weight: float = 0.3
+    curation_reevaluate_max_pmids: int = Field(default=50, ge=1)
+    curation_reevaluate_max_inflight_jobs: int = Field(default=2, ge=1)
     annotation_job_ttl_seconds: int = 3600
     # Max entries accepted per gene query API request (POST /v1/genes/query[/jobs]).
     gene_query_max_genes: int = 50
@@ -249,6 +251,7 @@ class Settings(BaseSettings):
     saml_idp_entity_id: str = ""  # IdP Issuer / Entity ID
     saml_allowed_groups: str = ""  # Comma-separated list of required SAML groups (optional)
     saml_admin_groups: str = ""  # Groups that map to the "admin" role
+    saml_curator_groups: str = ""  # Groups that map to the "curator" role (may edit curated overrides)
 
     # Keycloak OIDC & PingID SSO Settings (via keycloak.oncokb.org)
     keycloak_url: str = "https://keycloak.oncokb.org"
@@ -259,10 +262,13 @@ class Settings(BaseSettings):
     keycloak_redirect_uri: str = ""  # If left empty, computed from request or public_app_base_url
     keycloak_allowed_roles: str = ""  # Optional comma-separated list of required Keycloak roles
     keycloak_admin_roles: str = ""  # Keycloak roles that map to "admin" role
+    keycloak_curator_roles: str = ""  # Keycloak roles that map to "curator" role (may edit curated overrides)
 
     # JIT (Just-In-Time) Provisioning Settings
     jit_provisioning_enabled: bool = True
-    jit_default_role: str = "curator"  # Default role for new users: curator, annotator, viewer
+    # Role for users in none of the admin/curator roles or groups above. The role
+    # is re-derived from the IdP's roles/groups on every login.
+    jit_default_role: str = "viewer"
     jit_require_admin_approval: bool = False  # If True, new JIT users start in pending status
 
     # ACGC API keys (scripted access: `Authorization: Bearer acgc_...`)
@@ -287,6 +293,12 @@ class Settings(BaseSettings):
         return [r.strip() for r in self.keycloak_admin_roles.split(",") if r.strip()]
 
     @property
+    def keycloak_curator_roles_list(self) -> List[str]:
+        if not self.keycloak_curator_roles:
+            return []
+        return [r.strip() for r in self.keycloak_curator_roles.split(",") if r.strip()]
+
+    @property
     def allowed_domains_list(self) -> List[str]:
         if not self.allowed_email_domains:
             return []
@@ -309,6 +321,12 @@ class Settings(BaseSettings):
         if not self.saml_admin_groups:
             return []
         return [g.strip() for g in self.saml_admin_groups.split(",") if g.strip()]
+
+    @property
+    def saml_curator_groups_list(self) -> List[str]:
+        if not self.saml_curator_groups:
+            return []
+        return [g.strip() for g in self.saml_curator_groups.split(",") if g.strip()]
 
     log_level: str = "INFO"
 

@@ -883,6 +883,57 @@ python -m benchmarks.warm_literature_cache \
 The warmer only runs Tier 1 PubMed retrieval, so it populates Redis-backed
 `esearch`/`efetch` cache entries without invoking Tier 2 agentic retrieval.
 
+### Curator overrides
+
+Curators can replace parts of the pipeline's output with a vetted version that
+wins everywhere results are served (new runs, cache reuse, `/v1/genes/*`,
+annotation, enrichment and fusion-evidence jobs, and old shared run links).
+Run links and job polls always show the *current* override, so an edit, revert,
+or retraction after a run finished is reflected on the next request. Overrides
+live in their own tables and never touch `gene_annotations`, `runs`, or job
+storage, which hold pure pipeline output:
+
+- `curated_overrides`: one current row per subject, with an optimistic-concurrency
+  `version` and a snapshot of the pipeline's evidence PMIDs at curation time.
+- `curation_history`: append-only, one row per save or revert.
+
+A subject is a gene annotation (`gene`, keyed like `gene_annotations` by gene and
+tumor type) or an exact fusion-pair evidence result (`fusion`, keyed by
+`GENEA::GENEB` and tumor type). Retracted PMIDs are still stripped from curated
+content (flag `curated_retracted_pmids_removed`), and when the pipeline later
+cites PMIDs that were not in its evidence at curation time the result carries a
+non-blocking `newer_pipeline_evidence` flag. If overrides cannot be loaded,
+results are served as pipeline output with a critical `curation_unavailable`
+flag and a response-level `curation_unavailable: true`, and the `/v1/curation`
+endpoints return 503. Each run stores the tumor type used per gene
+(`annotation_tumor_types`) so a shared link finds tumor-scoped overrides; for
+runs saved before that, it is reconstructed from the saved request with the
+pipeline's own rule, and a gene whose context cannot be resolved gets no
+override (flagged `curation_unavailable`) until a later read resolves it.
+Reconstructed tumor context and fusion evidence are written to a run as
+atomic single-key JSON updates, and retraction write-backs compare-and-swap on
+the run's `revision`, so concurrent writers never overwrite each other.
+A save or revert returns 409 only when the override's version actually changed;
+persistent lock contention returns a retryable 503 (`Retry-After`).
+
+```bash
+curl http://127.0.0.1:8000/v1/curation/gene/ALK?tumor_type=LUAD           # current override
+curl -X PUT http://127.0.0.1:8000/v1/curation/gene/ALK?tumor_type=LUAD \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 0, "payload": {"citations": ["17625570"]}}'
+curl http://127.0.0.1:8000/v1/curation/gene/ALK/history?tumor_type=LUAD   # audit trail
+curl -X DELETE http://127.0.0.1:8000/v1/curation/gene/ALK?tumor_type=LUAD # revert
+```
+
+Writes require the `curator` or `admin` role. Roles come from the identity
+provider and are re-derived on every login: `KEYCLOAK_ADMIN_ROLES` /
+`SAML_ADMIN_GROUPS` map to `admin`, `KEYCLOAK_CURATOR_ROLES` /
+`SAML_CURATOR_GROUPS` map to `curator`, and everyone else gets
+`JIT_DEFAULT_ROLE` (`viewer`). API keys may curate only while their owner's
+profile role is curator or admin; a key whose owner has no profile is a viewer. `GET /auth/me` reports `can_curate`. For local
+testing, use dev login with `?role=curator` (or run with auth disabled, which
+allows curation).
+
 ## Benchmark
 
 Run the benchmark with API credits:
