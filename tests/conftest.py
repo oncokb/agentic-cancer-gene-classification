@@ -1,6 +1,7 @@
 """Shared test fixtures."""
 
 import sys
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -190,3 +191,4 @@ def _reset_statsd_lifecycle(monkeypatch):
 
     monkeypatch.setattr(observability, "_statsd_state", observability._UNINITIALIZED)
     monkeypatch.setattr(observability, "_statsd_client", None)
+    monkeypatch.setattr(observability, "_statsd_shutdown", threading.Event())

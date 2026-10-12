@@ -224,25 +224,82 @@ async def test_failed_lazy_construction_is_not_retried_on_every_emission(metrics
     assert observability._statsd_state == observability._UNAVAILABLE
 
 
-async def test_shutdown_is_bounded_even_when_the_lifecycle_lock_is_held(metrics_on):
-    held = threading.Event()
-    release = threading.Event()
+class _LockHolder:
+    """Holds the lifecycle lock on another thread until release()."""
 
-    def hold_lock() -> None:
+    def __init__(self) -> None:
+        self._held = threading.Event()
+        self._release = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
         with observability._statsd_lock:
-            held.set()
-            release.wait(5)
+            self._held.set()
+            self._release.wait(5)
 
-    holder = threading.Thread(target=hold_lock, daemon=True)
-    holder.start()
-    assert held.wait(1), "the lifecycle lock was never taken"
-    try:
+    def __enter__(self) -> "_LockHolder":
+        self._thread.start()
+        assert self._held.wait(1), "the lifecycle lock was never taken"
+        return self
+
+    def release(self) -> None:
+        self._release.set()
+        self._thread.join(1)
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+async def _wait_for_state(state: str) -> None:
+    for _ in range(100):
+        if observability._statsd_state == state:
+            return
+        await asyncio.sleep(0.01)
+
+
+async def test_shutdown_is_bounded_and_final_even_when_the_lifecycle_lock_is_held(counting_dogstatsd):
+    with _LockHolder() as holder:
         start = time.monotonic()
         await asyncio.to_thread(observability.shutdown_statsd, 0.05)
         assert time.monotonic() - start < 0.5
-    finally:
-        release.set()
-        holder.join(1)
+        holder.release()
+
+        # The deferred cleanup finishes the transition once the lock is free.
+        await _wait_for_state(observability._CLOSED)
+        assert observability._statsd_state == observability._CLOSED
+
+        # Shutdown stays final: no construction, nothing emitted, from the
+        # loop or from a synchronous caller.
+        observability.increment("llm.requests")
+        await asyncio.to_thread(observability.increment, "llm.requests")
+        assert await asyncio.to_thread(observability.init_statsd) is None
+        await asyncio.sleep(0.05)
+
+    assert counting_dogstatsd.constructed == []
+    assert observability._statsd_client is None
+
+
+async def test_timed_out_shutdown_still_stops_and_unpublishes_a_ready_client(counting_dogstatsd):
+    client = await asyncio.to_thread(observability.init_statsd)
+    assert observability._statsd_state == observability._READY
+
+    with _LockHolder() as holder:
+        await asyncio.to_thread(observability.shutdown_statsd, 0.05)
+        observability.increment("llm.requests")  # after shutdown returned
+        assert client.calls == []  # latched: not delivered even while still published
+        holder.release()
+        await _wait_for_state(observability._CLOSED)
+        for _ in range(100):
+            if client.stopped:
+                break
+            await asyncio.sleep(0.01)
+
+    assert observability._statsd_state == observability._CLOSED
+    assert observability._statsd_client is None
+    assert client.stopped
+    assert len(counting_dogstatsd.constructed) == 1
+    observability.increment("llm.requests")
+    assert client.calls == []
 
 
 async def test_initializer_finishing_after_shutdown_never_publishes(counting_dogstatsd, monkeypatch):

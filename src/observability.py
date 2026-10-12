@@ -49,6 +49,12 @@ _STATSD_STOP_TIMEOUT_SECONDS = 2.0
 # retried on every emission. Once `closed`, emissions are no-ops, no
 # initializer may start, and an initializer that finishes late stops and
 # discards its client instead of publishing it.
+#
+# _statsd_shutdown latches shutdown independently of the lock: it is set
+# before shutdown even tries the lock, and every emission and initializer
+# checks it first, so a shutdown that times out waiting for the lock is
+# still final. The `closed` transition (unpublish + stop the client) then
+# completes on a daemon thread as soon as the lock is free.
 _UNINITIALIZED = "uninitialized"
 _INITIALIZING = "initializing"
 _READY = "ready"
@@ -57,6 +63,7 @@ _CLOSED = "closed"
 
 _statsd_state = _UNINITIALIZED
 _statsd_lock = threading.Lock()
+_statsd_shutdown = threading.Event()
 
 
 def _build_statsd():
@@ -108,15 +115,15 @@ def init_statsd():
     it off the event loop — the app does so once at startup (see main.py's
     lifespan). Never raises."""
     global _statsd_client, _statsd_state
-    if not settings.datadog_metrics_enabled:
+    if not settings.datadog_metrics_enabled or _statsd_shutdown.is_set():
         return None
     with _statsd_lock:
-        if _statsd_state != _UNINITIALIZED:
-            return _statsd_client
+        if _statsd_shutdown.is_set() or _statsd_state != _UNINITIALIZED:
+            return None if _statsd_shutdown.is_set() else _statsd_client
         _statsd_state = _INITIALIZING
     client = _build_statsd()
     with _statsd_lock:
-        if _statsd_state == _INITIALIZING:
+        if _statsd_state == _INITIALIZING and not _statsd_shutdown.is_set():
             _statsd_client = client
             _statsd_state = _READY if client is not None else _UNAVAILABLE
             return client
@@ -131,18 +138,40 @@ def shutdown_statsd(timeout: float = _STATSD_STOP_TIMEOUT_SECONDS) -> None:
     sender, taking at most `timeout` seconds in total (never hangs shutdown
     on an unreachable Agent or a stuck initializer). Blocking; async code
     must run it off the event loop."""
-    global _statsd_client, _statsd_state
     deadline = time.monotonic() + timeout
+    _statsd_shutdown.set()  # final from here on, whether or not we get the lock
     if not _statsd_lock.acquire(timeout=timeout):
-        logger.warning("Datadog metrics shutdown gave up waiting for the client lock after %ss", timeout)
+        logger.warning(
+            "Datadog metrics shutdown timed out after %ss waiting for the client lock; closing in the background",
+            timeout,
+        )
+        threading.Thread(
+            target=_close_when_lock_free, args=(timeout,), name="statsd-close", daemon=True
+        ).start()
         return
     try:
-        _statsd_state = _CLOSED
-        client, _statsd_client = _statsd_client, None
+        client = _close_locked()
     finally:
         _statsd_lock.release()
     if client is not None:
         _stop_client(client, max(0.0, deadline - time.monotonic()))
+
+
+def _close_locked():
+    """Mark the lifecycle closed and unpublish the client (returned so the
+    caller can stop it outside the lock). Caller holds _statsd_lock."""
+    global _statsd_client, _statsd_state
+    _statsd_state = _CLOSED
+    client, _statsd_client = _statsd_client, None
+    return client
+
+
+def _close_when_lock_free(stop_timeout: float) -> None:
+    """Deferred half of a shutdown that couldn't get the lock in time."""
+    with _statsd_lock:
+        client = _close_locked()
+    if client is not None:
+        _stop_client(client, stop_timeout)
 
 
 def _start_background_init() -> None:
@@ -150,7 +179,7 @@ def _start_background_init() -> None:
 
 
 def _statsd():
-    if not settings.datadog_metrics_enabled:
+    if not settings.datadog_metrics_enabled or _statsd_shutdown.is_set():
         return None
     client = _statsd_client
     if client is not None or _statsd_state != _UNINITIALIZED:
