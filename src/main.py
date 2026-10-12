@@ -198,7 +198,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     # X-OpenEvidence-Poll: sent by app.js on every OpenEvidence sidecar
     # request (see get_gene_openevidence); without it a cross-origin
     # frontend's preflight would fail and the card would silently vanish.
@@ -2345,9 +2345,11 @@ async def benchmark(
 
 # Imported here, after every helper it reuses is defined, to avoid a circular
 # import at module load (the router module looks those helpers up on src.main).
+from src.api.curation_routes import router as curation_router  # noqa: E402
 from src.api.gene_query import router as gene_query_router  # noqa: E402
 
 app.include_router(gene_query_router)
+app.include_router(curation_router)
 
 
 @app.exception_handler(Exception)
