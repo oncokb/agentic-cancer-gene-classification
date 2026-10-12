@@ -60,7 +60,7 @@ class AuthenticatedUser(BaseModel):
     name: str
     picture: Optional[str] = None
     domain: str
-    role: str = "curator"
+    role: str = "viewer"
     status: str = "active"
     provider: str = "google"
     groups: List[str] = Field(default_factory=list)
@@ -74,7 +74,7 @@ class UserProfile(BaseModel):
     name: str
     picture: Optional[str] = None
     domain: str
-    role: str = "curator"
+    role: str = "viewer"
     status: str = "active"
     provider: str = "google"
     groups: List[str] = Field(default_factory=list)
@@ -84,6 +84,9 @@ class UserProfile(BaseModel):
     login_count: int = 1
     annotation_count: int = 0
     last_annotation_at: Optional[str] = None
+    # ROLE_DERIVATION_VERSION the stored role was derived under; profiles
+    # saved before role derivation existed load as 1.
+    role_version: int = 1
 
 
 class AuthUserResponse(BaseModel):
@@ -91,7 +94,7 @@ class AuthUserResponse(BaseModel):
     name: str
     picture: Optional[str] = None
     domain: str
-    role: str = "curator"
+    role: str = "viewer"
     status: str = "active"
     provider: str = "google"
     groups: List[str] = Field(default_factory=list)
@@ -111,6 +114,8 @@ class AuthMeResponse(BaseModel):
     jit_provisioning_enabled: bool = True
     dev_login_enabled: bool = False
     keycloak_enabled: bool = False
+    # Whether the current user may edit curated overrides (see require_curator).
+    can_curate: bool = False
 
 
 class SAMLAssertionData(BaseModel):
@@ -120,6 +125,46 @@ class SAMLAssertionData(BaseModel):
     display_name: str = ""
     issuer: str = ""
     session_index: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+
+# Roles allowed to edit curated overrides. Admins are included so the
+# curation flow can be exercised without a separate curator account.
+CURATION_ROLES = frozenset({"curator", "admin"})
+
+# Bumped when role derivation changes. Session tokens minted before the
+# current version carry a role from the old rules (everyone defaulted to
+# "curator"), so decode_session_token downgrades them to "viewer" until the
+# user signs in again and gets a re-derived role.
+ROLE_DERIVATION_VERSION = 2
+
+
+def derive_role(groups: Optional[List[str]]) -> str:
+    """Map IdP roles/groups (Keycloak roles or SAML groups) to an ACGC role.
+
+    admin if in any admin role/group, else curator if in any curator
+    role/group, else settings.jit_default_role ("viewer" by default).
+    """
+    user_groups = set(groups or [])
+    if user_groups.intersection(settings.keycloak_admin_roles_list) or user_groups.intersection(
+        settings.saml_admin_groups_list
+    ):
+        return "admin"
+    if user_groups.intersection(settings.keycloak_curator_roles_list) or user_groups.intersection(
+        settings.saml_curator_groups_list
+    ):
+        return "curator"
+    return settings.jit_default_role
+
+
+def can_curate(user: Optional["AuthenticatedUser"]) -> bool:
+    """True when `user` may edit curated overrides (always, with auth disabled)."""
+    if not settings.auth_enabled:
+        return True
+    return bool(user) and user.status == "active" and user.role in CURATION_ROLES
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +254,10 @@ async def provision_or_update_user(
     """
     Just-In-Time (JIT) provisioning: creates a new user profile on first login,
     or updates login timestamp, groups, and claims for returning users.
+
+    The role is re-derived from this login's groups every time (the IdP is the
+    source of truth), so a stored role from an earlier login never sticks.
+    `role` is an explicit override (dev login) that admin groups still win over.
     """
     clean_email = email.strip().lower()
     extracted_domain = domain or clean_email.split("@")[-1]
@@ -216,12 +265,8 @@ async def provision_or_update_user(
     user_groups = groups or []
     user_claims = claims or {}
 
-    # Derive role from SAML/OIDC groups or defaults
-    effective_role = role or settings.jit_default_role
-    if any(g in settings.saml_admin_groups_list for g in user_groups):
-        effective_role = "admin"
-    if any(g in settings.keycloak_admin_roles_list for g in user_groups):
-        effective_role = "admin"
+    derived_role = derive_role(user_groups)
+    effective_role = "admin" if derived_role == "admin" else (role or derived_role)
 
     existing = await get_user_profile(clean_email)
     if existing is None:
@@ -243,10 +288,12 @@ async def provision_or_update_user(
             first_login_at=now_iso,
             last_login_at=now_iso,
             login_count=1,
+            role_version=ROLE_DERIVATION_VERSION,
         )
     else:
         logger.info("JIT sync for returning user %s (login_count=%d)", clean_email, existing.login_count + 1)
-        resolved_role = "admin" if (effective_role == "admin" or existing.role == "admin") else existing.role
+        if existing.role != effective_role:
+            logger.info("Role for %s re-derived: %s -> %s", clean_email, existing.role, effective_role)
         merged_groups = list(dict.fromkeys(existing.groups + user_groups))
         profile = existing.model_copy(
             update={
@@ -256,7 +303,8 @@ async def provision_or_update_user(
                 "login_count": existing.login_count + 1,
                 "groups": merged_groups,
                 "claims": {**existing.claims, **user_claims},
-                "role": resolved_role,
+                "role": effective_role,
+                "role_version": ROLE_DERIVATION_VERSION,
             }
         )
 
@@ -359,6 +407,7 @@ def create_session_token(user: AuthenticatedUser, ttl_seconds: Optional[int] = N
         "status": user.status,
         "provider": user.provider,
         "groups": user.groups,
+        "rv": ROLE_DERIVATION_VERSION,
         "iat": now,
         "exp": now + ttl,
     }
@@ -411,12 +460,17 @@ def decode_session_token(token: str) -> Optional[AuthenticatedUser]:
             logger.warning("Session rejected for %s: account status is %s", email, status_val)
             return None
 
+        role = payload.get("role", settings.jit_default_role)
+        if role == "curator" and payload.get("rv", 1) < ROLE_DERIVATION_VERSION:
+            # Minted when every user defaulted to "curator"; re-login re-derives it.
+            role = "viewer"
+
         return AuthenticatedUser(
             email=email,
             name=payload.get("name") or email,
             picture=payload.get("picture"),
             domain=payload.get("domain") or email.split("@")[-1],
-            role=payload.get("role", settings.jit_default_role),
+            role=role,
             status=status_val,
             provider=payload.get("provider", "google"),
             groups=payload.get("groups", []),
@@ -784,13 +838,19 @@ async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[Au
             logger.warning("Failed to update last_used_at for API key %s: %s", record.id, exc)
 
     profile = await get_user_profile(owner_email)
+    # No live profile means no IdP-derived role to trust: never let JIT_DEFAULT_ROLE
+    # (which may be configured to curator/admin) confer privileges on a key.
+    role = profile.role if profile else "viewer"
+    if profile and role == "curator" and profile.role_version < ROLE_DERIVATION_VERSION:
+        # Stored before roles were derived from the IdP; re-derived at next login.
+        role = "viewer"
     return (
         AuthenticatedUser(
             email=owner_email,
             name=(profile.name if profile else None) or owner_email,
             picture=profile.picture if profile else None,
             domain=owner_email.split("@")[-1],
-            role=profile.role if profile else settings.jit_default_role,
+            role=role,
             status=profile.status if profile else "active",
             provider="api_key",
             groups=list(profile.groups) if profile else [],
@@ -896,6 +956,23 @@ async def require_admin(request: Request) -> AuthenticatedUser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Administrator privileges required for this action.",
+        )
+    return user
+
+
+async def require_curator(request: Request) -> AuthenticatedUser:
+    """Allow curators and admins to edit curated overrides.
+
+    API-key requests are allowed only when the key owner's live JIT profile
+    role is curator/admin (resolved per request in _verify_api_key; a missing
+    profile is a viewer), so a role removed in Keycloak stops working for keys
+    at the owner's next login.
+    """
+    user = await require_auth(request)
+    if not can_curate(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Curator privileges required for this action.",
         )
     return user
 
@@ -1178,13 +1255,7 @@ def parse_keycloak_user(token_data: Dict[str, Any], userinfo: Dict[str, Any]) ->
 
     unique_groups = sorted(list(set(groups)))
 
-    # Determine user role
-    role = settings.jit_default_role
-    admin_roles = set(settings.keycloak_admin_roles_list)
-    if admin_roles and any(r in admin_roles for r in unique_groups):
-        role = "admin"
-    elif settings.saml_admin_groups_list and any(g in set(settings.saml_admin_groups_list) for g in unique_groups):
-        role = "admin"
+    role = derive_role(unique_groups)
 
     return AuthenticatedUser(
         email=clean_email,

@@ -1007,6 +1007,9 @@ async function pollAnnotationJob(statusUrl) {
       fusions_processed: status.fusions_processed,
       genes_annotated: status.genes_total || status.genes_completed,
       annotations: status.annotations || [],
+      // Completed genes' tumor context, so enrichment started mid-run gets the
+      // right tumor-scoped curator override.
+      annotation_tumor_types: status.annotation_tumor_types || {},
       fusion_evidence: state.currentResult?.fusion_evidence || [],
       timings_ms: status.timings_ms || {},
     };
@@ -1133,6 +1136,9 @@ async function submitAnnotationEnrichment(annotation, label) {
   const localBackend = elements.annotateLocalBackend.value || undefined;
   const body = { annotations: [annotation] };
   if (localBackend) body.local_backend = localBackend;
+  // Lets the server apply this gene's tumor-scoped curator override to the result.
+  const tumorTypes = state.currentResult?.annotation_tumor_types || {};
+  if (tumorTypes[annotation.gene]) body.tumor_types = { [annotation.gene]: tumorTypes[annotation.gene] };
 
   const response = await fetch("/v1/annotate/enrichment/jobs", {
     method: "POST",
@@ -3151,8 +3157,13 @@ function renderClinicalActionability(annotation) {
 
   const score = document.createElement("span");
   score.className = "review-badge high";
-  const scoreValue = Number(actionability.confidence_score || 0);
-  score.textContent = `${Math.round(scoreValue * 100)}% confidence`;
+  if (actionability.curated) {
+    // Set from a curator's verified precedent, not the automated keyword score.
+    score.textContent = "Curator-verified";
+  } else {
+    const scoreValue = Number(actionability.confidence_score || 0);
+    score.textContent = `${Math.round(scoreValue * 100)}% confidence`;
+  }
   score.title = actionability.confidence_explanation || "";
   header.appendChild(score);
   section.appendChild(header);

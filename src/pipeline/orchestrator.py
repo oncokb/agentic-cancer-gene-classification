@@ -25,6 +25,7 @@ from src.models.schema import (
     ResolvedGene,
 )
 from src.observability import distribution, gene_latency_tag, increment, trace
+from src.pipeline.curation import apply_current_gene_overrides, has_curation_unavailable
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import (
     rank_literature_for_synthesis,
@@ -32,7 +33,12 @@ from src.pipeline.literature import (
     search_recent_pubmed_pmids,
 )
 from src.pipeline.llm_client import resolve_local_backend
-from src.pipeline.normalization import is_fusion_input, normalize_fusions
+from src.pipeline.normalization import (
+    gene_tumor_types,
+    is_fusion_input,
+    normalize_fusions,
+    split_input_tumor_types,
+)
 from src.pipeline.pmid_distillation import distill_and_save_pmid_evidence
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
@@ -537,18 +543,7 @@ def _normalize_fusion_inputs(
     Accept either plain strings or FusionInput objects.
     Returns (input_strings, tumor_type_by_input_string).
     """
-    input_strings: List[str] = []
-    tumor_type_map: Dict[str, str] = {}
-
-    for item in fusions:
-        if isinstance(item, str):
-            input_strings.append(item)
-        else:
-            input_strings.append(item.fusion)
-            if item.tumor_type:
-                tumor_type_map[item.fusion] = item.tumor_type
-
-    return input_strings, tumor_type_map
+    return split_input_tumor_types(fusions)
 
 
 async def run_pipeline(
@@ -609,13 +604,7 @@ async def run_pipeline(
     await _maybe_call_total(on_total_known, len(gene_map))
 
     # Build per-gene tumor_type: first non-null tumor_type from the gene's submitted inputs.
-    gene_tumor_type: Dict[str, Optional[str]] = {}
-    for canonical, (_, gene_inputs) in gene_map.items():
-        for f in gene_inputs:
-            tt = tumor_type_by_input.get(f)
-            if tt:
-                gene_tumor_type[canonical] = tt
-                break
+    gene_tumor_type = gene_tumor_types(gene_map, tumor_type_by_input)
 
     # Annotate genes with bounded fan-out. PubMed, Redis, and LLM paths still
     # enforce their own lower-level limits/caches.
@@ -730,6 +719,11 @@ async def run_pipeline(
     timings["annotation"] = _elapsed_ms(annotation_start)
 
     annotations.sort(key=lambda a: a.gene)
+    # Progress callbacks and gene_annotations only ever see pipeline output;
+    # curator overrides are overlaid once here, in one batched lookup (callers
+    # that store results keep the pipeline originals, see curation.py).
+    annotation_tumor_types = {a.gene: a.analysis_tumor_type for a in annotations}
+    annotations = await apply_current_gene_overrides(annotations, run_store)
     timings["total"] = _elapsed_ms(total_start)
     distribution("pipeline.duration_ms", timings["total"], tags=metric_tags)
 
@@ -740,4 +734,6 @@ async def run_pipeline(
         genes_annotated=len(annotations),
         annotations=annotations,
         timings_ms=timings,
+        annotation_tumor_types=annotation_tumor_types,
+        curation_unavailable=has_curation_unavailable(annotations),
     )

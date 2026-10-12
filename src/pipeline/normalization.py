@@ -10,11 +10,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import httpx
 
-from src.models.schema import ResolvedGene
+from src.models.schema import FusionInput, ResolvedGene
 from src.pipeline.cache import cached_call
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,41 @@ def split_fusion(fusion: str) -> Tuple[str, Optional[str]]:
     if len(parts) == 2:
         return parts[0].strip(), parts[1].strip()
     return parts[0].strip(), None
+
+
+def split_input_tumor_types(
+    fusions: Sequence[Union[str, FusionInput]],
+) -> Tuple[List[str], Dict[str, str]]:
+    """Input strings in order, plus each input string's tumor type. When the
+    same input string repeats, the LAST non-empty tumor type wins."""
+    input_strings: List[str] = []
+    tumor_type_by_input: Dict[str, str] = {}
+    for item in fusions:
+        if isinstance(item, str):
+            input_strings.append(item)
+        else:
+            input_strings.append(item.fusion)
+            if item.tumor_type:
+                tumor_type_by_input[item.fusion] = item.tumor_type
+    return input_strings, tumor_type_by_input
+
+
+def gene_tumor_types(
+    gene_map: Dict[str, Tuple[Any, List[str]]],
+    tumor_type_by_input: Dict[str, str],
+) -> Dict[str, Optional[str]]:
+    """The tumor type the pipeline annotates each canonical gene with: the
+    first tumor type among the gene's submitted inputs (None if none).
+
+    Shared by run_pipeline and legacy-run reconstruction (src/pipeline/
+    curation.py) so both apply exactly the same rule."""
+    return {
+        canonical: next(
+            (tumor_type_by_input[value] for value in gene_inputs if tumor_type_by_input.get(value)),
+            None,
+        )
+        for canonical, (_, gene_inputs) in gene_map.items()
+    }
 
 
 def is_fusion_input(value: str) -> bool:
