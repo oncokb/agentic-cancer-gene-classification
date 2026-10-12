@@ -8,16 +8,19 @@ Kept separate from run_store.py so curation tables evolve independently.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import pymysql
 
 from src.models.schema import CuratedOverride, CurationHistoryEntry
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 _CREATE_CURATED_OVERRIDES_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS curated_overrides (
@@ -59,6 +62,12 @@ _OVERRIDE_COLUMNS = (
 )
 
 SubjectId = Tuple[str, str, str]  # (subject_type, subject_key, tumor_type)
+
+# ER_LOCK_DEADLOCK / ER_LOCK_WAIT_TIMEOUT: concurrent first saves of the same
+# subject both take gap locks under SELECT ... FOR UPDATE and one deadlocks.
+_LOCK_RETRY_ERRNOS = frozenset({1213, 1205})
+_LOCK_RETRY_ATTEMPTS = 3
+_LOCK_RETRY_BACKOFF_SECONDS = 0.05
 
 
 class CurationVersionConflict(Exception):
@@ -141,6 +150,39 @@ class CurationStoreMixin:
         records = [_override_from_row(row) for row in rows]
         return {(r.subject_type, r.subject_key, r.tumor_type): r for r in records}
 
+    async def _current_override_version(self, subject_type: str, subject_key: str, tumor_type: str) -> int:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT version FROM curated_overrides "
+                    "WHERE subject_type = %s AND subject_key = %s AND tumor_type = %s",
+                    (subject_type, subject_key, tumor_type),
+                )
+                row = await cursor.fetchone()
+        return row[0] if row else 0
+
+    async def _with_lock_retry(self, attempt: Callable[[], Awaitable[T]], subject: SubjectId) -> T:
+        """Run a write transaction, retrying MySQL deadlocks/lock-wait timeouts.
+
+        When retries are exhausted, or a concurrent first save won the insert
+        race (IntegrityError), the caller's view is stale: re-read the current
+        version and raise CurationVersionConflict (HTTP 409), never a 500."""
+        for attempt_number in range(1, _LOCK_RETRY_ATTEMPTS + 1):
+            try:
+                return await attempt()
+            except pymysql.err.IntegrityError:
+                break
+            except pymysql.err.OperationalError as exc:
+                if not exc.args or exc.args[0] not in _LOCK_RETRY_ERRNOS:
+                    raise
+                logger.warning(
+                    "Curation write for %s hit MySQL lock error %s (attempt %d/%d)",
+                    subject, exc.args[0], attempt_number, _LOCK_RETRY_ATTEMPTS,
+                )
+                if attempt_number < _LOCK_RETRY_ATTEMPTS:
+                    await asyncio.sleep(_LOCK_RETRY_BACKOFF_SECONDS * attempt_number)
+        raise CurationVersionConflict(await self._current_override_version(*subject))
+
     async def save_curated_override(
         self,
         *,
@@ -157,6 +199,32 @@ class CurationStoreMixin:
 
         expected_version is the version the curator edited (0 when creating);
         raises CurationVersionConflict when it no longer matches."""
+        return await self._with_lock_retry(
+            lambda: self._save_curated_override_once(
+                subject_type=subject_type,
+                subject_key=subject_key,
+                tumor_type=tumor_type,
+                payload=payload,
+                curator_email=curator_email,
+                expected_version=expected_version,
+                pipeline_pmids_snapshot=pipeline_pmids_snapshot,
+                note=note,
+            ),
+            (subject_type, subject_key, tumor_type),
+        )
+
+    async def _save_curated_override_once(
+        self,
+        *,
+        subject_type: str,
+        subject_key: str,
+        tumor_type: str,
+        payload: Dict[str, Any],
+        curator_email: str,
+        expected_version: int,
+        pipeline_pmids_snapshot: Optional[List[str]],
+        note: Optional[str],
+    ) -> CuratedOverride:
         now = _utc_now()
         async with self._pool.acquire() as conn:
             await conn.begin()
@@ -217,10 +285,6 @@ class CurationStoreMixin:
                         ),
                     )
                 await conn.commit()
-            except pymysql.err.IntegrityError as exc:
-                # A concurrent first save inserted the same subject/version.
-                await conn.rollback()
-                raise CurationVersionConflict(expected_version + 1) from exc
             except BaseException:
                 await conn.rollback()
                 raise
@@ -250,7 +314,30 @@ class CurationStoreMixin:
         """Revert a subject to pipeline output, recording the revert in history.
 
         Returns the reverted-from version, or None when there was no override.
-        Raises CurationVersionConflict when expected_version is given and stale."""
+        Raises CurationVersionConflict when expected_version is given and stale,
+        including when the override it names was already reverted."""
+        return await self._with_lock_retry(
+            lambda: self._delete_curated_override_once(
+                subject_type=subject_type,
+                subject_key=subject_key,
+                tumor_type=tumor_type,
+                curator_email=curator_email,
+                expected_version=expected_version,
+                note=note,
+            ),
+            (subject_type, subject_key, tumor_type),
+        )
+
+    async def _delete_curated_override_once(
+        self,
+        *,
+        subject_type: str,
+        subject_key: str,
+        tumor_type: str,
+        curator_email: str,
+        expected_version: Optional[int],
+        note: Optional[str],
+    ) -> Optional[int]:
         now = _utc_now()
         async with self._pool.acquire() as conn:
             await conn.begin()
@@ -263,6 +350,8 @@ class CurationStoreMixin:
                     )
                     row = await cursor.fetchone()
                     if row is None:
+                        if expected_version is not None:
+                            raise CurationVersionConflict(0)
                         await conn.rollback()
                         return None
                     current_version = row[0]
