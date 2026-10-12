@@ -2911,3 +2911,29 @@ body.api-keys-body {
 .annotation-card:has(.curation-pending-refresh) .field-row {
   opacity: 0.45;
 }
+
+.curation-override-preview-section {
+  margin: 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 8px 12px;
+}
+
+.curation-override-preview-section h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.curation-override-preview dt {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.curation-override-preview dd {
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+}
