@@ -385,7 +385,7 @@ def test_statsd_omits_host_port_when_unconfigured(monkeypatch):
 
     observability._statsd()
 
-    assert captured == {"namespace": "acgc"}
+    assert captured == {"namespace": "acgc", **observability._STATSD_SENDER_KWARGS}
     assert "host" not in captured
     assert "port" not in captured
 
@@ -410,7 +410,7 @@ def test_statsd_uses_configured_host_port_when_set(monkeypatch):
 
     observability._statsd()
 
-    assert captured == {"namespace": "acgc", "host": "10.0.0.5", "port": 9125}
+    assert captured == {"namespace": "acgc", "host": "10.0.0.5", "port": 9125, **observability._STATSD_SENDER_KWARGS}
 
 
 def test_annotate_endpoint_records_user_header(monkeypatch):

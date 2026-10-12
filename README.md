@@ -785,6 +785,12 @@ Metrics emitted:
   cache token usage — Anthropic bills cache reads far cheaper than a fresh
   input token, so a low cache-read share relative to cache-creation points at
   wasted spend on repeated system prompts that aren't hitting cache.
+- `acgc.openevidence.*`: the OpenEvidence sidecar — endpoint outcomes and
+  response time, paid upstream calls/latency/retries (by `model`, `status`,
+  `source`), cache peeks, and the async lookup lifecycle (started, deduped,
+  completed, semaphore wait, time to ready). See
+  [docs/datadog/README.md](docs/datadog/README.md) for the full list and an
+  importable "OpenEvidence sidecar" dashboard widget group.
 
 Metric tags are intentionally low-cardinality: `mode`, `local_backend`,
 `tumor_type_present`, `cache_status`, `is_fusion`, `cache_name`, `result`,

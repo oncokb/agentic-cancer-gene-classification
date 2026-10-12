@@ -1,6 +1,7 @@
 """Shared test fixtures."""
 
 import sys
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -179,3 +180,15 @@ def fake_redis(monkeypatch):
     redis = FakeRedis()
     monkeypatch.setattr(cache_module, "_client", redis)
     return redis
+
+
+@pytest.fixture(autouse=True)
+def _reset_statsd_lifecycle(monkeypatch):
+    """Each test starts with a fresh (uninitialized, unpublished) shared
+    DogStatsd client lifecycle — a test that ran the app's lifespan leaves it
+    `closed`, which would otherwise turn later tests' metrics into no-ops."""
+    from src import observability
+
+    monkeypatch.setattr(observability, "_statsd_state", observability._UNINITIALIZED)
+    monkeypatch.setattr(observability, "_statsd_client", None)
+    monkeypatch.setattr(observability, "_statsd_shutdown", threading.Event())
