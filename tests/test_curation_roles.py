@@ -224,3 +224,15 @@ def test_api_key_without_live_profile_cannot_curate_even_with_privileged_jit_def
         assert client.get("/v1/api-keys?all=true", headers=_bearer(key)).status_code == 403  # not admin either
     finally:
         app.state.run_store = previous
+
+
+def test_reevaluate_jobs_require_curator(auth_on):
+    viewer = _session_client("viewer.reevaluate@mskcc.org", role="viewer")
+    body = {"subject_type": "gene", "subject_key": "ALK", "evidence_pmids": ["1"]}
+    post = viewer.post("/v1/curation/reevaluate/jobs", json=body)
+    assert post.status_code == 403
+    assert "Curator privileges required" in post.json()["detail"]
+    assert viewer.get("/v1/curation/reevaluate/jobs/missing").status_code == 403
+
+    curator = _session_client("curator.reevaluate@mskcc.org", role="curator")
+    assert curator.get("/v1/curation/reevaluate/jobs/missing").status_code == 404  # past auth
