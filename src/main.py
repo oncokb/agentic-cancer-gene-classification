@@ -103,6 +103,7 @@ from src.pipeline.curation import (
     ensure_annotation_tumor_types,
     has_curation_unavailable,
     overlay_annotation_result,
+    pipeline_original,
     pipeline_result,
     result_payload_for_storage,
 )
@@ -286,6 +287,9 @@ class AnnotationJobStatusResponse(BaseModel):
     timings_ms: Dict[str, float] = Field(default_factory=dict)
     # Set per poll: curator overrides could not be loaded (see curation.py).
     curation_unavailable: bool = False
+    # Tumor type each completed gene was annotated with (as on AnnotationResult),
+    # so lazy enrichment started mid-run can request the right curator override.
+    annotation_tumor_types: Dict[str, Optional[str]] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.monotonic, exclude=True)
     # Internal bookkeeping for callers that reuse this job store (e.g. the gene
     # query API): which endpoint family created the job and its request.
@@ -729,11 +733,15 @@ async def _overlay_annotation_job(job: AnnotationJobStatusResponse, run_store: A
     annotations = (
         result.annotations if result is not None else await apply_current_gene_overrides(job.annotations, run_store)
     )
+    tumor_types = {a.gene: pipeline_original(a).analysis_tumor_type for a in job.annotations}
+    if result is not None:
+        tumor_types.update(result.annotation_tumor_types)
     return job.model_copy(
         update={
             "annotations": annotations,
             "result": result,
             "curation_unavailable": has_curation_unavailable(annotations),
+            "annotation_tumor_types": tumor_types,
         }
     )
 
@@ -1808,13 +1816,23 @@ async def get_annotation_run(
         raise HTTPException(status_code=404, detail="Run not found")
     run_store = http_request.app.state.run_store
     result = AnnotationResult(**stored)
-    await ensure_annotation_tumor_types(result, run_store, run_id)
+    reconstructed = await ensure_annotation_tumor_types(result, run_store, run_id)
+    changed = False
     try:
         result, changed = await sanitize_annotation_result(result)
-        if changed:
-            await run_store.update_run_result(run_id, result_payload_for_storage(result))
     except Exception:
         logger.exception("Failed to sanitize stored run %s", run_id)
+    # Persist sanitization and/or newly confirmed tumor context. The map only
+    # ever holds confirmed entries, so unresolved genes are retried next time.
+    try:
+        if changed:
+            await run_store.update_run_result(run_id, result_payload_for_storage(result))
+        elif reconstructed:
+            await run_store.update_run_result(
+                run_id, {**stored, "annotation_tumor_types": dict(result.annotation_tumor_types)}
+            )
+    except Exception:
+        logger.exception("Failed to update stored run %s", run_id)
     # Runs are stored pipeline-pure; overlay the CURRENT curator overrides so
     # old shared links follow later curator edits and reverts.
     return await overlay_annotation_result(result, run_store)

@@ -1007,6 +1007,9 @@ async function pollAnnotationJob(statusUrl) {
       fusions_processed: status.fusions_processed,
       genes_annotated: status.genes_total || status.genes_completed,
       annotations: status.annotations || [],
+      // Completed genes' tumor context, so enrichment started mid-run gets the
+      // right tumor-scoped curator override.
+      annotation_tumor_types: status.annotation_tumor_types || {},
       fusion_evidence: state.currentResult?.fusion_evidence || [],
       timings_ms: status.timings_ms || {},
     };
