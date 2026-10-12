@@ -749,3 +749,7 @@ async def run_pipeline(
         annotation_tumor_types=annotation_tumor_types,
         curation_unavailable=has_curation_unavailable(annotations),
     )
+
+
+# Public helpers shared by draft re-evaluation; private names remain compatible.
+format_gene_identity = _format_gene_identity
