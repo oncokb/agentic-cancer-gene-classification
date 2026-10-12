@@ -25,7 +25,7 @@ from src.models.schema import (
     ResolvedGene,
 )
 from src.observability import distribution, gene_latency_tag, increment, trace
-from src.pipeline.curation import apply_current_gene_override
+from src.pipeline.curation import apply_current_gene_overrides, has_curation_unavailable
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import (
     rank_literature_for_synthesis,
@@ -703,9 +703,7 @@ async def run_pipeline(
             distribution("gene.queue_wait_ms", queue_wait_ms, tags=gene_tags)
         annotation.analysis_tumor_type = tumor_type
         annotation.symbol_lookup_failed = resolved_gene.lookup_failed
-        # Overlay any curator override only now, after the reuse/save paths
-        # above, so gene_annotations always holds pure pipeline output.
-        return await apply_current_gene_override(annotation, run_store, tumor_type)
+        return annotation
 
     tasks = [
         asyncio.create_task(annotate_one(canonical, resolved_gene, gene_inputs))
@@ -733,6 +731,11 @@ async def run_pipeline(
     timings["annotation"] = _elapsed_ms(annotation_start)
 
     annotations.sort(key=lambda a: a.gene)
+    # Progress callbacks and gene_annotations only ever see pipeline output;
+    # curator overrides are overlaid once here, in one batched lookup (callers
+    # that store results keep the pipeline originals, see curation.py).
+    annotation_tumor_types = {a.gene: a.analysis_tumor_type for a in annotations}
+    annotations = await apply_current_gene_overrides(annotations, run_store)
     timings["total"] = _elapsed_ms(total_start)
     distribution("pipeline.duration_ms", timings["total"], tags=metric_tags)
 
@@ -743,4 +746,6 @@ async def run_pipeline(
         genes_annotated=len(annotations),
         annotations=annotations,
         timings_ms=timings,
+        annotation_tumor_types=annotation_tumor_types,
+        curation_unavailable=has_curation_unavailable(annotations),
     )

@@ -692,6 +692,13 @@ class AnnotationResult(BaseModel):
     annotations: List[GeneAnnotation]
     fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    # Tumor type the pipeline annotated each gene with (canonical gene ->
+    # tumor type or null). Persisted with the run so a shared link finds each
+    # gene's tumor-scoped curator override; empty on runs saved before it.
+    annotation_tumor_types: Dict[str, Optional[str]] = Field(default_factory=dict)
+    # True when curator overrides could not be loaded, so some results show
+    # pipeline output only (those carry a `curation_unavailable` quality flag).
+    curation_unavailable: bool = False
 
 
 FeedbackCategory = Literal["bug", "feature_request", "gene_annotation_issue", "other"]

@@ -29,14 +29,15 @@ from src.models.schema import (
 from src.pipeline import curation, orchestrator, result_sanitizer
 from src.pipeline.curation import (
     CURATED_RETRACTED_FLAG,
+    CURATION_UNAVAILABLE_FLAG,
     NEWER_EVIDENCE_FLAG,
     apply_current_gene_overrides,
     apply_fusion_override,
     apply_override,
     normalize_subject_key,
-    preserve_curated_fields,
     result_payload_for_storage,
 )
+from src.pipeline.normalization import split_fusion
 from src.pipeline.curation_store import CurationVersionConflict
 from src.pipeline.orchestrator import run_pipeline
 
@@ -55,9 +56,17 @@ class FakeCurationStore:
         self.checked: List[Any] = []
         self.runs: Dict[str, Dict[str, Any]] = {}
         self.requests: Dict[str, Dict[str, Any]] = {}
+        self.fail_curation = False  # simulate the curation tables being unreachable
+        self.lookup_calls = 0
+
+    def _maybe_fail(self) -> None:
+        if self.fail_curation:
+            raise RuntimeError("curation tables unreachable")
 
     # -- curation -----------------------------------------------------------
     async def get_curated_overrides(self, subject_type, keys):
+        self._maybe_fail()
+        self.lookup_calls += 1
         found = {}
         for key, tumor_type in keys:
             override = self.overrides.get((subject_type, key, tumor_type))
@@ -66,6 +75,7 @@ class FakeCurationStore:
         return found
 
     async def get_curated_override(self, subject_type, subject_key, tumor_type):
+        self._maybe_fail()
         return self.overrides.get((subject_type, subject_key, tumor_type))
 
     def _max_history_version(self, subject) -> int:
@@ -76,6 +86,7 @@ class FakeCurationStore:
 
     async def save_curated_override(self, *, subject_type, subject_key, tumor_type, payload, curator_email,
                                     expected_version, pipeline_pmids_snapshot, note=None):
+        self._maybe_fail()
         subject = (subject_type, subject_key, tumor_type)
         current = self.overrides.get(subject)
         current_version = current.version if current else 0
@@ -96,9 +107,12 @@ class FakeCurationStore:
 
     async def delete_curated_override(self, *, subject_type, subject_key, tumor_type, curator_email,
                                       expected_version=None, note=None):
+        self._maybe_fail()
         subject = (subject_type, subject_key, tumor_type)
         current = self.overrides.get(subject)
         if current is None:
+            if expected_version is not None:
+                raise CurationVersionConflict(0)
             return None
         if expected_version is not None and expected_version != current.version:
             raise CurationVersionConflict(current.version)
@@ -110,6 +124,7 @@ class FakeCurationStore:
         return current.version
 
     async def list_curation_history(self, subject_type, subject_key, tumor_type):
+        self._maybe_fail()
         entries = [e for e in self.history if (e.subject_type, e.subject_key, e.tumor_type)
                    == (subject_type, subject_key, tumor_type)]
         return sorted(entries, key=lambda e: e.version, reverse=True)
@@ -169,6 +184,22 @@ async def _no_retractions(pmids):
     return set()
 
 
+ALIASES = {"MOZ": "KAT6A"}
+
+
+async def _fake_normalize_fusions(inputs, **_kwargs):
+    """HGNC normalization stand-in: split fusions, map known aliases."""
+    gene_map: Dict[str, Any] = {}
+    for value in inputs:
+        five, three = split_fusion(value)
+        for symbol in (five, three):
+            if symbol:
+                canonical = ALIASES.get(symbol.upper(), symbol.upper())
+                entry = gene_map.setdefault(canonical, (ResolvedGene(input_symbol=symbol, resolved=True), []))
+                entry[1].append(value)
+    return gene_map
+
+
 @pytest.fixture
 def store(monkeypatch):
     fake = FakeCurationStore()
@@ -177,6 +208,7 @@ def store(monkeypatch):
     monkeypatch.setattr(curation_routes.literature, "_efetch", _fake_efetch)
     monkeypatch.setattr(curation, "find_retracted_pmids", _no_retractions)
     monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", _no_retractions)
+    monkeypatch.setattr(curation, "normalize_fusions", _fake_normalize_fusions)
     yield fake
     main.app.state.run_store = previous
 
@@ -408,7 +440,7 @@ def test_apply_override_strips_retracted_curated_pmids_with_flag():
     assert curated.citations == ["222"]
     assert [card.pmid for card in curated.evidence_cards] == ["222"]
     assert curated.supporting_quotes == []
-    assert curated.clinical_actionability.pmids == [] and curated.clinical_actionability.evidence == []
+    assert curated.clinical_actionability is None  # every curated precedent was retracted
     codes = {flag.code: flag for flag in curated.quality_flags}
     assert "666" in codes[CURATED_RETRACTED_FLAG].detail and codes[CURATED_RETRACTED_FLAG].severity == "critical"
     assert "retracted_citations_removed" in codes
@@ -473,24 +505,29 @@ async def test_apply_current_overrides_checks_curated_pmids_for_retraction(monke
     assert applied[1] is other
 
 
-async def test_override_lookup_failure_fails_open():
-    class BrokenStore:
-        async def get_curated_overrides(self, subject_type, keys):
-            raise RuntimeError("db down")
-
+async def test_override_lookup_failure_is_flagged_not_silent(caplog):
+    store = FakeCurationStore()
+    store.fail_curation = True
     annotation = _pipeline_annotation()
-    assert (await apply_current_gene_overrides([annotation], BrokenStore(), ["luad"]))[0] is annotation
+    (flagged,) = await apply_current_gene_overrides([annotation], store, ["luad"])
+    flag = next(flag for flag in flagged.quality_flags if flag.code == CURATION_UNAVAILABLE_FLAG)
+    assert flag.severity == "critical" and "could not be loaded" in flag.detail
+    assert not flagged.curated and annotation.quality_flags == []  # input untouched
+    assert flagged._pipeline_annotation is annotation  # stored runs stay pure
+    assert any(r.levelname == "ERROR" and "lookup failed" in r.message for r in caplog.records)
     # Stores without curation support (e.g. the benchmark store) are a no-op.
     assert (await apply_current_gene_overrides([annotation], object(), ["luad"]))[0] is annotation
 
 
-def test_preserve_curated_fields_through_enrichment():
-    original = apply_override(_pipeline_annotation(), _override({"citations": ["222"]}))
-    enriched = _pipeline_annotation(gene_summary="Enriched summary.", citations=["111", "444"])
-    kept = preserve_curated_fields(enriched, original)
-    assert kept.citations == ["222"] and kept.gene_summary == "Enriched summary."
-    assert kept.curated and kept.curated_fields == ["citations"]
-    assert preserve_curated_fields(enriched, _pipeline_annotation()) is enriched
+def test_retracting_every_curated_precedent_clears_actionability():
+    override = _override({"therapeutic_precedent": {"summary": "Stale.", "precedents": [{"pmid": "666"}]}})
+    curated = apply_override(_pipeline_annotation(), override, retracted_pmids={"666"})
+    assert curated.clinical_actionability is None
+    assert any(flag.code == CURATED_RETRACTED_FLAG for flag in curated.quality_flags)
+    # A partially retracted precedent keeps the remaining, verified PMIDs.
+    override = _override({"therapeutic_precedent": {"precedents": [{"pmid": "666"}, {"pmid": "333"}]}})
+    curated = apply_override(_pipeline_annotation(), override, retracted_pmids={"666"})
+    assert curated.clinical_actionability.pmids == ["333"]
 
 
 def test_result_payload_for_storage_is_pipeline_pure():
@@ -656,3 +693,262 @@ def test_quality_flag_model_unchanged_for_pipeline_results():
     assert legacy.curated is False and legacy.quality_flags == []
     assert GeneAnnotation(gene="ALK").curated_fields == []
     assert isinstance(QualityFlag(code="x", label="y"), QualityFlag)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: live overrides on every poll, enrichment, aliases,
+# unavailable curation, stale reverts, batching
+# ---------------------------------------------------------------------------
+
+
+def _poll(client, url: str) -> Dict[str, Any]:
+    for _ in range(200):
+        body = client.get(url).json()
+        if body["status"] in ("complete", "failed"):
+            return body
+        time.sleep(0.01)
+    raise AssertionError(f"job at {url} did not finish")
+
+
+def _fake_pipeline(tumor_type: Optional[str] = "LUAD"):
+    async def fake_run_pipeline(fusions, on_annotation=None, **_kwargs):
+        annotation = _pipeline_annotation()
+        annotation.analysis_tumor_type = tumor_type
+        if on_annotation:
+            await on_annotation(annotation)
+        return AnnotationResult(run_id="run-job", timestamp=NOW, fusions_processed=1, genes_annotated=1,
+                                annotations=[annotation], annotation_tumor_types={"ALK": tumor_type})
+
+    return fake_run_pipeline
+
+
+def test_annotation_job_poll_reflects_post_completion_edit_retraction_and_revert(client, store, monkeypatch):
+    monkeypatch.setattr(main, "run_pipeline", _fake_pipeline())
+    url = client.post("/v1/annotate/jobs", json={"fusions": [{"fusion": "ALK", "tumor_type": "LUAD"}]}).json()[
+        "status_url"
+    ]
+    job = _poll(client, url)
+    assert job["annotations"][0]["curated"] is False and job["result"]["annotations"][0]["curated"] is False
+
+    # Edit after the job finished -> next poll shows it, in both annotations and result.
+    client.put("/v1/curation/gene/ALK?tumor_type=LUAD", json={"payload": {"citations": ["222", "333"]}})
+    job = client.get(url).json()
+    assert job["annotations"][0]["citations"] == ["222", "333"]
+    assert job["result"]["annotations"][0]["curation_version"] == 1
+
+    # A curated PMID retracted later is stripped on the next poll.
+    async def retract_333(pmids):
+        return {"333"} & set(pmids)
+
+    monkeypatch.setattr(curation, "find_retracted_pmids", retract_333)
+    job = client.get(url).json()
+    assert job["annotations"][0]["citations"] == ["222"]
+    assert CURATED_RETRACTED_FLAG in [f["code"] for f in job["annotations"][0]["quality_flags"]]
+
+    # Revert -> pipeline output again; the stored run never held curated content.
+    client.delete("/v1/curation/gene/ALK?tumor_type=LUAD")
+    job = client.get(url).json()
+    assert job["annotations"][0]["curated"] is False and job["annotations"][0]["citations"] == ["111"]
+    assert store.runs["run-job"]["annotations"][0]["curated"] is False
+
+
+def test_gene_query_job_poll_reflects_post_completion_edit(client, store, monkeypatch):
+    monkeypatch.setattr(main, "run_pipeline", _fake_pipeline(tumor_type=None))
+    url = client.post("/v1/genes/query/jobs", json={"genes": ["ALK"]}).json()["status_url"]
+    assert _poll(client, url)["results"][0]["curated"] is False
+
+    client.put("/v1/curation/gene/ALK", json={"payload": {"citations": ["222"]}})
+    result = client.get(url).json()["results"][0]
+    assert result["curated"] is True and result["citation_pmids"] == ["222"]
+    assert result["curated_by"] == "local@internal" and result["curation_version"] == 1
+    assert result["curated_fields"] == ["citations"] and result["curated_at"]
+
+    client.delete("/v1/curation/gene/ALK")
+    assert client.get(url).json()["results"][0]["curated"] is False
+
+
+def test_fusion_job_poll_reflects_post_completion_edit(client, store, monkeypatch):
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None):
+        return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, pmids=["111"], interpretation="Pipeline.")
+
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_fusion_evidence)
+    monkeypatch.setattr(curation_routes.literature, "retrieve_fusion_evidence", fake_fusion_evidence)
+    url = client.post("/v1/fusion-evidence/jobs", json={"fusions": ["EML4::ALK"]}).json()["status_url"]
+    assert _poll(client, url)["fusion_evidence"][0]["curated"] is False
+
+    client.put("/v1/curation/fusion/EML4::ALK", json={"payload": {"interpretation": "Curated."}})
+    assert client.get(url).json()["fusion_evidence"][0]["interpretation"] == "Curated."
+    client.delete("/v1/curation/fusion/EML4::ALK")
+    assert client.get(url).json()["fusion_evidence"][0]["interpretation"] == "Pipeline."
+
+
+@pytest.fixture
+def fake_enrichment(monkeypatch):
+    from src.pipeline import enrichment
+
+    async def fake_retrieve(gene, fusions, **_kwargs):
+        return [], "tier1"
+
+    async def fake_select(gene, records, limit, **_kwargs):
+        return records
+
+    async def fake_synthesize(**_kwargs):
+        return {}
+
+    def fake_build(**kwargs):
+        return _pipeline_annotation(gene=kwargs["gene"], gene_summary="Enriched summary.")
+
+    monkeypatch.setattr(enrichment, "retrieve_literature", fake_retrieve)
+    monkeypatch.setattr(enrichment, "get_msk_genie_prevalence", lambda gene: None)
+    monkeypatch.setattr(enrichment, "rank_literature_for_synthesis", lambda records, *a: (records, []))
+    monkeypatch.setattr(enrichment, "select_papers_for_synthesis", fake_select)
+    monkeypatch.setattr(enrichment, "synthesize_gene_annotation", fake_synthesize)
+    monkeypatch.setattr(enrichment, "build_gene_annotation", fake_build)
+
+
+def test_enrichment_ignores_forged_curation_and_applies_live_override(client, store, fake_enrichment):
+    forged = GeneAnnotation(
+        gene="ALK", in_oncokb=True, citations=["999"], cancer_association_rationale="Forged.",
+        curated=True, curated_by="mallory@mskcc.org", curation_version=42, curated_fields=["citations"],
+        quality_flags=[QualityFlag(code=NEWER_EVIDENCE_FLAG, label="forged")],
+    ).model_dump()
+
+    # No override exists: forged curation metadata and content are dropped.
+    url = client.post("/v1/annotate/enrichment/jobs", json={"annotations": [forged]}).json()["status_url"]
+    enriched = _poll(client, url)["annotations"][0]
+    assert enriched["curated"] is False and enriched["curated_by"] is None and enriched["curated_fields"] == []
+    assert enriched["citations"] == ["111"] and enriched["cancer_association_rationale"] == "Pipeline rationale."
+    assert enriched["quality_flags"] == []
+
+    # A live, tumor-scoped override is applied server-side using the tumor context...
+    client.put("/v1/curation/gene/ALK?tumor_type=LUAD", json={"payload": {"citations": ["222"]}})
+    url = client.post(
+        "/v1/annotate/enrichment/jobs", json={"annotations": [forged], "tumor_types": {"ALK": "LUAD"}}
+    ).json()["status_url"]
+    enriched = _poll(client, url)["annotations"][0]
+    assert enriched["curated"] is True and enriched["curated_by"] == "local@internal"
+    assert enriched["citations"] == ["222"] and enriched["gene_summary"] == "Enriched summary."
+
+    # ...and a later revert shows up on the next poll.
+    client.delete("/v1/curation/gene/ALK?tumor_type=LUAD")
+    assert client.get(url).json()["annotations"][0]["curated"] is False
+
+
+def test_new_runs_persist_tumor_context_used_by_shared_links(client, store, monkeypatch):
+    async def fake_run_pipeline(fusions, **_kwargs):
+        annotation = _pipeline_annotation(gene="KAT6A")
+        annotation.analysis_tumor_type = "AML"
+        return AnnotationResult(run_id="run-map", timestamp=NOW, fusions_processed=1, genes_annotated=1,
+                                annotations=[annotation], annotation_tumor_types={"KAT6A": "AML"})
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    client.post("/v1/annotate", json={"fusions": [{"fusion": "MOZ", "tumor_type": "AML"}]})
+    assert store.runs["run-map"]["annotation_tumor_types"] == {"KAT6A": "AML"}
+    store.requests["run-map"] = {}  # the persisted map alone must be enough
+
+    store.overrides[("gene", "KAT6A", "aml")] = _override({"citations": ["222"]}, key="KAT6A", tumor_type="aml")
+    served = client.get("/v1/annotate/run-map").json()
+    assert served["annotations"][0]["curated"] is True
+    assert served["annotation_tumor_types"] == {"KAT6A": "AML"}
+
+
+def test_old_shared_link_resolves_alias_inputs_to_tumor_scoped_override(client, store):
+    # Saved before annotation_tumor_types existed; the input was the alias MOZ.
+    stored = AnnotationResult(
+        run_id="run-alias", timestamp=NOW, fusions_processed=2, genes_annotated=2,
+        annotations=[_pipeline_annotation(gene="KAT6A"), GeneAnnotation(gene="BRAF")],
+    ).model_dump()
+    del stored["annotation_tumor_types"]
+    store.runs["run-alias"] = stored
+    store.requests["run-alias"] = {"fusions": [{"fusion": "MOZ", "tumor_type": "AML"}, "BRAF"]}
+    store.overrides[("gene", "KAT6A", "aml")] = _override({"citations": ["222"]}, key="KAT6A", tumor_type="aml")
+    store.overrides[("gene", "KAT6A", "")] = _override({"citations": ["333"]}, key="KAT6A", tumor_type="")
+
+    served = client.get("/v1/annotate/run-alias").json()
+    assert served["annotations"][0]["citations"] == ["222"]  # the AML override, not the untyped one
+    assert served["annotations"][1]["curated"] is False
+    assert served["annotation_tumor_types"] == {"KAT6A": "AML", "BRAF": None}
+
+
+def test_curation_unavailable_is_flagged_on_runs_and_jobs_and_503_on_curation_api(client, store, monkeypatch):
+    store.runs["run-down"] = AnnotationResult(
+        run_id="run-down", timestamp=NOW, fusions_processed=1, genes_annotated=1,
+        annotations=[_pipeline_annotation()], annotation_tumor_types={"ALK": "LUAD"},
+        fusion_evidence=[FusionEvidenceResult(fusion="EML4::ALK")],
+    ).model_dump()
+    store.fail_curation = True
+
+    served = client.get("/v1/annotate/run-down").json()
+    assert served["curation_unavailable"] is True
+    assert CURATION_UNAVAILABLE_FLAG in [f["code"] for f in served["annotations"][0]["quality_flags"]]
+    assert CURATION_UNAVAILABLE_FLAG in [f["code"] for f in served["fusion_evidence"][0]["quality_flags"]]
+    # The stored run is not polluted with the flag.
+    assert store.runs["run-down"]["annotations"][0]["quality_flags"] == []
+
+    monkeypatch.setattr(main, "run_pipeline", _fake_pipeline())
+    url = client.post("/v1/annotate/jobs", json={"fusions": ["ALK"]}).json()["status_url"]
+    job = _poll(client, url)
+    assert job["curation_unavailable"] is True and job["result"]["curation_unavailable"] is True
+
+    assert client.get("/v1/curation/gene/ALK").status_code == 503
+    assert client.get("/v1/curation/gene/ALK/history").status_code == 503
+    assert client.put("/v1/curation/gene/ALK", json={"payload": {"citations": ["222"]}}).status_code == 503
+    assert client.delete("/v1/curation/gene/ALK").status_code == 503
+
+
+def test_stale_delete_of_already_reverted_override_is_409(client, store):
+    client.put("/v1/curation/gene/ALK", json={"payload": {"citations": ["222"]}})
+    assert client.delete("/v1/curation/gene/ALK?expected_version=1").status_code == 200
+    stale = client.delete("/v1/curation/gene/ALK?expected_version=1")
+    assert stale.status_code == 409 and stale.json()["detail"]["current_version"] == 0
+    assert client.delete("/v1/curation/gene/ALK").status_code == 404  # no version given: nothing to revert
+
+
+async def test_run_pipeline_batches_override_lookup_and_retraction_check(pipeline_env, monkeypatch):
+    genes = ["ALK", "BRAF", "EGFR"]
+
+    async def fake_normalize_fusions(_inputs, **_kwargs):
+        return {gene: (_resolved(gene), [gene]) for gene in genes}
+
+    async def fake_annotate_gene(**kwargs):
+        return _pipeline_annotation(gene=kwargs["gene"], cache_status="refreshed")
+
+    retraction_calls = []
+
+    async def fake_retracted(pmids):
+        retraction_calls.append(sorted(pmids))
+        return set()
+
+    monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
+    monkeypatch.setattr(curation, "find_retracted_pmids", fake_retracted)
+    store = FakeCurationStore()
+    for gene in ("ALK", "BRAF"):
+        store.overrides[("gene", gene, "")] = _override({"citations": ["222", "333"]}, key=gene, tumor_type="")
+    progress = []
+
+    result = await run_pipeline(genes, run_store=store, on_annotation=progress.append)
+
+    assert store.lookup_calls == 1
+    assert retraction_calls == [["222", "333"]]
+    assert [a.curated for a in result.annotations] == [True, True, False]
+    assert result.annotation_tumor_types == {"ALK": None, "BRAF": None, "EGFR": None}
+    assert result.curation_unavailable is False
+    # Progress callbacks (and so job storage) only ever see pipeline output.
+    assert not any(a.curated for a in progress)
+
+
+async def test_run_pipeline_reports_curation_unavailable(pipeline_env, monkeypatch):
+    async def fake_annotate_gene(**_kwargs):
+        return _pipeline_annotation(cache_status="refreshed")
+
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
+    store = FakeCurationStore()
+    store.fail_curation = True
+    result = await run_pipeline(["ALK"], run_store=store)
+    assert result.curation_unavailable is True
+    assert CURATION_UNAVAILABLE_FLAG in [f.code for f in result.annotations[0].quality_flags]
+    # Neither gene_annotations nor the stored-run payload carries the flag.
+    assert store.saved_gene_annotations[0].quality_flags == []
+    stored = result_payload_for_storage(result)
+    assert stored["curation_unavailable"] is False and stored["annotations"][0]["quality_flags"] == []

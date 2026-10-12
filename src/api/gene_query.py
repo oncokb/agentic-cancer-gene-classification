@@ -171,6 +171,13 @@ class GeneRationale(BaseModel):
         default=False,
         description="True when a curator override replaced part of this result (e.g. rationale, citations).",
     )
+    curated_by: Optional[str] = Field(default=None, description="Email of the curator who last edited it.")
+    curated_at: Optional[str] = Field(default=None, description="When the curator override was last saved.")
+    curation_version: Optional[int] = Field(default=None, description="Version of the curator override applied.")
+    curated_fields: List[str] = Field(
+        default_factory=list,
+        description="Sections the curator replaced, e.g. `citations`, `cancer_association_rationale`.",
+    )
     error: Optional[str] = Field(default=None, description="Set when this gene could not be annotated.")
 
 
@@ -180,6 +187,10 @@ class GeneQueryResponse(BaseModel):
     run_id: str = Field(..., description="ID of the saved annotation run.")
     view_url: str = Field(..., description="Absolute link that opens the full run in the ACGC UI (requires login).")
     results: List[GeneRationale] = Field(default_factory=list, description="One entry per annotated gene.")
+    curation_unavailable: bool = Field(
+        default=False,
+        description="True when curator edits could not be loaded, so some results show pipeline output only.",
+    )
 
 
 class GeneQueryJobCreateResponse(BaseModel):
@@ -203,6 +214,10 @@ class GeneQueryJobStatusResponse(BaseModel):
         default_factory=list, description="Slim results for genes completed so far."
     )
     error: Optional[str] = Field(default=None, description="Generic failure message when `status` is `failed`.")
+    curation_unavailable: bool = Field(
+        default=False,
+        description="True when curator edits could not be loaded, so some results show pipeline output only.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +280,10 @@ def to_gene_rationale(annotation: GeneAnnotation) -> GeneRationale:
         cache_status=annotation.cache_status,
         cached_at=annotation.cached_at,
         curated=annotation.curated,
+        curated_by=annotation.curated_by,
+        curated_at=annotation.curated_at,
+        curation_version=annotation.curation_version,
+        curated_fields=list(annotation.curated_fields),
         error=_slim_error(annotation),
     )
 
@@ -370,6 +389,7 @@ def _response(http_request: Request, result: AnnotationResult) -> GeneQueryRespo
         run_id=result.run_id,
         view_url=_app()._run_view_url(http_request, result.run_id),
         results=[to_gene_rationale(annotation) for annotation in result.annotations],
+        curation_unavailable=result.curation_unavailable,
     )
 
 
@@ -431,7 +451,8 @@ async def get_gene_query_job(
         job = None
     if job is None or job.kind != "gene_query":
         raise HTTPException(status_code=404, detail="Gene query job not found")
-
+    # Overlay the CURRENT curator overrides on every poll (job storage is pipeline-pure).
+    job = await app._overlay_annotation_job(job, http_request.app.state.run_store)
 
     run_id = job.result.run_id if job.status == "complete" and job.result else None
     return GeneQueryJobStatusResponse(
@@ -443,6 +464,7 @@ async def get_gene_query_job(
         view_url=app._run_view_url(http_request, run_id) if run_id else None,
         results=[to_gene_rationale(annotation) for annotation in job.annotations],
         error=GENERIC_FAILURE if job.status == "failed" else None,
+        curation_unavailable=job.curation_unavailable,
     )
 
 

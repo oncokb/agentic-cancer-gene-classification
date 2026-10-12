@@ -100,8 +100,10 @@ from src.pipeline.cache import cached_call
 from src.pipeline.curation import (
     apply_current_fusion_overrides,
     apply_current_gene_overrides,
-    preserve_curated_fields,
-    restore_run_tumor_types,
+    ensure_annotation_tumor_types,
+    has_curation_unavailable,
+    overlay_annotation_result,
+    pipeline_result,
     result_payload_for_storage,
 )
 from src.pipeline.enrichment import enrich_gene_annotations
@@ -282,6 +284,8 @@ class AnnotationJobStatusResponse(BaseModel):
     result: Optional[AnnotationResult] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    # Set per poll: curator overrides could not be loaded (see curation.py).
+    curation_unavailable: bool = False
     created_at: float = Field(default_factory=time.monotonic, exclude=True)
     # Internal bookkeeping for callers that reuse this job store (e.g. the gene
     # query API): which endpoint family created the job and its request.
@@ -337,6 +341,13 @@ class EnrichmentRequest(BaseModel):
         default=None,
         description="Optional local agent backend for enrichment LLM calls.",
     )
+    tumor_types: Dict[str, Optional[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Tumor type each gene was annotated with (AnnotationResult.annotation_tumor_types), "
+            "used to apply that gene's tumor-scoped curator override to the enriched result."
+        ),
+    )
 
 
 class EnrichmentJobStatusResponse(BaseModel):
@@ -347,6 +358,7 @@ class EnrichmentJobStatusResponse(BaseModel):
     annotations: List[GeneAnnotation] = Field(default_factory=list)
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    curation_unavailable: bool = False
 
 
 class FusionEvidenceJobRequest(AnnotateRequest):
@@ -372,6 +384,7 @@ class FusionEvidenceJobStatusResponse(BaseModel):
     fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    curation_unavailable: bool = False
     created_at: float = Field(default_factory=time.monotonic, exclude=True)
 
 
@@ -705,6 +718,24 @@ async def _get_fusion_evidence_job(job_id: str) -> FusionEvidenceJobStatusRespon
     if job is None:
         raise HTTPException(status_code=404, detail="Fusion evidence job not found")
     return job
+
+
+# Job stores hold pipeline output only; every poll overlays the CURRENT curator
+# overrides, so edits, reverts and retractions after a job finished still show.
+
+
+async def _overlay_annotation_job(job: AnnotationJobStatusResponse, run_store: Any) -> AnnotationJobStatusResponse:
+    result = await overlay_annotation_result(job.result, run_store) if job.result else None
+    annotations = (
+        result.annotations if result is not None else await apply_current_gene_overrides(job.annotations, run_store)
+    )
+    return job.model_copy(
+        update={
+            "annotations": annotations,
+            "result": result,
+            "curation_unavailable": has_curation_unavailable(annotations),
+        }
+    )
 
 
 def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
@@ -1497,10 +1528,11 @@ async def _launch_annotation_job(
                 await _save_run_result(http_request, request.model_dump(), result)
             else:
                 await _persist_run_result(http_request, request.model_dump(), result)
+            stored = pipeline_result(result)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
-            current.result = result
-            current.annotations = result.annotations
+            current.result = stored
+            current.annotations = stored.annotations
             current.genes_completed = result.genes_annotated
             current.genes_total = result.genes_annotated
             current.timings_ms = result.timings_ms
@@ -1550,9 +1582,11 @@ async def create_annotation_job(
 @app.get("/v1/annotate/jobs/{job_id}", response_model=AnnotationJobStatusResponse)
 async def get_annotation_job(
     job_id: str,
+    http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> AnnotationJobStatusResponse:
-    return await _get_annotation_job(job_id)
+    job = await _get_annotation_job(job_id)
+    return await _overlay_annotation_job(job, http_request.app.state.run_store)
 
 
 @app.post("/v1/annotate/enrichment/jobs", response_model=EnrichmentJobCreateResponse)
@@ -1569,14 +1603,15 @@ async def create_enrichment_job(
     )
     await _store_enrichment_job(job)
 
-    originals = {annotation.gene: annotation for annotation in request.annotations}
-
-    def keep_curated(annotation: GeneAnnotation) -> GeneAnnotation:
-        original = originals.get(annotation.gene)
-        return preserve_curated_fields(annotation, original) if original else annotation
+    # Enrichment rebuilds each annotation from scratch, so nothing the client
+    # sent about curation survives; the job keeps that pipeline output (with the
+    # gene's tumor context) and polls overlay the live override server-side.
+    def with_tumor_context(annotation: GeneAnnotation) -> GeneAnnotation:
+        annotation.analysis_tumor_type = request.tumor_types.get(annotation.gene)
+        return annotation
 
     async def on_annotation(annotation: GeneAnnotation) -> None:
-        annotation = keep_curated(annotation)
+        annotation = with_tumor_context(annotation)
         current = await _get_enrichment_job(job_id)
         current.annotations.append(annotation)
         current.annotations.sort(key=lambda item: item.gene)
@@ -1595,7 +1630,7 @@ async def create_enrichment_job(
             )
             current = await _get_enrichment_job(job_id)
             current.status = "complete"
-            current.annotations = [keep_curated(annotation) for annotation in enriched]
+            current.annotations = [with_tumor_context(annotation) for annotation in enriched]
             current.annotations_completed = len(enriched)
             current.annotations_total = len(request.annotations)
             current.timings_ms = {
@@ -1622,9 +1657,14 @@ async def create_enrichment_job(
 @app.get("/v1/annotate/enrichment/jobs/{job_id}", response_model=EnrichmentJobStatusResponse)
 async def get_enrichment_job(
     job_id: str,
+    http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> EnrichmentJobStatusResponse:
-    return await _get_enrichment_job(job_id)
+    job = await _get_enrichment_job(job_id)
+    annotations = await apply_current_gene_overrides(job.annotations, http_request.app.state.run_store)
+    return job.model_copy(
+        update={"annotations": annotations, "curation_unavailable": has_curation_unavailable(annotations)}
+    )
 
 
 @app.post("/v1/fusion-evidence/jobs", response_model=FusionEvidenceJobCreateResponse)
@@ -1663,15 +1703,10 @@ async def create_fusion_evidence_job(
         try:
             semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
             tasks = [asyncio.create_task(run_one(item, semaphore)) for item in fusion_inputs]
-            # Pipeline-pure results are what gets persisted onto the run; the
-            # job serves them with any current curator override applied.
-            pipeline_results: List[FusionEvidenceResult] = []
             for task in asyncio.as_completed(tasks):
                 result = await task
-                pipeline_results.append(result)
-                (served,) = await apply_current_fusion_overrides([result], http_request.app.state.run_store)
                 current = await _get_fusion_evidence_job(job_id)
-                current.fusion_evidence.append(served)
+                current.fusion_evidence.append(result)
                 current.fusion_evidence.sort(key=lambda item: item.fusion)
                 current.fusions_completed = len(current.fusion_evidence)
                 await _store_fusion_evidence_job(current)
@@ -1682,8 +1717,7 @@ async def create_fusion_evidence_job(
             current.timings_ms = {"total": round((time.perf_counter() - start) * 1000, 2)}
             await _store_fusion_evidence_job(current)
             if request.run_id:
-                pipeline_results.sort(key=lambda item: item.fusion)
-                await _persist_fusion_evidence(http_request, request.run_id, pipeline_results)
+                await _persist_fusion_evidence(http_request, request.run_id, current.fusion_evidence)
         except Exception as exc:
             logger.exception("Fusion evidence job %s failed", job_id)
             current = await _get_fusion_evidence_job(job_id)
@@ -1701,9 +1735,14 @@ async def create_fusion_evidence_job(
 @app.get("/v1/fusion-evidence/jobs/{job_id}", response_model=FusionEvidenceJobStatusResponse)
 async def get_fusion_evidence_job(
     job_id: str,
+    http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> FusionEvidenceJobStatusResponse:
-    return await _get_fusion_evidence_job(job_id)
+    job = await _get_fusion_evidence_job(job_id)
+    fusion_evidence = await apply_current_fusion_overrides(job.fusion_evidence, http_request.app.state.run_store)
+    return job.model_copy(
+        update={"fusion_evidence": fusion_evidence, "curation_unavailable": has_curation_unavailable(fusion_evidence)}
+    )
 
 
 @app.post("/v1/annotate/gene", response_model=GeneAnnotationWithRun)
@@ -1769,7 +1808,7 @@ async def get_annotation_run(
         raise HTTPException(status_code=404, detail="Run not found")
     run_store = http_request.app.state.run_store
     result = AnnotationResult(**stored)
-    await restore_run_tumor_types(result, run_store, run_id)
+    await ensure_annotation_tumor_types(result, run_store, run_id)
     try:
         result, changed = await sanitize_annotation_result(result)
         if changed:
@@ -1778,9 +1817,7 @@ async def get_annotation_run(
         logger.exception("Failed to sanitize stored run %s", run_id)
     # Runs are stored pipeline-pure; overlay the CURRENT curator overrides so
     # old shared links follow later curator edits and reverts.
-    result.annotations = await apply_current_gene_overrides(result.annotations, run_store)
-    result.fusion_evidence = await apply_current_fusion_overrides(result.fusion_evidence, run_store)
-    return result
+    return await overlay_annotation_result(result, run_store)
 
 
 @app.post("/v1/fusion-context", response_model=FusionContextResponse)

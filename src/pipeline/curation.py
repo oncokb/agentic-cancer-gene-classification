@@ -14,8 +14,13 @@ wins, except that:
 Overrides are applied to what is served, never written into gene_annotations
 or the runs table: runs are persisted pipeline-pure (result_payload_for_storage)
 and re-overlaid with the CURRENT override when served, so shared links follow
-later edits and reverts. A stored run's per-gene tumor types are recovered
-from the run's request (restore_run_tumor_types).
+later edits and reverts. Job storage likewise keeps pipeline output and
+overlays on every poll. Each run stores the tumor type the pipeline used per
+gene (AnnotationResult.annotation_tumor_types); older runs replay it from
+their request (ensure_annotation_tumor_types).
+
+If overrides cannot be loaded, results are served as pipeline output with a
+critical `curation_unavailable` flag rather than silently.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ from src.models.schema import (
     QualityFlag,
 )
 from src.pipeline.literature import find_retracted_pmids
-from src.pipeline.normalization import FUSION_SEPARATORS, split_fusion
+from src.pipeline.normalization import FUSION_SEPARATORS, normalize_fusions, split_fusion
 from src.pipeline.result_sanitizer import strip_retracted_pmids_from_annotation
 
 logger = logging.getLogger(__name__)
@@ -47,6 +52,7 @@ SUBJECT_TYPES = (GENE, FUSION)
 
 NEWER_EVIDENCE_FLAG = "newer_pipeline_evidence"
 CURATED_RETRACTED_FLAG = "curated_retracted_pmids_removed"
+CURATION_UNAVAILABLE_FLAG = "curation_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +247,11 @@ def apply_override(
     removed = sorted(curated_pmids & retracted)
     if retracted:
         strip_retracted_pmids_from_annotation(curated, retracted)
+    actionability = curated.clinical_actionability
+    if actionability is not None and actionability.curated and not actionability.pmids:
+        # Every curator-verified precedent was retracted: drop the 1.0-confidence
+        # card rather than show it unsupported (the critical flag explains why).
+        curated.clinical_actionability = None
     if removed:
         _add_flag(curated.quality_flags, _curated_retracted_flag(removed))
 
@@ -296,25 +307,48 @@ def apply_fusion_override(
 
 
 # ---------------------------------------------------------------------------
-# Apply current overrides (store lookups; fail open)
+# Apply current overrides (store lookups)
 # ---------------------------------------------------------------------------
+
+
+def _curation_unavailable_flag() -> QualityFlag:
+    return QualityFlag(
+        code=CURATION_UNAVAILABLE_FLAG,
+        label="Curator edits unavailable",
+        severity="critical",
+        detail="Curator edits could not be loaded; showing pipeline output.",
+    )
+
+
+def has_curation_unavailable(items: Iterable[GeneAnnotation | FusionEvidenceResult]) -> bool:
+    return any(flag.code == CURATION_UNAVAILABLE_FLAG for item in items for flag in item.quality_flags)
+
+
+def pipeline_original(annotation: GeneAnnotation) -> GeneAnnotation:
+    """The pure pipeline annotation behind a served (overlaid) one."""
+    return annotation._pipeline_annotation or annotation
 
 
 async def _lookup_overrides(
     run_store: Any, subject_type: str, keys: List[Tuple[str, str]]
-) -> Dict[Tuple[str, str, str], CuratedOverride]:
+) -> Tuple[Dict[Tuple[str, str, str], CuratedOverride], bool]:
+    """(overrides by subject, lookup_failed). A store without curation support
+    (e.g. the benchmark store) is not a failure: it simply has no overrides."""
     getter = getattr(run_store, "get_curated_overrides", None) if run_store is not None else None
     if getter is None or not keys:
-        return {}
+        return {}, False
     try:
-        return await getter(subject_type, keys)
+        return await getter(subject_type, list(dict.fromkeys(keys))), False
     except Exception:
-        # Serving pipeline output beats failing the request; logged loudly.
-        logger.exception("Curated override lookup failed; serving pipeline output")
-        return {}
+        logger.error(
+            "Curated override lookup failed for %d %s subject(s); serving pipeline output flagged %s",
+            len(keys), subject_type, CURATION_UNAVAILABLE_FLAG, exc_info=True,
+        )
+        return {}, True
 
 
 async def _retracted_among(overrides: Iterable[CuratedOverride], subject_type: str) -> Set[str]:
+    """One deduplicated retraction check across every override in a batch."""
     pmids = _dedupe(
         pmid
         for override in overrides
@@ -337,24 +371,36 @@ def _gene_key(annotation: GeneAnnotation, tumor_type: Optional[str]) -> Optional
         return None
 
 
+def _flag_gene_unavailable(annotation: GeneAnnotation) -> GeneAnnotation:
+    flagged = annotation.model_copy(deep=True)
+    _add_flag(flagged.quality_flags, _curation_unavailable_flag())
+    flagged._pipeline_annotation = annotation
+    return flagged
+
+
 async def apply_current_gene_overrides(
     annotations: List[GeneAnnotation],
     run_store: Any,
     tumor_types: Optional[Sequence[Optional[str]]] = None,
 ) -> List[GeneAnnotation]:
-    """Overlay each annotation's current override (if any), in order.
+    """Overlay each annotation's CURRENT override (if any), in order, with one
+    batched lookup and one retraction check. Inputs are never mutated; an
+    already-overlaid annotation is re-overlaid from its pipeline original.
 
-    tumor_types aligns with annotations; it defaults to each annotation's
+    tumor_types aligns with annotations and defaults to each annotation's
     analysis_tumor_type. Pipeline retraction stripping must already be done."""
+    originals = [pipeline_original(annotation) for annotation in annotations]
     if tumor_types is None:
-        tumor_types = [annotation.analysis_tumor_type for annotation in annotations]
-    keys = [_gene_key(annotation, tt) for annotation, tt in zip(annotations, tumor_types)]
-    overrides = await _lookup_overrides(run_store, GENE, [key for key in keys if key])
+        tumor_types = [annotation.analysis_tumor_type for annotation in originals]
+    keys = [_gene_key(annotation, tt) for annotation, tt in zip(originals, tumor_types)]
+    overrides, failed = await _lookup_overrides(run_store, GENE, [key for key in keys if key])
+    if failed:
+        return [_flag_gene_unavailable(a) if key else a for a, key in zip(originals, keys)]
     if not overrides:
-        return list(annotations)
+        return originals
     retracted = await _retracted_among(overrides.values(), GENE)
     applied: List[GeneAnnotation] = []
-    for annotation, key in zip(annotations, keys):
+    for annotation, key in zip(originals, keys):
         override = overrides.get((GENE, *key)) if key else None
         if override is None:
             applied.append(annotation)
@@ -362,28 +408,30 @@ async def apply_current_gene_overrides(
         try:
             applied.append(apply_override(annotation, override, retracted))
         except Exception:
-            logger.exception("Failed to apply curated override for %s", annotation.gene)
-            applied.append(annotation)
+            logger.error("Failed to apply curated override for %s", annotation.gene, exc_info=True)
+            applied.append(_flag_gene_unavailable(annotation))
     return applied
 
 
-async def apply_current_gene_override(
-    annotation: GeneAnnotation, run_store: Any, tumor_type: Optional[str]
-) -> GeneAnnotation:
-    return (await apply_current_gene_overrides([annotation], run_store, [tumor_type]))[0]
+def _flag_fusion_unavailable(result: FusionEvidenceResult) -> FusionEvidenceResult:
+    flagged = result.model_copy(deep=True)
+    _add_flag(flagged.quality_flags, _curation_unavailable_flag())
+    return flagged
 
 
 async def apply_current_fusion_overrides(
     results: List[FusionEvidenceResult], run_store: Any
 ) -> List[FusionEvidenceResult]:
-    """Overlay each fusion evidence result's current override (if any), in order."""
+    """Overlay each pipeline fusion evidence result's CURRENT override (if any)."""
     keys: List[Optional[Tuple[str, str]]] = []
     for result in results:
         try:
             keys.append((normalize_subject_key(FUSION, result.fusion), normalize_tumor_type(result.tumor_type)))
         except ValueError:
             keys.append(None)
-    overrides = await _lookup_overrides(run_store, FUSION, [key for key in keys if key])
+    overrides, failed = await _lookup_overrides(run_store, FUSION, [key for key in keys if key])
+    if failed:
+        return [_flag_fusion_unavailable(r) if key else r for r, key in zip(results, keys)]
     if not overrides:
         return list(results)
     retracted = await _retracted_among(overrides.values(), FUSION)
@@ -396,79 +444,109 @@ async def apply_current_fusion_overrides(
         try:
             applied.append(apply_fusion_override(result, override, retracted))
         except Exception:
-            logger.exception("Failed to apply curated override for fusion %s", result.fusion)
-            applied.append(result)
+            logger.error("Failed to apply curated override for fusion %s", result.fusion, exc_info=True)
+            applied.append(_flag_fusion_unavailable(result))
     return applied
 
 
-def preserve_curated_fields(enriched: GeneAnnotation, original: GeneAnnotation) -> GeneAnnotation:
-    """Carry an input annotation's curated sections through lazy enrichment,
-    which rebuilds annotations from scratch and would otherwise drop them."""
-    if not original.curated:
-        return enriched
-    update: Dict[str, Any] = {
-        name: getattr(original, name)
-        for name in ("curated", "curated_by", "curated_at", "curation_version", "curated_fields")
-    }
-    for name in original.curated_fields:
-        if name == "therapeutic_precedent":
-            update["clinical_actionability"] = original.clinical_actionability
-        elif name in GeneAnnotation.model_fields:
-            update[name] = getattr(original, name)
-    if "citations" in original.curated_fields:
-        update["insufficient_evidence"] = original.insufficient_evidence
-    curation_codes = {NEWER_EVIDENCE_FLAG, CURATED_RETRACTED_FLAG}
-    update["quality_flags"] = [
-        *(flag for flag in enriched.quality_flags if flag.code not in curation_codes),
-        *(flag for flag in original.quality_flags if flag.code in curation_codes),
+def _annotation_tumor_types(result: AnnotationResult) -> List[Optional[str]]:
+    return [
+        result.annotation_tumor_types[annotation.gene]
+        if annotation.gene in result.annotation_tumor_types
+        else pipeline_original(annotation).analysis_tumor_type
+        for annotation in result.annotations
     ]
-    return enriched.model_copy(update=update)
+
+
+async def overlay_annotation_result(result: AnnotationResult, run_store: Any) -> AnnotationResult:
+    """A copy of a (pipeline) result with the CURRENT overrides applied to its
+    gene annotations and fusion evidence, and curation_unavailable set."""
+    annotations = await apply_current_gene_overrides(
+        result.annotations, run_store, _annotation_tumor_types(result)
+    )
+    fusion_evidence = await apply_current_fusion_overrides(result.fusion_evidence, run_store)
+    return result.model_copy(
+        update={
+            "annotations": annotations,
+            "fusion_evidence": fusion_evidence,
+            "curation_unavailable": has_curation_unavailable(annotations)
+            or has_curation_unavailable(fusion_evidence),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
-# Run persistence (pipeline-pure)
+# Pipeline-pure results (runs table, job storage)
 # ---------------------------------------------------------------------------
+
+
+def pipeline_result(result: AnnotationResult) -> AnnotationResult:
+    """A copy of `result` holding only pipeline output (no overrides/flags)."""
+    return result.model_copy(
+        update={
+            "annotations": [pipeline_original(annotation) for annotation in result.annotations],
+            "curation_unavailable": False,
+        }
+    )
 
 
 def result_payload_for_storage(result: AnnotationResult) -> Dict[str, Any]:
     """result.model_dump() with curated annotations swapped back to their
     pipeline originals, so the runs table only ever holds pipeline output."""
-    payload = result.model_dump()
-    for index, annotation in enumerate(result.annotations):
-        pipeline = annotation._pipeline_annotation
-        if pipeline is not None:
-            payload["annotations"][index] = pipeline.model_dump()
-    return payload
+    return pipeline_result(result).model_dump()
 
 
-def _tumor_type_from_request(annotation: GeneAnnotation, request: Optional[Dict[str, Any]]) -> Optional[str]:
-    """The pipeline's rule for a gene's tumor type, replayed on a saved
-    request: the first tumor type on an input naming this gene (or one of its
-    fusions). Inputs given as an alias of the canonical symbol don't match."""
-    if not request:
-        return None
-    if "fusions" not in request:
-        return request.get("tumor_type")  # GeneAnnotateRequest
-    gene = annotation.gene.upper()
-    names = {gene, *(fusion.upper() for fusion in annotation.fusions)}
+def _request_inputs(request: Dict[str, Any]) -> List[Tuple[str, Optional[str]]]:
+    if "fusions" not in request:  # GeneAnnotateRequest
+        return [(str(request.get("gene") or ""), request.get("tumor_type"))]
+    inputs = []
     for item in request.get("fusions") or []:
-        if not isinstance(item, dict) or not item.get("tumor_type"):
-            continue
-        value = str(item.get("fusion") or "").strip().upper()
-        if value in names or gene in split_fusion(value):
-            return item["tumor_type"]
+        if isinstance(item, str):
+            inputs.append((item, None))
+        elif isinstance(item, dict):
+            inputs.append((str(item.get("fusion") or ""), item.get("tumor_type")))
+    return inputs
+
+
+def _direct_tumor_type(gene: str, fusions: List[str], inputs: List[Tuple[str, Optional[str]]]) -> Optional[str]:
+    gene = gene.upper()
+    names = {gene, *(fusion.upper() for fusion in fusions)}
+    for value, tumor_type in inputs:
+        value = value.strip().upper()
+        if tumor_type and (value in names or gene in split_fusion(value)):
+            return tumor_type
     return None
 
 
-async def restore_run_tumor_types(result: AnnotationResult, run_store: Any, run_id: str) -> None:
-    """Set analysis_tumor_type on a stored run's annotations (in place)."""
+async def ensure_annotation_tumor_types(result: AnnotationResult, run_store: Any, run_id: str) -> None:
+    """Fill result.annotation_tumor_types (in place) for runs saved before it
+    existed, by replaying the pipeline's rule on the saved request: HGNC-
+    normalize the inputs (so aliases map to their canonical gene) and take the
+    first tumor type among each gene's inputs."""
+    missing = [a for a in result.annotations if a.gene not in result.annotation_tumor_types]
     getter = getattr(run_store, "get_run_request", None)
-    if getter is None or not result.annotations:
+    if not missing or getter is None:
         return
     try:
         request = await getter(run_id)
     except Exception:
         logger.warning("Failed to load request for run %s", run_id, exc_info=True)
         return
-    for annotation in result.annotations:
-        annotation.analysis_tumor_type = _tumor_type_from_request(annotation, request)
+    inputs = _request_inputs(request or {})
+    tumor_by_input: Dict[str, str] = {}
+    for value, tumor_type in inputs:
+        if tumor_type:
+            tumor_by_input.setdefault(value, tumor_type)
+    gene_map: Dict[str, Any] = {}
+    if tumor_by_input:
+        try:
+            gene_map = await normalize_fusions([value for value, _ in inputs])
+        except Exception:
+            logger.warning("Alias resolution failed for run %s; matching inputs literally", run_id, exc_info=True)
+    for annotation in missing:
+        if annotation.gene in gene_map:
+            _, gene_inputs = gene_map[annotation.gene]
+            tumor_type = next((tumor_by_input[v] for v in gene_inputs if v in tumor_by_input), None)
+        else:
+            tumor_type = _direct_tumor_type(annotation.gene, annotation.fusions, inputs)
+        result.annotation_tumor_types[annotation.gene] = tumor_type

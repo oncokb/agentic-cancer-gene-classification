@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Awaitable, Dict, List, Literal, Optional, Tuple, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -42,6 +42,8 @@ from src.pipeline.curation_store import CurationVersionConflict
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/curation", tags=["curation"])
+
+T = TypeVar("T")
 
 SubjectTypeParam = Literal["gene", "fusion"]
 
@@ -109,10 +111,25 @@ def _subject(subject_type: str, subject_key: str, tumor_type: Optional[str]) -> 
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+_STORE_UNAVAILABLE = "Curation storage is unavailable; please retry."
+
+
+async def _store_call(awaitable: Awaitable[T]) -> T:
+    """Await a curation store call; storage errors become 503 (never a silent
+    'no override'). Version conflicts propagate for the caller to map to 409."""
+    try:
+        return await awaitable
+    except CurationVersionConflict:
+        raise
+    except Exception as exc:
+        logger.error("Curation store call failed", exc_info=True)
+        raise HTTPException(status_code=503, detail=_STORE_UNAVAILABLE) from exc
+
+
 def _store(http_request: Request) -> Any:
     store = getattr(http_request.app.state, "run_store", None)
     if store is None or not hasattr(store, "get_curated_overrides"):
-        raise HTTPException(status_code=503, detail="Curation storage is unavailable.")
+        raise HTTPException(status_code=503, detail=_STORE_UNAVAILABLE)
     return store
 
 
@@ -197,7 +214,7 @@ async def get_curation(
 ) -> CurationResponse:
     """The current curator override for a subject, if any."""
     key, tt = _subject(subject_type, subject_key, tumor_type)
-    override = await _store(http_request).get_curated_override(subject_type, key, tt)
+    override = await _store_call(_store(http_request).get_curated_override(subject_type, key, tt))
     return CurationResponse(
         subject_type=subject_type,
         subject_key=key,
@@ -244,15 +261,17 @@ async def save_curation(
 
     snapshot = await _pipeline_pmids_snapshot(store, subject_type, key, tt)
     try:
-        override = await store.save_curated_override(
-            subject_type=subject_type,
-            subject_key=key,
-            tumor_type=tt,
-            payload=payload.model_dump(mode="json", exclude_none=True),
-            curator_email=current_user.email,
-            expected_version=request.expected_version,
-            pipeline_pmids_snapshot=snapshot,
-            note=request.note,
+        override = await _store_call(
+            store.save_curated_override(
+                subject_type=subject_type,
+                subject_key=key,
+                tumor_type=tt,
+                payload=payload.model_dump(mode="json", exclude_none=True),
+                curator_email=current_user.email,
+                expected_version=request.expected_version,
+                pipeline_pmids_snapshot=snapshot,
+                note=request.note,
+            )
         )
     except CurationVersionConflict as exc:
         raise HTTPException(
@@ -294,13 +313,15 @@ async def revert_curation(
     key, tt = _subject(subject_type, subject_key, tumor_type)
     store = _store(http_request)
     try:
-        reverted = await store.delete_curated_override(
-            subject_type=subject_type,
-            subject_key=key,
-            tumor_type=tt,
-            curator_email=current_user.email,
-            expected_version=expected_version,
-            note=note,
+        reverted = await _store_call(
+            store.delete_curated_override(
+                subject_type=subject_type,
+                subject_key=key,
+                tumor_type=tt,
+                curator_email=current_user.email,
+                expected_version=expected_version,
+                note=note,
+            )
         )
     except CurationVersionConflict as exc:
         raise HTTPException(
@@ -329,6 +350,6 @@ async def get_curation_history(
 ) -> CurationHistoryResponse:
     """Every save and revert for a subject, newest first."""
     key, tt = _subject(subject_type, subject_key, tumor_type)
-    entries = await _store(http_request).list_curation_history(subject_type, key, tt)
+    entries = await _store_call(_store(http_request).list_curation_history(subject_type, key, tt))
     return CurationHistoryResponse(subject_type=subject_type, subject_key=key, tumor_type=tt, entries=entries)
 
