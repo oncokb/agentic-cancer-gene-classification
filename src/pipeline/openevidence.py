@@ -21,9 +21,11 @@ clearly labeled unverified/supplementary evidence.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -38,6 +40,7 @@ from src.models.schema import (
     OpenEvidenceGuideline,
     OpenEvidenceTrialMention,
 )
+from src.pipeline import openevidence_metrics as oe_metrics
 from src.pipeline.cache import _get_client, cached_call
 from src.pipeline.normalization import split_fusion
 
@@ -850,10 +853,46 @@ def distilled_openevidence_has_additive_content(distilled: DistilledOpenEvidence
     return bool(distilled.guidelines or distilled.trial_mentions or distilled.citation_count)
 
 
+def _retry_reason(exc: Optional[BaseException]) -> str:
+    """Bounded retry-reason tag for openevidence.retries."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return f"http_{status}" if status in _RETRYABLE_HTTP_STATUSES else "http_5xx"
+    return "network"
+
+
+def _record_retry(retry_state) -> None:
+    exc = retry_state.outcome.exception() if retry_state.outcome is not None else None
+    oe_metrics.increment(
+        oe_metrics.RETRIES,
+        tags=[oe_metrics.model_tag(), f"reason:{_retry_reason(exc)}", f"source:{oe_metrics.current_call_source()}"],
+    )
+
+
+def _record_upstream_call(
+    status: str, status_code: Optional[int], started: float, first_chunk_ms: Optional[float]
+) -> None:
+    """One paid HTTP attempt to the streaming analysis endpoint (each retry
+    attempt is its own call, since each is a separate upstream request)."""
+    model = oe_metrics.model_tag()
+    source = f"source:{oe_metrics.current_call_source()}"
+    tags = [model, f"status:{status}", source]
+    status_class = oe_metrics.http_status_class(status_code)
+    if status_class:
+        tags.append(f"http_status_class:{status_class}")
+    oe_metrics.increment(oe_metrics.UPSTREAM_CALLS, tags=tags)
+    oe_metrics.distribution(
+        oe_metrics.UPSTREAM_DURATION_MS, (time.monotonic() - started) * 1000, tags=[model, f"status:{status}", source]
+    )
+    if first_chunk_ms is not None:
+        oe_metrics.distribution(oe_metrics.UPSTREAM_TIME_TO_FIRST_CHUNK_MS, first_chunk_ms, tags=[model, source])
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=8),
     retry=retry_if_exception(_is_transient_openevidence_error),
+    before_sleep=_record_retry,
 )
 async def _post_streaming_analysis(question: str, api_key: str, client: httpx.AsyncClient) -> str:
     base_url = settings.openevidence_base_url.strip().rstrip("/")
@@ -870,11 +909,35 @@ async def _post_streaming_analysis(question: str, api_key: str, client: httpx.As
     # raises from within aiter_text() itself (an httpx transport exception),
     # which the retry predicate above already treats as transient. A stream
     # that finishes this loop without raising is, by definition, complete.
-    async with client.stream(
-        "POST", url, json=payload, headers=headers, timeout=settings.openevidence_timeout_seconds
-    ) as response:
-        response.raise_for_status()
-        chunks = [chunk async for chunk in response.aiter_text()]
+    started = time.monotonic()
+    status = "error"
+    status_code: Optional[int] = None
+    first_chunk_ms: Optional[float] = None
+    try:
+        async with client.stream(
+            "POST", url, json=payload, headers=headers, timeout=settings.openevidence_timeout_seconds
+        ) as response:
+            status_code = response.status_code
+            response.raise_for_status()
+            chunks = []
+            async for chunk in response.aiter_text():
+                if first_chunk_ms is None:
+                    first_chunk_ms = (time.monotonic() - started) * 1000
+                chunks.append(chunk)
+        status = "success"
+    except httpx.TimeoutException:
+        status = "timeout"
+        raise
+    except httpx.HTTPStatusError:
+        status = "http_error"
+        raise
+    except asyncio.CancelledError:
+        # The sidecar's overall lookup budget (asyncio.wait_for) or shutdown
+        # cut the call short — still a paid request, so still counted.
+        status = "cancelled"
+        raise
+    finally:
+        _record_upstream_call(status, status_code, started, first_chunk_ms)
     return "".join(chunks)
 
 
@@ -997,14 +1060,28 @@ async def get_cached_gene_analysis(
         cached = await _get_client().get(key)
     except Exception as exc:
         logger.warning("OpenEvidence cache peek failed for %r: %s", key, exc)
+        _record_cache_peek("error")
         return None
     if cached is None:
+        _record_cache_peek("miss")
         return None
     try:
-        return _analysis_from_cached_payload(json.loads(cached))
+        analysis = _analysis_from_cached_payload(json.loads(cached))
     except Exception as exc:
         logger.warning("Ignoring unreadable OpenEvidence cache entry %r: %s", key, exc)
+        _record_cache_peek("error")
         return None
+    _record_cache_peek("hit")
+    return analysis
+
+
+def _record_cache_peek(result: str) -> None:
+    """The sidecar's cache-only peek bypasses cached_call, so it is NOT in
+    redis_cache.lookups{cache_name:openevidence} (which counts only
+    get_gene_analysis's read-through lookups — background lookups and
+    warmup); this metric counts the peeks alone, so nothing is double
+    counted."""
+    oe_metrics.increment(oe_metrics.CACHE_LOOKUPS, tags=[oe_metrics.model_tag(), f"result:{result}"])
 
 
 # The in-flight marker is a lease: its value is the owner's unique token, so
@@ -1087,6 +1164,7 @@ async def claim_lookup(cache_key: str, ttl_seconds: float) -> LeaseClaim:
             cache_key,
             exc,
         )
+        oe_metrics.increment(oe_metrics.LEASE_UNAVAILABLE, tags=[oe_metrics.model_tag(), "op:claim"])
         return LeaseClaim(token=token)
     outcome = _text(outcome)
     if outcome == "claimed":
@@ -1118,6 +1196,7 @@ async def renew_inflight_marker(cache_key: str, token: str, ttl_seconds: float) 
             cache_key,
             exc,
         )
+        oe_metrics.increment(oe_metrics.LEASE_UNAVAILABLE, tags=[oe_metrics.model_tag(), "op:renew"])
         return True
     return bool(renewed)
 

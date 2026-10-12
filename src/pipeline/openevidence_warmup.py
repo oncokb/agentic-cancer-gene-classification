@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Union
 
 from src.config import settings
 from src.models.schema import FusionInput
+from src.pipeline import openevidence_metrics as oe_metrics
 from src.pipeline.normalization import is_fusion_input, normalize_fusions
 from src.pipeline.openevidence import OpenEvidenceClient
 
@@ -103,13 +104,16 @@ async def warm_openevidence_cache(
             "timings_ms": {"openevidence_warmup": _elapsed_ms(start)},
         }
 
-    results = await asyncio.gather(
-        *[
-            warm_one(gene, gene_inputs)
-            for gene, (_resolved_gene, gene_inputs) in gene_map.items()
-        ],
-        return_exceptions=True,
-    )
+    # Tags this pass's upstream calls/retries source:warmup (gather copies
+    # the current context into each task it creates).
+    with oe_metrics.call_source("warmup"):
+        results = await asyncio.gather(
+            *[
+                warm_one(gene, gene_inputs)
+                for gene, (_resolved_gene, gene_inputs) in gene_map.items()
+            ],
+            return_exceptions=True,
+        )
 
     warmed = []
     errors = []
