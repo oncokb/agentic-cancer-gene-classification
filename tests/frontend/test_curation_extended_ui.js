@@ -74,15 +74,19 @@ const GENE_DRAFT = {
 
 // ---------------------------------------------------------------------------
 
-async function test_call_prefilled_from_draft_flipped_and_sent_in_put() {
+async function test_suggested_call_offered_applied_flipped_and_sent_in_put() {
   let put;
   const app = loadCurationApp({ routes: routes({ draft: GENE_DRAFT, onPut: (p) => { put = p; } }) });
   render(app);
   await toGeneReview(app);
 
-  const select = oneByData(body(app), "curation", "cancer-associated");
-  assert.strictEqual(select.value, "false", "prefilled with the model's suggested call");
+  let select = oneByData(body(app), "curation", "cancer-associated");
+  assert.strictEqual(select.value, "", "starts at the current (pipeline) call");
   assert.match(oneByData(body(app), "curation", "suggested-call").textContent, /suggested: No/);
+  oneByData(body(app), "curation", "use-suggested-call").click();
+  select = oneByData(body(app), "curation", "cancer-associated");
+  assert.strictEqual(select.value, "false", "one click applies the suggestion");
+  assert.strictEqual(byData(body(app), "curation", "use-suggested-call").length, 0);
   select.value = "true";
   select.fire("change");
   footerButton(app, "save").click();
@@ -98,6 +102,27 @@ async function test_call_prefilled_from_draft_flipped_and_sent_in_put() {
   assert.ok(annotation.curated_fields.includes("cancer_associated"));
   const tag = oneByData(app.root("results-window"), "curation", "curator-set");
   assert.strictEqual(tag.textContent, "Curator-set");
+}
+
+async function test_untouched_call_in_evidence_edit_is_not_written() {
+  let put;
+  const current = { version: 2, override: { ...OVERRIDE_META, payload: { cancer_associated: false } } };
+  const app = loadCurationApp({ routes: routes({ draft: { ...GENE_DRAFT, cancer_associated: true }, current, onPut: (p) => { put = p; } }) });
+  render(app, { cancer_associated: false, curated: true, curation_version: 2, curated_fields: ["cancer_associated"] });
+  await toGeneReview(app);
+  assert.strictEqual(oneByData(body(app), "curation", "cancer-associated").value, "false", "shows the current curated call");
+  footerButton(app, "save").click();
+  await waitFor(() => put, "PUT");
+  assert.strictEqual(put.body.payload.cancer_associated, false, "kept verbatim, not replaced by the suggestion");
+
+  // With no curated call, an untouched select adds none.
+  let put2;
+  const app2 = loadCurationApp({ routes: routes({ draft: GENE_DRAFT, onPut: (p) => { put2 = p; } }) });
+  render(app2);
+  await toGeneReview(app2);
+  oneByData(app2.root("curation-footer"), "curation", "save").click();
+  await waitFor(() => put2, "PUT");
+  assert.ok(!("cancer_associated" in put2.body.payload));
 }
 
 async function test_keep_pipeline_call_drops_previous_curated_call() {
@@ -150,6 +175,140 @@ async function test_curator_set_tag_replaces_flag_badge() {
 
   const plain = render(app, { cancer_associated: true });
   assert.strictEqual(byData(plain, "curation", "curator-set").length, 0, "pipeline calls carry no tag");
+}
+
+// ---------------------------------------------------------------------------
+// Call-only edits
+// ---------------------------------------------------------------------------
+
+const CURATED_SECTIONS = {
+  cancer_association_rationale: "Curated rationale.",
+  citations: ["111", "222"],
+  evidence_cards: [{ pmid: "111", title: "Paper one", selected_reason: "Curated reason", quote: "Alpha sentence.", evidence_type: "clinical" }],
+  supporting_quotes: [{ pmid: "111", quote: "Alpha sentence." }],
+  therapeutic_precedent: { summary: "Curated precedent.", precedents: [{ pmid: "789", quote: "Q.", therapies: ["crizotinib"], evidence_type: "clinical", title: "P" }] },
+};
+
+function callRoutes({ current, onWrite, annotate }) {
+  return async (method, url, reqBody) => {
+    if (method === "GET" && url.startsWith("/v1/curation/gene/ALK")) return [200, current()];
+    if (method === "PUT" || method === "DELETE") {
+      const result = onWrite(method, url, reqBody);
+      if (result) return result;
+      return method === "PUT"
+        ? [200, { version: current().version + 1, override: { ...OVERRIDE_META, payload: reqBody.payload } }]
+        : [200, { reverted_version: current().version }];
+    }
+    if (method === "GET" && url.startsWith("/v1/annotate/") && annotate) return [200, annotate()];
+    return undefined;
+  };
+}
+
+async function test_call_only_edit_keeps_other_sections_byte_identical() {
+  const writes = [];
+  const current = { version: 4, override: { ...OVERRIDE_META, payload: JSON.parse(JSON.stringify(CURATED_SECTIONS)) } };
+  const app = loadCurationApp({
+    routes: callRoutes({ current: () => current, onWrite: (method, url, reqBody) => { writes.push({ method, url, body: reqBody }); } }),
+  });
+  const win = render(app, {
+    curated: true, curation_version: 4, cancer_association_rationale: "Curated rationale.",
+    curated_fields: Object.keys(CURATED_SECTIONS),
+  });
+  const editCall = oneByData(win, "curation", "edit-call");
+  assert.ok(editCall.closest(".status-line"), "the call has its own control on the status line");
+  editCall.click();
+  const aux = app.root("curation-aux-body");
+  assert.match(oneByData(aux, "curation", "call-current").textContent, /Yes \(pipeline\)/);
+  const select = oneByData(aux, "curation", "cancer-associated");
+  select.value = "false";
+  select.fire("change");
+  const note = oneByData(aux, "curation", "call-note");
+  note.value = "Germline only";
+  note.fire("input");
+  oneByData(app.root("curation-aux-footer"), "curation", "save-call").click();
+  await waitFor(() => writes.length, "PUT");
+
+  assert.strictEqual(writes.length, 1);
+  const { method, url, body: sent } = writes[0];
+  assert.strictEqual(method, "PUT");
+  assert.strictEqual(url, "/v1/curation/gene/ALK?tumor_type=LUAD");
+  assert.strictEqual(sent.expected_version, 4);
+  assert.strictEqual(sent.note, "Germline only");
+  assert.deepStrictEqual(Object.keys(sent.payload).sort(), [...Object.keys(CURATED_SECTIONS), "cancer_associated"].sort());
+  assert.strictEqual(sent.payload.cancer_associated, false);
+  Object.keys(CURATED_SECTIONS).forEach((key) => {
+    assert.strictEqual(JSON.stringify(sent.payload[key]), JSON.stringify(current.override.payload[key]), `${key} verbatim`);
+  });
+  assert.ok(!app.requests.some((r) => r.url.startsWith("/v1/curation/reevaluate")), "no re-evaluation job");
+  assert.strictEqual(app.curationState.sessions.size, 0, "no edit session either");
+
+  await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "editor closed");
+  const annotation = app.state.currentResult.annotations[0];
+  assert.strictEqual(annotation.cancer_associated, false);
+  assert.strictEqual(annotation.cancer_association_rationale, "Curated rationale.");
+  assert.ok(byData(app.root("results-window"), "curation", "curator-set").length);
+}
+
+async function test_call_only_keep_pipeline_reverts_call_only_override() {
+  const writes = [];
+  const current = { version: 2, override: { ...OVERRIDE_META, payload: { cancer_associated: false } } };
+  const app = loadCurationApp({
+    routes: callRoutes({
+      current: () => current,
+      onWrite: (method, url) => { writes.push({ method, url }); },
+      annotate: () => ({ run_id: "run-1", annotation_tumor_types: { ALK: "LUAD" }, annotations: [geneAnnotation()], fusion_evidence: [] }),
+    }),
+  });
+  app.state.currentResult = null;
+  render(app, { cancer_associated: false, curated: true, curation_version: 2, curated_fields: ["cancer_associated"] });
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const select = oneByData(app.root("curation-aux-body"), "curation", "cancer-associated");
+  assert.strictEqual(select.value, "false");
+  select.value = "";
+  select.fire("change");
+  oneByData(app.root("curation-aux-footer"), "curation", "save-call").click();
+  await waitFor(() => writes.length, "DELETE");
+  assert.deepStrictEqual(writes, [{ method: "DELETE", url: "/v1/curation/gene/ALK?tumor_type=LUAD&expected_version=2" }]);
+  await waitFor(() => app.state.currentResult.annotations[0].cancer_associated === true, "pipeline call back");
+  assert.strictEqual(byData(app.root("results-window"), "curation", "curator-set").length, 0);
+}
+
+async function test_call_only_conflict_and_no_op() {
+  const writes = [];
+  let current = { version: 3, override: { ...OVERRIDE_META, payload: { citations: ["111"], cancer_associated: true } } };
+  const app = loadCurationApp({
+    routes: callRoutes({ current: () => current, onWrite: (method, url, reqBody) => { writes.push(reqBody); } }),
+  });
+  render(app, { curated: true, curation_version: 2, curated_fields: ["citations"] });
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const select = oneByData(app.root("curation-aux-body"), "curation", "cancer-associated");
+  select.value = "false";
+  select.fire("change");
+  const save = oneByData(app.root("curation-aux-footer"), "curation", "save-call");
+  save.click();
+  await waitFor(() => oneByData(app.root("curation-aux-body"), "curation", "call-error").textContent, "conflict");
+  assert.match(oneByData(app.root("curation-aux-body"), "curation", "call-error").textContent, /now v3, call: Yes/);
+  assert.strictEqual(writes.length, 0, "a stale version is never written");
+  save.click();
+  await waitFor(() => writes.length, "PUT after review");
+  assert.deepStrictEqual(writes[0], { expected_version: 3, payload: { citations: ["111"], cancer_associated: false } });
+
+  // Saving the call it already has writes nothing.
+  current = { version: 4, override: { ...OVERRIDE_META, payload: { cancer_associated: false } } };
+  render(app, { cancer_associated: false, curated: true, curation_version: 4, curated_fields: ["cancer_associated"] });
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  oneByData(app.root("curation-aux-footer"), "curation", "save-call").click();
+  await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "closed");
+  assert.strictEqual(writes.length, 1);
+}
+
+async function test_call_control_on_no_result_cards_and_hidden_from_viewers() {
+  const app = loadCurationApp();
+  app.state.resultsViewMode = "noresult";
+  const win = render(app, { insufficient_evidence: true, cancer_associated: null });
+  assert.strictEqual(byData(win, "curation", "edit-call").length, 1, "curators can decide undecided genes");
+  const viewer = loadCurationApp({ auth: { can_curate: false } });
+  assert.strictEqual(byData(render(viewer), "curation", "edit-call").length, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -280,8 +439,13 @@ async function test_partner_flags_and_viewer_controls() {
 }
 
 runTests("curation extended UI", [
-  test_call_prefilled_from_draft_flipped_and_sent_in_put,
+  test_suggested_call_offered_applied_flipped_and_sent_in_put,
+  test_untouched_call_in_evidence_edit_is_not_written,
   test_keep_pipeline_call_drops_previous_curated_call,
+  test_call_only_edit_keeps_other_sections_byte_identical,
+  test_call_only_keep_pipeline_reverts_call_only_override,
+  test_call_only_conflict_and_no_op,
+  test_call_control_on_no_result_cards_and_hidden_from_viewers,
   test_precedent_only_edit_keeps_curated_call,
   test_curator_set_tag_replaces_flag_badge,
   test_partner_precedent_edit_flow,

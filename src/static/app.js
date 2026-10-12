@@ -1662,6 +1662,9 @@ function renderNoResultView(hiddenAnnotations) {
         <div class="field-row-value">${escapeHtml(reason)}</div>
       </div>
     `;
+    // Curators can make the call for a gene the pipeline couldn't decide.
+    const editCall = curationCallEditButton(geneCurationSubject(annotation), annotation);
+    if (editCall) card.querySelector(".annotation-card-meta").appendChild(editCall);
     const summary = String(annotation.gene_summary || "").trim();
     if (summary) {
       const summaryRow = document.createElement("div");
@@ -3329,6 +3332,10 @@ function renderStatusLine(annotation) {
     const curatorSet = field === "cancer_associated" ? renderCuratorSetTag(annotation) : null;
     if (curatorSet) item.appendChild(curatorSet);
     wrapper.appendChild(item);
+    if (field === "cancer_associated") {
+      const editCall = curationCallEditButton(geneCurationSubject(annotation), annotation);
+      if (editCall) wrapper.appendChild(editCall);
+    }
   }
 
   (annotation.quality_flags || []).forEach((flag) => {

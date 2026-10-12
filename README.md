@@ -909,7 +909,10 @@ override of its own. A gene override can set the cancer-associated call
 (`cancer_associated: true|false`); the curator's call wins wherever the gene
 is served (UI, run links, `/v1/genes/*`, exports), counts as a decided call
 (`insufficient_evidence: false`), is listed in `curated_fields`, and carries an
-info flag `curator_set_cancer_association` naming the pipeline's call.
+info flag `curator_set_cancer_association` naming the pipeline's call. In the UI,
+"Edit call" changes only the call (other curated sections are saved verbatim,
+no re-evaluation); an evidence edit writes the call only if the curator changes
+it, with the re-evaluation's suggested call offered one click away.
 `evidence_support_score` stays the pipeline's literature-grounding score, and
 benchmarks score pipeline output only. Retracted PMIDs are still stripped from curated
 content (flag `curated_retracted_pmids_removed`), and when the pipeline later
