@@ -838,6 +838,9 @@ async function test_failed_conflict_reload_keeps_expected_version() {
           puts.push(reqBody);
           return [409, { detail: { message: "changed", current_version: 4 } }];
         }
+        if (method === "GET" && url === "/v1/annotate/run-1") {
+          return [200, geneResult({ curated: true, curation_version: 4, curated_by: "other@x", curated_at: "2026-10-11T00:00:00Z", cancer_association_rationale: "Other." })];
+        }
         return undefined;
       },
     }),
@@ -857,9 +860,160 @@ async function test_failed_conflict_reload_keeps_expected_version() {
   assert.match(oneByData(app.root("curation-status"), "curation", "message").textContent, /still targets v0\. Retry the reload\./);
   getFails = false;
   oneByData(app.root("curation-status"), "curation", "reload-conflict").click();
-  await waitFor(() => session.baseVersion === 4, "advanced after a successful fetch");
+  await waitFor(() => session.baseVersion === 4, "advanced after a successful fetch and refresh");
   const message = oneByData(app.root("curation-status"), "curation", "message").textContent;
-  assert.match(message, /v4 by other@x on 2026-10-11 \(sections: cancer_association_rationale, citations\)/);
+  assert.match(message, /v4 by other@x on 2026-10-11\. The results now show it\./);
+  assert.strictEqual(app.state.currentResult.annotations[0].cancer_association_rationale, "Other.");
+}
+
+async function test_conflict_reload_with_failed_run_refresh_requires_reviewing_preview() {
+  const puts = [];
+  let current = { version: 0, override: null };
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      current: () => current,
+      extra: async (method, url, reqBody) => {
+        if (method === "PUT") {
+          puts.push(reqBody);
+          return [200, { version: 5, override: { curator_email: "cur@x", updated_at: "2026-10-12T00:00:00Z", payload: reqBody.payload } }];
+        }
+        if (method === "GET" && url === "/v1/annotate/run-1") return [500, { detail: "run store down" }];
+        return undefined;
+      },
+    }),
+  });
+  render(app, geneResult());
+  await toDraft(app);
+  current = {
+    version: 4,
+    override: {
+      curator_email: "other@x", updated_at: "2026-10-11T00:00:00Z",
+      payload: {
+        cancer_association_rationale: "Other curator's <b>rationale</b>.", citations: ["9"],
+        evidence_cards: [{ pmid: "9", evidence_type: "clinical", selected_reason: "Other reason.", quote: "Other quote." }],
+        therapeutic_precedent: { summary: "Other precedent.", precedents: [{ pmid: "789", therapies: ["alectinib"], quote: "Q." }] },
+      },
+    },
+  };
+  footerButton(app, "save").click(); // the pre-save read finds v4: conflict, no PUT
+  await waitFor(() => byData(app.root("curation-status"), "curation", "reload-conflict").length, "conflict");
+  assert.strictEqual(puts.length, 0);
+  const session = app.curationState.sessions.get("gene|ALK|luad");
+  oneByData(app.root("curation-status"), "curation", "reload-conflict").click();
+  await waitFor(() => byData(app.root("curation-status"), "curation", "conflict-preview").length, "preview");
+  assert.strictEqual(session.baseVersion, 0, "not advanced while the results can't show v4");
+  assert.match(oneByData(app.root("curation-status"), "curation", "message").textContent, /couldn't be refreshed.*still targets v0/);
+  const preview = oneByData(app.root("curation-status"), "curation", "conflict-preview");
+  for (const text of ["Other curator's <b>rationale</b>.", "PMID 9 — clinical — Other reason. — “Other quote.”", "Other precedent.", "PMID 789 — alectinib — “Q.”"]) {
+    assert.ok(preview.querySelectorAll("dd").some((dd) => dd.textContent === text), `preview shows ${text}`);
+  }
+  assert.ok(!preview.allText.includes("<dd>"), "rendered as text, not markup");
+
+  // Saving without confirming still targets v0, so the server-side check stops it.
+  footerButton(app, "save").click();
+  await waitFor(() => !app.curationState.busy && byData(app.root("curation-status"), "curation", "reload-conflict").length, "still conflicted");
+  assert.strictEqual(puts.length, 0, "no PUT against an unseen version");
+
+  oneByData(app.root("curation-status"), "curation", "reload-conflict").click();
+  await waitFor(() => byData(app.root("curation-status"), "curation", "accept-conflict").length, "preview again");
+  oneByData(app.root("curation-status"), "curation", "accept-conflict").click();
+  assert.strictEqual(session.baseVersion, 4, "advances only after the curator reviewed v4");
+  footerButton(app, "save").click();
+  await waitFor(() => puts.length === 1, "re-save");
+  assert.strictEqual(puts[0].expected_version, 4);
+}
+
+async function test_conflict_with_revert_and_failed_refresh_keeps_version() {
+  let current = { version: 0, override: null };
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      current: () => current,
+      extra: async (method, url) => {
+        if (method === "PUT") return [409, { detail: { message: "changed", current_version: 3 } }];
+        if (method === "GET" && url === "/v1/annotate/run-1") return [500, { detail: "down" }];
+        return undefined;
+      },
+    }),
+  });
+  render(app, geneResult());
+  await toDraft(app);
+  current = { version: 3, override: null }; // another curator saved then reverted
+  footerButton(app, "save").click();
+  await waitFor(() => byData(app.root("curation-status"), "curation", "reload-conflict").length, "conflict");
+  oneByData(app.root("curation-status"), "curation", "reload-conflict").click();
+  await waitFor(() => app.root("curation-status").allText.includes("Retry the reload"), "retry");
+  assert.strictEqual(app.curationState.sessions.get("gene|ALK|luad").baseVersion, 0);
+  assert.strictEqual(byData(app.root("curation-status"), "curation", "accept-conflict").length, 0, "no preview of pipeline content");
+}
+
+async function test_save_restores_focus_to_rerendered_opener() {
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      extra: async (method, url, reqBody) => (method === "PUT"
+        ? [200, { version: 1, override: { curator_email: "cur@x", updated_at: "2026-10-12T00:00:00Z", payload: reqBody.payload } }]
+        : undefined),
+    }),
+  });
+  render(app, geneResult());
+  const opener = oneByData(app.root("results-window"), "curation", "edit-evidence");
+  opener.focus();
+  opener.click();
+  addPmid(app, "evidence", "333");
+  footerButton(app, "submit").click();
+  await waitFor(() => app.curationState.sessions.get("gene|ALK|luad")?.draft, "draft");
+  footerButton(app, "review").click();
+  footerButton(app, "save").click();
+  await waitFor(() => app.root("curation-modal").classList.contains("hidden"), "saved");
+  const active = app.document.activeElement;
+  assert.ok(active.isConnected, "focus is on a connected element");
+  assert.strictEqual(active.dataset.curation, "edit-evidence");
+  assert.notStrictEqual(active, opener, "the re-rendered opener, not the detached one");
+  assert.ok(app.root("results-window").contains(active));
+}
+
+async function test_focus_recovery_uses_control_id_for_quote_rows() {
+  const app = loadCurationApp({ routes: jobRoutes() });
+  render(app, geneResult());
+  await toDraft(app);
+  oneByData(body(app), "curation", "add-quote").click(); // 3 quote rows
+  const removes = byData(body(app), "curation", "remove-quote");
+  assert.strictEqual(removes.length, 3);
+  // Focus the second row's PMID select, then rebuild (as a select change does).
+  const selects = byData(body(app), "curation", "quote-pmid");
+  selects[1].focus();
+  const id = selects[1].id;
+  app.renderCurationDialog();
+  assert.strictEqual(app.document.activeElement.id, id, "same row's control by id, not the first quote row");
+  assert.notStrictEqual(app.document.activeElement, byData(body(app), "curation", "quote-pmid")[0]);
+  removes[2].focus();
+  const removeId = removes[2].id;
+  app.renderCurationDialog();
+  assert.strictEqual(app.document.activeElement.id, removeId);
+}
+
+async function test_retry_refresh_wording_matches_fresh_record() {
+  let calls = 0;
+  const app = loadCurationApp({
+    routes: async (method, url) => {
+      if (method === "DELETE") return [200, { reverted_version: 2 }];
+      if (method === "GET" && url === "/v1/annotate/run-1") {
+        calls += 1;
+        if (calls === 1) return [500, { detail: "down" }];
+        // Meanwhile another curator saved v3.
+        return [200, geneResult({ curated: true, curated_by: "other@x", curated_at: "2026-10-12", curation_version: 3 })];
+      }
+      return undefined;
+    },
+  });
+  render(app, geneResult({ curated: true, curated_by: "cur@x", curated_at: "2026-10-02", curation_version: 2 }));
+  oneByData(app.root("results-window"), "curation", "revert").click();
+  oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").click();
+  await waitFor(() => byData(app.root("results-window"), "curation", "retry-refresh").length, "pending");
+  oneByData(app.root("results-window"), "curation", "retry-refresh").click();
+  await waitFor(() => !app.curationState.pendingRefresh.size, "refreshed");
+  const toasts = app.root("toast-region").allText;
+  assert.ok(toasts.includes("ALK now shows the current curated version (v3) by other@x"));
+  assert.ok(!toasts.includes("now shows the pipeline version"));
 }
 
 async function test_focus_trap_and_inert_background() {
@@ -947,4 +1101,9 @@ runTests("curation UI", [
   test_failed_conflict_reload_keeps_expected_version,
   test_focus_trap_and_inert_background,
   test_revert_with_failed_reload_shows_pending_refresh,
+  test_conflict_reload_with_failed_run_refresh_requires_reviewing_preview,
+  test_conflict_with_revert_and_failed_refresh_keeps_version,
+  test_save_restores_focus_to_rerendered_opener,
+  test_focus_recovery_uses_control_id_for_quote_rows,
+  test_retry_refresh_wording_matches_fresh_record,
 ]);

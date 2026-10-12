@@ -984,8 +984,9 @@ async function saveCurationDraft(session) {
     }
     curationState.busy = false;
     discardCurationSession(session);
-    closeCurationDialog();
+    // Re-render before closing so focus returns to the re-rendered opener.
     refreshCurationView(session.subject);
+    closeCurationDialog();
     showCurationToast("Curator edits saved", "success");
   } catch (error) {
     session.message = { type: "error", text: `Couldn't save: ${error.message}` };
@@ -1120,18 +1121,37 @@ async function reloadAfterCurationConflict(session) {
       return;
     }
     const refreshed = await reloadCurationSubject(session.subject).catch(() => null);
-    if (refreshed) refreshCurationView(session.subject);
-    session.baseVersion = current.version;
     const override = current.override;
     const changes = override
-      ? `v${current.version} by ${override.curator_email} on ${formatCurationDate(override.updated_at)} ` +
-        `(sections: ${Object.keys(override.payload || {}).join(", ") || "none"})`
-      : `v${current.version}: the curated version was reverted to pipeline output`;
-    session.message = {
-      type: "info",
-      text: `Loaded the latest version — ${changes}.` +
-        `${refreshed ? " The results now show it." : ""} Your draft is kept; saving now replaces that version.`,
-    };
+      ? `v${current.version} by ${override.curator_email} on ${formatCurationDate(override.updated_at)}`
+      : `v${current.version} (the curated version was reverted to pipeline output)`;
+    if (refreshed) {
+      // The latest content is on screen, so saving over it is an informed choice.
+      refreshCurationView(session.subject);
+      session.baseVersion = current.version;
+      session.message = {
+        type: "info",
+        text: `Loaded the latest version — ${changes}. The results now show it. Your draft is kept; saving now replaces that version.`,
+      };
+    } else if (override) {
+      // The results couldn't be refreshed: show that version's content here and
+      // only advance once the curator confirms they've reviewed it.
+      session.message = {
+        type: "error",
+        text: `The latest version is ${changes}, but the results couldn't be refreshed to show it. ` +
+          `Review its content below before saving over it; your save still targets v${session.baseVersion || 0}.`,
+        conflict: true,
+        preview: { version: current.version, override },
+      };
+    } else {
+      // Pipeline content can't be previewed without the run: keep the old version.
+      session.message = {
+        type: "error",
+        text: `The latest version is ${changes}, but the results couldn't be refreshed to show it, ` +
+          `so your save still targets v${session.baseVersion || 0}. Retry the reload.`,
+        conflict: true,
+      };
+    }
   } finally {
     curationState.busy = false;
     renderCurationDialog();
@@ -1204,7 +1224,12 @@ async function retryCurationRefresh(subject, button) {
     const fresh = await reloadCurationSubject(subject).catch(() => null);
     if (fresh) {
       curationState.pendingRefresh.delete(curationSubjectId(subject));
-      showCurationToast(`${subject.label} now shows the pipeline version`, "success");
+      showCurationToast(
+        fresh.curated
+          ? `${subject.label} now shows the current curated version (v${fresh.curation_version}) by ${fresh.curated_by}`
+          : `${subject.label} now shows the pipeline version`,
+        "success"
+      );
     } else {
       showCurationToast(`Still couldn't load the pipeline version of ${subject.label}; re-run the annotation if this persists.`, "error");
     }
@@ -1471,17 +1496,22 @@ function trapCurationFocus(event) {
 }
 
 // Identifies the focused dialog control so a re-render can focus its replacement.
+// Prefers the control's unique id; falls back to action + PMID row.
 function curationFocusKey(node) {
-  if (!node || !node.dataset || !node.dataset.curation) return null;
+  if (!node) return null;
+  if (node.id) return { id: node.id };
+  if (!node.dataset || !node.dataset.curation) return null;
   const row = node.closest("[data-pmid]");
   return { action: node.dataset.curation, pmid: row ? row.dataset.pmid : null };
 }
 
 function curationFocusByKey(container, key) {
-  const match = Array.from(container.querySelectorAll(`[data-curation='${key.action}']`)).find((node) => {
-    const row = node.closest("[data-pmid]");
-    return !node.disabled && (row ? row.dataset.pmid : null) === key.pmid;
-  });
+  const match = key.id
+    ? Array.from(container.querySelectorAll(`#${key.id}`)).find((node) => !node.disabled)
+    : Array.from(container.querySelectorAll(`[data-curation='${key.action}']`)).find((node) => {
+      const row = node.closest("[data-pmid]");
+      return !node.disabled && (row ? row.dataset.pmid : null) === key.pmid;
+    });
   if (match && match.focus) match.focus();
   return Boolean(match);
 }
@@ -1546,6 +1576,18 @@ function renderCurationStatus(session, node) {
         action: "retry-save", disabled: curationState.busy,
       }));
     }
+    if (session.message.preview) {
+      const { version, override } = session.message.preview;
+      parts.push(renderCurationOverridePreview(override, version));
+      parts.push(curationButton(`I've reviewed v${version} — keep my draft`, () => {
+        session.baseVersion = version;
+        session.message = {
+          type: "info",
+          text: `Your draft is kept; saving now replaces v${version} by ${override.curator_email}.`,
+        };
+        renderCurationDialog();
+      }, { action: "accept-conflict", disabled: curationState.busy }));
+    }
     if (session.message.conflict) {
       parts.push(curationButton("Reload latest version", () => reloadAfterCurationConflict(session), {
         action: "reload-conflict",
@@ -1554,6 +1596,40 @@ function renderCurationStatus(session, node) {
   }
   node.replaceChildren(...parts);
   curationShow(node, parts.length > 0);
+}
+
+// Text-only rendering of another curator's override payload (no HTML).
+function renderCurationOverridePreview(override, version) {
+  const payload = override.payload || {};
+  const list = curationEl("dl", { className: "curation-override-preview" });
+  const add = (label, value) => {
+    if (value === undefined || value === null || value === "") return;
+    list.appendChild(curationEl("dt", { text: label }));
+    list.appendChild(curationEl("dd", { text: String(value) }));
+  };
+  const cardLine = (card) =>
+    [`PMID ${card.pmid}`, card.evidence_type, card.selected_reason, card.quote ? `“${card.quote}”` : ""]
+      .filter(Boolean).join(" — ");
+  add("Rationale", payload.cancer_association_rationale);
+  add("Interpretation", payload.interpretation);
+  if (payload.well_supported !== undefined) add("Well supported", payload.well_supported ? "Yes" : "No");
+  if (payload.citations) add("Cited PMIDs", payload.citations.join(", ") || "none");
+  if (payload.pmids) add("PMIDs", payload.pmids.join(", ") || "none");
+  (payload.evidence_cards || []).forEach((card) => add("Evidence card", cardLine(card)));
+  (payload.supporting_quotes || []).forEach((quote) => add("Supporting quote", `PMID ${quote.pmid}: “${quote.quote}”`));
+  const precedent = payload.therapeutic_precedent;
+  if (precedent) {
+    add("Precedent summary", precedent.summary || "(none)");
+    if (!(precedent.precedents || []).length) add("Precedent", "Cleared (no therapeutic precedent)");
+    (precedent.precedents || []).forEach((item) => add("Precedent", [
+      `PMID ${item.pmid}`, (item.therapies || []).join(", "), item.quote ? `“${item.quote}”` : "",
+    ].filter(Boolean).join(" — ")));
+  }
+  return curationEl("section", {
+    className: "curation-override-preview-section",
+    attrs: { "aria-label": `Content of v${version}` },
+    dataset: { curation: "conflict-preview" },
+  }, [curationEl("h3", { text: `v${version} by ${override.curator_email}` }), list]);
 }
 
 function renderCurationFooter(session, isReview) {
@@ -1885,10 +1961,12 @@ function renderCurationQuotes(session, idPrefix) {
       curationTextarea(quote.quote, (value) => { quote.quote = value; quoteCheck.update(value); }, { rows: 2, dataset: { curation: "quote-text" } }),
       { id: `${idPrefix}-quote-${index}-text`, hint: quoteCheck.warning }
     ));
-    row.appendChild(curationButton("Remove quote", () => {
+    const remove = curationButton("Remove quote", () => {
       draft.quotes.splice(index, 1);
       renderCurationDialog();
-    }, { className: "text-button danger-link", action: "remove-quote", label: `Remove supporting quote ${index + 1}` }));
+    }, { className: "text-button danger-link", action: "remove-quote", label: `Remove supporting quote ${index + 1}` });
+    remove.id = `${idPrefix}-quote-${index}-remove`;
+    row.appendChild(remove);
     section.appendChild(row);
   });
   section.appendChild(curationButton("Add quote", () => {
