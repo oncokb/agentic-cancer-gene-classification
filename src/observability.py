@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hashlib
 import logging
+import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
@@ -26,18 +28,32 @@ class NoopSpan:
         return None
 
 
-def _statsd():
-    global _statsd_client, _statsd_warning_logged
-    if not settings.datadog_metrics_enabled:
-        return None
-    if _statsd_client is not None:
-        return _statsd_client
+# DogStatsd's own background sender (datadog >= 0.43): emitting a metric only
+# enqueues the packet (put with sender_queue_timeout=0, i.e. drop instead of
+# block when the bounded queue is full) and a daemon thread does the socket
+# I/O, so a slow or unreachable Agent can never stall the event loop.
+_STATSD_SENDER_KWARGS: dict = {
+    "disable_background_sender": False,
+    "sender_queue_size": 4096,
+    "sender_queue_timeout": 0,
+}
+_STATSD_STOP_TIMEOUT_SECONDS = 2.0
+
+_statsd_init_lock = threading.Lock()
+_statsd_init_thread_lock = threading.Lock()
+_statsd_init_thread: Optional[threading.Thread] = None
+_statsd_unavailable = False
+
+
+def _build_statsd():
+    global _statsd_warning_logged, _statsd_unavailable
     try:
         from datadog import DogStatsd
     except ImportError as exc:  # pragma: no cover - depends on optional package install
         if not _statsd_warning_logged:
             logger.warning("Datadog metrics enabled but DogStatsD client is unavailable: %s", exc)
             _statsd_warning_logged = True
+        _statsd_unavailable = True
         return None
 
     # Only pin an explicit host/port when configured; otherwise leave them
@@ -45,13 +61,70 @@ def _statsd():
     # DD_AGENT_HOST / DD_DOGSTATSD_PORT env var detection, which is what
     # actually resolves to the Datadog Agent's Unix domain socket in this
     # cluster (mirrors how ddtrace-run auto-detects DD_TRACE_AGENT_URL).
-    kwargs: dict = {"namespace": settings.datadog_metrics_namespace}
+    kwargs: dict = {"namespace": settings.datadog_metrics_namespace, **_STATSD_SENDER_KWARGS}
     if settings.datadog_statsd_host:
         kwargs["host"] = settings.datadog_statsd_host
         kwargs["port"] = settings.datadog_statsd_port or 8125
 
-    _statsd_client = DogStatsd(**kwargs)
-    return _statsd_client
+    return DogStatsd(**kwargs)
+
+
+def init_statsd():
+    """Construct the shared DogStatsd client if metrics are enabled.
+
+    Blocking (client setup can do file and DNS I/O), so async code must run
+    it off the event loop — the app does so once at startup (see main.py's
+    lifespan). Idempotent."""
+    global _statsd_client
+    if not settings.datadog_metrics_enabled:
+        return None
+    with _statsd_init_lock:
+        if _statsd_client is None and not _statsd_unavailable:
+            _statsd_client = _build_statsd()
+        return _statsd_client
+
+
+def shutdown_statsd(timeout: float = _STATSD_STOP_TIMEOUT_SECONDS) -> None:
+    """Flush and stop the background sender, waiting at most `timeout`
+    seconds (never hangs shutdown on an unreachable Agent). Blocking; async
+    code must run it off the event loop."""
+    global _statsd_client
+    with _statsd_init_lock:
+        client, _statsd_client = _statsd_client, None
+    stop = getattr(client, "stop", None)
+    if stop is None:
+        return
+    try:
+        stop(timeout=timeout)
+    except Exception as exc:  # pragma: no cover - defensive; shutdown must not fail
+        logger.warning("Datadog metrics client shutdown failed: %s", exc)
+
+
+def _start_background_init() -> None:
+    global _statsd_init_thread
+    with _statsd_init_thread_lock:
+        if _statsd_init_thread is not None and _statsd_init_thread.is_alive():
+            return
+        _statsd_init_thread = threading.Thread(target=init_statsd, name="statsd-init", daemon=True)
+        _statsd_init_thread.start()
+
+
+def _statsd():
+    if not settings.datadog_metrics_enabled:
+        return None
+    client = _statsd_client
+    if client is not None or _statsd_unavailable:
+        return client
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Synchronous caller (CLI, scripts): build inline, as before.
+        return init_statsd()
+    # Inside the event loop and not initialized at startup (e.g. a script's
+    # asyncio.run): never build the client on the loop thread. Build it in
+    # the background and drop this metric.
+    _start_background_init()
+    return None
 
 
 def _merge_tags(tags: Iterable[str] | None) -> list[str]:

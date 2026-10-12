@@ -15,7 +15,11 @@ the sidecar's optimizations (the `osler` model switch, cache warming, the async
   `DD_VERSION` (set at deploy time, see the main README), so every metric
   carries `service:agentic-cancer-gene-classification`.
 - Metrics are best-effort: a failing metrics client never changes a response or
-  a lookup. With `OPENEVIDENCE_ENABLED=false` the endpoint's response is
+  a lookup. They also never block the event loop. The shared DogStatsd client
+  (used by every `acgc.*` metric) runs the library's background sender, and
+  emitting only enqueues a packet into a bounded queue (4096 packets) that
+  drops instead of blocking when full. The client is built once at app
+  startup, off the event loop, and stopped (with a 2s cap) at shutdown. With `OPENEVIDENCE_ENABLED=false` the endpoint's response is
   byte-identical to before; only `endpoint.requests{outcome:disabled}` and its
   duration are counted.
 
@@ -32,7 +36,7 @@ the sidecar's optimizations (the `osler` model switch, cache warming, the async
 | `openevidence.cache.lookups` | count | `model`, `result` | The endpoint's cache-only peek at the shared Redis cache. `result`: `hit`, `miss`, or `error`. This peek does not go through `cached_call`, so it is **not** counted in `redis_cache.lookups`. `redis_cache.lookups{cache_name:openevidence}` counts only the read-through lookups made by background lookups and warmup. Nothing is double counted. |
 | `openevidence.lookups.started` | count | `model` | Background lookups started: the cache missed, this request claimed the lease, and a paid call is on its way. |
 | `openevidence.lookups.deduped` | count | `model`, `scope` | Requests that joined a lookup already in flight instead of paying for a new one. `scope:in_process` means the lookup is in this worker's task registry; this includes every poll while a lookup runs. `scope:cross_pod` means another worker or pod holds the Redis lease. |
-| `openevidence.lookups.completed` | count | `model`, `result` | Background lookup outcomes. `result`: `success`, `failed`, `abandoned` (the lease was lost before the paid call, so no call was made), or `discarded` (the lease was lost mid-call and the failure was not published). |
+| `openevidence.lookups.completed` | count | `model`, `result` | Background lookup outcomes, exactly one per `lookups.started` (recorded when the lookup's task finishes, however it finishes). `result`: `success`, `failed`, `abandoned` (the lease was lost before the paid call, so no call was made), `discarded` (the lease was lost mid-call and the failure was not published), `cancelled` (cancelled at shutdown or while queued, including before it ever ran; no failure marker is published), or `error` (crashed unexpectedly). |
 | `openevidence.lookups.time_to_ready_ms` | distribution | `model` | Server-side time from the start of a background lookup (the first request that missed) until the answer is available to polls. It includes the semaphore wait. Measured without new state, so it starts at the lookup's start, not at the first "pending" response; the two differ by at most `OPENEVIDENCE_SIDECAR_PENDING_WAIT_SECONDS`. |
 | `openevidence.semaphore_wait_ms` | distribution | `model` | Time a background lookup waited for a slot under `OPENEVIDENCE_SIDECAR_CONCURRENCY` (3 by default). |
 | `openevidence.lease.unavailable` | count | `model`, `op` | Redis-lease fallbacks: the claim (`op:claim`) or a renewal (`op:renew`) hit a Redis error. The lookup then proceeds without a cross-pod lease, so a duplicate paid call is possible. |
@@ -92,21 +96,9 @@ percentiles**. Do this for `acgc.openevidence.upstream.duration_ms`,
 `acgc.openevidence.lookups.time_to_ready_ms`, and
 `acgc.openevidence.upstream.time_to_first_chunk_ms`.
 
-### Import through the UI (dashboard `s7n-fsn-pqm`)
+### Import through the API (recommended)
 
-1. Copy the whole contents of `openevidence_dashboard_widgets.json` to the
-   clipboard. On macOS: `pbcopy < docs/datadog/openevidence_dashboard_widgets.json`.
-2. Open `https://app.datadoghq.com/dashboard/s7n-fsn-pqm` (use your org's site
-   domain if it differs).
-3. Click **Edit Widgets**, click an empty spot on the dashboard canvas, and
-   paste with Cmd+V or Ctrl+V. Datadog recognizes copied widget JSON and adds
-   the group. Alternatively, use **Configure → Import dashboard JSON**, but that
-   replaces the whole dashboard, so prefer paste.
-4. Adjust the group's position or size, then click **Save**.
-
-### Import through the API (optional)
-
-Use your own keys from the environment, and never commit or hardcode them.
+This is the primary path for dashboard `s7n-fsn-pqm`. Use your own keys from the environment, and never commit or hardcode them.
 This script GETs the dashboard, appends the group, and PUTs it back. Run it
 from the repo root.
 
@@ -140,6 +132,22 @@ curl -sf -X PUT "https://api.${DD_SITE}/api/v1/dashboard/${DASH}" \
 ```
 
 On a dashboard with `reflow_type: fixed`, the group is placed at the bottom
-with a full-width layout. On an auto-reflow dashboard, the per-widget layouts
-are stripped, because auto-reflow dashboards do not accept them. Restore
+with a full-width layout. Otherwise the script strips the per-widget layouts,
+which only apply to fixed-reflow dashboards. Restore
 `/tmp/dash-${DASH}.backup.json` with the same PUT if anything looks wrong.
+
+### Import through the UI (alternative)
+
+1. Open `https://app.datadoghq.com/dashboard/s7n-fsn-pqm` (use your org's
+   site domain if it differs).
+2. Either export the dashboard JSON (**Configure → Export dashboard JSON**),
+   append the contents of `openevidence_dashboard_widgets.json` to its
+   top-level `widgets` array, and load it back with **Configure → Import
+   dashboard JSON** (this replaces the whole dashboard, so keep the export as
+   a backup); or edit the dashboard's JSON in place, if your Datadog UI
+   offers that, and add the group to `widgets` the same way.
+3. Check the group renders, then save.
+
+Neither the API script nor the UI route has been run against a live
+Datadog dashboard yet (no keys were available when this was written).
+Verify the result on the dashboard after importing.

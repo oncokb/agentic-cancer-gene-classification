@@ -385,3 +385,176 @@ async def test_a_failing_metrics_client_never_changes_behavior(fake_redis, upstr
 
     assert (first.status, second.status) == ("pending", "ready")
     assert upstream.calls == 1
+
+
+# --- Lookup cancellation: started and completed always balance -------------
+
+
+def _completed_results(statsd: FakeStatsd) -> List[str]:
+    return [tags[1] for tags in statsd.tags_of("openevidence.lookups.completed")]
+
+
+async def test_shutdown_cancellation_records_one_cancelled_completion(fake_redis, statsd, upstream):
+    result, _ = await _request("ALK")
+    assert result.status == "pending"
+
+    await main._cancel_openevidence_sidecar_lookups()
+    await asyncio.sleep(0)
+
+    assert len(statsd.named("openevidence.lookups.started")) == 1
+    assert _completed_results(statsd) == ["result:cancelled"]
+    # Existing cleanup kept: lease released, no failure marker published.
+    assert fake_redis.keys_with_prefix("openevidence_inflight:") == []
+    assert fake_redis.keys_with_prefix("openevidence_failed:") == []
+    assert statsd.named("openevidence.lookups.time_to_ready_ms") == []
+
+
+async def test_cancellation_while_queued_on_the_semaphore_records_cancelled(
+    fake_redis, statsd, upstream, monkeypatch
+):
+    monkeypatch.setattr(main.settings, "openevidence_sidecar_concurrency", 1)
+    await _request("ALK")  # holds the only slot (upstream is gated)
+    await _request("ROS1")  # queued behind it
+    queued = next(task for key, task in main._openevidence_sidecar_tasks.items() if '"ROS1"' in key)
+    assert upstream.calls == 1
+
+    queued.cancel()
+    await asyncio.gather(queued, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert _completed_results(statsd) == ["result:cancelled"]
+    # The queued lookup never acquired a slot: only ALK's wait is recorded.
+    assert len(statsd.named("openevidence.semaphore_wait_ms")) == 1
+
+    upstream.release()
+    await _wait_for_background_lookups()
+    assert sorted(_completed_results(statsd)) == ["result:cancelled", "result:success"]
+    assert len(statsd.named("openevidence.lookups.started")) == 2
+
+
+async def test_cancellation_before_the_lookup_body_starts_records_cancelled_once(fake_redis, statsd, upstream):
+    key = openevidence.sidecar_cache_key("ALK")
+    task = main._start_openevidence_sidecar_lookup(key, "token", "ALK", None, None)
+    task.cancel()  # before the task ever ran
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert task.cancelled()
+    assert upstream.calls == 0
+    assert len(statsd.named("openevidence.lookups.started")) == 1
+    assert _completed_results(statsd) == ["result:cancelled"]
+
+
+# --- `source` ContextVar isolation -------------------------------------------
+
+
+async def test_concurrent_warmup_and_sidecar_calls_keep_their_own_source(fake_redis, statsd, upstream, monkeypatch):
+    async def fake_normalize_fusions(inputs):
+        return {"ROS1": (ResolvedGene(input_symbol="ROS1", canonical_symbol="ROS1", resolved=True), ["ROS1"])}
+
+    monkeypatch.setattr(openevidence_warmup, "normalize_fusions", fake_normalize_fusions)
+    warmup = asyncio.create_task(openevidence_warmup.warm_openevidence_cache(["ROS1"]))
+    await _request("ALK")
+    for _ in range(100):  # both paid calls in flight at the same time
+        if upstream.calls == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert upstream.calls == 2
+
+    upstream.release()
+    await _wait_for_background_lookups()
+    report = await asyncio.wait_for(warmup, timeout=2.0)
+
+    assert report["genes_warmed"] == 1
+    sources = sorted(tags[2] for tags in statsd.tags_of("openevidence.upstream.calls"))
+    assert sources == ["source:sidecar", "source:warmup"]
+
+
+# --- Units: every *_ms value is milliseconds (controlled clock) --------------
+
+
+class FakeClock:
+    """Module-local stand-in for `time` (only monotonic() is faked), so the
+    event loop's own clock is untouched."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name):
+        import time
+
+        return getattr(time, name)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = FakeClock()
+    monkeypatch.setattr(openevidence, "time", fake)
+    monkeypatch.setattr(main, "time", fake)
+    return fake
+
+
+def _values(statsd: FakeStatsd, metric: str) -> List[float]:
+    return [call[2] for call in statsd.named(metric, "distribution")]
+
+
+async def test_upstream_duration_and_time_to_first_chunk_are_milliseconds(fake_redis, statsd, clock):
+    class SlowStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            clock.advance(1.5)
+            yield _SSE_STREAM[:40].encode()
+            clock.advance(2.0)
+            yield _SSE_STREAM[40:].encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=SlowStream())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        await OpenEvidenceClient().get_gene_analysis("ALK", client=http_client)
+
+    assert _values(statsd, "openevidence.upstream.time_to_first_chunk_ms") == [pytest.approx(1500.0)]
+    assert _values(statsd, "openevidence.upstream.duration_ms") == [pytest.approx(3500.0)]
+
+
+async def test_endpoint_duration_is_milliseconds(fake_redis, statsd, clock, upstream, monkeypatch):
+    upstream.release()
+    await OpenEvidenceClient().get_gene_analysis("ALK")
+    statsd.calls.clear()
+    real_get = fake_redis.get
+
+    async def slow_get(key):
+        clock.advance(0.25)
+        return await real_get(key)
+
+    monkeypatch.setattr(fake_redis, "get", slow_get)
+    result, _ = await _request("ALK")
+
+    assert result.status == "ready"
+    assert _values(statsd, "openevidence.endpoint.duration_ms") == [pytest.approx(250.0)]
+
+
+async def test_semaphore_wait_and_time_to_ready_are_milliseconds(fake_redis, statsd, clock, monkeypatch):
+    async def upstream_taking_two_seconds(question, api_key, client):
+        clock.advance(2.0)
+        return _SSE_STREAM
+
+    monkeypatch.setattr(openevidence, "_post_streaming_analysis", upstream_taking_two_seconds)
+    monkeypatch.setattr(main.settings, "openevidence_sidecar_concurrency", 1)
+    semaphore = main._openevidence_sidecar_semaphore()
+    await semaphore.acquire()  # the lookup has to queue
+    try:
+        result, _ = await _request("ALK")
+        assert result.status == "pending"
+        clock.advance(0.4)
+    finally:
+        semaphore.release()
+    await _wait_for_background_lookups()
+
+    assert _values(statsd, "openevidence.semaphore_wait_ms") == [pytest.approx(400.0)]
+    assert _values(statsd, "openevidence.lookups.time_to_ready_ms") == [pytest.approx(2400.0)]

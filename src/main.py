@@ -88,10 +88,12 @@ from src.models.schema import (
 from src.observability import (
     get_user_context,
     increment,
+    init_statsd,
     record_user_action,
     record_user_seen,
     reset_user_context,
     set_user_context,
+    shutdown_statsd,
     tag_current_span,
     tag_user,
 )
@@ -163,6 +165,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Build the DogStatsD client (file/DNS I/O) off the event loop, once,
+    # before any request can emit a metric.
+    await asyncio.to_thread(init_statsd)
     app.state.run_store = await RunStore.create()
     logger.info(
         "Application startup: auth_enabled=%s, google_client_id_configured=%s, "
@@ -176,6 +181,7 @@ async def lifespan(app: FastAPI):
     yield
     await _cancel_openevidence_sidecar_lookups()
     await app.state.run_store.close()
+    await asyncio.to_thread(shutdown_statsd)
 
 
 app = FastAPI(
@@ -548,7 +554,12 @@ async def _keep_openevidence_lease_alive(key: str, token: str, lost: asyncio.Eve
 
 
 async def _run_openevidence_sidecar_lookup(
-    key: str, token: str, gene: str, tumor_type: Optional[str], fusion: Optional[str]
+    key: str,
+    token: str,
+    gene: str,
+    tumor_type: Optional[str],
+    fusion: Optional[str],
+    outcome: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Background body of one sidecar lookup, run by the owner of the
     in-flight lease `token`. Returns None on success (the analysis is then
@@ -566,26 +577,47 @@ async def _run_openevidence_sidecar_lookup(
     outcome lands. A *successful* analysis is still kept even then: it is
     genuine data for this cache key (get_gene_analysis has already written
     it to the shared cache by the time we know), equivalent to what the new
-    owner will write, and serving it sooner is strictly better."""
+    owner will write, and serving it sooner is strictly better.
+
+    `outcome`, when given, receives the terminal result for metrics
+    ("result": success/failed/abandoned/discarded, plus "ready_at" on
+    success); the task's done-callback records it (see
+    _start_openevidence_sidecar_lookup)."""
     with oe_metrics.call_source("sidecar"):
-        return await _run_openevidence_sidecar_lookup_body(key, token, gene, tumor_type, fusion)
+        return await _run_openevidence_sidecar_lookup_body(
+            key, token, gene, tumor_type, fusion, outcome if outcome is not None else {}
+        )
 
 
-def _record_openevidence_lookup_completed(result: str, started: float) -> None:
+def _record_openevidence_lookup_completed(
+    task: "asyncio.Task[Optional[str]]", outcome: Dict[str, Any], started: float
+) -> None:
+    """Exactly one terminal metric per started lookup. Runs as the task's
+    done-callback, so it also covers a lookup cancelled before its body ever
+    ran (shutdown, or while queued) — "cancelled" — and an unexpected crash
+    ("error"). A result the body already reached wins over a cancellation
+    that only interrupted its lease cleanup."""
+    result = outcome.get("result") or ("cancelled" if task.cancelled() else "error")
     model = oe_metrics.model_tag()
     oe_metrics.increment(oe_metrics.LOOKUPS_COMPLETED, tags=[model, f"result:{result}"])
-    if result == "success":
+    if result == "success" and "ready_at" in outcome:
         # Server-side time from the lookup's start (the first request that
         # missed — it then answered "pending" within
         # openevidence_sidecar_pending_wait_seconds) to the answer landing
         # in the cache/result memo, i.e. when a poll can first see "ready".
-        oe_metrics.distribution(oe_metrics.LOOKUP_TIME_TO_READY_MS, (time.monotonic() - started) * 1000, tags=[model])
+        oe_metrics.distribution(
+            oe_metrics.LOOKUP_TIME_TO_READY_MS, (outcome["ready_at"] - started) * 1000, tags=[model]
+        )
 
 
 async def _run_openevidence_sidecar_lookup_body(
-    key: str, token: str, gene: str, tumor_type: Optional[str], fusion: Optional[str]
+    key: str,
+    token: str,
+    gene: str,
+    tumor_type: Optional[str],
+    fusion: Optional[str],
+    outcome: Dict[str, Any],
 ) -> Optional[str]:
-    started = time.monotonic()
     lease_lost = asyncio.Event()
     heartbeat = asyncio.create_task(_keep_openevidence_lease_alive(key, token, lease_lost))
     try:
@@ -599,7 +631,7 @@ async def _run_openevidence_sidecar_lookup_body(
             # than make a duplicate upstream call.
             if not await renew_inflight_marker(key, token, settings.openevidence_sidecar_inflight_ttl_seconds):
                 logger.info("OpenEvidence sidecar lookup for %s abandoned: lease now held elsewhere", gene)
-                _record_openevidence_lookup_completed("abandoned", started)
+                outcome["result"] = "abandoned"
                 return None
             # httpx's timeout is per read, so a slowly trickling stream could
             # otherwise run forever; cap the whole call (not the queue time).
@@ -616,17 +648,17 @@ async def _run_openevidence_sidecar_lookup_body(
         failed_ttl = settings.openevidence_sidecar_failed_ttl_seconds
         if lease_lost.is_set() or not await publish_failure_and_release(key, token, error, failed_ttl):
             logger.info("OpenEvidence sidecar lookup for %s failed after losing its lease (%s); discarded", gene, error)
-            _record_openevidence_lookup_completed("discarded", started)
+            outcome["result"] = "discarded"
             return None
         logger.warning("OpenEvidence sidecar lookup failed for %s: %s", gene, error)
         _openevidence_memo_put(_openevidence_sidecar_failures, key, failed_ttl, error)
-        _record_openevidence_lookup_completed("failed", started)
+        outcome["result"] = "failed"
         return error
     else:
         _openevidence_memo_put(
             _openevidence_sidecar_results, key, settings.openevidence_sidecar_inflight_ttl_seconds, analysis
         )
-        _record_openevidence_lookup_completed("success", started)
+        outcome.update(result="success", ready_at=time.monotonic())
         return None
     finally:
         heartbeat.cancel()
@@ -641,13 +673,16 @@ def _start_openevidence_sidecar_lookup(
     # Not tied to the request: it keeps running (and caches its answer) if
     # the client disconnects or the request returns "pending". Tracked like
     # the annotation jobs' tasks; the per-key registry below adds dedupe.
-    task = _track_background_task(_run_openevidence_sidecar_lookup(key, token, gene, tumor_type, fusion))
+    started = time.monotonic()
+    outcome: Dict[str, Any] = {}
+    task = _track_background_task(_run_openevidence_sidecar_lookup(key, token, gene, tumor_type, fusion, outcome))
     _openevidence_sidecar_tasks[key] = task
     oe_metrics.increment(oe_metrics.LOOKUPS_STARTED, tags=[oe_metrics.model_tag()])
 
     def _forget(done: "asyncio.Task[Optional[str]]") -> None:
         if _openevidence_sidecar_tasks.get(key) is done:
             del _openevidence_sidecar_tasks[key]
+        _record_openevidence_lookup_completed(done, outcome, started)
 
     task.add_done_callback(_forget)
     return task
