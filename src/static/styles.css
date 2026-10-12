@@ -2920,5 +2920,6 @@ body.api-keys-body {
 .partner-curation-controls {
   display: grid;
   gap: 6px;
+  justify-items: start;
   margin-bottom: 8px;
 }
