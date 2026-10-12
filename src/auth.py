@@ -838,7 +838,9 @@ async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[Au
             logger.warning("Failed to update last_used_at for API key %s: %s", record.id, exc)
 
     profile = await get_user_profile(owner_email)
-    role = profile.role if profile else settings.jit_default_role
+    # No live profile means no IdP-derived role to trust: never let JIT_DEFAULT_ROLE
+    # (which may be configured to curator/admin) confer privileges on a key.
+    role = profile.role if profile else "viewer"
     if profile and role == "curator" and profile.role_version < ROLE_DERIVATION_VERSION:
         # Stored before roles were derived from the IdP; re-derived at next login.
         role = "viewer"
@@ -962,8 +964,9 @@ async def require_curator(request: Request) -> AuthenticatedUser:
     """Allow curators and admins to edit curated overrides.
 
     API-key requests are allowed only when the key owner's live JIT profile
-    role is curator/admin (resolved per request in _verify_api_key), so a role
-    removed in Keycloak stops working for keys at the owner's next login.
+    role is curator/admin (resolved per request in _verify_api_key; a missing
+    profile is a viewer), so a role removed in Keycloak stops working for keys
+    at the owner's next login.
     """
     user = await require_auth(request)
     if not can_curate(user):

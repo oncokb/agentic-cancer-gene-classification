@@ -203,3 +203,24 @@ def test_dev_login_role_param(auth_on, monkeypatch):
 
     resp = client.get("/auth/dev/login?email=dev.admin@mskcc.org&role=admin", follow_redirects=False)
     assert decode_session_token(resp.cookies.get(settings.auth_cookie_name)).role == "admin"
+
+
+@pytest.mark.parametrize("jit_default", ["curator", "admin"])
+def test_api_key_without_live_profile_cannot_curate_even_with_privileged_jit_default(auth_on, monkeypatch, jit_default):
+    from src import api_keys as api_keys_module
+    from src.api_keys import InMemoryRateLimiter
+
+    monkeypatch.setattr(api_keys_module, "_memory_limiter", InMemoryRateLimiter())
+    previous = getattr(app.state, "run_store", None)
+    app.state.run_store = FakeStore()
+    email = f"no.profile.{jit_default}@mskcc.org"
+    try:
+        key = _create_key(_session_client(email, role="curator"))["key"]
+        monkeypatch.setattr(settings, "jit_default_role", jit_default)
+        monkeypatch.delitem(auth_module._user_store, email, raising=False)
+        client = TestClient(app)
+        resp = client.put(CURATION_URL, json={"payload": {"citations": ["1"]}}, headers=_bearer(key))
+        assert resp.status_code == 403
+        assert client.get("/v1/api-keys?all=true", headers=_bearer(key)).status_code == 403  # not admin either
+    finally:
+        app.state.run_store = previous
