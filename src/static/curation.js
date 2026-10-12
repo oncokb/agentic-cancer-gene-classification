@@ -58,6 +58,9 @@ const curationState = {
   localVersions: new Map(),
   // subjectIds reverted here whose pipeline content hasn't loaded yet.
   pendingRefresh: new Set(),
+  // subjectId -> "save" for saves whose fresh content hasn't loaded yet (the
+  // shown content predates the save); absent means a revert.
+  pendingRefreshKind: new Map(),
   // fusion_partner subjectId -> { record, entries: Map(container -> { request,
   // record }) }. Partner lookups are on-demand, not part of the run result, so
   // each rendered lookup registers here for the editor to find and refresh.
@@ -180,6 +183,8 @@ function reconcileCuratedRecord(subject, existing, incoming) {
   if (!stale) {
     // Uncurated content after a local revert is the pipeline version we were waiting for.
     if (local.revertedFrom && !incoming.curated) curationState.pendingRefresh.delete(curationSubjectId(subject));
+    // Any current content after a local save is the version we were waiting for.
+    if (!local.revertedFrom) curationState.pendingRefresh.delete(curationSubjectId(subject));
     return incoming;
   }
   const merged = { ...incoming };
@@ -883,6 +888,32 @@ async function fetchCurrentCurationOverride(subject) {
 // Save / revert / reload
 // ---------------------------------------------------------------------------
 
+// Sections the record shows as curated that the saved override no longer
+// sets. Their pipeline values aren't known here, so the saved override can't
+// be overlaid onto the record without presenting stale curated values.
+function curationRemovedSections(record, payload) {
+  return (record?.curated_fields || []).filter((key) => !(key in (payload || {})));
+}
+
+// After a successful save whose reload failed: overlay the saved override
+// when that is exact, else mark the subject pending refresh (with Retry).
+function applySavedCurationFallback(subject, saved) {
+  const id = curationSubjectId(subject);
+  const record = findCurationRecord(subject);
+  if (!record) return;
+  if (curationRemovedSections(record, saved.override?.payload).length) {
+    curationState.pendingRefresh.add(id);
+    curationState.pendingRefreshKind.set(id, "save");
+    return;
+  }
+  replaceCurationRecord(subject, curatedRecordFromOverride(subject, record, saved));
+}
+
+function markCurationRevertPending(id) {
+  curationState.pendingRefresh.add(id);
+  curationState.pendingRefreshKind.delete(id);
+}
+
 function curatedRecordFromOverride(subject, record, response) {
   const override = response.override || {};
   const payload = override.payload || {};
@@ -992,10 +1023,7 @@ async function saveCurationDraft(session) {
     curationState.pendingRefresh.delete(curationSubjectId(session.subject));
     // Render what the server serves; fall back to the saved (full) override.
     const fresh = await reloadCurationSubject(session.subject).catch(() => null);
-    const record = findCurationRecord(session.subject);
-    if (!fresh && record) {
-      replaceCurationRecord(session.subject, curatedRecordFromOverride(session.subject, record, saved));
-    }
+    if (!fresh) applySavedCurationFallback(session.subject, saved);
     curationState.busy = false;
     discardCurationSession(session);
     // Re-render before closing so focus returns to the re-rendered opener.
@@ -1210,9 +1238,15 @@ async function saveCurationCall(subject, edit, errorNode, button) {
     if (!response.ok) {
       const detail = await curationResponseDetail(response);
       if (response.status === 409) {
-        errorNode.textContent =
-          `Another curator saved changes${detail?.current_version ? ` (now v${detail.current_version})` : ""}. ` +
-          "Nothing was saved; save again to review and replace it.";
+        // Show the newer version's call now; a retry merges into it, keeping
+        // whatever else the other curator saved.
+        const latest = await fetchCurrentCurationOverride(subject).catch(() => null);
+        if (latest) edit.baseVersion = latest.version;
+        errorNode.textContent = latest
+          ? `Another curator saved changes (now v${latest.version}, call: ` +
+            `${curationCallText(latest.override?.payload?.cancer_associated)}). Nothing was saved; save again to apply your call to that version.`
+          : `Another curator saved changes${detail?.current_version ? ` (now v${detail.current_version})` : ""}. ` +
+            "Nothing was saved; save again to review and replace it.";
       } else if (response.status === 503) {
         errorNode.textContent = curationRetryMessage(response, detail, "save");
       } else if (response.status === 403) {
@@ -1228,14 +1262,13 @@ async function saveCurationCall(subject, edit, errorNode, button) {
       curationState.localVersions.set(id, { version: 0, revertedFrom: current.version });
       fresh = await reloadCurationSubject(subject).catch(() => null);
       if (fresh) curationState.pendingRefresh.delete(id);
-      else curationState.pendingRefresh.add(id);
+      else markCurationRevertPending(id);
     } else {
       const saved = await response.json();
       curationState.localVersions.set(id, { version: saved.version, revertedFrom: 0 });
       curationState.pendingRefresh.delete(id);
       fresh = await reloadCurationSubject(subject).catch(() => null);
-      const record = findCurationRecord(subject);
-      if (!fresh && record) replaceCurationRecord(subject, curatedRecordFromOverride(subject, record, saved));
+      if (!fresh) applySavedCurationFallback(subject, saved);
     }
     curationState.busy = false;
     refreshCurationView(subject);
@@ -1348,7 +1381,7 @@ async function revertCuration(subject, version, errorNode, button) {
     curationState.busy = false;
     if (fresh) curationState.pendingRefresh.delete(curationSubjectId(subject));
     // Don't present the old curated content as current: mark it pending.
-    else curationState.pendingRefresh.add(curationSubjectId(subject));
+    else markCurationRevertPending(curationSubjectId(subject));
     // Re-render before closing so focus returns to the re-rendered card.
     refreshCurationView(subject);
     closeCurationAuxModal();
@@ -1377,7 +1410,7 @@ async function retryCurationRefresh(subject, button) {
         "success"
       );
     } else {
-      showCurationToast(`Still couldn't load the pipeline version of ${subject.label}; re-run the annotation if this persists.`, "error");
+      showCurationToast(`Still couldn't load the current version of ${subject.label}; re-run the annotation if this persists.`, "error");
     }
   } finally {
     curationState.busy = false;
@@ -1477,11 +1510,21 @@ function renderCurationPanel(subject, record) {
       attrs: { role: "alert" },
       dataset: { flag: "pending_refresh" },
     }, [
-      curationEl("strong", { text: "Reverted to pipeline output — refresh pending." }),
-      curationEl("span", { text: " The pipeline version couldn't be loaded yet; the content below is the old curated version. " }),
+      ...(curationState.pendingRefreshKind.get(curationSubjectId(subject)) === "save"
+        ? [
+            curationEl("strong", { text: "Saved — refresh pending." }),
+            curationEl("span", {
+              text: " The saved version couldn't be loaded yet; the content below predates this save " +
+                "(a removed curator edit may still show). ",
+            }),
+          ]
+        : [
+            curationEl("strong", { text: "Reverted to pipeline output — refresh pending." }),
+            curationEl("span", { text: " The pipeline version couldn't be loaded yet; the content below is the old curated version. " }),
+          ]),
     ]);
     const retry = curationButton("Retry refresh", () => retryCurationRefresh(subject, retry), {
-      className: "text-button", action: "retry-refresh", label: `Retry loading the pipeline version of ${subject.label}`,
+      className: "text-button", action: "retry-refresh", label: `Retry loading the current version of ${subject.label}`,
     });
     retry.dataset.curationSubject = curationSubjectId(subject);
     notice.appendChild(retry);
