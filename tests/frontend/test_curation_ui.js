@@ -985,10 +985,18 @@ async function test_focus_recovery_uses_control_id_for_quote_rows() {
   app.renderCurationDialog();
   assert.strictEqual(app.document.activeElement.id, id, "same row's control by id, not the first quote row");
   assert.notStrictEqual(app.document.activeElement, byData(body(app), "curation", "quote-pmid")[0]);
-  removes[2].focus();
-  const removeId = removes[2].id;
+  // Re-acquire the third remove button: `removes` was detached by the rebuild above.
+  const third = byData(body(app), "curation", "remove-quote")[2];
+  assert.ok(third.isConnected, "focus a live control, not one from before the rebuild");
+  assert.ok(third.id, "the control has an id to recover focus by");
+  third.focus();
+  const removeId = third.id;
   app.renderCurationDialog();
-  assert.strictEqual(app.document.activeElement.id, removeId);
+  const focused = app.document.activeElement;
+  assert.notStrictEqual(focused, third, "the rebuild replaced the focused control");
+  assert.ok(focused.isConnected, "focus moved to the rebuilt control");
+  assert.strictEqual(focused.id, removeId);
+  assert.strictEqual(focused, byData(body(app), "curation", "remove-quote")[2], "the third row's button, not another row's");
 }
 
 async function test_retry_refresh_wording_matches_fresh_record() {

@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tup
 import pymysql
 
 from src.models.schema import CuratedOverride, CurationHistoryEntry
+from src.pipeline.schema_migrations import add_column_if_missing
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +135,8 @@ class CurationStoreMixin:
         await cursor.execute(_CREATE_CURATION_HISTORY_TABLE_SQL)
         # runs.revision: bumped by every result_json write, so whole-result
         # rewrites can compare-and-swap instead of clobbering concurrent ones.
-        await cursor.execute("SHOW COLUMNS FROM runs LIKE 'revision'")
-        if await cursor.fetchone() is None:
-            await cursor.execute("ALTER TABLE runs ADD COLUMN revision INT NOT NULL DEFAULT 0")
+        # Safe when several instances start at once (see schema_migrations).
+        await add_column_if_missing(cursor, "runs", "revision", "INT NOT NULL DEFAULT 0")
 
     async def get_curated_override(
         self, subject_type: str, subject_key: str, tumor_type: str

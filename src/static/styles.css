@@ -2912,6 +2912,18 @@ body.api-keys-body {
   opacity: 0.45;
 }
 
+/* Curator-set cancer-associated call, inline after the status value. */
+.curator-set-tag {
+  margin-left: 6px;
+}
+
+.partner-curation-controls {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  margin-bottom: 8px;
+}
+
 .curation-override-preview-section {
   margin: 8px 0;
   border: 1px solid var(--line);

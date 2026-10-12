@@ -19,6 +19,7 @@ from src.api_keys import ApiKeyRecord
 from src.config import settings
 from src.models.schema import GeneAnnotation, PMIDEvidenceRecord
 from src.pipeline.curation_store import CurationStoreMixin
+from src.pipeline.schema_migrations import add_column_if_missing, run_concurrent_safe_ddl
 
 logger = logging.getLogger(__name__)
 
@@ -188,21 +189,23 @@ class RunStore(CurationStoreMixin):
 
     async def _ensure_gene_annotation_schema(self, cursor) -> None:
         """Migrate older gene-only annotation caches to gene + tumor-type keys."""
-        await cursor.execute("SHOW COLUMNS FROM gene_annotations LIKE 'tumor_type'")
-        if await cursor.fetchone() is None:
-            await cursor.execute(
-                "ALTER TABLE gene_annotations "
-                "ADD COLUMN tumor_type VARCHAR(128) NOT NULL DEFAULT '' AFTER gene"
+        # Both steps are safe when several instances start at once (see schema_migrations).
+        await add_column_if_missing(
+            cursor, "gene_annotations", "tumor_type", "VARCHAR(128) NOT NULL DEFAULT '' AFTER gene"
+        )
+        if await self._gene_annotation_primary_columns(cursor) == ["gene"]:
+            await run_concurrent_safe_ddl(
+                cursor,
+                "ALTER TABLE gene_annotations DROP PRIMARY KEY, ADD PRIMARY KEY (gene, tumor_type)",
             )
+            if await self._gene_annotation_primary_columns(cursor) != ["gene", "tumor_type"]:
+                raise RuntimeError("Schema migration failed: gene_annotations primary key not (gene, tumor_type)")
 
+    @staticmethod
+    async def _gene_annotation_primary_columns(cursor) -> List[str]:
         await cursor.execute("SHOW INDEX FROM gene_annotations WHERE Key_name = 'PRIMARY'")
         rows = await cursor.fetchall()
-        primary_columns = [row[4] for row in sorted(rows, key=lambda row: row[3])]
-        if primary_columns == ["gene"]:
-            await cursor.execute(
-                "ALTER TABLE gene_annotations "
-                "DROP PRIMARY KEY, ADD PRIMARY KEY (gene, tumor_type)"
-            )
+        return [row[4] for row in sorted(rows, key=lambda row: row[3])]
 
     async def save_run(
         self,
