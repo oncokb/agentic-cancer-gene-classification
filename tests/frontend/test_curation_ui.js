@@ -82,9 +82,14 @@ function geneSubject(app) {
   return app.geneCurationSubject(app.state.currentResult.annotations[0]);
 }
 
-function jobRoutes({ draft = GENE_DRAFT, final, extra } = {}) {
+// `current` is the override GET /v1/curation/{type}/{key} serves (read before
+// every save): an object, or a function returning one.
+function jobRoutes({ draft = GENE_DRAFT, final, extra, current = { version: 0, override: null } } = {}) {
   let polls = 0;
   return async (method, url, reqBody) => {
+    if (method === "GET" && /^\/v1\/curation\/(gene|fusion)\/[^/?]+(\?|$)/.test(url)) {
+      return [200, typeof current === "function" ? current() : current];
+    }
     if (method === "POST" && url === "/v1/curation/reevaluate/jobs") {
       return [200, { job_id: "job-1", status_url: "/v1/curation/reevaluate/jobs/job-1" }];
     }
@@ -254,6 +259,7 @@ async function test_save_put_body_rerenders_in_place_and_toasts() {
   let put;
   const app = loadCurationApp({
     routes: jobRoutes({
+      current: { version: 3, override: { curator_email: "old@mskcc.org", updated_at: "2026-09-01T00:00:00Z", payload: { citations: ["111", "222"] } } },
       extra: async (method, url, reqBody) => {
         if (method !== "PUT") return undefined;
         put = { url, body: reqBody };
@@ -343,6 +349,11 @@ async function test_save_409_offers_reload_and_resaves_with_current_version() {
   const puts = [];
   const app = loadCurationApp({
     routes: jobRoutes({
+      // Another curator saves v4 between our pre-save read and our PUT.
+      current: () => (puts.length ? {
+        version: 4,
+        override: { curator_email: "other@x", updated_at: "2026-10-11T00:00:00Z", payload: { cancer_association_rationale: "Other curator." } },
+      } : { version: 0, override: null }),
       extra: async (method, url, reqBody) => {
         if (method === "PUT") {
           puts.push(reqBody);
@@ -473,12 +484,16 @@ async function test_curated_badge_flags_history_and_revert() {
   app.pressKey("Escape");
   assert.ok(app.root("curation-aux-modal").classList.contains("hidden"));
 
-  oneByData(app.root("results-window"), "curation", "revert").click();
+  const revertButton = oneByData(app.root("results-window"), "curation", "revert");
+  revertButton.focus(); // a real click focuses the button
+  revertButton.click();
   assert.ok(app.root("curation-aux-body").allText.includes("Revert ALK to the pipeline output?"));
   assert.strictEqual(deleted, undefined, "nothing deleted before confirming");
   oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").click();
   await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "revert");
   assert.strictEqual(deleted, "/v1/curation/gene/ALK?tumor_type=LUAD&expected_version=2");
+  assert.ok(app.document.activeElement.classList.contains("curation-edit-button"), "focus lands on the re-rendered card");
+  assert.strictEqual(app.document.activeElement.dataset.curationSubject, "gene|ALK|luad");
   assert.strictEqual(app.state.currentResult.annotations[0].cancer_association_rationale, "Pipeline again.");
   assert.strictEqual(byData(app.root("results-window"), "curation", "curated-badge").length, 0);
   assert.ok(app.root("toast-region").allText.includes("ALK reverted to pipeline output"));
@@ -639,6 +654,276 @@ async function test_unresolved_tumor_context_disables_edit() {
   assert.strictEqual(oneByData(okWin, "curation", "edit-evidence").disabled, false);
 }
 
+// --- Review regressions -----------------------------------------------------
+
+const CURATED_PRECEDENT = {
+  summary: "Curated precedent.",
+  precedents: [{ pmid: "789", quote: "Verbatim precedent quote.", therapies: ["crizotinib"], evidence_type: "clinical", title: "Precedent paper", abstract: "Verbatim precedent quote." }],
+};
+
+function bothSectionsCurated() {
+  return geneResult({
+    curated: true, curated_by: "old@x", curated_at: "2026-10-01T00:00:00Z", curation_version: 2,
+    curated_fields: ["cancer_association_rationale", "citations", "evidence_cards", "supporting_quotes", "therapeutic_precedent"],
+    clinical_actionability: {
+      confidence_score: 1, summary: "Curated precedent.", confidence_explanation: "Curator-verified", pmids: ["789"],
+      evidence: [{ pmid: "789", title: "Precedent paper", abstract: "Verbatim precedent quote.", quote: "Verbatim precedent quote.", therapies: ["crizotinib"], evidence_type: "clinical" }],
+      curated: true,
+    },
+  });
+}
+
+async function test_evidence_only_edit_preserves_curated_precedent_verbatim() {
+  let put;
+  const currentPayload = {
+    cancer_association_rationale: "Old curated rationale.", citations: ["111", "222"],
+    evidence_cards: [{ pmid: "111", evidence_type: "clinical", selected_reason: "r1", quote: "Alpha sentence.", title: "Paper one" }],
+    supporting_quotes: [{ pmid: "111", quote: "Alpha sentence." }],
+    therapeutic_precedent: CURATED_PRECEDENT,
+  };
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      current: { version: 2, override: { curator_email: "old@x", updated_at: "2026-10-01T00:00:00Z", payload: currentPayload } },
+      extra: async (method, url, reqBody) => {
+        if (method === "PUT") {
+          put = reqBody;
+          return [200, { version: 3, override: { curator_email: "cur@x", updated_at: "2026-10-12T00:00:00Z", payload: reqBody.payload } }];
+        }
+        if (method === "GET" && url === "/v1/annotate/run-1") {
+          return [200, geneResult({ ...bothSectionsCurated().annotations[0], curation_version: 3, curated_by: "cur@x", curated_at: "2026-10-12T00:00:00Z", cancer_association_rationale: "Server-rendered rationale." })];
+        }
+        return undefined;
+      },
+    }),
+  });
+  render(app, bothSectionsCurated());
+  app.openCurationDialog(geneSubject(app), { focus: "evidence" });
+  assert.strictEqual(oneByData(body(app), "curation", "precedent-include").checked, false, "precedent not under edit");
+  const evidenceInclude = oneByData(body(app), "curation", "evidence-include");
+  evidenceInclude.checked = false;
+  evidenceInclude.fire("change");
+  footerButton(app, "submit").click();
+  assert.match(oneByData(app.root("curation-status"), "curation", "message").textContent, /Choose evidence, precedent, or both/);
+  assert.ok(!app.requests.some((r) => r.method === "POST"), "nothing submitted");
+  oneByData(body(app), "curation", "evidence-include").checked = true;
+  oneByData(body(app), "curation", "evidence-include").fire("change");
+  footerButton(app, "submit").click();
+  await waitFor(() => app.curationState.sessions.get("gene|ALK|luad")?.draft, "draft");
+  assert.deepStrictEqual(app.requests.find((r) => r.method === "POST").body.precedent_pmids, [], "precedent not re-evaluated");
+  footerButton(app, "review").click();
+  assert.strictEqual(byData(body(app), "curation", "precedent").length, 0, "no precedent editor");
+  footerButton(app, "save").click();
+  await waitFor(() => put, "PUT");
+  assert.strictEqual(put.expected_version, 2);
+  assert.deepStrictEqual(put.payload.therapeutic_precedent, CURATED_PRECEDENT, "precedent sent verbatim");
+  assert.strictEqual(put.payload.cancer_association_rationale, "Suggested rationale.", "edited section replaced");
+  await waitFor(() => app.root("curation-modal").classList.contains("hidden"), "closed");
+  const shown = app.state.currentResult.annotations[0];
+  assert.strictEqual(shown.cancer_association_rationale, "Server-rendered rationale.", "renders the server's version");
+  assert.ok(shown.clinical_actionability.curated, "curated precedent still shown");
+}
+
+async function saveOnce(app, version) {
+  await toDraft(app);
+  footerButton(app, "save").click();
+  await waitFor(() => app.curationState.localVersions.get("gene|ALK|luad")?.version === version, "saved");
+}
+
+async function test_delayed_annotation_poll_cannot_undo_save() {
+  let polls = 0;
+  const stale = geneAnnotation({ cancer_association_rationale: "Pipeline rationale (stale poll)." });
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      extra: async (method, url, reqBody) => {
+        if (method === "PUT") return [200, { version: 1, override: { curator_email: "cur@x", updated_at: "2026-10-12T00:00:00Z", payload: reqBody.payload } }];
+        if (url === "/v1/annotate/jobs/a1") {
+          polls += 1;
+          const base = { job_id: "a1", genes_completed: 1, genes_total: 1, fusions_processed: 1, annotations: [stale], annotation_tumor_types: { ALK: "LUAD" } };
+          if (polls === 1) return [200, { ...base, status: "running", result: null }];
+          return [200, { ...base, status: "complete", result: geneResult({ cancer_association_rationale: "Pipeline rationale (stale poll)." }) }];
+        }
+        return undefined;
+      },
+    }),
+  });
+  render(app, geneResult());
+  await saveOnce(app, 1);
+  assert.strictEqual(app.state.currentResult.annotations[0].cancer_association_rationale, "Suggested rationale.");
+  const final = await app.pollAnnotationJob("/v1/annotate/jobs/a1");
+  assert.strictEqual(polls, 2);
+  const shown = app.state.currentResult.annotations[0];
+  assert.strictEqual(shown.cancer_association_rationale, "Suggested rationale.", "completion poll kept the save");
+  assert.strictEqual(shown.curation_version, 1);
+  assert.strictEqual(final.annotations[0].cancer_association_rationale, "Suggested rationale.");
+}
+
+async function test_cross_tumor_context_draft_never_touches_displayed_annotation() {
+  let put;
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      extra: async (method, url, reqBody) => {
+        if (method !== "PUT") return undefined;
+        put = { url, body: reqBody };
+        return [200, { version: 1, override: { curator_email: "cur@x", updated_at: "2026-10-12T00:00:00Z", payload: reqBody.payload } }];
+      },
+    }),
+  });
+  render(app, geneResult());
+  await toDraft(app); // ALK · LUAD draft
+  app.pressKey("Escape");
+  // Another run now shows ALK under a different tumor context.
+  render(app, geneResult({ cancer_association_rationale: "BRCA pipeline." }, { run_id: "run-2", annotation_tumor_types: { ALK: "BRCA" } }));
+  const luad = { type: "gene", key: "ALK", tumorType: "LUAD", label: "ALK" };
+  assert.strictEqual(app.findCurationRecord(luad), null, "LUAD subject isn't the displayed BRCA record");
+  assert.ok(!app.replaceCurationRecord(luad, { gene: "ALK" }), "replace refuses another context");
+  assert.ok(!oneByData(app.root("results-window"), "curation", "edit-evidence").textContent.includes("draft in progress"));
+  app.openCurationDialog(luad, { step: "review" });
+  footerButton(app, "save").click();
+  await waitFor(() => put, "PUT");
+  assert.strictEqual(put.url, "/v1/curation/gene/ALK?tumor_type=LUAD", "saves its own subject");
+  await waitFor(() => app.root("curation-modal").classList.contains("hidden"), "closed");
+  const shown = app.state.currentResult.annotations[0];
+  assert.strictEqual(shown.cancer_association_rationale, "BRCA pipeline.", "BRCA annotation untouched");
+  assert.ok(!shown.curated);
+  // Fusion keys are canonicalized: EML4--ALK is the same subject as EML4::ALK.
+  assert.strictEqual(
+    app.curationSubjectId({ type: "fusion", key: "eml4--alk", tumorType: " LUAD " }),
+    app.curationSubjectId({ type: "fusion", key: "EML4::ALK", tumorType: "luad" })
+  );
+}
+
+async function test_lists_locked_while_submission_pending() {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const routes = jobRoutes();
+  const app = loadCurationApp({
+    routes: async (method, url, reqBody) => {
+      if (method === "POST") await gate;
+      return routes(method, url, reqBody);
+    },
+  });
+  render(app, geneResult());
+  app.openCurationDialog(geneSubject(app));
+  const session = app.curationState.sessions.get("gene|ALK|luad");
+  footerButton(app, "submit").click(); // POST now pending
+  assert.ok(session.submitting);
+  assert.ok(oneByData(body(app), "curation", "evidence-input").disabled, "input disabled while POST pending");
+  assert.ok(oneByData(body(app), "curation", "evidence-add").disabled);
+  assert.ok(oneByData(body(app), "curation", "precedent-include").disabled);
+  assert.ok(oneByData(oneByData(body(app), "pmid", "111"), "curation", "remove-pmid").disabled);
+  assert.match(app.addCurationPmids(session, "evidence", "999").error, /Wait for the current re-evaluation/);
+  app.removeCurationPmid(session, "evidence", "111");
+  app.moveCurationPmid(session, "evidence", "222", -1);
+  app.setCurationInclude(session, "precedent", true);
+  assert.deepStrictEqual([...session.lists.evidence], ["111", "222"], "lists unchanged");
+  assert.strictEqual(session.include.precedent, false);
+  release();
+  await waitFor(() => session.draft, "draft");
+  assert.deepStrictEqual(app.requests.find((r) => r.method === "POST").body.evidence_pmids, ["111", "222"]);
+  assert.ok(Object.isFrozen(session.submitted.lists.evidence), "draft built from a frozen snapshot");
+  assert.deepStrictEqual([...session.draft.cards.map((c) => c.pmid)], ["111", "222"]);
+}
+
+async function test_failed_conflict_reload_keeps_expected_version() {
+  const puts = [];
+  let getFails = false;
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      current: () => (puts.length ? {
+        version: 4,
+        override: { curator_email: "other@x", updated_at: "2026-10-11T00:00:00Z", payload: { cancer_association_rationale: "Other.", citations: ["9"] } },
+      } : { version: 0, override: null }),
+      extra: async (method, url, reqBody) => {
+        if (method === "PUT") {
+          puts.push(reqBody);
+          return [409, { detail: { message: "changed", current_version: 4 } }];
+        }
+        return undefined;
+      },
+    }),
+  });
+  const routes = app.fetch;
+  app.fetch = async (url, options) => (getFails && url.startsWith("/v1/curation/gene/") ? { ok: false, status: 500, headers: { get: () => null }, text: async () => "boom", json: async () => ({}) } : routes(url, options));
+  app.globalThis.fetch = app.fetch;
+  render(app, geneResult());
+  await toDraft(app);
+  footerButton(app, "save").click();
+  await waitFor(() => byData(app.root("curation-status"), "curation", "reload-conflict").length, "conflict");
+  const session = app.curationState.sessions.get("gene|ALK|luad");
+  getFails = true;
+  oneByData(app.root("curation-status"), "curation", "reload-conflict").click();
+  await waitFor(() => app.root("curation-status").allText.includes("Couldn't load the latest version"), "reload error");
+  assert.strictEqual(session.baseVersion, 0, "version not advanced");
+  assert.match(oneByData(app.root("curation-status"), "curation", "message").textContent, /still targets v0\. Retry the reload\./);
+  getFails = false;
+  oneByData(app.root("curation-status"), "curation", "reload-conflict").click();
+  await waitFor(() => session.baseVersion === 4, "advanced after a successful fetch");
+  const message = oneByData(app.root("curation-status"), "curation", "message").textContent;
+  assert.match(message, /v4 by other@x on 2026-10-11 \(sections: cancer_association_rationale, citations\)/);
+}
+
+async function test_focus_trap_and_inert_background() {
+  const app = loadCurationApp();
+  render(app, geneResult());
+  app.openCurationDialog(geneSubject(app));
+  const modal = app.root("curation-modal");
+  const shell = app.root(".app-shell");
+  assert.strictEqual(shell.inert, true);
+  assert.strictEqual(shell.getAttribute("aria-hidden"), "true");
+  assert.strictEqual(app.root("curation-notifications").inert, true);
+  assert.notStrictEqual(modal.inert, true);
+  const focusable = modal.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])")
+    .filter((n) => !n.closest(".hidden"));
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  assert.strictEqual(first.id, "close-curation");
+  last.focus();
+  let event = app.pressKey("Tab");
+  assert.ok(event.defaultPrevented);
+  assert.strictEqual(app.document.activeElement, first, "Tab from last wraps to first");
+  event = app.pressKey("Tab", { shiftKey: true });
+  assert.ok(event.defaultPrevented);
+  assert.strictEqual(app.document.activeElement, last, "Shift+Tab from first wraps to last");
+  app.root("body").focus(); // focus escaped somehow
+  app.pressKey("Tab");
+  assert.ok(modal.contains(app.document.activeElement), "Tab pulls focus back into the dialog");
+
+  // Removing a focused row moves focus deliberately, not to the page.
+  const removeButton = oneByData(oneByData(body(app), "pmid", "222"), "curation", "remove-pmid");
+  removeButton.focus();
+  removeButton.click();
+  assert.ok(modal.contains(app.document.activeElement), "focus stays in the dialog after a rebuild");
+
+  app.pressKey("Escape");
+  assert.strictEqual(shell.inert, false);
+  assert.strictEqual(shell.getAttribute("aria-hidden"), null);
+}
+
+async function test_revert_with_failed_reload_shows_pending_refresh() {
+  let runOk = false;
+  const app = loadCurationApp({
+    routes: async (method, url) => {
+      if (method === "DELETE") return [200, { reverted_version: 2 }];
+      if (method === "GET" && url === "/v1/annotate/run-1") return runOk ? [200, geneResult({ cancer_association_rationale: "Pipeline again." })] : [500, { detail: "down" }];
+      return undefined;
+    },
+  });
+  render(app, geneResult({ curated: true, curated_by: "cur@x", curated_at: "2026-10-02", curation_version: 2, cancer_association_rationale: "Curated text." }));
+  oneByData(app.root("results-window"), "curation", "revert").click();
+  oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").click();
+  await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "revert done");
+  const win = app.root("results-window");
+  assert.ok(byData(win, "flag", "pending_refresh").length, "pending-refresh state shown");
+  assert.strictEqual(byData(win, "curation", "curated-badge").length, 0, "not presented as curated");
+  assert.ok(!app.root("toast-region").allText.includes("reverted to pipeline output"), "no success toast");
+  assert.ok(app.root("toast-region").allText.includes("couldn't be loaded yet"));
+  runOk = true;
+  oneByData(win, "curation", "retry-refresh").click();
+  await waitFor(() => !app.curationState.pendingRefresh.size, "refreshed");
+  assert.strictEqual(app.state.currentResult.annotations[0].cancer_association_rationale, "Pipeline again.");
+  assert.strictEqual(byData(app.root("results-window"), "flag", "pending_refresh").length, 0);
+}
+
 runTests("curation UI", [
   test_viewer_sees_no_edit_controls,
   test_curator_sees_controls_even_when_sections_empty,
@@ -655,4 +940,11 @@ runTests("curation UI", [
   test_escape_closes_and_draft_survives_reopen,
   test_save_and_revert_503_contention_show_retry_message,
   test_unresolved_tumor_context_disables_edit,
+  test_evidence_only_edit_preserves_curated_precedent_verbatim,
+  test_delayed_annotation_poll_cannot_undo_save,
+  test_cross_tumor_context_draft_never_touches_displayed_annotation,
+  test_lists_locked_while_submission_pending,
+  test_failed_conflict_reload_keeps_expected_version,
+  test_focus_trap_and_inert_background,
+  test_revert_with_failed_reload_shows_pending_refresh,
 ]);

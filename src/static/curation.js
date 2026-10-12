@@ -52,6 +52,8 @@ const curationState = {
   sessions: new Map(),
   // subjectId -> { version, revertedFrom } for overrides saved/reverted here.
   localVersions: new Map(),
+  // subjectIds reverted here whose pipeline content hasn't loaded yet.
+  pendingRefresh: new Set(),
   openSubjectId: null,
   returnFocus: null,
   busy: false,
@@ -70,8 +72,9 @@ function curationNormalizeTumorType(value) {
   return String(value || "").trim().toLowerCase().split(/\s+/).filter(Boolean).join(" ");
 }
 
-function geneCurationSubject(annotation) {
-  const tumorTypes = state.currentResult?.annotation_tumor_types || {};
+// `result` supplies the gene's tumor context (defaults to the displayed result).
+function geneCurationSubject(annotation, result = state.currentResult) {
+  const tumorTypes = result?.annotation_tumor_types || {};
   return {
     type: "gene",
     key: annotation.gene,
@@ -84,8 +87,25 @@ function fusionCurationSubject(item) {
   return { type: "fusion", key: item.fusion, tumorType: item.tumor_type || null, label: item.fusion };
 }
 
+// Mirrors the server's normalize_subject_key: upper-cased gene, or GENEA::GENEB.
+function curationCanonicalKey(type, key) {
+  const raw = String(key || "").trim().toUpperCase();
+  if (type !== "fusion") return raw;
+  const partners = raw.split(/::|--|\//).map((part) => part.trim()).filter(Boolean);
+  return partners.length === 2 ? partners.join("::") : raw;
+}
+
+// Full subject identity: type, canonical key and normalized tumor type.
 function curationSubjectId(subject) {
-  return [subject.type, String(subject.key).toUpperCase(), curationNormalizeTumorType(subject.tumorType)].join("|");
+  return [subject.type, curationCanonicalKey(subject.type, subject.key), curationNormalizeTumorType(subject.tumorType)].join("|");
+}
+
+function curationRecordSubject(type, item, result) {
+  return type === "gene" ? geneCurationSubject(item, result) : fusionCurationSubject(item);
+}
+
+function curationRecordList(type) {
+  return type === "gene" ? "annotations" : "fusion_evidence";
 }
 
 function curationUrl(subject, suffix = "", params = {}) {
@@ -98,33 +118,30 @@ function curationUrl(subject, suffix = "", params = {}) {
   return `/v1/curation/${subject.type}/${encodeURIComponent(subject.key)}${suffix}${qs ? `?${qs}` : ""}`;
 }
 
-function findCurationRecord(subject) {
-  const result = state.currentResult;
+// The record in `result` with exactly this subject identity, or null (e.g.
+// the same gene shown under another tumor context).
+function findCurationRecord(subject, result = state.currentResult) {
   if (!result) return null;
-  if (subject.type === "gene") {
-    return (result.annotations || []).find((item) => item.gene === subject.key) || null;
-  }
   const id = curationSubjectId(subject);
-  return (result.fusion_evidence || []).find((item) => curationSubjectId(fusionCurationSubject(item)) === id) || null;
+  return (result[curationRecordList(subject.type)] || []).find(
+    (item) => curationSubjectId(curationRecordSubject(subject.type, item, result)) === id
+  ) || null;
 }
 
+// Replaces the displayed record for exactly this subject. Returns false (and
+// changes nothing) when the displayed result doesn't contain that subject.
 function replaceCurationRecord(subject, next) {
   const result = state.currentResult;
-  if (!result) return;
-  if (subject.type === "gene") {
-    state.currentResult = {
-      ...result,
-      annotations: (result.annotations || []).map((item) => (item.gene === subject.key ? next : item)),
-    };
-    return;
-  }
+  if (!findCurationRecord(subject, result)) return false;
   const id = curationSubjectId(subject);
+  const field = curationRecordList(subject.type);
   state.currentResult = {
     ...result,
-    fusion_evidence: (result.fusion_evidence || []).map((item) =>
-      curationSubjectId(fusionCurationSubject(item)) === id ? next : item
+    [field]: result[field].map((item) =>
+      curationSubjectId(curationRecordSubject(subject.type, item, result)) === id ? next : item
     ),
   };
+  return true;
 }
 
 // Keeps locally saved/reverted curated content when a poll or enrichment
@@ -134,13 +151,31 @@ function reconcileCuratedRecord(subject, existing, incoming) {
   if (!local || !existing || !incoming) return incoming;
   const version = incoming.curation_version || 0;
   const stale = version < local.version || (local.revertedFrom && version > 0 && version <= local.revertedFrom);
-  if (!stale) return incoming;
+  if (!stale) {
+    // Uncurated content after a local revert is the pipeline version we were waiting for.
+    if (local.revertedFrom && !incoming.curated) curationState.pendingRefresh.delete(curationSubjectId(subject));
+    return incoming;
+  }
   const merged = { ...incoming };
   (subject.type === "gene" ? CURATION_GENE_KEYS : CURATION_FUSION_KEYS).forEach((key) => {
     if (key in existing) merged[key] = existing[key];
     else delete merged[key];
   });
   return merged;
+}
+
+// Guards a whole incoming annotation result (e.g. an annotation job poll)
+// against undoing local saves/reverts; tumor context comes from `next`.
+function reconcileAnnotationResult(previous, next) {
+  if (!next) return next;
+  return {
+    ...next,
+    annotations: (next.annotations || []).map((annotation) => {
+      const subject = geneCurationSubject(annotation, next);
+      return reconcileCuratedRecord(subject, findCurationRecord(subject, previous), annotation);
+    }),
+    fusion_evidence: reconcileFusionEvidence(previous?.fusion_evidence, next.fusion_evidence),
+  };
 }
 
 function reconcileFusionEvidence(existingList, incomingList) {
@@ -336,19 +371,21 @@ function createCurationSession(subject, record, focus) {
   const isGene = subject.type === "gene";
   const evidence = isGene ? record?.citations || [] : record?.pmids || [];
   const precedent = isGene ? record?.clinical_actionability?.pmids || [] : [];
-  const curatedFields = record?.curated_fields || [];
   return {
     subject,
     baseVersion: record?.curation_version || 0,
     lists: { evidence: [...evidence], precedent: [...precedent] },
-    include: {
-      evidence: focus !== "precedent" || curatedFields.includes("citations"),
-      precedent: isGene && (focus === "precedent" || curatedFields.includes("therapeutic_precedent")),
-    },
+    // Only the section the curator opened is edited (and re-evaluated);
+    // sections left out are saved verbatim from the current override.
+    include: { evidence: focus !== "precedent", precedent: isGene && focus === "precedent" },
     info: curationPmidInfo(record),
     invalid: new Map(),
     inputErrors: { evidence: "", precedent: "" },
     job: null,
+    // Frozen copy of the lists/inclusion as submitted; the draft and the
+    // save payload are built from it, never from the live (editable) lists.
+    submitted: null,
+    submitting: false,
     draft: null,
     step: "pmids",
     note: "",
@@ -381,9 +418,32 @@ function curationJobRunning(session) {
   return Boolean(session.job && (session.job.status === "queued" || session.job.status === "running"));
 }
 
+// PMID lists and inclusion are read-only from the moment a submission starts
+// until its job finishes (and during any other request).
+function curationLocked(session) {
+  return Boolean(curationState.busy || session.submitting || curationJobRunning(session));
+}
+
+function curationSnapshot(session) {
+  return Object.freeze({
+    lists: Object.freeze({
+      evidence: Object.freeze([...session.lists.evidence]),
+      precedent: Object.freeze([...session.lists.precedent]),
+    }),
+    include: Object.freeze({ ...session.include }),
+  });
+}
+
+function setCurationInclude(session, listName, included) {
+  if (curationLocked(session)) return;
+  session.include[listName] = included;
+  curationListsChanged(session);
+}
+
 // Parses "123, 456 789" into PMIDs, validating format, duplicates and the cap.
 // Returns { added, error }; mutates the session list only on success.
 function addCurationPmids(session, listName, rawValue) {
+  if (curationLocked(session)) return { added: [], error: "Wait for the current re-evaluation to finish." };
   const values = String(rawValue || "").split(/[\s,;]+/).map((value) => value.trim()).filter(Boolean);
   if (!values.length) return { added: [], error: "Enter a PMID." };
   const list = session.lists[listName];
@@ -412,6 +472,7 @@ function addCurationPmids(session, listName, rawValue) {
 }
 
 function removeCurationPmid(session, listName, pmid) {
+  if (curationLocked(session)) return;
   session.lists[listName] = session.lists[listName].filter((value) => value !== pmid);
   session.include[listName] = true;
   session.invalid.delete(pmid);
@@ -419,6 +480,7 @@ function removeCurationPmid(session, listName, pmid) {
 }
 
 function moveCurationPmid(session, listName, pmid, delta) {
+  if (curationLocked(session)) return;
   const list = session.lists[listName];
   const from = list.indexOf(pmid);
   const to = from + delta;
@@ -430,7 +492,7 @@ function moveCurationPmid(session, listName, pmid, delta) {
 }
 
 // Any PMID change invalidates a finished draft (it was built from the old
-// lists); editing is disabled while a job is running.
+// lists); editing is disabled while a submission or job is in flight.
 function curationListsChanged(session) {
   if (session.job && !curationJobRunning(session)) {
     session.job.dismissed = true;
@@ -438,20 +500,20 @@ function curationListsChanged(session) {
     session.job = null;
   }
   session.draft = null;
+  session.submitted = null;
 }
 
 // ---------------------------------------------------------------------------
 // Re-evaluation jobs
 // ---------------------------------------------------------------------------
 
-function curationJobBody(session) {
-  const { subject } = session;
+function curationJobBody(subject, snapshot) {
   return {
     subject_type: subject.type,
     subject_key: subject.key,
     tumor_type: subject.tumorType || null,
-    evidence_pmids: session.include.evidence ? [...session.lists.evidence] : [],
-    precedent_pmids: session.include.precedent ? [...session.lists.precedent] : [],
+    evidence_pmids: snapshot.include.evidence ? [...snapshot.lists.evidence] : [],
+    precedent_pmids: snapshot.include.precedent ? [...snapshot.lists.precedent] : [],
   };
 }
 
@@ -468,18 +530,26 @@ function curationJobErrorMessage(status, detail) {
 }
 
 async function submitCurationReevaluation(session) {
-  if (curationState.busy || curationJobRunning(session)) return;
-  const body = curationJobBody(session);
-  session.invalid = new Map();
-  if (!body.evidence_pmids.length && !body.precedent_pmids.length) {
-    // Nothing to re-evaluate (e.g. clearing the precedent): edit directly.
-    session.draft = curationDraftFromRecord(session);
-    session.step = "review";
-    session.message = null;
+  if (curationLocked(session)) return;
+  if (session.subject.type === "gene" && !session.include.evidence && !session.include.precedent) {
+    session.message = { type: "error", text: "Choose evidence, precedent, or both to edit." };
     renderCurationDialog();
     return;
   }
+  const snapshot = curationSnapshot(session);
+  const body = curationJobBody(session.subject, snapshot);
+  session.invalid = new Map();
+  if (!body.evidence_pmids.length && !body.precedent_pmids.length) {
+    // Nothing to re-evaluate (e.g. clearing the precedent): edit directly.
+    session.submitted = snapshot;
+    session.draft = curationDraftFromRecord(session);
+    session.step = "review";
+    session.message = null;
+    renderCurationDialog({ focusFirst: true });
+    return;
+  }
   curationState.busy = true;
+  session.submitting = true;
   session.message = null;
   renderCurationDialog();
   try {
@@ -494,7 +564,7 @@ async function submitCurationReevaluation(session) {
       return;
     }
     const created = await response.json();
-    session.job = { id: created.job_id, statusUrl: created.status_url, status: "queued", error: null };
+    session.job = { id: created.job_id, statusUrl: created.status_url, status: "queued", error: null, snapshot };
     session.draft = null;
     showCurationToast(`${session.subject.label}: ${CURATION_SUBMITTED_MESSAGE}`);
     renderCurationNotification(session);
@@ -503,6 +573,7 @@ async function submitCurationReevaluation(session) {
     session.message = { type: "error", text: `Couldn't start re-evaluation: ${error.message}` };
   } finally {
     curationState.busy = false;
+    session.submitting = false;
     renderCurationDialog();
   }
 }
@@ -572,7 +643,8 @@ function finishCurationJob(session, job, status) {
   job.status = status.status;
   job.error = status.error || null;
   if (status.status === "succeeded") {
-    session.draft = curationDraftFromJob(session, status.draft || {});
+    session.submitted = job.snapshot;
+    session.draft = curationDraftFromJob(session, job.snapshot, status.draft || {});
     showCurationToast(`Draft ready for ${session.subject.label} — review and save it.`, "success");
   } else {
     session.invalid = curationInvalidFromJob(status.invalid_pmids);
@@ -643,12 +715,12 @@ function curationOrderCards(cards, pmids) {
   return pmids.map((pmid) => byPmid.get(pmid) || curationDraftCard({ pmid }));
 }
 
-function curationDraftFromJob(session, draft) {
+function curationDraftFromJob(session, snapshot, draft) {
   const isGene = session.subject.type === "gene";
-  const cards = curationOrderCards((draft.evidence_cards || []).map(curationDraftCard), session.lists.evidence);
+  const cards = curationOrderCards((draft.evidence_cards || []).map(curationDraftCard), snapshot.lists.evidence);
   cards.forEach((card) => session.info.set(card.pmid, { title: card.title, abstract: card.abstract }));
   const precedent = curationDraftPrecedent(draft.clinical_actionability);
-  precedent.items = session.lists.precedent.map(
+  precedent.items = snapshot.lists.precedent.map(
     (pmid) => precedent.items.find((item) => item.pmid === pmid) ||
       { pmid, title: "", abstract: "", quote: "", therapies: "", evidence_type: "other" }
   );
@@ -674,15 +746,17 @@ function curationDraftFromRecord(session) {
   };
 }
 
-function buildCurationPayload(session) {
-  const { draft, include, subject } = session;
+// The sections being edited, from the draft and the submitted snapshot.
+function curationEditedSections(session) {
+  const { draft, subject } = session;
+  const { include, lists } = session.submitted;
   const cards = draft.cards.map((card) => ({
     pmid: card.pmid,
     evidence_type: curationEvidenceType(card.evidence_type),
     selected_reason: card.selected_reason.trim(),
     quote: card.quote.trim() || null,
   }));
-  const pmids = session.lists.evidence.slice();
+  const pmids = lists.evidence.slice();
   if (subject.type === "fusion") {
     return {
       interpretation: draft.rationale.trim(),
@@ -712,6 +786,26 @@ function buildCurationPayload(session) {
     };
   }
   return payload;
+}
+
+// PUT replaces the whole override, so start from the current override's
+// payload and replace only the sections being edited; the rest go verbatim.
+function buildCurationPayload(session, currentPayload = {}) {
+  return { ...currentPayload, ...curationEditedSections(session) };
+}
+
+// GET the subject's current override: { version, override } (version 0 and
+// override null when there is none). Throws { status, detail } on failure.
+async function fetchCurrentCurationOverride(subject) {
+  const response = await fetch(curationUrl(subject));
+  if (!response.ok) {
+    const error = new Error("Couldn't load the current curated version");
+    error.response = response;
+    error.detail = await curationResponseDetail(response);
+    throw error;
+  }
+  const current = await response.json();
+  return { version: current.version || 0, override: current.override || null };
 }
 
 // ---------------------------------------------------------------------------
@@ -773,14 +867,29 @@ function curatedRecordFromOverride(subject, record, response) {
 }
 
 async function saveCurationDraft(session) {
-  if (curationState.busy || !session.draft) return;
-  const body = { expected_version: session.baseVersion || 0, payload: buildCurationPayload(session) };
-  const note = session.note.trim();
-  if (note) body.note = note;
+  if (curationState.busy || !session.draft || !session.submitted) return;
   curationState.busy = true;
   session.message = { type: "info", text: "Saving curator edits…" };
   renderCurationDialog();
   try {
+    let current;
+    try {
+      current = await fetchCurrentCurationOverride(session.subject);
+    } catch (error) {
+      const response = error.response;
+      session.message = response && response.status === 503
+        ? { type: "error", text: curationRetryMessage(response, error.detail, "save"), retry: true }
+        : { type: "error", text: `${error.message}, so nothing was saved; please retry.`, retry: true };
+      return;
+    }
+    const expected = session.baseVersion || 0;
+    if (current.version !== expected) {
+      handleCurationSaveError(session, 409, { current_version: current.version });
+      return;
+    }
+    const body = { expected_version: expected, payload: buildCurationPayload(session, current.override?.payload) };
+    const note = session.note.trim();
+    if (note) body.note = note;
     const response = await fetch(curationUrl(session.subject), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -796,11 +905,14 @@ async function saveCurationDraft(session) {
       return;
     }
     const saved = await response.json();
+    curationState.localVersions.set(curationSubjectId(session.subject), { version: saved.version, revertedFrom: 0 });
+    curationState.pendingRefresh.delete(curationSubjectId(session.subject));
+    // Render what the server serves; fall back to the saved (full) override.
+    const fresh = await reloadCurationSubject(session.subject).catch(() => null);
     const record = findCurationRecord(session.subject);
-    if (record) {
+    if (!fresh && record) {
       replaceCurationRecord(session.subject, curatedRecordFromOverride(session.subject, record, saved));
     }
-    curationState.localVersions.set(curationSubjectId(session.subject), { version: saved.version, revertedFrom: 0 });
     curationState.busy = false;
     discardCurationSession(session);
     closeCurationDialog();
@@ -843,38 +955,49 @@ function handleCurationSaveError(session, status, detail) {
 
 // Re-reads the subject from the saved run (the server overlays the live
 // override on every read). Returns the fresh record, or null.
+// Only updates the displayed result when it is that run and shows this exact
+// subject (same tumor context).
 async function reloadCurationSubject(subject) {
   const runId = state.currentResult?.run_id;
-  if (!runId) return null;
+  if (!runId || !findCurationRecord(subject)) return null;
   const response = await fetch(`/v1/annotate/${encodeURIComponent(runId)}`);
   if (!response.ok) return null;
   const result = await response.json();
-  const id = curationSubjectId(subject);
-  const fresh = subject.type === "gene"
-    ? (result.annotations || []).find((item) => item.gene === subject.key)
-    : (result.fusion_evidence || []).find((item) => curationSubjectId(fusionCurationSubject(item)) === id);
-  if (!fresh) return null;
-  replaceCurationRecord(subject, fresh);
-  return fresh;
+  const fresh = findCurationRecord(subject, result);
+  if (!fresh || state.currentResult?.run_id !== runId) return null;
+  return replaceCurationRecord(subject, fresh) ? fresh : null;
 }
 
+// The expected version only advances once the current override has been
+// fetched; its author and changed sections are shown before the re-save.
 async function reloadAfterCurationConflict(session) {
   if (curationState.busy) return;
   curationState.busy = true;
   try {
-    const fresh = await reloadCurationSubject(session.subject);
-    if (fresh) {
-      session.baseVersion = fresh.curation_version || 0;
-      if (state.currentResult) renderAnnotationResult(state.currentResult);
-    } else if (session.conflictVersion) {
-      session.baseVersion = session.conflictVersion;
+    let current;
+    try {
+      current = await fetchCurrentCurationOverride(session.subject);
+    } catch (error) {
+      session.message = {
+        type: "error",
+        text: `Couldn't load the latest version, so your save still targets v${session.baseVersion || 0}. Retry the reload.`,
+        conflict: true,
+      };
+      return;
     }
+    const refreshed = await reloadCurationSubject(session.subject).catch(() => null);
+    if (refreshed && state.currentResult) renderAnnotationResult(state.currentResult);
+    session.baseVersion = current.version;
+    const override = current.override;
+    const changes = override
+      ? `v${current.version} by ${override.curator_email} on ${formatCurationDate(override.updated_at)} ` +
+        `(sections: ${Object.keys(override.payload || {}).join(", ") || "none"})`
+      : `v${current.version}: the curated version was reverted to pipeline output`;
     session.message = {
       type: "info",
-      text: `Reloaded the latest version (v${session.baseVersion}). Your draft is kept — review it and save again to replace that version.`,
+      text: `Loaded the latest version — ${changes}.` +
+        `${refreshed ? " The results now show it." : ""} Your draft is kept; saving now replaces that version.`,
     };
-  } catch (error) {
-    session.message = { type: "error", text: `Couldn't reload: ${error.message}` };
   } finally {
     curationState.busy = false;
     renderCurationDialog();
@@ -922,24 +1045,39 @@ async function revertCuration(subject, version, errorNode, button) {
     }
     curationState.localVersions.set(curationSubjectId(subject), { version: 0, revertedFrom: version });
     const fresh = await reloadCurationSubject(subject).catch(() => null);
-    if (!fresh) {
-      const record = findCurationRecord(subject);
-      if (record) {
-        replaceCurationRecord(subject, {
-          ...record, curated: false, curated_by: null, curated_at: null, curation_version: null, curated_fields: [],
-        });
-      }
-      setMessage(`${subject.label} reverted. Re-run the annotation to see the full pipeline output.`, "info");
-    }
     curationState.busy = false;
-    closeCurationAuxModal();
+    if (fresh) curationState.pendingRefresh.delete(curationSubjectId(subject));
+    // Don't present the old curated content as current: mark it pending.
+    else curationState.pendingRefresh.add(curationSubjectId(subject));
+    // Re-render before closing so focus returns to the re-rendered card.
     if (state.currentResult) renderAnnotationResult(state.currentResult);
-    showCurationToast(`${subject.label} reverted to pipeline output`, "success");
+    closeCurationAuxModal();
+    if (fresh) showCurationToast(`${subject.label} reverted to pipeline output`, "success");
+    else showCurationToast(`${subject.label} reverted, but the pipeline version couldn't be loaded yet.`, "error");
   } catch (error) {
     errorNode.textContent = `Couldn't revert: ${error.message}`;
   } finally {
     curationState.busy = false;
     button.disabled = false;
+  }
+}
+
+async function retryCurationRefresh(subject, button) {
+  if (curationState.busy) return;
+  curationState.busy = true;
+  button.disabled = true;
+  try {
+    const fresh = await reloadCurationSubject(subject).catch(() => null);
+    if (fresh) {
+      curationState.pendingRefresh.delete(curationSubjectId(subject));
+      showCurationToast(`${subject.label} now shows the pipeline version`, "success");
+    } else {
+      showCurationToast(`Still couldn't load the pipeline version of ${subject.label}; re-run the annotation if this persists.`, "error");
+    }
+  } finally {
+    curationState.busy = false;
+    button.disabled = false;
+    if (state.currentResult) renderAnnotationResult(state.currentResult);
   }
 }
 
@@ -1021,10 +1159,29 @@ function curationNewerPmids(flag) {
 // Returns null when there's nothing to show (uncurated, no curation flags).
 function renderCurationPanel(subject, record) {
   const flags = (record?.quality_flags || []).filter((flag) => CURATION_FLAG_CODES.has(flag.code));
-  if (!record?.curated && !flags.length) return null;
+  const pending = curationState.pendingRefresh.has(curationSubjectId(subject));
+  if (!record?.curated && !flags.length && !pending) return null;
   const panel = curationEl("div", { className: "curation-panel", dataset: { curationPanel: subject.type } });
 
-  if (record.curated) {
+  if (pending) {
+    // Reverted here, but the pipeline version hasn't loaded: the content
+    // shown is the old curated version (dimmed via .curation-pending-refresh).
+    panel.classList.add("curation-pending-refresh");
+    const notice = curationEl("div", {
+      className: "curation-flag curation-flag-critical",
+      attrs: { role: "alert" },
+      dataset: { flag: "pending_refresh" },
+    }, [
+      curationEl("strong", { text: "Reverted to pipeline output — refresh pending." }),
+      curationEl("span", { text: " The pipeline version couldn't be loaded yet; the content below is the old curated version. " }),
+    ]);
+    const retry = curationButton("Retry refresh", () => retryCurationRefresh(subject, retry), {
+      className: "text-button", action: "retry-refresh", label: `Retry loading the pipeline version of ${subject.label}`,
+    });
+    retry.dataset.curationSubject = curationSubjectId(subject);
+    notice.appendChild(retry);
+    panel.appendChild(notice);
+  } else if (record.curated) {
     const row = curationEl("div", { className: "curation-panel-row" });
     row.appendChild(curationEl("span", {
       className: "review-badge curated-badge",
@@ -1039,6 +1196,9 @@ function renderCurationPanel(subject, record) {
         className: "text-button danger-link", action: "revert", label: `Revert ${subject.label} to pipeline output`,
       }));
     }
+    row.querySelectorAll("button").forEach((button) => {
+      button.dataset.curationSubject = curationSubjectId(subject);
+    });
     panel.appendChild(row);
   }
 
@@ -1090,6 +1250,7 @@ function openCurationDialog(subject, { focus = "evidence", step } = {}) {
   curationState.openSubjectId = curationSubjectId(subject);
   session.focus = focus;
   curationShow(curationById("curation-modal"), true);
+  syncCurationModalInert();
   renderCurationDialog({ focusFirst: true });
 }
 
@@ -1098,15 +1259,97 @@ function closeCurationDialog() {
   const subjectId = curationState.openSubjectId;
   curationState.openSubjectId = null;
   curationShow(curationById("curation-modal"), false);
-  let target = curationState.returnFocus;
+  syncCurationModalInert();
+  const target = curationState.returnFocus;
   curationState.returnFocus = null;
-  if (!target || target.isConnected === false) {
-    // The opener was replaced by a re-render: focus its replacement instead.
-    target = Array.from(document.querySelectorAll(".curation-edit-button")).find(
-      (button) => button.dataset.curationSubject === subjectId
-    );
+  curationRestoreFocus(target, subjectId);
+}
+
+// Focuses `target`, or — when a re-render replaced it — the same control for
+// the same subject, else that subject's edit button.
+function curationRestoreFocus(target, subjectId) {
+  let node = target && target.isConnected !== false ? target : null;
+  if (!node && target && target.dataset) {
+    const action = target.dataset.curation;
+    const subject = target.dataset.curationSubject || subjectId;
+    const candidates = Array.from(document.querySelectorAll("[data-curation-subject]"))
+      .filter((button) => button.dataset.curationSubject === subject && !button.disabled);
+    node = candidates.find((button) => button.dataset.curation === action) ||
+      candidates.find((button) => button.classList.contains("curation-edit-button")) || null;
   }
-  if (target && target.focus) target.focus();
+  if (!node && subjectId) {
+    node = Array.from(document.querySelectorAll(".curation-edit-button"))
+      .find((button) => button.dataset.curationSubject === subjectId) || null;
+  }
+  if (node && node.focus) node.focus();
+}
+
+const CURATION_FOCUSABLE =
+  "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], summary";
+
+function curationTopModal() {
+  const aux = curationById("curation-aux-modal");
+  if (aux && !aux.classList.contains("hidden")) return aux;
+  const modal = curationById("curation-modal");
+  if (modal && !modal.classList.contains("hidden")) return modal;
+  return null;
+}
+
+// Everything behind the top-most curation modal is inert and hidden from
+// assistive technology; nothing is when no curation modal is open.
+function syncCurationModalInert() {
+  const top = curationTopModal();
+  [document.querySelector(".app-shell"), curationById("curation-notifications"), curationById("curation-modal")]
+    .forEach((node) => {
+      if (!node || node === top) {
+        if (node) {
+          node.inert = false;
+          node.removeAttribute("aria-hidden");
+        }
+        return;
+      }
+      node.inert = Boolean(top);
+      if (top) node.setAttribute("aria-hidden", "true");
+      else node.removeAttribute("aria-hidden");
+    });
+}
+
+// Keeps Tab / Shift+Tab inside the top-most curation modal.
+function trapCurationFocus(event) {
+  const top = curationTopModal();
+  if (!top) return;
+  const focusable = Array.from(top.querySelectorAll(CURATION_FOCUSABLE)).filter((node) => !node.closest(".hidden"));
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  const inside = Boolean(active && top.contains(active));
+  if (event.shiftKey && (!inside || active === first)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (!inside || active === last)) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+// Identifies the focused dialog control so a re-render can focus its replacement.
+function curationFocusKey(node) {
+  if (!node || !node.dataset || !node.dataset.curation) return null;
+  const row = node.closest("[data-pmid]");
+  return { action: node.dataset.curation, pmid: row ? row.dataset.pmid : null };
+}
+
+function curationFocusByKey(container, key) {
+  const match = Array.from(container.querySelectorAll(`[data-curation='${key.action}']`)).find((node) => {
+    const row = node.closest("[data-pmid]");
+    return !node.disabled && (row ? row.dataset.pmid : null) === key.pmid;
+  });
+  if (match && match.focus) match.focus();
+  return Boolean(match);
 }
 
 function openCuratedSession() {
@@ -1122,6 +1365,10 @@ function renderCurationDialog({ focusFirst = false } = {}) {
   const statusNode = curationById("curation-status");
   const bodyNode = curationById("curation-body");
   const footer = curationById("curation-footer");
+  const modal = curationById("curation-modal");
+  const active = document.activeElement;
+  const hadFocus = Boolean(active && modal.contains(active));
+  const focusKey = hadFocus ? curationFocusKey(active) : null;
   const subjectText = `${session.subject.label}${session.subject.tumorType ? ` · ${session.subject.tumorType}` : ""}`;
   title.textContent = isReview ? `Review draft — ${session.subject.label}` : `Edit evidence — ${session.subject.label}`;
   subtitle.textContent = isReview
@@ -1137,6 +1384,10 @@ function renderCurationDialog({ focusFirst = false } = {}) {
       isReview ? "input, textarea, select" : `[data-curation='${session.focus === "precedent" ? "precedent" : "evidence"}-input']`
     );
     if (preferred && preferred.focus) preferred.focus();
+  } else if (hadFocus && (!active.isConnected || active.disabled)) {
+    // The focused control was rebuilt or disabled: focus its replacement, or
+    // the dialog heading, rather than dropping focus to the page.
+    if (!(focusKey && curationFocusByKey(modal, focusKey)) && title.focus) title.focus();
   }
 }
 
@@ -1184,7 +1435,7 @@ function renderCurationFooter(session, isReview) {
   if (isReview) {
     buttons.push(curationButton("Back to PMIDs", () => {
       session.step = "pmids";
-      renderCurationDialog();
+      renderCurationDialog({ focusFirst: true });
     }, { action: "back", disabled: curationState.busy }));
     buttons.push(curationButton("Save curator edits", () => saveCurationDraft(session), {
       className: "primary-action", action: "save", disabled: curationState.busy,
@@ -1198,8 +1449,8 @@ function renderCurationFooter(session, isReview) {
     }, { className: "primary-action", action: "review" }));
     return buttons;
   }
-  buttons.push(curationButton(running ? "Re-evaluating…" : "Submit for re-evaluation", () => submitCurationReevaluation(session), {
-    className: "primary-action", action: "submit", disabled: running || curationState.busy,
+  buttons.push(curationButton(running || session.submitting ? "Re-evaluating…" : "Submit for re-evaluation", () => submitCurationReevaluation(session), {
+    className: "primary-action", action: "submit", disabled: curationLocked(session),
   }));
   return buttons;
 }
@@ -1217,7 +1468,7 @@ function renderCurationPmidStep(session) {
 
 function renderCurationPmidList(session, listName) {
   const isEvidence = listName === "evidence";
-  const running = curationJobRunning(session);
+  const running = curationLocked(session);
   const legendText = isEvidence
     ? (session.subject.type === "gene" ? "Evidence PMIDs (Cited on PubMed)" : "Fusion evidence PMIDs")
     : "Therapeutic precedent PMIDs";
@@ -1230,8 +1481,7 @@ function renderCurationPmidList(session, listName) {
     include.checked = Boolean(session.include[listName]);
     include.disabled = running;
     include.addEventListener("change", () => {
-      session.include[listName] = include.checked;
-      curationListsChanged(session);
+      setCurationInclude(session, listName, include.checked);
       renderCurationDialog();
     });
     fieldset.appendChild(curationEl("label", { className: "curation-include", attrs: { for: includeId } }, [
@@ -1374,7 +1624,8 @@ function renderCurationReview(session) {
   const container = curationEl("div", { className: "curation-review" });
   const idPrefix = `curation-${cssSafeIdForCuration(subject.key)}`;
 
-  if (!isGene || session.include.evidence) {
+  const { include, lists } = session.submitted;
+  if (!isGene || include.evidence) {
     container.appendChild(curationField(
       isGene ? "Cancer association rationale" : "Fusion interpretation",
       curationTextarea(draft.rationale, (value) => { draft.rationale = value; }, { rows: 5, dataset: { curation: "rationale" } }),
@@ -1400,7 +1651,7 @@ function renderCurationReview(session) {
     if (isGene) container.appendChild(renderCurationQuotes(session, idPrefix));
   }
 
-  if (isGene && session.include.precedent) container.appendChild(renderCurationPrecedent(session, idPrefix));
+  if (isGene && include.precedent) container.appendChild(renderCurationPrecedent(session, idPrefix));
 
   container.appendChild(curationField(
     "Note for history (optional)",
@@ -1453,9 +1704,8 @@ function renderCurationQuotes(session, idPrefix) {
   draft.quotes.forEach((quote, index) => {
     const row = curationEl("div", { className: "curation-quote-row", dataset: { curation: "quote-row" } });
     const select = curationEl("select", { dataset: { curation: "quote-pmid" } });
-    const pmids = session.lists.evidence.includes(quote.pmid) || !quote.pmid
-      ? session.lists.evidence
-      : [quote.pmid, ...session.lists.evidence];
+    const evidence = session.submitted.lists.evidence;
+    const pmids = evidence.includes(quote.pmid) || !quote.pmid ? evidence : [quote.pmid, ...evidence];
     pmids.forEach((pmid) => {
       const option = curationEl("option", { text: `PMID ${pmid}` });
       option.value = pmid;
@@ -1481,9 +1731,9 @@ function renderCurationQuotes(session, idPrefix) {
     section.appendChild(row);
   });
   section.appendChild(curationButton("Add quote", () => {
-    draft.quotes.push({ pmid: session.lists.evidence[0] || "", quote: "" });
+    draft.quotes.push({ pmid: session.submitted.lists.evidence[0] || "", quote: "" });
     renderCurationDialog();
-  }, { action: "add-quote", disabled: !session.lists.evidence.length }));
+  }, { action: "add-quote", disabled: !session.submitted.lists.evidence.length }));
   return section;
 }
 
@@ -1537,6 +1787,7 @@ function openCurationAuxModal(titleText, body, buttons) {
     curationState.auxReturnFocus = document.activeElement || null;
   }
   curationShow(curationById("curation-aux-modal"), true);
+  syncCurationModalInert();
   const first = buttons[0];
   if (first && first.focus) first.focus();
 }
@@ -1544,9 +1795,10 @@ function openCurationAuxModal(titleText, body, buttons) {
 function closeCurationAuxModal() {
   if (curationState.busy) return;
   curationShow(curationById("curation-aux-modal"), false);
+  syncCurationModalInert();
   const target = curationState.auxReturnFocus;
   curationState.auxReturnFocus = null;
-  if (target && target.focus && target.isConnected !== false) target.focus();
+  curationRestoreFocus(target, target && target.dataset ? target.dataset.curationSubject : null);
 }
 
 function bindCurationEvents() {
@@ -1555,6 +1807,10 @@ function bindCurationEvents() {
   const closeAux = curationById("close-curation-aux");
   if (closeAux) closeAux.addEventListener("click", closeCurationAuxModal);
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Tab") {
+      trapCurationFocus(event);
+      return;
+    }
     if (event.key !== "Escape") return;
     const aux = curationById("curation-aux-modal");
     if (aux && !aux.classList.contains("hidden")) {
