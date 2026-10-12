@@ -2911,3 +2911,14 @@ body.api-keys-body {
 .annotation-card:has(.curation-pending-refresh) .field-row {
   opacity: 0.45;
 }
+
+/* Curator-set cancer-associated call, inline after the status value. */
+.curator-set-tag {
+  margin-left: 6px;
+}
+
+.partner-curation-controls {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 8px;
+}

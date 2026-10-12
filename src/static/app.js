@@ -2759,8 +2759,29 @@ function fetchFusionPartnerEvidence(gene, { tumorType, agnostic, excludePmids } 
   return promise;
 }
 
-function renderFusionPartnerResultBody(container, data) {
+// Drops cached lookups for a partner gene (after a curator edit), so the next
+// expansion fetches the served (overlaid) version.
+function forgetFusionPartnerEvidence(gene) {
+  Object.keys(state.fusionPartnerEvidenceByKey).forEach((key) => {
+    if (key.startsWith(`${gene}|`)) delete state.fusionPartnerEvidenceByKey[key];
+  });
+}
+
+// `request` is the lookup's { tumorType, agnostic, excludePmids }, kept so a
+// curator edit can re-fetch exactly this view. The result goes in its own
+// node so curation refreshes leave the agnostic follow-up control in place.
+function renderFusionPartnerResultBody(container, data, request = {}) {
   container.replaceChildren();
+  const content = document.createElement("div");
+  content.className = "fusion-partner-result-content";
+  container.appendChild(content);
+  renderFusionPartnerResultContent(content, data, request);
+}
+
+function renderFusionPartnerResultContent(container, data, request = {}) {
+  container.replaceChildren();
+  const curationControls = renderPartnerCurationControls(container, data, request);
+  if (curationControls) container.appendChild(curationControls);
 
   const scopeNote =
     data.scope === "tumor_type_scoped" && data.tumor_type
@@ -2820,9 +2841,10 @@ function appendFusionPartnerAgnosticFollowUp(body, gene, tumorType, seenPmids) {
     button.disabled = true;
     resultBox.replaceChildren(renderLoadingState(`Searching all tumor types for ${gene}`));
     followUp.appendChild(resultBox);
-    fetchFusionPartnerEvidence(gene, { tumorType, agnostic: true, excludePmids: seenPmids })
+    const request = { tumorType, agnostic: true, excludePmids: seenPmids };
+    fetchFusionPartnerEvidence(gene, request)
       .then((data) => {
-        renderFusionPartnerResultBody(resultBox, data);
+        renderFusionPartnerResultBody(resultBox, data, request);
         button.remove();
       })
       .catch((error) => {
@@ -2857,10 +2879,11 @@ function renderFusionPartnerCheck(gene, tumorType) {
     if (!details.open || loaded) return;
     loaded = true;
     body.replaceChildren(renderLoadingState(`Searching PubMed for ${gene} fusion precedent`));
-    fetchFusionPartnerEvidence(gene, { tumorType, agnostic: !tumorType })
+    const request = { tumorType, agnostic: !tumorType };
+    fetchFusionPartnerEvidence(gene, request)
       .then((data) => {
         body.replaceChildren();
-        renderFusionPartnerResultBody(body, data);
+        renderFusionPartnerResultBody(body, data, request);
         if (tumorType) appendFusionPartnerAgnosticFollowUp(body, gene, tumorType, data.pmids || []);
       })
       .catch((error) => {
@@ -2894,10 +2917,11 @@ function renderFusionPartnerQueryButton(gene, tumorType) {
     button.disabled = true;
     resultBox.classList.remove("hidden");
     resultBox.replaceChildren(renderLoadingState(`Searching PubMed for ${gene} fusion precedent`));
-    fetchFusionPartnerEvidence(gene, { tumorType, agnostic: !tumorType })
+    const request = { tumorType, agnostic: !tumorType };
+    fetchFusionPartnerEvidence(gene, request)
       .then((data) => {
         resultBox.replaceChildren();
-        renderFusionPartnerResultBody(resultBox, data);
+        renderFusionPartnerResultBody(resultBox, data, request);
         if (tumorType) appendFusionPartnerAgnosticFollowUp(resultBox, gene, tumorType, data.pmids || []);
       })
       .catch((error) => {
@@ -3302,11 +3326,14 @@ function renderStatusLine(annotation) {
       "status-value " +
       (value === true ? "status-yes" : value === false ? "status-no" : "status-unknown");
     item.textContent = `${label}: ${text}`;
+    const curatorSet = field === "cancer_associated" ? renderCuratorSetTag(annotation) : null;
+    if (curatorSet) item.appendChild(curatorSet);
     wrapper.appendChild(item);
   }
 
   (annotation.quality_flags || []).forEach((flag) => {
-    if (CURATION_FLAG_CODES.has(flag.code)) return; // shown in the curation panel
+    // Curation flags show in the curation panel; the call's flag as its tag.
+    if (CURATION_FLAG_CODES.has(flag.code) || flag.code === CURATOR_CALL_FLAG) return;
     const badge = document.createElement("span");
     const severity = ["info", "warning", "critical"].includes(flag.severity)
       ? flag.severity

@@ -1,4 +1,5 @@
-// Curator editing for gene annotations and fusion evidence: edit evidence /
+// Curator editing for gene annotations, fusion evidence and fusion-partner
+// precedent lookups: edit evidence /
 // precedent PMIDs, re-evaluate them into a draft (POST
 // /v1/curation/reevaluate/jobs), review and edit the draft, then save it as a
 // curator override (PUT /v1/curation/{type}/{key}). Also renders the curated
@@ -36,8 +37,11 @@ const CURATION_INVALID_REASONS = {
 };
 // Fields a saved override can change; kept from the local copy when a stale
 // poll/enrichment response (an older curation_version) is merged over it.
+// Info flag on a gene whose cancer-associated call a curator set; shown as a
+// "Curator-set" tag on the call rather than as a separate badge.
+const CURATOR_CALL_FLAG = "curator_set_cancer_association";
 const CURATION_GENE_KEYS = [
-  "cancer_association_rationale", "citations", "evidence_cards", "supporting_quotes",
+  "cancer_associated", "cancer_association_rationale", "citations", "evidence_cards", "supporting_quotes",
   "clinical_actionability", "insufficient_evidence", "quality_flags",
   "curated", "curated_by", "curated_at", "curation_version", "curated_fields",
 ];
@@ -54,6 +58,10 @@ const curationState = {
   localVersions: new Map(),
   // subjectIds reverted here whose pipeline content hasn't loaded yet.
   pendingRefresh: new Set(),
+  // fusion_partner subjectId -> { record, entries: Map(container -> { request,
+  // record }) }. Partner lookups are on-demand, not part of the run result, so
+  // each rendered lookup registers here for the editor to find and refresh.
+  partnerViews: new Map(),
   openSubjectId: null,
   returnFocus: null,
   busy: false,
@@ -85,6 +93,14 @@ function geneCurationSubject(annotation, result = state.currentResult) {
 
 function fusionCurationSubject(item) {
   return { type: "fusion", key: item.fusion, tumorType: item.tumor_type || null, label: item.fusion };
+}
+
+// A fusion-partner precedent lookup is keyed by the tumor type it searched:
+// its tumor type when tumor-scoped, none for an all-tumor-types search
+// (including the agnostic follow-up), matching the server's override key.
+function partnerCurationSubject(data) {
+  const tumorType = data.scope === "tumor_type_scoped" ? data.tumor_type || null : null;
+  return { type: "fusion_partner", key: data.gene, tumorType, label: `${data.gene} partner precedent` };
 }
 
 // Mirrors the server's normalize_subject_key: upper-cased gene, or GENEA::GENEB.
@@ -121,6 +137,9 @@ function curationUrl(subject, suffix = "", params = {}) {
 // The record in `result` with exactly this subject identity, or null (e.g.
 // the same gene shown under another tumor context).
 function findCurationRecord(subject, result = state.currentResult) {
+  if (subject.type === "fusion_partner") {
+    return curationState.partnerViews.get(curationSubjectId(subject))?.record || null;
+  }
   if (!result) return null;
   const id = curationSubjectId(subject);
   return (result[curationRecordList(subject.type)] || []).find(
@@ -131,6 +150,13 @@ function findCurationRecord(subject, result = state.currentResult) {
 // Replaces the displayed record for exactly this subject. Returns false (and
 // changes nothing) when the displayed result doesn't contain that subject.
 function replaceCurationRecord(subject, next) {
+  if (subject.type === "fusion_partner") {
+    const view = curationState.partnerViews.get(curationSubjectId(subject));
+    if (!view) return false;
+    view.record = next;
+    view.entries.forEach((entry) => { entry.record = next; });
+    return true;
+  }
   const result = state.currentResult;
   if (!findCurationRecord(subject, result)) return false;
   const id = curationSubjectId(subject);
@@ -725,9 +751,13 @@ function curationDraftFromJob(session, snapshot, draft) {
       { pmid, title: "", abstract: "", quote: "", therapies: "", evidence_type: "other" }
   );
   precedent.items.forEach((item) => session.info.set(item.pmid, { title: item.title, abstract: item.abstract }));
+  const suggestedCall = typeof draft.cancer_associated === "boolean" ? draft.cancer_associated : null;
   return {
     rationale: isGene ? draft.cancer_association_rationale || "" : draft.interpretation || "",
-    wellSupported: Boolean(draft.well_supported),
+    wellSupported: curationDraftSupported(session.subject, draft),
+    // Prefilled with the model's suggested call, else the current curated call.
+    cancerAssociated: suggestedCall ?? curatedCall(findCurationRecord(session.subject)),
+    suggestedCall,
     cards,
     quotes: (draft.supporting_quotes || []).map((quote) => ({ pmid: quote.pmid, quote: quote.quote || "" })),
     precedent,
@@ -739,11 +769,23 @@ function curationDraftFromRecord(session) {
   const isGene = session.subject.type === "gene";
   return {
     rationale: isGene ? record.cancer_association_rationale || "" : record.interpretation || "",
-    wellSupported: Boolean(record.well_supported),
+    wellSupported: curationDraftSupported(session.subject, record),
+    cancerAssociated: curatedCall(record),
+    suggestedCall: null,
     cards: [],
     quotes: [],
     precedent: { summary: "", items: [] },
   };
+}
+
+// Fusion pairs are "well supported"; partner lookups "have precedent".
+function curationDraftSupported(subject, source) {
+  return Boolean(subject.type === "fusion_partner" ? source.has_precedent : source.well_supported);
+}
+
+// The curator-set cancer-associated call on a served record, or null.
+function curatedCall(record) {
+  return (record?.curated_fields || []).includes("cancer_associated") ? record.cancer_associated : null;
 }
 
 // The sections being edited, from the draft and the submitted snapshot.
@@ -765,8 +807,17 @@ function curationEditedSections(session) {
       evidence_cards: cards,
     };
   }
+  if (subject.type === "fusion_partner") {
+    return {
+      interpretation: draft.rationale.trim(),
+      has_precedent: Boolean(draft.wellSupported),
+      pmids,
+      evidence_cards: cards,
+    };
+  }
   const payload = {};
   if (include.evidence) {
+    if (typeof draft.cancerAssociated === "boolean") payload.cancer_associated = draft.cancerAssociated;
     payload.cancer_association_rationale = draft.rationale.trim();
     payload.citations = pmids;
     payload.evidence_cards = cards;
@@ -791,7 +842,13 @@ function curationEditedSections(session) {
 // PUT replaces the whole override, so start from the current override's
 // payload and replace only the sections being edited; the rest go verbatim.
 function buildCurationPayload(session, currentPayload = {}) {
-  return { ...currentPayload, ...curationEditedSections(session) };
+  const payload = { ...currentPayload, ...curationEditedSections(session) };
+  // "Keep the pipeline's call" in an evidence edit drops a curated call.
+  if (session.subject.type === "gene" && session.submitted.include.evidence &&
+      typeof session.draft.cancerAssociated !== "boolean") {
+    delete payload.cancer_associated;
+  }
+  return payload;
 }
 
 // GET the subject's current override: { version, override } (version 0 and
@@ -828,6 +885,10 @@ function curatedRecordFromOverride(subject, record, response) {
     }
     if (payload.evidence_cards) next.evidence_cards = payload.evidence_cards;
     if (payload.supporting_quotes) next.supporting_quotes = payload.supporting_quotes;
+    if (typeof payload.cancer_associated === "boolean") {
+      next.cancer_associated = payload.cancer_associated;
+      next.insufficient_evidence = false;
+    }
     if (payload.therapeutic_precedent) {
       const precedent = payload.therapeutic_precedent;
       const items = precedent.precedents || [];
@@ -851,11 +912,19 @@ function curatedRecordFromOverride(subject, record, response) {
   } else {
     if (payload.interpretation !== undefined) next.interpretation = payload.interpretation;
     if (payload.well_supported !== undefined) next.well_supported = payload.well_supported;
+    if (payload.has_precedent !== undefined) next.has_precedent = payload.has_precedent;
     if (payload.pmids) {
       next.pmids = payload.pmids;
       next.retrieved_count = payload.pmids.length;
     }
-    if (payload.evidence_cards) next.evidence_cards = payload.evidence_cards.map((card) => ({ ...card, fusion: record.fusion }));
+    if (payload.evidence_cards) {
+      next.evidence_cards = subject.type === "fusion"
+        ? payload.evidence_cards.map((card) => ({ ...card, fusion: record.fusion }))
+        : payload.evidence_cards;
+    }
+    if (subject.type === "fusion_partner" && payload.pmids && payload.has_precedent === undefined) {
+      next.has_precedent = payload.pmids.length > 0;
+    }
   }
   next.curated = true;
   next.curated_by = override.curator_email;
@@ -916,7 +985,7 @@ async function saveCurationDraft(session) {
     curationState.busy = false;
     discardCurationSession(session);
     closeCurationDialog();
-    if (state.currentResult) renderAnnotationResult(state.currentResult);
+    refreshCurationView(session.subject);
     showCurationToast("Curator edits saved", "success");
   } catch (error) {
     session.message = { type: "error", text: `Couldn't save: ${error.message}` };
@@ -958,6 +1027,7 @@ function handleCurationSaveError(session, status, detail) {
 // Only updates the displayed result when it is that run and shows this exact
 // subject (same tumor context).
 async function reloadCurationSubject(subject) {
+  if (subject.type === "fusion_partner") return reloadPartnerCurationViews(subject);
   const runId = state.currentResult?.run_id;
   if (!runId || !findCurationRecord(subject)) return null;
   const response = await fetch(`/v1/annotate/${encodeURIComponent(runId)}`);
@@ -966,6 +1036,70 @@ async function reloadCurationSubject(subject) {
   const fresh = findCurationRecord(subject, result);
   if (!fresh || state.currentResult?.run_id !== runId) return null;
   return replaceCurationRecord(subject, fresh) ? fresh : null;
+}
+
+// Re-renders what shows `subject`: its registered partner-precedent lookups,
+// or the run result for gene and fusion subjects.
+function refreshCurationView(subject) {
+  if (subject.type !== "fusion_partner") {
+    if (state.currentResult) renderAnnotationResult(state.currentResult);
+    return;
+  }
+  const view = curationState.partnerViews.get(curationSubjectId(subject));
+  if (!view) return;
+  view.entries.forEach((entry, container) => {
+    if (container.isConnected === false) view.entries.delete(container);
+    else renderFusionPartnerResultContent(container, entry.record, entry.request);
+  });
+}
+
+// Re-fetches each rendered lookup of a partner subject with its own request
+// (the server overlays the live override). Returns a fresh record, or null.
+async function reloadPartnerCurationViews(subject) {
+  const view = curationState.partnerViews.get(curationSubjectId(subject));
+  if (!view) return null;
+  forgetFusionPartnerEvidence(subject.key);
+  let fresh = null;
+  for (const [container, entry] of view.entries) {
+    if (container.isConnected === false) {
+      view.entries.delete(container);
+      continue;
+    }
+    const data = await fetchFusionPartnerEvidence(subject.key, entry.request || {});
+    entry.record = data;
+    fresh = data;
+  }
+  if (fresh) view.record = fresh;
+  return fresh;
+}
+
+// Called by app.js for each rendered partner-precedent lookup: registers it
+// and returns the curation panel and edit control (null when there's none).
+function renderPartnerCurationControls(container, data, request) {
+  const subject = partnerCurationSubject(data);
+  const id = curationSubjectId(subject);
+  const view = curationState.partnerViews.get(id) || { record: data, entries: new Map() };
+  view.record = data;
+  view.entries.set(container, { request, record: data });
+  curationState.partnerViews.set(id, view);
+  const panel = renderCurationPanel(subject, data);
+  const edit = curationEditButton(subject, "evidence", "Edit partner precedent");
+  if (!panel && !edit) return null;
+  return curationEl("div", { className: "partner-curation-controls" }, [panel, edit]);
+}
+
+// "Curator-set" tag for the cancer-associated call, or null when the call is
+// the pipeline's.
+function renderCuratorSetTag(annotation) {
+  if (!(annotation.curated_fields || []).includes("cancer_associated")) return null;
+  const flag = (annotation.quality_flags || []).find((item) => item.code === CURATOR_CALL_FLAG);
+  const tag = curationEl("span", {
+    className: "review-badge curated-badge curator-set-tag",
+    text: "Curator-set",
+    dataset: { curation: "curator-set" },
+  });
+  tag.title = flag?.detail || `Set by ${annotation.curated_by || "a curator"}`;
+  return tag;
 }
 
 // The expected version only advances once the current override has been
@@ -986,7 +1120,7 @@ async function reloadAfterCurationConflict(session) {
       return;
     }
     const refreshed = await reloadCurationSubject(session.subject).catch(() => null);
-    if (refreshed && state.currentResult) renderAnnotationResult(state.currentResult);
+    if (refreshed) refreshCurationView(session.subject);
     session.baseVersion = current.version;
     const override = current.override;
     const changes = override
@@ -1050,7 +1184,7 @@ async function revertCuration(subject, version, errorNode, button) {
     // Don't present the old curated content as current: mark it pending.
     else curationState.pendingRefresh.add(curationSubjectId(subject));
     // Re-render before closing so focus returns to the re-rendered card.
-    if (state.currentResult) renderAnnotationResult(state.currentResult);
+    refreshCurationView(subject);
     closeCurationAuxModal();
     if (fresh) showCurationToast(`${subject.label} reverted to pipeline output`, "success");
     else showCurationToast(`${subject.label} reverted, but the pipeline version couldn't be loaded yet.`, "error");
@@ -1077,7 +1211,7 @@ async function retryCurationRefresh(subject, button) {
   } finally {
     curationState.busy = false;
     button.disabled = false;
-    if (state.currentResult) renderAnnotationResult(state.currentResult);
+    refreshCurationView(subject);
   }
 }
 
@@ -1429,7 +1563,7 @@ function renderCurationFooter(session, isReview) {
       if (curationState.busy) return;
       discardCurationSession(session);
       closeCurationDialog();
-      if (state.currentResult) renderAnnotationResult(state.currentResult);
+      refreshCurationView(session.subject);
     }, { action: "discard", disabled: curationState.busy }),
   ];
   if (isReview) {
@@ -1470,7 +1604,8 @@ function renderCurationPmidList(session, listName) {
   const isEvidence = listName === "evidence";
   const running = curationLocked(session);
   const legendText = isEvidence
-    ? (session.subject.type === "gene" ? "Evidence PMIDs (Cited on PubMed)" : "Fusion evidence PMIDs")
+    ? ({ gene: "Evidence PMIDs (Cited on PubMed)", fusion_partner: "Partner-precedent PMIDs" }[session.subject.type] ||
+      "Fusion evidence PMIDs")
     : "Therapeutic precedent PMIDs";
   const fieldset = curationEl("fieldset", { className: "curation-pmid-list", dataset: { list: listName } });
   fieldset.appendChild(curationEl("legend", { text: legendText }));
@@ -1624,19 +1759,21 @@ function renderCurationReview(session) {
   const container = curationEl("div", { className: "curation-review" });
   const idPrefix = `curation-${cssSafeIdForCuration(subject.key)}`;
 
-  const { include, lists } = session.submitted;
+  const { include } = session.submitted;
+  const isPartner = subject.type === "fusion_partner";
   if (!isGene || include.evidence) {
     container.appendChild(curationField(
-      isGene ? "Cancer association rationale" : "Fusion interpretation",
+      isGene ? "Cancer association rationale" : isPartner ? "Partner-precedent interpretation" : "Fusion interpretation",
       curationTextarea(draft.rationale, (value) => { draft.rationale = value; }, { rows: 5, dataset: { curation: "rationale" } }),
       { id: `${idPrefix}-rationale` }
     ));
+    if (isGene) container.appendChild(renderCurationCallSelect(draft, idPrefix));
     if (!isGene) {
       const checkbox = curationEl("input", { type: "checkbox", id: `${idPrefix}-well-supported`, dataset: { curation: "well-supported" } });
       checkbox.checked = Boolean(draft.wellSupported);
       checkbox.addEventListener("change", () => { draft.wellSupported = checkbox.checked; });
       container.appendChild(curationEl("label", { className: "curation-include", attrs: { for: checkbox.id } }, [
-        checkbox, curationEl("span", { text: " Well supported" }),
+        checkbox, curationEl("span", { text: isPartner ? " Has fusion-partner precedent" : " Well supported" }),
       ]));
     }
 
@@ -1659,6 +1796,30 @@ function renderCurationReview(session) {
     { id: `${idPrefix}-note` }
   ));
   return container;
+}
+
+// The cancer-associated call: prefilled with the model's suggestion (or the
+// current curated call); "Keep the pipeline's call" saves no curated call.
+function renderCurationCallSelect(draft, idPrefix) {
+  const select = curationEl("select", { dataset: { curation: "cancer-associated" } });
+  [["", "Keep the pipeline's call"], ["true", "Yes — cancer-associated"], ["false", "No — not cancer-associated"]]
+    .forEach(([value, text]) => {
+      const option = curationEl("option", { text });
+      option.value = value;
+      select.appendChild(option);
+    });
+  select.value = typeof draft.cancerAssociated === "boolean" ? String(draft.cancerAssociated) : "";
+  select.addEventListener("change", () => {
+    draft.cancerAssociated = select.value === "" ? null : select.value === "true";
+  });
+  const hint = typeof draft.suggestedCall === "boolean"
+    ? curationEl("p", {
+      className: "subtle",
+      text: `Re-evaluation suggested: ${draft.suggestedCall ? "Yes" : "No"}.`,
+      dataset: { curation: "suggested-call" },
+    })
+    : null;
+  return curationField("Cancer-associated call", select, { id: `${idPrefix}-cancer-associated`, hint });
 }
 
 function cssSafeIdForCuration(value) {
