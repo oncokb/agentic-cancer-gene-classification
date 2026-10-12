@@ -33,7 +33,12 @@ from src.pipeline.literature import (
     search_recent_pubmed_pmids,
 )
 from src.pipeline.llm_client import resolve_local_backend
-from src.pipeline.normalization import is_fusion_input, normalize_fusions
+from src.pipeline.normalization import (
+    gene_tumor_types,
+    is_fusion_input,
+    normalize_fusions,
+    split_input_tumor_types,
+)
 from src.pipeline.pmid_distillation import distill_and_save_pmid_evidence
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
@@ -538,18 +543,7 @@ def _normalize_fusion_inputs(
     Accept either plain strings or FusionInput objects.
     Returns (input_strings, tumor_type_by_input_string).
     """
-    input_strings: List[str] = []
-    tumor_type_map: Dict[str, str] = {}
-
-    for item in fusions:
-        if isinstance(item, str):
-            input_strings.append(item)
-        else:
-            input_strings.append(item.fusion)
-            if item.tumor_type:
-                tumor_type_map[item.fusion] = item.tumor_type
-
-    return input_strings, tumor_type_map
+    return split_input_tumor_types(fusions)
 
 
 async def run_pipeline(
@@ -610,13 +604,7 @@ async def run_pipeline(
     await _maybe_call_total(on_total_known, len(gene_map))
 
     # Build per-gene tumor_type: first non-null tumor_type from the gene's submitted inputs.
-    gene_tumor_type: Dict[str, Optional[str]] = {}
-    for canonical, (_, gene_inputs) in gene_map.items():
-        for f in gene_inputs:
-            tt = tumor_type_by_input.get(f)
-            if tt:
-                gene_tumor_type[canonical] = tt
-                break
+    gene_tumor_type = gene_tumor_types(gene_map, tumor_type_by_input)
 
     # Annotate genes with bounded fan-out. PubMed, Redis, and LLM paths still
     # enforce their own lower-level limits/caches.

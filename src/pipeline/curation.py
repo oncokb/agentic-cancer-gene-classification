@@ -36,12 +36,19 @@ from src.models.schema import (
     CuratedTherapeuticPrecedent,
     FusionCurationPayload,
     FusionEvidenceResult,
+    FusionInput,
     GeneAnnotation,
     GeneCurationPayload,
     QualityFlag,
 )
 from src.pipeline.literature import find_retracted_pmids
-from src.pipeline.normalization import FUSION_SEPARATORS, normalize_fusions, split_fusion
+from src.pipeline.normalization import (
+    FUSION_SEPARATORS,
+    gene_tumor_types,
+    normalize_fusions,
+    split_fusion,
+    split_input_tumor_types,
+)
 from src.pipeline.result_sanitizer import strip_retracted_pmids_from_annotation
 
 logger = logging.getLogger(__name__)
@@ -460,10 +467,26 @@ def _annotation_tumor_types(result: AnnotationResult) -> List[Optional[str]]:
 
 async def overlay_annotation_result(result: AnnotationResult, run_store: Any) -> AnnotationResult:
     """A copy of a (pipeline) result with the CURRENT overrides applied to its
-    gene annotations and fusion evidence, and curation_unavailable set."""
-    annotations = await apply_current_gene_overrides(
-        result.annotations, run_store, _annotation_tumor_types(result)
+    gene annotations and fusion evidence, and curation_unavailable set.
+
+    Genes whose tumor context is unresolved get no override at all (applying
+    the untyped one could be wrong) and are flagged curation_unavailable."""
+    unresolved = result._unresolved_tumor_genes
+    tumor_types = _annotation_tumor_types(result)
+    resolvable = [i for i, a in enumerate(result.annotations) if a.gene not in unresolved]
+    overlaid = await apply_current_gene_overrides(
+        [result.annotations[i] for i in resolvable], run_store, [tumor_types[i] for i in resolvable]
     )
+    by_index = dict(zip(resolvable, overlaid))
+    if unresolved:
+        logger.error(
+            "Tumor context unresolved for %s in run %s; their curator overrides are not applied",
+            ", ".join(sorted(unresolved)), result.run_id,
+        )
+    annotations = [
+        by_index[i] if i in by_index else _flag_gene_unavailable(pipeline_original(a))
+        for i, a in enumerate(result.annotations)
+    ]
     fusion_evidence = await apply_current_fusion_overrides(result.fusion_evidence, run_store)
     return result.model_copy(
         update={
@@ -496,57 +519,61 @@ def result_payload_for_storage(result: AnnotationResult) -> Dict[str, Any]:
     return pipeline_result(result).model_dump()
 
 
-def _request_inputs(request: Dict[str, Any]) -> List[Tuple[str, Optional[str]]]:
-    if "fusions" not in request:  # GeneAnnotateRequest
-        return [(str(request.get("gene") or ""), request.get("tumor_type"))]
-    inputs = []
-    for item in request.get("fusions") or []:
-        if isinstance(item, str):
-            inputs.append((item, None))
-        elif isinstance(item, dict):
-            inputs.append((str(item.get("fusion") or ""), item.get("tumor_type")))
-    return inputs
+def _request_fusion_inputs(request: Dict[str, Any]) -> List[FusionInput]:
+    """The saved request's inputs as FusionInputs (AnnotateRequest, or a
+    GeneAnnotateRequest's single gene). Raises on a malformed request."""
+    if "fusions" not in request:
+        return [FusionInput(gene=request["gene"], tumor_type=request.get("tumor_type"))]
+    return [
+        item if isinstance(item, str) else FusionInput.model_validate(item)
+        for item in request.get("fusions") or []
+    ]
 
 
-def _direct_tumor_type(gene: str, fusions: List[str], inputs: List[Tuple[str, Optional[str]]]) -> Optional[str]:
-    gene = gene.upper()
-    names = {gene, *(fusion.upper() for fusion in fusions)}
-    for value, tumor_type in inputs:
-        value = value.strip().upper()
-        if tumor_type and (value in names or gene in split_fusion(value)):
-            return tumor_type
-    return None
+async def ensure_annotation_tumor_types(result: AnnotationResult, run_store: Any, run_id: str) -> bool:
+    """Reconstruct annotation_tumor_types for runs saved before it existed.
 
+    Replays the pipeline's own rule (normalization.gene_tumor_types) on the
+    saved request, HGNC-normalizing only the inputs that carry a tumor type
+    (the only ones that can give a gene tumor context), so aliases map to
+    their canonical gene. Only CONFIRMED entries are added to the map; when the
+    request or alias resolution is unavailable, the missing genes are recorded
+    in result._unresolved_tumor_genes instead. Returns True when confirmed
+    entries were added (so the caller can persist them)."""
+    missing = [a.gene for a in result.annotations if a.gene not in result.annotation_tumor_types]
+    # Only matters where overrides exist; other stores (benchmark, tests) skip it.
+    if not missing or getattr(run_store, "get_curated_overrides", None) is None:
+        return False
 
-async def ensure_annotation_tumor_types(result: AnnotationResult, run_store: Any, run_id: str) -> None:
-    """Fill result.annotation_tumor_types (in place) for runs saved before it
-    existed, by replaying the pipeline's rule on the saved request: HGNC-
-    normalize the inputs (so aliases map to their canonical gene) and take the
-    first tumor type among each gene's inputs."""
-    missing = [a for a in result.annotations if a.gene not in result.annotation_tumor_types]
+    def unresolved(reason: str) -> bool:
+        logger.error("Cannot reconstruct tumor context for run %s (%s): %s", run_id, reason, ", ".join(missing))
+        result._unresolved_tumor_genes.update(missing)
+        return False
+
     getter = getattr(run_store, "get_run_request", None)
-    if not missing or getter is None:
-        return
+    if getter is None:
+        return unresolved("store cannot load run requests")
     try:
         request = await getter(run_id)
+        if not request:
+            return unresolved("saved request not found")
+        input_strings, tumor_type_by_input = split_input_tumor_types(_request_fusion_inputs(request))
     except Exception:
         logger.warning("Failed to load request for run %s", run_id, exc_info=True)
-        return
-    inputs = _request_inputs(request or {})
-    tumor_by_input: Dict[str, str] = {}
-    for value, tumor_type in inputs:
-        if tumor_type:
-            tumor_by_input.setdefault(value, tumor_type)
-    gene_map: Dict[str, Any] = {}
-    if tumor_by_input:
+        return unresolved("saved request unavailable")
+
+    tumor_types: Dict[str, Optional[str]] = {}
+    if tumor_type_by_input:
+        typed_inputs = list(dict.fromkeys(v for v in input_strings if v in tumor_type_by_input))
         try:
-            gene_map = await normalize_fusions([value for value, _ in inputs])
+            gene_map = await normalize_fusions(typed_inputs)
         except Exception:
-            logger.warning("Alias resolution failed for run %s; matching inputs literally", run_id, exc_info=True)
-    for annotation in missing:
-        if annotation.gene in gene_map:
-            _, gene_inputs = gene_map[annotation.gene]
-            tumor_type = next((tumor_by_input[v] for v in gene_inputs if v in tumor_by_input), None)
-        else:
-            tumor_type = _direct_tumor_type(annotation.gene, annotation.fusions, inputs)
-        result.annotation_tumor_types[annotation.gene] = tumor_type
+            logger.warning("Alias resolution failed for run %s", run_id, exc_info=True)
+            return unresolved("alias resolution failed")
+        if any(resolved.lookup_failed for resolved, _ in gene_map.values()):
+            return unresolved("gene symbol lookup unavailable")
+        tumor_types = gene_tumor_types(gene_map, tumor_type_by_input)
+    # A gene no tumor-typed input resolves to is confirmed to have none.
+    for gene in missing:
+        result.annotation_tumor_types[gene] = tumor_types.get(gene)
+    return True

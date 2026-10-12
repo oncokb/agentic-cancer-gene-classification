@@ -952,3 +952,179 @@ async def test_run_pipeline_reports_curation_unavailable(pipeline_env, monkeypat
     assert store.saved_gene_annotations[0].quality_flags == []
     stored = result_payload_for_storage(result)
     assert stored["curation_unavailable"] is False and stored["annotations"][0]["quality_flags"] == []
+
+
+# ---------------------------------------------------------------------------
+# Round 2: legacy tumor-context reconstruction, partial jobs, contention
+# ---------------------------------------------------------------------------
+
+
+def _legacy_run(store: FakeCurationStore, run_id: str, annotations: List[GeneAnnotation], request: Dict[str, Any]):
+    """A run saved before annotation_tumor_types existed."""
+    stored = AnnotationResult(run_id=run_id, timestamp=NOW, fusions_processed=len(annotations),
+                              genes_annotated=len(annotations), annotations=annotations).model_dump()
+    del stored["annotation_tumor_types"]
+    store.runs[run_id] = stored
+    store.requests[run_id] = request
+
+
+async def test_pipeline_and_reconstruction_share_duplicate_input_rule(pipeline_env, monkeypatch):
+    async def fake_annotate_gene(**_kwargs):
+        return _pipeline_annotation(cache_status="refreshed")
+
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
+    inputs = [FusionInput(fusion="ALK", tumor_type="LUAD"), FusionInput(fusion="ALK", tumor_type="NSCLC")]
+    result = await run_pipeline(inputs, run_store=FakeCurationStore())
+    assert result.annotation_tumor_types == {"ALK": "NSCLC"}  # the pipeline's rule
+
+    store = FakeCurationStore()
+    _legacy_run(store, "run-dup", [_pipeline_annotation()], {"fusions": [i.model_dump() for i in inputs]})
+    legacy = AnnotationResult(**store.runs["run-dup"])
+    monkeypatch.setattr(curation, "normalize_fusions", _fake_normalize_fusions)
+    assert await curation.ensure_annotation_tumor_types(legacy, store, "run-dup") is True
+    assert legacy.annotation_tumor_types == result.annotation_tumor_types
+
+
+def test_legacy_link_with_duplicate_inputs_uses_pipeline_tumor_context(client, store):
+    _legacy_run(store, "run-dup", [_pipeline_annotation()],
+                {"fusions": [{"fusion": "ALK", "tumor_type": "LUAD"}, {"fusion": "ALK", "tumor_type": "NSCLC"}]})
+    store.overrides[("gene", "ALK", "luad")] = _override({"citations": ["333"]}, tumor_type="luad")
+    store.overrides[("gene", "ALK", "nsclc")] = _override({"citations": ["222"]}, tumor_type="nsclc")
+    assert client.get("/v1/annotate/run-dup").json()["annotations"][0]["citations"] == ["222"]
+
+
+def test_unresolved_alias_never_applies_untyped_override_or_persists_guess(client, store, monkeypatch):
+    _legacy_run(store, "run-moz", [_pipeline_annotation(gene="KAT6A"), GeneAnnotation(gene="BRAF")],
+                {"fusions": [{"fusion": "MOZ", "tumor_type": "AML"}, "BRAF"]})
+    store.overrides[("gene", "KAT6A", "")] = _override({"citations": ["333"]}, key="KAT6A", tumor_type="")
+    store.overrides[("gene", "KAT6A", "aml")] = _override({"citations": ["222"]}, key="KAT6A", tumor_type="aml")
+
+    async def hgnc_down(_inputs, **_kwargs):
+        raise RuntimeError("HGNC unreachable")
+
+    monkeypatch.setattr(curation, "normalize_fusions", hgnc_down)
+    served = client.get("/v1/annotate/run-moz").json()
+    kat6a = served["annotations"][0]
+    assert kat6a["curated"] is False and kat6a["citations"] == ["111"]  # untyped override NOT applied
+    assert CURATION_UNAVAILABLE_FLAG in [f["code"] for f in kat6a["quality_flags"]]
+    assert served["curation_unavailable"] is True
+    assert "KAT6A" not in served["annotation_tumor_types"]
+    assert "annotation_tumor_types" not in store.runs["run-moz"]  # nothing guessed was persisted
+
+    # A symbol lookup that "succeeds" with lookup_failed is just as unresolved.
+    async def lookup_failed(inputs, **_kwargs):
+        return {"MOZ": (ResolvedGene(input_symbol="MOZ", resolved=False, lookup_failed=True), list(inputs))}
+
+    monkeypatch.setattr(curation, "normalize_fusions", lookup_failed)
+    assert client.get("/v1/annotate/run-moz").json()["annotations"][0]["curated"] is False
+
+    # Once resolution works, the AML override applies and the map is persisted.
+    monkeypatch.setattr(curation, "normalize_fusions", _fake_normalize_fusions)
+    served = client.get("/v1/annotate/run-moz").json()
+    assert served["annotations"][0]["citations"] == ["222"] and served["curation_unavailable"] is False
+    assert store.runs["run-moz"]["annotation_tumor_types"] == {"KAT6A": "AML", "BRAF": None}
+
+
+def test_sanitizer_write_back_does_not_persist_unresolved_tumor_context(client, store, monkeypatch):
+    _legacy_run(store, "run-san", [_pipeline_annotation(gene="KAT6A")],
+                {"fusions": [{"fusion": "MOZ", "tumor_type": "AML"}]})
+    store.overrides[("gene", "KAT6A", "aml")] = _override({"cancer_association_rationale": "AML."},
+                                                           key="KAT6A", tumor_type="aml")
+
+    async def retract_111(pmids):
+        return {"111"} & set(pmids)
+
+    async def hgnc_down(_inputs, **_kwargs):
+        raise RuntimeError("HGNC unreachable")
+
+    monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", retract_111)
+    monkeypatch.setattr(curation, "normalize_fusions", hgnc_down)
+    client.get("/v1/annotate/run-san")
+    persisted = store.runs["run-san"]
+    assert persisted["annotations"][0]["citations"] == []  # the sanitizer did write back
+    assert persisted["annotation_tumor_types"] == {}  # ...without an unresolved/null entry
+
+    monkeypatch.setattr(curation, "normalize_fusions", _fake_normalize_fusions)
+    served = client.get("/v1/annotate/run-san").json()  # reconstruction is retried
+    assert served["annotations"][0]["cancer_association_rationale"] == "AML."
+    assert store.runs["run-san"]["annotation_tumor_types"] == {"KAT6A": "AML"}
+
+
+def test_reconstructed_context_is_persisted_once_and_only_typed_inputs_normalized(client, store, monkeypatch):
+    _legacy_run(store, "run-once", [_pipeline_annotation(gene="KAT6A"), GeneAnnotation(gene="BRAF")],
+                {"fusions": [{"fusion": "MOZ", "tumor_type": "AML"}, "BRAF", {"fusion": "EGFR"}]})
+    calls = []
+
+    async def counting_normalize(inputs, **kwargs):
+        calls.append(list(inputs))
+        return await _fake_normalize_fusions(inputs, **kwargs)
+
+    monkeypatch.setattr(curation, "normalize_fusions", counting_normalize)
+    client.get("/v1/annotate/run-once")  # no sanitization change; map persisted anyway
+    assert store.runs["run-once"]["annotation_tumor_types"] == {"KAT6A": "AML", "BRAF": None}
+    client.get("/v1/annotate/run-once")
+    assert calls == [["MOZ"]]
+
+
+def test_partial_annotation_job_exposes_completed_genes_tumor_context(store, monkeypatch):
+    import threading
+
+    class _StoreFactory:  # lifespan opens app.state.run_store via RunStore.create()
+        @staticmethod
+        async def create():
+            return store
+
+    monkeypatch.setattr(store, "close", lambda: _noop(), raising=False)
+    monkeypatch.setattr(main, "RunStore", _StoreFactory)
+    # One portal (event loop) for the whole test, so the background job keeps
+    # running between polls instead of stalling on a per-request loop.
+    with TestClient(main.app) as client:
+        _check_partial_job(client, store, monkeypatch, threading.Event())
+
+
+async def _noop():
+    return None
+
+
+def _check_partial_job(client, store, monkeypatch, release):
+
+    async def slow_pipeline(fusions, on_annotation=None, **_kwargs):
+        import asyncio
+
+        annotation = _pipeline_annotation()
+        annotation.analysis_tumor_type = "LUAD"
+        await on_annotation(annotation)
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        return AnnotationResult(run_id="run-partial", timestamp=NOW, fusions_processed=2, genes_annotated=1,
+                                annotations=[annotation], annotation_tumor_types={"ALK": "LUAD"})
+
+    monkeypatch.setattr(main, "run_pipeline", slow_pipeline)
+    store.overrides[("gene", "ALK", "luad")] = _override({"citations": ["222"]})
+    url = client.post("/v1/annotate/jobs", json={"fusions": [{"fusion": "ALK", "tumor_type": "LUAD"}]}).json()[
+        "status_url"
+    ]
+    try:
+        for _ in range(200):
+            body = client.get(url).json()
+            if body["genes_completed"]:
+                break
+            time.sleep(0.01)
+        assert body["status"] == "running" and body["result"] is None
+        assert body["annotation_tumor_types"] == {"ALK": "LUAD"}
+        assert body["annotations"][0]["curated"] is True  # overlaid mid-run too
+    finally:
+        release.set()
+    assert _poll(client, url)["annotation_tumor_types"] == {"ALK": "LUAD"}
+
+
+def test_lock_contention_is_retryable_503(client, store, monkeypatch):
+    from src.pipeline.curation_store import CurationStorageContention
+
+    async def contended(**_kwargs):
+        raise CurationStorageContention("busy")
+
+    monkeypatch.setattr(store, "save_curated_override", contended)
+    resp = client.put("/v1/curation/gene/ALK", json={"payload": {"citations": ["222"]}})
+    assert resp.status_code == 503 and resp.headers["retry-after"] == "1"
+    assert "contention" in resp.json()["detail"]
