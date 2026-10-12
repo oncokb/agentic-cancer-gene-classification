@@ -18,6 +18,19 @@ Both routes require the curator or admin role (`require_curator`); viewers get
 }
 ```
 
+Gene drafts carry the model's suggested `cancer_associated` (null for
+precedent-only drafts); the editor prefills the curator's call from it, and the
+curator can flip it before saving it as `cancer_associated` in the override.
+
+For fusion-partner precedent drafts, use `"subject_type": "fusion_partner"`, the
+partner gene as `subject_key`, the searched tumor type (or null for all tumor
+types), and the precedent PMIDs in `evidence_pmids` (`precedent_pmids` must be
+empty, else 422). No synthesis runs: the draft is shaped like
+`FusionPartnerEvidenceResult` (`gene`, `tumor_type`, `scope`, `has_precedent`,
+`pmids`, `interpretation`, `evidence_cards` in curator order with verbatim
+quotes, `quality_flags`, `model_info`, `generated_at`), and its editable fields
+save as a `fusion_partner` override.
+
 For fusion drafts, use `"subject_type": "fusion"` and
 `"subject_key": "EML4::ALK"` (also accepts `--` or `/` notation).
 Fusion input partners are uppercased for lookup through HGNC/Ensembl, then
