@@ -417,3 +417,10 @@ def assess_clinical_actionability(
         score_components=components,
         evidence=evidence_entries,
     )
+
+
+# Public helpers shared by draft re-evaluation; private names remain compatible.
+evidence_type = _evidence_type
+extract_therapies = _extract_therapies
+extract_domains = _extract_domains
+record_text = _record_text

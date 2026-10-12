@@ -741,3 +741,7 @@ async def run_pipeline(
         annotations=annotations,
         timings_ms=timings,
     )
+
+
+# Public helpers shared by draft re-evaluation; private names remain compatible.
+format_gene_identity = _format_gene_identity
