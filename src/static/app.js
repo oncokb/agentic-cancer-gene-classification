@@ -265,6 +265,8 @@ async function checkAuth() {
     if (!response.ok) return;
     const payload = await response.json();
     state.auth = payload;
+    // can_curate gates the curator edit controls on already-rendered results.
+    if (payload.can_curate && state.currentResult) renderAnnotationResult(state.currentResult);
 
     if (!payload.auth_enabled) {
       if (elements.userAuthBar) elements.userAuthBar.classList.add("hidden");
@@ -1087,7 +1089,7 @@ async function pollFusionEvidenceJob(statusUrl) {
 
     state.currentResult = {
       ...state.currentResult,
-      fusion_evidence: status.fusion_evidence || [],
+      fusion_evidence: reconcileFusionEvidence(state.currentResult?.fusion_evidence, status.fusion_evidence),
     };
     renderAnnotationResult(state.currentResult);
 
@@ -1107,7 +1109,10 @@ async function pollFusionEvidenceJob(statusUrl) {
 function mergeAnnotations(existing, enriched) {
   const byGene = new Map((existing || []).map((annotation) => [annotation.gene, annotation]));
   (enriched || []).forEach((annotation) => {
-    byGene.set(annotation.gene, { ...(byGene.get(annotation.gene) || {}), ...annotation });
+    const previous = byGene.get(annotation.gene);
+    const merged = { ...(previous || {}), ...annotation };
+    // A response computed before a curator save here must not undo it.
+    byGene.set(annotation.gene, reconcileCuratedRecord(geneCurationSubject(annotation), previous, merged));
   });
   return Array.from(byGene.values()).sort((a, b) => a.gene.localeCompare(b.gene));
 }
@@ -1545,6 +1550,8 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
 
   const list = document.createElement("div");
   list.className = "annotation-list";
+  const curationBanner = renderCurationUnavailableBanner(state.currentResult);
+  if (curationBanner) list.appendChild(curationBanner);
 
   visibleAnnotations.forEach((annotation) => {
     const card = document.createElement("article");
@@ -1568,6 +1575,8 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
     const cacheBadge = renderCacheBadge(annotation);
     if (cacheBadge) card.querySelector(".cache-badge-slot").appendChild(cacheBadge);
     card.querySelector(".status-line-slot").appendChild(renderStatusLine(annotation));
+    const curationPanel = renderCurationPanel(geneCurationSubject(annotation), annotation);
+    if (curationPanel) card.querySelector(".status-line-slot").appendChild(curationPanel);
 
     const fields = card.querySelector(".annotation-fields");
     for (const [field, label, type] of editableFields) {
@@ -1686,6 +1695,8 @@ function renderFusionEvidenceView(fusionEvidence) {
 
   const list = document.createElement("div");
   list.className = "annotation-list fusion-evidence-list";
+  const curationBanner = renderCurationUnavailableBanner(state.currentResult);
+  if (curationBanner) list.appendChild(curationBanner);
 
   items.forEach((item) => {
     const card = document.createElement("article");
@@ -1715,7 +1726,12 @@ function renderFusionEvidenceView(fusionEvidence) {
       <div class="supporting-evidence fusion-supporting-evidence"></div>
     `;
 
+    const curationSubject = fusionCurationSubject(item);
+    const curationPanel = renderCurationPanel(curationSubject, item);
+    if (curationPanel) card.querySelector("header").after(curationPanel);
     const evidence = card.querySelector(".fusion-supporting-evidence");
+    const editEvidence = curationEditButton(curationSubject, "evidence", "Edit evidence");
+    if (editEvidence) evidence.appendChild(editEvidence);
     if (pmids.length) {
       const links = document.createElement("div");
       links.className = "citation-links";
@@ -1847,15 +1863,21 @@ function renderSupportingEvidence(annotation) {
   const allRetrieved = annotation.retrieved_pmids || [];
   const count = annotation.retrieval_count ?? allRetrieved.length;
 
-  if (!quotes.length && !citations.length && !evidenceCards.length && !count) return null;
+  // Curators get the section (and its Edit evidence control) even when empty.
+  const editEvidence = curationEditButton(geneCurationSubject(annotation), "evidence", "Edit evidence");
+  if (!quotes.length && !citations.length && !evidenceCards.length && !count && !editEvidence) return null;
 
   const section = document.createElement("div");
   section.className = "supporting-evidence";
 
+  const headingRow = document.createElement("div");
+  headingRow.className = "supporting-evidence-heading-row";
   const heading = document.createElement("h4");
   heading.className = "supporting-evidence-heading";
   heading.textContent = "Supporting Evidence";
-  section.appendChild(heading);
+  headingRow.appendChild(heading);
+  if (editEvidence) headingRow.appendChild(editEvidence);
+  section.appendChild(headingRow);
 
   // Total retrieved PMIDs — collapsible
   if (count > 0) {
@@ -3140,7 +3162,8 @@ function renderField(annotation, field, label, type) {
 
 function renderClinicalActionability(annotation) {
   const actionability = annotation.clinical_actionability;
-  if (!actionability) return null;
+  const editPrecedent = curationEditButton(geneCurationSubject(annotation), "precedent", "Edit precedent");
+  if (!actionability && !editPrecedent) return null;
 
   const section = document.createElement("div");
   section.className = "clinical-actionability";
@@ -3151,6 +3174,18 @@ function renderClinicalActionability(annotation) {
   title.className = "field-label";
   title.textContent = "High-confidence therapeutic precedent";
   header.appendChild(title);
+
+  if (!actionability) {
+    // Curators only: no precedent yet, but one can be added.
+    section.classList.add("empty");
+    header.appendChild(editPrecedent);
+    section.appendChild(header);
+    const none = document.createElement("p");
+    none.className = "subtle";
+    none.textContent = "No high-confidence therapeutic precedent.";
+    section.appendChild(none);
+    return section;
+  }
 
   const score = document.createElement("span");
   score.className = "review-badge high";
@@ -3163,6 +3198,7 @@ function renderClinicalActionability(annotation) {
   }
   score.title = actionability.confidence_explanation || "";
   header.appendChild(score);
+  if (editPrecedent) header.appendChild(editPrecedent);
   section.appendChild(header);
 
   const summary = document.createElement("p");
@@ -3266,6 +3302,7 @@ function renderStatusLine(annotation) {
   }
 
   (annotation.quality_flags || []).forEach((flag) => {
+    if (CURATION_FLAG_CODES.has(flag.code)) return; // shown in the curation panel
     const badge = document.createElement("span");
     const severity = ["info", "warning", "critical"].includes(flag.severity)
       ? flag.severity
@@ -3675,6 +3712,7 @@ function bindEvents() {
   elements.openFeedback.addEventListener("click", () => showFeedbackModal());
   elements.closeFeedback.addEventListener("click", () => hideFeedbackModal());
   elements.submitFeedback.addEventListener("click", submitFeedbackForm);
+  bindCurationEvents();
 
   document.querySelectorAll(".input-examples, .input-examples-compact").forEach((container) => {
     container.addEventListener("click", (event) => {

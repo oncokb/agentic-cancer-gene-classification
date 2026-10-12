@@ -322,6 +322,42 @@
       </section>
     </div>
 
+    <div class="modal-backdrop hidden" id="curation-modal" role="presentation">
+      <section
+        class="feedback-modal curation-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="curation-title"
+        aria-describedby="curation-subtitle"
+      >
+        <div class="modal-header">
+          <div>
+            <h2 id="curation-title">Edit evidence</h2>
+            <p id="curation-subtitle"></p>
+          </div>
+          <button class="icon-button" id="close-curation" type="button" aria-label="Close editor">x</button>
+        </div>
+        <div class="curation-status hidden" id="curation-status" role="status" aria-live="polite"></div>
+        <div class="curation-body" id="curation-body"></div>
+        <div class="modal-footer curation-footer" id="curation-footer"></div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="curation-aux-modal" role="presentation">
+      <section class="feedback-modal" role="dialog" aria-modal="true" aria-labelledby="curation-aux-title">
+        <div class="modal-header">
+          <h2 id="curation-aux-title"></h2>
+          <button class="icon-button" id="close-curation-aux" type="button" aria-label="Close">x</button>
+        </div>
+        <div class="curation-aux-body" id="curation-aux-body"></div>
+        <div class="modal-footer curation-footer" id="curation-aux-footer"></div>
+      </section>
+    </div>
+
+    <div class="curation-notifications" id="curation-notifications" role="status" aria-live="polite"></div>
+    <div class="toast-region" id="toast-region" role="status" aria-live="polite"></div>
+
+    <script src="/static/curation.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
