@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
 AnnotationMode = Literal["full", "core"]
 CacheStatus = Literal["miss", "reused", "refreshed", "bypassed"]
+CurationSubjectType = Literal["gene", "fusion"]
 PMIDEvidenceType = Literal["clinical", "preclinical", "case_report", "review", "other"]
 PMIDOncogenicRole = Literal["oncogene", "tumor_suppressor", "resistance", "neutral", "unknown"]
 
@@ -140,6 +142,14 @@ class FusionEvidenceResult(BaseModel):
     pmids: List[str] = Field(default_factory=list)
     interpretation: str = ""
     evidence_cards: List[FusionEvidenceCard] = Field(default_factory=list)
+    # Curator override metadata (see src/pipeline/curation.py). Defaults mean
+    # "pipeline output only"; quality_flags only ever carries curation flags.
+    curated: bool = False
+    curated_by: Optional[str] = None
+    curated_at: Optional[str] = None
+    curation_version: Optional[int] = None
+    curated_fields: List[str] = Field(default_factory=list)
+    quality_flags: List["QualityFlag"] = Field(default_factory=list)
 
 
 class FusionPartnerEvidenceRequest(BaseModel):
@@ -217,6 +227,11 @@ class ClinicalActionability(BaseModel):
     pmids: List[str] = Field(default_factory=list)
     score_components: List[ClinicalActionabilityScoreComponent] = Field(default_factory=list)
     evidence: List[ClinicalActionabilityEvidence] = Field(default_factory=list)
+    # True when set from a curator's therapeutic precedent override instead of
+    # the deterministic keyword score (UI: "Curator-verified").
+    curated: bool = False
+    curated_by: Optional[str] = None
+    curated_at: Optional[str] = None
 
 
 class FusionTreatmentKnowledge(BaseModel):
@@ -386,11 +401,21 @@ class GeneAnnotation(BaseModel):
     last_pubmed_checked_at: Optional[str] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    # Curator override metadata (see src/pipeline/curation.py). curated_fields
+    # names the payload sections the override replaced, e.g. ["citations"].
+    curated: bool = False
+    curated_by: Optional[str] = None
+    curated_at: Optional[str] = None
+    curation_version: Optional[int] = None
+    curated_fields: List[str] = Field(default_factory=list)
     # In-process only (not in any schema, never serialized or persisted): the
     # tumor type the pipeline actually annotated this gene with, and whether
     # symbol resolution failed because the lookup service was unavailable.
     _analysis_tumor_type: Optional[str] = PrivateAttr(default=None)
     _symbol_lookup_failed: bool = PrivateAttr(default=False)
+    # The pre-override pipeline annotation when a curator override was applied,
+    # so runs are persisted pipeline-pure (see curation.result_payload_for_storage).
+    _pipeline_annotation: Optional["GeneAnnotation"] = PrivateAttr(default=None)
 
     @property
     def analysis_tumor_type(self) -> Optional[str]:
@@ -409,6 +434,142 @@ class GeneAnnotation(BaseModel):
     @symbol_lookup_failed.setter
     def symbol_lookup_failed(self, value: bool) -> None:
         self._symbol_lookup_failed = value
+
+
+_PMID_PATTERN = re.compile(r"^[0-9]{1,9}$")
+
+
+def _clean_pmid(value: str) -> str:
+    pmid = str(value).strip()
+    if not _PMID_PATTERN.match(pmid):
+        raise ValueError(f"PMID must be 1-9 digits, got {value!r}")
+    return pmid
+
+
+class CuratedPrecedent(BaseModel):
+    """One curator-selected therapeutic precedent PMID. title/abstract are
+    filled from PubMed on save; quote/therapies/evidence_type are curator-set."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pmid: str
+    quote: Optional[str] = None
+    therapies: List[str] = Field(default_factory=list)
+    evidence_type: PMIDEvidenceType = "other"
+    title: str = ""
+    abstract: Optional[str] = None
+
+    @field_validator("pmid")
+    @classmethod
+    def _check_pmid(cls, value: str) -> str:
+        return _clean_pmid(value)
+
+
+class CuratedTherapeuticPrecedent(BaseModel):
+    """Curator override for clinical_actionability. An empty `precedents`
+    list means the curator found no therapeutic precedent (clears it)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = ""
+    precedents: List[CuratedPrecedent] = Field(default_factory=list)
+
+
+class GeneCurationPayload(BaseModel):
+    """Curator-set sections of a gene annotation. Every field is optional: a
+    None section keeps the pipeline value, so an override can touch only some.
+
+    For evidence_cards, curators edit selected_reason/quote/evidence_type;
+    title/journal/publication_types/is_preprint/abstract are filled from PubMed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cancer_association_rationale: Optional[str] = None
+    citations: Optional[List[str]] = None
+    evidence_cards: Optional[List[EvidenceCard]] = None
+    supporting_quotes: Optional[List[SupportingQuote]] = None
+    therapeutic_precedent: Optional[CuratedTherapeuticPrecedent] = None
+
+    @field_validator("citations")
+    @classmethod
+    def _check_citations(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        return list(dict.fromkeys(_clean_pmid(pmid) for pmid in value))
+
+    @field_validator("evidence_cards")
+    @classmethod
+    def _check_cards(cls, value: Optional[List[EvidenceCard]]) -> Optional[List[EvidenceCard]]:
+        for card in value or []:
+            card.pmid = _clean_pmid(card.pmid)
+        return value
+
+    @field_validator("supporting_quotes")
+    @classmethod
+    def _check_quotes(cls, value: Optional[List[SupportingQuote]]) -> Optional[List[SupportingQuote]]:
+        for quote in value or []:
+            quote.pmid = _clean_pmid(quote.pmid)
+        return value
+
+
+class FusionCurationPayload(BaseModel):
+    """Curator-set sections of an exact fusion-pair evidence result
+    (FusionEvidenceResult). None sections keep the pipeline value."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    interpretation: Optional[str] = None
+    well_supported: Optional[bool] = None
+    pmids: Optional[List[str]] = None
+    evidence_cards: Optional[List[FusionEvidenceCard]] = None
+
+    @field_validator("pmids")
+    @classmethod
+    def _check_pmids(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        return list(dict.fromkeys(_clean_pmid(pmid) for pmid in value))
+
+    @field_validator("evidence_cards")
+    @classmethod
+    def _check_cards(cls, value: Optional[List[FusionEvidenceCard]]) -> Optional[List[FusionEvidenceCard]]:
+        for card in value or []:
+            card.pmid = _clean_pmid(card.pmid)
+        return value
+
+
+class CuratedOverride(BaseModel):
+    """The current curator override for one subject (curated_overrides row).
+
+    subject_key is normalized: an upper-cased gene symbol, or 'GENEA::GENEB'
+    for a fusion; tumor_type is normalized like the gene_annotations cache key
+    ('' when none). pipeline_pmids_snapshot is the pipeline's evidence PMIDs
+    when the curator saved (None if unknown), for the newer-evidence flag."""
+
+    subject_type: CurationSubjectType
+    subject_key: str
+    tumor_type: str = ""
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    curator_email: str
+    created_at: str
+    updated_at: str
+    version: int
+    pipeline_pmids_snapshot: Optional[List[str]] = None
+    note: Optional[str] = None
+
+
+class CurationHistoryEntry(BaseModel):
+    """One append-only curation_history row: a save or a revert."""
+
+    subject_type: CurationSubjectType
+    subject_key: str
+    tumor_type: str = ""
+    version: int
+    action: Literal["save", "revert"]
+    curator_email: str
+    created_at: str
+    payload: Optional[Dict[str, Any]] = None
+    note: Optional[str] = None
 
 
 class GeneAnnotationWithRun(GeneAnnotation):

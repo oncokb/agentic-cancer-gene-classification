@@ -116,6 +116,7 @@ Accepted gene identifiers:
       "quality_flags": [],
       "cache_status": "reused",
       "cached_at": "2026-10-01T14:03:11+00:00",
+      "curated": false,
       "error": null
     }
   ]
@@ -139,6 +140,7 @@ Accepted gene identifiers:
 | `evidence_support_score` | 0 to 1: how well the answer is backed by the literature ACGC found. It is not a probability that the classification is biologically correct. |
 | `quality_flags` | Codes for any quality concerns raised during classification. |
 | `cache_status`, `cached_at` | Whether a saved result was reused or the gene was classified fresh, and when that result was produced. |
+| `curated` | `true` when an MSK curator has replaced part of this result (for example the rationale or citations) with a reviewed version. |
 | `error` | Set only when this gene couldn't be classified. See [Errors](#6-errors). |
 
 The API deliberately leaves out abstracts, quotes, evidence cards and

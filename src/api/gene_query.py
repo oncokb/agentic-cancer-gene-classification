@@ -167,6 +167,10 @@ class GeneRationale(BaseModel):
         default=None, description="Whether a cached annotation was reused, refreshed, or newly computed."
     )
     cached_at: Optional[str] = Field(default=None, description="When the cached annotation was produced.")
+    curated: bool = Field(
+        default=False,
+        description="True when a curator override replaced part of this result (e.g. rationale, citations).",
+    )
     error: Optional[str] = Field(default=None, description="Set when this gene could not be annotated.")
 
 
@@ -260,6 +264,7 @@ def to_gene_rationale(annotation: GeneAnnotation) -> GeneRationale:
         quality_flags=[flag.code for flag in annotation.quality_flags],
         cache_status=annotation.cache_status,
         cached_at=annotation.cached_at,
+        curated=annotation.curated,
         error=_slim_error(annotation),
     )
 

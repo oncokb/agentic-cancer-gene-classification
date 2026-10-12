@@ -97,6 +97,13 @@ from src.observability import (
     tag_user,
 )
 from src.pipeline.cache import cached_call
+from src.pipeline.curation import (
+    apply_current_fusion_overrides,
+    apply_current_gene_overrides,
+    preserve_curated_fields,
+    restore_run_tumor_types,
+    result_payload_for_storage,
+)
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
@@ -722,7 +729,7 @@ async def _save_run_result(
     """Save a run, raising on failure. For callers that hand out a link to the
     run and so must not report success unless it was actually saved."""
     await http_request.app.state.run_store.save_run(
-        result.run_id, result.timestamp, request_payload, result.model_dump()
+        result.run_id, result.timestamp, request_payload, result_payload_for_storage(result)
     )
 
 
@@ -1562,7 +1569,14 @@ async def create_enrichment_job(
     )
     await _store_enrichment_job(job)
 
+    originals = {annotation.gene: annotation for annotation in request.annotations}
+
+    def keep_curated(annotation: GeneAnnotation) -> GeneAnnotation:
+        original = originals.get(annotation.gene)
+        return preserve_curated_fields(annotation, original) if original else annotation
+
     async def on_annotation(annotation: GeneAnnotation) -> None:
+        annotation = keep_curated(annotation)
         current = await _get_enrichment_job(job_id)
         current.annotations.append(annotation)
         current.annotations.sort(key=lambda item: item.gene)
@@ -1581,7 +1595,7 @@ async def create_enrichment_job(
             )
             current = await _get_enrichment_job(job_id)
             current.status = "complete"
-            current.annotations = enriched
+            current.annotations = [keep_curated(annotation) for annotation in enriched]
             current.annotations_completed = len(enriched)
             current.annotations_total = len(request.annotations)
             current.timings_ms = {
@@ -1649,10 +1663,15 @@ async def create_fusion_evidence_job(
         try:
             semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
             tasks = [asyncio.create_task(run_one(item, semaphore)) for item in fusion_inputs]
+            # Pipeline-pure results are what gets persisted onto the run; the
+            # job serves them with any current curator override applied.
+            pipeline_results: List[FusionEvidenceResult] = []
             for task in asyncio.as_completed(tasks):
                 result = await task
+                pipeline_results.append(result)
+                (served,) = await apply_current_fusion_overrides([result], http_request.app.state.run_store)
                 current = await _get_fusion_evidence_job(job_id)
-                current.fusion_evidence.append(result)
+                current.fusion_evidence.append(served)
                 current.fusion_evidence.sort(key=lambda item: item.fusion)
                 current.fusions_completed = len(current.fusion_evidence)
                 await _store_fusion_evidence_job(current)
@@ -1663,7 +1682,8 @@ async def create_fusion_evidence_job(
             current.timings_ms = {"total": round((time.perf_counter() - start) * 1000, 2)}
             await _store_fusion_evidence_job(current)
             if request.run_id:
-                await _persist_fusion_evidence(http_request, request.run_id, current.fusion_evidence)
+                pipeline_results.sort(key=lambda item: item.fusion)
+                await _persist_fusion_evidence(http_request, request.run_id, pipeline_results)
         except Exception as exc:
             logger.exception("Fusion evidence job %s failed", job_id)
             current = await _get_fusion_evidence_job(job_id)
@@ -1747,13 +1767,19 @@ async def get_annotation_run(
     stored = await http_request.app.state.run_store.get_run(run_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    run_store = http_request.app.state.run_store
     result = AnnotationResult(**stored)
+    await restore_run_tumor_types(result, run_store, run_id)
     try:
         result, changed = await sanitize_annotation_result(result)
         if changed:
-            await http_request.app.state.run_store.update_run_result(run_id, result.model_dump())
+            await run_store.update_run_result(run_id, result_payload_for_storage(result))
     except Exception:
         logger.exception("Failed to sanitize stored run %s", run_id)
+    # Runs are stored pipeline-pure; overlay the CURRENT curator overrides so
+    # old shared links follow later curator edits and reverts.
+    result.annotations = await apply_current_gene_overrides(result.annotations, run_store)
+    result.fusion_evidence = await apply_current_fusion_overrides(result.fusion_evidence, run_store)
     return result
 
 
