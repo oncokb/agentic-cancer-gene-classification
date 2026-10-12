@@ -302,6 +302,43 @@ async function test_call_only_conflict_and_no_op() {
   assert.strictEqual(writes.length, 1);
 }
 
+async function test_sole_call_removal_delete_race_retry_keeps_new_section() {
+  const writes = [];
+  let current = { version: 2, override: { ...OVERRIDE_META, payload: { cancer_associated: false } } };
+  const app = loadCurationApp({
+    routes: callRoutes({
+      current: () => current,
+      onWrite: (method, url, reqBody) => {
+        writes.push({ method, url, body: reqBody });
+        if (method === "DELETE") {
+          // Another curator added a section after our GET: the revert is stale.
+          current = { version: 3, override: { ...OVERRIDE_META, payload: { cancer_associated: false, citations: ["222"] } } };
+          return [409, { detail: { message: "changed", current_version: 3 } }];
+        }
+        return undefined;
+      },
+    }),
+  });
+  render(app, { cancer_associated: false, curated: true, curation_version: 2, curated_fields: ["cancer_associated"] });
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const select = oneByData(app.root("curation-aux-body"), "curation", "cancer-associated");
+  select.value = "";
+  select.fire("change");
+  const save = oneByData(app.root("curation-aux-footer"), "curation", "save-call");
+  save.click();
+  await waitFor(() => oneByData(app.root("curation-aux-body"), "curation", "call-error").textContent, "409");
+  assert.match(oneByData(app.root("curation-aux-body"), "curation", "call-error").textContent, /now v3, call: No/);
+  assert.deepStrictEqual(writes.map((w) => w.method), ["DELETE"]);
+  assert.match(writes[0].url, /expected_version=2/);
+
+  save.click();
+  await waitFor(() => writes.length === 2, "retry");
+  assert.deepStrictEqual(writes[1], {
+    method: "PUT", url: "/v1/curation/gene/ALK?tumor_type=LUAD",
+    body: { expected_version: 3, payload: { citations: ["222"] } },
+  });
+}
+
 async function test_call_control_on_no_result_cards_and_hidden_from_viewers() {
   const app = loadCurationApp();
   app.state.resultsViewMode = "noresult";
@@ -309,6 +346,91 @@ async function test_call_control_on_no_result_cards_and_hidden_from_viewers() {
   assert.strictEqual(byData(win, "curation", "edit-call").length, 1, "curators can decide undecided genes");
   const viewer = loadCurationApp({ auth: { can_curate: false } });
   assert.strictEqual(byData(render(viewer), "curation", "edit-call").length, 0);
+}
+
+// A curated gene: pipeline call Yes; the override has No + a rationale.
+function curatedNoCall(extra = {}) {
+  return {
+    cancer_associated: false, cancer_association_rationale: "Curated rationale.", curated: true,
+    curated_by: "cur@x", curated_at: "2026-10-12", curation_version: 5,
+    curated_fields: ["cancer_associated", "cancer_association_rationale"], ...extra,
+  };
+}
+
+async function assertPendingThenRetry(app, reload) {
+  const win = app.root("results-window");
+  const banner = oneByData(win, "flag", "pending_refresh");
+  assert.match(banner.allText, /Saved — refresh pending/);
+  const annotation = app.state.currentResult.annotations[0];
+  assert.strictEqual(annotation.cancer_associated, false);
+  assert.ok(annotation.curated_fields.includes("cancer_associated"), "the old call is not relabelled as pipeline output");
+  assert.ok(byData(win, "curation", "curator-set").length, "the old call keeps its Curator-set tag while pending");
+  assert.strictEqual(byData(win, "curation", "curated-badge").length, 0, "not presented as the current curated version");
+
+  reload.ok = true;
+  oneByData(win, "curation", "retry-refresh").click();
+  await waitFor(() => !app.curationState.pendingRefresh.size, "refreshed");
+  const fresh = app.state.currentResult.annotations[0];
+  assert.strictEqual(fresh.cancer_associated, true, "the pipeline's call once it has loaded");
+  assert.deepStrictEqual(fresh.curated_fields, ["cancer_association_rationale"]);
+  assert.strictEqual(byData(app.root("results-window"), "curation", "curator-set").length, 0);
+  assert.strictEqual(byData(app.root("results-window"), "flag", "pending_refresh").length, 0);
+}
+
+function servedAfterRemoval(version) {
+  return {
+    run_id: "run-1", annotation_tumor_types: { ALK: "LUAD" }, fusion_evidence: [],
+    annotations: [geneAnnotation({
+      cancer_associated: true, cancer_association_rationale: "Curated rationale.", curated: true,
+      curated_by: "cur@x", curated_at: "2026-10-12", curation_version: version,
+      curated_fields: ["cancer_association_rationale"],
+    })],
+  };
+}
+
+async function test_call_removal_with_failed_reload_shows_pending_not_pipeline() {
+  const reload = { ok: false };
+  const current = { version: 5, override: { ...OVERRIDE_META, payload: { cancer_associated: false, cancer_association_rationale: "Curated rationale." } } };
+  const writes = [];
+  const app = loadCurationApp({
+    routes: callRoutes({
+      current: () => current,
+      onWrite: (method, url, reqBody) => { writes.push({ method, body: reqBody }); },
+      annotate: () => (reload.ok ? servedAfterRemoval(6) : null),
+    }),
+  });
+  render(app, curatedNoCall());
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const select = oneByData(app.root("curation-aux-body"), "curation", "cancer-associated");
+  select.value = "";
+  select.fire("change");
+  oneByData(app.root("curation-aux-footer"), "curation", "save-call").click();
+  await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "saved");
+  assert.deepStrictEqual(writes, [{ method: "PUT", body: { expected_version: 5, payload: { cancer_association_rationale: "Curated rationale." } } }]);
+  await assertPendingThenRetry(app, reload);
+}
+
+async function test_call_removal_in_evidence_edit_with_failed_reload_shows_pending() {
+  const reload = { ok: false };
+  let put;
+  const current = { version: 5, override: { ...OVERRIDE_META, payload: { cancer_associated: false, cancer_association_rationale: "Curated rationale." } } };
+  const app = loadCurationApp({
+    routes: routes({
+      draft: { ...GENE_DRAFT, cancer_association_rationale: "Curated rationale." },
+      current,
+      onPut: (p) => { put = p; },
+      extra: async (method, url) => (method === "GET" && url.startsWith("/v1/annotate/") && reload.ok ? [200, servedAfterRemoval(6)] : undefined),
+    }),
+  });
+  render(app, curatedNoCall());
+  await toGeneReview(app);
+  const select = oneByData(body(app), "curation", "cancer-associated");
+  select.value = "";
+  select.fire("change");
+  footerButton(app, "save").click();
+  await waitFor(() => put && app.root("curation-modal").classList.contains("hidden"), "saved");
+  assert.ok(!("cancer_associated" in put.body.payload));
+  await assertPendingThenRetry(app, reload);
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +532,32 @@ async function test_partner_precedent_edit_flow() {
   assert.strictEqual(app.state.currentResult, null, "the run result is untouched");
 }
 
+async function test_partner_revert_with_failed_reload_shows_pending() {
+  const lookup = { ok: false };
+  const curated = {
+    ...PARTNER, curated: true, curated_by: "cur@x", curated_at: "2026-10-12", curation_version: 2,
+    interpretation: "Curated partner interpretation.", curated_fields: ["interpretation", "pmids"],
+  };
+  const app = loadCurationApp({
+    routes: async (method, url) => {
+      if (method === "DELETE") return [200, { reverted_version: 2 }];
+      if (method === "POST" && url === "/v1/fusion-partner-evidence") return lookup.ok ? [200, PARTNER] : [503, { detail: "down" }];
+      return undefined;
+    },
+  });
+  const outer = renderPartner(app, curated, { tumorType: "NSCLC", agnostic: false });
+  oneByData(outer, "curation", "revert").click();
+  oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").click();
+  await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "reverted");
+  assert.match(oneByData(outer, "flag", "pending_refresh").allText, /Reverted to pipeline output — refresh pending/);
+  assert.strictEqual(byData(outer, "curation", "curated-badge").length, 0);
+  lookup.ok = true;
+  oneByData(outer, "curation", "retry-refresh").click();
+  await waitFor(() => !app.curationState.pendingRefresh.size, "refreshed");
+  assert.ok(outer.allText.includes("Pipeline partner interpretation.") || outer.allText.includes("1 paper found"));
+  assert.strictEqual(byData(outer, "flag", "pending_refresh").length, 0);
+}
+
 async function test_partner_subject_keyed_by_searched_tumor_type() {
   const app = loadCurationApp();
   const scoped = app.partnerCurationSubject(PARTNER);
@@ -445,10 +593,14 @@ runTests("curation extended UI", [
   test_call_only_edit_keeps_other_sections_byte_identical,
   test_call_only_keep_pipeline_reverts_call_only_override,
   test_call_only_conflict_and_no_op,
+  test_sole_call_removal_delete_race_retry_keeps_new_section,
   test_call_control_on_no_result_cards_and_hidden_from_viewers,
+  test_call_removal_with_failed_reload_shows_pending_not_pipeline,
+  test_call_removal_in_evidence_edit_with_failed_reload_shows_pending,
   test_precedent_only_edit_keeps_curated_call,
   test_curator_set_tag_replaces_flag_badge,
   test_partner_precedent_edit_flow,
+  test_partner_revert_with_failed_reload_shows_pending,
   test_partner_subject_keyed_by_searched_tumor_type,
   test_partner_flags_and_viewer_controls,
 ]);
