@@ -2904,3 +2904,10 @@ body.api-keys-body {
 .curation-notification-succeeded {
   border-left-color: var(--ok);
 }
+
+/* Reverted here but the pipeline version hasn't loaded: dim the stale content. */
+.annotation-card:has(.curation-pending-refresh) .annotation-fields,
+.annotation-card:has(.curation-pending-refresh) .fusion-supporting-evidence,
+.annotation-card:has(.curation-pending-refresh) .field-row {
+  opacity: 0.45;
+}

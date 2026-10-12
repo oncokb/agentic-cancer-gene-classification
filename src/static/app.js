@@ -1003,7 +1003,7 @@ async function pollAnnotationJob(statusUrl) {
     // completed result is first rendered, so its timed-out/failed keys stay.
     if (status.result?.run_id) adoptOpenEvidenceRunId(status.job_id, status.result.run_id);
 
-    const partial = status.result || {
+    const partial = reconcileAnnotationResult(state.currentResult, status.result || {
       run_id: status.job_id,
       timestamp: "",
       fusions_processed: status.fusions_processed,
@@ -1014,16 +1014,17 @@ async function pollAnnotationJob(statusUrl) {
       annotation_tumor_types: status.annotation_tumor_types || {},
       fusion_evidence: state.currentResult?.fusion_evidence || [],
       timings_ms: status.timings_ms || {},
-    };
+    });
     state.currentResult = partial;
     renderAnnotationResult(partial);
     updateExportState({ annotationExportDisabled: status.status !== "complete" });
     elements.shareRun.disabled = status.status !== "complete";
 
     if (status.status === "complete") {
-      state.currentResult = status.result;
-      renderAnnotationResult(status.result);
-      return status.result;
+      // A save/revert made while this job ran must survive its final result.
+      state.currentResult = reconcileAnnotationResult(state.currentResult, status.result);
+      renderAnnotationResult(state.currentResult);
+      return state.currentResult;
     }
 
     const total = status.genes_total || "?";

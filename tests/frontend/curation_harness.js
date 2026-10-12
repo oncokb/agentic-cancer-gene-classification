@@ -29,7 +29,11 @@ function loadedSource() {
 }
 
 function parseSelector(selector) {
-  const sel = selector.trim();
+  const notAttrs = [];
+  const sel = selector.trim().replace(/:not\(\[([\w-]+)\]\)/g, (_m, name) => {
+    notAttrs.push(name);
+    return "";
+  });
   const attrs = [];
   const rest = sel.replace(/\[([\w-]+)(?:=['"]?([^'"\]]*)['"]?)?\]/g, (_m, name, value) => {
     attrs.push([name, value]);
@@ -38,7 +42,14 @@ function parseSelector(selector) {
   const tag = (rest.match(/^[a-zA-Z][\w-]*/) || [""])[0].toLowerCase();
   const id = (rest.match(/#([\w-]+)/) || [])[1];
   const classes = (rest.match(/\.[\w-]+/g) || []).map((c) => c.slice(1));
-  return { tag, id, classes, attrs };
+  return { tag, id, classes, attrs, notAttrs };
+}
+
+// Boolean DOM properties (disabled, hidden, ...) count as attributes when set.
+function attrValue(el, name) {
+  if (name.startsWith("data-")) return el.dataset[datasetKey(name)];
+  if (["disabled", "hidden", "checked"].includes(name)) return el[name] ? "" : null;
+  return el.getAttribute(name);
 }
 
 function datasetKey(attr) {
@@ -47,12 +58,13 @@ function datasetKey(attr) {
 
 function matches(el, selector) {
   return selector.split(",").some((part) => {
-    const { tag, id, classes, attrs } = parseSelector(part);
+    const { tag, id, classes, attrs, notAttrs } = parseSelector(part);
     if (tag && el.tagName !== tag) return false;
     if (id && el.id !== id) return false;
     if (classes.some((c) => !el.classList.contains(c))) return false;
+    if (notAttrs.some((name) => attrValue(el, name) !== null && attrValue(el, name) !== undefined)) return false;
     return attrs.every(([name, value]) => {
-      const actual = name.startsWith("data-") ? el.dataset[datasetKey(name)] : el.getAttribute(name);
+      const actual = attrValue(el, name);
       return value === undefined ? actual !== undefined && actual !== null : String(actual) === value;
     });
   });
@@ -238,12 +250,24 @@ function loadCurationApp({ routes = async () => undefined, auth = { can_curate: 
     }
     return roots.get(id);
   };
+  // Mirror index.html: each modal contains its title, close button, and content regions.
+  const modal = (id, parts) => {
+    const container = root(id);
+    parts.forEach(([partId, tag]) => {
+      const part = root(partId);
+      if (tag) part.tagName = tag;
+      container.appendChild(part);
+    });
+  };
+  modal("curation-modal", [["curation-title", "h2"], ["close-curation", "button"], ["curation-status"], ["curation-body"], ["curation-footer"]]);
+  modal("curation-aux-modal", [["curation-aux-title", "h2"], ["close-curation-aux", "button"], ["curation-aux-body"], ["curation-aux-footer"]]);
+  const topLevel = () => Array.from(roots.values()).filter((r) => !r._parent);
   const documentListeners = new Map();
   const fakeDocument = {
     activeElement: null,
     body: root("body"),
     querySelector: (selector) => root(selector.replace(/^#/, "")),
-    querySelectorAll: () => [],
+    querySelectorAll: (selector) => topLevel().flatMap((r) => [...(matches(r, selector) ? [r] : []), ...r.querySelectorAll(selector)]),
     getElementById: (id) => root(id),
     createElement: (tag) => new FakeElement(tag),
     addEventListener(type, handler) {
@@ -285,7 +309,12 @@ function loadCurationApp({ routes = async () => undefined, auth = { can_curate: 
   sandbox.bindCurationEvents();
   sandbox.requests = requests;
   sandbox.root = root;
-  sandbox.pressKey = (key) => (documentListeners.get("keydown") || []).forEach((h) => h({ key, preventDefault() {} }));
+  // Returns the event so tests can check defaultPrevented.
+  sandbox.pressKey = (key, extra = {}) => {
+    const event = { key, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...extra };
+    (documentListeners.get("keydown") || []).forEach((h) => h(event));
+    return event;
+  };
   return sandbox;
 }
 
