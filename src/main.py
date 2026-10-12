@@ -101,6 +101,7 @@ from src.pipeline.cache import cached_call
 from src.pipeline.curation import (
     apply_current_fusion_overrides,
     apply_current_gene_overrides,
+    apply_current_partner_override,
     carry_tumor_context,
     ensure_annotation_tumor_types,
     has_curation_unavailable,
@@ -2122,6 +2123,7 @@ async def get_gene_openevidence(
 @app.post("/v1/fusion-partner-evidence", response_model=FusionPartnerEvidenceResult)
 async def fusion_partner_evidence(
     request: FusionPartnerEvidenceRequest,
+    http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> FusionPartnerEvidenceResult:
     """
@@ -2131,6 +2133,11 @@ async def fusion_partner_evidence(
     the background fusion-evidence job: this only runs when a curator explicitly
     expands the "Check fusion partner precedent" disclosure on a gene that came back
     insufficient_evidence, so it never adds cost to the core annotation run.
+
+    The CURRENT `fusion_partner` curator override for (gene, searched tumor
+    type) is overlaid on the (cached) pipeline result; an all-tumor-types
+    search, including the agnostic follow-up, uses the override saved with
+    no tumor type. See src/pipeline/curation.py.
     """
     gene = request.gene.strip().upper()
     if not gene:
@@ -2138,12 +2145,15 @@ async def fusion_partner_evidence(
     tumor_type = request.tumor_type.strip() if request.tumor_type else None
     # No tumor type to scope by — agnostic is the only meaningful search.
     agnostic = request.agnostic or not tumor_type
-    return await retrieve_fusion_partner_evidence(
+    exclude_pmids = set(request.exclude_pmids)
+    result = await retrieve_fusion_partner_evidence(
         gene,
         tumor_type=tumor_type,
         agnostic=agnostic,
-        exclude_pmids=set(request.exclude_pmids),
+        exclude_pmids=exclude_pmids,
     )
+    run_store = getattr(http_request.app.state, "run_store", None)
+    return await apply_current_partner_override(result, run_store, exclude_pmids)
 
 
 FEEDBACK_ISSUE_TOOL = {

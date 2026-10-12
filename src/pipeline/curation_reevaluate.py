@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 class ReevaluateRequest(BaseModel):
-    subject_type: Literal["gene", "fusion"]
+    # fusion_partner: one partner gene's fusion-partner precedent lookup;
+    # evidence_pmids are the precedent entries (precedent_pmids must be empty).
+    subject_type: Literal["gene", "fusion", "fusion_partner"]
     subject_key: str = Field(min_length=1, max_length=128)
     tumor_type: Optional[str] = Field(default=None, max_length=256)
     evidence_pmids: list[str] = Field(default_factory=list)
@@ -59,6 +61,10 @@ class ReevaluateRequest(BaseModel):
             self.subject_key
         ):
             raise ValueError("subject_key must match subject_type (two partners for fusion)")
+        if self.subject_type == "fusion_partner" and self.precedent_pmids:
+            raise ValueError(
+                "fusion_partner drafts take their precedent PMIDs in evidence_pmids; precedent_pmids must be empty"
+            )
         if not self.evidence_pmids and not self.precedent_pmids:
             raise ValueError("Supply at least one evidence or precedent PMID")
         if any(
@@ -252,7 +258,79 @@ async def gene_context(subject: str, tumor_type: Optional[str], run_store):
     )
 
 
+async def reevaluate_partner(request: ReevaluateRequest) -> dict:
+    """Draft for a fusion_partner subject, shaped like FusionPartnerEvidenceResult:
+    curator-pinned precedent entries in curator order with verbatim quotes, and a
+    suggested interpretation. No synthesis call (there is no cancer-association
+    call for a partner lookup), just the one batched suggestion call."""
+    by_pmid = await validated_records(request.evidence_pmids)
+    records = [by_pmid[p] for p in request.evidence_pmids]
+    async with httpx.AsyncClient() as client:
+        resolved = await resolve_gene(request.subject_key.upper(), client)
+    if resolved.lookup_failed:
+        raise UpstreamUnavailable("Gene lookup is temporarily unavailable; please retry.")
+    if not resolved.resolved:
+        raise SubjectNotResolved(
+            f"Could not resolve subject: {request.subject_key}. Check the partner gene symbol and retry."
+        )
+    gene = resolved.canonical_symbol
+    scope_note = f" in {request.tumor_type}" if request.tumor_type else " across tumor types"
+    suggestions, summary = await suggest_cards(
+        f"{gene} as a partner gene in oncogenic fusions{scope_note} (fusion-partner precedent, "
+        "not any one exact fusion pair)",
+        records,
+        request.evidence_pmids,
+    )
+    cards = []
+    for record in records:
+        suggested = suggestions.get(record.pmid, {})
+        suggested_type = suggested.get("evidence_type")
+        cards.append(
+            EvidenceCard(
+                pmid=record.pmid,
+                title=record.title,
+                journal=record.journal,
+                publication_types=record.publication_types,
+                is_preprint=literature.is_preprint_publication(record.publication_types),
+                abstract=record.abstract,
+                quote=verbatim_quote(record, suggested.get("quote")),
+                selected_reason=bounded_text(suggested.get("selected_reason"), 600)
+                or "Curator-selected fusion-partner precedent; review the abstract for applicability.",
+                evidence_type=suggested_type
+                if isinstance(suggested_type, str) and suggested_type in get_args(PMIDEvidenceType)
+                else evidence_type(record),
+            ).model_dump()
+        )
+    return {
+        "gene": gene,
+        "tumor_type": request.tumor_type,
+        "scope": "tumor_type_scoped" if request.tumor_type else "all_tumor_types",
+        "has_precedent": bool(records),
+        "retrieved_count": len(records),
+        "pmids": request.evidence_pmids,
+        "interpretation": summary
+        or f"Curator-selected fusion-partner precedent for {gene}{scope_note}; review each abstract.",
+        "evidence_cards": cards,
+        "quality_flags": [
+            {
+                "code": "curator_pinned_draft",
+                "label": "Curator-selected draft",
+                "severity": "info",
+                "detail": "All supplied PMIDs are included in curator order. Inclusion does not establish relevance; review this unpersisted suggestion.",
+            }
+        ],
+        "model_info": {
+            "synthesis_model": None,
+            "synthesis_escalated": False,
+            "suggestion_model": settings.pmid_distillation_model,
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 async def reevaluate(request: ReevaluateRequest, run_store=None) -> dict:
+    if request.subject_type == "fusion_partner":
+        return await reevaluate_partner(request)
     pmids = list(dict.fromkeys(request.evidence_pmids + request.precedent_pmids))
     by_pmid = await validated_records(pmids)
     records = [by_pmid[p] for p in request.evidence_pmids]

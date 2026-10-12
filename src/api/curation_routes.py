@@ -1,8 +1,10 @@
 """Curator override API: read, save, revert, and audit curated overrides.
 
 Subjects are a gene annotation (`gene`, keyed like gene_annotations by gene
-and tumor type) or an exact fusion-pair evidence result (`fusion`, keyed by
-'GENEA::GENEB' and tumor type). Reads need any login; writes need the curator
+and tumor type), an exact fusion-pair evidence result (`fusion`, keyed by
+'GENEA::GENEB' and tumor type), or a fusion-partner precedent lookup
+(`fusion_partner`, keyed by the partner gene and the tumor type the lookup was
+scoped to; '' for an all-tumor-types search). Reads need any login; writes need the curator
 or admin role (require_curator). See src/pipeline/curation.py for how
 overrides are applied wherever results are served.
 """
@@ -28,7 +30,9 @@ from src.models.schema import (
 from src.observability import record_user_action
 from src.pipeline import literature
 from src.pipeline.curation import (
+    FUSION,
     GENE,
+    CurationPayload,
     fusion_evidence_pmids,
     gene_evidence_pmids,
     normalize_subject_key,
@@ -45,7 +49,7 @@ router = APIRouter(prefix="/v1/curation", tags=["curation"])
 
 T = TypeVar("T")
 
-SubjectTypeParam = Literal["gene", "fusion"]
+SubjectTypeParam = Literal["gene", "fusion", "fusion_partner"]
 
 # Upper bound on the PubMed call that snapshots fusion evidence on save; a
 # cache miss would otherwise run a full fusion retrieval inside the request.
@@ -70,8 +74,9 @@ class CurationSaveRequest(BaseModel):
     payload: Dict[str, Any] = Field(
         ...,
         description=(
-            "GeneCurationPayload for genes, FusionCurationPayload for fusions. Omitted/null "
-            "sections keep the pipeline value."
+            "GeneCurationPayload for genes, FusionCurationPayload for fusions, "
+            "FusionPartnerCurationPayload for fusion partners. Omitted/null sections keep the "
+            "pipeline value."
         ),
     )
     note: Optional[str] = Field(default=None, max_length=2000, description="Optional note kept in history.")
@@ -162,7 +167,7 @@ def _invalid_pmids(pmids: List[str], records: Dict[str, LiteratureRecord]) -> Li
 
 
 def _fill_from_pubmed(
-    payload: GeneCurationPayload | FusionCurationPayload,
+    payload: CurationPayload,
     records: Dict[str, LiteratureRecord],
     subject_key: str,
 ) -> None:
@@ -179,7 +184,7 @@ def _fill_from_pubmed(
             card.fusion = subject_key
             card.matched_via_alias = False
             card.alias_matches = []
-    elif payload.therapeutic_precedent:
+    elif isinstance(payload, GeneCurationPayload) and payload.therapeutic_precedent:
         for precedent in payload.therapeutic_precedent.precedents:
             record = records[precedent.pmid]
             precedent.title = record.title
@@ -196,10 +201,14 @@ async def _pipeline_pmids_snapshot(
             if cached is None:
                 return None
             return gene_evidence_pmids(GeneAnnotation(**cached["annotation"]))
-        result = await asyncio.wait_for(
-            literature.retrieve_fusion_evidence(subject_key, tumor_type=tumor_type or None),
-            timeout=_FUSION_SNAPSHOT_TIMEOUT_SECONDS,
-        )
+        if subject_type == FUSION:
+            lookup = literature.retrieve_fusion_evidence(subject_key, tumor_type=tumor_type or None)
+        else:
+            # The same search the subject is keyed by: tumor-scoped, or all tumor types for ''.
+            lookup = literature.retrieve_fusion_partner_evidence(
+                subject_key, tumor_type=tumor_type or None, agnostic=not tumor_type
+            )
+        result = await asyncio.wait_for(lookup, timeout=_FUSION_SNAPSHOT_TIMEOUT_SECONDS)
         return fusion_evidence_pmids(result)
     except Exception:
         logger.warning("Could not snapshot pipeline PMIDs for %s %s", subject_type, subject_key, exc_info=True)
@@ -214,8 +223,8 @@ async def _pipeline_pmids_snapshot(
 @router.get("/{subject_type}/{subject_key}", response_model=CurationResponse)
 async def get_curation(
     http_request: Request,
-    subject_type: SubjectTypeParam = Path(..., description="`gene` or `fusion`."),
-    subject_key: str = Path(..., description="Gene symbol, or fusion as `GENEA::GENEB`."),
+    subject_type: SubjectTypeParam = Path(..., description="`gene`, `fusion` or `fusion_partner`."),
+    subject_key: str = Path(..., description="Gene symbol (gene, fusion_partner), or fusion as `GENEA::GENEB`."),
     tumor_type: Optional[str] = Query(default=None, description="Tumor type context; omit for none."),
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> CurationResponse:
