@@ -660,7 +660,7 @@ async def synthesize_gene_annotation(
     """
     prompt_records = (
         records[: settings.core_synthesis_max_papers]
-        if mode == "core" and not pinned
+        if mode == "core"
         else records
     )
     user_prompt = _build_user_prompt(
@@ -823,3 +823,7 @@ def build_gene_annotation(
         cache_status="refreshed",
         cache_reason="computed_new_annotation",
     )
+
+
+# Public helpers shared by draft re-evaluation; private names remain compatible.
+evidence_type = _evidence_type

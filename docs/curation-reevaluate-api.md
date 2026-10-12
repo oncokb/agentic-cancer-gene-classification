@@ -20,8 +20,29 @@ swapped to `require_curator` when the curator-overrides PR merges.
 
 For fusion drafts, use `"subject_type": "fusion"` and
 `"subject_key": "EML4::ALK"` (also accepts `--` or `/` notation).
-`tumor_type` is optional/null. Both PMID arrays default to `[]`; at least one
-array must be nonempty. PMIDs must be positive numeric **strings**, unique
+Fusion partners are uppercased, resolved through HGNC/Ensembl, and returned
+as canonical symbols. `tumor_type` is optional/null. Both PMID arrays default to `[]`; at least one
+array must be nonempty. Precedent-only requests skip synthesis and return
+`insufficient_evidence: true`, empty `citations`/`model_citations`/cards/quotes,
+and a null synthesis model with a suggested precedent block.
+
+`CURATION_REEVALUATE_MAX_PMIDS` defaults to **50**: each array and the combined
+unique PMID count must fit this cap, or POST returns **422** (standard FastAPI
+validation detail). Both copies of an ID shared across arrays count once toward
+the combined limit. `CURATION_REEVALUATE_MAX_INFLIGHT_JOBS` defaults to **2**:
+queued/running jobs count toward the normalized owner email's limit, or POST
+returns **429**:
+
+```json
+{"detail": "Too many in-flight re-evaluation jobs"}
+```
+
+Admission and counting occur under one lock. Finished jobs release their slot.
+GET is restricted to the job owner; another user's GET returns **404** with
+`{"detail": "Job not found"}`. Admins may read any job. Owners are stored internally
+and excluded from JSON. Start/success/failure actions are logged against the owner.
+
+PMIDs must be positive numeric **strings**, unique
 within each array. An ID can occur in both arrays. Order is preserved in each
 output block. Invalid request shape returns HTTP 422; valid-shaped requests
 with unknown/retracted/no-abstract papers create a job that fails validation.
@@ -55,6 +76,13 @@ Validation failure (a paper can appear in both retracted and no_abstract):
 }
 ```
 
+If every supplied PMID is unknown after the existence check, the job returns
+`status: failed`, `invalid_pmids: null`, and
+`error: "NCBI returned no verifiable PMIDs; please retry."`, treating a complete
+absence of results as an upstream error. Unresolved subjects return a specific
+`"Could not resolve subject: <input>. Check the gene symbol and retry."` error
+(or `"Check the fusion partner symbols and retry."` for a fusion).
+
 Other failures return `"error": "Re-evaluation failed; please retry."` with
 `invalid_pmids` and `draft` null. Cancellation returns `"error": "Job cancelled"`.
 Unknown/expired IDs return HTTP 404 `{"detail": "Job not found"}`. Standard
@@ -71,6 +99,7 @@ application authentication errors apply to both endpoints.
     "gene": "ALK",
     "cancer_association_rationale": "Suggested rationale from synthesis.",
     "citations": ["123", "456"],
+    "model_citations": ["123"],
     "evidence_cards": [
       {
         "pmid": "123", "title": "Paper title", "journal": "Journal",
@@ -102,7 +131,7 @@ application authentication errors apply to both endpoints.
     },
     "quality_flags": [{
       "code": "curator_pinned_draft", "label": "Curator-selected draft", "severity": "info",
-      "detail": "All supplied evidence PMIDs are included in curator order. Inclusion does not establish relevance; review this unpersisted suggestion."
+      "detail": "All supplied evidence PMIDs are included in curator order. Inclusion does not establish relevance; review this unpersisted suggestion. Evidence support is computed from model_citations, not the pinned citation list."
     }],
     "model_info": {
       "synthesis_model": "claude-haiku-4-5-20251001",
@@ -118,12 +147,27 @@ Complete serialized gene and fusion request/response JSON examples (using illust
 
 The example above shows the UI-editable fields. A gene draft also contains all ordinary
 `GeneAnnotation` fields (classification, evidence-support metadata, etc.).
-`clinical_actionability` is **null** when no precedent PMIDs were supplied.
+`model_citations` preserves the synthesis model's verified citation list, which
+may be smaller than the pinned `citations`. Evidence-support scores and standard
+quality flags use **model_citations**, not the pinned list. The pinned-draft flag
+explains this difference.
+
+The ordinary deterministic `ClinicalActionability` assessment produced by the
+annotation builder is **replaced** by the curator precedent suggestion.
+`clinical_actionability` is **null** when no precedent PMIDs were supplied,
+even if the ordinary assessment would have produced a block. Precedent confidence
+marks curator selection rather than an independent assessment.
 `quality_flags` can contain additional standard synthesis flags. Model names
-reflect configured synthesis/escalation models; `suggestion_model` is null
-when no supplemental call was needed. Every evidence PMID has exactly one
+reflect configured synthesis/escalation models. `synthesis_model` is null for
+precedent-only requests; `suggestion_model` identifies the supplemental model
+attempted for every valid draft. Every evidence PMID has exactly one
 card and supporting quote, including papers the synthesis model did not cite.
-Every quote is a substring of the respective abstract.
+Every quote is a substring of the respective abstract. Candidates are tried
+in order (synthesis, then supplemental suggestion) and must be 20–400 characters;
+otherwise the verbatim first sentence is used. Selected reasons are strings capped
+at 600 characters; invalid LLM evidence types fall back to the deterministic
+record classifier. Precedent summaries are capped at 2,000 characters. Abstracts
+in the supplemental prompt are escaped and fenced as untrusted data.
 
 Fusion drafts have the same common fields and annotation metadata, replace
 `gene` with `fusion`, and add the existing fusion-evidence fields:
@@ -144,7 +188,7 @@ partner precedent is kept separate from the exact-fusion evidence array.
 ## Operations and timing
 
 Jobs use the same process-local memory/asyncio pattern as annotation jobs.
-Completed jobs are evicted on subsequent POSTs after
+The in-flight limit and ownership store are process-local. Completed jobs are evicted on subsequent POSTs after
 `settings.annotation_job_ttl_seconds`. Polling must reach the same worker;
 restarting the worker loses its jobs. No database persistence is involved.
 
@@ -152,6 +196,6 @@ Plan for roughly **10–60 seconds** for a typical small PMID set on the Haiku
 fast path, with longer times for Opus escalation, upstream retries, or large
 sets. This is an engineering estimate, not a measured live-LLM benchmark.
 The path fetches selected papers and resolves gene context, then runs synthesis
-and at most one batched supplemental Haiku call; it does no literature search
+and one batched supplemental Haiku call; it does no literature search
 or paper selection. Missing fetch results receive an ID-existence check to
 distinguish no-abstract from unknown papers.

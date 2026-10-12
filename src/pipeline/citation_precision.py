@@ -150,7 +150,7 @@ def filter_and_rank_citations(
     """
     records_by_pmid = {record.pmid: record for record in records}
     if pinned:
-        # Curator order is authoritative; unretrieved identifiers remain rejected.
+        # Preserve emitted citation order in pinned mode; reject unretrieved identifiers.
         return [pmid for pmid in dict.fromkeys(emitted_citations) if pmid in records_by_pmid]
     ranked: list[tuple[int, int, str]] = []
 
