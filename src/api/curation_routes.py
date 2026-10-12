@@ -37,7 +37,7 @@ from src.pipeline.curation import (
     payload_fields,
     payload_pmids,
 )
-from src.pipeline.curation_store import CurationVersionConflict
+from src.pipeline.curation_store import CurationStorageContention, CurationVersionConflict
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +121,13 @@ async def _store_call(awaitable: Awaitable[T]) -> T:
         return await awaitable
     except CurationVersionConflict:
         raise
+    except CurationStorageContention as exc:
+        logger.warning("Curation write gave up on lock contention: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Curation storage contention; please retry.",
+            headers={"Retry-After": "1"},
+        ) from exc
     except Exception as exc:
         logger.error("Curation store call failed", exc_info=True)
         raise HTTPException(status_code=503, detail=_STORE_UNAVAILABLE) from exc

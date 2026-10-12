@@ -78,6 +78,11 @@ class CurationVersionConflict(Exception):
         self.current_version = current_version
 
 
+class CurationStorageContention(Exception):
+    """Lock errors persisted through every retry while the override was still
+    at the caller's version: nothing conflicts, the write should just be retried."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -161,12 +166,16 @@ class CurationStoreMixin:
                 row = await cursor.fetchone()
         return row[0] if row else 0
 
-    async def _with_lock_retry(self, attempt: Callable[[], Awaitable[T]], subject: SubjectId) -> T:
+    async def _with_lock_retry(
+        self, attempt: Callable[[], Awaitable[T]], subject: SubjectId, expected_version: Optional[int]
+    ) -> T:
         """Run a write transaction, retrying MySQL deadlocks/lock-wait timeouts.
 
         When retries are exhausted, or a concurrent first save won the insert
-        race (IntegrityError), the caller's view is stale: re-read the current
-        version and raise CurationVersionConflict (HTTP 409), never a 500."""
+        race (IntegrityError), re-read the current version: if it differs from
+        expected_version the caller's view is stale (CurationVersionConflict,
+        HTTP 409); otherwise it is plain contention (CurationStorageContention,
+        a retryable 503). Never a 500."""
         for attempt_number in range(1, _LOCK_RETRY_ATTEMPTS + 1):
             try:
                 return await attempt()
@@ -181,7 +190,10 @@ class CurationStoreMixin:
                 )
                 if attempt_number < _LOCK_RETRY_ATTEMPTS:
                     await asyncio.sleep(_LOCK_RETRY_BACKOFF_SECONDS * attempt_number)
-        raise CurationVersionConflict(await self._current_override_version(*subject))
+        current_version = await self._current_override_version(*subject)
+        if expected_version is not None and current_version != expected_version:
+            raise CurationVersionConflict(current_version)
+        raise CurationStorageContention(f"Curation write for {subject} kept hitting lock errors")
 
     async def save_curated_override(
         self,
@@ -211,6 +223,7 @@ class CurationStoreMixin:
                 note=note,
             ),
             (subject_type, subject_key, tumor_type),
+            expected_version,
         )
 
     async def _save_curated_override_once(
@@ -326,6 +339,7 @@ class CurationStoreMixin:
                 note=note,
             ),
             (subject_type, subject_key, tumor_type),
+            expected_version,
         )
 
     async def _delete_curated_override_once(

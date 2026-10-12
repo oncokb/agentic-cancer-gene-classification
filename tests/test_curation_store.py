@@ -13,7 +13,7 @@ import pymysql
 import pytest
 
 from src.pipeline import curation_store
-from src.pipeline.curation_store import CurationVersionConflict
+from src.pipeline.curation_store import CurationStorageContention, CurationVersionConflict
 from src.pipeline.run_store import RunStore
 
 SUBJECT = {"subject_type": "gene", "subject_key": "CURTEST1", "tumor_type": "luad"}
@@ -37,7 +37,7 @@ class _ScriptedCursor:
 
     async def execute(self, sql, params=None):
         self.pool.statements.append(sql.split()[0])
-        if sql.lstrip().startswith("SELECT version, created_at") and self.pool.lock_errors:
+        if "FOR UPDATE" in sql and self.pool.lock_errors:
             raise pymysql.err.OperationalError(self.pool.lock_errors.pop(0), "Deadlock found")
         if sql.lstrip().startswith("SELECT COALESCE"):
             self._result = (0,)
@@ -94,12 +94,24 @@ async def test_save_retries_deadlock_then_succeeds(no_backoff):
     assert pool.transactions == 3 and pool.rollbacks == 2 and pool.commits == 1
 
 
-async def test_save_exhausting_lock_retries_is_a_version_conflict(no_backoff):
+async def test_save_exhausting_lock_retries_unchanged_version_is_contention(no_backoff):
     pool = _ScriptedPool(lock_errors=[1213, 1213, 1213], current_version=0)
+    with pytest.raises(CurationStorageContention):
+        await _save(RunStore(pool), 0, {"citations": ["111"]})
+    assert pool.transactions == 3 and pool.commits == 0
+
+
+async def test_save_exhausting_lock_retries_changed_version_is_conflict(no_backoff):
+    pool = _ScriptedPool(lock_errors=[1213, 1213, 1213], current_version=3)
     with pytest.raises(CurationVersionConflict) as conflict:
         await _save(RunStore(pool), 0, {"citations": ["111"]})
-    assert conflict.value.current_version == 0  # rechecked after the retries
-    assert pool.transactions == 3 and pool.commits == 0
+    assert conflict.value.current_version == 3  # rechecked after the retries
+
+
+async def test_delete_exhausting_lock_retries_without_version_is_contention(no_backoff):
+    pool = _ScriptedPool(lock_errors=[1205, 1205, 1205], current_version=2)
+    with pytest.raises(CurationStorageContention):
+        await RunStore(pool).delete_curated_override(**SUBJECT, curator_email="c@mskcc.org")
 
 
 async def test_non_lock_operational_errors_are_not_retried(no_backoff):
