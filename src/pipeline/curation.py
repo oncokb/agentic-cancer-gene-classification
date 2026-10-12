@@ -530,7 +530,9 @@ def _request_fusion_inputs(request: Dict[str, Any]) -> List[FusionInput]:
     ]
 
 
-async def ensure_annotation_tumor_types(result: AnnotationResult, run_store: Any, run_id: str) -> bool:
+async def ensure_annotation_tumor_types(
+    result: AnnotationResult, run_store: Any, run_id: str
+) -> Dict[str, Optional[str]]:
     """Reconstruct annotation_tumor_types for runs saved before it existed.
 
     Replays the pipeline's own rule (normalization.gene_tumor_types) on the
@@ -538,17 +540,17 @@ async def ensure_annotation_tumor_types(result: AnnotationResult, run_store: Any
     (the only ones that can give a gene tumor context), so aliases map to
     their canonical gene. Only CONFIRMED entries are added to the map; when the
     request or alias resolution is unavailable, the missing genes are recorded
-    in result._unresolved_tumor_genes instead. Returns True when confirmed
-    entries were added (so the caller can persist them)."""
+    in result._unresolved_tumor_genes instead. Returns the newly confirmed
+    entries (so the caller can persist exactly those)."""
     missing = [a.gene for a in result.annotations if a.gene not in result.annotation_tumor_types]
     # Only matters where overrides exist; other stores (benchmark, tests) skip it.
     if not missing or getattr(run_store, "get_curated_overrides", None) is None:
-        return False
+        return {}
 
-    def unresolved(reason: str) -> bool:
+    def unresolved(reason: str) -> Dict[str, Optional[str]]:
         logger.error("Cannot reconstruct tumor context for run %s (%s): %s", run_id, reason, ", ".join(missing))
         result._unresolved_tumor_genes.update(missing)
-        return False
+        return {}
 
     getter = getattr(run_store, "get_run_request", None)
     if getter is None:
@@ -574,6 +576,15 @@ async def ensure_annotation_tumor_types(result: AnnotationResult, run_store: Any
             return unresolved("gene symbol lookup unavailable")
         tumor_types = gene_tumor_types(gene_map, tumor_type_by_input)
     # A gene no tumor-typed input resolves to is confirmed to have none.
-    for gene in missing:
-        result.annotation_tumor_types[gene] = tumor_types.get(gene)
-    return True
+    confirmed = {gene: tumor_types.get(gene) for gene in missing}
+    result.annotation_tumor_types.update(confirmed)
+    return confirmed
+
+
+def carry_tumor_context(target: AnnotationResult, source: AnnotationResult) -> None:
+    """Copy reconstructed tumor context onto a freshly reloaded copy of the run."""
+    for gene, tumor_type in source.annotation_tumor_types.items():
+        target.annotation_tumor_types.setdefault(gene, tumor_type)
+    target._unresolved_tumor_genes.update(
+        gene for gene in source._unresolved_tumor_genes if gene not in target.annotation_tumor_types
+    )

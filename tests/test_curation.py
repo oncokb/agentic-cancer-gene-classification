@@ -3,6 +3,7 @@ results are served (cache reuse, fresh runs, shared run links, fusion jobs)."""
 
 from __future__ import annotations
 
+import copy
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,6 +58,9 @@ class FakeCurationStore:
         self.runs: Dict[str, Dict[str, Any]] = {}
         self.requests: Dict[str, Dict[str, Any]] = {}
         self.fail_curation = False  # simulate the curation tables being unreachable
+        self.revisions: Dict[str, int] = {}
+        self.before_cas = None  # one-shot async hook: a concurrent write before the next CAS
+        self.cas_rejections = 0
         self.lookup_calls = 0
 
     def _maybe_fail(self) -> None:
@@ -129,19 +133,49 @@ class FakeCurationStore:
                    == (subject_type, subject_key, tumor_type)]
         return sorted(entries, key=lambda e: e.version, reverse=True)
 
-    # -- runs ---------------------------------------------------------------
+    # -- runs (result_json + revision, like curation_store.py) --------------
+    # Reads and writes copy, as a database would; every write bumps revision.
     async def save_run(self, run_id, timestamp, request_payload, result_payload):
-        self.runs[run_id] = result_payload
+        self.runs[run_id] = copy.deepcopy(result_payload)
         self.requests[run_id] = request_payload
 
     async def get_run(self, run_id):
-        return self.runs.get(run_id)
+        return copy.deepcopy(self.runs.get(run_id))
 
     async def get_run_request(self, run_id):
         return self.requests.get(run_id)
 
+    def _bump(self, run_id):
+        self.revisions[run_id] = self.revisions.get(run_id, 0) + 1
+
     async def update_run_result(self, run_id, result_payload):
-        self.runs[run_id] = result_payload
+        self.runs[run_id] = copy.deepcopy(result_payload)
+        self._bump(run_id)
+
+    async def get_run_with_revision(self, run_id):
+        if run_id not in self.runs:
+            return None
+        return copy.deepcopy(self.runs[run_id]), self.revisions.get(run_id, 0)
+
+    async def update_run_result_if_unchanged(self, run_id, result_payload, expected_revision):
+        if self.before_cas:
+            hook, self.before_cas = self.before_cas, None
+            await hook()
+        if self.revisions.get(run_id, 0) != expected_revision:
+            self.cas_rejections += 1
+            return False
+        await self.update_run_result(run_id, result_payload)
+        return True
+
+    async def set_run_annotation_tumor_types(self, run_id, entries):
+        if run_id in self.runs:
+            self.runs[run_id].setdefault("annotation_tumor_types", {}).update(entries)
+            self._bump(run_id)
+
+    async def set_run_fusion_evidence(self, run_id, fusion_evidence):
+        if run_id in self.runs:
+            self.runs[run_id]["fusion_evidence"] = copy.deepcopy(fusion_evidence)
+            self._bump(run_id)
 
     # -- gene_annotations ---------------------------------------------------
     async def get_gene_annotation(self, gene, tumor_type=None):
@@ -981,7 +1015,7 @@ async def test_pipeline_and_reconstruction_share_duplicate_input_rule(pipeline_e
     _legacy_run(store, "run-dup", [_pipeline_annotation()], {"fusions": [i.model_dump() for i in inputs]})
     legacy = AnnotationResult(**store.runs["run-dup"])
     monkeypatch.setattr(curation, "normalize_fusions", _fake_normalize_fusions)
-    assert await curation.ensure_annotation_tumor_types(legacy, store, "run-dup") is True
+    assert await curation.ensure_annotation_tumor_types(legacy, store, "run-dup") == {"ALK": "NSCLC"}
     assert legacy.annotation_tumor_types == result.annotation_tumor_types
 
 
@@ -1128,3 +1162,110 @@ def test_lock_contention_is_retryable_503(client, store, monkeypatch):
     resp = client.put("/v1/curation/gene/ALK", json={"payload": {"citations": ["222"]}})
     assert resp.status_code == 503 and resp.headers["retry-after"] == "1"
     assert "contention" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Round 3: concurrent run writes are never clobbered
+# ---------------------------------------------------------------------------
+
+
+def _moz_legacy_run(store: FakeCurationStore, run_id: str) -> None:
+    _legacy_run(store, run_id, [_pipeline_annotation(gene="KAT6A")],
+                {"fusions": [{"fusion": "MOZ", "tumor_type": "AML"}]})
+    store.overrides[("gene", "KAT6A", "aml")] = _override({"cancer_association_rationale": "AML."},
+                                                           key="KAT6A", tumor_type="aml")
+
+
+# No PMIDs: the fusion sanitizer drops PMIDs without a matching evidence card,
+# which would muddy what these tests check (that the write itself survives).
+FUSION_EVIDENCE = FusionEvidenceResult(fusion="KAT6A::CREBBP", interpretation="Concurrent job.").model_dump()
+
+
+def test_reconstruction_does_not_clobber_fusion_evidence_persisted_meanwhile(client, store, monkeypatch):
+    _moz_legacy_run(store, "run-fe-race")
+
+    async def slow_hgnc(inputs, **kwargs):
+        # A fusion-evidence job persists onto the run while HGNC is in flight.
+        await store.set_run_fusion_evidence("run-fe-race", [FUSION_EVIDENCE])
+        return await _fake_normalize_fusions(inputs, **kwargs)
+
+    monkeypatch.setattr(curation, "normalize_fusions", slow_hgnc)
+    served = client.get("/v1/annotate/run-fe-race").json()
+
+    persisted = store.runs["run-fe-race"]
+    assert persisted["fusion_evidence"][0]["interpretation"] == "Concurrent job."  # concurrent write survived
+    assert persisted["annotation_tumor_types"] == {"KAT6A": "AML"}
+    assert served["fusion_evidence"][0]["fusion"] == "KAT6A::CREBBP"  # served from the fresh copy
+    assert served["annotations"][0]["cancer_association_rationale"] == "AML."
+    assert store.revisions["run-fe-race"] == 2  # fusion write + tumor merge; no whole-result rewrite
+
+
+def test_reconstruction_does_not_undo_concurrent_sanitizer_write(client, store, monkeypatch):
+    _moz_legacy_run(store, "run-san-race")
+
+    async def slow_hgnc(inputs, **kwargs):
+        # Another reader's sanitizer strips a retracted PMID while HGNC is in flight.
+        stripped = copy.deepcopy(store.runs["run-san-race"])
+        stripped["annotations"][0]["citations"] = []
+        await store.update_run_result("run-san-race", stripped)
+        return await _fake_normalize_fusions(inputs, **kwargs)
+
+    monkeypatch.setattr(curation, "normalize_fusions", slow_hgnc)
+    client.get("/v1/annotate/run-san-race")
+
+    persisted = store.runs["run-san-race"]
+    assert persisted["annotations"][0]["citations"] == []  # the removal was not undone
+    assert persisted["annotation_tumor_types"] == {"KAT6A": "AML"}
+
+
+@pytest.mark.parametrize("concurrent_write", ["tumor_context", "fusion_evidence"])
+def test_sanitizer_write_back_reloads_instead_of_overwriting_concurrent_writes(
+    client, store, monkeypatch, concurrent_write
+):
+    store.runs["run-cas"] = AnnotationResult(
+        run_id="run-cas", timestamp=NOW, fusions_processed=1, genes_annotated=1,
+        annotations=[_pipeline_annotation(gene="KAT6A")],
+    ).model_dump()
+    store.requests["run-cas"] = {"fusions": [{"fusion": "MOZ", "tumor_type": "AML"}]}
+    del store.runs["run-cas"]["annotation_tumor_types"]
+
+    async def retract_111(pmids):
+        return {"111"} & set(pmids)
+
+    async def concurrent():
+        if concurrent_write == "tumor_context":
+            await store.set_run_annotation_tumor_types("run-cas", {"KAT6A": "AML"})
+        else:
+            await store.set_run_fusion_evidence("run-cas", [FUSION_EVIDENCE])
+
+    monkeypatch.setattr(result_sanitizer, "find_retracted_pmids", retract_111)
+    monkeypatch.setattr(curation, "normalize_fusions", _fake_normalize_fusions)
+    store.before_cas = concurrent  # lands between the sanitizer's read and its write
+    served = client.get("/v1/annotate/run-cas").json()
+
+    persisted = store.runs["run-cas"]
+    assert store.cas_rejections == 1  # stale write refused, then reloaded and retried
+    assert persisted["annotations"][0]["citations"] == []  # sanitization persisted
+    assert persisted["annotation_tumor_types"] == {"KAT6A": "AML"}
+    if concurrent_write == "fusion_evidence":
+        assert persisted["fusion_evidence"][0]["interpretation"] == "Concurrent job."
+        assert served["fusion_evidence"][0]["fusion"] == "KAT6A::CREBBP"
+
+
+def test_fusion_job_persists_only_fusion_evidence(client, store, monkeypatch):
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None):
+        return FusionEvidenceResult(fusion=fusion, pmids=["222"])
+
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_fusion_evidence)
+    store.runs["run-only-fe"] = AnnotationResult(
+        run_id="run-only-fe", timestamp=NOW, fusions_processed=1, genes_annotated=1,
+        annotations=[_pipeline_annotation()], annotation_tumor_types={"ALK": "LUAD"},
+    ).model_dump()
+    store.runs["run-only-fe"]["annotations"][0]["citations"] = ["sanitized-meanwhile"]
+    url = client.post("/v1/fusion-evidence/jobs",
+                      json={"fusions": ["EML4::ALK"], "run_id": "run-only-fe"}).json()["status_url"]
+    _poll(client, url)
+    persisted = store.runs["run-only-fe"]
+    assert persisted["fusion_evidence"][0]["pmids"] == ["222"]
+    assert persisted["annotations"][0]["citations"] == ["sanitized-meanwhile"]
+    assert persisted["annotation_tumor_types"] == {"ALK": "LUAD"}

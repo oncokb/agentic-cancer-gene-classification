@@ -100,6 +100,7 @@ from src.pipeline.cache import cached_call
 from src.pipeline.curation import (
     apply_current_fusion_overrides,
     apply_current_gene_overrides,
+    carry_tumor_context,
     ensure_annotation_tumor_types,
     has_curation_unavailable,
     overlay_annotation_result,
@@ -792,12 +793,18 @@ async def _persist_fusion_evidence(
 ) -> None:
     """Merge a completed fusion-evidence job back onto its run, so opening a
     shared link later shows it instead of a hidden/empty fusion evidence tab."""
+    run_store = http_request.app.state.run_store
+    payload = [item.model_dump() for item in fusion_evidence]
     try:
-        stored = await http_request.app.state.run_store.get_run(run_id)
+        if hasattr(run_store, "set_run_fusion_evidence"):
+            # Only this key, atomically: never clobbers concurrent run updates.
+            await run_store.set_run_fusion_evidence(run_id, payload)
+            return
+        stored = await run_store.get_run(run_id)
         if stored is None:
             return
-        stored["fusion_evidence"] = [item.model_dump() for item in fusion_evidence]
-        await http_request.app.state.run_store.update_run_result(run_id, stored)
+        stored["fusion_evidence"] = payload
+        await run_store.update_run_result(run_id, stored)
     except Exception:
         logger.exception("Failed to persist fusion evidence for run %s", run_id)
 
@@ -1804,6 +1811,49 @@ async def annotate_gene(
     )
 
 
+_SANITIZE_WRITE_ATTEMPTS = 3
+
+
+async def _sanitize_stored_run(run_store: Any, run_id: str, result: AnnotationResult) -> AnnotationResult:
+    """Strip retracted PMIDs from a stored run and persist that if anything changed.
+
+    The write-back is a compare-and-swap on the run's revision: if the run was
+    written meanwhile (fusion evidence, tumor context, another sanitizer), it
+    is reloaded and re-sanitized rather than overwritten with a stale copy.
+    Stores without revisions fall back to a plain overwrite."""
+    get_with_revision = getattr(run_store, "get_run_with_revision", None)
+    if get_with_revision is None:
+        try:
+            result, changed = await sanitize_annotation_result(result)
+            if changed:
+                await run_store.update_run_result(run_id, result_payload_for_storage(result))
+        except Exception:
+            logger.exception("Failed to sanitize stored run %s", run_id)
+        return result
+
+    context = result
+    for _ in range(_SANITIZE_WRITE_ATTEMPTS):
+        try:
+            loaded = await get_with_revision(run_id)
+            if loaded is None:
+                return result
+            stored, revision = loaded
+            current = AnnotationResult(**stored)
+            carry_tumor_context(current, context)
+            current, changed = await sanitize_annotation_result(current)
+            result = current
+            if not changed or await run_store.update_run_result_if_unchanged(
+                run_id, result_payload_for_storage(current), revision
+            ):
+                return result
+        except Exception:
+            logger.exception("Failed to sanitize stored run %s", run_id)
+            return result
+        logger.info("Run %s changed during sanitization; reloading", run_id)
+    logger.warning("Gave up persisting sanitization of run %s after concurrent writes", run_id)
+    return result
+
+
 @app.get("/v1/annotate/{run_id}", response_model=AnnotationResult)
 async def get_annotation_run(
     run_id: str,
@@ -1816,23 +1866,15 @@ async def get_annotation_run(
         raise HTTPException(status_code=404, detail="Run not found")
     run_store = http_request.app.state.run_store
     result = AnnotationResult(**stored)
-    reconstructed = await ensure_annotation_tumor_types(result, run_store, run_id)
-    changed = False
-    try:
-        result, changed = await sanitize_annotation_result(result)
-    except Exception:
-        logger.exception("Failed to sanitize stored run %s", run_id)
-    # Persist sanitization and/or newly confirmed tumor context. The map only
-    # ever holds confirmed entries, so unresolved genes are retried next time.
-    try:
-        if changed:
-            await run_store.update_run_result(run_id, result_payload_for_storage(result))
-        elif reconstructed:
-            await run_store.update_run_result(
-                run_id, {**stored, "annotation_tumor_types": dict(result.annotation_tumor_types)}
-            )
-    except Exception:
-        logger.exception("Failed to update stored run %s", run_id)
+    confirmed = await ensure_annotation_tumor_types(result, run_store, run_id)
+    if confirmed and hasattr(run_store, "set_run_annotation_tumor_types"):
+        # Only the confirmed map entries, atomically, so a slow reconstruction
+        # never overwrites concurrent sanitizer or fusion-evidence writes.
+        try:
+            await run_store.set_run_annotation_tumor_types(run_id, confirmed)
+        except Exception:
+            logger.exception("Failed to persist tumor context for run %s", run_id)
+    result = await _sanitize_stored_run(run_store, run_id, result)
     # Runs are stored pipeline-pure; overlay the CURRENT curator overrides so
     # old shared links follow later curator edits and reverts.
     return await overlay_annotation_result(result, run_store)

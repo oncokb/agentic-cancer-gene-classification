@@ -210,3 +210,36 @@ async def test_concurrent_first_saves_yield_one_winner_and_conflicts(mysql_store
     assert all(isinstance(r, CurationVersionConflict) for r in results if r not in winners)
     history = await mysql_store.list_curation_history("gene", "CURTEST1", "luad")
     assert [e.version for e in history] == [1]
+
+
+async def test_run_updates_are_key_scoped_and_compare_and_swap(mysql_store):
+    run_id = "curtest-run-0001"
+    async with mysql_store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("DELETE FROM runs WHERE run_id = %s", (run_id,))
+    await mysql_store.save_run(
+        run_id, "2026-10-12T12:00:00+00:00", {"fusions": []},
+        {"run_id": run_id, "annotations": [{"gene": "KAT6A", "citations": ["111"]}], "fusion_evidence": []},
+    )
+    stored, revision = await mysql_store.get_run_with_revision(run_id)
+    assert revision == 0 and "annotation_tumor_types" not in stored
+
+    # Key-scoped atomic updates (also creating the map when absent).
+    await mysql_store.set_run_annotation_tumor_types(run_id, {"KAT6A": "AML", 'odd"gene\\x': None})
+    await mysql_store.set_run_annotation_tumor_types(run_id, {"BRAF": "melanoma"})
+    await mysql_store.set_run_fusion_evidence(run_id, [{"fusion": "KAT6A::CREBBP", "pmids": ["222"]}])
+    current, current_revision = await mysql_store.get_run_with_revision(run_id)
+    assert current_revision == 3
+    assert current["annotation_tumor_types"] == {"KAT6A": "AML", 'odd"gene\\x': None, "BRAF": "melanoma"}
+    assert current["fusion_evidence"] == [{"fusion": "KAT6A::CREBBP", "pmids": ["222"]}]
+    assert current["annotations"] == [{"gene": "KAT6A", "citations": ["111"]}]
+
+    # A whole-result write from the stale read is refused; from the fresh one it lands.
+    stale = {**stored, "annotations": [{"gene": "KAT6A", "citations": []}]}
+    assert await mysql_store.update_run_result_if_unchanged(run_id, stale, revision) is False
+    fresh = {**current, "annotations": [{"gene": "KAT6A", "citations": []}]}
+    assert await mysql_store.update_run_result_if_unchanged(run_id, fresh, current_revision) is True
+    final, final_revision = await mysql_store.get_run_with_revision(run_id)
+    assert final == fresh and final_revision == 4
+    await mysql_store.update_run_result(run_id, final)  # plain writes bump the revision too
+    assert (await mysql_store.get_run_with_revision(run_id))[1] == 5

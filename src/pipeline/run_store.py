@@ -230,7 +230,7 @@ class RunStore(CurationStoreMixin):
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
-                    "UPDATE runs SET result_json = %s WHERE run_id = %s",
+                    "UPDATE runs SET result_json = %s, revision = revision + 1 WHERE run_id = %s",
                     (json.dumps(result_payload), run_id),
                 )
 
