@@ -19,7 +19,10 @@ the sidecar's optimizations (the `osler` model switch, cache warming, the async
   (used by every `acgc.*` metric) runs the library's background sender, and
   emitting only enqueues a packet into a bounded queue (4096 packets) that
   drops instead of blocking when full. The client is built once at app
-  startup, off the event loop, and stopped (with a 2s cap) at shutdown. With `OPENEVIDENCE_ENABLED=false` the endpoint's response is
+  startup, off the event loop, and stopped (with a 2s cap) at shutdown. If
+  it cannot be built (for example a bad `DD_*` setting), startup continues
+  and metrics stay off for the life of the process. Requires
+  `datadog>=0.55.0`. With `OPENEVIDENCE_ENABLED=false` the endpoint's response is
   byte-identical to before; only `endpoint.requests{outcome:disabled}` and its
   duration are counted.
 

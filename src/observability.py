@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import inspect
 import logging
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
@@ -16,7 +18,6 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 _statsd_client = None
-_statsd_warning_logged = False
 _tracing_warning_logged = False
 
 
@@ -39,81 +40,120 @@ _STATSD_SENDER_KWARGS: dict = {
 }
 _STATSD_STOP_TIMEOUT_SECONDS = 2.0
 
-_statsd_init_lock = threading.Lock()
-_statsd_init_thread_lock = threading.Lock()
-_statsd_init_thread: Optional[threading.Thread] = None
-_statsd_unavailable = False
+# Lifecycle of the shared client. Transitions happen under _statsd_lock,
+# which is only ever held briefly (never while constructing or stopping a
+# client), so shutdown can always take it within its time budget:
+#   uninitialized -> initializing -> ready | unavailable
+#   any           -> closed            (shutdown_statsd; terminal)
+# `unavailable` is terminal too: a client that failed to build once is not
+# retried on every emission. Once `closed`, emissions are no-ops, no
+# initializer may start, and an initializer that finishes late stops and
+# discards its client instead of publishing it.
+_UNINITIALIZED = "uninitialized"
+_INITIALIZING = "initializing"
+_READY = "ready"
+_UNAVAILABLE = "unavailable"
+_CLOSED = "closed"
+
+_statsd_state = _UNINITIALIZED
+_statsd_lock = threading.Lock()
 
 
 def _build_statsd():
-    global _statsd_warning_logged, _statsd_unavailable
+    """Construct a DogStatsd client, or None (logged) if that fails for any
+    reason — a missing package or bad DD_* configuration must never break
+    the caller (e.g. app startup)."""
     try:
         from datadog import DogStatsd
-    except ImportError as exc:  # pragma: no cover - depends on optional package install
-        if not _statsd_warning_logged:
-            logger.warning("Datadog metrics enabled but DogStatsD client is unavailable: %s", exc)
-            _statsd_warning_logged = True
-        _statsd_unavailable = True
+
+        # Only pin an explicit host/port when configured; otherwise leave
+        # them unset so DogStatsd falls through to its own DD_DOGSTATSD_URL /
+        # DD_AGENT_HOST / DD_DOGSTATSD_PORT env var detection, which is what
+        # actually resolves to the Datadog Agent's Unix domain socket in this
+        # cluster (mirrors how ddtrace-run auto-detects DD_TRACE_AGENT_URL).
+        kwargs: dict = {"namespace": settings.datadog_metrics_namespace, **_STATSD_SENDER_KWARGS}
+        if settings.datadog_statsd_host:
+            kwargs["host"] = settings.datadog_statsd_host
+            kwargs["port"] = settings.datadog_statsd_port or 8125
+        return DogStatsd(**kwargs)
+    except Exception as exc:
+        logger.warning("Datadog metrics enabled but the DogStatsD client could not be created; metrics are off: %s", exc)
         return None
 
-    # Only pin an explicit host/port when configured; otherwise leave them
-    # unset so DogStatsd falls through to its own DD_DOGSTATSD_URL /
-    # DD_AGENT_HOST / DD_DOGSTATSD_PORT env var detection, which is what
-    # actually resolves to the Datadog Agent's Unix domain socket in this
-    # cluster (mirrors how ddtrace-run auto-detects DD_TRACE_AGENT_URL).
-    kwargs: dict = {"namespace": settings.datadog_metrics_namespace, **_STATSD_SENDER_KWARGS}
-    if settings.datadog_statsd_host:
-        kwargs["host"] = settings.datadog_statsd_host
-        kwargs["port"] = settings.datadog_statsd_port or 8125
 
-    return DogStatsd(**kwargs)
-
-
-def init_statsd():
-    """Construct the shared DogStatsd client if metrics are enabled.
-
-    Blocking (client setup can do file and DNS I/O), so async code must run
-    it off the event loop — the app does so once at startup (see main.py's
-    lifespan). Idempotent."""
-    global _statsd_client
-    if not settings.datadog_metrics_enabled:
-        return None
-    with _statsd_init_lock:
-        if _statsd_client is None and not _statsd_unavailable:
-            _statsd_client = _build_statsd()
-        return _statsd_client
-
-
-def shutdown_statsd(timeout: float = _STATSD_STOP_TIMEOUT_SECONDS) -> None:
-    """Flush and stop the background sender, waiting at most `timeout`
-    seconds (never hangs shutdown on an unreachable Agent). Blocking; async
-    code must run it off the event loop."""
-    global _statsd_client
-    with _statsd_init_lock:
-        client, _statsd_client = _statsd_client, None
+def _stop_client(client, timeout: float) -> None:
+    """Flush and stop `client`'s background sender within `timeout`."""
     stop = getattr(client, "stop", None)
     if stop is None:
         return
     try:
-        stop(timeout=timeout)
-    except Exception as exc:  # pragma: no cover - defensive; shutdown must not fail
+        if "timeout" in inspect.signature(stop).parameters:
+            stop(timeout=timeout)
+            return
+        # Older datadog: stop() has no timeout and may block on a slow Agent.
+        # Run it on a daemon thread so shutdown stays bounded either way.
+        logger.warning("DogStatsd.stop() takes no timeout (datadog < 0.55?); stopping it in the background")
+        stopper = threading.Thread(target=stop, name="statsd-stop", daemon=True)
+        stopper.start()
+        stopper.join(timeout)
+    except Exception as exc:
         logger.warning("Datadog metrics client shutdown failed: %s", exc)
 
 
+def init_statsd():
+    """Construct and publish the shared DogStatsd client if metrics are
+    enabled and it hasn't been built (or failed, or been shut down) yet.
+
+    Blocking (client setup can do file and DNS I/O), so async code must run
+    it off the event loop — the app does so once at startup (see main.py's
+    lifespan). Never raises."""
+    global _statsd_client, _statsd_state
+    if not settings.datadog_metrics_enabled:
+        return None
+    with _statsd_lock:
+        if _statsd_state != _UNINITIALIZED:
+            return _statsd_client
+        _statsd_state = _INITIALIZING
+    client = _build_statsd()
+    with _statsd_lock:
+        if _statsd_state == _INITIALIZING:
+            _statsd_client = client
+            _statsd_state = _READY if client is not None else _UNAVAILABLE
+            return client
+    # Shut down while we were building: never publish a client after that.
+    if client is not None:
+        _stop_client(client, timeout=0)
+    return None
+
+
+def shutdown_statsd(timeout: float = _STATSD_STOP_TIMEOUT_SECONDS) -> None:
+    """Close the metrics client for good: flush and stop the background
+    sender, taking at most `timeout` seconds in total (never hangs shutdown
+    on an unreachable Agent or a stuck initializer). Blocking; async code
+    must run it off the event loop."""
+    global _statsd_client, _statsd_state
+    deadline = time.monotonic() + timeout
+    if not _statsd_lock.acquire(timeout=timeout):
+        logger.warning("Datadog metrics shutdown gave up waiting for the client lock after %ss", timeout)
+        return
+    try:
+        _statsd_state = _CLOSED
+        client, _statsd_client = _statsd_client, None
+    finally:
+        _statsd_lock.release()
+    if client is not None:
+        _stop_client(client, max(0.0, deadline - time.monotonic()))
+
+
 def _start_background_init() -> None:
-    global _statsd_init_thread
-    with _statsd_init_thread_lock:
-        if _statsd_init_thread is not None and _statsd_init_thread.is_alive():
-            return
-        _statsd_init_thread = threading.Thread(target=init_statsd, name="statsd-init", daemon=True)
-        _statsd_init_thread.start()
+    threading.Thread(target=init_statsd, name="statsd-init", daemon=True).start()
 
 
 def _statsd():
     if not settings.datadog_metrics_enabled:
         return None
     client = _statsd_client
-    if client is not None or _statsd_unavailable:
+    if client is not None or _statsd_state != _UNINITIALIZED:
         return client
     try:
         asyncio.get_running_loop()
@@ -122,7 +162,8 @@ def _statsd():
         return init_statsd()
     # Inside the event loop and not initialized at startup (e.g. a script's
     # asyncio.run): never build the client on the loop thread. Build it in
-    # the background and drop this metric.
+    # the background (init_statsd's state check lets only one thread build)
+    # and drop this metric.
     _start_background_init()
     return None
 

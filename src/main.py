@@ -166,8 +166,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Build the DogStatsD client (file/DNS I/O) off the event loop, once,
-    # before any request can emit a metric.
-    await asyncio.to_thread(init_statsd)
+    # before any request can emit a metric. Metrics are optional: nothing
+    # about them may stop the app from starting.
+    try:
+        await asyncio.to_thread(init_statsd)
+    except Exception:
+        logger.warning("Datadog metrics initialization failed; continuing without metrics", exc_info=True)
     app.state.run_store = await RunStore.create()
     logger.info(
         "Application startup: auth_enabled=%s, google_client_id_configured=%s, "
@@ -181,7 +185,10 @@ async def lifespan(app: FastAPI):
     yield
     await _cancel_openevidence_sidecar_lookups()
     await app.state.run_store.close()
-    await asyncio.to_thread(shutdown_statsd)
+    try:
+        await asyncio.to_thread(shutdown_statsd)
+    except Exception:
+        logger.warning("Datadog metrics shutdown failed", exc_info=True)
 
 
 app = FastAPI(
