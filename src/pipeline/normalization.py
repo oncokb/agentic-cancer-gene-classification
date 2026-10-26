@@ -54,35 +54,56 @@ def is_fusion_input(value: str) -> bool:
 # hyphen is not a separator because real symbols and aliases contain one
 # (HLA-A, NKX2-1, GM-CSF).
 _SYMBOL_TOKEN = r"[A-Za-z][A-Za-z0-9]{1,14}"
-_HYPHEN_PAIR = re.compile(rf"^({_SYMBOL_TOKEN})-({_SYMBOL_TOKEN})$")
-_WHITESPACE_PAIR = re.compile(rf"^({_SYMBOL_TOKEN})\s+({_SYMBOL_TOKEN})(?:\s+fusion)?$", re.IGNORECASE)
+_HYPHEN_PAIR = re.compile(rf"^(?P<gene1>{_SYMBOL_TOKEN})-(?P<gene2>{_SYMBOL_TOKEN})$")
+# Two whitespace-separated partners only count as a fusion when the input says
+# so ('EML4 ALK fusion', 'fusion EML4 ALK'); a bare 'BRAF melanoma' is a gene
+# plus context, and a bare 'EML4 ALK' is an accepted miss.
+_FUSION_WORD = r"(?:fusions?|rearrangements?|translocations?)"
+_WHITESPACE_PAIR = re.compile(
+    rf"^(?:(?P<lead>{_FUSION_WORD})\s+)?(?P<gene1>{_SYMBOL_TOKEN})\s+(?P<gene2>{_SYMBOL_TOKEN})"
+    rf"(?:\s+(?P<trail>{_FUSION_WORD}))?$",
+    re.IGNORECASE,
+)
 # HGNC families whose hyphenated members look like two symbols (HLA-DRB1, MT-CO1).
 _HYPHENATED_SYMBOL_PREFIXES = frozenset({"HLA", "MT"})
-# Words (and protein changes like V600E) that follow a gene without naming a partner.
+# Words that accompany a gene without naming a partner: event and status words,
+# Greek-letter protein names (TNF-alpha, IFN-gamma), and prose (NF-kB, anti-EGFR).
 _NON_PARTNER_WORDS = frozenset(
-    {"FUSION", "FUSIONS", "GENE", "GENES", "MUTATION", "MUTANT", "AMPLIFICATION", "DELETION", "WT"}
-)
-# Greek-letter suffixes are protein names, not partners (TNF-alpha, IFN-gamma).
-_GREEK_LETTERS = frozenset(
     {
+        "FUSION", "FUSIONS", "REARRANGEMENT", "REARRANGEMENTS", "TRANSLOCATION", "TRANSLOCATIONS",
+        "GENE", "GENES", "PROTEIN", "VARIANT", "VARIANTS", "MUTATION", "MUTATIONS", "MUTANT", "MUTATED",
+        "POSITIVE", "NEGATIVE", "POS", "NEG", "AMPLIFICATION", "AMPLIFIED", "AMP", "DELETION", "DELETED",
+        "DEL", "LOSS", "GAIN", "EXPRESSION", "OVEREXPRESSION", "WILDTYPE", "WT", "NULL", "INHIBITOR",
+        "ANTI", "NON", "KB", "CELL", "SMALL", "LARGE", "HIGH", "LOW",
         "ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA", "THETA", "IOTA", "KAPPA", "LAMBDA",
         "MU", "NU", "XI", "OMICRON", "PI", "RHO", "SIGMA", "TAU", "UPSILON", "PHI", "CHI", "PSI", "OMEGA",
     }
 )
-_PROTEIN_CHANGE = re.compile(r"^(?:[A-Z]\d+[A-Z]?|EXON\d+)$", re.IGNORECASE)
-# Short words with lowercase letters (NF-kB, anti-EGFR) are not symbols.
-_SHORT_LOWERCASE_WORD = re.compile(r"^(?=[A-Za-z]*[a-z])[A-Za-z]{1,5}$")
+# Single-word tumor names and abbreviations. Superset of the single-word terms in
+# literature._TUMOR_TYPE_ALIASES (copied: literature imports this module; a test
+# keeps them in sync).
+_TUMOR_TYPE_WORDS = frozenset(
+    {
+        "LUAD", "LUSC", "NSCLC", "SCLC", "TNBC", "CRC", "COAD", "READ", "PDAC", "HCC", "GC", "STAD",
+        "EAC", "ESCC", "CCA", "RCC", "CCRCC", "KIRC", "KIRP", "GBM", "LGG", "AML", "CML", "ALL", "CLL",
+        "MM", "DLBCL", "FL", "MCL", "NHL", "HL", "OV", "UCEC", "CESC", "SKCM", "UVM", "HNSCC", "THCA",
+        "PRAD", "BLCA", "UC", "MESO", "SARC", "LCNEC", "PCPG", "MDS", "MPN", "GIST", "IMT", "ALCL",
+        "CANCER", "TUMOR", "TUMOUR", "NEOPLASM", "MALIGNANCY", "CARCINOMA", "ADENOCARCINOMA", "SARCOMA",
+        "MELANOMA", "GLIOMA", "GLIOBLASTOMA", "LYMPHOMA", "LEUKEMIA", "LEUKAEMIA", "MYELOMA",
+        "MESOTHELIOMA", "CHOLANGIOCARCINOMA", "PHEOCHROMOCYTOMA", "PARAGANGLIOMA", "NEUROBLASTOMA",
+        "BLASTOMA", "LUNG", "BREAST", "COLON", "RECTAL", "COLORECTAL", "GASTRIC", "PANCREATIC",
+        "THYROID", "PROSTATE", "BLADDER", "OVARIAN", "RENAL", "KIDNEY", "LIVER", "SKIN", "BRAIN",
+        "ESOPHAGOGASTRIC",
+    }
+)
+# Protein changes and exon references (V600E, G12C, T790M, Q61fs, exon19, ex20).
+_PROTEIN_CHANGE = re.compile(r"^(?:[A-Z]\d+(?:[A-Z]|FS|DEL|INS|DUP)?|(?:EXON|EX)\d+)$", re.IGNORECASE)
 HGNC_ALIAS_SEARCH_URL = 'https://rest.genenames.org/search/alias_symbol:"{symbol}"+OR+prev_symbol:"{symbol}"'
 
 
 def _looks_like_partner(token: str) -> bool:
     upper = token.upper()
-    return not (
-        upper in _NON_PARTNER_WORDS
-        or upper in _GREEK_LETTERS
-        or _PROTEIN_CHANGE.match(token)
-        or _SHORT_LOWERCASE_WORD.match(token)
-    )
+    return not (upper in _NON_PARTNER_WORDS or upper in _TUMOR_TYPE_WORDS or _PROTEIN_CHANGE.match(token))
 
 
 def unparsed_fusion_warning(
@@ -98,24 +119,28 @@ def unparsed_fusion_warning(
     A hyphenated input only warns when HGNC confirmed it is not a symbol, so a
     real hyphenated gene, or one whose lookup failed, never warns; nor does one
     listed in `known_aliases` (alias/previous symbols of genes already resolved).
-    The whitespace form ignores `resolved`: symbols never contain spaces, and
-    HGNC's fuzzy search fallback "resolves" 'EML4 ALK fusion' to EML4.
+    The whitespace form must name a fusion explicitly and ignores `resolved`:
+    symbols never contain spaces, and HGNC's fuzzy search fallback "resolves"
+    'EML4 ALK fusion' to EML4.
     """
     text = value.strip()
     if is_fusion_input(text):
         return None
 
     match = _WHITESPACE_PAIR.match(text)
-    if match is None:
+    if match is not None:
+        if not (match.group("lead") or match.group("trail")):
+            return None
+    else:
         match = _HYPHEN_PAIR.match(text)
         if match is None or resolved is None or not resolved.unresolvable or resolved.lookup_failed:
             return None
-        if match.group(1).upper() in _HYPHENATED_SYMBOL_PREFIXES:
+        if match.group("gene1").upper() in _HYPHENATED_SYMBOL_PREFIXES:
             return None
         if text.upper() in {alias.upper() for alias in known_aliases}:
             return None
 
-    gene1, gene2 = match.group(1), match.group(2)
+    gene1, gene2 = match.group("gene1"), match.group("gene2")
     if not (_looks_like_partner(gene1) and _looks_like_partner(gene2)):
         return None
     return (

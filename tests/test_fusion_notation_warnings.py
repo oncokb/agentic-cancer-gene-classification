@@ -13,8 +13,10 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from src import main
+from src.pipeline import literature
 from src.models.schema import AnnotateRequest, FusionInput, GeneAnnotation, ResolvedGene
 from src.pipeline.normalization import (
+    _TUMOR_TYPE_WORDS,
     normalize_fusions,
     unparsed_fusion_warning,
     unparsed_fusion_warnings,
@@ -59,6 +61,8 @@ _HGNC = {
     "CSF2": (["GM-CSF"], []),
     "TNF": (["TNF-alpha"], []),
     "IL6": (["IL-6"], []),
+    # Fictional: a hyphenated name known only as a previous symbol.
+    "NEWSYM1": ([], ["OLDA-OLDB1"]),
 }
 _ALIAS_QUERY = re.compile(r'alias_symbol:"([^"]+)"')
 
@@ -102,19 +106,29 @@ def _hgnc_handler(offline: bool = False, alias_offline: bool = False):
 
 
 @pytest.fixture
-def fake_hgnc(monkeypatch):
-    """Patch only the HGNC HTTP boundary (and bypass the Redis cache) so tests exercise real normalization."""
+def fake_cache(monkeypatch):
+    """In-memory stand-in for the Redis-backed cached_call (same compute-on-miss contract)."""
+    store: dict = {}
+
+    async def cached_call(key, compute, ttl_seconds=None):
+        if key not in store:
+            store[key] = await compute()
+        return store[key]
+
+    monkeypatch.setattr("src.pipeline.normalization.cached_call", cached_call)
+    return store
+
+
+@pytest.fixture
+def fake_hgnc(monkeypatch, fake_cache):
+    """Patch only the HGNC HTTP boundary (and the cache) so tests exercise real normalization."""
     real_client = httpx.AsyncClient
     state = {"handler": _hgnc_handler()}
 
     def client_factory(*args, **kwargs):
         return real_client(transport=httpx.MockTransport(lambda request: state["handler"](request)))
 
-    async def no_cache(key, compute, ttl_seconds=None):
-        return await compute()
-
     monkeypatch.setattr("src.pipeline.normalization.httpx.AsyncClient", client_factory)
-    monkeypatch.setattr("src.pipeline.normalization.cached_call", no_cache)
 
     def configure(**kwargs):
         state["handler"] = _hgnc_handler(**kwargs)
@@ -137,10 +151,12 @@ def test_single_hyphen_fusion_warns_when_hgnc_confirms_not_a_symbol():
     )
 
 
-def test_lowercase_single_hyphen_fusion_suggests_uppercase_notation():
-    assert unparsed_fusion_warning("ewsr1-fli1", _unresolvable("ewsr1-fli1")) == _warning(
-        "ewsr1-fli1", "EWSR1::FLI1"
-    )
+@pytest.mark.parametrize(
+    "value, suggestion",
+    [("ewsr1-fli1", "EWSR1::FLI1"), ("bcr-abl1", "BCR::ABL1"), ("eml4-alk", "EML4::ALK")],
+)
+def test_lowercase_single_hyphen_fusion_suggests_uppercase_notation(value, suggestion):
+    assert unparsed_fusion_warning(value, _unresolvable(value)) == _warning(value, suggestion)
 
 
 def test_single_hyphen_does_not_warn_without_a_confirmed_hgnc_miss():
@@ -149,14 +165,45 @@ def test_single_hyphen_does_not_warn_without_a_confirmed_hgnc_miss():
     assert unparsed_fusion_warning("EWSR1-FLI1", _resolved("EWSR1-FLI1")) is None
 
 
-def test_whitespace_separated_partners_warn():
-    assert unparsed_fusion_warning("EML4 ALK fusion", _unresolvable("EML4 ALK fusion")) == _warning(
-        "EML4 ALK fusion", "EML4::ALK"
-    )
-    assert unparsed_fusion_warning("EML4 ALK") is not None
+@pytest.mark.parametrize(
+    "value, suggestion",
+    [
+        ("EML4 ALK fusion", "EML4::ALK"),
+        ("eml4 alk fusion", "EML4::ALK"),
+        ("fusion EML4 ALK", "EML4::ALK"),
+        ("EWSR1 FLI1 fusions", "EWSR1::FLI1"),
+        ("KMT2A AFF1 rearrangement", "KMT2A::AFF1"),
+        ("BCR ABL1 translocation", "BCR::ABL1"),
+    ],
+)
+def test_whitespace_partners_with_an_explicit_fusion_word_warn(value, suggestion):
+    assert unparsed_fusion_warning(value, _unresolvable(value)) == _warning(value, suggestion)
+
+
+def test_whitespace_form_ignores_fuzzy_hgnc_resolution():
     # HGNC's fuzzy search fallback "resolves" the whole string to EML4; that must not suppress it.
     fuzzy_hit = ResolvedGene(input_symbol="EML4 ALK fusion", canonical_symbol="EML4", resolved=True)
     assert unparsed_fusion_warning("EML4 ALK fusion", fuzzy_hit) is not None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "EML4 ALK",
+        "BRAF melanoma",
+        "ALK LUAD",
+        "EGFR NSCLC",
+        "BRAF melanoma fusion",
+        "ALK NSCLC rearrangement",
+        "ERBB2 amplification",
+        "TP53 mutant",
+        "ALK positive fusion",
+        "EGFR exon19 fusion",
+        "BRAF V600E fusion",
+    ],
+)
+def test_gene_plus_context_does_not_warn(value):
+    assert unparsed_fusion_warning(value, _unresolvable(value)) is None
 
 
 @pytest.mark.parametrize("symbol", ["HLA-A", "HLA-DRB1", "NKX2-1", "MT-CO1", "IL-6"])
@@ -166,8 +213,8 @@ def test_real_hyphenated_symbols_never_warn(symbol, resolution):
     assert unparsed_fusion_warning(symbol, resolved) is None
 
 
-@pytest.mark.parametrize("value", ["TNF-alpha", "IFN-gamma", "NF-kB", "anti-EGFR"])
-def test_greek_letter_and_short_lowercase_halves_never_warn(value):
+@pytest.mark.parametrize("value", ["TNF-alpha", "IFN-gamma", "NF-kB", "anti-EGFR", "TGF-beta", "non-small"])
+def test_non_partner_words_never_warn(value):
     assert unparsed_fusion_warning(value, _unresolvable(value)) is None
 
 
@@ -188,11 +235,23 @@ def test_known_aliases_from_resolved_genes_suppress_the_warning():
         "KRAS G12C",
         "KRAS G12D",
         "EGFR exon19",
+        "EGFR T790M",
         "TNF alpha",
+        "ALK-LUAD",
+        "EGFR-exon19",
     ],
 )
 def test_parsed_fusions_and_non_fusion_text_do_not_warn(value):
     assert unparsed_fusion_warning(value, _unresolvable(value)) is None
+
+
+def test_tumor_words_cover_the_literature_tumor_type_aliases():
+    # normalization keeps its own copy (literature imports normalization); keep them in sync.
+    terms = {key for key in literature._TUMOR_TYPE_ALIASES}
+    terms |= {term for aliases in literature._TUMOR_TYPE_ALIASES.values() for term in aliases}
+    single_words = {term.upper() for term in terms if re.fullmatch(r"[A-Za-z0-9]+", term)}
+
+    assert single_words <= _TUMOR_TYPE_WORDS, sorted(single_words - _TUMOR_TYPE_WORDS)
 
 
 # --- unparsed_fusion_warnings over real normalization -----------------------
@@ -210,12 +269,16 @@ async def test_warnings_from_real_normalization(fake_hgnc):
         "GREB1::NCOA2",
         "BCR/ABL1",
         "EML4 ALK fusion",
+        "BRAF melanoma",
+        "EML4 ALK",
+        "bcr-abl1",
         "EWSR1-FLI1",
     ]
 
     assert await _warnings_for(inputs) == [
         _warning("EWSR1-FLI1", "EWSR1::FLI1"),
         _warning("EML4 ALK fusion", "EML4::ALK"),
+        _warning("bcr-abl1", "BCR::ABL1"),
     ]
 
 
@@ -223,6 +286,26 @@ async def test_warnings_from_real_normalization(fake_hgnc):
 @pytest.mark.parametrize("alias", ["GM-CSF", "TNF-alpha", "IL-6"])
 async def test_hyphenated_hgnc_aliases_do_not_warn(fake_hgnc, alias):
     assert await _warnings_for([alias]) == []
+
+
+@pytest.mark.asyncio
+async def test_hyphenated_previous_symbol_does_not_warn(fake_hgnc):
+    handler = fake_hgnc()
+
+    assert await _warnings_for(["OLDA-OLDB1"]) == []
+    assert [path for path in handler.requests if 'alias_symbol:"OLDA-OLDB1"' in path]
+
+
+@pytest.mark.asyncio
+async def test_alias_lookup_result_is_served_from_cache(fake_hgnc, fake_cache):
+    handler = fake_hgnc()
+
+    assert await _warnings_for(["GM-CSF", "EWSR1-FLI1"]) == [_warning("EWSR1-FLI1", "EWSR1::FLI1")]
+    assert await _warnings_for(["GM-CSF", "EWSR1-FLI1"]) == [_warning("EWSR1-FLI1", "EWSR1::FLI1")]
+
+    alias_lookups = [path for path in handler.requests if "alias_symbol" in path]
+    assert len(alias_lookups) == 2  # one per distinct input, none on the second run
+    assert fake_cache["hgnc:alias:GM-CSF"] and fake_cache["hgnc:alias:EWSR1-FLI1"] == []
 
 
 @pytest.mark.asyncio
@@ -313,7 +396,10 @@ _EWSR1_FLI1_WARNING = _warning("EWSR1-FLI1", "EWSR1::FLI1")
 
 
 def test_annotate_returns_unparsed_fusion_warning(client):
-    response = client.post("/v1/annotate", json={"fusions": ["EWSR1-FLI1", "HLA-A", "GM-CSF", "TNF-alpha"]})
+    response = client.post(
+        "/v1/annotate",
+        json={"fusions": ["EWSR1-FLI1", "HLA-A", "GM-CSF", "TNF-alpha", "BRAF melanoma", "ALK LUAD"]},
+    )
 
     assert response.status_code == 200
     assert response.json()["warnings"] == [_EWSR1_FLI1_WARNING]
