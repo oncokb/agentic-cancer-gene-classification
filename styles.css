@@ -461,6 +461,9 @@ textarea {
   font-size: 12px;
   font-weight: 600;
   min-height: 0;
+  /* Keep natural height so a long list scrolls in .gene-index instead of
+     squashing every item (min-height: 0 + overflow: hidden let them shrink). */
+  flex-shrink: 0;
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
