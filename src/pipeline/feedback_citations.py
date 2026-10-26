@@ -107,10 +107,11 @@ _COMMON_ENGLISH_WORDS = frozenset({
     "who", "why", "win", "yes", "yet", "you", "zoo",
 })
 _ASSAY_NAMES = frozenset({
-    "CDNA", "CNV", "CT", "DNA", "ELISA", "FISH", "FFPE", "IHC", "ISH", "MRI",
-    "MRNA", "MSI", "NGS", "PCR", "PET", "PMCID", "PMID", "RNA", "RNASEQ",
-    "RRNA", "RTPCR", "SANGER", "SEQ", "SNP", "TMB", "TRNA", "WB", "WES", "WGS",
-    "WT",
+    "CDNA", "CNV", "CR", "CT", "DNA", "ELISA", "EMA", "ER", "FDA", "FISH",
+    "FFPE", "ICI", "IHC", "ISH", "MRI", "MRNA", "MSI", "NGS", "ORR", "OS",
+    "PCR", "PD", "PD-L1", "PDL1", "PET", "PFS", "PMCID", "PMID", "PR", "RNA",
+    "RNASEQ", "RRNA", "RTPCR", "SANGER", "SEQ", "SNP", "TKI", "TMB", "TRNA",
+    "WB", "WES", "WGS", "WT",
 })
 # Prefixes of hyphenated gene symbols (HLA-DRB1, MT-CO1) that must not be read
 # as fusions just because they contain a hyphen.
@@ -284,7 +285,7 @@ def _fusion_matches(message: str) -> List[Tuple[str, str, str]]:
         left, separator, right = match.group(1), match.group(2), match.group(3)
         if not _valid_fusion_pair(left, right, separator):
             continue
-        if separator == "-" and not _FUSION_CONTEXT.search(message or ""):
+        if separator in ("-", "/") and not _FUSION_CONTEXT.search(message or ""):
             continue
         matches.append((left, separator, right))
     return matches
@@ -415,11 +416,17 @@ def _gene_mentioned(text: str, gene: str, aliases: Sequence[str]) -> bool:
 
 def _tumor_aliases(tumor: str) -> Tuple[str, ...]:
     group = _TUMOR_GROUPS.get(tumor.casefold(), (tumor,))
-    # Drop lowercase 3-letter keys; only uppercase abbreviations (ALL) should
-    # match English-looking text.
-    return tuple(
-        term for term in group if not (len(term) == 3 and not term.isupper())
-    ) or (tumor,)
+    # Two-letter abbreviations (GC, UC, OV) are only for detecting the tumor in
+    # the feedback text; they are too ambiguous to search for in abstracts.
+    # Also drop lowercase 3-letter keys, which are English words.
+    terms = tuple(
+        term
+        for term in group
+        if len(term) > 2 and not (len(term) == 3 and not term.isupper())
+    )
+    if terms:
+        return terms
+    return (tumor,) if len(tumor) > 2 else ()
 
 
 def _tumor_match(text: str, tumor: Optional[str]) -> Optional[str]:
@@ -437,7 +444,7 @@ def _tumor_detail(text: str, tumor: str) -> str:
     matched = _tumor_match(text, tumor)
     if matched:
         return f"{tumor}: found: {matched}"
-    searched = ", ".join(_tumor_aliases(tumor))
+    searched = ", ".join(_tumor_aliases(tumor)) or "no unambiguous aliases"
     return f"{tumor}: not found (searched: {searched})"
 
 
@@ -539,7 +546,10 @@ async def _build_section(
             continue
         lines.append(_record_line(pmid, record, five, three, aliases_five, aliases_three, tumor))
 
-    intro: List[str] = ["Automated, informational only; title/abstract were checked, not full text."]
+    intro: List[str] = [
+        "Automated, informational only; title/abstract were checked, not full text. "
+        "This reports mentions, not diagnoses; a differential diagnosis still counts as a mention."
+    ]
     if not tumor:
         intro.append("Tumor type not detected in feedback; tumor mention was not checked.")
     return "\n".join([_SECTION_HEADING, "", *intro, "", *lines])

@@ -162,6 +162,10 @@ def test_explicit_double_colon_fusion_is_preferred_over_slash():
     assert extract_subject("TP53/EGFR and EML4::ALK fusion.") == ("EML4::ALK", True)
 
 
+def test_clinical_acronyms_are_not_fusion_partners():
+    assert extract_subject("ER/PR status; GREB1-BCL9L fusion") == ("GREB1::BCL9L", True)
+
+
 def test_extract_subject_prefers_structured_gene():
     assert extract_subject("Review GREB1::BCL9L fusion.", "TP53") == ("TP53", False)
 
@@ -187,6 +191,8 @@ def test_hyphenated_gene_symbol_is_not_mistaken_for_a_fusion():
         ("Review TP53 in read.", None),
         ("Review TP53 in GC.", "GC"),
         ("Review TP53 in gc.", None),
+        ("Review TP53 in UC.", "UC"),
+        ("Review TP53 in uc.", None),
         ("Reported in biliary tract cancer.", "biliary tract cancer"),
         ("Reported in ovarian cancers.", "ovarian cancer"),
         ("Reported in non\u2013small cell lung cancer.", "non-small cell lung cancer"),
@@ -282,6 +288,7 @@ async def test_positive_gene_mention_and_tumor(pubmed):
         in section
     )
     assert "(abstract checked; full text not checked)" in section
+    assert "reports mentions, not diagnoses" in section
     assert pubmed["pmids"] == ["41424301"]
     assert pubmed["filter_retracted"] is False
 
@@ -342,6 +349,24 @@ async def test_aml_abstract_does_not_match_all(pubmed):
     assert "ALL: not found" in section
 
 
+async def test_two_letter_tumor_abbreviations_are_not_searched_in_abstracts(pubmed):
+    pubmed["records"] = [
+        _record("41424301", "TP53 in GC B cells", "GC-MS was used.")
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 in GC. PMID 41424301", gene="TP53"
+    )
+    assert "GC: not found" in section
+
+    pubmed["records"] = [
+        _record("41424301", "TP53 in UC (ulcerative colitis)", "TP53 cohort.")
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 in UC. PMID 41424301", gene="TP53"
+    )
+    assert "UC: not found" in section
+
+
 async def test_utrosct_does_not_count_as_ovarian_cancer(pubmed):
     pubmed["records"] = [
         _record(
@@ -353,6 +378,21 @@ async def test_utrosct_does_not_count_as_ovarian_cancer(pubmed):
     section = await build_citation_check_section(
         "Review TP53 annotation for ovarian cancer. PMID 41424301", gene="TP53"
     )
+    assert "ovarian cancer: not found" in section
+
+
+async def test_utrosct_case_121_end_to_end(pubmed):
+    pubmed["records"] = [
+        _record(
+            "41424301",
+            "Uterine tumor resembling ovarian sex cord tumor (UTROSCT)",
+            "GREB1 rearrangements were identified in this uterine tumor.",
+        )
+    ]
+    section = await build_citation_check_section(
+        "Review GREB1::BCL9L fusion annotation for ovarian cancer. PMID 41424301"
+    )
+    assert "mentions `GREB1` — yes; `BCL9L` — NO" in section
     assert "ovarian cancer: not found" in section
 
 
