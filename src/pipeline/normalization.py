@@ -50,6 +50,70 @@ def is_fusion_input(value: str) -> bool:
     return bool(gene1 and gene2)
 
 
+# Fusion-like notation that split_fusion deliberately does not parse. A single
+# hyphen is not a separator because real symbols contain one (HLA-A, NKX2-1).
+_SYMBOL_TOKEN = r"[A-Za-z][A-Za-z0-9]{1,14}"
+_HYPHEN_PAIR = re.compile(rf"^({_SYMBOL_TOKEN})-({_SYMBOL_TOKEN})$")
+_WHITESPACE_PAIR = re.compile(rf"^({_SYMBOL_TOKEN})\s+({_SYMBOL_TOKEN})(?:\s+fusion)?$", re.IGNORECASE)
+# HGNC families whose hyphenated members look like two symbols (HLA-DRB1, MT-CO1).
+_HYPHENATED_SYMBOL_PREFIXES = frozenset({"HLA", "MT"})
+# Words (and protein changes like V600E) that follow a gene without naming a partner.
+_NON_PARTNER_WORDS = frozenset(
+    {"FUSION", "FUSIONS", "GENE", "GENES", "MUTATION", "MUTANT", "AMPLIFICATION", "DELETION", "WT"}
+)
+_PROTEIN_CHANGE = re.compile(r"^(?:[A-Z]\d+[A-Z]?|EXON\d+)$", re.IGNORECASE)
+
+
+def _looks_like_partner(token: str) -> bool:
+    return token.upper() not in _NON_PARTNER_WORDS and not _PROTEIN_CHANGE.match(token)
+
+
+def unparsed_fusion_warning(value: str, resolved: Optional[ResolvedGene] = None) -> Optional[str]:
+    """
+    Return a warning when an input looks like fusion notation that was treated
+    as a single gene ('EWSR1-FLI1', 'EML4 ALK fusion'), else None.
+
+    `resolved` is the HGNC resolution of the whole input as a single symbol.
+    A hyphenated input only warns when HGNC confirmed it is not a symbol, so a
+    real hyphenated gene, or one whose lookup failed, never warns.
+    """
+    text = value.strip()
+    if is_fusion_input(text):
+        return None
+    if resolved is not None and resolved.resolved:
+        return None
+
+    match = _WHITESPACE_PAIR.match(text)
+    if match is None:
+        match = _HYPHEN_PAIR.match(text)
+        if match is None or resolved is None or not resolved.unresolvable or resolved.lookup_failed:
+            return None
+        if match.group(1).upper() in _HYPHENATED_SYMBOL_PREFIXES:
+            return None
+
+    gene1, gene2 = match.group(1), match.group(2)
+    if not (_looks_like_partner(gene1) and _looks_like_partner(gene2)):
+        return None
+    return (
+        f"'{text}' was treated as a single gene. "
+        f"To annotate it as a fusion, write '{gene1}::{gene2}'."
+    )
+
+
+def unparsed_fusion_warnings(
+    inputs: Iterable[str],
+    gene_map: Dict[str, Tuple[ResolvedGene, list[str]]],
+) -> list[str]:
+    """Warnings for each distinct input in `inputs`, reusing normalize_fusions' HGNC results."""
+    resolved_by_symbol = {rg.input_symbol: rg for rg, _ in gene_map.values()}
+    warnings: list[str] = []
+    for value in dict.fromkeys(inputs):
+        warning = unparsed_fusion_warning(value, resolved_by_symbol.get(value.strip()))
+        if warning:
+            warnings.append(warning)
+    return warnings
+
+
 def _is_ensembl_id(symbol: str) -> bool:
     return bool(ENSEMBL_PATTERN.match(symbol))
 

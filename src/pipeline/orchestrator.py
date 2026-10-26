@@ -32,7 +32,7 @@ from src.pipeline.literature import (
     search_recent_pubmed_pmids,
 )
 from src.pipeline.llm_client import resolve_local_backend
-from src.pipeline.normalization import is_fusion_input, normalize_fusions
+from src.pipeline.normalization import is_fusion_input, normalize_fusions, unparsed_fusion_warnings
 from src.pipeline.pmid_distillation import distill_and_save_pmid_evidence
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
@@ -607,6 +607,7 @@ async def run_pipeline(
     increment("genes.queried", value=len(gene_map), tags=metric_tags)
     logger.info("Resolved %d unique genes from %d inputs", len(gene_map), len(input_strings))
     await _maybe_call_total(on_total_known, len(gene_map))
+    warnings = unparsed_fusion_warnings(input_strings, gene_map)
 
     # Build per-gene tumor_type: first non-null tumor_type from the gene's submitted inputs.
     gene_tumor_type: Dict[str, Optional[str]] = {}
@@ -739,5 +740,6 @@ async def run_pipeline(
         fusions_processed=len(input_strings),
         genes_annotated=len(annotations),
         annotations=annotations,
+        warnings=warnings,
         timings_ms=timings,
     )
