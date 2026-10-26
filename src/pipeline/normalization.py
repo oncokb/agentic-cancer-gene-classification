@@ -51,7 +51,8 @@ def is_fusion_input(value: str) -> bool:
 
 
 # Fusion-like notation that split_fusion deliberately does not parse. A single
-# hyphen is not a separator because real symbols contain one (HLA-A, NKX2-1).
+# hyphen is not a separator because real symbols and aliases contain one
+# (HLA-A, NKX2-1, GM-CSF).
 _SYMBOL_TOKEN = r"[A-Za-z][A-Za-z0-9]{1,14}"
 _HYPHEN_PAIR = re.compile(rf"^({_SYMBOL_TOKEN})-({_SYMBOL_TOKEN})$")
 _WHITESPACE_PAIR = re.compile(rf"^({_SYMBOL_TOKEN})\s+({_SYMBOL_TOKEN})(?:\s+fusion)?$", re.IGNORECASE)
@@ -61,26 +62,47 @@ _HYPHENATED_SYMBOL_PREFIXES = frozenset({"HLA", "MT"})
 _NON_PARTNER_WORDS = frozenset(
     {"FUSION", "FUSIONS", "GENE", "GENES", "MUTATION", "MUTANT", "AMPLIFICATION", "DELETION", "WT"}
 )
+# Greek-letter suffixes are protein names, not partners (TNF-alpha, IFN-gamma).
+_GREEK_LETTERS = frozenset(
+    {
+        "ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA", "THETA", "IOTA", "KAPPA", "LAMBDA",
+        "MU", "NU", "XI", "OMICRON", "PI", "RHO", "SIGMA", "TAU", "UPSILON", "PHI", "CHI", "PSI", "OMEGA",
+    }
+)
 _PROTEIN_CHANGE = re.compile(r"^(?:[A-Z]\d+[A-Z]?|EXON\d+)$", re.IGNORECASE)
+# Short words with lowercase letters (NF-kB, anti-EGFR) are not symbols.
+_SHORT_LOWERCASE_WORD = re.compile(r"^(?=[A-Za-z]*[a-z])[A-Za-z]{1,5}$")
+HGNC_ALIAS_SEARCH_URL = 'https://rest.genenames.org/search/alias_symbol:"{symbol}"+OR+prev_symbol:"{symbol}"'
 
 
 def _looks_like_partner(token: str) -> bool:
-    return token.upper() not in _NON_PARTNER_WORDS and not _PROTEIN_CHANGE.match(token)
+    upper = token.upper()
+    return not (
+        upper in _NON_PARTNER_WORDS
+        or upper in _GREEK_LETTERS
+        or _PROTEIN_CHANGE.match(token)
+        or _SHORT_LOWERCASE_WORD.match(token)
+    )
 
 
-def unparsed_fusion_warning(value: str, resolved: Optional[ResolvedGene] = None) -> Optional[str]:
+def unparsed_fusion_warning(
+    value: str,
+    resolved: Optional[ResolvedGene] = None,
+    known_aliases: Iterable[str] = (),
+) -> Optional[str]:
     """
     Return a warning when an input looks like fusion notation that was treated
     as a single gene ('EWSR1-FLI1', 'EML4 ALK fusion'), else None.
 
     `resolved` is the HGNC resolution of the whole input as a single symbol.
     A hyphenated input only warns when HGNC confirmed it is not a symbol, so a
-    real hyphenated gene, or one whose lookup failed, never warns.
+    real hyphenated gene, or one whose lookup failed, never warns; nor does one
+    listed in `known_aliases` (alias/previous symbols of genes already resolved).
+    The whitespace form ignores `resolved`: symbols never contain spaces, and
+    HGNC's fuzzy search fallback "resolves" 'EML4 ALK fusion' to EML4.
     """
     text = value.strip()
     if is_fusion_input(text):
-        return None
-    if resolved is not None and resolved.resolved:
         return None
 
     match = _WHITESPACE_PAIR.match(text)
@@ -90,28 +112,70 @@ def unparsed_fusion_warning(value: str, resolved: Optional[ResolvedGene] = None)
             return None
         if match.group(1).upper() in _HYPHENATED_SYMBOL_PREFIXES:
             return None
+        if text.upper() in {alias.upper() for alias in known_aliases}:
+            return None
 
     gene1, gene2 = match.group(1), match.group(2)
     if not (_looks_like_partner(gene1) and _looks_like_partner(gene2)):
         return None
     return (
         f"'{text}' was treated as a single gene. "
-        f"To annotate it as a fusion, write '{gene1}::{gene2}'."
+        f"To annotate it as a fusion, write '{gene1.upper()}::{gene2.upper()}'."
     )
 
 
-def unparsed_fusion_warnings(
+async def _is_hgnc_alias(symbol: str, client: httpx.AsyncClient) -> Optional[bool]:
+    """True when HGNC lists `symbol` as an alias or previous symbol; None if the lookup failed."""
+    url = HGNC_ALIAS_SEARCH_URL.format(symbol=symbol)
+
+    async def _fetch() -> list:
+        resp = await client.get(url, headers={"Accept": "application/json"}, timeout=HGNC_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        return resp.json().get("response", {}).get("docs", [])
+
+    try:
+        docs = await cached_call(f"hgnc:alias:{symbol.upper()}", _fetch)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("HGNC alias lookup failed for %s: %s", symbol, exc)
+        return None
+    return bool(docs)
+
+
+async def unparsed_fusion_warnings(
     inputs: Iterable[str],
     gene_map: Dict[str, Tuple[ResolvedGene, list[str]]],
+    client: Optional[httpx.AsyncClient] = None,
 ) -> list[str]:
-    """Warnings for each distinct input in `inputs`, reusing normalize_fusions' HGNC results."""
+    """
+    Warnings for each distinct input in `inputs`, reusing normalize_fusions' HGNC results.
+
+    A hyphenated input that would warn gets one extra HGNC alias/previous-symbol
+    lookup (only on this already-unresolved path); a match, or a failed lookup,
+    suppresses the warning.
+    """
     resolved_by_symbol = {rg.input_symbol: rg for rg, _ in gene_map.values()}
-    warnings: list[str] = []
+    known_aliases = {
+        alias for rg, _ in gene_map.values() for alias in [*rg.alias_symbols, *rg.prev_symbols]
+    }
+    candidates: list[tuple[str, str]] = []
     for value in dict.fromkeys(inputs):
-        warning = unparsed_fusion_warning(value, resolved_by_symbol.get(value.strip()))
+        warning = unparsed_fusion_warning(value, resolved_by_symbol.get(value.strip()), known_aliases)
         if warning:
-            warnings.append(warning)
-    return warnings
+            candidates.append((value.strip(), warning))
+    if not any(_HYPHEN_PAIR.match(text) for text, _ in candidates):
+        return [warning for _, warning in candidates]
+
+    async def _keep(text: str, http: httpx.AsyncClient) -> bool:
+        return not _HYPHEN_PAIR.match(text) or await _is_hgnc_alias(text, http) is False
+
+    async def _filter(http: httpx.AsyncClient) -> list[str]:
+        keeps = await asyncio.gather(*(_keep(text, http) for text, _ in candidates))
+        return [warning for (_, warning), keep in zip(candidates, keeps) if keep]
+
+    if client is not None:
+        return await _filter(client)
+    async with httpx.AsyncClient() as http:
+        return await _filter(http)
 
 
 def _is_ensembl_id(symbol: str) -> bool:
