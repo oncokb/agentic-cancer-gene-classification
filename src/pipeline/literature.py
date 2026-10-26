@@ -172,7 +172,7 @@ _TUMOR_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     # Hematologic malignancies
     "aml": ("acute myeloid leukemia", "AML"),
     "cml": ("chronic myeloid leukemia", "CML"),
-    "all": ("acute lymphoblastic leukemia", "ALL", "acute lymphocytic leukemia"),
+    "all": ("acute lymphoblastic leukemia", "ALL", "acute lymphocytic leukemia", "B-ALL", "T-ALL"),
     "cll": ("chronic lymphocytic leukemia", "CLL"),
     "mm": ("multiple myeloma", "MM"),
     "dlbcl": ("diffuse large B-cell lymphoma", "DLBCL"),
@@ -277,10 +277,25 @@ _SHORT_TUMOR_WORDS = frozenset({
     "gland", "head", "heart", "liver", "lung", "lungs", "neck", "nerve", "nasal", "oral",
     "ovary", "penis", "renal", "skin", "spine", "tumor", "uvea", "vulva", "wilms",
 })
+# The one dash class: hyphen-minus, U+2010-U+2015 (hyphen, non-breaking hyphen,
+# figure dash, en dash, em dash, horizontal bar) and U+2212 minus sign. Text and
+# terms are folded to "-" before matching, so the patterns below only need "-".
+# A soft hyphen (U+00AD) is an invisible break hint inside a word, so it is
+# dropped: "breast\u00adfeeding" reads as "breastfeeding".
+_TUMOR_TEXT_DASHES = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+_TUMOR_TEXT_TRANSLATION = str.maketrans(
+    {**{dash: "-" for dash in _TUMOR_TEXT_DASHES}, "\u00ad": None}
+)
 # Word edges. A hyphenated neighbour also ends the match ("breast-feeding",
-# "non-small"); hyphens inside an alias such as "non-small cell" are part of it.
-_TUMOR_TERM_START = r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]-)"
+# "non-small"), as does a preceding "non " ("non small cell lung cancer" is not
+# SCLC); hyphens inside an alias such as "non-small cell" are part of it.
+_TUMOR_TERM_START = r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]-)(?<!\b[Nn][Oo][Nn] )"
 _TUMOR_TERM_END = r"(?![A-Za-z0-9])(?!-[A-Za-z0-9])"
+
+
+def _normalize_tumor_text(text: str) -> str:
+    """Fold every dash to "-", drop soft hyphens and collapse whitespace before matching."""
+    return " ".join(text.translate(_TUMOR_TEXT_TRANSLATION).split())
 
 
 def normalize_tumor_identity(tumor_type: Optional[str]) -> str:
@@ -322,7 +337,7 @@ def _requested_tumor_matchers(tumor_identity: str) -> tuple[tuple[str, re.Patter
     """
     matchers = []
     for term, is_abbreviation in _requested_tumor_match_terms(tumor_identity):
-        term = term.strip()
+        term = _normalize_tumor_text(term)
         if not term:
             continue
         if is_abbreviation:
@@ -356,8 +371,8 @@ def requested_tumor_terms_in_record(record: LiteratureRecord, tumor_type: Option
     tumor_identity = normalize_tumor_identity(tumor_type)
     if not tumor_identity:
         return []
-    title = _mask_tumor_mention_exclusions(record.title, tumor_identity)
-    abstract = _mask_tumor_mention_exclusions(record.abstract, tumor_identity)
+    title = _mask_tumor_mention_exclusions(_normalize_tumor_text(record.title), tumor_identity)
+    abstract = _mask_tumor_mention_exclusions(_normalize_tumor_text(record.abstract), tumor_identity)
     matched: List[str] = []
     for term, pattern, title_only in _requested_tumor_matchers(tumor_identity):
         if pattern.search(title) or (not title_only and pattern.search(abstract)):
@@ -910,7 +925,8 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             "alias_expansion_version": 1,
             # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
             # 2: hyphen-aware word edges; case-independent free-text abbreviations.
-            "tumor_scope_version": 2,
+            # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
+            "tumor_scope_version": 3,
         },
         sort_keys=True,
     )

@@ -414,7 +414,11 @@ Each `fusion_evidence` entry (the same shape is returned inline by
 Tumor mentions are matched deterministically on word boundaries against the
 same expanded terms as the tumor-scoped query (for example `LUAD` also matches
 "lung adenocarcinoma"). The case of `tumor_type` does not matter. A hyphenated
-neighbour ends a match, so `breast` does not match "breast-feeding".
+neighbour ends a match, so `breast` does not match "breast-feeding"; this covers
+Unicode dashes (en and em dashes, non-breaking hyphens, minus signs) as well as
+`-`, and soft hyphens are ignored. A preceding "non" also ends a match, so `SCLC`
+does not match "non-small cell lung cancer" or "non small cell lung cancer".
+`ALL` also matches "B-ALL" and "T-ALL".
 Abbreviations match case-sensitively as uppercase tokens; an unlisted
 `tumor_type` of up to 5 letters or digits (such as `dsrct`) is treated as an
 abbreviation unless it is a common word such as `lung`. Two-letter

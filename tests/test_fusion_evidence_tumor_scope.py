@@ -115,6 +115,61 @@ def test_unhyphenated_mentions_still_match(tumor_type, text, expected):
     assert _terms(tumor_type, abstract=text) == expected
 
 
+# En dash, em dash, non-breaking hyphen (U+2011) and minus sign (U+2212).
+UNICODE_DASHES = pytest.mark.parametrize(
+    "dash", ["\u2013", "\u2014", "\u2011", "\u2212"], ids=["en", "em", "nb-hyphen", "minus"],
+)
+
+
+@UNICODE_DASHES
+@pytest.mark.parametrize("tumor_type, text", [
+    ("SCLC", "Seen in non{d}small cell lung cancer."),
+    ("breast", "Infants were exposed through breast{d}feeding."),
+    ("ALL", "Detected in ALL{d}like cell lines."),
+    ("liver", "We used liver{d}derived organoids."),
+    ("ovarian", "Uterine tumor resembling ovarian sex{d}cord tumor with ESR1::NCOA3."),
+    ("ovarian", "Uterine tumor resembling ovarian sex cord tumor{d}like lesion."),
+])
+def test_unicode_dashes_end_a_match_like_hyphens(dash, tumor_type, text):
+    assert _terms(tumor_type, abstract=text.format(d=dash)) == []
+
+
+@UNICODE_DASHES
+def test_unicode_dash_inside_an_alias_still_matches(dash):
+    abstract = f"Seen in non{dash}small cell lung cancer."
+    assert _terms("NSCLC", abstract=abstract) == ["non-small cell lung cancer"]
+
+
+def test_soft_hyphen_joins_the_word_it_splits():
+    assert _terms("breast", abstract="Exposure through breast\u00adfeeding.") == []
+    assert _terms("LUAD", abstract="EML4-ALK lung adeno\u00adcarcinoma.") == ["lung adenocarcinoma"]
+
+
+@pytest.mark.parametrize("tumor_type, text", [
+    ("SCLC", "Seen in non small cell lung cancer."),
+    ("SCLC", "Seen in Non  small cell lung cancer."),
+    ("HL", "Seen in non Hodgkin lymphoma."),
+])
+def test_non_prefix_with_a_space_ends_a_match(tumor_type, text):
+    assert _terms(tumor_type, abstract=text) == []
+
+
+def test_non_prefixed_alias_still_matches_its_own_request():
+    assert _terms("NSCLC", abstract="Seen in non small cell lung cancer.") == [
+        "non-small cell lung cancer",
+    ]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Recurrent fusions in pediatric B-ALL.", ["B-ALL"]),
+    ("Recurrent fusions in T\u2013ALL.", ["T-ALL"]),
+    ("Recurrent fusions in B-ALL and T-ALL.", ["B-ALL", "T-ALL"]),
+    ("Recurrent fusions in ALL.", ["ALL"]),
+])
+def test_b_and_t_all_count_for_an_all_request(text, expected):
+    assert _terms("ALL", abstract=text) == expected
+
+
 OS_ABSTRACT = "The fusion was detected in 12 patients; median OS was 12 months."
 
 
@@ -333,7 +388,7 @@ def test_cache_key_is_bumped_for_tumor_scope(monkeypatch):
     )
 
     assert key != pre_scope_key
-    assert json.loads(key.removeprefix("fusion_evidence:"))["tumor_scope_version"] == 2
+    assert json.loads(key.removeprefix("fusion_evidence:"))["tumor_scope_version"] == 3
 
 
 async def test_retrieve_fusion_evidence_uses_the_bumped_cache_key(monkeypatch):
