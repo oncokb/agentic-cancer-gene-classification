@@ -549,6 +549,11 @@ class FeedbackRequest(BaseModel):
     page_url: Optional[str] = Field(
         default=None, max_length=2048, description="URL of the page feedback was submitted from"
     )
+    pmids: Optional[List[str]] = Field(
+        default=None,
+        max_length=20,
+        description="Optional structured list of PMIDs cited by the feedback",
+    )
 
 
 class FeedbackResponse(BaseModel):

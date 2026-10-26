@@ -37,7 +37,19 @@ class Settings(BaseSettings):
     core_synthesis_escalation_sufficient_score: float = 1.01
     selection_model: str = "claude-haiku-4-5-20251001"
     feedback_issue_creation_enabled: bool = True
+    # Labels applied to bot-created feedback issues. They must already exist in
+    # the repository; creating missing labels is out of scope.
+    feedback_issue_labels: List[str] = Field(
+        default_factory=lambda: ["feedback", "needs-triage"]
+    )
     feedback_rate_limit_per_hour: int = Field(default=10, ge=1)
+    # Best-effort check of PMIDs cited in feedback. The check is appended to the
+    # issue body; a timeout or any PubMed/HGNC error renders "check unavailable"
+    # instead of failing the submission.
+    feedback_citation_check_enabled: bool = True
+    feedback_citation_check_timeout_seconds: float = 8.0
+    feedback_citation_alias_timeout_seconds: float = 2.0
+    feedback_citation_max_pmids: int = 5
     feedback_model: str = "claude-haiku-4-5-20251001"
     retrieval_model: str = "claude-haiku-4-5-20251001"
 
