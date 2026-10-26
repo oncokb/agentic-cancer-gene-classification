@@ -8,12 +8,12 @@ feedback's subject gene/fusion and tumor type. The result is appended to the
 GitHub issue, never used to block or fail feedback submission: any timeout or
 error degrades to a "check unavailable" line.
 
-Gene matching is case-sensitive only for short symbols (KIT, MET, SET, ALK)
-and aliases whose lowercase form is an English word; longer and hyphenated
-symbols (C11orf95, c-Kit) match case-insensitively. Tumor abbreviations are
-always case-sensitive, and full tumor names are matched with dash/space and
-plural normalization plus organ-word equivalence (ovarian carcinoma is
-ovarian cancer).
+All-letter gene terms (any length) match case-sensitively; only terms with a
+digit, a hyphen, or mixed case (C11orf95, c-Kit, Notch1) match
+case-insensitively. Tumor abbreviations are always case-sensitive, and full
+tumor names are matched as explicit alias phrases with dash/space and plural
+normalization. There is no generic organ-equivalence rule: a missed match is
+preferable to a wrong "found".
 
 Only title/abstract are checked. There is no full-text retrieval helper in
 this codebase, so the rendered section says so explicitly.
@@ -37,7 +37,10 @@ logger = logging.getLogger(__name__)
 # the lookarounds reject long numbers instead of truncating them.
 _PMID_ATOM = r"(?<!\d)\d{6,9}(?!\d)"
 _PMID_DIGITS = re.compile(r"(?<!\d)\d{6,9}(?!\d)")
-_STRUCTURED_PMID = re.compile(r"(?<!\d)\d{1,10}(?!\d)")
+_STRUCTURED_PMID_PREFERRED = re.compile(r"(?<!\d)\d{6,9}(?!\d)")
+_STRUCTURED_PMID_FALLBACK = re.compile(r"(?<!\d)\d{1,10}(?!\d)")
+_PMCID = re.compile(r"(?i)\bpmc\s*\d+|\bpmcid\b")
+_DOI_PREFIX = re.compile(r"(?i)^\s*(?:doi\b|https?://(?:dx\.)?doi\.org/)")
 _PMID_SEPARATOR = r"\s*(?:,|;|and|&)\s*"
 # A singular label only accepts explicit separators; a plural label also
 # accepts whitespace-separated lists ("PMIDs 11111111 22222222").
@@ -55,7 +58,9 @@ _PMID_URL = re.compile(
     rf"pubmed\.ncbi\.nlm\.nih\.gov/({_PMID_ATOM})",
     re.IGNORECASE,
 )
-_GENE_TOKEN = r"(?=[A-Za-z0-9]*[A-Z])[A-Za-z][A-Za-z0-9]{1,9}"
+# Gene-like tokens are validated by _is_gene_symbol after matching; the regex
+# stays broad so digit-bearing mixed-case symbols (C11orf95, Notch1) survive.
+_GENE_TOKEN = r"[A-Za-z][A-Za-z0-9]{1,15}"
 _FUSION_SUBJECT = re.compile(
     rf"(?<![A-Za-z0-9])({_GENE_TOKEN})\s*(::+|--|/|-)\s*"
     rf"({_GENE_TOKEN})(?![A-Za-z0-9])"
@@ -70,14 +75,6 @@ _GENERIC_TUMOR = re.compile(
     r"myeloma|tumou?r))\b",
     re.IGNORECASE,
 )
-_LEADING_STOPWORDS = frozenset({
-    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on",
-    "or", "the", "to", "with",
-})
-_GENERIC_TUMOR_WORDS = frozenset({
-    "cancer", "carcinoma", "sarcoma", "leukemia", "lymphoma", "melanoma", "glioma",
-    "mesothelioma", "myeloma", "tumor", "tumour",
-})
 # Organ/site adjectives allowed to form a previously-unseen generic tumor phrase
 # (e.g. "biliary tract cancer"). Without this, "the annotation for this tumor"
 # would be extracted as a tumor type.
@@ -110,8 +107,10 @@ _COMMON_ENGLISH_WORDS = frozenset({
     "who", "why", "win", "yes", "yet", "you", "zoo",
 })
 _ASSAY_NAMES = frozenset({
-    "CT", "ELISA", "FISH", "IHC", "ISH", "MRI", "NGS", "PCR", "PET", "RTPCR",
-    "SANGER", "WB", "WES", "WGS", "RNASEQ",
+    "CDNA", "CNV", "CT", "DNA", "ELISA", "FISH", "FFPE", "IHC", "ISH", "MRI",
+    "MRNA", "MSI", "NGS", "PCR", "PET", "PMCID", "PMID", "RNA", "RNASEQ",
+    "RRNA", "RTPCR", "SANGER", "SEQ", "SNP", "TMB", "TRNA", "WB", "WES", "WGS",
+    "WT",
 })
 # Prefixes of hyphenated gene symbols (HLA-DRB1, MT-CO1) that must not be read
 # as fusions just because they contain a hyphen.
@@ -125,7 +124,16 @@ _TUMOR_DASHES = str.maketrans({
     "-": " ", "\u2010": " ", "\u2011": " ", "\u2012": " ", "\u2013": " ",
     "\u2014": " ", "\u2212": " ",
 })
-_TUMOR_NOUN = r"(?:cancers?|carcinomas?|tumou?rs?|neoplasms?)"
+# Explicit, curated histology phrases for common tumor types. These are kept
+# deliberately narrow: a wrong "found" is worse than a missed match.
+_EXTRA_TUMOR_ALIASES: dict[str, Tuple[str, ...]] = {
+    "ovarian cancer": (
+        "ovarian carcinoma",
+        "serous ovarian carcinoma",
+        "high-grade serous ovarian carcinoma",
+        "epithelial ovarian cancer",
+    ),
+}
 
 _SECTION_HEADING = "## Automated citation check"
 _ABSTRACT_CAVEAT = "abstract checked; full text not checked"
@@ -141,9 +149,13 @@ def _tumor_groups() -> dict[str, Tuple[str, ...]]:
             key_terms = [key]
         else:
             key_terms = [key.upper()]
-        group = tuple(dict.fromkeys([*key_terms, *aliases]))
-        for term in group:
-            groups.setdefault(term.casefold(), group)
+        group = [*key_terms, *aliases]
+        for canonical, extra in _EXTRA_TUMOR_ALIASES.items():
+            if canonical in group:
+                group.extend(extra)
+        deduped = tuple(dict.fromkeys(group))
+        for term in deduped:
+            groups.setdefault(term.casefold(), deduped)
     return groups
 
 
@@ -161,16 +173,40 @@ _TUMOR_ABBREVIATIONS = frozenset(
 )
 
 
-def _display_tumor(term: str) -> str:
-    return term
+def _parse_structured_pmid(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (pmid, None) or (None, reason) for one structured PMID value.
+
+    A 6-9 digit run is preferred; a single 1-10 digit number is accepted as a
+    fallback. Anything with several candidate numbers (or an unsupported ID
+    type) is reported instead of guessed, because a wrong PMID would check the
+    wrong paper.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None, None
+    if _PMCID.search(text):
+        return None, "PMCID not supported"
+    if _DOI_PREFIX.match(text):
+        return None, "DOI not supported"
+    preferred = _STRUCTURED_PMID_PREFERRED.findall(text)
+    if len(preferred) == 1:
+        return preferred[0], None
+    if len(preferred) > 1:
+        return None, "multiple candidate numbers"
+    fallback = _STRUCTURED_PMID_FALLBACK.findall(text)
+    if len(fallback) == 1:
+        return fallback[0], None
+    if len(fallback) > 1:
+        return None, "multiple candidate numbers"
+    return None, "no PMID found"
 
 
 def _collect_cited_pmids(
     text: Optional[str],
     structured_pmids: Optional[Iterable[str]] = None,
-) -> Tuple[List[str], List[str]]:
+) -> Tuple[List[str], List[Tuple[str, str]]]:
     found: List[str] = []
-    unparseable: List[str] = []
+    unparseable: List[Tuple[str, str]] = []
 
     def _add(value: str) -> None:
         if value and value not in found:
@@ -178,11 +214,13 @@ def _collect_cited_pmids(
 
     for value in structured_pmids or ():
         raw = str(value).strip()
-        match = _STRUCTURED_PMID.search(raw)
-        if match:
-            _add(match.group(0))
-        elif raw:
-            unparseable.append(raw)
+        if not raw:
+            continue
+        pmid, reason = _parse_structured_pmid(raw)
+        if pmid:
+            _add(pmid)
+        elif reason:
+            unparseable.append((raw, reason))
     source = text or ""
     for pattern in (_PMID_LABEL_PLURAL, _PMID_LABEL_SINGULAR, _PMID_URL):
         for match in pattern.finditer(source):
@@ -204,10 +242,12 @@ def parse_cited_pmids(
 
 
 def _is_gene_symbol(token: str) -> bool:
-    return bool(
-        re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,9}", token)
-        and any(character.isupper() for character in token)
-    )
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,15}", token):
+        return False
+    # Gene symbols are all-uppercase (letters/digits). Mixed case is only
+    # accepted when the token contains a digit (C11orf95, Notch1); this keeps
+    # ordinary words such as "Kras" or "Fusion" out of fusion detection.
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9]+", token) or any(c.isdigit() for c in token))
 
 
 def _is_variant(token: str) -> bool:
@@ -238,22 +278,32 @@ def _valid_fusion_pair(left: str, right: str, separator: str) -> bool:
     return True
 
 
-def extract_subject(message: str, gene: Optional[str] = None) -> Tuple[Optional[str], bool]:
-    """Return (subject, is_fusion) from the structured field or message.
-
-    The structured gene keeps its submitted case; matching is case-insensitive
-    for long symbols and case-sensitive only for short/ambiguous ones.
-    """
-    if gene and gene.strip():
-        subject = gene.strip()
-        _, right = _split_subject(subject)
-        return subject, right is not None
+def _fusion_matches(message: str) -> List[Tuple[str, str, str]]:
+    matches = []
     for match in _FUSION_SUBJECT.finditer(message or ""):
         left, separator, right = match.group(1), match.group(2), match.group(3)
         if not _valid_fusion_pair(left, right, separator):
             continue
         if separator == "-" and not _FUSION_CONTEXT.search(message or ""):
             continue
+        matches.append((left, separator, right))
+    return matches
+
+
+def extract_subject(message: str, gene: Optional[str] = None) -> Tuple[Optional[str], bool]:
+    """Return (subject, is_fusion) from the structured field or message.
+
+    The structured gene keeps its submitted case. Free-text fusions prefer an
+    explicit "::" match anywhere in the message over a "-" or "/" match, so a
+    real fusion is not lost behind an earlier slash-separated phrase.
+    """
+    if gene and gene.strip():
+        subject = gene.strip()
+        _, right = _split_subject(subject)
+        return subject, right is not None
+    matches = _fusion_matches(message)
+    preferred = [item for item in matches if "::" in item[1]]
+    for left, _, right in preferred or matches:
         return f"{left}::{right}", True
     match = _NAMED_GENE_SUBJECT.search(message or "")
     if match:
@@ -267,10 +317,40 @@ def _normalize_tumor_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").translate(_TUMOR_DASHES).lower()).strip()
 
 
-def _phrase_present(normalized_text: str, term: str) -> bool:
+def _tumor_negative_guard(normalized_text: str, normalized_term: str, start: int) -> bool:
+    # "tumor resembling ovarian ..." must not count as an ovarian tumor, and
+    # "non small cell lung cancer" must not satisfy "small cell lung cancer".
+    clause = re.split(r"[.;:]", normalized_text[max(0, start - 80):start])[-1]
+    if re.search(r"\bresembling\b", clause):
+        return True
+    if normalized_term.startswith("small cell ") and normalized_text[
+        max(0, start - 4):start
+    ] == "non ":
+        return True
+    return False
+
+
+def _abbreviation_blocked(text: str, term: str, end: int) -> bool:
+    if term == "GC":
+        return bool(
+            re.match(r"\s*-?\s*(?:content|rich)\b", text[end:end + 12], re.IGNORECASE)
+        )
+    return False
+
+
+def _term_match(text: str, normalized: str, term: str) -> bool:
+    if term.isupper():
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
+        for match in re.finditer(pattern, text or ""):
+            if not _abbreviation_blocked(text, term, match.end()):
+                return True
+        return False
     normalized_term = _normalize_tumor_text(term)
     pattern = rf"(?<![a-z0-9]){re.escape(normalized_term)}(?:s|es)?(?![a-z0-9])"
-    return bool(re.search(pattern, normalized_text))
+    for match in re.finditer(pattern, normalized):
+        if not _tumor_negative_guard(normalized, normalized_term, match.start()):
+            return True
+    return False
 
 
 def extract_tumor_type(message: str) -> Optional[str]:
@@ -278,22 +358,19 @@ def extract_tumor_type(message: str) -> Optional[str]:
     source = message or ""
     normalized = _normalize_tumor_text(source)
     for term in _TUMOR_TERMS:
-        if term.isupper():
-            if _contains(source, term, case_sensitive=True):
-                return term
-        elif _phrase_present(normalized, term):
+        if _term_match(source, normalized, term):
             return term
     match = _GENERIC_TUMOR.search(source)
     if not match:
         return None
     words = match.group(1).split()
-    while words and words[0].lower() in _LEADING_STOPWORDS:
-        words.pop(0)
-    if len(words) < 2 or not any(
-        word.casefold() in _ORGAN_SITE_WORDS for word in words[:-1]
-    ):
+    site_index = next(
+        (index for index, word in enumerate(words[:-1]) if word.casefold() in _ORGAN_SITE_WORDS),
+        None,
+    )
+    if site_index is None:
         return None
-    return " ".join(words)
+    return " ".join(words[site_index:])
 
 
 def _split_subject(subject: str) -> Tuple[str, Optional[str]]:
@@ -323,7 +400,12 @@ def _usable_aliases(aliases: Sequence[str]) -> List[str]:
 
 
 def _gene_case_sensitive(term: str) -> bool:
-    return len(term) <= 3 or term.casefold() in _COMMON_ENGLISH_WORDS
+    # All-letter terms (any length) are case-sensitive. A digit, a hyphen, or
+    # deliberate mixed case (C11orf95, c-Kit, Notch1) means the term is
+    # specific enough to match case-insensitively.
+    has_lower = any(character.islower() for character in term)
+    has_upper = any(character.isupper() for character in term)
+    return not (any(character.isdigit() for character in term) or "-" in term or (has_lower and has_upper))
 
 
 def _gene_mentioned(text: str, gene: str, aliases: Sequence[str]) -> bool:
@@ -340,31 +422,23 @@ def _tumor_aliases(tumor: str) -> Tuple[str, ...]:
     ) or (tumor,)
 
 
-def _organ_equivalence(normalized_text: str, tumor: str) -> bool:
-    organs = {
-        word
-        for alias in _tumor_aliases(tumor)
-        for word in re.findall(r"[a-z]+", _normalize_tumor_text(alias))
-        if word in _ORGAN_SITE_WORDS
-    }
-    for organ in organs:
-        pattern = rf"(?<![a-z0-9]){organ}(?![a-z0-9])(?:\W+\w+){{0,5}}\W+{_TUMOR_NOUN}"
-        if re.search(pattern, normalized_text):
-            return True
-    return False
-
-
-def _tumor_mentioned(text: str, tumor: Optional[str]) -> bool:
+def _tumor_match(text: str, tumor: Optional[str]) -> Optional[str]:
+    """Return the alias term found in text, or None. No organ-equivalence rules."""
     if not tumor:
-        return False
+        return None
     normalized = _normalize_tumor_text(text)
     for term in _tumor_aliases(tumor):
-        if term.isupper():
-            if _contains(text, term, case_sensitive=True):
-                return True
-        elif _phrase_present(normalized, term):
-            return True
-    return _organ_equivalence(normalized, tumor)
+        if _term_match(text, normalized, term):
+            return term
+    return None
+
+
+def _tumor_detail(text: str, tumor: str) -> str:
+    matched = _tumor_match(text, tumor)
+    if matched:
+        return f"{tumor}: found: {matched}"
+    searched = ", ".join(_tumor_aliases(tumor))
+    return f"{tumor}: not found (searched: {searched})"
 
 
 def _yes(flag: bool) -> str:
@@ -403,9 +477,9 @@ def _retraction_kind(record) -> Optional[str]:
     if "retraction of publication" in types or "retractionof" in refs:
         return "retraction notice"
     title = (record.title or "").strip().lower()
-    if title.startswith("retraction"):
+    if re.match(r"^\[?retraction\b", title):
         return "retraction notice"
-    if title.startswith("retracted"):
+    if re.match(r"^\[?retracted\b", title):
         return "retracted publication"
     return None
 
@@ -436,7 +510,7 @@ def _record_line(
     else:
         detail = f"mentions `{_safe_code(five)}` — {_yes(five_hit)}"
     if tumor:
-        detail += f"; {tumor} — {_yes(_tumor_mentioned(text, tumor))}"
+        detail += f"; {_tumor_detail(text, tumor)}"
     return f"- PMID {pmid}: {detail} ({_ABSTRACT_CAVEAT})"
 
 
@@ -471,9 +545,11 @@ async def _build_section(
     return "\n".join([_SECTION_HEADING, "", *intro, "", *lines])
 
 
-def _unparseable_lines(values: Sequence[str]) -> List[str]:
-    rendered = ", ".join(f"`{_safe_code(value)}`" for value in values)
-    return [f"- Unparseable structured PMID value(s): {rendered} (not checked)."]
+def _unparseable_lines(values: Sequence[Tuple[str, str]]) -> List[str]:
+    return [
+        f"- Structured PMID value `{_safe_code(value)}` not checked: {reason}."
+        for value, reason in values
+    ]
 
 
 def _unavailable(reason: str) -> str:

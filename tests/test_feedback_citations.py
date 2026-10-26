@@ -63,6 +63,19 @@ def test_parse_structured_pmids_accepts_common_pasted_forms():
     assert parse_cited_pmids(None, ["12345", "PMID 41424301"]) == ["12345", "41424301"]
 
 
+def test_parse_structured_pmid_prefers_six_to_nine_digit_run():
+    assert parse_cited_pmids(None, ["2025 paper 41424301"]) == ["41424301"]
+
+
+def test_parse_structured_pmid_rejects_multiple_candidates():
+    assert parse_cited_pmids(None, ["41424301 and 41424302"]) == []
+    assert parse_cited_pmids(None, ["doi:10.1038/s41586-023-06123-4"]) == []
+
+
+def test_parse_structured_pmid_rejects_pmcid():
+    assert parse_cited_pmids(None, ["PMC1234567"]) == []
+
+
 def test_parse_label_without_space():
     assert parse_cited_pmids("See PMID12345678 for details.") == ["12345678"]
 
@@ -125,6 +138,30 @@ def test_extract_subject_rejects_non_fusion_tokens(message):
     assert is_fusion is False
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "RNA-Seq detected the fusion.",
+        "Next-Generation sequencing.",
+        "Fusion-Positive.",
+        "Kras-Mutant.",
+        "PMID/PMCID mismatch.",
+        "Wild-Type allele; no fusion.",
+    ],
+)
+def test_mixed_case_words_are_not_gene_tokens(message):
+    assert extract_subject(message) == (None, False)
+
+
+def test_explicit_gene_wins_over_earlier_mixed_case_words():
+    assert extract_subject("Wild-Type allele; EML4-ALK fusion.") == ("EML4::ALK", True)
+    assert extract_subject("Yes/No answer for GREB1::BCL9L") == ("GREB1::BCL9L", True)
+
+
+def test_explicit_double_colon_fusion_is_preferred_over_slash():
+    assert extract_subject("TP53/EGFR and EML4::ALK fusion.") == ("EML4::ALK", True)
+
+
 def test_extract_subject_prefers_structured_gene():
     assert extract_subject("Review GREB1::BCL9L fusion.", "TP53") == ("TP53", False)
 
@@ -153,6 +190,10 @@ def test_hyphenated_gene_symbol_is_not_mistaken_for_a_fusion():
         ("Reported in biliary tract cancer.", "biliary tract cancer"),
         ("Reported in ovarian cancers.", "ovarian cancer"),
         ("Reported in non\u2013small cell lung cancer.", "non-small cell lung cancer"),
+        ("Review in ovarian carcinoma.", "ovarian carcinoma"),
+        ("Review in biliary carcinoma.", "biliary carcinoma"),
+        ("Analyze GC content.", None),
+        ("GC-rich regions were enriched.", None),
         ("The annotation for this tumor is wrong.", None),
         ("Please fix the export dropdown.", None),
     ],
@@ -189,6 +230,20 @@ def test_long_and_hyphenated_genes_match_case_insensitively():
     assert _gene_mentioned("c-Kit driven leukemia", "KIT", ["c-Kit"]) is True
     assert _gene_mentioned("c11orf95 rearrangement", "C11orf95", []) is True
     assert _gene_mentioned("C11ORF95-RELA fusion", "C11orf95-RELA", []) is True
+    assert _gene_mentioned("NOTCH1 driven leukemia", "Notch1", []) is True
+
+
+@pytest.mark.parametrize(
+    "gene,aliases,text",
+    [
+        ("REST", [], "The rest of the cohort recovered."),
+        ("DDIT3", ["CHOP"], "We chop the tissue before staining."),
+        ("TNFSF14", ["LIGHT"], "In light of these results."),
+        ("DDIT3", ["STOP"], "A stop codon was introduced."),
+    ],
+)
+def test_all_letter_gene_terms_match_case_sensitively(gene, aliases, text):
+    assert _gene_mentioned(text, gene, aliases) is False
 
 
 def test_structured_gene_keeps_submitted_case():
@@ -222,7 +277,10 @@ async def test_positive_gene_mention_and_tumor(pubmed):
         "Review TP53 annotation for ovarian cancer. PMID 41424301", gene="TP53"
     )
     assert "## Automated citation check" in section
-    assert "PMID 41424301: mentions `TP53` — yes; ovarian cancer — yes" in section
+    assert (
+        "PMID 41424301: mentions `TP53` — yes; ovarian cancer: found: ovarian cancer"
+        in section
+    )
     assert "(abstract checked; full text not checked)" in section
     assert pubmed["pmids"] == ["41424301"]
     assert pubmed["filter_retracted"] is False
@@ -240,7 +298,7 @@ async def test_negative_fusion_partner_is_called_out(pubmed):
         "Review GREB1::BCL9L fusion annotation for ovarian cancer. PMID 41424301"
     )
     assert "mentions `GREB1` — yes; `BCL9L` — NO" in section
-    assert "ovarian cancer — yes" in section
+    assert "ovarian cancer: found: ovarian cancer" in section
     assert "(abstract checked; full text not checked)" in section
 
 
@@ -262,7 +320,7 @@ async def test_tumor_alias_expansion_matches_full_name(pubmed):
     section = await build_citation_check_section(
         "Review TP53 in NSCLC. PMID 41424301", gene="TP53"
     )
-    assert "NSCLC — yes" in section
+    assert "NSCLC: found: non-small cell lung cancer" in section
 
 
 async def test_breast_cancer_abstract_does_not_match_nsclc(pubmed):
@@ -272,7 +330,8 @@ async def test_breast_cancer_abstract_does_not_match_nsclc(pubmed):
     section = await build_citation_check_section(
         "Review TP53 in NSCLC. PMID 41424301", gene="TP53"
     )
-    assert "NSCLC — NO" in section
+    assert "NSCLC: not found" in section
+    assert "searched: NSCLC, non-small cell lung cancer" in section
 
 
 async def test_aml_abstract_does_not_match_all(pubmed):
@@ -280,7 +339,65 @@ async def test_aml_abstract_does_not_match_all(pubmed):
     section = await build_citation_check_section(
         "Review TP53 in ALL. PMID 41424301", gene="TP53"
     )
-    assert "ALL — NO" in section
+    assert "ALL: not found" in section
+
+
+async def test_utrosct_does_not_count_as_ovarian_cancer(pubmed):
+    pubmed["records"] = [
+        _record(
+            "41424301",
+            "Uterine tumor resembling ovarian sex cord tumor (UTROSCT)",
+            "TP53 cohort.",
+        )
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 annotation for ovarian cancer. PMID 41424301", gene="TP53"
+    )
+    assert "ovarian cancer: not found" in section
+
+
+async def test_colorectal_metastasis_does_not_count_as_ovarian(pubmed):
+    pubmed["records"] = [
+        _record("41424301", "Ovarian metastasis from colorectal carcinoma", "")
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 annotation for ovarian cancer. PMID 41424301", gene="TP53"
+    )
+    assert "ovarian cancer: not found" in section
+
+
+async def test_ovarian_function_sentence_does_not_count_as_ovarian(pubmed):
+    pubmed["records"] = [
+        _record(
+            "41424301",
+            "Ovarian function was preserved. The uterine tumor was resected.",
+            "",
+        )
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 annotation for ovarian cancer. PMID 41424301", gene="TP53"
+    )
+    assert "ovarian cancer: not found" in section
+
+
+async def test_sclc_abstract_does_not_match_nsclc(pubmed):
+    pubmed["records"] = [
+        _record("41424301", "TP53 in small cell lung cancer", "TP53 cohort.")
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 in NSCLC. PMID 41424301", gene="TP53"
+    )
+    assert "NSCLC: not found" in section
+
+
+async def test_nsclc_abstract_does_not_match_sclc(pubmed):
+    pubmed["records"] = [
+        _record("41424301", "TP53 in non-small cell lung cancer", "TP53 cohort.")
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 in SCLC. PMID 41424301", gene="TP53"
+    )
+    assert "SCLC: not found" in section
 
 
 async def test_no_tumor_detected_is_stated(pubmed):
@@ -352,12 +469,30 @@ async def test_retraction_notice_is_labelled_distinctly(pubmed):
     assert "PMID 41424301: RETRACTED — retraction notice" in section
 
 
-async def test_tumor_organ_equivalence_matches_ovarian_carcinoma(pubmed):
+async def test_retraction_title_is_detected(pubmed):
+    pubmed["records"] = [_record("41424301", "Retraction: TP53 study", "")]
+    section = await build_citation_check_section(
+        "Review TP53 annotation. PMID 41424301", gene="TP53"
+    )
+    assert "PMID 41424301: RETRACTED — retraction notice" in section
+
+
+async def test_bibliometric_retractions_title_is_not_flagged(pubmed):
+    pubmed["records"] = [
+        _record("41424301", "Retractions in oncology: a bibliometric study", "")
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 annotation. PMID 41424301", gene="TP53"
+    )
+    assert "RETRACTED" not in section
+
+
+async def test_ovarian_carcinoma_is_an_explicit_ovarian_cancer_alias(pubmed):
     pubmed["records"] = [_record("41424301", "TP53 in ovarian carcinoma", "")]
     section = await build_citation_check_section(
         "Review TP53 annotation for ovarian cancer. PMID 41424301", gene="TP53"
     )
-    assert "ovarian cancer — yes" in section
+    assert "ovarian cancer: found: ovarian carcinoma" in section
 
 
 async def test_untrusted_subject_cannot_break_code_span(pubmed):
@@ -556,7 +691,34 @@ def test_unparseable_structured_pmid_is_reported(feedback_client):
     assert response.status_code == 201
     body = response.json()["issue_body"]
     assert "No parseable PMIDs were cited; citation check skipped." in body
-    assert "Unparseable structured PMID value(s): `abc` (not checked)." in body
+    assert "Structured PMID value `abc` not checked: no PMID found." in body
+
+
+def test_pmcid_structured_value_is_reported_as_unsupported(feedback_client):
+    response = feedback_client.post(
+        "/v1/feedback",
+        json={
+            "category": "gene_annotation_issue",
+            "message": "The cited paper does not support this annotation.",
+            "pmids": ["PMC1234567"],
+        },
+    )
+    assert response.status_code == 201
+    body = response.json()["issue_body"]
+    assert "Structured PMID value `PMC1234567` not checked: PMCID not supported." in body
+
+
+def test_doi_structured_value_is_reported_as_unsupported(feedback_client):
+    response = feedback_client.post(
+        "/v1/feedback",
+        json={
+            "category": "gene_annotation_issue",
+            "message": "The cited paper does not support this annotation.",
+            "pmids": ["doi:10.1038/s41586-023-06123-4"],
+        },
+    )
+    assert response.status_code == 201
+    assert "DOI not supported" in response.json()["issue_body"]
 
 
 def test_structured_pmid_list_is_capped_at_twenty(feedback_client):
