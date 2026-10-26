@@ -8,6 +8,7 @@ MySQL is reachable, so the rest of the suite isn't blocked by it.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 import aiomysql
@@ -17,6 +18,7 @@ from src.config import settings
 from src.models.schema import GeneAnnotation
 from src.pipeline.run_store import (
     RunStore,
+    RunsSchemaUpgradeError,
     _mysql_connection_kwargs,
     _parse_jdbc_mysql_host_port,
     summarize_run_inputs,
@@ -361,13 +363,52 @@ async def test_multibyte_input_summary_round_trips(run_store):
     assert len(expected) == 255
 
 
-async def test_schema_upgrade_lock_timeout_starts_degraded(run_store, monkeypatch):
-    """A long-running reader holding `runs` makes the column ALTER wait; it
-    gives up after the configured timeout instead of stalling startup."""
-    async with run_store._pool.acquire() as conn:
+async def _session_lock_wait_timeouts(store) -> set[int]:
+    """@@SESSION.lock_wait_timeout of every idle pooled connection."""
+    conns = [await store._pool.acquire() for _ in range(store._pool.freesize)]
+    try:
+        values = set()
+        for conn in conns:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT @@SESSION.lock_wait_timeout")
+                values.add((await cursor.fetchone())[0])
+        return values
+    finally:
+        for conn in conns:
+            store._pool.release(conn)
+
+
+async def _global_lock_wait_timeout(store) -> int:
+    async with store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT @@GLOBAL.lock_wait_timeout")
+            return (await cursor.fetchone())[0]
+
+
+async def _make_legacy_runs_table(store) -> None:
+    async with store._pool.acquire() as conn:
         async with conn.cursor() as cursor:
             await cursor.execute("DROP TABLE runs")
             await cursor.execute(_LEGACY_RUNS_SQL)
+
+
+async def test_schema_upgrade_restores_lock_wait_timeout_on_pooled_connections(run_store, monkeypatch):
+    monkeypatch.setattr(settings, "runs_ddl_lock_wait_timeout_seconds", 3)
+    await _make_legacy_runs_table(run_store)
+    default = await _global_lock_wait_timeout(run_store)
+    assert default != 3
+
+    await run_store._ensure_schema()
+
+    assert "owner_email" in await _runs_columns(run_store)
+    assert await _session_lock_wait_timeouts(run_store) == {default}
+
+
+async def test_schema_upgrade_lock_timeout_fails_startup(run_store, monkeypatch):
+    """A long-running reader holding `runs` makes the column ALTER wait; after
+    the bounded wait startup fails rather than saving runs without owners."""
+    await _make_legacy_runs_table(run_store)
+    default = await _global_lock_wait_timeout(run_store)
     monkeypatch.setattr(settings, "runs_ddl_lock_wait_timeout_seconds", 1)
 
     holder = await aiomysql.connect(**_mysql_connection_kwargs(), autocommit=False)
@@ -375,18 +416,18 @@ async def test_schema_upgrade_lock_timeout_starts_degraded(run_store, monkeypatc
         async with holder.cursor() as cursor:
             await cursor.execute("BEGIN")
             await cursor.execute("SELECT COUNT(*) FROM runs")  # holds a metadata lock until commit
-        await run_store._ensure_schema()
+        started = time.monotonic()
+        with pytest.raises(RunsSchemaUpgradeError, match="Timed out after 1s"):
+            await run_store._ensure_schema()
+        assert time.monotonic() - started < 10
     finally:
         await holder.rollback()
         holder.close()
 
-    assert not run_store._owner_columns_ready
     assert "owner_email" not in await _runs_columns(run_store)
-    await run_store.save_run("run-1", "2026-10-26T12:00:00+00:00", {"gene": "ALK"}, {}, owner_email="a@mskcc.org")
-    assert await run_store.get_run("run-1") == {}
-    assert (await run_store.list_runs_for_owner("a@mskcc.org")).runs == []
+    assert await _session_lock_wait_timeouts(run_store) == {default}
 
-    await run_store._ensure_schema()  # lock released: the next startup completes the upgrade
+    await run_store._ensure_schema()  # lock released: the restart completes the upgrade
 
-    assert run_store._owner_columns_ready
     assert "owner_email" in await _runs_columns(run_store)
+    assert await _session_lock_wait_timeouts(run_store) == {default}

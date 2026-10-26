@@ -9,7 +9,9 @@ real-SQL round trips live in tests/test_run_store.py.
 from __future__ import annotations
 
 import base64
+import inspect
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
@@ -26,9 +28,11 @@ from src.api_keys import ApiKeyRecord, InMemoryRateLimiter, generate_api_key, ha
 from src.auth import AuthenticatedUser, create_session_token
 from src.config import settings
 from src.models.schema import AnnotationResult, GeneAnnotation
+from src.pipeline import run_store as run_store_module
 from src.pipeline.run_store import (
     INPUT_SUMMARY_MAX_LENGTH,
     RunStore,
+    RunsSchemaUpgradeError,
     _decode_runs_cursor,
     _encode_runs_cursor,
     summarize_run_inputs,
@@ -273,14 +277,16 @@ class FakeCursor:
 
     `alter_errors` holds one MySQL error code (or None for success) per ALTER,
     consumed in order. A duplicate-column/key error also applies the change,
-    as the concurrent pod that caused it would have.
+    as the concurrent pod that caused it would have, unless
+    `duplicate_applies` is False (that pod added only some columns).
     """
 
-    def __init__(self, columns=(), indexes=(), rows=(), alter_errors=()):
+    def __init__(self, columns=(), indexes=(), rows=(), alter_errors=(), duplicate_applies=True):
         self.columns = set(columns)
         self.indexes = set(indexes)
         self.rows = list(rows)
         self.alter_errors = list(alter_errors)
+        self.duplicate_applies = duplicate_applies
         self.lock_wait_timeout = 31536000
         self.executed: list[tuple[str, tuple]] = []
         self._result: list = []
@@ -303,7 +309,7 @@ class FakeCursor:
             self._result = [("runs", 1, index)] if index in self.indexes else []
         elif sql.startswith("ALTER TABLE runs"):
             code = self.alter_errors.pop(0) if self.alter_errors else None
-            if code in (1060, 1061):
+            if code in (1060, 1061) and self.duplicate_applies:
                 self._apply_alter(sql)
             if code is not None:
                 raise pymysql.err.OperationalError(code, "failed")
@@ -362,7 +368,6 @@ async def test_runs_schema_upgrade_adds_columns_instantly_and_index_online_once(
     add_columns, add_index = _alters(cursor)
     assert add_columns.count("ADD COLUMN") == 5 and add_columns.endswith(", ALGORITHM=INSTANT")
     assert add_index.endswith(", ALGORITHM=INPLACE, LOCK=NONE")
-    assert store._owner_columns_ready
 
     cursor.executed.clear()
     await store._ensure_runs_schema(cursor)
@@ -403,7 +408,6 @@ async def test_runs_schema_upgrade_falls_back_to_inplace_without_instant(instant
     assert instant.endswith("ALGORITHM=INSTANT")
     assert inplace.replace(", ALGORITHM=INPLACE, LOCK=NONE", "") == instant.replace(", ALGORITHM=INSTANT", "")
     assert cursor.columns == _RUNS_COLUMNS
-    assert store._owner_columns_ready
 
 
 async def test_runs_schema_upgrade_tolerates_a_concurrent_upgrade():
@@ -413,7 +417,7 @@ async def test_runs_schema_upgrade_tolerates_a_concurrent_upgrade():
     await store._ensure_runs_schema(cursor)
 
     assert len(_alters(cursor)) == 2
-    assert store._owner_columns_ready
+    assert cursor.columns == _RUNS_COLUMNS
 
 
 async def test_runs_schema_upgrade_reraises_other_errors():
@@ -424,30 +428,58 @@ async def test_runs_schema_upgrade_reraises_other_errors():
     assert cursor.lock_wait_timeout == 31536000  # restored even on failure
 
 
-async def test_column_lock_timeout_starts_degraded(caplog):
-    cursor = FakeCursor(alter_errors=[1205])
-    store = RunStore(FakePool(cursor))
+@pytest.mark.parametrize("alter_errors", [[1205], [1845, 1205]], ids=["instant", "inplace-fallback"])
+async def test_column_lock_timeout_fails_startup_with_a_clear_error(alter_errors, monkeypatch):
+    monkeypatch.setattr(settings, "runs_ddl_lock_wait_timeout_seconds", 7)
+    cursor = FakeCursor(alter_errors=alter_errors)
 
-    with caplog.at_level(logging.WARNING, logger="src.pipeline.run_store"):
-        await store._ensure_runs_schema(cursor)
+    with pytest.raises(RunsSchemaUpgradeError) as raised:
+        await RunStore(FakePool(cursor))._ensure_runs_schema(cursor)
 
-    assert not store._owner_columns_ready
-    assert len(_alters(cursor)) == 1  # no index attempt without its columns
-    assert "starting without them" in caplog.text
+    message = str(raised.value)
+    assert "Timed out after 7s" in message and "refusing to start" in message
+    assert "ALTER TABLE runs ADD COLUMN owner_email" in message  # the manual fix
+    assert isinstance(raised.value.__cause__, pymysql.err.OperationalError)
+    assert cursor.columns == set()
+    assert not any("ADD INDEX" in sql for sql in _alters(cursor))
     assert cursor.lock_wait_timeout == 31536000
 
-    # Saves still succeed, just without the owner columns ...
-    await store.save_run(
-        "run-1", "2026-10-26T12:00:00+00:00", {"gene": "ALK"}, {}, owner_email="a@mskcc.org", source="session"
-    )
-    sql, params = cursor.executed[-1]
-    assert sql.startswith("INSERT INTO runs (run_id, created_at, request_json, result_json) VALUES")
-    assert len(params) == 4
-    # ... and listings are empty rather than failing on missing columns.
-    statements = len(cursor.executed)
-    page = await store.list_runs_for_owner("a@mskcc.org")
-    assert page.runs == [] and page.next_cursor is None
-    assert len(cursor.executed) == statements
+
+async def test_columns_still_missing_after_a_concurrent_upgrade_fails_startup():
+    cursor = FakeCursor(alter_errors=[1060], duplicate_applies=False)
+
+    with pytest.raises(RunsSchemaUpgradeError, match="still missing run owner columns"):
+        await RunStore(FakePool(cursor))._ensure_runs_schema(cursor)
+
+
+async def test_failed_upgrade_closes_the_pool(monkeypatch):
+    closed = []
+
+    class Pool(FakePool):
+        def close(self):
+            closed.append(True)
+
+        async def wait_closed(self):
+            pass
+
+    async def fake_create_pool(**kwargs):
+        return Pool(FakeCursor(alter_errors=[1205]))
+
+    monkeypatch.setattr("src.pipeline.run_store.aiomysql.create_pool", fake_create_pool)
+    monkeypatch.setattr(RunStore, "_ensure_schema", lambda self: self._ensure_runs_schema(self._pool._cursor))
+
+    with pytest.raises(RunsSchemaUpgradeError):
+        await RunStore.create()
+    assert closed == [True]
+
+
+def test_no_code_path_saves_a_run_without_owner_columns():
+    source = inspect.getsource(run_store_module)
+    inserts = re.findall(r"INSERT INTO runs \(([^)]*)\)", source)
+
+    assert inserts, "expected at least one INSERT INTO runs"
+    for columns in inserts:
+        assert "owner_email" in columns and "source" in columns and "input_summary" in columns
 
 
 async def test_index_lock_timeout_keeps_owner_columns_usable(caplog):
@@ -457,9 +489,18 @@ async def test_index_lock_timeout_keeps_owner_columns_usable(caplog):
     with caplog.at_level(logging.WARNING, logger="src.pipeline.run_store"):
         await store._ensure_runs_schema(cursor)
 
-    assert store._owner_columns_ready
+    assert cursor.columns == _RUNS_COLUMNS
     assert cursor.indexes == set()
     assert "idx_runs_owner_created_at" in caplog.text
+    assert cursor.lock_wait_timeout == 31536000
+
+    # Startup continued, and new runs still record their owner.
+    await store.save_run(
+        "run-1", "2026-10-26T12:00:00+00:00", {"gene": "ALK"}, {}, owner_email="A@mskcc.org", source="session"
+    )
+    sql, params = cursor.executed[-1]
+    assert "owner_email, source, input_summary" in sql
+    assert params[4:7] == ("a@mskcc.org", "session", "ALK")
 
 
 async def test_save_run_writes_owner_source_and_summary():

@@ -56,7 +56,12 @@ _RUNS_OWNER_INDEX = "idx_runs_owner_created_at"
 _ER_DUP_FIELDNAME = 1060
 _ER_DUP_KEYNAME = 1061
 _ER_LOCK_WAIT_TIMEOUT = 1205
-# ALGORITHM=INSTANT unknown (MySQL < 8.0) or not possible for this table.
+# Errors after which the column ALTER retries with ALGORITHM=INPLACE: INSTANT
+# is an unknown algorithm (MySQL < 8.0, error 1800) or the operation isn't
+# supported with it (1845/1846). Other INSTANT limitations, e.g. too many
+# row versions (4092) or a table that can't take an instant column (4158),
+# are deliberately not listed: they fail startup so an operator can run the
+# upgrade by hand rather than have pods silently rebuild a large table.
 _ER_UNKNOWN_ALTER_ALGORITHM = 1800
 _ER_ALTER_OPERATION_NOT_SUPPORTED = 1845
 _ER_ALTER_OPERATION_NOT_SUPPORTED_REASON = 1846
@@ -281,14 +286,15 @@ def _mysql_connection_kwargs() -> Dict[str, Any]:
     }
 
 
+class RunsSchemaUpgradeError(RuntimeError):
+    """Startup couldn't add the run owner columns to `runs`."""
+
+
 class RunStore:
     """Save/fetch runs and reusable gene annotations. Calling code never issues raw SQL."""
 
     def __init__(self, pool: aiomysql.Pool):
         self._pool = pool
-        # False only when startup couldn't add the owner columns to `runs`
-        # (see _ensure_runs_schema); saves and listings then skip them.
-        self._owner_columns_ready = True
 
     @classmethod
     async def create(cls) -> "RunStore":
@@ -297,7 +303,11 @@ class RunStore:
             autocommit=True,
         )
         store = cls(pool)
-        await store._ensure_schema()
+        try:
+            await store._ensure_schema()
+        except BaseException:
+            await store.close()
+            raise
         return store
 
     async def _ensure_schema(self) -> None:
@@ -317,13 +327,17 @@ class RunStore:
     async def _ensure_runs_schema(self, cursor) -> None:
         """Add owner/listing columns and index to `runs` tables created before them.
 
-        `runs` can be large, so this is built to never stall a pod's startup:
-        the columns go in one ALTER that is metadata-only where the server
-        supports ALGORITHM=INSTANT, the index is built online, and every DDL
-        waits at most `runs_ddl_lock_wait_timeout_seconds` for the table's
-        metadata lock. On a timeout the app starts anyway: without the
-        columns, saves skip owner fields and owner listings come back empty
-        until a later startup completes the upgrade.
+        `runs` can be large, so the columns go in one ALTER that is
+        metadata-only where the server supports ALGORITHM=INSTANT, and the
+        index is built online (INPLACE, LOCK=NONE). Each DDL waits at most
+        `runs_ddl_lock_wait_timeout_seconds` to acquire the table's metadata
+        lock; that bounds the wait for other queries, not the DDL's own
+        runtime, so an INPLACE fallback or index build on a large table can
+        still take long once it has the lock.
+
+        If the columns can't be added, startup fails (RunsSchemaUpgradeError):
+        every new run must record its owner, and a restart retries. If only the
+        index can't be built, startup continues; listing works without it.
         """
         await cursor.execute("SELECT @@SESSION.lock_wait_timeout")
         previous_timeout = (await cursor.fetchone())[0]
@@ -332,8 +346,7 @@ class RunStore:
         )
         try:
             await self._add_runs_owner_columns(cursor)
-            if self._owner_columns_ready:
-                await self._add_runs_owner_index(cursor)
+            await self._add_runs_owner_index(cursor)
         finally:
             await cursor.execute("SET SESSION lock_wait_timeout = %s", (previous_timeout,))
 
@@ -344,28 +357,35 @@ class RunStore:
     async def _add_runs_owner_columns(self, cursor) -> None:
         present = await self._runs_columns(cursor)
         missing = [(column, definition) for column, definition in _RUNS_ADDED_COLUMNS if column not in present]
-        if missing:
-            add_columns = ", ".join(f"ADD COLUMN {column} {definition}" for column, definition in missing)
+        if not missing:
+            return
+        add_columns = ", ".join(f"ADD COLUMN {column} {definition}" for column, definition in missing)
+        try:
             try:
-                try:
-                    await cursor.execute(f"ALTER TABLE runs {add_columns}, ALGORITHM=INSTANT")
-                except pymysql.err.MySQLError as exc:
-                    if _mysql_errno(exc) not in _INSTANT_UNSUPPORTED_ERRORS:
-                        raise
-                    await cursor.execute(f"ALTER TABLE runs {add_columns}, ALGORITHM=INPLACE, LOCK=NONE")
+                await cursor.execute(f"ALTER TABLE runs {add_columns}, ALGORITHM=INSTANT")
             except pymysql.err.MySQLError as exc:
-                if _mysql_errno(exc) == _ER_LOCK_WAIT_TIMEOUT:
-                    logger.warning(
-                        "Timed out after %ss waiting for a lock to add run owner columns to `runs`; "
-                        "starting without them. New runs are saved unowned and run lists are empty "
-                        "until a restart completes the upgrade.",
-                        settings.runs_ddl_lock_wait_timeout_seconds,
-                    )
-                elif _mysql_errno(exc) != _ER_DUP_FIELDNAME:
+                if _mysql_errno(exc) not in _INSTANT_UNSUPPORTED_ERRORS:
                     raise
-        # Re-read: a concurrent pod may have added some or all of them.
-        present = await self._runs_columns(cursor)
-        self._owner_columns_ready = all(column in present for column, _ in _RUNS_ADDED_COLUMNS)
+                await cursor.execute(f"ALTER TABLE runs {add_columns}, ALGORITHM=INPLACE, LOCK=NONE")
+        except pymysql.err.MySQLError as exc:
+            if _mysql_errno(exc) == _ER_LOCK_WAIT_TIMEOUT:
+                raise RunsSchemaUpgradeError(
+                    f"Timed out after {settings.runs_ddl_lock_wait_timeout_seconds}s waiting for the "
+                    "metadata lock on `runs` to add the run owner columns, so refusing to start "
+                    "(new runs must record their owner). A restart retries; to avoid this, run "
+                    f"`ALTER TABLE runs {add_columns}, ALGORITHM=INSTANT` off-peak, or raise "
+                    "RUNS_DDL_LOCK_WAIT_TIMEOUT_SECONDS."
+                ) from exc
+            if _mysql_errno(exc) != _ER_DUP_FIELDNAME:
+                raise
+        # Re-read: a concurrent pod's upgrade (a duplicate-column error above)
+        # may have added only some of them.
+        still_missing = [column for column, _ in _RUNS_ADDED_COLUMNS if column not in await self._runs_columns(cursor)]
+        if still_missing:
+            raise RunsSchemaUpgradeError(
+                f"`runs` is still missing run owner columns {still_missing} after the upgrade; "
+                "refusing to start. A restart retries."
+            )
 
     async def _add_runs_owner_index(self, cursor) -> None:
         await cursor.execute(f"SHOW INDEX FROM runs WHERE Key_name = '{_RUNS_OWNER_INDEX}'")
@@ -378,10 +398,11 @@ class RunStore:
             )
         except pymysql.err.MySQLError as exc:
             if _mysql_errno(exc) == _ER_LOCK_WAIT_TIMEOUT:
-                # Listing still works without it, just via a table scan.
+                # Owner columns are in place, so runs are still saved with their
+                # owner; listing just scans instead of using the index.
                 logger.warning(
-                    "Timed out after %ss waiting for a lock to add index %s to `runs`; "
-                    "starting without it. A restart will retry.",
+                    "Timed out after %ss waiting for the metadata lock on `runs` to add index %s; "
+                    "starting without it (run listing is slower until a restart adds it).",
                     settings.runs_ddl_lock_wait_timeout_seconds,
                     _RUNS_OWNER_INDEX,
                 )
@@ -416,15 +437,6 @@ class RunStore:
         owner_email: Optional[str] = None,
         source: Optional[str] = None,
     ) -> None:
-        if not self._owner_columns_ready:
-            async with self._pool.acquire() as conn:
-                async with conn.cursor() as cursor:
-                    await cursor.execute(
-                        "INSERT INTO runs (run_id, created_at, request_json, result_json) "
-                        "VALUES (%s, %s, %s, %s)",
-                        (run_id, _to_utc_datetime(created_at), json.dumps(request_payload), json.dumps(result_payload)),
-                    )
-            return
         input_summary, input_count = summarize_run_inputs(request_payload)
         genes_annotated = result_payload.get("genes_annotated")
         async with self._pool.acquire() as conn:
@@ -460,8 +472,6 @@ class RunStore:
         if limit < 1:
             raise ValueError("limit must be at least 1")
         before = _decode_runs_cursor(cursor) if cursor is not None else None
-        if not self._owner_columns_ready:
-            return RunSummaryPage(runs=[], next_cursor=None)
         sql = (
             "SELECT run_id, created_at, source, input_summary, input_count, genes_annotated "
             "FROM runs WHERE owner_email = %s"
