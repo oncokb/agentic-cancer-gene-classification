@@ -39,7 +39,7 @@ from src.models.schema import (
     LiteraturePaperScore,
     LiteratureRecord,
 )
-from src.pipeline.normalization import resolve_gene, split_fusion
+from src.pipeline.normalization import has_ensembl_identifier, read_gene_input, resolve_gene, split_fusion
 from src.pipeline.cache import cached_call
 from src.pipeline.llm_client import (
     complete_with_tool,
@@ -748,6 +748,17 @@ async def retrieve_fusion_evidence(
     max_results: Optional[int] = None,
 ) -> FusionEvidenceResult:
     """Return deterministic fusion-level PubMed evidence for exact gene-pair queries."""
+    submitted = fusion
+    if has_ensembl_identifier(fusion):
+        # PubMed knows symbols, not Ensembl IDs: query the resolved pair.
+        reading = await read_gene_input(fusion)
+        if reading.errors:
+            return FusionEvidenceResult(
+                fusion=fusion,
+                tumor_type=tumor_type,
+                interpretation="Fusion evidence was not retrieved: " + " ".join(reading.errors),
+            )
+        fusion = reading.canonical
     max_results = max_results or settings.fusion_evidence_max_results
     cache_key = "fusion_evidence:" + json.dumps(
         {
@@ -775,7 +786,10 @@ async def retrieve_fusion_evidence(
         _compute,
         ttl_seconds=settings.fusion_evidence_cache_ttl_seconds,
     )
-    return FusionEvidenceResult(**payload)
+    result = FusionEvidenceResult(**payload)
+    if fusion != submitted:
+        result.input = submitted
+    return result
 
 
 async def _retrieve_fusion_evidence_uncached(

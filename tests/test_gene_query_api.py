@@ -151,6 +151,8 @@ def test_slim_mapping_is_an_allowlist():
 
     assert set(GeneRationale.model_fields) == {
         "gene",
+        "submitted_inputs",
+        "warnings",
         "tumor_type",
         "cancer_associated",
         "gene_class",

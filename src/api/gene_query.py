@@ -25,7 +25,7 @@ from src.api.run_persistence import GENERIC_FAILURE, save_run_or_raise
 from src.config import settings
 from src.models.schema import AnnotateRequest, AnnotationResult, CacheStatus, FusionInput, GeneAnnotation
 from src.observability import record_user_action, record_user_seen, tag_current_span
-from src.pipeline.normalization import FUSION_SEPARATORS
+from src.pipeline.normalization import FUSION_SEPARATORS, has_ensembl_identifier
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -41,6 +41,9 @@ _MAX_SYMBOL_LENGTH = 64
 # including dangling forms like 'ALK::' that would normalize into one gene.
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?$")
 _UNRESOLVABLE_PREFIX = "Unresolvable gene symbol"
+# Normalization's error for GENE(ENST...) whose transcript is another gene's.
+_ENSEMBL_MISMATCH_MARKER = re.compile(r"^Unresolvable gene symbol — '[^']*': Ensembl \S+ belongs to ")
+_ENSEMBL_MISMATCH_ERROR = "The Ensembl ID belongs to a different gene than the one named."
 _UNRESOLVABLE_ERROR = "Gene symbol could not be resolved."
 _LOOKUP_FAILED_ERROR = "Gene symbol lookup is temporarily unavailable; please retry."
 _GENE_NOT_FOUND = "Gene symbol not found."
@@ -65,7 +68,9 @@ class GeneQueryItem(BaseModel):
         ...,
         description=(
             "HGNC-style gene symbol or Ensembl ID, e.g. `ALK`, `HLA-A`: letters, digits, `-` and `.`, "
-            "starting and ending with a letter or digit. Fusions are not accepted."
+            "starting and ending with a letter or digit. Ensembl gene/transcript/protein IDs "
+            "(`ENSG...`, `ENST...`, `ENSP...`), `GENE(ENST...)` and `ENST...:c....` are resolved to "
+            "the gene. Fusions are not accepted."
         ),
     )
     tumor_type: Optional[str] = Field(
@@ -136,6 +141,14 @@ class GeneRationale(BaseModel):
     deliberately omitted — open `view_url` for the full report."""
 
     gene: str = Field(..., description="Canonical gene symbol the pipeline annotated.")
+    submitted_inputs: List[str] = Field(
+        default_factory=list,
+        description="Inputs as submitted that were rewritten to `gene`, e.g. an Ensembl transcript ID.",
+    )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description="Caveats about how a submitted input was read, e.g. an HGVS variant that was not interpreted.",
+    )
     tumor_type: Optional[str] = Field(
         default=None,
         description=(
@@ -214,7 +227,7 @@ def _validate_symbol(value: str) -> str:
         raise ValueError(f"Gene symbol must be at most {_MAX_SYMBOL_LENGTH} characters")
     if FUSION_SEPARATORS.search(symbol):
         raise ValueError("Fusions are not supported by the gene query API; use POST /v1/annotate")
-    if not _SYMBOL_PATTERN.match(symbol):
+    if not (_SYMBOL_PATTERN.match(symbol) or has_ensembl_identifier(symbol)):
         raise ValueError(
             "Gene symbol may contain only letters, digits, '-' and '.', "
             "and must start and end with a letter or digit"
@@ -237,7 +250,11 @@ def _slim_error(annotation: GeneAnnotation) -> Optional[str]:
     # Fixed messages only: per-gene errors can embed raw exception text, which
     # stays in the UI behind view_url.
     if _is_unresolvable(annotation):
-        return _LOOKUP_FAILED_ERROR if annotation.symbol_lookup_failed else _UNRESOLVABLE_ERROR
+        if annotation.symbol_lookup_failed:
+            return _LOOKUP_FAILED_ERROR
+        if _ENSEMBL_MISMATCH_MARKER.match(annotation.error):
+            return _ENSEMBL_MISMATCH_ERROR
+        return _UNRESOLVABLE_ERROR
     return _GENERIC_GENE_ERROR
 
 
@@ -249,6 +266,8 @@ def to_gene_rationale(annotation: GeneAnnotation) -> GeneRationale:
     always the context the classification ran with, including for aliases."""
     return GeneRationale(
         gene=annotation.gene,
+        submitted_inputs=[resolution.input for resolution in annotation.resolved_inputs],
+        warnings=[warning for resolution in annotation.resolved_inputs for warning in resolution.warnings],
         tumor_type=annotation.analysis_tumor_type,
         cancer_associated=annotation.cancer_associated,
         gene_class=annotation.gene_class,

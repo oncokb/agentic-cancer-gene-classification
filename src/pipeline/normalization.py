@@ -1,8 +1,9 @@
 """
 Gene symbol normalization via the HGNC and Ensembl REST APIs.
 Splits fusion inputs into partner genes and resolves each symbol to its
-canonical HUGO identifier. Ensembl IDs are batch-resolved when possible;
-unannotated loci are routed to the insufficient-evidence path.
+canonical HUGO identifier. Ensembl gene, transcript and protein IDs (also as
+GENE(ENST...) and ENST...:c.... forms) are resolved through Ensembl, never
+HGNC search; unannotated loci are routed to the insufficient-evidence path.
 """
 
 from __future__ import annotations
@@ -10,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Dict, Iterable, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import httpx
 
@@ -22,7 +24,22 @@ logger = logging.getLogger(__name__)
 HGNC_FETCH_URL = "https://rest.genenames.org/fetch/symbol/{symbol}"
 HGNC_SEARCH_URL = "https://rest.genenames.org/search/symbol/{symbol}"
 ENSEMBL_LOOKUP_URL = "https://rest.ensembl.org/lookup/id"
-ENSEMBL_PATTERN = re.compile(r"^ENSG\d+", re.IGNORECASE)
+_ENSEMBL_ID = r"ENS[GTP]\d{11}(?:\.\d+)?"
+# Human Ensembl gene/transcript/protein stable ID, optionally versioned.
+ENSEMBL_PATTERN = re.compile(rf"^{_ENSEMBL_ID}$", re.IGNORECASE)
+# GENE(ENST...): a symbol annotated with the transcript (or gene/protein) it was called on.
+_DECORATED_PATTERN = re.compile(
+    rf"^(?P<gene>[A-Za-z0-9][A-Za-z0-9.\-]*)\s*\(\s*(?P<id>{_ENSEMBL_ID})\s*\)$", re.IGNORECASE
+)
+# HGVS on an Ensembl transcript/protein: ENST...:c.215C>G, ENST...(TP53):c.215C>G, ENSP...:p.R72P.
+_HGVS_PATTERN = re.compile(
+    r"^(?P<id>ENS[TP]\d{11}(?:\.\d+)?)(?:\((?P<gene>[A-Za-z0-9][A-Za-z0-9.\-]*)\))?:(?P<variant>[cnrp]\..+)$",
+    re.IGNORECASE,
+)
+# Contains something Ensembl-like outside the forms above (ENSG123,
+# ENSMUSG00000017167, ENST...:x, 'EML4(ENST...) ALK(ENST...) fusion'):
+# rejected outright, never sent to HGNC search, which would fuzzy-match it.
+_ENSEMBL_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9])ENS[A-Z]{0,4}[EGTPR]\d{3,}", re.IGNORECASE)
 HGNC_ID_PATTERN = re.compile(r"Acc:(HGNC:\d+)")
 HGNC_TIMEOUT_SECONDS = 5.0
 ENSEMBL_TIMEOUT_SECONDS = 8.0
@@ -153,7 +170,7 @@ def unparsed_fusion_warning(
     'EML4 ALK fusion' to EML4.
     """
     text = value.strip()
-    if is_fusion_input(text):
+    if is_fusion_input(text) or has_ensembl_identifier(text):
         return None
 
     match = _WHITESPACE_PAIR.match(text)
@@ -243,7 +260,47 @@ def _ensembl_lookup_id(symbol: str) -> str:
     return symbol.split(".", 1)[0]
 
 
-def _unresolvable_gene(symbol: str, lookup_failed: bool = False) -> ResolvedGene:
+@dataclass(frozen=True)
+class _EnsemblToken:
+    """A fusion partner (or single gene input) written with an Ensembl ID."""
+
+    raw: str
+    ensembl_id: Optional[str]  # upper-cased, version kept; None when malformed
+    named_gene: Optional[str] = None  # GENE in GENE(ENST...) or ENST...(GENE):c....
+    variant: Optional[str] = None  # HGVS suffix, e.g. c.215C>G
+
+
+def _parse_ensembl_token(token: str) -> Optional[_EnsemblToken]:
+    """Parse an Ensembl-form partner token; None for anything else (plain symbols)."""
+    text = token.strip()
+    if ENSEMBL_PATTERN.match(text):
+        return _EnsemblToken(raw=text, ensembl_id=text.upper())
+    match = _DECORATED_PATTERN.match(text)
+    if match:
+        return _EnsemblToken(raw=text, ensembl_id=match.group("id").upper(), named_gene=match.group("gene"))
+    match = _HGVS_PATTERN.match(text)
+    if match:
+        return _EnsemblToken(
+            raw=text,
+            ensembl_id=match.group("id").upper(),
+            named_gene=match.group("gene"),
+            variant=match.group("variant"),
+        )
+    if _ENSEMBL_LIKE_PATTERN.search(text):
+        return _EnsemblToken(raw=text, ensembl_id=None)
+    return None
+
+
+def has_ensembl_identifier(value: str) -> bool:
+    """True when a gene or fusion input names a partner with an Ensembl ID (valid or not)."""
+    return any(_parse_ensembl_token(token) for token in split_fusion(value) if token)
+
+
+def _unresolvable_gene(
+    symbol: str,
+    lookup_failed: bool = False,
+    resolution_error: Optional[str] = None,
+) -> ResolvedGene:
     return ResolvedGene(
         input_symbol=symbol,
         canonical_symbol=symbol,
@@ -251,12 +308,27 @@ def _unresolvable_gene(symbol: str, lookup_failed: bool = False) -> ResolvedGene
         resolved=False,
         unresolvable=True,
         lookup_failed=lookup_failed,
+        resolution_error=resolution_error,
     )
 
 
+def _ensembl_absent(symbol: str) -> ResolvedGene:
+    return _unresolvable_gene(symbol, resolution_error=f"Ensembl has no human gene, transcript or protein {symbol}.")
+
+
+def _ensembl_failed(symbol: str) -> ResolvedGene:
+    return _unresolvable_gene(
+        symbol, lookup_failed=True, resolution_error=f"The Ensembl lookup for {symbol} failed; please retry."
+    )
+
+
+def _is_human(doc: dict) -> bool:
+    return doc.get("species") in (None, "homo_sapiens")
+
+
 def _resolved_from_ensembl(symbol: str, doc: Optional[dict]) -> ResolvedGene:
-    if not doc or doc.get("object_type") != "Gene" or not doc.get("display_name"):
-        return _unresolvable_gene(symbol)
+    if not doc or doc.get("object_type") != "Gene" or not doc.get("display_name") or not _is_human(doc):
+        return _ensembl_absent(symbol)
 
     description = doc.get("description") or ""
     hgnc_match = HGNC_ID_PATTERN.search(description)
@@ -268,8 +340,8 @@ def _resolved_from_ensembl(symbol: str, doc: Optional[dict]) -> ResolvedGene:
     )
 
 
-async def _resolve_ensembl_ids(
-    symbols: Iterable[str],
+async def _resolve_ensembl_gene_ids(
+    symbols: List[str],
     client: httpx.AsyncClient,
 ) -> Dict[str, ResolvedGene]:
     """
@@ -278,12 +350,11 @@ async def _resolve_ensembl_ids(
     Ensembl can be slow, so batching avoids one network round-trip per ENSG ID
     and keeps a bounded timeout. Unresolved IDs fall back to insufficient evidence.
     """
-    symbol_list = list(dict.fromkeys(symbols))
-    if not symbol_list:
+    if not symbols:
         return {}
 
     lookup_to_symbols: Dict[str, list[str]] = {}
-    for symbol in symbol_list:
+    for symbol in symbols:
         lookup_to_symbols.setdefault(_ensembl_lookup_id(symbol), []).append(symbol)
 
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -307,13 +378,74 @@ async def _resolve_ensembl_ids(
         if not confirmed_absent:
             logger.warning("Ensembl lookup failed for %d IDs: %s", len(lookup_to_symbols), exc)
         return {
-            symbol: _unresolvable_gene(symbol, lookup_failed=not confirmed_absent) for symbol in symbol_list
+            symbol: _ensembl_absent(symbol) if confirmed_absent else _ensembl_failed(symbol)
+            for symbol in symbols
         }
 
     resolved: Dict[str, ResolvedGene] = {}
     for lookup_id, original_symbols in lookup_to_symbols.items():
         for symbol in original_symbols:
             resolved[symbol] = _resolved_from_ensembl(symbol, data.get(lookup_id))
+    return resolved
+
+
+async def _ensembl_lookup(stable_id: str, client: httpx.AsyncClient) -> Optional[dict]:
+    """GET /lookup/id/{id}, cached. None when Ensembl says the ID doesn't exist;
+    raises httpx.HTTPError / ValueError when the lookup itself failed."""
+
+    async def _fetch() -> Optional[dict]:
+        resp = await client.get(
+            f"{ENSEMBL_LOOKUP_URL}/{stable_id}",
+            headers={"Accept": "application/json"},
+            timeout=ENSEMBL_TIMEOUT_SECONDS,
+        )
+        if resp.status_code in (400, 404):
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    return await cached_call(f"ensembl:lookup:{stable_id}", _fetch)
+
+
+async def _resolve_ensembl_transcript_id(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
+    """ENST -> parent gene, ENSP -> parent transcript -> parent gene, then the gene's symbol."""
+    stable_id = _ensembl_lookup_id(symbol).upper()
+    try:
+        doc = await _ensembl_lookup(stable_id, client)
+        if stable_id.startswith("ENSP"):
+            if not doc or doc.get("object_type") != "Translation" or not doc.get("Parent"):
+                return _ensembl_absent(symbol)
+            doc = await _ensembl_lookup(doc["Parent"], client)
+        if not doc or doc.get("object_type") != "Transcript" or not doc.get("Parent") or not _is_human(doc):
+            return _ensembl_absent(symbol)
+        gene_doc = await _ensembl_lookup(doc["Parent"], client)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Ensembl lookup failed for %s: %s", symbol, exc)
+        return _ensembl_failed(symbol)
+    resolved = _resolved_from_ensembl(symbol, gene_doc)
+    if resolved.unresolvable:
+        return resolved
+    transcript_id = symbol.upper() if stable_id.startswith("ENST") else doc.get("id") or stable_id
+    return resolved.model_copy(update={"ensembl_transcript_id": transcript_id})
+
+
+async def _resolve_ensembl_ids(
+    symbols: Iterable[str],
+    client: httpx.AsyncClient,
+) -> Dict[str, ResolvedGene]:
+    """Resolve Ensembl gene (one batch POST), transcript and protein IDs to gene symbols."""
+    symbol_list = list(dict.fromkeys(symbols))
+    gene_ids = [symbol for symbol in symbol_list if symbol.upper().startswith("ENSG")]
+    other_ids = [symbol for symbol in symbol_list if not symbol.upper().startswith("ENSG")]
+    resolved = await _resolve_ensembl_gene_ids(gene_ids, client)
+
+    semaphore = asyncio.Semaphore(NORMALIZATION_CONCURRENCY)
+
+    async def resolve_one(symbol: str) -> ResolvedGene:
+        async with semaphore:
+            return await _resolve_ensembl_transcript_id(symbol, client)
+
+    resolved.update(zip(other_ids, await asyncio.gather(*(resolve_one(symbol) for symbol in other_ids))))
     return resolved
 
 
@@ -324,6 +456,10 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
     """
     if _is_ensembl_id(symbol):
         return (await _resolve_ensembl_ids([symbol], client))[symbol]
+    if _parse_ensembl_token(symbol):
+        # Decorated, HGVS or malformed Ensembl forms: HGNC search would
+        # fuzzy-match 'EML4(ENST...)' to EML4, so never send them there.
+        return _unresolvable_gene(symbol, resolution_error=f"'{symbol}' is not a gene symbol.")
 
     url = HGNC_FETCH_URL.format(symbol=symbol)
     headers = {"Accept": "application/json"}
@@ -406,33 +542,184 @@ async def _resolve_hgnc_symbols_concurrently(
     return dict(pairs)
 
 
+@dataclass
+class CanonicalInput:
+    """How one submitted gene/fusion input was read before HGNC normalization."""
+
+    submitted: str
+    # The input with each resolved Ensembl-form partner replaced by its gene
+    # symbol ('ENST...::ENST...' -> 'EML4::ALK'); the submitted string itself
+    # when nothing was rewritten.
+    canonical: str
+    five_transcript: Optional[str] = None
+    three_transcript: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    # True when an error is only a failed (retryable) Ensembl/HGNC lookup.
+    lookup_failed: bool = False
+
+
+class GeneMap(Dict[str, Tuple[ResolvedGene, List[str]]]):
+    """normalize_fusions' result. The input lists hold canonical input strings;
+    `submitted` holds the same inputs as submitted (same order), and `inputs`
+    maps each submitted input to how it was read."""
+
+    def __init__(self, *args, inputs: Optional[Dict[str, CanonicalInput]] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.inputs: Dict[str, CanonicalInput] = inputs or {}
+        self.submitted: Dict[str, List[str]] = {}
+
+
+def _read_ensembl_token(
+    token: _EnsemblToken,
+    ensembl: Dict[str, ResolvedGene],
+    hgnc: Dict[str, ResolvedGene],
+) -> Tuple[Optional[str], ResolvedGene, Optional[str], Optional[str]]:
+    """
+    Decide what an Ensembl-form token means.
+
+    Returns (symbol, resolved, transcript, warning). `symbol` is the gene name
+    the canonical input uses; it is None when the token can't be used, in
+    which case `resolved` is unresolvable and carries the reason. For a
+    GENE(ENST...) whose transcript belongs to GENE, `symbol` is GENE as
+    written and the caller resolves it through HGNC like a plain symbol.
+    """
+    if token.ensembl_id is None:
+        return None, _unresolvable_gene(
+            token.raw,
+            resolution_error=(
+                f"'{token.raw}' is not a valid human Ensembl ID or supported form (expected ENSG, ENST "
+                "or ENSP followed by 11 digits and an optional .version, GENE(ENST...), or ENST...:c....)."
+            ),
+        ), None, None
+
+    by_id = ensembl[token.ensembl_id]
+    if by_id.unresolvable:
+        return None, by_id.model_copy(update={"input_symbol": token.raw, "canonical_symbol": token.raw}), None, None
+
+    ensembl_symbol = by_id.canonical_symbol or ""
+    transcript = by_id.ensembl_transcript_id
+    named = token.named_gene
+    if named and named.upper() != ensembl_symbol.upper():
+        named_resolved = hgnc.get(named)
+        if named_resolved is not None and named_resolved.lookup_failed:
+            return None, _unresolvable_gene(
+                token.raw,
+                lookup_failed=True,
+                resolution_error=(
+                    f"Could not check that {token.ensembl_id} belongs to {named}: the HGNC lookup failed; "
+                    "please retry."
+                ),
+            ), None, None
+        if not (named_resolved and named_resolved.resolved
+                and (named_resolved.canonical_symbol or "").upper() == ensembl_symbol.upper()):
+            return None, _unresolvable_gene(
+                token.raw,
+                resolution_error=(
+                    f"'{token.raw}': Ensembl {token.ensembl_id} belongs to {ensembl_symbol}, not {named}. "
+                    "Correct the gene or the Ensembl ID."
+                ),
+            ), None, None
+
+    warning = None
+    if token.variant:
+        warning = (
+            f"'{token.raw}' was annotated as gene {ensembl_symbol} (from {token.ensembl_id}); "
+            f"variant-level interpretation of {token.variant} is not supported."
+        )
+    if named and not token.variant:
+        # GENE(ENST...) matching its transcript: annotate GENE as written.
+        return named, by_id.model_copy(update={"input_symbol": named}), transcript, warning
+    return ensembl_symbol, by_id.model_copy(update={"input_symbol": token.raw}), transcript, warning
+
+
 async def normalize_fusions(
     fusions: list[str],
     *,
     strict_gene_lookup: bool = False,
-) -> Dict[str, Tuple[ResolvedGene, list[str]]]:
+) -> GeneMap:
     """
     Given a list of gene or fusion strings, return a mapping of
-    canonical_symbol -> (ResolvedGene, [input strings involving this gene]).
+    canonical_symbol -> (ResolvedGene, [canonical input strings involving this gene]).
 
-    Each gene appears once regardless of how many inputs involve it.
+    Each gene appears once regardless of how many inputs involve it. Ensembl
+    IDs (bare, GENE(ENST...) or ENST...:c....) are resolved through Ensembl and
+    replaced by their gene symbol in the canonical input strings; see
+    GeneMap.inputs for how each submitted input was read.
     """
-    gene_to_fusions: Dict[str, list[str]] = {}
-    gene_symbols: Set[str] = set()
-
-    for fusion in fusions:
+    tokens_by_input: Dict[str, list[tuple[str, Optional[_EnsemblToken]]]] = {}
+    for fusion in dict.fromkeys(fusions):
         g1, g2 = split_fusion(fusion)
-        for g in filter(None, [g1, g2]):
-            gene_symbols.add(g)
-            gene_to_fusions.setdefault(g, []).append(fusion)
-
-    ensembl_symbols = sorted(symbol for symbol in gene_symbols if _is_ensembl_id(symbol))
-    hgnc_symbols = sorted(symbol for symbol in gene_symbols if not _is_ensembl_id(symbol))
+        tokens_by_input[fusion] = [(g, _parse_ensembl_token(g)) for g in filter(None, [g1, g2])]
+    ensembl_tokens = [token for tokens in tokens_by_input.values() for _, token in tokens if token]
+    ensembl_ids = sorted({token.ensembl_id for token in ensembl_tokens if token.ensembl_id})
+    plain_symbols = {g for tokens in tokens_by_input.values() for g, token in tokens if token is None}
 
     async with httpx.AsyncClient() as client:
-        resolved: Dict[str, ResolvedGene] = {}
-        resolved.update(await _resolve_ensembl_ids(ensembl_symbols, client))
-        resolved.update(await _resolve_hgnc_symbols_concurrently(hgnc_symbols, client))
+        ensembl = await _resolve_ensembl_ids(ensembl_ids, client)
+        # GENE in GENE(ENST...) is resolved alongside the plain symbols (one
+        # HGNC pass), both to check it against the transcript's gene and,
+        # when it matches, to annotate it like a plain symbol.
+        named_symbols = {
+            token.named_gene
+            for token in ensembl_tokens
+            if token.named_gene and token.ensembl_id and ensembl[token.ensembl_id].resolved
+        }
+        hgnc = await _resolve_hgnc_symbols_concurrently(sorted(plain_symbols | named_symbols), client)
+
+    # Ensembl-resolved (or failed) tokens keep their own ResolvedGene, keyed by
+    # the submitted token; everything else is keyed by the HGNC symbol.
+    gene_to_fusions: Dict[str, list[str]] = {}
+    ensembl_resolved: Dict[str, ResolvedGene] = {}
+    hgnc_keys: set[str] = set()
+    inputs: Dict[str, CanonicalInput] = {}
+    keys_by_input: Dict[str, list[str]] = {}
+    for fusion, tokens in tokens_by_input.items():
+        info = CanonicalInput(submitted=fusion, canonical=fusion)
+        symbols: list[str] = []
+        transcripts: list[Optional[str]] = []
+        keys: list[str] = []
+        for raw, token in tokens:
+            if token is None:
+                symbols.append(raw)
+                transcripts.append(None)
+                keys.append(raw)
+                hgnc_keys.add(raw)
+                continue
+            symbol, resolved, transcript, warning = _read_ensembl_token(token, ensembl, hgnc)
+            if warning:
+                info.warnings.append(warning)
+            if symbol is None:
+                info.errors.append(resolved.resolution_error or f"'{raw}' could not be resolved.")
+                info.lookup_failed = info.lookup_failed or resolved.lookup_failed
+                symbols.append(raw)
+                transcripts.append(None)
+                keys.append(raw)
+                ensembl_resolved[raw] = resolved
+            elif token.named_gene and not token.variant:
+                symbols.append(symbol)
+                transcripts.append(transcript)
+                keys.append(symbol)
+                hgnc_keys.add(symbol)
+            else:
+                symbols.append(symbol)
+                transcripts.append(transcript)
+                keys.append(raw)
+                ensembl_resolved[raw] = resolved
+        if symbols != [raw for raw, _ in tokens]:
+            info.canonical = "::".join(symbols)
+        if len(transcripts) == 2:
+            info.five_transcript, info.three_transcript = transcripts
+        inputs[fusion] = info
+        keys_by_input[fusion] = keys
+    gene_to_submitted: Dict[str, list[str]] = {}
+    for fusion in fusions:
+        for key in keys_by_input[fusion]:
+            gene_to_fusions.setdefault(key, []).append(inputs[fusion].canonical)
+            gene_to_submitted.setdefault(key, []).append(fusion)
+
+    resolved = {key: ensembl_resolved[key] for key in sorted(ensembl_resolved)}
+    resolved.update({key: hgnc[key] for key in sorted(hgnc_keys)})
 
     if strict_gene_lookup:
         # The gene query API must not classify or reuse a cached annotation
@@ -442,13 +729,20 @@ async def normalize_fusions(
             for symbol, gene in resolved.items()
         }
 
-    result: Dict[str, Tuple[ResolvedGene, list[str]]] = {}
+    result = GeneMap(inputs=inputs)
     for symbol, rg in resolved.items():
         key = rg.canonical_symbol or symbol
         if key not in result:
             result[key] = (rg, gene_to_fusions[symbol])
+            result.submitted[key] = list(gene_to_submitted[symbol])
         else:
             # Merge fusion lists if same canonical symbol maps from multiple inputs
             result[key][1].extend(gene_to_fusions[symbol])
+            result.submitted[key].extend(gene_to_submitted[symbol])
 
     return result
+
+
+async def read_gene_input(value: str) -> CanonicalInput:
+    """How one gene/fusion input reads: its canonical form, transcripts, warnings and errors."""
+    return (await normalize_fusions([value])).inputs[value]

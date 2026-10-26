@@ -23,6 +23,7 @@ from src.models.schema import (
     PMIDEvidenceRecord,
     QualityFlag,
     ResolvedGene,
+    ResolvedInput,
 )
 from src.observability import distribution, gene_latency_tag, increment, trace
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
@@ -360,7 +361,11 @@ async def _annotate_gene(
             ),
             cache_status="bypassed",
             cache_reason="unresolvable_gene",
-            error="Unresolvable gene symbol — bare Ensembl ID or unannotated locus",
+            error=(
+                f"Unresolvable gene symbol — {resolved_gene.resolution_error}"
+                if resolved_gene.resolution_error
+                else "Unresolvable gene symbol — bare Ensembl ID or unannotated locus"
+            ),
         )
         annotation.timings_ms["total"] = _elapsed_ms(total_start)
         _record_annotation_duration(annotation, gene, fusions, metric_tags)
@@ -608,13 +613,30 @@ async def run_pipeline(
     logger.info("Resolved %d unique genes from %d inputs", len(gene_map), len(input_strings))
     await _maybe_call_total(on_total_known, len(gene_map))
 
+    # gene_map lists canonical input strings (Ensembl IDs replaced by symbols);
+    # tumor contexts are matched against the inputs as submitted.
+    input_readings = getattr(gene_map, "inputs", {})
+    submitted_by_gene = getattr(gene_map, "submitted", {})
+    resolved_inputs_by_canonical: Dict[str, List[ResolvedInput]] = {}
+    for reading in input_readings.values():
+        if reading.canonical != reading.submitted or reading.warnings:
+            resolved_inputs_by_canonical.setdefault(reading.canonical, []).append(
+                ResolvedInput(
+                    input=reading.submitted,
+                    resolved=reading.canonical,
+                    five_transcript=reading.five_transcript,
+                    three_transcript=reading.three_transcript,
+                    warnings=reading.warnings,
+                )
+            )
+
     # Preserve normalized input precedence, keeping the first non-null context
     # for repeated input strings, and disclose conflicting contexts.
     gene_tumor_type: Dict[str, Optional[str]] = {}
     warnings: List[str] = []
     for canonical, (_, gene_inputs) in gene_map.items():
         tumor_types_by_key: Dict[str, str] = {}
-        for value in gene_inputs:
+        for value in submitted_by_gene.get(canonical, gene_inputs):
             for submitted, tt in tumor_contexts:
                 if submitted == value:
                     key = " ".join(tt.strip().lower().split())
@@ -630,6 +652,9 @@ async def run_pipeline(
             )
     # Shared with the tumor-type notes above: append, never replace.
     warnings.extend(await unparsed_fusion_warnings(input_strings, gene_map))
+    for reading in input_readings.values():
+        warnings.extend(reading.warnings)
+        warnings.extend(reading.errors)
 
     # Annotate genes with bounded fan-out. PubMed, Redis, and LLM paths still
     # enforce their own lower-level limits/caches.
@@ -716,6 +741,12 @@ async def run_pipeline(
             distribution("gene.queue_wait_ms", queue_wait_ms, tags=gene_tags)
         annotation.analysis_tumor_type = tumor_type
         annotation.symbol_lookup_failed = resolved_gene.lookup_failed
+        # Per run, never from a cached annotation: which submitted inputs became this gene.
+        annotation.resolved_inputs = [
+            resolution
+            for value in dict.fromkeys(gene_inputs)
+            for resolution in resolved_inputs_by_canonical.get(value, [])
+        ]
         return annotation
 
     tasks = [

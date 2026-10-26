@@ -32,6 +32,11 @@ class ResolvedGene(BaseModel):
     # True when unresolvable only because the lookup service failed (timeout,
     # 5xx, ...), as opposed to the service confirming the symbol doesn't exist.
     lookup_failed: bool = False
+    # Why an Ensembl-form input (ENST..., GENE(ENST...), ENST...:c....) could
+    # not be used, e.g. an unknown ID or a transcript of a different gene.
+    resolution_error: Optional[str] = None
+    # Transcript an ENST/ENSP input resolved through (ENSP -> its parent ENST).
+    ensembl_transcript_id: Optional[str] = None
 
 
 class LiteratureRecord(BaseModel):
@@ -134,6 +139,10 @@ class FusionEvidenceCard(EvidenceCard):
 
 class FusionEvidenceResult(BaseModel):
     fusion: str
+    input: Optional[str] = Field(
+        default=None,
+        description="The fusion as submitted, when it differs from `fusion` (e.g. Ensembl IDs resolved to symbols).",
+    )
     tumor_type: Optional[str] = None
     well_supported: bool = False
     retrieved_count: int = 0
@@ -335,11 +344,29 @@ class DistilledOpenEvidence(BaseModel):
     redundant_citation_count: int = 0
 
 
+class ResolvedInput(BaseModel):
+    """A submitted input that was rewritten before annotation, e.g. an Ensembl
+    transcript ID resolved to its gene symbol."""
+
+    input: str = Field(..., description="The input as submitted, e.g. `ENST00000269305`.")
+    resolved: str = Field(..., description="The gene or fusion string that was annotated, e.g. `TP53`.")
+    five_transcript: Optional[str] = Field(default=None, description="5' partner transcript taken from the input.")
+    three_transcript: Optional[str] = Field(default=None, description="3' partner transcript taken from the input.")
+    warnings: List[str] = Field(default_factory=list, description="Caveats about how the input was read.")
+
+
 class GeneAnnotation(BaseModel):
     """One row in Nicole's spreadsheet, keyed by gene."""
 
     gene: str
     fusions: List[str] = Field(default_factory=list)
+    resolved_inputs: List[ResolvedInput] = Field(
+        default_factory=list,
+        description=(
+            "Submitted inputs for this gene that were rewritten before annotation (Ensembl IDs, "
+            "GENE(ENST...) and ENST...:c.... forms), with what each resolved to."
+        ),
+    )
     in_oncokb: Optional[bool] = None  # None when OncoKB token not configured
 
     cancer_associated: Optional[bool] = None

@@ -1997,11 +1997,20 @@ function renderSupportingEvidence(annotation) {
 // from the fusion-annotation service response, never through the LLM. This
 // keeps latency and clutter off the default card: nothing here fetches until
 // a curator explicitly expands the section for a given fusion.
-function fetchFusionContext(fusionKey) {
+// Submitted input row for an annotated fusion string. The server rewrites
+// Ensembl-form inputs (ENST...::ENST..., GENE(ENST...)::...) to symbols, so
+// fall back to the submitted form it reports in resolved_inputs.
+function lastInputForFusion(annotation, fusion) {
+  if (state.lastInputsByFusion[fusion]) return state.lastInputsByFusion[fusion];
+  const resolution = (annotation.resolved_inputs || []).find((entry) => entry.resolved === fusion);
+  return resolution ? state.lastInputsByFusion[resolution.input] || { fusion: resolution.input } : undefined;
+}
+
+function fetchFusionContext(fusionKey, annotation) {
   if (state.fusionContextByFusion[fusionKey]) {
     return state.fusionContextByFusion[fusionKey];
   }
-  const requestBody = { fusion: fusionKey, ...(state.lastInputsByFusion[fusionKey] || {}) };
+  const requestBody = { fusion: fusionKey, ...(lastInputForFusion(annotation, fusionKey) || {}) };
   const promise = fetch("/v1/fusion-context", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2140,7 +2149,7 @@ function renderDomainsAndTreatments(annotation) {
   details.addEventListener("toggle", () => {
     if (!details.open || loaded) return;
     loaded = true;
-    fetchFusionContext(fusionKey)
+    fetchFusionContext(fusionKey, annotation)
       .then((response) => renderFusionContextResult(body, response))
       .catch(() => {
         body.textContent = "Domain and treatment data not available for this fusion.";
@@ -2698,7 +2707,7 @@ function fusionPartnerGenes(annotation) {
 
 function tumorTypeForAnnotation(annotation) {
   for (const fusion of annotation.fusions || []) {
-    const match = state.lastInputsByFusion[fusion];
+    const match = lastInputForFusion(annotation, fusion);
     if (match && match.tumor_type) return match.tumor_type;
   }
   return null;

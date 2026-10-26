@@ -88,10 +88,12 @@ curl -s -X POST https://acgc.oncokb.org/v1/genes/query \
 
 Accepted gene identifiers for the gene query API:
 
-- HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`, and Ensembl gene IDs such
-  as `ENSG00000141510` or `ENSG00000141510.17`.
-- Letters, digits, `-` and `.` only, starting and ending with a letter or
-  digit.
+- HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`, and Ensembl gene,
+  transcript and protein IDs such as `ENSG00000141510.17`, `ENST00000269305`
+  or `ENSP00000269305`, also as `TP53(ENST00000269305)` or
+  `ENST00000269305:c.215C>G`. See [Gene identifiers](#gene-identifiers).
+- Symbols: letters, digits, `-` and `.` only, starting and ending with a
+  letter or digit.
 - **Not fusions.** `EML4::ALK`, `ALK::` and similar are rejected with `422`.
   Use the full `/v1/annotate` endpoint for fusions (see the
   [README](../README.md#acgc-api-keys-for-scripts)).
@@ -131,6 +133,8 @@ Accepted gene identifiers for the gene query API:
 | `run_id` | ID of the saved run that holds these results. |
 | `view_url` | Link to the full report in the ACGC web app. Whoever opens it signs in first if they aren't already, then lands on the report. |
 | `gene` | The gene symbol ACGC classified. This can differ from what you sent, for example when an Ensembl ID or an old alias resolves to the current symbol. |
+| `submitted_inputs` | What you sent, when it was rewritten to `gene` (for example an Ensembl transcript ID). Empty otherwise. |
+| `warnings` | Caveats about how an input was read, for example an HGVS variant that was not interpreted. |
 | `tumor_type` | The tumor type the classification actually used, or `null`. |
 | `cancer_associated` | Whether ACGC classifies the gene as cancer-associated. |
 | `gene_class` | Functional class, for example a kinase. |
@@ -146,6 +150,37 @@ Accepted gene identifiers for the gene query API:
 The gene query API deliberately leaves out abstracts, quotes, evidence cards
 and OpenEvidence content. Open its `view_url` to see them. (The annotate
 endpoints return full annotations, including evidence cards.)
+
+### Gene identifiers
+
+Every endpoint that takes genes or fusions (`/v1/genes/...`, `/v1/annotate`,
+`/v1/annotate/jobs`, `/v1/annotate/gene`, `/v1/fusion-evidence/jobs`) accepts,
+alone or as either fusion partner:
+
+| Input | Read as |
+| --- | --- |
+| `TP53` | HGNC symbol (aliases and previous symbols resolve to the current symbol). |
+| `ENSG00000141510`, `ENSG00000141510.17` | The Ensembl gene's symbol. |
+| `ENST00000269305`, `ENST00000269305.9` | The symbol of the gene that owns the transcript. |
+| `ENSP00000269305` | Protein → its transcript → that transcript's gene. |
+| `TP53(ENST00000269305)` | `TP53`, after checking the transcript belongs to TP53. In a fusion, the transcript is used as that partner's breakpoint transcript. |
+| `ENST00000269305:c.215C>G`, `ENSP00000269305:p.Arg72Pro` | The transcript's gene, with a warning: the variant itself is **not** interpreted. |
+
+So `ENST00000318522::ENST00000389048` is annotated as `EML4::ALK`, and fusion
+evidence searches PubMed for the symbols, not the IDs. Only human stable IDs
+(`ENSG`/`ENST`/`ENSP` plus 11 digits, optional `.version`) are accepted.
+Ensembl IDs are never fuzzy-matched to a gene.
+
+Your original input stays in the result: `resolved_inputs` on each annotation
+(`input`, `resolved`, `five_transcript`, `three_transcript`, `warnings`),
+`submitted_inputs` in gene-query results, and `input` on fusion-evidence
+results. Request-level `warnings` repeat any caveats and errors.
+
+An input that can't be used gets its own error and is not annotated as any
+gene. That covers an unknown or malformed ID, an Ensembl lookup that failed
+(retry), and `GENE(ENST...)` where the transcript belongs to a different gene.
+In the gene query API the last case reads "The Ensembl ID belongs to a
+different gene than the one named."
 
 ## 4. Gene query background jobs
 
@@ -468,8 +503,8 @@ polling intervals at 15 seconds or longer when you have several jobs running.
   in the response-level `warnings`. That list preserves submission order
   only among inputs using the same symbol. Across aliases or Ensembl IDs, the
   inputs are resolved and merged in an identifier-dependent order (sorted
-  Ensembl IDs before sorted HGNC symbols;
-  `src/pipeline/normalization.py:245-268`), so the chosen tumor type is **not
+  Ensembl IDs before sorted HGNC symbols; see `normalize_fusions` in
+  `src/pipeline/normalization.py`), so the chosen tumor type is **not
   guaranteed** to be the first one you submitted. If the tumor type matters,
   send one request per tumor type.
 - Fusion separators are `::`, `--` and `/` only. A single hyphen is **not** a
