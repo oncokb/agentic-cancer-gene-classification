@@ -115,7 +115,9 @@ class Settings(BaseSettings):
     context_score_pubtype_case_report_weight: float = 0.3
     context_score_pubtype_editorial_weight: float = 0.15
     context_score_pubtype_preprint_weight: float = 0.3
-    annotation_job_ttl_seconds: int = 3600
+    # Async job status snapshots (annotation, enrichment, gene-query and
+    # fusion-evidence jobs) expire this long after the job's last update.
+    job_ttl_seconds: int = 86400
     # Max entries accepted per gene query API request (POST /v1/genes/query[/jobs]).
     gene_query_max_genes: int = 50
 

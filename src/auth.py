@@ -890,9 +890,13 @@ async def require_auth(request: Request) -> AuthenticatedUser:
     return user
 
 
+def is_admin(user: AuthenticatedUser) -> bool:
+    return user.role == "admin" or settings.agcg_dev_mode
+
+
 async def require_admin(request: Request) -> AuthenticatedUser:
     user = await require_auth(request)
-    if user.role != "admin" and not settings.agcg_dev_mode:
+    if not is_admin(user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Administrator privileges required for this action.",

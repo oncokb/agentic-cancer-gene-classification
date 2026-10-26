@@ -9,7 +9,7 @@ from src.models.schema import FusionEvidenceResult
 
 
 def test_fusion_evidence_job_runs_in_background_and_ignores_gene_inputs(monkeypatch):
-    main._fusion_evidence_jobs.clear()
+    main._fusion_evidence_jobs.clear_local()
     seen = []
 
     async def fake_retrieve_fusion_evidence(fusion, tumor_type=None):
@@ -58,7 +58,7 @@ def test_fusion_evidence_job_runs_in_background_and_ignores_gene_inputs(monkeypa
     assert payload["fusion_evidence"][0]["fusion"] == "EML4::ALK"
     assert payload["fusion_evidence"][0]["well_supported"] is True
     assert seen == [("EML4::ALK", "LUAD")]
-    main._fusion_evidence_jobs.clear()
+    main._fusion_evidence_jobs.clear_local()
 
 
 class _FakeRunStore:
@@ -75,7 +75,7 @@ class _FakeRunStore:
 
 
 def test_fusion_evidence_job_persists_result_onto_run_when_run_id_given(monkeypatch):
-    main._fusion_evidence_jobs.clear()
+    main._fusion_evidence_jobs.clear_local()
 
     async def fake_retrieve_fusion_evidence(fusion, tumor_type=None):
         return FusionEvidenceResult(
@@ -121,4 +121,4 @@ def test_fusion_evidence_job_persists_result_onto_run_when_run_id_given(monkeypa
     assert updated_run_id == "run-42"
     assert updated_payload["fusion_evidence"][0]["fusion"] == "EML4::ALK"
     assert updated_payload["fusion_evidence"][0]["well_supported"] is True
-    main._fusion_evidence_jobs.clear()
+    main._fusion_evidence_jobs.clear_local()
