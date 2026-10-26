@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
-from src.api.run_persistence import save_run_or_raise
+from src.api.run_persistence import run_owner, save_run_or_raise
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
     AuthenticatedUser,
@@ -819,11 +819,12 @@ async def _save_run_result(
     http_request: Request,
     request_payload: dict,
     result: AnnotationResult,
+    current_user: Optional[AuthenticatedUser],
 ) -> None:
     """Save a run, raising on failure. For callers that hand out a link to the
     run and so must not report success unless it was actually saved."""
     await http_request.app.state.run_store.save_run(
-        result.run_id, result.timestamp, request_payload, result.model_dump()
+        result.run_id, result.timestamp, request_payload, result.model_dump(), **run_owner(current_user)
     )
 
 
@@ -831,9 +832,10 @@ async def _persist_run_result(
     http_request: Request,
     request_payload: dict,
     result: AnnotationResult,
+    current_user: Optional[AuthenticatedUser],
 ) -> None:
     try:
-        await _save_run_result(http_request, request_payload, result)
+        await _save_run_result(http_request, request_payload, result, current_user)
     except Exception:
         # A run's own result always returns even if it can't be persisted for
         # later sharing — the run store isn't on the critical path for the caller.
@@ -1517,7 +1519,7 @@ async def annotate(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     await _include_inline_fusion_evidence(request, result)
-    await _persist_run_result(http_request, request.model_dump(), result)
+    await _persist_run_result(http_request, request.model_dump(), result, current_user)
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
     record_user_action(
@@ -1593,9 +1595,9 @@ async def _launch_annotation_job(
                 await _store_annotation_job(current)
             await _include_inline_fusion_evidence(request, result)
             if require_persistence:
-                await _save_run_result(http_request, request.model_dump(), result)
+                await _save_run_result(http_request, request.model_dump(), result, current_user)
             else:
-                await _persist_run_result(http_request, request.model_dump(), result)
+                await _persist_run_result(http_request, request.model_dump(), result, current_user)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
             current.phase = "complete"
@@ -1818,7 +1820,7 @@ async def annotate_gene(
         logger.exception("Gene annotation pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    await save_run_or_raise(http_request, request.model_dump(), result)
+    await save_run_or_raise(http_request, request.model_dump(), result, current_user)
 
     if not result.annotations:
         raise HTTPException(status_code=500, detail="No gene annotation was returned")

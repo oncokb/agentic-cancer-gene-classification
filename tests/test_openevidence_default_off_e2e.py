@@ -30,7 +30,7 @@ class _RecordingRunStore:
         self.pmid_evidence_reads = []
         self.pmid_evidence_writes = []
 
-    async def save_run(self, run_id, timestamp, request_payload, result_payload):
+    async def save_run(self, run_id, timestamp, request_payload, result_payload, **owner):
         self.saved_runs.append(run_id)
 
     async def get_gene_annotation(self, gene, tumor_type=None):

@@ -166,6 +166,11 @@ class Settings(BaseSettings):
     db_username: str = ""
     db_password: str = ""
 
+    # Upper bound on how long startup schema changes to `runs` wait for the
+    # table's metadata lock. On timeout the app starts without them (see
+    # RunStore._ensure_runs_schema) instead of stalling behind long queries.
+    runs_ddl_lock_wait_timeout_seconds: int = Field(default=10, ge=1)
+
     fusion_annotation_api_enabled: bool = False
     fusion_annotation_api_base_url: str = ""
     fusion_annotation_api_timeout_seconds: float = 15.0
