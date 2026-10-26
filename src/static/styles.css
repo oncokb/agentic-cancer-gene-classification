@@ -2614,14 +2614,37 @@ body.api-keys-body {
 }
 
 /* Fusion evidence sections reuse the results sidebar sizing at every zoom. */
-.fusion-evidence-section > summary {
-  cursor: pointer;
+.fusion-section-heading {
+  margin: 0;
   padding: 10px 0;
+  font-size: 15px;
 }
 
-.fusion-evidence-section > summary h3 {
-  display: inline;
-  font-size: 15px;
+.fusion-section-toggle {
+  border: 0;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fusion-section-toggle::before {
+  content: "▾ ";
+}
+
+.fusion-section-toggle[aria-expanded="false"]::before {
+  content: "▸ ";
+}
+
+.fusion-section-cards {
+  padding: 0;
+}
+
+.fusion-section-cards[hidden] {
+  display: none;
 }
 
 .fusion-index-section {
@@ -2671,5 +2694,7 @@ body.api-keys-body {
 }
 
 .fusion-section-card-name {
+  margin: 0;
+  font-size: 18px;
   overflow-wrap: anywhere;
 }

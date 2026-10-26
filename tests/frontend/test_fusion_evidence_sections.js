@@ -13,9 +13,13 @@ FakeElement.prototype.querySelectorAll = function (selector) {
     ? hasClass(node, "annotation-card") && node.id
     : hasClass(node, selector.slice(1)));
 };
+const originalQuerySelector = FakeElement.prototype.querySelector;
+FakeElement.prototype.querySelector = function (selector) {
+  return this.querySelectorAll(selector)[0] || originalQuerySelector.call(this, selector);
+};
 FakeElement.prototype.closest = function () {
   for (let node = this._parent; node; node = node._parent) {
-    if (node.tagName === "details" && hasClass(node, "fusion-evidence-section")) return node;
+    if (node.tagName === "section" && hasClass(node, "fusion-evidence-section")) return node;
   }
   return null;
 };
@@ -69,7 +73,7 @@ function testSectioningAndOrder() {
       ["Found in other tumor types (2)", ["OTHER::FIRST", "OTHER::SECOND"]],
     ] : [["Literature found (3)", ["OTHER::FIRST", "MATCH::FIRST", "OTHER::SECOND"]]];
     expected.push(
-      ["Literature found (not classified by tumor type) (2)", ["OLD::PMIDS", "OLD::COUNT"]],
+      ["Literature found — not classified by tumor type (2)", ["OLD::PMIDS", "OLD::COUNT"]],
       ["No literature found (3)", ["NONE::FIRST", "OLD::EMPTY", "OLD::ABSENT"]],
       ["Lookup failed (2)", ["FAILED::FIRST", "FAILED::SCOPE"]],
     );
@@ -79,9 +83,16 @@ function testSectioningAndOrder() {
     ]), expected);
     sections.forEach((section) => {
       const noLiterature = allText(section.children[0]).startsWith("No literature found");
-      assert.strictEqual(section.open, !noLiterature);
-      assert.strictEqual(section.tagName, "details");
-      assert.strictEqual(section.children[0].tagName, "summary");
+      const toggle = section.children[0].children[0];
+      assert.strictEqual(toggle.getAttribute("aria-expanded"), String(!noLiterature));
+      assert.strictEqual(section.children[1].hidden, noLiterature);
+      assert.strictEqual(section.tagName, "section");
+      assert.strictEqual(section.children[0].tagName, "h3");
+      assert.strictEqual(toggle.tagName, "button");
+      assert.strictEqual(toggle.getAttribute("aria-controls"), section.children[1].id);
+      section.children[1].children.forEach((card) => {
+        assert.strictEqual(card.children[0].children[0].children[0].tagName, "h4");
+      });
     });
   }
 }
@@ -109,12 +120,13 @@ function testSidebarNavigationAndActiveTracking() {
     assert.ok(button.title);
     assert.strictEqual(button.children[0].textContent, button.title);
     assert.strictEqual(button.children[1].textContent,
-      button.title === "OLD::COUNT" || button.title === "NONE::FIRST" ||
+      button.title === "OLD::COUNT" ? "3" : button.title === "NONE::FIRST" ||
       button.title === "OLD::EMPTY" || button.title === "OLD::ABSENT" ||
       button.title === "FAILED::FIRST" ? "0" : "2");
     const section = card.closest();
     button.click();
-    assert.ok(section.open);
+    assert.strictEqual(section.querySelector(".fusion-section-toggle").getAttribute("aria-expanded"), "true");
+    assert.strictEqual(section.children[1].hidden, false);
     assert.ok(card.scrolled);
   });
   const target = sandbox.document.getElementById(buttons[2].dataset.targetId);
@@ -133,7 +145,7 @@ function testActiveTrackingAcrossObserverBatches() {
   sandbox.elements.resultsWindow.scrollHeight = 1000;
   sandbox.elements.resultsWindow.clientHeight = 500;
   sandbox.renderFusionEvidenceView(fixture("Lung cancer"));
-  assert.strictEqual(sandbox.observers[0].options.root, sandbox.elements.resultsWindow);
+  assert.strictEqual(sandbox.observers[0].options.root, null);
   const buttons = sandbox.elements.geneIndex.querySelectorAll(".gene-index-item");
   const first = sandbox.document.getElementById(buttons[0].dataset.targetId);
   const second = sandbox.document.getElementById(buttons[1].dataset.targetId);
@@ -151,6 +163,67 @@ function testActiveTrackingAcrossObserverBatches() {
   sandbox.elements.resultsWindow.clientHeight = 1000;
   sandbox.renderFusionEvidenceView(fixture("Lung cancer"));
   assert.strictEqual(sandbox.observers.at(-1).options.root, null);
+}
+
+function testSharedPmidCountAndFutureScopes() {
+  for (const tumor_type of ["Lung cancer", null]) {
+    const sandbox = app();
+    sandbox.renderFusionEvidenceView([
+      { fusion: "OLD::COUNT", pmids: [], retrieved_count: 3, tumor_type },
+      { fusion: "FUTURE::SCOPE", pmids: ["1"], literature_scope: "future_scope", tumor_type },
+      { fusion: "FUTURE::EMPTY", pmids: [], literature_scope: "future_scope", tumor_type },
+    ]);
+    const buttons = sandbox.elements.geneIndex.querySelectorAll(".gene-index-item");
+    const legacy = buttons.find((button) => button.title === "OLD::COUNT");
+    const card = sandbox.document.getElementById(legacy.dataset.targetId);
+    assert.strictEqual(legacy.children[1].textContent, "3");
+    assert.strictEqual(card.querySelector(".status-pill").textContent, "3 PMIDs");
+    const sections = sandbox.elements.resultsWindow.children[0].children;
+    assert.strictEqual(sections.length, 1);
+    assert.strictEqual(sections[0].children[0].children[0].textContent,
+      "Literature found — not classified by tumor type (3)");
+  }
+}
+
+function testExpansionPersistsAndResetsForNewResults() {
+  const sandbox = app();
+  const items = fixture("Lung cancer");
+  sandbox.state.currentResult = { run_id: "first-run", fusion_evidence: items };
+  const render = () => sandbox.renderFusionEvidenceView(sandbox.state.currentResult.fusion_evidence);
+  const section = (label) => sandbox.elements.resultsWindow.children[0].children.find((node) =>
+    allText(node.children[0]).startsWith(label));
+  render();
+  let empty = section("No literature found");
+  assert.strictEqual(empty.children[1].hidden, true);
+  empty.querySelector(".fusion-section-toggle").click();
+  section("Found in Lung cancer").querySelector(".fusion-section-toggle").click();
+  // Polling replaces the result object, retaining its run id.
+  sandbox.state.currentResult = { ...sandbox.state.currentResult, fusion_evidence: [...items] };
+  render();
+  empty = section("No literature found");
+  assert.strictEqual(empty.children[1].hidden, false);
+  assert.strictEqual(section("Found in Lung cancer").children[1].hidden, true);
+  // Sidebar expansion must also be remembered on the next render.
+  empty.querySelector(".fusion-section-toggle").click();
+  sandbox.elements.geneIndex.querySelectorAll(".gene-index-item")
+    .find((button) => button.title === "NONE::FIRST").click();
+  render();
+  assert.strictEqual(section("No literature found").children[1].hidden, false);
+  // New runs, explicit reloads, and anonymous new results restore defaults.
+  sandbox.state.currentResult = { run_id: "second-run", fusion_evidence: items };
+  render();
+  assert.strictEqual(section("No literature found").children[1].hidden, true);
+  assert.strictEqual(section("Found in Lung cancer").children[1].hidden, false);
+  section("No literature found").querySelector(".fusion-section-toggle").click();
+  sandbox.resetFusionEvidenceSections();
+  render();
+  assert.strictEqual(section("No literature found").children[1].hidden, true);
+  sandbox.state.currentResult = { fusion_evidence: items };
+  render();
+  section("No literature found").querySelector(".fusion-section-toggle").click();
+  sandbox.state.currentResult = { fusion_evidence: items };
+  render();
+  assert.strictEqual(section("No literature found").children[1].hidden, true);
 }
 
 function testHighlightsAndSafeCardContent() {
@@ -172,6 +245,9 @@ function testHighlightsAndSafeCardContent() {
     assert.ok(content.includes(expected), expected);
   }
   assert.ok(walk(root).every((node) => node.innerHTML === ""), "fusion API data must use DOM text");
+  const paperLink = walk(root).find((node) => node.tagName === "a" && node.textContent === "PMID 1");
+  assert.strictEqual(paperLink.className, "", "topline links keep the original plain-link appearance");
+  assert.strictEqual(root.querySelectorAll(".citation-link").length, 2, "retrieved PMID pills retain their style");
   sandbox.renderFusionEvidenceView([{ fusion: "EML4::ALK", literature_scope: "no_literature" }]);
   assert.strictEqual(root.querySelectorAll(".fusion-partner-query-button").length, 2);
   sandbox.renderFusionEvidenceView([{ fusion: "EML4::ALK", retrieval_status: "failed" }]);
@@ -202,8 +278,8 @@ function testResultsAndNoResultSidebarUnchanged() {
 
 const tests = [testSectioningAndOrder, testEmptySectionsOmitted,
   testSidebarNavigationAndActiveTracking, testActiveTrackingAcrossObserverBatches,
-  testHighlightsAndSafeCardContent,
-  testResultsAndNoResultSidebarUnchanged];
+  testHighlightsAndSafeCardContent, testSharedPmidCountAndFutureScopes,
+  testExpansionPersistsAndResetsForNewResults, testResultsAndNoResultSidebarUnchanged];
 for (const test of tests) {
   test();
   console.log(`PASS ${test.name}`);

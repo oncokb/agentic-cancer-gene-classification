@@ -454,6 +454,7 @@ function clearQueue() {
 }
 
 function clearResults() {
+  resetFusionEvidenceSections();
   state.currentResult = null;
   state.resultsViewMode = "results";
   state.fusionEvidenceStatus = null;
@@ -934,6 +935,8 @@ async function runAnnotation() {
     return;
   }
 
+  resetFusionEvidenceSections();
+
   // Collapse the expanded batch sidebar so results have room
   document.body.classList.remove("batch-active");
 
@@ -1239,6 +1242,7 @@ async function loadSharedRun() {
     if (result.fusion_evidence?.length) {
       state.fusionEvidenceStatus = "complete";
     }
+    resetFusionEvidenceSections();
     state.currentResult = result;
     renderAnnotationResult(result);
     setMessage("Shared run restored.", "info");
@@ -1337,8 +1341,9 @@ function rebuildGeneIndex(entries) {
     btn.addEventListener("click", () => {
       const card = document.getElementById(targetId);
       if (!card) return;
-      const section = card.closest("details.fusion-evidence-section");
-      if (section) section.open = true;
+      const sectionContainer = card.closest(".fusion-evidence-section");
+      const toggle = sectionContainer?.querySelector(".fusion-section-toggle");
+      if (toggle?.getAttribute("aria-expanded") === "false") toggle.click();
       card.scrollIntoView({ behavior: "smooth", block: "start" });
     });
     elements.geneIndex.appendChild(btn);
@@ -1371,9 +1376,9 @@ function observeGeneCards() {
       });
     },
     {
-      // The narrow layout scrolls the page rather than the results pane.
-      root: elements.resultsWindow.scrollHeight > elements.resultsWindow.clientHeight
-        ? elements.resultsWindow : null,
+      // Viewport intersections are also clipped by scrolling ancestors, so
+      // this works across pane/page scrolling without re-picking on resize.
+      root: null,
       threshold: 0.15,
     },
   );
@@ -1712,7 +1717,21 @@ function renderNoResultView(hiddenAnnotations) {
   })));
 }
 
+let _fusionSectionResultKey = null;
+const _fusionSectionOpen = new Map();
+
+function resetFusionEvidenceSections(resultKey = null) {
+  _fusionSectionResultKey = resultKey;
+  _fusionSectionOpen.clear();
+}
+
+function fusionEvidencePmidCount(item) {
+  return item.retrieved_count || (item.pmids || []).length;
+}
+
 function renderFusionEvidenceView(fusionEvidence) {
+  const resultKey = state.currentResult?.run_id || state.currentResult;
+  if (_fusionSectionResultKey !== resultKey) resetFusionEvidenceSections(resultKey);
   const items = fusionEvidence || [];
   if (!items.length) {
     renderEmptyState(
@@ -1729,23 +1748,29 @@ function renderFusionEvidenceView(fusionEvidence) {
 
   const indexEntries = [];
   fusionEvidenceSections(items).forEach(({ label, items, collapsed }) => {
-    const section = document.createElement("details");
+    const section = document.createElement("section");
     section.className = "fusion-evidence-section";
-    section.open = !collapsed;
-    const summary = document.createElement("summary");
-    const heading = document.createElement("h3");
-    heading.textContent = `${label} (${items.length})`;
-    summary.appendChild(heading);
-    section.appendChild(summary);
+    const heading = appendFusionText(section, "h3", "fusion-section-heading");
+    const toggle = appendFusionText(heading, "button", "fusion-section-toggle", `${label} (${items.length})`);
+    toggle.type = "button";
     const cards = document.createElement("div");
-    cards.className = "annotation-list";
+    cards.className = "annotation-list fusion-section-cards";
+    cards.id = `fusion-section-${list.children.length}`;
+    toggle.setAttribute("aria-controls", cards.id);
+    const setOpen = (open) => {
+      toggle.setAttribute("aria-expanded", String(open));
+      cards.hidden = !open;
+      _fusionSectionOpen.set(label, open);
+    };
+    setOpen(_fusionSectionOpen.get(label) ?? !collapsed);
+    toggle.addEventListener("click", () => setOpen(cards.hidden));
     items.forEach((item) => {
       const card = renderFusionEvidenceCard(item);
       // Include an ordinal so distinct fusion spellings cannot collide after sanitizing.
       card.id = `fusion-${cssSafeId(item.fusion)}-${indexEntries.length}`;
       cards.appendChild(card);
       indexEntries.push({
-        targetId: card.id, label: item.fusion, count: (item.pmids || []).length, section: label,
+        targetId: card.id, label: item.fusion, count: fusionEvidencePmidCount(item), section: label,
       });
     });
     section.appendChild(cards);
@@ -1773,11 +1798,11 @@ function fusionEvidenceSections(items) {
     } else if (item.literature_scope === "other_or_unspecified" && item.tumor_type) {
       label = "Found in other tumor types";
       order = 1;
-    } else if (item.literature_scope) {
+    } else if (item.literature_scope === "any_tumor") {
       label = "Literature found";
       order = 0;
-    } else if ((item.pmids || []).length || item.retrieved_count > 0) {
-      label = "Literature found (not classified by tumor type)";
+    } else if (item.literature_scope || (item.pmids || []).length || item.retrieved_count > 0) {
+      label = "Literature found — not classified by tumor type";
       order = 2;
     } else {
       label = "No literature found";
@@ -1805,12 +1830,12 @@ function renderFusionEvidenceCard(item) {
   const pmids = item.pmids || [];
   const header = appendFusionText(card, "header", "fusion-section-card-header");
   const heading = appendFusionText(header, "div", "annotation-heading");
-  appendFusionText(heading, "h3", "fusion-section-card-name", item.fusion);
+  appendFusionText(heading, "h4", "fusion-section-card-name", item.fusion);
   appendFusionText(heading, "div", "subtle", item.tumor_type || "Any tumor type");
   const meta = appendFusionText(header, "div", "annotation-card-meta");
   appendFusionText(meta, "span", `review-badge ${item.well_supported ? "high" : "low"}`,
     item.well_supported ? "Well supported" : "Exploratory");
-  const count = item.retrieved_count || pmids.length;
+  const count = fusionEvidencePmidCount(item);
   appendFusionText(meta, "span", "status-pill", `${count} PMID${count === 1 ? "" : "s"}`);
   if (item.literature_scope === "requested_tumor" && item.tumor_type && item.retrieval_status !== "failed") {
     appendFusionText(card, "p", "fusion-tumor-match",
@@ -1833,6 +1858,9 @@ function renderFusionEvidenceCard(item) {
       const topline = appendFusionText(paperCard, "div", "evidence-card-topline");
       const pill = appendFusionText(topline, "span", "pmid-pill");
       const link = makePubMedLink(paper.pmid);
+      // Topline links retain the existing plain-link appearance, unlike the
+      // rounded pills in the separate Retrieved PMIDs list.
+      link.className = "";
       link.textContent = `PMID ${paper.pmid}`;
       pill.appendChild(link);
       if (paper.abstract) {
