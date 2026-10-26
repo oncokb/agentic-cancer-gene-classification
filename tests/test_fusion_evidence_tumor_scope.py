@@ -84,10 +84,89 @@ def test_phrases_match_on_word_boundaries_with_plural_and_hyphen_variants():
     assert _terms("SARC", abstract="Found in an osteosarcoma.") == []
     assert _terms("SARC", abstract="Found in a soft tissue sarcoma.") == ["sarcoma"]
     assert _terms(None, abstract="lung adenocarcinoma") == []
-    # A tumor type outside the alias table is matched as given.
-    assert _terms("Infantile fibrosarcoma", abstract="ETV6-NTRK3 infantile fibrosarcomas") == [
-        "Infantile fibrosarcoma"
+    # A tumor type outside the alias table is matched by its normalized form.
+    assert _terms("Infantile  Fibrosarcoma", abstract="ETV6-NTRK3 infantile fibrosarcomas") == [
+        "infantile fibrosarcoma"
     ]
+    # Hyphens inside an alias are part of it.
+    assert _terms("NSCLC", abstract="in non-small-cell lung cancer") == ["non-small cell lung cancer"]
+
+
+@pytest.mark.parametrize("tumor_type, text", [
+    ("breast", "Infants were exposed through breast-feeding."),
+    ("lung", "Patients received lung-protective ventilation."),
+    ("liver", "We used liver-derived organoids."),
+    ("ALL", "Detected in ALL-like cell lines."),
+    # "small cell lung cancer" (SCLC) must not match inside "non-small cell lung cancer".
+    ("SCLC", "Seen in non-small cell lung cancer."),
+])
+def test_hyphenated_neighbour_ends_a_match(tumor_type, text):
+    assert _terms(tumor_type, abstract=text) == []
+
+
+@pytest.mark.parametrize("tumor_type, text, expected", [
+    ("breast", "A cohort of breast cancer patients.", ["breast"]),
+    ("breast", "Two breast carcinomas carried the fusion.", ["breast"]),
+    ("breast cancer", "Two breast cancers carried the fusion.", ["breast cancer"]),
+    ("lung", "Seen in lung, breast-feeding aside.", ["lung"]),
+    ("SCLC", "Seen in small-cell lung cancer.", ["small cell lung cancer"]),
+])
+def test_unhyphenated_mentions_still_match(tumor_type, text, expected):
+    assert _terms(tumor_type, abstract=text) == expected
+
+
+OS_ABSTRACT = "The fusion was detected in 12 patients; median OS was 12 months."
+
+
+@pytest.mark.parametrize("tumor_type", ["os", "OS", "Os", " oS "])
+def test_unknown_short_code_is_an_abbreviation_whatever_its_case(tumor_type):
+    assert _terms(tumor_type, abstract=OS_ABSTRACT) == []
+    assert _terms(tumor_type, abstract="os and Os in the abstract") == []
+    assert _terms(tumor_type, title="EWSR1 fusion in OS") == ["OS"]
+
+
+async def test_os_and_OS_requests_classify_identically(monkeypatch):
+    records = [
+        _record("2", "EWSR1-FLI1 fusion cohort", f"EWSR1-FLI1 fusion. {OS_ABSTRACT}"),
+        _record("1", "EWSR1-FLI1 fusion", "EWSR1-FLI1 in Os and os."),
+    ]
+    _patch_retrieval(monkeypatch, records)
+
+    lower = await retrieve_fusion_evidence("EWSR1::FLI1", tumor_type="os", max_results=10)
+    upper = await retrieve_fusion_evidence("EWSR1::FLI1", tumor_type="OS", max_results=10)
+
+    assert _fusion_evidence_cache_key("EWSR1::FLI1", "os", 10) == _fusion_evidence_cache_key(
+        "EWSR1::FLI1", "OS", 10
+    )
+    for result in (lower, upper):
+        assert result.literature_scope == "other_or_unspecified"
+        assert result.requested_tumor_pmids == []
+    assert [card.requested_tumor_terms for card in lower.evidence_cards] == [
+        card.requested_tumor_terms for card in upper.evidence_cards
+    ]
+
+
+@pytest.mark.parametrize("tumor_type", ["dsrct", "DSRCT", "Dsrct"])
+def test_unknown_lowercase_code_matches_its_uppercase_token(tumor_type):
+    assert _terms(tumor_type, abstract="EWSR1-WT1 defines DSRCT.") == ["DSRCT"]
+    assert _terms(tumor_type, abstract="EWSR1-WT1 defines dsrct.") == []
+
+
+@pytest.mark.parametrize("tumor_type", ["pecoma", "PEComa", "PECOMA"])
+def test_unknown_longer_name_matches_as_a_word(tumor_type):
+    # Six characters: a name, matched case-insensitively.
+    assert _terms(tumor_type, abstract="TFE3-rearranged PEComas") == ["pecoma"]
+
+
+def test_short_tumor_words_are_not_treated_as_codes():
+    assert _terms("Lung", abstract="Found in lung tumors.") == ["lung"]
+    assert _terms("LUNG", abstract="Found in lung tumors.") == ["lung"]
+
+
+def test_known_lowercase_codes_still_expand():
+    assert _terms("luad", abstract="EML4-ALK in LUAD.") == ["LUAD"]
+    assert _terms("luad", abstract="EML4-ALK in luad.") == []
+    assert _terms("luad", abstract="in lung adenocarcinoma") == ["lung adenocarcinoma"]
 
 
 UTROSCT_ABSTRACT = (
@@ -254,7 +333,7 @@ def test_cache_key_is_bumped_for_tumor_scope(monkeypatch):
     )
 
     assert key != pre_scope_key
-    assert json.loads(key.removeprefix("fusion_evidence:"))["tumor_scope_version"] == 1
+    assert json.loads(key.removeprefix("fusion_evidence:"))["tumor_scope_version"] == 2
 
 
 async def test_retrieve_fusion_evidence_uses_the_bumped_cache_key(monkeypatch):

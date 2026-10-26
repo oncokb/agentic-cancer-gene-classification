@@ -268,28 +268,64 @@ _TUMOR_MENTION_EXCLUSIONS: tuple[re.Pattern[str], ...] = (
 )
 _UTROSCT_TERM_KEYS = frozenset(term.lower() for term in _UTROSCT_TERMS)
 _TUMOR_ABBREVIATION_TITLE_ONLY_LENGTH = 2
+# A tumor type outside the alias table counts as a code (DSRCT, OS) when it is
+# one alphanumeric token of at most this many characters...
+_FREE_TEXT_ABBREVIATION_MAX_LENGTH = 5
+# ...unless it is one of these ordinary words, which match as words.
+_SHORT_TUMOR_WORDS = frozenset({
+    "anal", "anus", "blood", "bone", "bones", "brain", "colon", "ear", "ewing", "eye", "eyes",
+    "gland", "head", "heart", "liver", "lung", "lungs", "neck", "nerve", "nasal", "oral",
+    "ovary", "penis", "renal", "skin", "spine", "tumor", "uvea", "vulva", "wilms",
+})
+# Word edges. A hyphenated neighbour also ends the match ("breast-feeding",
+# "non-small"); hyphens inside an alias such as "non-small cell" are part of it.
+_TUMOR_TERM_START = r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]-)"
+_TUMOR_TERM_END = r"(?![A-Za-z0-9])(?!-[A-Za-z0-9])"
+
+
+def normalize_tumor_identity(tumor_type: Optional[str]) -> str:
+    """Case- and whitespace-insensitive tumor identity, shared by the cache key and the matcher."""
+    return " ".join((tumor_type or "").strip().lower().split())
 
 
 def _is_tumor_abbreviation(term: str) -> bool:
-    """Single token with an uppercase letter after the first character: ALL, MM, ccRCC, LG-ESS."""
+    """Alias-table form with an uppercase letter after the first character: ALL, MM, ccRCC, LG-ESS."""
     return not any(char.isspace() for char in term) and any(char.isupper() for char in term[1:])
 
 
+def _requested_tumor_match_terms(tumor_identity: str) -> List[Tuple[str, bool]]:
+    """(term, is_abbreviation) for a normalized tumor identity.
+
+    Alias-table forms are fixed, so they are classified as written. Anything
+    else is classified from the lowercased identity alone, so "os", "OS" and
+    "Os" (one cache entry) are always matched the same way.
+    """
+    aliases = _TUMOR_TYPE_ALIASES.get(tumor_identity)
+    if aliases:
+        return [(term, _is_tumor_abbreviation(term)) for term in aliases]
+    if (
+        re.fullmatch(rf"[a-z0-9]{{1,{_FREE_TEXT_ABBREVIATION_MAX_LENGTH}}}", tumor_identity)
+        and tumor_identity not in _SHORT_TUMOR_WORDS
+    ):
+        return [(tumor_identity.upper(), True)]
+    return [(tumor_identity, False)]
+
+
 @lru_cache(maxsize=256)
-def _requested_tumor_matchers(tumor_type: str) -> tuple[tuple[str, re.Pattern[str], bool], ...]:
-    """(term, pattern, title_only) for each expanded term of tumor_type.
+def _requested_tumor_matchers(tumor_identity: str) -> tuple[tuple[str, re.Pattern[str], bool], ...]:
+    """(term, pattern, title_only) for each match term of a normalized tumor identity.
 
     Abbreviations match case-sensitively as whole tokens, so "all" and "5 mm"
     never count as ALL or MM; two-letter abbreviations are matched in titles
     only. Other terms match case-insensitively on word boundaries, tolerating
-    space/hyphen variation and a simple plural.
+    space/hyphen variation inside the term and a simple plural.
     """
     matchers = []
-    for term in _expand_tumor_type_terms(tumor_type):
+    for term, is_abbreviation in _requested_tumor_match_terms(tumor_identity):
         term = term.strip()
         if not term:
             continue
-        if _is_tumor_abbreviation(term):
+        if is_abbreviation:
             body = re.escape(term) + "s?"
             flags = 0
             title_only = len(re.sub(r"[^A-Za-z0-9]", "", term)) <= _TUMOR_ABBREVIATION_TITLE_ONLY_LENGTH
@@ -297,13 +333,13 @@ def _requested_tumor_matchers(tumor_type: str) -> tuple[tuple[str, re.Pattern[st
             body = r"[\s-]+".join(re.escape(token) for token in re.split(r"[\s-]+", term)) + "(?:e?s)?"
             flags = re.IGNORECASE
             title_only = False
-        pattern = re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])", flags)
+        pattern = re.compile(_TUMOR_TERM_START + body + _TUMOR_TERM_END, flags)
         matchers.append((term, pattern, title_only))
     return tuple(matchers)
 
 
-def _mask_tumor_mention_exclusions(text: str, tumor_type: str) -> str:
-    terms = {term.lower() for term in _expand_tumor_type_terms(tumor_type)}
+def _mask_tumor_mention_exclusions(text: str, tumor_identity: str) -> str:
+    terms = {term.lower() for term, _ in _requested_tumor_match_terms(tumor_identity)}
     if terms & _UTROSCT_TERM_KEYS:
         return text
     for pattern in _TUMOR_MENTION_EXCLUSIONS:
@@ -312,14 +348,18 @@ def _mask_tumor_mention_exclusions(text: str, tumor_type: str) -> str:
 
 
 def requested_tumor_terms_in_record(record: LiteratureRecord, tumor_type: Optional[str]) -> List[str]:
-    """Expanded tumor_type terms mentioned in the record's title or abstract, in alias-table order."""
-    tumor_type = (tumor_type or "").strip()
-    if not tumor_type:
+    """Requested-tumor terms mentioned in the record's title or abstract, in alias-table order.
+
+    Depends only on normalize_tumor_identity(tumor_type), so requests that
+    share a cache entry always classify identically.
+    """
+    tumor_identity = normalize_tumor_identity(tumor_type)
+    if not tumor_identity:
         return []
-    title = _mask_tumor_mention_exclusions(record.title, tumor_type)
-    abstract = _mask_tumor_mention_exclusions(record.abstract, tumor_type)
+    title = _mask_tumor_mention_exclusions(record.title, tumor_identity)
+    abstract = _mask_tumor_mention_exclusions(record.abstract, tumor_identity)
     matched: List[str] = []
-    for term, pattern, title_only in _requested_tumor_matchers(tumor_type):
+    for term, pattern, title_only in _requested_tumor_matchers(tumor_identity):
         if pattern.search(title) or (not title_only and pattern.search(abstract)):
             matched.append(term)
     return list(dict.fromkeys(matched))
@@ -862,14 +902,15 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
     return "fusion_evidence:" + json.dumps(
         {
             "fusion": fusion.strip(),
-            "tumor_type": " ".join((tumor_type or "").strip().lower().split()),
+            "tumor_type": normalize_tumor_identity(tumor_type),
             "max_results": max_results,
             "min_papers": settings.min_papers_for_strong_association,
             "exact_fusion_filter_version": 2,
             "retraction_filter_version": 2,
             "alias_expansion_version": 1,
             # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
-            "tumor_scope_version": 1,
+            # 2: hyphen-aware word edges; case-independent free-text abbreviations.
+            "tumor_scope_version": 2,
         },
         sort_keys=True,
     )

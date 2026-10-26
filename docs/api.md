@@ -413,9 +413,13 @@ Each `fusion_evidence` entry (the same shape is returned inline by
 
 Tumor mentions are matched deterministically on word boundaries against the
 same expanded terms as the tumor-scoped query (for example `LUAD` also matches
-"lung adenocarcinoma"). Abbreviations match case-sensitively, two-letter
-abbreviations such as `MM` count only in titles, and "uterine tumor resembling
-ovarian sex cord tumor" does not count as an ovarian tumor mention.
+"lung adenocarcinoma"). The case of `tumor_type` does not matter. A hyphenated
+neighbour ends a match, so `breast` does not match "breast-feeding".
+Abbreviations match case-sensitively as uppercase tokens; an unlisted
+`tumor_type` of up to 5 letters or digits (such as `dsrct`) is treated as an
+abbreviation unless it is a common word such as `lung`. Two-letter
+abbreviations such as `MM` or `os` count only in titles, and "uterine tumor
+resembling ovarian sex cord tumor" does not count as an ovarian tumor mention.
 - **The job status response is the authoritative source for the evidence.** If
   `run_id` was supplied, the job marks itself `complete` first and then
   best-effort attaches the evidence to that run. A missing run is silently
