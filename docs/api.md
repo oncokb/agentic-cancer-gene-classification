@@ -360,10 +360,10 @@ Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
     {
       "fusion": "EML4::ALK",
       "tumor_type": "LUAD",
-      "well_supported": true,
+      "well_supported": false,
       "retrieved_count": 2,
       "pmids": ["17625570", "20979469"],
-      "interpretation": "The exact fusion pair is well supported in LUAD ...",
+      "interpretation": "EML4::ALK in LUAD has 2 non-retracted PubMed record(s) from exact fusion-pair searches, below the well-supported threshold.",
       "evidence_cards": [ ... ]
     }
   ],
@@ -440,10 +440,16 @@ polling intervals at 15 seconds or longer when you have several jobs running.
   Exact fusion-pair evidence requires `POST /v1/fusion-evidence/jobs`.
 - Only one tumor type is used per gene per request, chosen in two stages. If
   the **same input string** is repeated with different tumor types, the last
-  non-empty `tumor_type` overwrites the earlier ones. Then, across a gene's
-  distinct input strings, the first non-null tumor type in submission order is
-  used; later ones are ignored (`src/pipeline/orchestrator.py:543-549`,
-  `src/pipeline/orchestrator.py:611-618`).
+  non-empty `tumor_type` overwrites the earlier ones. Then, from the merged
+  input list for a gene, the first non-null tumor type is used; later ones are
+  ignored (`src/pipeline/orchestrator.py:543-549`,
+  `src/pipeline/orchestrator.py:611-618`). That list preserves submission order
+  only among inputs using the same symbol. Across aliases or Ensembl IDs, the
+  inputs are resolved and merged in an identifier-dependent order (sorted
+  Ensembl IDs before sorted HGNC symbols;
+  `src/pipeline/normalization.py:245-268`), so the chosen tumor type is **not
+  guaranteed** to be the first one you submitted. If the tumor type matters,
+  send one request per tumor type.
 - Fusion separators are `::`, `--` and `/` only. A single hyphen is **not** a
   separator: `EWSR1-FLI1` is treated as one gene symbol, not a fusion. Write
   `EWSR1::FLI1`.
