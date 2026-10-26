@@ -227,7 +227,7 @@ async def no_cache_static(request: Request, call_next):
     # app.js/styles.css after a deploy on a plain reload, not just a hard
     # refresh — force revalidation on every request for both.
     response = await call_next(request)
-    if request.url.path in ("/", "/login", "/api-keys") or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/login", "/api-keys", "/runs") or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -984,6 +984,14 @@ async def api_keys_page(request: Request) -> Response:
         "__ACGC_API_KEY_MAX_EXPIRES_DAYS__", str(int(settings.api_key_max_expires_in_days))
     )
     return HTMLResponse(page)
+
+
+@app.get("/runs")
+async def runs_page(request: Request) -> Response:
+    redirect = _login_redirect(request)
+    if redirect:
+        return redirect
+    return FileResponse(_STATIC_DIR / "runs.html")
 
 
 @app.get("/login")

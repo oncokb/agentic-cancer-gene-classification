@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="same-origin" />
+    <title>My runs — Cancer Gene Classification</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/favicon-180.png" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="api-keys-body">
+    <main class="api-keys-page" id="runs-page">
+      <header class="api-keys-header">
+        <a class="api-keys-back" href="/">&larr; Back to annotations</a>
+        <div class="brand-title">
+          <img class="brand-icon" src="/static/favicon.svg" alt="" width="28" height="28" />
+          <h1>My runs</h1>
+        </div>
+        <p class="api-keys-lead">
+          Your saved annotation runs, newest first.
+        </p>
+      </header>
+
+      <div class="api-keys-alert hidden" id="runs-error" role="alert"></div>
+
+      <section class="api-keys-card" aria-labelledby="runs-list-heading">
+        <div class="api-keys-list-heading">
+          <h2 id="runs-list-heading">Runs</h2>
+        </div>
+        <p class="api-keys-empty hidden" id="runs-empty">No saved runs yet — runs you start while signed in will appear here</p>
+        <p class="api-keys-empty" id="runs-loading">Loading…</p>
+        <div class="api-keys-table-wrap">
+          <table class="api-keys-table hidden" id="runs-table">
+            <thead>
+              <tr>
+                <th>Date/time</th>
+                <th>Inputs</th>
+                <th>Genes annotated</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody id="runs-tbody"></tbody>
+          </table>
+        </div>
+        <div class="runs-actions">
+          <button class="primary-action hidden" id="runs-load-more" type="button">Load more</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/runs.js"></script>
+  </body>
+</html>
