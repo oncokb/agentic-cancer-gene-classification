@@ -670,6 +670,9 @@ async def normalize_fusions(
     # Ensembl-resolved (or failed) tokens keep their own ResolvedGene, keyed by
     # the submitted token; everything else is keyed by the HGNC symbol.
     ensembl_resolved: Dict[str, ResolvedGene] = {}
+    # A failed token's row is shared by every input that used it, so it
+    # collects each input's own message (fusions name the rejected partner).
+    row_errors: Dict[str, list[str]] = {}
     inputs: Dict[str, CanonicalInput] = {}
     keys_by_input: Dict[str, list[str]] = {}
     for fusion, tokens in tokens_by_input.items():
@@ -691,20 +694,22 @@ async def normalize_fusions(
                 info.warnings.append(warning)
             if symbol is None:
                 error = resolved.resolution_error or f"'{raw}' could not be resolved."
+                note = ""
                 if len(readings) == 2:
                     # Say which partner was rejected; the other one is still annotated.
                     side, other_side = ("5′", "3′") if index == 0 else ("3′", "5′")
                     error = f"{side} partner of '{fusion}' rejected — {error}"
-                    resolved = resolved.model_copy(update={"resolution_error": error})
                     other = readings[1 - index][2]
                     if other is None or other[0] is not None:
-                        error += f" The {other_side} partner is still annotated on its own."
-                info.errors.append(error)
+                        note = f" The {other_side} partner is still annotated on its own."
+                if error not in row_errors.setdefault(raw, []):
+                    row_errors[raw].append(error)
+                info.errors.append(error + note)
                 info.lookup_failed = info.lookup_failed or resolved.lookup_failed
                 symbols.append(raw)
                 transcripts.append(None)
                 keys.append(raw)
-                ensembl_resolved.setdefault(raw, resolved)
+                ensembl_resolved[raw] = resolved
             elif token.named_gene and not token.variant:
                 symbols.append(symbol)
                 transcripts.append(transcript)
@@ -720,6 +725,9 @@ async def normalize_fusions(
             info.five_transcript, info.three_transcript = transcripts
         inputs[fusion] = info
         keys_by_input[fusion] = keys
+
+    for raw, errors in row_errors.items():
+        ensembl_resolved[raw] = ensembl_resolved[raw].model_copy(update={"resolution_error": " ".join(errors)})
 
     # (request position, canonical input, submitted input) per key, in request
     # order, so merged genes keep first-input-wins whatever the identifier type.

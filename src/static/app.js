@@ -1649,6 +1649,8 @@ function renderNoResultView(hiddenAnnotations) {
         <div class="field-row-value">${escapeHtml(reason)}</div>
       </div>
     `;
+    const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
+    if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);
     const summary = String(annotation.gene_summary || "").trim();
     if (summary) {
       const summaryRow = document.createElement("div");

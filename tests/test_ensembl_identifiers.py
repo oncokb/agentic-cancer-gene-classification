@@ -311,6 +311,43 @@ async def test_unknown_transcript_is_a_clear_error_not_a_fuzzy_match(fake_http):
     assert _hgnc_requests(handler) == ["rest.genenames.org/fetch/symbol/ALK"]  # only the plain symbol
 
 
+_UNKNOWN_MESSAGE = f"Ensembl has no human gene, transcript or protein {_UNKNOWN_TX}."
+_UNKNOWN_FUSION = f"{_UNKNOWN_TX}::ALK"
+_UNKNOWN_PARTNER_MESSAGE = f"5′ partner of '{_UNKNOWN_FUSION}' rejected — {_UNKNOWN_MESSAGE}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_repeated_failed_token_row_carries_each_inputs_message(fake_http, reverse):
+    inputs = [_UNKNOWN_TX, _UNKNOWN_FUSION]
+    if reverse:
+        inputs.reverse()
+
+    gene_map = await normalize_fusions(inputs)
+
+    # One row for the token, carrying both inputs' own messages in request order.
+    expected = [_UNKNOWN_MESSAGE, _UNKNOWN_PARTNER_MESSAGE]
+    if reverse:
+        expected.reverse()
+    assert gene_map[_UNKNOWN_TX][0].resolution_error == " ".join(expected)
+    assert gene_map[_UNKNOWN_TX][1] == inputs
+    # Each input's own request-level error, whatever the order.
+    assert gene_map.inputs[_UNKNOWN_TX].errors == [_UNKNOWN_MESSAGE]
+    assert gene_map.inputs[_UNKNOWN_FUSION].errors == [
+        f"{_UNKNOWN_PARTNER_MESSAGE} The 3′ partner is still annotated on its own."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_same_failed_partner_in_two_fusions_names_each_fusion(fake_http):
+    other_fusion = f"EML4::{_UNKNOWN_TX}"
+    gene_map = await normalize_fusions([_UNKNOWN_FUSION, other_fusion])
+
+    assert gene_map[_UNKNOWN_TX][0].resolution_error == (
+        f"{_UNKNOWN_PARTNER_MESSAGE} 3′ partner of '{other_fusion}' rejected — {_UNKNOWN_MESSAGE}"
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "value",
@@ -537,6 +574,23 @@ def test_gene_query_first_submitted_tumor_type_wins(client):
         body = client.post("/v1/genes/query", json={"genes": order}).json()
         assert client.tumor_types == {"TP53": order[0]["tumor_type"]}
         assert body["results"][0]["tumor_type"] == order[0]["tumor_type"]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_annotate_error_row_names_rejected_partner_in_either_order(client, reverse):
+    inputs = [_UNKNOWN_TX, _UNKNOWN_FUSION]
+    if reverse:
+        inputs.reverse()
+
+    result = _annotate(client, "/v1/annotate", {"fusions": inputs})
+
+    row = next(annotation for annotation in result["annotations"] if annotation["gene"] == _UNKNOWN_TX)
+    messages = [_UNKNOWN_MESSAGE, _UNKNOWN_PARTNER_MESSAGE]
+    if reverse:
+        messages.reverse()
+    assert row["error"] == "Unresolvable gene symbol — " + " ".join(messages)
+    assert row["fusions"] == [_UNKNOWN_FUSION]
+    assert client.annotated == {"ALK": [_UNKNOWN_FUSION]}
 
 
 def test_annotate_gene_endpoint_resolves_protein_id(client):
