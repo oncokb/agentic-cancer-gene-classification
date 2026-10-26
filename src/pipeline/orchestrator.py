@@ -607,7 +607,7 @@ async def run_pipeline(
     increment("genes.queried", value=len(gene_map), tags=metric_tags)
     logger.info("Resolved %d unique genes from %d inputs", len(gene_map), len(input_strings))
     await _maybe_call_total(on_total_known, len(gene_map))
-    warnings = unparsed_fusion_warnings(input_strings, gene_map)
+    warnings = await unparsed_fusion_warnings(input_strings, gene_map)
 
     # Build per-gene tumor_type: first non-null tumor_type from the gene's submitted inputs.
     gene_tumor_type: Dict[str, Optional[str]] = {}
