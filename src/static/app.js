@@ -1308,6 +1308,7 @@ function rebuildGeneIndex(annotations) {
     const btn = document.createElement("button");
     btn.className = "gene-index-item";
     btn.textContent = annotation.gene;
+    btn.title = annotation.gene;
     btn.type = "button";
     btn.addEventListener("click", () => {
       const card = document.getElementById(`gene-${annotation.gene}`);
