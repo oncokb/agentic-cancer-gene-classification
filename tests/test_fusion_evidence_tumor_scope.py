@@ -115,9 +115,15 @@ def test_unhyphenated_mentions_still_match(tumor_type, text, expected):
     assert _terms(tumor_type, abstract=text) == expected
 
 
-# En dash, em dash, non-breaking hyphen (U+2011) and minus sign (U+2212).
+# En dash, em dash, non-breaking hyphen (U+2011), minus sign (U+2212), the
+# compatibility dashes U+FE58, U+FE63, U+FF0D, hyphen bullet U+2043 and soft hyphen.
 UNICODE_DASHES = pytest.mark.parametrize(
-    "dash", ["\u2013", "\u2014", "\u2011", "\u2212"], ids=["en", "em", "nb-hyphen", "minus"],
+    "dash",
+    ["\u2013", "\u2014", "\u2011", "\u2212", "\ufe58", "\ufe63", "\uff0d", "\u2043", "\u00ad"],
+    ids=[
+        "en", "em", "nb-hyphen", "minus", "small-em", "small-hyphen", "fullwidth", "hyphen-bullet",
+        "soft-hyphen",
+    ],
 )
 
 
@@ -140,9 +146,47 @@ def test_unicode_dash_inside_an_alias_still_matches(dash):
     assert _terms("NSCLC", abstract=abstract) == ["non-small cell lung cancer"]
 
 
-def test_soft_hyphen_joins_the_word_it_splits():
-    assert _terms("breast", abstract="Exposure through breast\u00adfeeding.") == []
-    assert _terms("LUAD", abstract="EML4-ALK lung adeno\u00adcarcinoma.") == ["lung adenocarcinoma"]
+@pytest.mark.parametrize("tumor_type, text, expected", [
+    # Folded to "-", not deleted: deleting would give "sexcord" and escape the UTROSCT exclusion.
+    ("ovarian", "Uterine tumor resembling ovarian sex\u00adcord tumor.", []),
+    ("breast", "Exposure through breast\u00adfeeding.", []),
+    ("SCLC", "Seen in small\u00adcell lung cancer.", ["small cell lung cancer"]),
+    ("ALL", "Recurrent fusions in B\u00adALL.", ["B-ALL"]),
+])
+def test_soft_hyphen_behaves_like_a_hyphen(tumor_type, text, expected):
+    assert _terms(tumor_type, abstract=text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "Seen in non-\nsmall cell lung cancer.",
+    "Seen in non- small cell lung cancer.",
+    "Seen in non\u2013 small cell lung cancer.",
+])
+def test_line_broken_non_prefix_ends_a_match(text):
+    assert _terms("SCLC", abstract=text) == []
+
+
+@pytest.mark.parametrize("ascii_form, dashed_form", [
+    ("non-small cell lung cancer", "non\u2013small cell lung cancer"),
+    ("non-small cell lung cancer", "Non\uff0dSmall  Cell Lung Cancer"),
+    ("uterine tumor resembling ovarian sex-cord tumor", "uterine tumor resembling ovarian sex\u2013cord tumor"),
+])
+def test_dashed_tumor_type_shares_identity_expansion_and_matching(ascii_form, dashed_form):
+    assert literature.normalize_tumor_identity(dashed_form) == literature.normalize_tumor_identity(ascii_form)
+    assert literature._expand_tumor_type_terms(dashed_form) == literature._expand_tumor_type_terms(ascii_form)
+    assert len(literature._expand_tumor_type_terms(dashed_form)) > 1  # alias-expanded
+    assert literature._fusion_evidence_cache_key("A::B", dashed_form, 10) == (
+        literature._fusion_evidence_cache_key("A::B", ascii_form, 10)
+    )
+    for title, abstract in [("NSCLC cohort", ""), ("ESR1::NCOA3 in UTROSCT", UTROSCT_ABSTRACT)]:
+        assert _terms(dashed_form, title=title, abstract=abstract) == (
+            _terms(ascii_form, title=title, abstract=abstract)
+        )
+
+
+def test_dashed_utrosct_request_is_not_masked_by_its_own_exclusion():
+    dashed = "uterine tumor resembling ovarian sex\u2013cord tumor"
+    assert _terms(dashed, abstract=UTROSCT_ABSTRACT) == _terms("UTROSCT", abstract=UTROSCT_ABSTRACT)
 
 
 @pytest.mark.parametrize("tumor_type, text", [
@@ -388,7 +432,7 @@ def test_cache_key_is_bumped_for_tumor_scope(monkeypatch):
     )
 
     assert key != pre_scope_key
-    assert json.loads(key.removeprefix("fusion_evidence:"))["tumor_scope_version"] == 3
+    assert json.loads(key.removeprefix("fusion_evidence:"))["tumor_scope_version"] == 4
 
 
 async def test_retrieve_fusion_evidence_uses_the_bumped_cache_key(monkeypatch):

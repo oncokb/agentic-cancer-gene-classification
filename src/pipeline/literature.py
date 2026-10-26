@@ -229,7 +229,9 @@ _TUMOR_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
 
 def _expand_tumor_type_terms(tumor_type: str) -> list[str]:
     """Return PubMed search phrases for tumor_type, expanding abbreviations/aliases."""
-    aliases = _TUMOR_TYPE_ALIASES.get(tumor_type.strip().lower())
+    # Looked up by the cache-key identity, so requests sharing a cache entry
+    # (e.g. en dash vs "-") also share their query expansion.
+    aliases = _TUMOR_TYPE_ALIASES.get(normalize_tumor_identity(tumor_type))
     return list(aliases) if aliases else [tumor_type.strip()]
 
 
@@ -266,7 +268,6 @@ _TUMOR_MENTION_EXCLUSIONS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
 )
-_UTROSCT_TERM_KEYS = frozenset(term.lower() for term in _UTROSCT_TERMS)
 _TUMOR_ABBREVIATION_TITLE_ONLY_LENGTH = 2
 # A tumor type outside the alias table counts as a code (DSRCT, OS) when it is
 # one alphanumeric token of at most this many characters...
@@ -278,29 +279,37 @@ _SHORT_TUMOR_WORDS = frozenset({
     "ovary", "penis", "renal", "skin", "spine", "tumor", "uvea", "vulva", "wilms",
 })
 # The one dash class: hyphen-minus, U+2010-U+2015 (hyphen, non-breaking hyphen,
-# figure dash, en dash, em dash, horizontal bar) and U+2212 minus sign. Text and
-# terms are folded to "-" before matching, so the patterns below only need "-".
-# A soft hyphen (U+00AD) is an invisible break hint inside a word, so it is
-# dropped: "breast\u00adfeeding" reads as "breastfeeding".
-_TUMOR_TEXT_DASHES = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
-_TUMOR_TEXT_TRANSLATION = str.maketrans(
-    {**{dash: "-" for dash in _TUMOR_TEXT_DASHES}, "\u00ad": None}
+# figure dash, en dash, em dash, horizontal bar), U+2043 hyphen bullet, U+2212
+# minus sign, the compatibility forms U+FE58, U+FE63 and U+FF0D, and U+00AD soft
+# hyphen. Text, terms and the tumor identity are folded to "-" before matching,
+# so the patterns below only need "-". A soft hyphen is folded rather than
+# dropped so "sex\u00adcord" stays "sex-cord" and the hyphen guards still apply.
+_TUMOR_TEXT_DASHES = (
+    "-\u2010\u2011\u2012\u2013\u2014\u2015\u2043\u2212\ufe58\ufe63\uff0d\u00ad"
 )
+_TUMOR_TEXT_TRANSLATION = str.maketrans({dash: "-" for dash in _TUMOR_TEXT_DASHES})
 # Word edges. A hyphenated neighbour also ends the match ("breast-feeding",
-# "non-small"), as does a preceding "non " ("non small cell lung cancer" is not
-# SCLC); hyphens inside an alias such as "non-small cell" are part of it.
-_TUMOR_TERM_START = r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]-)(?<!\b[Nn][Oo][Nn] )"
+# "non-small"), as does a preceding "non " or "non- " ("non small cell lung
+# cancer" and a line-broken "non-\nsmall cell lung cancer" are not SCLC);
+# hyphens inside an alias such as "non-small cell" are part of it.
+_TUMOR_TERM_START = (
+    r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]-)(?<!\b[Nn][Oo][Nn] )(?<!\b[Nn][Oo][Nn]- )"
+)
 _TUMOR_TERM_END = r"(?![A-Za-z0-9])(?!-[A-Za-z0-9])"
 
 
 def _normalize_tumor_text(text: str) -> str:
-    """Fold every dash to "-", drop soft hyphens and collapse whitespace before matching."""
+    """Fold every dash (soft hyphens included) to "-" and collapse whitespace before matching."""
     return " ".join(text.translate(_TUMOR_TEXT_TRANSLATION).split())
 
 
 def normalize_tumor_identity(tumor_type: Optional[str]) -> str:
-    """Case- and whitespace-insensitive tumor identity, shared by the cache key and the matcher."""
-    return " ".join((tumor_type or "").strip().lower().split())
+    """Case-, dash- and whitespace-insensitive tumor identity, shared by the cache key,
+    alias expansion and the matcher."""
+    return _normalize_tumor_text((tumor_type or "").lower())
+
+
+_UTROSCT_TERM_KEYS = frozenset(normalize_tumor_identity(term) for term in _UTROSCT_TERMS)
 
 
 def _is_tumor_abbreviation(term: str) -> bool:
@@ -354,7 +363,7 @@ def _requested_tumor_matchers(tumor_identity: str) -> tuple[tuple[str, re.Patter
 
 
 def _mask_tumor_mention_exclusions(text: str, tumor_identity: str) -> str:
-    terms = {term.lower() for term, _ in _requested_tumor_match_terms(tumor_identity)}
+    terms = {normalize_tumor_identity(term) for term, _ in _requested_tumor_match_terms(tumor_identity)}
     if terms & _UTROSCT_TERM_KEYS:
         return text
     for pattern in _TUMOR_MENTION_EXCLUSIONS:
@@ -926,7 +935,8 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
             # 2: hyphen-aware word edges; case-independent free-text abbreviations.
             # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
-            "tumor_scope_version": 3,
+            # 4: compatibility dashes, soft hyphen as "-", dash-folded identity, "non- ".
+            "tumor_scope_version": 4,
         },
         sort_keys=True,
     )
