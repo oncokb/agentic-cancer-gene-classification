@@ -207,8 +207,9 @@ curl -s -X POST https://acgc.oncokb.org/v1/annotate \
   -d '{"fusions": ["EML4::ALK"]}'
 ```
 
-That annotates the genes but leaves `fusion_evidence` empty. Exact
-fusion-pair evidence is a second step: start a fusion-evidence job, passing
+That annotates the genes and leaves `fusion_evidence` empty by default. Add
+`"include_fusion_evidence": true` to retrieve exact-pair evidence inline
+before saving and returning the run. Alternatively, start a fusion-evidence job, passing
 the annotation run's `run_id` so ACGC best-effort attaches the evidence to
 that run, then poll its `status_url`.
 
@@ -359,11 +360,22 @@ curl -X POST http://127.0.0.1:8000/v1/annotate/jobs \
 curl http://127.0.0.1:8000/v1/annotate/jobs/{job_id}
 ```
 
-Annotation results always contain `fusion_evidence: []`. To get exact
-fusion-pair evidence, run a second job with the completed annotation job's
-`run_id` and poll it; see the
+Annotation results contain `fusion_evidence: []` by default. Set
+`include_fusion_evidence: true` on `/v1/annotate` or `/v1/annotate/jobs` to
+retrieve exact fusion-pair evidence before saving and returning the run.
+Alternatively, run a second job with the completed annotation job's `run_id`
+and poll it; see the
 [API user guide](docs/api.md#post-v1fusion-evidencejobs) and the
 [batch workflow](docs/api.md#batch-workflow).
+
+`/v1/annotate`, `/v1/annotate/jobs`, and `/v1/fusion-evidence/jobs` accept at
+most `ANNOTATE_MAX_INPUTS` entries (default 50), before deduplication or
+filtering. Larger requests return `422` with a string `detail`, such as
+`{"detail": "At most 50 inputs may be annotated per request"}`.
+Annotation results include `warnings` (default `[]`) naming genes with
+conflicting tumor types, the type used, and the ignored types. Repeated
+identical inputs keep the first non-empty tumor type; annotation still uses
+one tumor type per gene.
 
 Core results can be enriched lazily after the first response returns. The UI
 exposes this through **Enrich results**; API callers can submit returned
@@ -606,9 +618,13 @@ PubMed retrieval excludes records marked as `Retracted Publication` or
 `Retraction of Publication`, and citation verification ignores any retracted
 records that reach synthesis through cached or test fixtures.
 
-Fusion-level evidence is intentionally outside the core annotation critical
-path, so `/v1/annotate` and `/v1/annotate/jobs` always return
-`fusion_evidence: []`. The UI starts `/v1/fusion-evidence/jobs` after gene
+Fusion-level evidence is outside the annotation critical path by default:
+`/v1/annotate` and `/v1/annotate/jobs` return `fusion_evidence: []` unless
+`include_fusion_evidence: true` requests inline retrieval. Inline evidence is
+saved with the run, and its duration is recorded in
+`timings_ms.fusion_evidence` and included in `timings_ms.total`. Annotation
+jobs expose `phase: "fusion_evidence"` during this step. The UI starts
+`/v1/fusion-evidence/jobs` after gene
 annotations are available, polls it in the background, and displays results in
 a separate Fusion evidence tab; pass the annotation run's `run_id` to
 best-effort attach the evidence to the run. Each exact fusion/tumor lookup is

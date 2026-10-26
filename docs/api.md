@@ -211,13 +211,23 @@ curl -s -X POST https://acgc.oncokb.org/v1/annotate \
 | Field | Meaning |
 | --- | --- |
 | `fusions` | Required, at least one entry. Each entry is a gene or fusion string, or an object with `fusion` (aliases `gene`, `input` and `query` also work) and an optional `tumor_type`. |
+| `include_fusion_evidence` | Optional, default `false`. Retrieves exact-pair evidence inline before saving and returning the run; also supported by `/v1/annotate/jobs`. |
 | `mode` | `"full"` (default) or `"core"`. `"core"` prioritizes the cancer association, rationale, summary and citations. |
 | `force_refresh` | Optional, default `false`. Bypasses saved gene annotations and recomputes them. |
 | `skip_literature_for_oncokb` | Optional, default `false`. Genes confirmed in OncoKB return a deterministic OncoKB-based annotation without PubMed retrieval or LLM synthesis. |
 
 Each fusion is split into its partner genes, and every unique gene is annotated
 once. `fusions_processed` counts submitted inputs; `genes_annotated` counts
-unique genes.
+unique genes. Each request to `/v1/annotate`, `/v1/annotate/jobs`, or
+`/v1/fusion-evidence/jobs` accepts at most `ANNOTATE_MAX_INPUTS` entries
+(default 50), before deduplication or filtering. Over-limit requests return
+`422` with a string `detail`, for example
+`{"detail": "At most 50 inputs may be annotated per request"}`.
+
+`warnings` defaults to `[]`. When a gene has conflicting tumor types, it names
+the gene, the type used, and the ignored types; annotation still uses one type
+per gene. Comparisons ignore case and surrounding/repeated whitespace while
+warnings preserve the original strings.
 
 ```json
 {
@@ -242,6 +252,7 @@ unique genes.
     }
   ],
   "fusion_evidence": [],
+  "warnings": [],
   "timings_ms": {"normalization": 120.4, "annotation": 4300.2, "total": 4420.6}
 }
 ```
@@ -249,10 +260,13 @@ unique genes.
 _The `annotations` array above is abbreviated: this request returns one entry
 for `ALK` and one for `EML4`. The other entry is omitted here for brevity._
 
-`fusion_evidence` is **always empty** in the `POST /v1/annotate` response. It is
-only populated on a saved run after a fusion-evidence job is attached to that
-run, or directly in a fusion-evidence job's response. See
-[Fusion evidence jobs](#post-v1fusion-evidencejobs).
+`fusion_evidence` is empty by default. Set `include_fusion_evidence: true`
+to retrieve it before the annotation result is saved and returned. This also
+adds `timings_ms.fusion_evidence`, included in `timings_ms.total`. Individual
+fusion retrieval failures are logged and represented in the evidence result
+without failing annotation. Alternatively, retrieve it separately with
+[Fusion evidence jobs](#post-v1fusion-evidencejobs), optionally attaching it
+to the saved run with `run_id`.
 
 Saving the run is best-effort: if persistence fails, the response is still
 returned with its `run_id`, but `GET /v1/annotate/{run_id}` may then return
@@ -286,6 +300,7 @@ Poll the `status_url` until `status` is `complete` or `failed`.
 {
   "job_id": "6f2d8a1c-7b3e-4a9d-9c11-8f0e2d4b6a70",
   "status": "complete",
+  "phase": "complete",
   "fusions_processed": 2,
   "genes_completed": 4,
   "genes_total": 4,
@@ -297,6 +312,7 @@ Poll the `status_url` until `status` is `complete` or `failed`.
     "genes_annotated": 4,
     "annotations": [ ... ],
     "fusion_evidence": [],
+    "warnings": [],
     "timings_ms": {"total": 8120.4}
   },
   "error": null,
@@ -305,6 +321,8 @@ Poll the `status_url` until `status` is `complete` or `failed`.
 ```
 
 - `status` is `queued`, `running`, `complete` or `failed`.
+- `phase` is `queued`, `annotation`, `fusion_evidence`, `complete`, or `failed`;
+  it distinguishes optional inline evidence retrieval from gene annotation.
 - `annotations` fills in as genes finish; `genes_completed` and `genes_total`
   show progress.
 - On success, `result` is the same `AnnotationResult` that `POST /v1/annotate`
@@ -321,8 +339,8 @@ Poll the `status_url` until `status` is `complete` or `failed`.
 
 ### `POST /v1/fusion-evidence/jobs`
 
-Runs exact fusion-pair PubMed evidence retrieval in the background. This is
-where `fusion_evidence` comes from.
+Runs exact fusion-pair PubMed evidence retrieval in the background as an
+alternative to `include_fusion_evidence: true` on annotation requests.
 
 ```bash
 curl -s -X POST https://acgc.oncokb.org/v1/fusion-evidence/jobs \
@@ -339,6 +357,8 @@ curl -s -X POST https://acgc.oncokb.org/v1/fusion-evidence/jobs \
 | `fusions` | Required, at least one entry in the same string-or-object form as `POST /v1/annotate`. Only entries with a fusion separator and two non-empty partners are processed; gene-only entries and entries such as `ALK::` are ignored. |
 | `run_id` | Optional. When set, ACGC best-effort saves the completed evidence onto that existing run, so a later `GET /v1/annotate/{run_id}` may include it. |
 
+The same `ANNOTATE_MAX_INPUTS` cap (default 50) applies before filtering or
+deduplication; exceeding it returns `422` with a string `detail`.
 Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
 
 ```json
@@ -387,7 +407,7 @@ Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
 ### `GET /v1/annotate/{run_id}`
 
 Returns the saved `AnnotationResult` for a run without recomputing it. This is
-how you read back fusion evidence attached by a successful
+how you read back inline fusion evidence or evidence attached by a successful
 `/v1/fusion-evidence/jobs` request.
 
 ```bash
@@ -402,25 +422,27 @@ a `view_url`. Build the report link yourself from the run ID:
 https://acgc.oncokb.org/?run=<run_id>
 ```
 
-That is the same link format the app uses (`src/main.py:836-838`).
-`fusion_evidence` is populated only if a fusion-evidence job successfully
-attached it to this run; otherwise it is `[]`. An unknown `run_id` returns
-`404`.
+That is the same link format the app uses (`_run_view_url` in `src/main.py`).
+`fusion_evidence` is populated if the annotation request set
+`include_fusion_evidence: true` or a fusion-evidence job successfully attached
+it to this run; otherwise it is `[]`. An unknown `run_id` returns `404`.
 
 ### Batch workflow
 
 For a large gene/fusion list, this sequence avoids request timeouts and gives
 you exact-pair fusion evidence:
 
-1. Split the inputs into chunks of about 50. There is no hard item cap on
-   `POST /v1/annotate`, but a synchronous request with many uncached genes can
-   exceed the production ingress timeout (about 300 seconds).
-2. For each chunk, `POST /v1/annotate/jobs` with the chunk's `fusions`.
+1. Split the inputs into chunks of at most `ANNOTATE_MAX_INPUTS` (default 50).
+   Larger requests return `422` with a string `detail`; synchronous requests
+   can also exceed the production ingress timeout (about 300 seconds).
+2. For each chunk, `POST /v1/annotate/jobs` with the chunk's `fusions`. Set
+   `include_fusion_evidence: true` to retrieve evidence in the same job.
 3. Poll `GET /v1/annotate/jobs/{job_id}` every 15 to 30 seconds until `status`
    is `complete` or `failed`. On `429`, wait for `Retry-After` seconds and
    retry the same poll.
-4. From the completed job, keep `result.annotations` and `result.run_id`.
-5. If the chunk contains fusions, `POST /v1/fusion-evidence/jobs` with those
+4. From the completed job, keep `result.annotations` and `result.run_id`. If
+   inline evidence was requested, read `result.fusion_evidence` and skip steps 5–7.
+5. Otherwise, if the chunk contains fusions, `POST /v1/fusion-evidence/jobs` with those
    fusion entries and `run_id` set to `result.run_id`. Gene-only entries can be
    left in the list; they are ignored.
 6. Poll `GET /v1/fusion-evidence/jobs/{job_id}` every 15 to 30 seconds, again
@@ -436,14 +458,14 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 
 ### Known limitations
 
-- `POST /v1/annotate` (and its jobs) always returns `fusion_evidence: []`.
-  Exact fusion-pair evidence requires `POST /v1/fusion-evidence/jobs`.
+- `POST /v1/annotate` (and its jobs) returns `fusion_evidence: []` by default.
+  Set `include_fusion_evidence: true` or run `POST /v1/fusion-evidence/jobs`
+  separately for exact fusion-pair evidence.
 - Only one tumor type is used per gene per request, chosen in two stages. If
-  the **same input string** is repeated with different tumor types, the last
-  non-empty `tumor_type` overwrites the earlier ones. Then, from the merged
-  input list for a gene, the first non-null tumor type is used; later ones are
-  ignored (`src/pipeline/orchestrator.py:543-549`,
-  `src/pipeline/orchestrator.py:611-618`). That list preserves submission order
+  the **same input string** is repeated with different tumor types, the first
+  non-empty `tumor_type` is kept. Then, from the merged input list for a gene,
+  the first non-null tumor type is used; ignored conflicting types are named
+  in the response-level `warnings`. That list preserves submission order
   only among inputs using the same symbol. Across aliases or Ensembl IDs, the
   inputs are resolved and merged in an identifier-dependent order (sorted
   Ensembl IDs before sorted HGNC symbols;
@@ -491,9 +513,10 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 
 ### Whole-request errors
 
-Rows that mention gene symbols, fusions, the 50-gene cap or `view_url` describe
+Rows that mention gene symbols, fusions, the `GENE_QUERY_MAX_GENES` 50-gene cap or `view_url` describe
 the **gene query API** (`/v1/genes/...`). `POST /v1/annotate` accepts fusions,
-has no item cap, and does not return `view_url`. The `401`, `403`, `429` and
+has the separate `ANNOTATE_MAX_INPUTS` cap (default 50), and does not return
+`view_url`. The `401`, `403`, `429` and
 `503` cases apply to all endpoints.
 
 | Status | Meaning | What to do |
@@ -501,7 +524,7 @@ has no item cap, and does not return `view_url`. The `401`, `403`, `429` and
 | `401` | No key, or the key is wrong, revoked or expired, or its owner is no longer allowed to use ACGC. | Check `ACGC_API_KEY`, or create a new key. |
 | `403` | Your account is waiting for administrator approval, or a key was used to manage keys. | Contact the ACGC team, or manage keys on the API keys page. |
 | `404` | Gene query API, `GET /v1/genes/{symbol}`: the gene doesn't exist (HGNC or Ensembl confirmed no match). Annotate, `GET /v1/annotate/{run_id}`: the run doesn't exist. | Check the symbol or run ID. |
-| `422` | Gene query API: a bad gene symbol, a fusion, more than 50 genes, or invalid JSON. Annotate: an empty `fusions` list or invalid JSON. | Fix the request. The response says which field is wrong. |
+| `422` | Gene query API: a bad gene symbol, a fusion, more than 50 genes, or invalid JSON. Annotation and fusion-evidence requests: an empty `fusions` list, invalid JSON, or more than `ANNOTATE_MAX_INPUTS` entries (default 50; over-limit responses have a string `detail`). | Fix the request. The response says which field is wrong, or states the input limit. |
 | `429` | You exceeded your key's rate limit. | Wait for the number of seconds in `Retry-After`, then retry. |
 | `500` | Gene query API: ACGC couldn't save the run, so no `view_url` is returned. Annotate: an unexpected pipeline error (run saving is separate and best-effort). | Retry later. |
 | `503` | A gene lookup service (HGNC or Ensembl) was temporarily unavailable, or ACGC can't verify keys right now. | Retry after a short wait. |

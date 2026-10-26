@@ -117,6 +117,10 @@ class Settings(BaseSettings):
     context_score_pubtype_case_report_weight: float = 0.3
     context_score_pubtype_editorial_weight: float = 0.15
     context_score_pubtype_preprint_weight: float = 0.3
+    annotate_max_inputs: int = Field(
+        default=50, ge=1,
+        description="Maximum inputs per annotation or fusion-evidence request (ANNOTATE_MAX_INPUTS).",
+    )
     annotation_job_ttl_seconds: int = 3600
     # Max entries accepted per gene query API request (POST /v1/genes/query[/jobs]).
     gene_query_max_genes: int = 50

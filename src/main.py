@@ -19,7 +19,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from html import escape as html_escape
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Coroutine, Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import parse_qs, quote
 
 import httpx
@@ -281,6 +281,9 @@ class AnnotationJobCreateResponse(BaseModel):
 class AnnotationJobStatusResponse(BaseModel):
     job_id: str
     status: str
+    phase: Literal["queued", "annotation", "fusion_evidence", "complete", "failed"] = Field(
+        default="queued", description="Current job phase, including optional inline fusion evidence retrieval.",
+    )
     fusions_processed: int
     genes_completed: int = 0
     genes_total: Optional[int] = None
@@ -356,6 +359,8 @@ class EnrichmentJobStatusResponse(BaseModel):
 
 
 class FusionEvidenceJobRequest(AnnotateRequest):
+    # This endpoint always retrieves evidence; the inline annotation flag does not apply.
+    include_fusion_evidence: ClassVar[bool] = False
     run_id: Optional[str] = Field(
         default=None,
         description=(
@@ -770,6 +775,12 @@ async def _get_fusion_evidence_job(job_id: str) -> FusionEvidenceJobStatusRespon
     return job
 
 
+def _check_annotate_input_limit(fusions: List[FusionInput]) -> None:
+    limit = settings.annotate_max_inputs
+    if len(fusions) > limit:
+        raise HTTPException(status_code=422, detail=f"At most {limit} inputs may be annotated per request")
+
+
 def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
     seen: set[tuple[str, Optional[str]]] = set()
     inputs: List[FusionInput] = []
@@ -782,6 +793,36 @@ def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
         seen.add(key)
         inputs.append(item)
     return inputs
+
+
+async def _retrieve_fusion_evidence_input(
+    item: FusionInput, semaphore: asyncio.Semaphore,
+) -> FusionEvidenceResult:
+    async with semaphore:
+        try:
+            return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
+        except Exception as exc:
+            logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
+            return FusionEvidenceResult(
+                fusion=item.fusion,
+                tumor_type=item.tumor_type,
+                interpretation=f"Fusion evidence retrieval failed: {exc}",
+            )
+
+
+async def _include_inline_fusion_evidence(
+    request: AnnotateRequest, result: AnnotationResult,
+) -> None:
+    if request.include_fusion_evidence:
+        start = time.perf_counter()
+        semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
+        result.fusion_evidence = list(await asyncio.gather(*(
+            _retrieve_fusion_evidence_input(item, semaphore)
+            for item in _fusion_evidence_inputs(request.fusions)
+        )))
+        elapsed = round((time.perf_counter() - start) * 1000, 2)
+        result.timings_ms["fusion_evidence"] = elapsed
+        result.timings_ms["total"] = round(result.timings_ms.get("total", 0.0) + elapsed, 2)
 
 
 async def _save_run_result(
@@ -1470,6 +1511,7 @@ async def annotate(
     Input supports plain strings or structured objects with optional tumor_type and breakpoint fields:
     `{ "fusions": ["ALK", {"fusion": "EML4::ALK", "tumor_type": "LUAD"}] }`
     """
+    _check_annotate_input_limit(request.fusions)
     _record_annotation_request_metrics(request, http_request, current_user)
     try:
         result = await run_pipeline(
@@ -1484,6 +1526,7 @@ async def annotate(
         logger.exception("Pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
+    await _include_inline_fusion_evidence(request, result)
     await _persist_run_result(http_request, request.model_dump(), result)
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
@@ -1541,6 +1584,7 @@ async def _launch_annotation_job(
     async def run_job() -> None:
         current = await _get_annotation_job(job_id)
         current.status = "running"
+        current.phase = "annotation"
         await _store_annotation_job(current)
         try:
             result = await run_pipeline(
@@ -1554,12 +1598,18 @@ async def _launch_annotation_job(
                 on_total_known=on_total_known,
                 **({"strict_gene_lookup": True} if kind == "gene_query" else {}),
             )
+            if request.include_fusion_evidence:
+                current = await _get_annotation_job(job_id)
+                current.phase = "fusion_evidence"
+                await _store_annotation_job(current)
+            await _include_inline_fusion_evidence(request, result)
             if require_persistence:
                 await _save_run_result(http_request, request.model_dump(), result)
             else:
                 await _persist_run_result(http_request, request.model_dump(), result)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
+            current.phase = "complete"
             current.result = result
             current.annotations = result.annotations
             current.genes_completed = result.genes_annotated
@@ -1587,6 +1637,7 @@ async def _launch_annotation_job(
             )
             current = await _get_annotation_job(job_id)
             current.status = "failed"
+            current.phase = "failed"
             current.error = str(exc)
             await _store_annotation_job(current)
 
@@ -1600,6 +1651,7 @@ async def create_annotation_job(
     http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> AnnotationJobCreateResponse:
+    _check_annotate_input_limit(request.fusions)
     _record_annotation_request_metrics(request, http_request, current_user)
     job_id = await _launch_annotation_job(request, http_request, current_user)
     return AnnotationJobCreateResponse(
@@ -1688,6 +1740,7 @@ async def create_fusion_evidence_job(
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> FusionEvidenceJobCreateResponse:
     """Run exact fusion-pair PubMed evidence retrieval outside the annotation critical path."""
+    _check_annotate_input_limit(request.fusions)
     fusion_inputs = _fusion_evidence_inputs(request.fusions)
     job_id = str(uuid.uuid4())
     job = FusionEvidenceJobStatusResponse(
@@ -1697,18 +1750,6 @@ async def create_fusion_evidence_job(
     )
     await _store_fusion_evidence_job(job)
 
-    async def run_one(item: FusionInput, semaphore: asyncio.Semaphore) -> FusionEvidenceResult:
-        async with semaphore:
-            try:
-                return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
-            except Exception as exc:
-                logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
-                return FusionEvidenceResult(
-                    fusion=item.fusion,
-                    tumor_type=item.tumor_type,
-                    interpretation=f"Fusion evidence retrieval failed: {exc}",
-                )
-
     async def run_job() -> None:
         start = time.perf_counter()
         current = await _get_fusion_evidence_job(job_id)
@@ -1716,7 +1757,10 @@ async def create_fusion_evidence_job(
         await _store_fusion_evidence_job(current)
         try:
             semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
-            tasks = [asyncio.create_task(run_one(item, semaphore)) for item in fusion_inputs]
+            tasks = [
+                asyncio.create_task(_retrieve_fusion_evidence_input(item, semaphore))
+                for item in fusion_inputs
+            ]
             for task in asyncio.as_completed(tasks):
                 result = await task
                 current = await _get_fusion_evidence_job(job_id)
