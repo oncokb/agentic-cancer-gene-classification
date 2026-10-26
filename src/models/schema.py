@@ -529,7 +529,13 @@ class AnnotationResult(BaseModel):
     fusions_processed: int
     genes_annotated: int
     annotations: List[GeneAnnotation]
-    fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
+    fusion_evidence: List[FusionEvidenceResult] = Field(
+        default_factory=list,
+        description=(
+            "Exact fusion-pair evidence. POST /v1/annotate always returns an empty list; "
+            "run POST /v1/fusion-evidence/jobs (optionally with run_id) to populate it."
+        ),
+    )
     timings_ms: Dict[str, float] = Field(default_factory=dict)
 
 
