@@ -176,11 +176,17 @@ Your original input stays in the result: `resolved_inputs` on each annotation
 `submitted_inputs` in gene-query results, and `input` on fusion-evidence
 results. Request-level `warnings` repeat any caveats and errors.
 
-An input that can't be used gets its own error and is not annotated as any
-gene. That covers an unknown or malformed ID, an Ensembl lookup that failed
-(retry), and `GENE(ENST...)` where the transcript belongs to a different gene.
-In the gene query API the last case reads "The Ensembl ID belongs to a
+An identifier that can't be used gets its own error row and is not annotated
+as any gene. That covers an unknown or malformed ID, an Ensembl lookup that
+failed (retry), and `GENE(ENST...)` where the transcript belongs to a different
+gene. In the gene query API the last case reads "The Ensembl ID belongs to a
 different gene than the one named."
+
+In a fusion, only the bad partner is rejected: the other partner is still
+annotated on its own. For `EML4(ENST00000256078)::ALK` (a KRAS transcript),
+ALK is annotated, and the error row and request `warnings` say "5′ partner of
+'EML4(ENST00000256078)::ALK' rejected — ... belongs to KRAS, not EML4". Fix
+the partner and resubmit to annotate the fusion as a pair.
 
 ## 4. Gene query background jobs
 
@@ -496,16 +502,11 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 - `POST /v1/annotate` (and its jobs) returns `fusion_evidence: []` by default.
   Set `include_fusion_evidence: true` or run `POST /v1/fusion-evidence/jobs`
   separately for exact fusion-pair evidence.
-- Only one tumor type is used per gene per request, chosen in two stages. If
-  the **same input string** is repeated with different tumor types, the first
-  non-empty `tumor_type` is kept. Then, from the merged input list for a gene,
-  the first non-null tumor type is used; ignored conflicting types are named
-  in the response-level `warnings`. That list preserves submission order
-  only among inputs using the same symbol. Across aliases or Ensembl IDs, the
-  inputs are resolved and merged in an identifier-dependent order (sorted
-  Ensembl IDs before sorted HGNC symbols; see `normalize_fusions` in
-  `src/pipeline/normalization.py`), so the chosen tumor type is **not
-  guaranteed** to be the first one you submitted. If the tumor type matters,
+- Only one tumor type is used per gene per request: the first non-empty
+  `tumor_type` in submission order among all inputs that resolve to that gene,
+  whatever their spelling (`TP53`, an alias, `ENSG...`, `ENST...`, `ENSP...`
+  or `TP53(ENST...)`). Ignored conflicting types are named in the
+  response-level `warnings`. To annotate a gene in more than one tumor type,
   send one request per tumor type.
 - Fusion separators are `::`, `--` and `/` only. A single hyphen is **not** a
   separator: `EWSR1-FLI1` is treated as one gene symbol, not a fusion. Write

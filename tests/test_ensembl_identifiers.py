@@ -32,6 +32,7 @@ pytestmark = pytest.mark.no_real_redis
 _TP53_GENE, _TP53_TX, _TP53_PROTEIN = "ENSG00000141510", "ENST00000269305", "ENSP00000269305"
 _EML4_TX, _ALK_TX, _KRAS_TX = "ENST00000318522", "ENST00000389048", "ENST00000256078"
 _UNKNOWN_TX = "ENST00000000001"
+_TP53_TX_2 = "ENST00000420246"  # a second TP53 transcript
 
 _GENES = {
     _TP53_GENE: "TP53",
@@ -41,6 +42,7 @@ _GENES = {
 }
 _TRANSCRIPTS = {
     _TP53_TX: _TP53_GENE,
+    _TP53_TX_2: _TP53_GENE,
     _EML4_TX: "ENSG00000143924",
     _ALK_TX: "ENSG00000171094",
     _KRAS_TX: "ENSG00000133703",
@@ -244,9 +246,14 @@ async def test_decorated_transcript_of_another_gene_is_an_error(fake_http):
     failed = gene_map[f"EML4({_KRAS_TX})"][0]
     assert failed.unresolvable and not failed.lookup_failed
     assert failed.resolution_error == (
-        f"'EML4({_KRAS_TX})': Ensembl {_KRAS_TX} belongs to KRAS, not EML4. Correct the gene or the Ensembl ID."
+        f"5′ partner of '{value}' rejected — 'EML4({_KRAS_TX})': Ensembl {_KRAS_TX} belongs to KRAS, not EML4. "
+        "Correct the gene or the Ensembl ID."
     )
-    assert gene_map.inputs[value].errors == [failed.resolution_error]
+    # The valid partner is still annotated, and the request-level error says so.
+    assert gene_map["ALK"][0].resolved and gene_map["ALK"][1] == [value]
+    assert gene_map.inputs[value].errors == [
+        f"{failed.resolution_error} The 3′ partner is still annotated on its own."
+    ]
     assert gene_map.inputs[value].canonical == value
 
 
@@ -284,20 +291,24 @@ async def test_hgvs_naming_another_gene_is_an_error(fake_http):
     gene_map = await normalize_fusions([value])
 
     assert list(gene_map) == [value]
-    assert "belongs to TP53, not KRAS" in gene_map[value][0].resolution_error
+    assert gene_map[value][0].resolution_error.startswith(f"'{value}': Ensembl {_TP53_TX} belongs to TP53, not KRAS.")
 
 
 @pytest.mark.asyncio
 async def test_unknown_transcript_is_a_clear_error_not_a_fuzzy_match(fake_http):
     handler = fake_http()
 
-    gene_map = await normalize_fusions([_UNKNOWN_TX, f"EML4({_UNKNOWN_TX})"])
+    gene_map = await normalize_fusions([_UNKNOWN_TX, f"EML4({_UNKNOWN_TX})", f"ALK::{_UNKNOWN_TX}.2"])
 
-    assert sorted(gene_map) == [f"EML4({_UNKNOWN_TX})", _UNKNOWN_TX]
-    for key, (resolved, _) in gene_map.items():
+    assert sorted(gene_map) == ["ALK", f"EML4({_UNKNOWN_TX})", _UNKNOWN_TX, f"{_UNKNOWN_TX}.2"]
+    for key in (_UNKNOWN_TX, f"EML4({_UNKNOWN_TX})"):
+        resolved = gene_map[key][0]
         assert resolved.unresolvable and not resolved.lookup_failed
         assert resolved.resolution_error == f"Ensembl has no human gene, transcript or protein {_UNKNOWN_TX}."
-    assert _hgnc_requests(handler) == []
+    assert gene_map[f"{_UNKNOWN_TX}.2"][0].resolution_error.startswith(
+        f"3′ partner of 'ALK::{_UNKNOWN_TX}.2' rejected — Ensembl has no human"
+    )
+    assert _hgnc_requests(handler) == ["rest.genenames.org/fetch/symbol/ALK"]  # only the plain symbol
 
 
 @pytest.mark.asyncio
@@ -385,6 +396,9 @@ class FakeRunStore:
     async def save_run(self, run_id, timestamp, request_payload, result_payload, **kwargs):
         self.saved.append(result_payload)
 
+    async def save_gene_annotation(self, annotation, started_at, tumor_type=None):
+        pass
+
     async def get_run(self, run_id):
         return None
 
@@ -392,12 +406,14 @@ class FakeRunStore:
 @pytest.fixture
 def client(monkeypatch, fake_http):
     annotated = {}
+    annotated_tumor_types = {}
     real_annotate_gene = orchestrator._annotate_gene
 
     async def fake_annotate_gene(**kwargs):
         if kwargs["unresolvable"]:
             return await real_annotate_gene(**kwargs)  # production early return; no network
         annotated[kwargs["gene"]] = kwargs["fusions"]
+        annotated_tumor_types[kwargs["gene"]] = kwargs["tumor_type"]
         return GeneAnnotation(gene=kwargs["gene"], fusions=kwargs["fusions"], cache_status="refreshed")
 
     async def no_cached_annotation(**kwargs):
@@ -413,6 +429,7 @@ def client(monkeypatch, fake_http):
     main.app.state.run_store = FakeRunStore()
     test_client = TestClient(main.app)
     test_client.annotated = annotated
+    test_client.tumor_types = annotated_tumor_types
     return test_client
 
 
@@ -465,14 +482,61 @@ def test_annotate_reports_mismatch_and_unknown_ids_per_input(client):
     by_gene = {annotation["gene"]: annotation for annotation in result["annotations"]}
     assert sorted(by_gene) == ["ALK", f"EML4({_KRAS_TX})", _UNKNOWN_TX]
     assert "EML4" not in client.annotated and "KRAS" not in client.annotated
+    assert client.annotated["ALK"] == [f"EML4({_KRAS_TX})::ALK"]  # the valid partner is still annotated
     assert by_gene[f"EML4({_KRAS_TX})"]["error"] == (
-        f"Unresolvable gene symbol — 'EML4({_KRAS_TX})': Ensembl {_KRAS_TX} belongs to KRAS, not EML4. "
-        "Correct the gene or the Ensembl ID."
+        f"Unresolvable gene symbol — 5′ partner of 'EML4({_KRAS_TX})::ALK' rejected — "
+        f"'EML4({_KRAS_TX})': Ensembl {_KRAS_TX} belongs to KRAS, not EML4. Correct the gene or the Ensembl ID."
     )
     assert by_gene[_UNKNOWN_TX]["error"] == (
         f"Unresolvable gene symbol — Ensembl has no human gene, transcript or protein {_UNKNOWN_TX}."
     )
     assert len(result["warnings"]) == 2
+
+
+# Two spellings of TP53 in each pair; the first-submitted tumor type must win.
+_SAME_GENE_SPELLINGS = [
+    ("TP53", _TP53_TX),
+    ("TP53", _TP53_GENE),
+    (_TP53_TX, _TP53_TX_2),
+    (f"TP53({_TP53_TX})", _TP53_TX_2),
+    (f"TP53({_TP53_TX})", "TP53"),
+    (_TP53_PROTEIN, f"{_TP53_TX}.9"),
+    (f"{_TP53_TX}:c.215C>G", "TP53"),
+]
+
+
+@pytest.mark.parametrize("first, second", _SAME_GENE_SPELLINGS)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_first_submitted_tumor_type_wins_across_identifier_types(client, first, second, reverse):
+    rows = [{"fusion": first, "tumor_type": "LUAD"}, {"fusion": second, "tumor_type": "BRCA"}]
+    if reverse:
+        rows.reverse()
+    winner, loser = rows[0]["tumor_type"], rows[1]["tumor_type"]
+
+    result = _annotate(client, "/v1/annotate", {"fusions": rows})
+
+    assert [annotation["gene"] for annotation in result["annotations"]] == ["TP53"]
+    assert client.tumor_types == {"TP53": winner}
+    assert f"TP53: using tumor type {winner!r}; ignored tumor types: {loser!r}." in result["warnings"]
+
+
+def test_first_tumor_type_wins_when_earlier_input_has_none(client):
+    rows = ["TP53", {"fusion": _TP53_TX, "tumor_type": "BRCA"}, {"fusion": "TP53", "tumor_type": "LUAD"}]
+
+    result = _annotate(client, "/v1/annotate", {"fusions": rows})
+
+    assert client.tumor_types == {"TP53": "BRCA"}
+    assert "TP53: using tumor type 'BRCA'; ignored tumor types: 'LUAD'." in result["warnings"]
+
+
+def test_gene_query_first_submitted_tumor_type_wins(client):
+    genes = [{"gene": "TP53", "tumor_type": "LUAD"}, {"gene": _TP53_TX, "tumor_type": "BRCA"}]
+
+    for order in (genes, genes[::-1]):
+        client.tumor_types.clear()
+        body = client.post("/v1/genes/query", json={"genes": order}).json()
+        assert client.tumor_types == {"TP53": order[0]["tumor_type"]}
+        assert body["results"][0]["tumor_type"] == order[0]["tumor_type"]
 
 
 def test_annotate_gene_endpoint_resolves_protein_id(client):

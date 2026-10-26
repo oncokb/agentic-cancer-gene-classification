@@ -669,9 +669,7 @@ async def normalize_fusions(
 
     # Ensembl-resolved (or failed) tokens keep their own ResolvedGene, keyed by
     # the submitted token; everything else is keyed by the HGNC symbol.
-    gene_to_fusions: Dict[str, list[str]] = {}
     ensembl_resolved: Dict[str, ResolvedGene] = {}
-    hgnc_keys: set[str] = set()
     inputs: Dict[str, CanonicalInput] = {}
     keys_by_input: Dict[str, list[str]] = {}
     for fusion, tokens in tokens_by_input.items():
@@ -679,28 +677,38 @@ async def normalize_fusions(
         symbols: list[str] = []
         transcripts: list[Optional[str]] = []
         keys: list[str] = []
-        for raw, token in tokens:
-            if token is None:
+        readings = [
+            (raw, token, _read_ensembl_token(token, ensembl, hgnc) if token else None) for raw, token in tokens
+        ]
+        for index, (raw, token, reading) in enumerate(readings):
+            if reading is None:
                 symbols.append(raw)
                 transcripts.append(None)
                 keys.append(raw)
-                hgnc_keys.add(raw)
                 continue
-            symbol, resolved, transcript, warning = _read_ensembl_token(token, ensembl, hgnc)
+            symbol, resolved, transcript, warning = reading
             if warning:
                 info.warnings.append(warning)
             if symbol is None:
-                info.errors.append(resolved.resolution_error or f"'{raw}' could not be resolved.")
+                error = resolved.resolution_error or f"'{raw}' could not be resolved."
+                if len(readings) == 2:
+                    # Say which partner was rejected; the other one is still annotated.
+                    side, other_side = ("5′", "3′") if index == 0 else ("3′", "5′")
+                    error = f"{side} partner of '{fusion}' rejected — {error}"
+                    resolved = resolved.model_copy(update={"resolution_error": error})
+                    other = readings[1 - index][2]
+                    if other is None or other[0] is not None:
+                        error += f" The {other_side} partner is still annotated on its own."
+                info.errors.append(error)
                 info.lookup_failed = info.lookup_failed or resolved.lookup_failed
                 symbols.append(raw)
                 transcripts.append(None)
                 keys.append(raw)
-                ensembl_resolved[raw] = resolved
+                ensembl_resolved.setdefault(raw, resolved)
             elif token.named_gene and not token.variant:
                 symbols.append(symbol)
                 transcripts.append(transcript)
                 keys.append(symbol)
-                hgnc_keys.add(symbol)
             else:
                 symbols.append(symbol)
                 transcripts.append(transcript)
@@ -712,14 +720,15 @@ async def normalize_fusions(
             info.five_transcript, info.three_transcript = transcripts
         inputs[fusion] = info
         keys_by_input[fusion] = keys
-    gene_to_submitted: Dict[str, list[str]] = {}
-    for fusion in fusions:
-        for key in keys_by_input[fusion]:
-            gene_to_fusions.setdefault(key, []).append(inputs[fusion].canonical)
-            gene_to_submitted.setdefault(key, []).append(fusion)
 
-    resolved = {key: ensembl_resolved[key] for key in sorted(ensembl_resolved)}
-    resolved.update({key: hgnc[key] for key in sorted(hgnc_keys)})
+    # (request position, canonical input, submitted input) per key, in request
+    # order, so merged genes keep first-input-wins whatever the identifier type.
+    entries_by_key: Dict[str, list[tuple[int, str, str]]] = {}
+    for position, fusion in enumerate(fusions):
+        for key in keys_by_input[fusion]:
+            entries_by_key.setdefault(key, []).append((position, inputs[fusion].canonical, fusion))
+
+    resolved = {key: ensembl_resolved[key] if key in ensembl_resolved else hgnc[key] for key in entries_by_key}
 
     if strict_gene_lookup:
         # The gene query API must not classify or reuse a cached annotation
@@ -730,15 +739,17 @@ async def normalize_fusions(
         }
 
     result = GeneMap(inputs=inputs)
+    merged: Dict[str, list[tuple[int, str, str]]] = {}
     for symbol, rg in resolved.items():
+        # The first-submitted spelling of a gene supplies its ResolvedGene.
         key = rg.canonical_symbol or symbol
         if key not in result:
-            result[key] = (rg, gene_to_fusions[symbol])
-            result.submitted[key] = list(gene_to_submitted[symbol])
-        else:
-            # Merge fusion lists if same canonical symbol maps from multiple inputs
-            result[key][1].extend(gene_to_fusions[symbol])
-            result.submitted[key].extend(gene_to_submitted[symbol])
+            result[key] = (rg, [])
+        merged.setdefault(key, []).extend(entries_by_key[symbol])
+    for key, entries in merged.items():
+        entries.sort(key=lambda entry: entry[0])
+        result[key][1].extend(canonical for _, canonical, _ in entries)
+        result.submitted[key] = [submitted for _, _, submitted in entries]
 
     return result
 

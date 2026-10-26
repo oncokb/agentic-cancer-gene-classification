@@ -636,12 +636,14 @@ async def run_pipeline(
     warnings: List[str] = []
     for canonical, (_, gene_inputs) in gene_map.items():
         tumor_types_by_key: Dict[str, str] = {}
-        for value in submitted_by_gene.get(canonical, gene_inputs):
-            for submitted, tt in tumor_contexts:
-                if submitted == value:
-                    key = " ".join(tt.strip().lower().split())
-                    if key:
-                        tumor_types_by_key.setdefault(key, tt)
+        # Request order across every input that resolved to this gene, whatever
+        # its spelling (symbol, alias, ENSG/ENST/ENSP, GENE(ENST...)).
+        gene_submitted = set(submitted_by_gene.get(canonical, gene_inputs))
+        for submitted, tt in tumor_contexts:
+            if submitted in gene_submitted:
+                key = " ".join(tt.strip().lower().split())
+                if key:
+                    tumor_types_by_key.setdefault(key, tt)
         tumor_types = list(tumor_types_by_key.values())
         if tumor_types:
             gene_tumor_type[canonical] = tumor_types[0]

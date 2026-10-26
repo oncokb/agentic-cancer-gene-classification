@@ -2612,3 +2612,11 @@ body.api-keys-body {
     grid-template-columns: 1fr;
   }
 }
+
+.submitted-input-note {
+  margin-top: 2px;
+}
+
+.submitted-input-warning {
+  color: var(--warning);
+}

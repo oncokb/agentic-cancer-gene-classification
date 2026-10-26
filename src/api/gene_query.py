@@ -42,7 +42,7 @@ _MAX_SYMBOL_LENGTH = 64
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?$")
 _UNRESOLVABLE_PREFIX = "Unresolvable gene symbol"
 # Normalization's error for GENE(ENST...) whose transcript is another gene's.
-_ENSEMBL_MISMATCH_MARKER = re.compile(r"^Unresolvable gene symbol — '[^']*': Ensembl \S+ belongs to ")
+_ENSEMBL_MISMATCH_MARKER = re.compile(r"^Unresolvable gene symbol — .*: Ensembl ENS[TPG]\S* belongs to \S+, not ")
 _ENSEMBL_MISMATCH_ERROR = "The Ensembl ID belongs to a different gene than the one named."
 _UNRESOLVABLE_ERROR = "Gene symbol could not be resolved."
 _LOOKUP_FAILED_ERROR = "Gene symbol lookup is temporarily unavailable; please retry."

@@ -1563,6 +1563,8 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
       <div class="annotation-fields"></div>
     `;
 
+    const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
+    if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);
     const cacheBadge = renderCacheBadge(annotation);
     if (cacheBadge) card.querySelector(".cache-badge-slot").appendChild(cacheBadge);
     card.querySelector(".status-line-slot").appendChild(renderStatusLine(annotation));
@@ -1670,6 +1672,36 @@ function renderNoResultView(hiddenAnnotations) {
   rebuildGeneIndex(hiddenAnnotations);
 }
 
+// "TP53 — from ENST00000269305" for each input the server rewrote (Ensembl
+// IDs resolved to symbols), plus that input's warnings. Text only: these
+// strings echo user input, so never go through innerHTML.
+function renderSubmittedInputNote(resolutions) {
+  const rows = (resolutions || []).filter(
+    (entry) => entry && entry.input && (entry.input !== entry.resolved || (entry.warnings || []).length),
+  );
+  if (!rows.length) return null;
+  const note = document.createElement("div");
+  note.className = "subtle submitted-input-note";
+  rows.forEach((entry) => {
+    if (entry.input !== entry.resolved) {
+      const line = document.createElement("div");
+      line.textContent = `${entry.resolved} — from ${entry.input}`;
+      note.appendChild(line);
+    }
+    (entry.warnings || []).forEach((warning) => {
+      const line = document.createElement("div");
+      line.className = "submitted-input-warning";
+      line.textContent = warning;
+      note.appendChild(line);
+    });
+  });
+  return note;
+}
+
+function fusionEvidenceInputNote(item) {
+  return renderSubmittedInputNote(item.input ? [{ input: item.input, resolved: item.fusion, warnings: [] }] : []);
+}
+
 function renderFusionEvidenceView(fusionEvidence) {
   const items = fusionEvidence || [];
   if (!items.length) {
@@ -1713,6 +1745,8 @@ function renderFusionEvidenceView(fusionEvidence) {
       <div class="supporting-evidence fusion-supporting-evidence"></div>
     `;
 
+    const inputNote = fusionEvidenceInputNote(item);
+    if (inputNote) card.querySelector(".annotation-heading").appendChild(inputNote);
     const evidence = card.querySelector(".fusion-supporting-evidence");
     if (pmids.length) {
       const links = document.createElement("div");
