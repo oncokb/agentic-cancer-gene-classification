@@ -86,12 +86,15 @@ class JobStore(Generic[JobT]):
         redis_client_factory: Optional[Callable[[], Any]] = _default_redis_client,
         ttl_seconds: Callable[[], int] = job_ttl_seconds,
         clock: Callable[[], float] = time.monotonic,
+        call_later: Optional[Callable[[float, Callable[[], None]], Any]] = None,
     ) -> None:
         self.kind = kind
         self.model = model
         self._redis_client_factory = redis_client_factory
         self._ttl_seconds = ttl_seconds
         self._clock = clock
+        # Schedules the retry timer; defaults to the running loop's call_later.
+        self._call_later = call_later
         # job_id -> (live job object, local expiry on `clock`)
         self.local: Dict[str, Tuple[JobT, float]] = {}
         # job_id -> write sequence number of the newest snapshot not yet in Redis
@@ -104,7 +107,7 @@ class JobStore(Generic[JobT]):
         self._locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
             weakref.WeakKeyDictionary()
         )
-        self._retry_timer: Optional[Tuple[asyncio.AbstractEventLoop, asyncio.TimerHandle]] = None
+        self._retry_timer: Optional[Tuple[asyncio.AbstractEventLoop, Any]] = None
         self._retry_tasks: Set[asyncio.Task] = set()
 
     def key(self, job_id: str) -> str:
@@ -197,7 +200,16 @@ class JobStore(Generic[JobT]):
                     self._dirty.pop(job_id, None)
                     continue
                 job, expires_at = entry
-                ex = max(1, math.ceil(expires_at - self._clock()))
+                now = self._clock()
+                if expires_at <= now:
+                    if getattr(job, "status", None) in TERMINAL_STATUSES:
+                        # Expired while waiting to be republished: let it go
+                        # rather than resurrect it in Redis.
+                        self._forget(job_id)
+                        continue
+                    expires_at = now + max(1, int(self._ttl_seconds()))
+                    self.local[job_id] = (job, expires_at)
+                ex = max(1, math.ceil(expires_at - now))
                 try:
                     await client.set(self.key(job_id), self._dump(job), ex=ex)
                 except Exception as exc:
@@ -223,7 +235,8 @@ class JobStore(Generic[JobT]):
             timer_loop, handle = self._retry_timer
             if timer_loop is loop and not loop.is_closed() and not handle.cancelled():
                 return
-        self._retry_timer = (loop, loop.call_later(REDIS_RETRY_BACKOFF_SECONDS + 1, self._on_retry_timer))
+        call_later = self._call_later or loop.call_later
+        self._retry_timer = (loop, call_later(REDIS_RETRY_BACKOFF_SECONDS + 1, self._on_retry_timer))
 
     def _on_retry_timer(self) -> None:
         self._retry_timer = None
@@ -268,8 +281,21 @@ class JobStore(Generic[JobT]):
             return None
 
     def clear_local(self) -> None:
+        """Forget all process-local state (jobs, pending republishes, retry
+        timer/tasks, back-off, locks); Redis is untouched."""
         self.local.clear()
         self._dirty.clear()
+        if self._retry_timer is not None:
+            self._retry_timer[1].cancel()
+            self._retry_timer = None
+        for task in list(self._retry_tasks):
+            try:
+                task.cancel()
+            except RuntimeError:
+                pass  # its loop is already closed
+        self._retry_tasks.clear()
+        self._redis_down = None
+        self._locks = weakref.WeakKeyDictionary()
 
 
 def job_owner(user: Any) -> Optional[str]:

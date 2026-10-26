@@ -8,6 +8,7 @@ Redis is always an in-test FakeRedis: the module is marked `no_real_redis`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 
@@ -44,6 +45,8 @@ def _no_real_redis_clients(monkeypatch):
 
     monkeypatch.setattr(redis.asyncio, "from_url", refuse)
     monkeypatch.setattr(sentinel, "Sentinel", refuse)
+    # src.pipeline.cache imported the Sentinel symbol directly.
+    monkeypatch.setattr("src.pipeline.cache.Sentinel", refuse)
     yield
     assert attempts == []
 
@@ -85,7 +88,40 @@ def _annotation_job(job_id: str = "job-1", **overrides) -> AnnotationJobStatusRe
     return AnnotationJobStatusResponse(**data)
 
 
+class _Handle:
+    def __init__(self) -> None:
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+
+class _Scheduler:
+    """Stands in for loop.call_later so retry timers never run on wall-clock
+    time: tests fire them explicitly."""
+
+    def __init__(self) -> None:
+        self.timers = []
+
+    def __call__(self, delay, callback):
+        handle = _Handle()
+        self.timers.append((delay, callback, handle))
+        return handle
+
+    def pending(self):
+        return [timer for timer in self.timers if not timer[2].cancelled()]
+
+    def fire(self) -> None:
+        (delay, callback, handle), = self.pending()
+        handle.cancel()
+        callback()
+
+
 def _store(redis, **kwargs) -> JobStore:
+    kwargs.setdefault("call_later", _Scheduler())
     return JobStore("annotation", AnnotationJobStatusResponse, redis_client_factory=lambda: redis, **kwargs)
 
 
@@ -133,11 +169,12 @@ async def test_cross_process_reads_see_latest_progress():
     assert await poller.get("missing") is None
 
 
-async def _fail_running_then_complete_during_backoff(redis, clock):
+async def _fail_running_then_complete_during_backoff(redis, clock, scheduler=None):
     """Persist `queued`; fail the `running` write; finish during the back-off;
     then restore Redis and move past the back-off. Until the submitter
     republishes, another pod still sees `queued`."""
-    submitter, poller = _store(redis, clock=clock), _store(redis, clock=clock)
+    submitter = _store(redis, clock=clock, call_later=scheduler or _Scheduler())
+    poller = _store(redis, clock=clock)
     job = _annotation_job(status="queued")
     await submitter.put(job)
     redis.down = True
@@ -155,32 +192,64 @@ async def _fail_running_then_complete_during_backoff(redis, clock):
 
 
 async def test_snapshot_written_during_outage_is_republished_by_retry_timer():
-    redis, clock = _FlakyRedis(), _Clock()
-    submitter, poller = await _fail_running_then_complete_during_backoff(redis, clock)
+    redis, clock, scheduler = _FlakyRedis(), _Clock(), _Scheduler()
+    submitter, poller = await _fail_running_then_complete_during_backoff(redis, clock, scheduler)
 
-    assert submitter._retry_timer is not None
-    loop, handle = submitter._retry_timer
-    assert loop is asyncio.get_running_loop()
-    assert handle.when() - loop.time() > REDIS_RETRY_BACKOFF_SECONDS - 1
-    # Fire the timer now instead of waiting 31 real seconds.
-    handle.cancel()
-    submitter._on_retry_timer()
+    # Exactly one timer, armed for just past the back-off.
+    assert [delay for delay, _, _ in scheduler.pending()] == [REDIS_RETRY_BACKOFF_SECONDS + 1]
+    scheduler.fire()
     await asyncio.gather(*submitter._retry_tasks)
 
     polled = await poller.get("job-1")
     assert (polled.status, polled.genes_completed) == ("complete", 2)
     assert submitter._dirty == {}
+    assert scheduler.pending() == []
+
+
+async def test_retry_timer_does_not_resurrect_an_expired_result(monkeypatch):
+    monkeypatch.setattr(settings, "job_ttl_seconds", 40)
+    redis, clock, scheduler = _FlakyRedis(), _Clock(), _Scheduler()
+    submitter, poller = await _fail_running_then_complete_during_backoff(redis, clock, scheduler)
+    # The finished job outlives its TTL before the retry timer fires.
+    clock.now += 40
+    redis.advance(REDIS_RETRY_BACKOFF_SECONDS + 41)
+
+    scheduler.fire()
+    await asyncio.gather(*submitter._retry_tasks)
+
+    assert redis.keys_with_prefix("job:") == []
+    assert await poller.get("job-1") is None
+    assert "job-1" not in submitter.local and submitter._dirty == {}
 
 
 async def test_snapshot_written_during_outage_is_republished_on_next_read():
     redis, clock = _FlakyRedis(), _Clock()
     submitter, poller = await _fail_running_then_complete_during_backoff(redis, clock)
-    submitter._retry_timer[1].cancel()
 
     assert (await submitter.get("job-1")).status == "complete"
 
     polled = await poller.get("job-1")
     assert (polled.status, polled.genes_completed) == ("complete", 2)
+
+
+async def test_clear_local_resets_all_process_state():
+    redis, clock, scheduler = _FlakyRedis(), _Clock(), _Scheduler()
+    submitter, _ = await _fail_running_then_complete_during_backoff(redis, clock, scheduler)
+    (timer,) = scheduler.pending()
+    in_flight = asyncio.ensure_future(asyncio.sleep(10))
+    submitter._retry_tasks.add(in_flight)
+    submitter._lock()
+    assert submitter._redis_down is not None
+
+    submitter.clear_local()
+
+    assert submitter.local == {} and submitter._dirty == {}
+    assert submitter._retry_timer is None and submitter._retry_tasks == set()
+    assert timer[2].cancelled()
+    await asyncio.sleep(0)
+    assert in_flight.cancelled()
+    assert submitter._redis_down is None
+    assert len(submitter._locks) == 0
 
 
 async def test_snapshot_written_during_outage_is_republished_on_next_write():
@@ -366,6 +435,7 @@ def job_backends(monkeypatch):
     monkeypatch.setattr(main, "_save_run_result", noop)
     monkeypatch.setattr(main, "record_user_annotation_activity", noop)
     monkeypatch.setattr(settings, "public_app_base_url", "https://acgc.example.org/")
+    monkeypatch.setattr(main, "RunStore", _KeepRunStore)
     redis = FakeRedis()
     for store_ in _STORES:
         store_.clear_local()
@@ -373,6 +443,35 @@ def job_backends(monkeypatch):
     yield redis
     for store_ in _STORES:
         store_.clear_local()
+
+
+class _NullRunStore:
+    async def close(self) -> None:
+        return None
+
+
+class _KeepRunStore:
+    """Lifespan's RunStore: keeps whatever run store the test installed
+    (e.g. the API-key FakeStore) instead of connecting to MySQL."""
+
+    @staticmethod
+    async def create():
+        current = getattr(app.state, "run_store", None)
+        if current is None:
+            return _NullRunStore()
+        if not hasattr(current, "close"):
+            current.close = _NullRunStore().close
+        return current
+
+
+@contextlib.contextmanager
+def _lifespan_client(email=None, role="curator", headers=None):
+    """A lifespan-managed client: its event loop (where submitted jobs'
+    background tasks run) stays up between submission and polling."""
+    with TestClient(app, headers=headers) as client:
+        if email is not None:
+            client.cookies = _session_client(email, role).cookies
+        yield client
 
 
 JOB_KINDS = {
@@ -410,7 +509,11 @@ def _poll_until_complete(client: TestClient, status_url: str) -> dict:
 @pytest.mark.parametrize("kind", sorted(JOB_KINDS))
 def test_job_status_is_owner_only_and_served_from_redis(store, job_backends, kind):  # noqa: F811
     path, body = JOB_KINDS[kind]
-    owner = _session_client("Curator@MSKCC.org")
+    with _lifespan_client("Curator@MSKCC.org") as owner:
+        _check_owner_only_and_served_from_redis(owner, job_backends, kind, path, body)
+
+
+def _check_owner_only_and_served_from_redis(owner, job_backends, kind, path, body):
     created = owner.post(path, json=body)
     assert created.status_code == 200, created.text
     job_id, status_url = created.json()["job_id"], created.json()["status_url"]
@@ -444,9 +547,9 @@ def test_job_status_is_owner_only_and_served_from_redis(store, job_backends, kin
 
 
 def test_redis_snapshot_rebuilds_on_a_separate_store_instance(store, job_backends):  # noqa: F811
-    owner = _session_client()
-    created = owner.post(*JOB_KINDS["annotate"][:1], json=JOB_KINDS["annotate"][1])
-    _poll_until_complete(owner, created.json()["status_url"])
+    with _lifespan_client("curator@mskcc.org") as owner:
+        created = owner.post(*JOB_KINDS["annotate"][:1], json=JOB_KINDS["annotate"][1])
+        _poll_until_complete(owner, created.json()["status_url"])
 
     other_pod = JobStore("annotation", AnnotationJobStatusResponse, redis_client_factory=lambda: job_backends)
     job = asyncio.run(other_pod.get(created.json()["job_id"]))
@@ -462,31 +565,32 @@ def test_api_key_jobs_are_owned_by_the_key_owner(store, job_backends):  # noqa: 
     other_key = _create_key(_session_client("someone.else@mskcc.org"))["key"]
     path, body = JOB_KINDS["fusion_evidence"]
 
-    created = TestClient(app).post(path, json=body, headers=_bearer(key))
-    assert created.status_code == 200, created.text
-    status_url = created.json()["status_url"]
-    job = main._fusion_evidence_jobs.local[created.json()["job_id"]][0]
-    assert job.owner == "curator@mskcc.org"
+    with _lifespan_client(headers=_bearer(key)) as key_client:
+        created = key_client.post(path, json=body)
+        assert created.status_code == 200, created.text
+        status_url = created.json()["status_url"]
+        job = main._fusion_evidence_jobs.local[created.json()["job_id"]][0]
+        assert job.owner == "curator@mskcc.org"
+        _poll_until_complete(key_client, status_url)
 
-    assert TestClient(app).get(status_url, headers=_bearer(key)).status_code == 200
     assert owner_session.get(status_url).status_code == 200
     assert TestClient(app).get(status_url, headers=_bearer(other_key)).status_code == 404
 
 
 def test_dev_mode_does_not_grant_job_access(store, job_backends, monkeypatch):  # noqa: F811
     monkeypatch.setattr(settings, "agcg_dev_mode", True)
-    owner = _session_client()
-    created = owner.post(*JOB_KINDS["fusion_evidence"][:1], json=JOB_KINDS["fusion_evidence"][1])
-    status_url = created.json()["status_url"]
-    assert owner.get(status_url).status_code == 200
+    with _lifespan_client("curator@mskcc.org") as owner:
+        created = owner.post(*JOB_KINDS["fusion_evidence"][:1], json=JOB_KINDS["fusion_evidence"][1])
+        status_url = created.json()["status_url"]
+        _poll_until_complete(owner, status_url)
     assert _session_client("someone.else@mskcc.org").get(status_url).status_code == 404
 
 
 def test_local_dev_without_auth_still_reads_its_jobs(job_backends):
-    client = TestClient(app)
-    created = client.post(*JOB_KINDS["fusion_evidence"][:1], json=JOB_KINDS["fusion_evidence"][1])
-    assert created.status_code == 200
-    assert client.get(created.json()["status_url"]).status_code == 200
+    with _lifespan_client() as client:
+        created = client.post(*JOB_KINDS["fusion_evidence"][:1], json=JOB_KINDS["fusion_evidence"][1])
+        assert created.status_code == 200
+        _poll_until_complete(client, created.json()["status_url"])
 
 
 async def test_job_without_owner_is_admin_only(store, job_backends):  # noqa: F811
