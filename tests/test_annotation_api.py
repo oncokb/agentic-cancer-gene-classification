@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+
+import pytest
 
 from fastapi.testclient import TestClient
 
 from src import main
-from src.models.schema import AnnotationResult, GeneAnnotation
+from src.models.schema import AnnotationResult, FusionEvidenceResult, GeneAnnotation
 
 
 class FakeRunStore:
     def __init__(self):
         self.saved_runs = []
+
+    async def close(self):
+        pass
 
     async def save_run(self, run_id, timestamp, request_payload, result_payload):
         self.saved_runs.append((run_id, timestamp, request_payload, result_payload))
@@ -212,3 +218,82 @@ def test_enrichment_job_endpoint_streams_enriched_annotations(monkeypatch):
     assert status_payload["annotations"][0]["evidence_cards"][0]["evidence_type"] == "clinical"
     assert status_payload["annotations"][0]["quality_flags"][0]["code"] == "low_evidence_score"
     assert status_payload["timings_ms"]["total"] == 1.5
+
+
+@pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
+@pytest.mark.parametrize("include", [None, False, True])
+def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, include):
+    store = FakeRunStore()
+    monkeypatch.setattr(main.app.state, "run_store", store, raising=False)
+    async def create_store():
+        return store
+
+    monkeypatch.setattr(main.RunStore, "create", create_store)
+    seen = []
+    active = 0
+    peak = 0
+
+    async def fake_pipeline(fusions, **kwargs):
+        return AnnotationResult(
+            run_id="inline", timestamp="2026-10-26", fusions_processed=len(fusions),
+            genes_annotated=0, annotations=[],
+        )
+
+    async def fake_retrieve(fusion, tumor_type=None):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        seen.append((fusion, tumor_type))
+        await asyncio.sleep(0.001)
+        active -= 1
+        if fusion == "BCR::ABL1":
+            raise RuntimeError("upstream unavailable")
+        return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, pmids=["123"])
+
+    monkeypatch.setattr(main, "run_pipeline", fake_pipeline)
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_retrieve)
+    monkeypatch.setattr(main.settings, "fusion_evidence_concurrency", 1)
+    request = {"fusions": [
+        {"fusion": "EML4::ALK", "tumor_type": "LUAD"},
+        {"fusion": "EML4::ALK", "tumor_type": "LUAD"},
+        "BRAF", "BCR::ABL1",
+    ]}
+    if include is not None:
+        request["include_fusion_evidence"] = include
+    with TestClient(main.app) as client:
+        response = client.post(path, json=request)
+        assert response.status_code == 200
+        payload = response.json()
+        if path.endswith("/jobs"):
+            for _ in range(100):
+                status = client.get(payload["status_url"]).json()
+                if status["status"] in ("complete", "failed"):
+                    break
+                time.sleep(0.01)
+            assert status["status"] == "complete"
+            payload = status["result"]
+        if include:
+            assert seen == [("EML4::ALK", "LUAD"), ("BCR::ABL1", None)]
+            assert peak == 1
+            assert payload["fusion_evidence"][0]["pmids"] == ["123"]
+            assert "upstream unavailable" in payload["fusion_evidence"][1]["interpretation"]
+        else:
+            assert seen == []
+            assert payload["fusion_evidence"] == []
+        assert store.saved_runs[-1][3]["fusion_evidence"] == payload["fusion_evidence"]
+
+
+@pytest.mark.parametrize("path", [
+    "/v1/annotate", "/v1/annotate/jobs", "/v1/fusion-evidence/jobs",
+])
+def test_annotation_input_cap_returns_422_before_work(monkeypatch, path):
+    monkeypatch.setattr(main.settings, "annotate_max_inputs", 2)
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail("Over-limit request must be rejected before work starts")
+
+    monkeypatch.setattr(main, "run_pipeline", unexpected)
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", unexpected)
+    response = TestClient(main.app).post(path, json={"fusions": ["ALK"] * 3})
+    assert response.status_code == 422
+    assert "At most 2 inputs may be annotated per request" in response.text

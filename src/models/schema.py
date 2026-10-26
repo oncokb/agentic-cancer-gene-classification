@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from src.config import settings
+
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
 AnnotationMode = Literal["full", "core"]
 CacheStatus = Literal["miss", "reused", "refreshed", "bypassed"]
@@ -449,6 +451,10 @@ class FusionInput(BaseModel):
 
 
 class AnnotateRequest(BaseModel):
+    include_fusion_evidence: bool = Field(
+        default=False,
+        description="Retrieve exact-pair fusion evidence inline before returning and saving the annotation run.",
+    )
     fusions: List[FusionInput] = Field(
         ...,
         description="Gene or fusion inputs with optional tumor type and breakpoint context",
@@ -483,7 +489,10 @@ class AnnotateRequest(BaseModel):
     @classmethod
     def coerce_string_fusions(cls, data: Any) -> Any:
         """Accept plain gene/fusion strings alongside structured FusionInput dicts."""
-        if isinstance(data, dict) and "fusions" in data:
+        if isinstance(data, dict) and isinstance(data.get("fusions"), list):
+            limit = settings.annotate_max_inputs
+            if len(data["fusions"]) > limit:
+                raise ValueError(f"At most {limit} inputs may be annotated per request")
             coerced = []
             for item in data["fusions"]:
                 if isinstance(item, str):
@@ -530,6 +539,7 @@ class AnnotationResult(BaseModel):
     genes_annotated: int
     annotations: List[GeneAnnotation]
     fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
     timings_ms: Dict[str, float] = Field(default_factory=dict)
 
 

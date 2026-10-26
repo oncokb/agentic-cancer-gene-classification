@@ -784,6 +784,32 @@ def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
     return inputs
 
 
+async def _retrieve_fusion_evidence_input(
+    item: FusionInput, semaphore: asyncio.Semaphore,
+) -> FusionEvidenceResult:
+    async with semaphore:
+        try:
+            return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
+        except Exception as exc:
+            logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
+            return FusionEvidenceResult(
+                fusion=item.fusion,
+                tumor_type=item.tumor_type,
+                interpretation=f"Fusion evidence retrieval failed: {exc}",
+            )
+
+
+async def _include_inline_fusion_evidence(
+    request: AnnotateRequest, result: AnnotationResult,
+) -> None:
+    if request.include_fusion_evidence:
+        semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
+        result.fusion_evidence = list(await asyncio.gather(*(
+            _retrieve_fusion_evidence_input(item, semaphore)
+            for item in _fusion_evidence_inputs(request.fusions)
+        )))
+
+
 async def _save_run_result(
     http_request: Request,
     request_payload: dict,
@@ -1484,6 +1510,7 @@ async def annotate(
         logger.exception("Pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
+    await _include_inline_fusion_evidence(request, result)
     await _persist_run_result(http_request, request.model_dump(), result)
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
@@ -1554,6 +1581,7 @@ async def _launch_annotation_job(
                 on_total_known=on_total_known,
                 **({"strict_gene_lookup": True} if kind == "gene_query" else {}),
             )
+            await _include_inline_fusion_evidence(request, result)
             if require_persistence:
                 await _save_run_result(http_request, request.model_dump(), result)
             else:
@@ -1697,18 +1725,6 @@ async def create_fusion_evidence_job(
     )
     await _store_fusion_evidence_job(job)
 
-    async def run_one(item: FusionInput, semaphore: asyncio.Semaphore) -> FusionEvidenceResult:
-        async with semaphore:
-            try:
-                return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
-            except Exception as exc:
-                logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
-                return FusionEvidenceResult(
-                    fusion=item.fusion,
-                    tumor_type=item.tumor_type,
-                    interpretation=f"Fusion evidence retrieval failed: {exc}",
-                )
-
     async def run_job() -> None:
         start = time.perf_counter()
         current = await _get_fusion_evidence_job(job_id)
@@ -1716,7 +1732,10 @@ async def create_fusion_evidence_job(
         await _store_fusion_evidence_job(current)
         try:
             semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
-            tasks = [asyncio.create_task(run_one(item, semaphore)) for item in fusion_inputs]
+            tasks = [
+                asyncio.create_task(_retrieve_fusion_evidence_input(item, semaphore))
+                for item in fusion_inputs
+            ]
             for task in asyncio.as_completed(tasks):
                 result = await task
                 current = await _get_fusion_evidence_job(job_id)
