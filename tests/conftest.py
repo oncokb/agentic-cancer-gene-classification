@@ -78,6 +78,25 @@ def _reset_ncbi_rate_limiter():
 
 
 @pytest.fixture(autouse=True)
+def _job_stores_use_fake_redis(monkeypatch):
+    """Point src.main's job stores at a per-test FakeRedis with empty local
+    state, so job snapshots never reach a real Redis and no job leaks
+    between tests. Only touches src.main if a test already imported it."""
+    main = sys.modules.get("src.main")
+    if main is None:
+        yield
+        return
+    redis = FakeRedis()
+    stores = (main._annotation_jobs, main._enrichment_jobs, main._fusion_evidence_jobs)
+    for store in stores:
+        store.clear_local()
+        monkeypatch.setattr(store, "_redis_client_factory", lambda: redis)
+    yield
+    for store in stores:
+        store.clear_local()
+
+
+@pytest.fixture(autouse=True)
 def _default_auth_disabled(monkeypatch):
     """Ensure tests run with auth_enabled=False by default (individual auth tests monkeypatch it to True)."""
     from src.config import settings

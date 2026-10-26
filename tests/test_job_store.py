@@ -614,3 +614,70 @@ async def test_status_response_shape_unchanged(job_backends):
         "error",
         "timings_ms",
     }
+
+
+# --- inline fusion evidence (job `phase`) through the store -----------------
+
+
+def test_inline_evidence_job_phase_is_visible_to_other_pods(store, job_backends, monkeypatch):  # noqa: F811
+    other_pod = JobStore("annotation", AnnotationJobStatusResponse, redis_client_factory=lambda: job_backends)
+    seen_by_other_pod = []
+
+    async def fake_fusion_evidence(fusion, tumor_type=None):
+        # Runs mid-job: another pod reads the job's snapshot from Redis.
+        (job_id,) = [key.rsplit(":", 1)[1] for key in job_backends.keys_with_prefix("job:annotation:")]
+        snapshot = await other_pod.get(job_id)
+        seen_by_other_pod.append((snapshot.status, snapshot.phase, snapshot.owner))
+        return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, pmids=["123"])
+
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_fusion_evidence)
+    body = {"fusions": [{"fusion": "EML4::ALK", "tumor_type": "LUAD"}], "include_fusion_evidence": True}
+    with _lifespan_client("Curator@MSKCC.org") as owner:
+        created = owner.post("/v1/annotate/jobs", json=body)
+        assert created.status_code == 200, created.text
+        status_url = created.json()["status_url"]
+        local = _poll_until_complete(owner, status_url)
+
+    assert seen_by_other_pod == [("running", "fusion_evidence", "curator@mskcc.org")]
+    assert local["phase"] == "complete"
+    assert local["result"]["fusion_evidence"][0]["pmids"] == ["123"]
+    assert "fusion_evidence" in local["result"]["timings_ms"]
+
+    # Polled from another pod: same phase, result and owner checks.
+    for store_ in _STORES:
+        store_.clear_local()
+    remote = owner.get(status_url)
+    assert remote.status_code == 200 and remote.json() == local
+    assert _session_client("someone.else@mskcc.org").get(status_url).status_code == 404
+    assert _session_client("boss@mskcc.org", role="admin").get(status_url).status_code == 200
+    (key,) = job_backends.keys_with_prefix("job:annotation:")
+    assert job_backends._store[key][1] == job_backends.now + 86400
+
+
+async def test_phase_written_during_outage_is_republished_after_recovery():
+    redis, clock, scheduler = _FlakyRedis(), _Clock(), _Scheduler()
+    submitter = _store(redis, clock=clock, call_later=scheduler)
+    poller = _store(redis, clock=clock)
+    job = _annotation_job(status="running", phase="annotation")
+    await submitter.put(job)
+    redis.down = True
+    job.phase = "fusion_evidence"
+    await submitter.put(job)
+    redis.down = False
+    clock.now += REDIS_RETRY_BACKOFF_SECONDS + 1
+    assert (await poller.get("job-1")).phase == "annotation"
+
+    scheduler.fire()
+    await asyncio.gather(*submitter._retry_tasks)
+
+    assert (await poller.get("job-1")).phase == "fusion_evidence"
+
+
+@pytest.mark.parametrize("path", ["/v1/annotate/jobs", "/v1/fusion-evidence/jobs"])
+def test_input_cap_rejects_before_creating_a_job(job_backends, monkeypatch, path):
+    monkeypatch.setattr(settings, "annotate_max_inputs", 2)
+    with _lifespan_client() as client:
+        response = client.post(path, json={"fusions": ["ALK", "ROS1", "RET"]})
+    assert response.status_code == 422
+    assert job_backends.keys_with_prefix("job:") == []
+    assert all(store_.local == {} for store_ in _STORES)
