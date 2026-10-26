@@ -100,6 +100,7 @@ from src.observability import (
 )
 from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
+from src.pipeline.feedback_citations import build_citation_check_section
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
 from src.pipeline.llm_client import complete_with_tool
@@ -2371,6 +2372,8 @@ async def _create_github_issue(title: str, body: str) -> Optional[str]:
         return None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            labels = list(settings.feedback_issue_labels)
+            request_body = {"title": title, "body": body, "labels": labels}
             response = await client.post(
                 f"https://api.github.com/repos/{settings.github_repo}/issues",
                 headers={
@@ -2378,8 +2381,26 @@ async def _create_github_issue(title: str, body: str) -> Optional[str]:
                     "Accept": "application/vnd.github+json",
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
-                json={"title": title, "body": body},
+                json=request_body,
             )
+            if labels and response.status_code == 422:
+                # GitHub returns 422 when a label cannot be applied; retry once
+                # without labels so the feedback is still filed.
+                increment("feedback.github_issue_labels_rejected")
+                logger.warning(
+                    "GitHub rejected feedback issue labels %s (status %s); retrying without labels",
+                    labels,
+                    response.status_code,
+                )
+                response = await client.post(
+                    f"https://api.github.com/repos/{settings.github_repo}/issues",
+                    headers={
+                        "Authorization": f"Bearer {settings.oncokbdev_private_access_token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                    json={"title": title, "body": body},
+                )
             response.raise_for_status()
             increment("feedback.github_issue_created")
             return response.json().get("html_url")
@@ -2447,6 +2468,22 @@ async def submit_feedback(
     if not settings.feedback_issue_creation_enabled:
         return FeedbackResponse(feedback_id=feedback_id)
     issue_title, issue_body = await _draft_feedback_issue(payload, feedback_id)
+    if issue_body is not None:
+        try:
+            citation_section = await build_citation_check_section(
+                payload.message,
+                gene=payload.gene,
+                structured_pmids=payload.pmids,
+            )
+        except Exception:
+            # The check is informational; feedback storage and issue creation
+            # must continue even if the check itself has a bug.
+            logger.exception("Feedback citation check wrapper failed")
+            citation_section = (
+                "## Automated citation check\n\ncheck unavailable (citation check failed)."
+            )
+        if citation_section:
+            issue_body = f"{issue_body}\n\n{citation_section}"
     issue_url = (
         await _create_github_issue(issue_title, issue_body)
         if issue_title is not None and issue_body is not None else None

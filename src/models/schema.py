@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, constr, model_validator
 
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
 AnnotationMode = Literal["full", "core"]
@@ -563,6 +563,14 @@ class FeedbackRequest(BaseModel):
     )
     page_url: Optional[str] = Field(
         default=None, max_length=2048, description="URL of the page feedback was submitted from"
+    )
+    pmids: Optional[List[constr(max_length=64)]] = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Optional structured list of PMIDs cited by the feedback. Values are "
+            "parsed leniently; unparseable entries are reported in the citation check."
+        ),
     )
 
 
