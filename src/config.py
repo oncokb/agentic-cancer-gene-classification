@@ -37,8 +37,10 @@ class Settings(BaseSettings):
     core_synthesis_escalation_sufficient_score: float = 1.01
     selection_model: str = "claude-haiku-4-5-20251001"
     feedback_issue_creation_enabled: bool = True
-    # Labels applied to bot-created feedback issues. They must already exist in
-    # the repository; creating missing labels is out of scope.
+    # Labels applied to bot-created feedback issues. These are best-effort: if
+    # GitHub rejects the labels on creation (e.g. a label doesn't exist in the
+    # repo), issue creation is retried once without labels so the feedback is
+    # still filed.
     feedback_issue_labels: List[str] = Field(
         default_factory=lambda: ["feedback", "needs-triage"]
     )
