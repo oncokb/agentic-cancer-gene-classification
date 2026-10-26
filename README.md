@@ -207,6 +207,21 @@ curl -s -X POST https://acgc.oncokb.org/v1/annotate \
   -d '{"fusions": ["EML4::ALK"]}'
 ```
 
+That annotates the genes but leaves `fusion_evidence` empty. Exact
+fusion-pair evidence is a second step: start a fusion-evidence job, passing
+the annotation run's `run_id` so ACGC best-effort attaches the evidence to
+that run, then poll its `status_url`.
+
+```bash
+curl -s -X POST https://acgc.oncokb.org/v1/fusion-evidence/jobs \
+  -H "Authorization: Bearer $ACGC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"fusions": [{"fusion": "EML4::ALK", "tumor_type": "LUAD"}], "run_id": "<run_id>"}'
+```
+
+See the [API user guide](docs/api.md) for the full annotate and
+fusion-evidence workflow, batch jobs, and known limitations.
+
 List (secrets are never returned) and revoke keys on the API keys page, or
 with your session (not the key itself):
 
@@ -343,6 +358,12 @@ curl -X POST http://127.0.0.1:8000/v1/annotate/jobs \
 
 curl http://127.0.0.1:8000/v1/annotate/jobs/{job_id}
 ```
+
+Annotation results always contain `fusion_evidence: []`. To get exact
+fusion-pair evidence, run a second job with the completed annotation job's
+`run_id` and poll it; see the
+[API user guide](docs/api.md#post-v1fusion-evidencejobs) and the
+[batch workflow](docs/api.md#batch-workflow).
 
 Core results can be enriched lazily after the first response returns. The UI
 exposes this through **Enrich results**; API callers can submit returned
@@ -586,11 +607,16 @@ PubMed retrieval excludes records marked as `Retracted Publication` or
 records that reach synthesis through cached or test fixtures.
 
 Fusion-level evidence is intentionally outside the core annotation critical
-path. The UI starts `/v1/fusion-evidence/jobs` after gene annotations are
-available, polls it in the background, and displays results in a separate
-Fusion evidence tab. Each exact fusion/tumor lookup is cached in Redis under
-`fusion_evidence:*` using `FUSION_EVIDENCE_CACHE_TTL_SECONDS`, with bounded
-per-job fan-out controlled by `FUSION_EVIDENCE_CONCURRENCY`.
+path, so `/v1/annotate` and `/v1/annotate/jobs` always return
+`fusion_evidence: []`. The UI starts `/v1/fusion-evidence/jobs` after gene
+annotations are available, polls it in the background, and displays results in
+a separate Fusion evidence tab; pass the annotation run's `run_id` to
+best-effort attach the evidence to the run. Each exact fusion/tumor lookup is
+cached in Redis under `fusion_evidence:*` using
+`FUSION_EVIDENCE_CACHE_TTL_SECONDS`, with bounded per-job fan-out controlled by
+`FUSION_EVIDENCE_CONCURRENCY`. See the
+[API user guide](docs/api.md#post-v1fusion-evidencejobs) for request and
+response shapes.
 
 When a gene is marked `insufficient_evidence`, the JSON result still includes
 `retrieved_pmids` and any grounded `gene_summary` produced from the retrieved
