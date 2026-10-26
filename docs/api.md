@@ -598,3 +598,38 @@ for r in job["results"]:
   [ACGC API Keys (for scripts)](../README.md#acgc-api-keys-for-scripts) and
   [Gene query API](../README.md#gene-query-api).
 - Questions or problems: contact the ACGC team.
+
+## GET /v1/runs
+
+List your saved runs, newest first. Requires a signed-in session or an API key;
+API keys list runs belonging to the key owner. With authentication disabled for
+local development, the owner is `local@internal`.
+
+Query parameters: `limit` (default `20`, range `1`–`100`) and optional opaque
+`cursor` (use the preceding response's `next_cursor` unchanged).
+
+```json
+{
+  "runs": [
+    {
+      "run_id": "example-run-id",
+      "created_at": "2026-10-26T12:00:00+00:00",
+      "source": "session",
+      "input_summary": "ALK, TP53",
+      "input_count": 2,
+      "genes_annotated": 2,
+      "view_url": "/?run=example-run-id"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+`source`, `input_summary`, `input_count`, and `genes_annotated` may be null.
+`next_cursor` is null on the last page, including an empty list. Responses contain
+metadata only, never request or result blobs. Invalid limits or cursors return
+`422`, whose `detail` may be a string or FastAPI's validation-error list.
+Unauthenticated requests return `401`. Run storage that isn't configured returns
+`503`; a database outage returns `500`, like `GET /v1/annotate/{run_id}`.
+`created_at` is an ISO-8601 UTC timestamp and may include microseconds.
+The `run_id` in `view_url` is URL-encoded.

@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
 from src.api.run_persistence import run_owner, save_run_or_raise
+from src.api.runs import router as runs_router
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
     AuthenticatedUser,
@@ -213,6 +214,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-OpenEvidence-Poll"],
 )
 app.include_router(api_keys_router)
+app.include_router(runs_router)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 if _STATIC_DIR.exists():
