@@ -549,10 +549,13 @@ class FeedbackRequest(BaseModel):
     page_url: Optional[str] = Field(
         default=None, max_length=2048, description="URL of the page feedback was submitted from"
     )
-    pmids: Optional[List[constr(pattern=r"^\d{6,9}$", max_length=9)]] = Field(
+    pmids: Optional[List[constr(max_length=64)]] = Field(
         default=None,
         max_length=20,
-        description="Optional structured list of PMIDs cited by the feedback",
+        description=(
+            "Optional structured list of PMIDs cited by the feedback. Values are "
+            "parsed leniently; unparseable entries are reported in the citation check."
+        ),
     )
 
 

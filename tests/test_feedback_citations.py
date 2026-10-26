@@ -51,6 +51,18 @@ def test_parse_plural_label_with_multiple_pmids():
     assert parse_cited_pmids(text) == ["41424301", "41424302", "41424303"]
 
 
+def test_parse_plural_label_with_whitespace_separated_pmids():
+    assert parse_cited_pmids("PMIDs 41424301 41424302 41424303") == [
+        "41424301",
+        "41424302",
+        "41424303",
+    ]
+
+
+def test_parse_structured_pmids_accepts_common_pasted_forms():
+    assert parse_cited_pmids(None, ["12345", "PMID 41424301"]) == ["12345", "41424301"]
+
+
 def test_parse_label_without_space():
     assert parse_cited_pmids("See PMID12345678 for details.") == ["12345678"]
 
@@ -130,9 +142,17 @@ def test_hyphenated_gene_symbol_is_not_mistaken_for_a_fusion():
         ("This annotation is missing melanoma context.", "melanoma"),
         ("Reported in a patient with pancreatic cancer and liver metastases.", "pancreatic cancer"),
         ("Review TP53 in NSCLC.", "NSCLC"),
-        ("Review TP53 in nsclc.", "NSCLC"),
+        ("Review TP53 in nsclc.", None),
         ("Review TP53 in ALL.", "ALL"),
+        ("Review TP53 in MM.", "MM"),
+        ("Review TP53 in mm.", None),
+        ("Review TP53 in READ.", "READ"),
+        ("Review TP53 in read.", None),
+        ("Review TP53 in GC.", "GC"),
+        ("Review TP53 in gc.", None),
         ("Reported in biliary tract cancer.", "biliary tract cancer"),
+        ("Reported in ovarian cancers.", "ovarian cancer"),
+        ("Reported in non\u2013small cell lung cancer.", "non-small cell lung cancer"),
         ("The annotation for this tumor is wrong.", None),
         ("Please fix the export dropdown.", None),
     ],
@@ -163,6 +183,23 @@ def test_alk_requires_word_boundaries():
 
 def test_usable_aliases_drops_short_and_common_words():
     assert _usable_aliases(["K", "ABL", "SET", "met", "MOZ"]) == ["ABL", "MOZ"]
+
+
+def test_long_and_hyphenated_genes_match_case_insensitively():
+    assert _gene_mentioned("c-Kit driven leukemia", "KIT", ["c-Kit"]) is True
+    assert _gene_mentioned("c11orf95 rearrangement", "C11orf95", []) is True
+    assert _gene_mentioned("C11ORF95-RELA fusion", "C11orf95-RELA", []) is True
+
+
+def test_structured_gene_keeps_submitted_case():
+    assert extract_subject("Review this annotation.", "c-Kit") == ("c-Kit", False)
+
+
+def test_free_text_detects_mixed_case_hyphenated_fusion():
+    assert extract_subject("Review C11orf95-RELA fusion annotation.") == (
+        "C11orf95::RELA",
+        True,
+    )
 
 
 async def test_lowercase_gene_word_does_not_count_as_mention(pubmed):
@@ -223,7 +260,7 @@ async def test_tumor_alias_expansion_matches_full_name(pubmed):
         _record("41424301", "TP53 in non-small cell lung cancer", "TP53 cohort.")
     ]
     section = await build_citation_check_section(
-        "Review TP53 in nsclc. PMID 41424301", gene="TP53"
+        "Review TP53 in NSCLC. PMID 41424301", gene="TP53"
     )
     assert "NSCLC — yes" in section
 
@@ -295,9 +332,41 @@ async def test_retracted_citation_is_marked(pubmed):
     section = await build_citation_check_section(
         "Review TP53 annotation. PMID 41424301", gene="TP53"
     )
-    assert "PMID 41424301: RETRACTED" in section
+    assert "PMID 41424301: RETRACTED — retracted publication" in section
     assert "abstract not retrieved" not in section
     assert pubmed["filter_retracted"] is False
+
+
+async def test_retraction_notice_is_labelled_distinctly(pubmed):
+    pubmed["records"] = [
+        _record(
+            "41424301",
+            "Retraction: TP53 study",
+            "",
+            publication_types=["Retraction of Publication"],
+        )
+    ]
+    section = await build_citation_check_section(
+        "Review TP53 annotation. PMID 41424301", gene="TP53"
+    )
+    assert "PMID 41424301: RETRACTED — retraction notice" in section
+
+
+async def test_tumor_organ_equivalence_matches_ovarian_carcinoma(pubmed):
+    pubmed["records"] = [_record("41424301", "TP53 in ovarian carcinoma", "")]
+    section = await build_citation_check_section(
+        "Review TP53 annotation for ovarian cancer. PMID 41424301", gene="TP53"
+    )
+    assert "ovarian cancer — yes" in section
+
+
+async def test_untrusted_subject_cannot_break_code_span(pubmed):
+    pubmed["records"] = [_record("41424301", "TP53 study", "")]
+    section = await build_citation_check_section(
+        "Review TP53 annotation. PMID 41424301", gene="T`P\n53"
+    )
+    assert "mentions `TP53` — NO" in section
+    assert "T`P" not in section
 
 
 async def test_missing_abstract_is_unavailable_per_pmid(pubmed):
@@ -444,14 +513,71 @@ def test_structured_pmids_are_checked(feedback_client, pubmed):
     assert "PMID 41424301: mentions `TP53` — yes" in response.json()["issue_body"]
 
 
-@pytest.mark.parametrize("pmids", [["12345"], ["PMID 41424301"], ["1234567890"], ["abc"]])
-def test_invalid_structured_pmids_are_rejected(feedback_client, pmids):
+def test_structured_pmid_with_label_prefix_is_parsed(feedback_client, pubmed):
+    pubmed["records"] = [_record("41424301", "TP53 in ovarian cancer", "")]
     response = feedback_client.post(
         "/v1/feedback",
         json={
             "category": "gene_annotation_issue",
             "message": "The cited paper does not support this annotation.",
-            "pmids": pmids,
+            "gene": "TP53",
+            "pmids": ["PMID 41424301"],
+        },
+    )
+    assert response.status_code == 201
+    assert "PMID 41424301: mentions `TP53` — yes" in response.json()["issue_body"]
+
+
+def test_short_and_ten_digit_structured_pmids_are_accepted(feedback_client, pubmed):
+    response = feedback_client.post(
+        "/v1/feedback",
+        json={
+            "category": "gene_annotation_issue",
+            "message": "The cited paper does not support this annotation.",
+            "gene": "TP53",
+            "pmids": ["12345", "1234567890"],
+        },
+    )
+    assert response.status_code == 201
+    body = response.json()["issue_body"]
+    assert "PMID 12345: check unavailable (abstract not retrieved)" in body
+    assert "PMID 1234567890: check unavailable (abstract not retrieved)" in body
+
+
+def test_unparseable_structured_pmid_is_reported(feedback_client):
+    response = feedback_client.post(
+        "/v1/feedback",
+        json={
+            "category": "gene_annotation_issue",
+            "message": "The cited paper does not support this annotation.",
+            "pmids": ["abc"],
+        },
+    )
+    assert response.status_code == 201
+    body = response.json()["issue_body"]
+    assert "No parseable PMIDs were cited; citation check skipped." in body
+    assert "Unparseable structured PMID value(s): `abc` (not checked)." in body
+
+
+def test_structured_pmid_list_is_capped_at_twenty(feedback_client):
+    response = feedback_client.post(
+        "/v1/feedback",
+        json={
+            "category": "gene_annotation_issue",
+            "message": "The cited paper does not support this annotation.",
+            "pmids": [str(10000000 + index) for index in range(21)],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_structured_pmid_entry_is_capped_at_64_characters(feedback_client):
+    response = feedback_client.post(
+        "/v1/feedback",
+        json={
+            "category": "gene_annotation_issue",
+            "message": "The cited paper does not support this annotation.",
+            "pmids": ["9" * 65],
         },
     )
     assert response.status_code == 422
@@ -462,7 +588,8 @@ class _FakeGithubResponse:
         self.status_code = status_code
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
     def json(self):
         return {"html_url": "https://github.com/example/issues/121"}
@@ -500,7 +627,7 @@ def test_create_github_issue_passes_configured_labels(monkeypatch, labels):
     assert posts == [{"title": "Feedback: title", "body": "body", "labels": labels}]
 
 
-def test_create_github_issue_retries_without_labels_on_4xx(monkeypatch):
+def test_create_github_issue_retries_without_labels_on_422(monkeypatch):
     posts = []
     monkeypatch.setattr(main.settings, "oncokbdev_private_access_token", "token")
     monkeypatch.setattr(main.settings, "feedback_issue_labels", ["feedback", "needs-triage"])
@@ -512,3 +639,29 @@ def test_create_github_issue_retries_without_labels_on_4xx(monkeypatch):
     assert len(posts) == 2
     assert posts[0]["labels"] == ["feedback", "needs-triage"]
     assert posts[1] == {"title": "Feedback: title", "body": "body"}
+
+
+def test_create_github_issue_does_not_retry_without_labels_on_other_errors(monkeypatch):
+    posts = []
+    monkeypatch.setattr(main.settings, "oncokbdev_private_access_token", "token")
+    monkeypatch.setattr(main.settings, "feedback_issue_labels", ["feedback", "needs-triage"])
+    monkeypatch.setattr(
+        main, "httpx", type("_httpx", (), {"AsyncClient": _fake_github_client(posts, [500])})
+    )
+    url = asyncio.run(main._create_github_issue("Feedback: title", "body"))
+    assert url is None
+    assert len(posts) == 1
+
+
+def test_create_github_issue_returns_none_when_retry_also_fails(monkeypatch):
+    posts = []
+    monkeypatch.setattr(main.settings, "oncokbdev_private_access_token", "token")
+    monkeypatch.setattr(main.settings, "feedback_issue_labels", ["feedback", "needs-triage"])
+    monkeypatch.setattr(
+        main,
+        "httpx",
+        type("_httpx", (), {"AsyncClient": _fake_github_client(posts, [422, 422])}),
+    )
+    url = asyncio.run(main._create_github_issue("Feedback: title", "body"))
+    assert url is None
+    assert len(posts) == 2

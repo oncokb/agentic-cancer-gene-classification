@@ -140,6 +140,8 @@ def test_feedback_submit_creates_github_issue_when_token_configured(monkeypatch)
     seen = {}
 
     class FakeResponse:
+        status_code = 201
+
         def raise_for_status(self):
             return None
 

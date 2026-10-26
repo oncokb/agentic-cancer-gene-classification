@@ -8,11 +8,12 @@ feedback's subject gene/fusion and tumor type. The result is appended to the
 GitHub issue, never used to block or fail feedback submission: any timeout or
 error degrades to a "check unavailable" line.
 
-Gene symbols are matched case-sensitively on word boundaries so short symbols
-(KIT, MET, SET, ALK) don't match ordinary English words or longer symbols
-(CALK, ALKBH5). Tumor terms are matched against the full alias set for the
-detected tumor type, so "NSCLC" and "non-small cell lung cancer" are
-equivalent without letting "this tumor" become a tumor type.
+Gene matching is case-sensitive only for short symbols (KIT, MET, SET, ALK)
+and aliases whose lowercase form is an English word; longer and hyphenated
+symbols (C11orf95, c-Kit) match case-insensitively. Tumor abbreviations are
+always case-sensitive, and full tumor names are matched with dash/space and
+plural normalization plus organ-word equivalence (ovarian carcinoma is
+ovarian cancer).
 
 Only title/abstract are checked. There is no full-text retrieval helper in
 this codebase, so the rendered section says so explicitly.
@@ -36,21 +37,31 @@ logger = logging.getLogger(__name__)
 # the lookarounds reject long numbers instead of truncating them.
 _PMID_ATOM = r"(?<!\d)\d{6,9}(?!\d)"
 _PMID_DIGITS = re.compile(r"(?<!\d)\d{6,9}(?!\d)")
-_PMID_LABEL = re.compile(
-    r"\b(?:pmids?|pubmed(?:\s+ids?)?)\s*(?:numbers?|nos?\.?)?\s*[:#]?\s*"
-    rf"({_PMID_ATOM}(?:\s*(?:,|;|and|&)\s*{_PMID_ATOM})*)",
+_STRUCTURED_PMID = re.compile(r"(?<!\d)\d{1,10}(?!\d)")
+_PMID_SEPARATOR = r"\s*(?:,|;|and|&)\s*"
+# A singular label only accepts explicit separators; a plural label also
+# accepts whitespace-separated lists ("PMIDs 11111111 22222222").
+_PMID_LABEL_SINGULAR = re.compile(
+    r"\b(?:pmid|pubmed(?:\s+id)?)\s*(?:number|no\.?)?\s*[:#]?\s*"
+    rf"({_PMID_ATOM}(?:{_PMID_SEPARATOR}{_PMID_ATOM})*)",
+    re.IGNORECASE,
+)
+_PMID_LABEL_PLURAL = re.compile(
+    r"\b(?:pmids|pubmed\s+ids)\s*(?:numbers|nos?\.?)?\s*[:#]?\s*"
+    rf"({_PMID_ATOM}(?:(?:{_PMID_SEPARATOR}|\s+){_PMID_ATOM})*)",
     re.IGNORECASE,
 )
 _PMID_URL = re.compile(
     rf"pubmed\.ncbi\.nlm\.nih\.gov/({_PMID_ATOM})",
     re.IGNORECASE,
 )
+_GENE_TOKEN = r"(?=[A-Za-z0-9]*[A-Z])[A-Za-z][A-Za-z0-9]{1,9}"
 _FUSION_SUBJECT = re.compile(
-    r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{1,9})\s*(::+|--|/|-)\s*"
-    r"([A-Z][A-Z0-9]{1,9})(?![A-Za-z0-9])"
+    rf"(?<![A-Za-z0-9])({_GENE_TOKEN})\s*(::+|--|/|-)\s*"
+    rf"({_GENE_TOKEN})(?![A-Za-z0-9])"
 )
 _NAMED_GENE_SUBJECT = re.compile(
-    r"\b(?:gene|symbol)\s+([A-Z][A-Z0-9-]{1,9})\b",
+    r"\b(?:gene|symbol)\s+([A-Za-z][A-Za-z0-9-]{1,9})\b",
     re.IGNORECASE,
 )
 _GENERIC_TUMOR = re.compile(
@@ -77,7 +88,7 @@ _ORGAN_SITE_WORDS = frozenset({
     "kidney", "laryngeal", "liver", "lung", "mediastinal", "melanocytic", "neck",
     "oral", "oropharyngeal", "ovarian", "pancreatic", "pelvic", "penile",
     "peritoneal", "pleural", "prostate", "rectal", "renal", "salivary", "skin",
-    "small", "stomach", "testicular", "thymic", "thyroid", "tongue", "ureteral",
+    "stomach", "testicular", "thymic", "thyroid", "tongue", "ureteral",
     "urethral", "uterine", "vaginal", "vulvar",
 })
 _COMMON_ENGLISH_WORDS = frozenset({
@@ -110,6 +121,11 @@ _FUSION_CONTEXT = re.compile(
     r"\b(fusion|fusions|fused|chimeric|rearrangement|rearranged|translocation)\b",
     re.IGNORECASE,
 )
+_TUMOR_DASHES = str.maketrans({
+    "-": " ", "\u2010": " ", "\u2011": " ", "\u2012": " ", "\u2013": " ",
+    "\u2014": " ", "\u2212": " ",
+})
+_TUMOR_NOUN = r"(?:cancers?|carcinomas?|tumou?rs?|neoplasms?)"
 
 _SECTION_HEADING = "## Automated citation check"
 _ABSTRACT_CAVEAT = "abstract checked; full text not checked"
@@ -118,7 +134,14 @@ _ABSTRACT_CAVEAT = "abstract checked; full text not checked"
 def _tumor_groups() -> dict[str, Tuple[str, ...]]:
     groups: dict[str, Tuple[str, ...]] = {}
     for key, aliases in _TUMOR_TYPE_ALIASES.items():
-        group = tuple(dict.fromkeys((key, *aliases)))
+        # Lowercase lookup keys ("read", "meso", "sarc") are English words and
+        # must never be match terms. Short abbreviation keys contribute their
+        # uppercase form instead; multi-word keys are valid phrases.
+        if " " in key or len(key) > 5:
+            key_terms = [key]
+        else:
+            key_terms = [key.upper()]
+        group = tuple(dict.fromkeys([*key_terms, *aliases]))
         for term in group:
             groups.setdefault(term.casefold(), group)
     return groups
@@ -139,36 +162,33 @@ _TUMOR_ABBREVIATIONS = frozenset(
 
 
 def _display_tumor(term: str) -> str:
-    """Normalize a short lowercase abbreviation to its uppercase HGNC-style form."""
-    if len(term) <= 5 and " " not in term and not term.isupper():
-        group = _TUMOR_GROUPS.get(term.casefold(), ())
-        for candidate in group:
-            if candidate.isupper() and candidate.casefold() == term.casefold():
-                return candidate
-        return term.upper()
     return term
 
 
 def _collect_cited_pmids(
     text: Optional[str],
     structured_pmids: Optional[Iterable[str]] = None,
-) -> List[str]:
+) -> Tuple[List[str], List[str]]:
     found: List[str] = []
+    unparseable: List[str] = []
 
     def _add(value: str) -> None:
         if value and value not in found:
             found.append(value)
 
     for value in structured_pmids or ():
-        match = _PMID_DIGITS.search(str(value))
+        raw = str(value).strip()
+        match = _STRUCTURED_PMID.search(raw)
         if match:
             _add(match.group(0))
+        elif raw:
+            unparseable.append(raw)
     source = text or ""
-    for pattern in (_PMID_LABEL, _PMID_URL):
+    for pattern in (_PMID_LABEL_PLURAL, _PMID_LABEL_SINGULAR, _PMID_URL):
         for match in pattern.finditer(source):
             for pmid in _PMID_DIGITS.findall(match.group(1)):
                 _add(pmid)
-    return found
+    return found, unparseable
 
 
 def parse_cited_pmids(
@@ -178,13 +198,16 @@ def parse_cited_pmids(
     max_pmids: Optional[int] = None,
 ) -> List[str]:
     """Return unique PMIDs cited in free text and/or a structured field, in order."""
-    found = _collect_cited_pmids(text, structured_pmids)
+    found, _ = _collect_cited_pmids(text, structured_pmids)
     limit = max_pmids if max_pmids is not None else settings.feedback_citation_max_pmids
     return found[: max(0, limit)]
 
 
 def _is_gene_symbol(token: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z][A-Z0-9]{1,9}", token))
+    return bool(
+        re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,9}", token)
+        and any(character.isupper() for character in token)
+    )
 
 
 def _is_variant(token: str) -> bool:
@@ -196,7 +219,8 @@ def _is_variant(token: str) -> bool:
 
 
 def _excluded_symbol(token: str) -> bool:
-    return token in _ASSAY_NAMES or token in _TUMOR_ABBREVIATIONS
+    upper = token.upper()
+    return upper in _ASSAY_NAMES or upper in _TUMOR_ABBREVIATIONS
 
 
 def _valid_gene_token(token: str) -> bool:
@@ -207,17 +231,22 @@ def _valid_fusion_pair(left: str, right: str, separator: str) -> bool:
     if not (_valid_gene_token(left) and _valid_gene_token(right)):
         return False
     if separator == "-" and (
-        left in _HYPHENATED_GENE_PREFIXES or right in _HYPHENATED_GENE_PREFIXES
+        left.upper() in _HYPHENATED_GENE_PREFIXES
+        or right.upper() in _HYPHENATED_GENE_PREFIXES
     ):
         return False
     return True
 
 
 def extract_subject(message: str, gene: Optional[str] = None) -> Tuple[Optional[str], bool]:
-    """Return (canonical subject, is_fusion) from the structured field or message."""
+    """Return (subject, is_fusion) from the structured field or message.
+
+    The structured gene keeps its submitted case; matching is case-insensitive
+    for long symbols and case-sensitive only for short/ambiguous ones.
+    """
     if gene and gene.strip():
-        subject = gene.strip().upper()
-        left, right = _split_subject(subject)
+        subject = gene.strip()
+        _, right = _split_subject(subject)
         return subject, right is not None
     for match in _FUSION_SUBJECT.finditer(message or ""):
         left, separator, right = match.group(1), match.group(2), match.group(3)
@@ -228,25 +257,32 @@ def extract_subject(message: str, gene: Optional[str] = None) -> Tuple[Optional[
         return f"{left}::{right}", True
     match = _NAMED_GENE_SUBJECT.search(message or "")
     if match:
-        token = match.group(1).upper()
+        token = match.group(1)
         if _valid_gene_token(token):
             return token, False
     return None, False
 
 
+def _normalize_tumor_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").translate(_TUMOR_DASHES).lower()).strip()
+
+
+def _phrase_present(normalized_text: str, term: str) -> bool:
+    normalized_term = _normalize_tumor_text(term)
+    pattern = rf"(?<![a-z0-9]){re.escape(normalized_term)}(?:s|es)?(?![a-z0-9])"
+    return bool(re.search(pattern, normalized_text))
+
+
 def extract_tumor_type(message: str) -> Optional[str]:
     """Return the first recognizable tumor type mentioned in the feedback."""
     source = message or ""
+    normalized = _normalize_tumor_text(source)
     for term in _TUMOR_TERMS:
-        if len(term) < 3 or term.isdigit():
-            continue
-        # Three-letter abbreviations (ALL, AML, CRC, ...) are only tumor terms
-        # when written as the uppercase abbreviation, not as English words.
-        if len(term) == 3 and not term.isupper():
-            continue
-        case_sensitive = len(term) == 3
-        if _contains(source, term, case_sensitive=case_sensitive):
-            return _display_tumor(term)
+        if term.isupper():
+            if _contains(source, term, case_sensitive=True):
+                return term
+        elif _phrase_present(normalized, term):
+            return term
     match = _GENERIC_TUMOR.search(source)
     if not match:
         return None
@@ -286,32 +322,59 @@ def _usable_aliases(aliases: Sequence[str]) -> List[str]:
     ]
 
 
+def _gene_case_sensitive(term: str) -> bool:
+    return len(term) <= 3 or term.casefold() in _COMMON_ENGLISH_WORDS
+
+
 def _gene_mentioned(text: str, gene: str, aliases: Sequence[str]) -> bool:
     terms = list(dict.fromkeys([gene, *_usable_aliases(aliases)]))
-    return any(_contains(text, term, case_sensitive=True) for term in terms)
+    return any(_contains(text, term, case_sensitive=_gene_case_sensitive(term)) for term in terms)
 
 
 def _tumor_aliases(tumor: str) -> Tuple[str, ...]:
     group = _TUMOR_GROUPS.get(tumor.casefold(), (tumor,))
-    # Drop lowercase 3-letter keys (e.g. the "all" lookup key); only the
-    # uppercase abbreviation (ALL) should match English-looking text.
+    # Drop lowercase 3-letter keys; only uppercase abbreviations (ALL) should
+    # match English-looking text.
     return tuple(
         term for term in group if not (len(term) == 3 and not term.isupper())
     ) or (tumor,)
 
 
-def _tumor_mentioned(text: str, tumor: Optional[str]) -> bool:
-    if not tumor:
-        return False
-    for term in _tumor_aliases(tumor):
-        case_sensitive = len(term) == 3 and term.isupper()
-        if _contains(text, term, case_sensitive=case_sensitive):
+def _organ_equivalence(normalized_text: str, tumor: str) -> bool:
+    organs = {
+        word
+        for alias in _tumor_aliases(tumor)
+        for word in re.findall(r"[a-z]+", _normalize_tumor_text(alias))
+        if word in _ORGAN_SITE_WORDS
+    }
+    for organ in organs:
+        pattern = rf"(?<![a-z0-9]){organ}(?![a-z0-9])(?:\W+\w+){{0,5}}\W+{_TUMOR_NOUN}"
+        if re.search(pattern, normalized_text):
             return True
     return False
 
 
+def _tumor_mentioned(text: str, tumor: Optional[str]) -> bool:
+    if not tumor:
+        return False
+    normalized = _normalize_tumor_text(text)
+    for term in _tumor_aliases(tumor):
+        if term.isupper():
+            if _contains(text, term, case_sensitive=True):
+                return True
+        elif _phrase_present(normalized, term):
+            return True
+    return _organ_equivalence(normalized, tumor)
+
+
 def _yes(flag: bool) -> str:
     return "yes" if flag else "NO"
+
+
+def _safe_code(value: str) -> str:
+    """Make untrusted text safe inside a Markdown code span."""
+    cleaned = re.sub(r"[`\r\n\t]", "", str(value)).strip()
+    return cleaned[:64] or "?"
 
 
 async def _resolve_aliases(five: str, three: Optional[str]) -> Tuple[List[str], List[str]]:
@@ -329,6 +392,24 @@ async def _resolve_aliases(five: str, three: Optional[str]) -> Tuple[List[str], 
         return [], []
 
 
+def _retraction_kind(record) -> Optional[str]:
+    types = {value.strip().lower() for value in record.publication_types}
+    refs = {
+        value.strip().lower().replace(" ", "")
+        for value in record.pubmed_comment_ref_types
+    }
+    if "retracted publication" in types or "retractionin" in refs:
+        return "retracted publication"
+    if "retraction of publication" in types or "retractionof" in refs:
+        return "retraction notice"
+    title = (record.title or "").strip().lower()
+    if title.startswith("retraction"):
+        return "retraction notice"
+    if title.startswith("retracted"):
+        return "retracted publication"
+    return None
+
+
 def _record_line(
     pmid: str,
     record,
@@ -338,15 +419,22 @@ def _record_line(
     aliases_three: Sequence[str],
     tumor: Optional[str],
 ) -> str:
-    if literature._is_retracted_publication(record):
-        return f"- PMID {pmid}: RETRACTED (citation is retracted; mention check skipped)"
+    retraction_kind = _retraction_kind(record)
+    if retraction_kind:
+        return (
+            f"- PMID {pmid}: RETRACTED — {retraction_kind} "
+            "(citation is retracted; mention check skipped)"
+        )
     text = f"{record.title} {record.abstract}"
     five_hit = _gene_mentioned(text, five, aliases_five)
     if three:
         three_hit = _gene_mentioned(text, three, aliases_three)
-        detail = f"mentions `{five}` — {_yes(five_hit)}; `{three}` — {_yes(three_hit)}"
+        detail = (
+            f"mentions `{_safe_code(five)}` — {_yes(five_hit)}; "
+            f"`{_safe_code(three)}` — {_yes(three_hit)}"
+        )
     else:
-        detail = f"mentions `{five}` — {_yes(five_hit)}"
+        detail = f"mentions `{_safe_code(five)}` — {_yes(five_hit)}"
     if tumor:
         detail += f"; {tumor} — {_yes(_tumor_mentioned(text, tumor))}"
     return f"- PMID {pmid}: {detail} ({_ABSTRACT_CAVEAT})"
@@ -383,6 +471,11 @@ async def _build_section(
     return "\n".join([_SECTION_HEADING, "", *intro, "", *lines])
 
 
+def _unparseable_lines(values: Sequence[str]) -> List[str]:
+    rendered = ", ".join(f"`{_safe_code(value)}`" for value in values)
+    return [f"- Unparseable structured PMID value(s): {rendered} (not checked)."]
+
+
 def _unavailable(reason: str) -> str:
     return "\n".join([_SECTION_HEADING, "", f"check unavailable ({reason})."])
 
@@ -400,9 +493,18 @@ async def build_citation_check_section(
     """
     if not settings.feedback_citation_check_enabled:
         return None
-    all_pmids = _collect_cited_pmids(message, structured_pmids)
+    all_pmids, unparseable = _collect_cited_pmids(message, structured_pmids)
     if not all_pmids:
-        return None
+        if not unparseable:
+            return None
+        return "\n".join(
+            [
+                _SECTION_HEADING,
+                "",
+                "No parseable PMIDs were cited; citation check skipped.",
+                *_unparseable_lines(unparseable),
+            ]
+        )
     cap = max(0, settings.feedback_citation_max_pmids)
     pmids = all_pmids[:cap]
     dropped = len(all_pmids) - len(pmids)
@@ -413,8 +515,15 @@ async def build_citation_check_section(
         )
         if not section:
             return _unavailable("no subject gene or fusion detected")
+        extra: List[str] = []
         if dropped:
-            section = f"{section}\n- {dropped} additional cited PMID(s) were not checked (cap {cap})."
+            extra.append(
+                f"- {dropped} additional cited PMID(s) were not checked (cap {cap})."
+            )
+        if unparseable:
+            extra.extend(_unparseable_lines(unparseable))
+        if extra:
+            section = "\n".join([section, *extra])
         return section
     except asyncio.TimeoutError:
         logger.warning("Feedback citation check timed out for %d PMID(s)", len(pmids))

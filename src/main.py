@@ -2346,15 +2346,14 @@ async def _create_github_issue(title: str, body: str) -> Optional[str]:
                 },
                 json=request_body,
             )
-            status_code = getattr(response, "status_code", 200)
-            if labels and 400 <= status_code < 500:
-                # A missing label (or any other label-related 4xx) must not
-                # lose the feedback issue; retry once without labels.
+            if labels and response.status_code == 422:
+                # GitHub returns 422 when a label cannot be applied; retry once
+                # without labels so the feedback is still filed.
                 increment("feedback.github_issue_labels_rejected")
                 logger.warning(
                     "GitHub rejected feedback issue labels %s (status %s); retrying without labels",
                     labels,
-                    status_code,
+                    response.status_code,
                 )
                 response = await client.post(
                     f"https://api.github.com/repos/{settings.github_repo}/issues",
