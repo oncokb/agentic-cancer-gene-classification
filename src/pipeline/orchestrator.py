@@ -32,7 +32,7 @@ from src.pipeline.literature import (
     search_recent_pubmed_pmids,
 )
 from src.pipeline.llm_client import resolve_local_backend
-from src.pipeline.normalization import is_fusion_input, normalize_fusions
+from src.pipeline.normalization import is_fusion_input, normalize_fusions, unparsed_fusion_warnings
 from src.pipeline.pmid_distillation import distill_and_save_pmid_evidence
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
@@ -628,6 +628,8 @@ async def run_pipeline(
                 f"{canonical}: using tumor type {tumor_types[0]!r}; "
                 f"ignored tumor types: {', '.join(repr(tt) for tt in tumor_types[1:])}."
             )
+    # Shared with the tumor-type notes above: append, never replace.
+    warnings.extend(await unparsed_fusion_warnings(input_strings, gene_map))
 
     # Annotate genes with bounded fan-out. PubMed, Redis, and LLM paths still
     # enforce their own lower-level limits/caches.

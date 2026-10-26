@@ -50,6 +50,190 @@ def is_fusion_input(value: str) -> bool:
     return bool(gene1 and gene2)
 
 
+# Fusion-like notation that split_fusion deliberately does not parse. A single
+# hyphen is not a separator because real symbols and aliases contain one
+# (HLA-A, NKX2-1, GM-CSF).
+_SYMBOL_TOKEN = r"[A-Za-z][A-Za-z0-9]{1,14}"
+_HYPHEN_PAIR = re.compile(rf"^(?P<gene1>{_SYMBOL_TOKEN})-(?P<gene2>{_SYMBOL_TOKEN})$")
+# Two whitespace-separated partners only count as a fusion when the input says
+# so ('EML4 ALK fusion', 'fusion EML4 ALK'); a bare 'BRAF melanoma' is a gene
+# plus context, and a bare 'EML4 ALK' is an accepted miss.
+_FUSION_WORD = r"(?:fusions?|rearrangements?|translocations?)"
+_WHITESPACE_PAIR = re.compile(
+    rf"^(?:(?P<lead>{_FUSION_WORD})\s+)?(?P<gene1>{_SYMBOL_TOKEN})\s+(?P<gene2>{_SYMBOL_TOKEN})"
+    rf"(?:\s+(?P<trail>{_FUSION_WORD}))?$",
+    re.IGNORECASE,
+)
+# HGNC families whose hyphenated members look like two symbols (HLA-DRB1, MT-CO1).
+_HYPHENATED_SYMBOL_PREFIXES = frozenset({"HLA", "MT"})
+# Words that accompany a gene without naming a partner: event and status words,
+# Greek-letter protein names (TNF-alpha, IFN-gamma), and prose (NF-kB, anti-EGFR).
+_NON_PARTNER_WORDS = frozenset(
+    {
+        "FUSION", "FUSIONS", "REARRANGEMENT", "REARRANGEMENTS", "TRANSLOCATION", "TRANSLOCATIONS",
+        "GENE", "GENES", "PROTEIN", "VARIANT", "VARIANTS", "MUTATION", "MUTATIONS", "MUTANT", "MUTATED",
+        "POSITIVE", "NEGATIVE", "POS", "NEG", "AMPLIFICATION", "AMPLIFIED", "AMP", "DELETION", "DELETED",
+        "DEL", "LOSS", "GAIN", "EXPRESSION", "OVEREXPRESSION", "WILDTYPE", "WT", "NULL", "INHIBITOR",
+        "ANTI", "NON", "KB", "CELL", "SMALL", "LARGE", "HIGH", "LOW",
+        "ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA", "THETA", "IOTA", "KAPPA", "LAMBDA",
+        "MU", "NU", "XI", "OMICRON", "PI", "RHO", "SIGMA", "TAU", "UPSILON", "PHI", "CHI", "PSI", "OMEGA",
+    }
+)
+# Short English words that join hyphenated prose (in-frame, one-two); none is an HGNC symbol.
+_SHORT_ENGLISH_WORDS = frozenset(
+    {
+        "IN", "ON", "OF", "TO", "AT", "BY", "OR", "AN", "AS", "IS", "IT", "BE", "NO", "UP", "SO", "IF",
+        "WE", "ONE", "TWO", "SIX", "TEN", "AND", "THE", "FOR", "NOT", "OUT", "OFF", "END", "NEW", "OLD",
+        "BUT", "ARE", "WAS", "HAS", "TOP", "PRE",
+    }
+)
+# Single-word tumor names and abbreviations. Superset of the single-word terms in
+# literature._TUMOR_TYPE_ALIASES (copied: literature imports this module; a test
+# keeps them in sync).
+_TUMOR_TYPE_WORDS = frozenset(
+    {
+        "LUAD", "LUSC", "NSCLC", "SCLC", "TNBC", "CRC", "COAD", "READ", "PDAC", "HCC", "GC", "STAD",
+        "EAC", "ESCC", "CCA", "RCC", "CCRCC", "KIRC", "KIRP", "GBM", "LGG", "AML", "CML", "ALL", "CLL",
+        "MM", "DLBCL", "FL", "MCL", "NHL", "HL", "OV", "UCEC", "CESC", "SKCM", "UVM", "HNSCC", "THCA",
+        "PRAD", "BLCA", "UC", "MESO", "SARC", "LCNEC", "PCPG", "MDS", "MPN", "GIST", "IMT", "ALCL",
+        "CANCER", "TUMOR", "TUMOUR", "NEOPLASM", "MALIGNANCY", "CARCINOMA", "ADENOCARCINOMA", "SARCOMA",
+        "MELANOMA", "GLIOMA", "GLIOBLASTOMA", "LYMPHOMA", "LEUKEMIA", "LEUKAEMIA", "MYELOMA",
+        "MESOTHELIOMA", "CHOLANGIOCARCINOMA", "PHEOCHROMOCYTOMA", "PARAGANGLIOMA", "NEUROBLASTOMA",
+        "BLASTOMA", "LUNG", "BREAST", "COLON", "RECTAL", "COLORECTAL", "GASTRIC", "PANCREATIC",
+        "THYROID", "PROSTATE", "BLADDER", "OVARIAN", "RENAL", "KIDNEY", "LIVER", "SKIN", "BRAIN",
+        "ESOPHAGOGASTRIC", "ESS", "HGESS", "LGESS", "ULMS", "USARC", "UTROSCT",
+    }
+)
+# Protein changes and exon references (V600E, G12C, T790M, Q61fs, exon19, ex20).
+_PROTEIN_CHANGE = re.compile(r"^(?:[A-Z]\d+(?:[A-Z]|FS|DEL|INS|DUP)?|(?:EXON|EX)\d+)$", re.IGNORECASE)
+HGNC_ALIAS_SEARCH_URL = 'https://rest.genenames.org/search/alias_symbol:"{symbol}"+OR+prev_symbol:"{symbol}"'
+
+
+def _looks_like_partner(token: str) -> bool:
+    upper = token.upper()
+    return not (
+        upper in _NON_PARTNER_WORDS
+        or upper in _SHORT_ENGLISH_WORDS
+        or upper in _TUMOR_TYPE_WORDS
+        or _PROTEIN_CHANGE.match(token)
+    )
+
+
+def _has_digit(token: str) -> bool:
+    return any(char.isdigit() for char in token)
+
+
+def _partners_are_symbol_cased(text: str, gene1: str, gene2: str) -> bool:
+    """
+    Case check that keeps hyphenated prose (well-differentiated, Well-Differentiated)
+    from reading as two genes. An all-lowercase input needs a digit in a partner
+    (ewsr1-fli1, bcr-abl1; a bare bcr-abl is an accepted miss); otherwise every
+    partner must be all-uppercase or contain a digit (EWSR1-FLI1, C11orf95-RELA).
+    """
+    if not any(char.isupper() for char in text):
+        return _has_digit(gene1) or _has_digit(gene2)
+    return all(token.isupper() or _has_digit(token) for token in (gene1, gene2))
+
+
+def unparsed_fusion_warning(
+    value: str,
+    resolved: Optional[ResolvedGene] = None,
+    known_aliases: Iterable[str] = (),
+) -> Optional[str]:
+    """
+    Return a warning when an input looks like fusion notation that was treated
+    as a single gene ('EWSR1-FLI1', 'EML4 ALK fusion'), else None.
+
+    `resolved` is the HGNC resolution of the whole input as a single symbol.
+    A hyphenated input only warns when HGNC confirmed it is not a symbol, so a
+    real hyphenated gene, or one whose lookup failed, never warns; nor does one
+    listed in `known_aliases` (alias/previous symbols of genes already resolved).
+    The whitespace form must name a fusion explicitly and ignores `resolved`:
+    symbols never contain spaces, and HGNC's fuzzy search fallback "resolves"
+    'EML4 ALK fusion' to EML4.
+    """
+    text = value.strip()
+    if is_fusion_input(text):
+        return None
+
+    match = _WHITESPACE_PAIR.match(text)
+    if match is not None:
+        if not (match.group("lead") or match.group("trail")):
+            return None
+    else:
+        match = _HYPHEN_PAIR.match(text)
+        if match is None or resolved is None or not resolved.unresolvable or resolved.lookup_failed:
+            return None
+        if match.group("gene1").upper() in _HYPHENATED_SYMBOL_PREFIXES:
+            return None
+        if text.upper() in {alias.upper() for alias in known_aliases}:
+            return None
+
+    gene1, gene2 = match.group("gene1"), match.group("gene2")
+    if not (_looks_like_partner(gene1) and _looks_like_partner(gene2)):
+        return None
+    if not _partners_are_symbol_cased(text, gene1, gene2):
+        return None
+    return (
+        f"'{text}' was treated as a single gene. "
+        f"To annotate it as a fusion, write '{gene1.upper()}::{gene2.upper()}'."
+    )
+
+
+async def _is_hgnc_alias(symbol: str, client: httpx.AsyncClient) -> Optional[bool]:
+    """True when HGNC lists `symbol` as an alias or previous symbol; None if the lookup failed."""
+    url = HGNC_ALIAS_SEARCH_URL.format(symbol=symbol)
+
+    async def _fetch() -> list:
+        resp = await client.get(url, headers={"Accept": "application/json"}, timeout=HGNC_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        return resp.json().get("response", {}).get("docs", [])
+
+    try:
+        docs = await cached_call(f"hgnc:alias:{symbol.upper()}", _fetch)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("HGNC alias lookup failed for %s: %s", symbol, exc)
+        return None
+    return bool(docs)
+
+
+async def unparsed_fusion_warnings(
+    inputs: Iterable[str],
+    gene_map: Dict[str, Tuple[ResolvedGene, list[str]]],
+    client: Optional[httpx.AsyncClient] = None,
+) -> list[str]:
+    """
+    Warnings for each distinct input in `inputs`, reusing normalize_fusions' HGNC results.
+
+    A hyphenated input that would warn gets one extra HGNC alias/previous-symbol
+    lookup (only on this already-unresolved path); a match, or a failed lookup,
+    suppresses the warning.
+    """
+    resolved_by_symbol = {rg.input_symbol: rg for rg, _ in gene_map.values()}
+    known_aliases = {
+        alias for rg, _ in gene_map.values() for alias in [*rg.alias_symbols, *rg.prev_symbols]
+    }
+    candidates: list[tuple[str, str]] = []
+    for value in dict.fromkeys(inputs):
+        warning = unparsed_fusion_warning(value, resolved_by_symbol.get(value.strip()), known_aliases)
+        if warning:
+            candidates.append((value.strip(), warning))
+    if not any(_HYPHEN_PAIR.match(text) for text, _ in candidates):
+        return [warning for _, warning in candidates]
+
+    async def _keep(text: str, http: httpx.AsyncClient) -> bool:
+        return not _HYPHEN_PAIR.match(text) or await _is_hgnc_alias(text, http) is False
+
+    async def _filter(http: httpx.AsyncClient) -> list[str]:
+        keeps = await asyncio.gather(*(_keep(text, http) for text, _ in candidates))
+        return [warning for (_, warning), keep in zip(candidates, keeps) if keep]
+
+    if client is not None:
+        return await _filter(client)
+    async with httpx.AsyncClient() as http:
+        return await _filter(http)
+
+
 def _is_ensembl_id(symbol: str) -> bool:
     return bool(ENSEMBL_PATTERN.match(symbol))
 

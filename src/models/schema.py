@@ -440,8 +440,29 @@ class FusionInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def coerce_gene_input_aliases(cls, data: Any) -> Any:
-        """Allow structured rows to name the required value as gene/input/query."""
-        if isinstance(data, dict) and "fusion" not in data:
+        """Allow structured rows to name the required value as gene/input/query,
+        or to give fusion partners separately as gene1/gene2."""
+        if not isinstance(data, dict):
+            return data
+        if "gene1" in data or "gene2" in data:
+            gene1 = str(data.get("gene1") or "").strip()
+            gene2 = str(data.get("gene2") or "").strip()
+            if not (gene1 and gene2):
+                raise ValueError("gene1 and gene2 must both be given to describe a fusion")
+            fusion = f"{gene1}::{gene2}"
+            given = data.get("fusion")
+            # Deferred: normalization imports this module.
+            from src.pipeline.normalization import split_fusion
+
+            if given is not None and tuple(
+                (part or "").upper() for part in split_fusion(str(given))
+            ) != (gene1.upper(), gene2.upper()):
+                raise ValueError(
+                    f"fusion '{given}' conflicts with gene1/gene2 ('{fusion}'); give one or the other"
+                )
+            data = {key: value for key, value in data.items() if key not in ("gene1", "gene2")}
+            return {**data, "fusion": fusion if given is None else given}
+        if "fusion" not in data:
             for alias in ("gene", "input", "query"):
                 if alias in data:
                     return {**data, "fusion": data[alias]}
