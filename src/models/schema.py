@@ -533,7 +533,14 @@ class AnnotationResult(BaseModel):
     fusions_processed: int
     genes_annotated: int
     annotations: List[GeneAnnotation]
-    fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
+    fusion_evidence: List[FusionEvidenceResult] = Field(
+        default_factory=list,
+        description=(
+            "Exact fusion-pair evidence, empty by default. Set include_fusion_evidence=true "
+            "on the annotation request to populate it inline; otherwise run "
+            "POST /v1/fusion-evidence/jobs (optionally with run_id) to populate it."
+        ),
+    )
     warnings: List[str] = Field(
         default_factory=list,
         description="Request-level warnings, including the tumor type used and ignored conflicting types per gene.",
