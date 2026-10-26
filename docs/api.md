@@ -300,6 +300,7 @@ Poll the `status_url` until `status` is `complete` or `failed`.
 {
   "job_id": "6f2d8a1c-7b3e-4a9d-9c11-8f0e2d4b6a70",
   "status": "complete",
+  "phase": "complete",
   "fusions_processed": 2,
   "genes_completed": 4,
   "genes_total": 4,
@@ -421,7 +422,7 @@ a `view_url`. Build the report link yourself from the run ID:
 https://acgc.oncokb.org/?run=<run_id>
 ```
 
-That is the same link format the app uses (`src/main.py:836-838`).
+That is the same link format the app uses (`_run_view_url` in `src/main.py`).
 `fusion_evidence` is populated if the annotation request set
 `include_fusion_evidence: true` or a fusion-evidence job successfully attached
 it to this run; otherwise it is `[]`. An unknown `run_id` returns `404`.
@@ -512,7 +513,7 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 
 ### Whole-request errors
 
-Rows that mention gene symbols, fusions, the 50-gene cap or `view_url` describe
+Rows that mention gene symbols, fusions, the `GENE_QUERY_MAX_GENES` 50-gene cap or `view_url` describe
 the **gene query API** (`/v1/genes/...`). `POST /v1/annotate` accepts fusions,
 has the separate `ANNOTATE_MAX_INPUTS` cap (default 50), and does not return
 `view_url`. The `401`, `403`, `429` and
@@ -523,7 +524,7 @@ has the separate `ANNOTATE_MAX_INPUTS` cap (default 50), and does not return
 | `401` | No key, or the key is wrong, revoked or expired, or its owner is no longer allowed to use ACGC. | Check `ACGC_API_KEY`, or create a new key. |
 | `403` | Your account is waiting for administrator approval, or a key was used to manage keys. | Contact the ACGC team, or manage keys on the API keys page. |
 | `404` | Gene query API, `GET /v1/genes/{symbol}`: the gene doesn't exist (HGNC or Ensembl confirmed no match). Annotate, `GET /v1/annotate/{run_id}`: the run doesn't exist. | Check the symbol or run ID. |
-| `422` | Gene query API: a bad gene symbol, a fusion, more than 50 genes, or invalid JSON. Annotation and fusion-evidence requests: an empty `fusions` list, invalid JSON, or more than `ANNOTATE_MAX_INPUTS` entries (default 50; over-limit responses have a string `detail`). | Fix the request. The response says which field is wrong. |
+| `422` | Gene query API: a bad gene symbol, a fusion, more than 50 genes, or invalid JSON. Annotation and fusion-evidence requests: an empty `fusions` list, invalid JSON, or more than `ANNOTATE_MAX_INPUTS` entries (default 50; over-limit responses have a string `detail`). | Fix the request. The response says which field is wrong, or states the input limit. |
 | `429` | You exceeded your key's rate limit. | Wait for the number of seconds in `Retry-After`, then retry. |
 | `500` | Gene query API: ACGC couldn't save the run, so no `view_url` is returned. Annotate: an unexpected pipeline error (run saving is separate and best-effort). | Retry later. |
 | `503` | A gene lookup service (HGNC or Ensembl) was temporarily unavailable, or ACGC can't verify keys right now. | Retry after a short wait. |
