@@ -209,8 +209,8 @@ curl -s -X POST https://acgc.oncokb.org/v1/annotate \
 
 That annotates the genes but leaves `fusion_evidence` empty. Exact
 fusion-pair evidence is a second step: start a fusion-evidence job, passing
-the annotation run's `run_id` so the evidence is saved onto that run, then
-poll its `status_url`.
+the annotation run's `run_id` so ACGC best-effort attaches the evidence to
+that run, then poll its `status_url`.
 
 ```bash
 curl -s -X POST https://acgc.oncokb.org/v1/fusion-evidence/jobs \
@@ -610,10 +610,11 @@ Fusion-level evidence is intentionally outside the core annotation critical
 path, so `/v1/annotate` and `/v1/annotate/jobs` always return
 `fusion_evidence: []`. The UI starts `/v1/fusion-evidence/jobs` after gene
 annotations are available, polls it in the background, and displays results in
-a separate Fusion evidence tab; pass the annotation run's `run_id` to save the
-evidence back onto the run. Each exact fusion/tumor lookup is cached in Redis
-under `fusion_evidence:*` using `FUSION_EVIDENCE_CACHE_TTL_SECONDS`, with
-bounded per-job fan-out controlled by `FUSION_EVIDENCE_CONCURRENCY`. See the
+a separate Fusion evidence tab; pass the annotation run's `run_id` to
+best-effort attach the evidence to the run. Each exact fusion/tumor lookup is
+cached in Redis under `fusion_evidence:*` using
+`FUSION_EVIDENCE_CACHE_TTL_SECONDS`, with bounded per-job fan-out controlled by
+`FUSION_EVIDENCE_CONCURRENCY`. See the
 [API user guide](docs/api.md#post-v1fusion-evidencejobs) for request and
 response shapes.
 

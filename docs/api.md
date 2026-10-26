@@ -4,11 +4,13 @@ This guide is for MSK staff who want to query ACGC (Agentic Cancer Gene
 Classification) from a script or pipeline. It covers getting an API key,
 asking ACGC about genes, and reading the results.
 
-What you get back for each gene is its classification and rationale: whether
-it's cancer-associated, its gene class, a short rationale with supporting
-PubMed IDs, and a support score. Every response also includes a `view_url`
-link that opens the full report in the ACGC web app (evidence cards,
-abstracts, quotes, clinical actionability) for anyone who signs in.
+For the gene query API (`/v1/genes/...`), what you get back for each gene is
+its classification and rationale: whether it's cancer-associated, its gene
+class, a short rationale with supporting PubMed IDs, and a support score.
+Gene-query responses also include a `view_url` link that opens the full report
+in the ACGC web app (evidence cards, abstracts, quotes, clinical actionability)
+for anyone who signs in. The annotate endpoints in section 5 return a richer
+`AnnotationResult` and do not include `view_url`.
 
 Base URL: `https://acgc.oncokb.org`
 
@@ -84,7 +86,7 @@ curl -s -X POST https://acgc.oncokb.org/v1/genes/query \
 - **`force_refresh`**: optional, default `false`. See
   [Speed and freshness](#6-speed-and-freshness).
 
-Accepted gene identifiers:
+Accepted gene identifiers for the gene query API:
 
 - HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`, and Ensembl gene IDs such
   as `ENSG00000141510` or `ENSG00000141510.17`.
@@ -141,12 +143,13 @@ Accepted gene identifiers:
 | `cache_status`, `cached_at` | Whether a saved result was reused or the gene was classified fresh, and when that result was produced. |
 | `error` | Set only when this gene couldn't be classified. See [Errors](#7-errors). |
 
-The API deliberately leaves out abstracts, quotes, evidence cards and
-OpenEvidence content. Open `view_url` to see them.
+The gene query API deliberately leaves out abstracts, quotes, evidence cards
+and OpenEvidence content. Open its `view_url` to see them. (The annotate
+endpoints return full annotations, including evidence cards.)
 
-## 4. Background jobs
+## 4. Gene query background jobs
 
-Start a job with the same body as `POST /v1/genes/query`:
+Start a gene-query job with the same body as `POST /v1/genes/query`:
 
 ```bash
 curl -s -X POST https://acgc.oncokb.org/v1/genes/query/jobs \
@@ -243,10 +246,17 @@ unique genes.
 }
 ```
 
+_The `annotations` array above is abbreviated: this request returns one entry
+for `ALK` and one for `EML4`. The other entry is omitted here for brevity._
+
 `fusion_evidence` is **always empty** in the `POST /v1/annotate` response. It is
 only populated on a saved run after a fusion-evidence job is attached to that
 run, or directly in a fusion-evidence job's response. See
 [Fusion evidence jobs](#post-v1fusion-evidencejobs).
+
+Saving the run is best-effort: if persistence fails, the response is still
+returned with its `run_id`, but `GET /v1/annotate/{run_id}` may then return
+`404` (`src/main.py:799-809`, `src/main.py:1557-1560`).
 
 ### `POST /v1/annotate/jobs`
 
@@ -277,14 +287,14 @@ Poll the `status_url` until `status` is `complete` or `failed`.
   "job_id": "6f2d8a1c-7b3e-4a9d-9c11-8f0e2d4b6a70",
   "status": "complete",
   "fusions_processed": 2,
-  "genes_completed": 3,
-  "genes_total": 3,
+  "genes_completed": 4,
+  "genes_total": 4,
   "annotations": [ ... ],
   "result": {
     "run_id": "0b8f3c2e-5d1a-4c3e-9f57-2a6c1d9e4b10",
     "timestamp": "2026-10-26T14:03:11+00:00",
     "fusions_processed": 2,
-    "genes_annotated": 3,
+    "genes_annotated": 4,
     "annotations": [ ... ],
     "fusion_evidence": [],
     "timings_ms": {"total": 8120.4}
@@ -298,11 +308,16 @@ Poll the `status_url` until `status` is `complete` or `failed`.
 - `annotations` fills in as genes finish; `genes_completed` and `genes_total`
   show progress.
 - On success, `result` is the same `AnnotationResult` that `POST /v1/annotate`
-  returns. Save `result.run_id`; the fusion-evidence step below needs it.
+  returns. Save `result.run_id`; the fusion-evidence step below needs it. Run
+  saving is best-effort, so a `run_id` whose save failed will return `404` from
+  `GET /v1/annotate/{run_id}`.
 - On failure, `error` holds a short message.
-- Finished jobs are kept for about one hour (`ANNOTATION_JOB_TTL_SECONDS`,
-  default 3600) and are then evicted when another annotation job is created.
-  A poll after that returns `404`. Jobs do not survive a process restart.
+- Expiry is measured from job **creation**, not completion
+  (`ANNOTATION_JOB_TTL_SECONDS`, default 3600). Eviction runs only when another
+  annotation job is launched, and only removes jobs that are already `complete`
+  or `failed`. A job that ran longer than an hour can therefore be evicted as
+  soon as it finishes, on the next job launch; a poll after eviction returns
+  `404`. Jobs do not survive a process restart.
 
 ### `POST /v1/fusion-evidence/jobs`
 
@@ -321,8 +336,8 @@ curl -s -X POST https://acgc.oncokb.org/v1/fusion-evidence/jobs \
 
 | Field | Meaning |
 | --- | --- |
-| `fusions` | Required, at least one entry in the same string-or-object form as `POST /v1/annotate`. Only entries that contain a fusion separator are processed; gene-only entries are ignored. |
-| `run_id` | Optional. When set, the completed evidence is saved onto that existing run, so `GET /v1/annotate/{run_id}` and the shared `view_url` include it. |
+| `fusions` | Required, at least one entry in the same string-or-object form as `POST /v1/annotate`. Only entries with a fusion separator and two non-empty partners are processed; gene-only entries and entries such as `ALK::` are ignored. |
+| `run_id` | Optional. When set, ACGC best-effort saves the completed evidence onto that existing run, so a later `GET /v1/annotate/{run_id}` may include it. |
 
 Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
 
@@ -346,7 +361,7 @@ Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
       "fusion": "EML4::ALK",
       "tumor_type": "LUAD",
       "well_supported": true,
-      "retrieved_count": 12,
+      "retrieved_count": 2,
       "pmids": ["17625570", "20979469"],
       "interpretation": "The exact fusion pair is well supported in LUAD ...",
       "evidence_cards": [ ... ]
@@ -360,9 +375,12 @@ Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
 - `status` is `queued`, `running`, `complete` or `failed`.
 - `fusion_evidence` fills in as fusions finish; `fusions_completed` and
   `fusions_total` show progress.
-- If `run_id` was supplied, the evidence is also saved to that run on success.
-  If the run no longer exists, the job still completes and returns the evidence;
-  only the save is skipped.
+- **The job status response is the authoritative source for the evidence.** If
+  `run_id` was supplied, the job marks itself `complete` first and then
+  best-effort attaches the evidence to that run. A missing run is silently
+  skipped; other persistence errors are only logged. The run may therefore lag
+  behind the job, and `GET /v1/annotate/{run_id}` is not guaranteed to include
+  the evidence (`src/main.py:1728-1734`, `src/main.py:812-826`).
 - Fusion-evidence job records have no age-based eviction, but they are
   process-local and are lost on restart.
 
@@ -377,9 +395,17 @@ curl -s "https://acgc.oncokb.org/v1/annotate/$RUN_ID" \
   -H "Authorization: Bearer $ACGC_API_KEY"
 ```
 
-The response has the same shape as `POST /v1/annotate`. `fusion_evidence` is
-populated only if a fusion-evidence job was attached to this run; otherwise it
-is `[]`. An unknown `run_id` returns `404`.
+The response has the same shape as `POST /v1/annotate`; it does **not** include
+a `view_url`. Build the report link yourself from the run ID:
+
+```text
+https://acgc.oncokb.org/?run=<run_id>
+```
+
+That is the same link format the app uses (`src/main.py:836-838`).
+`fusion_evidence` is populated only if a fusion-evidence job successfully
+attached it to this run; otherwise it is `[]`. An unknown `run_id` returns
+`404`.
 
 ### Batch workflow
 
@@ -399,9 +425,11 @@ you exact-pair fusion evidence:
    left in the list; they are ignored.
 6. Poll `GET /v1/fusion-evidence/jobs/{job_id}` every 15 to 30 seconds, again
    honoring `Retry-After` on `429`, until `status` is `complete` or `failed`.
-7. Read the evidence from the fusion job's `fusion_evidence`, or fetch the run
-   with `GET /v1/annotate/{run_id}` to get it back together with the gene
-   annotations and a shareable `view_url`.
+7. Read the evidence from the fusion job's `fusion_evidence`. That response is
+   authoritative. If you also supplied `run_id`, you can fetch the run with
+   `GET /v1/annotate/{run_id}` and construct its report link as
+   `https://acgc.oncokb.org/?run=<run_id>`; attachment is best-effort, so the
+   run may not have the evidence yet (or at all).
 
 Status polls count toward the **60 requests per minute** per-key limit, so keep
 polling intervals at 15 seconds or longer when you have several jobs running.
@@ -410,18 +438,25 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 
 - `POST /v1/annotate` (and its jobs) always returns `fusion_evidence: []`.
   Exact fusion-pair evidence requires `POST /v1/fusion-evidence/jobs`.
-- Only one tumor type is used per gene per request. If the same gene appears
-  more than once with different `tumor_type` values, the first non-null one
-  wins and the others are ignored.
+- Only one tumor type is used per gene per request, chosen in two stages. If
+  the **same input string** is repeated with different tumor types, the last
+  non-empty `tumor_type` overwrites the earlier ones. Then, across a gene's
+  distinct input strings, the first non-null tumor type in submission order is
+  used; later ones are ignored (`src/pipeline/orchestrator.py:543-549`,
+  `src/pipeline/orchestrator.py:611-618`).
 - Fusion separators are `::`, `--` and `/` only. A single hyphen is **not** a
   separator: `EWSR1-FLI1` is treated as one gene symbol, not a fusion. Write
   `EWSR1::FLI1`.
 - Job state is held in memory in the process that created it. Restarting the
   app loses all annotation and fusion-evidence jobs, even ones that were
-  running. Annotation job records also expire about an hour after completion
-  or failure.
-- Fusion-evidence jobs only process entries that contain a fusion separator.
-  Gene-only entries are silently skipped.
+  running.
+- Annotation-job expiry is measured from **creation**, not completion. Eviction
+  runs when another annotation job is launched and removes completed or failed
+  jobs older than the TTL (default one hour), so a job that runs longer than an
+  hour can be evicted as soon as it finishes.
+- Fusion-evidence jobs only process entries that contain a fusion separator and
+  have two non-empty partners. Gene-only entries and malformed entries such as
+  `ALK::` are silently skipped.
 - `force_refresh` refreshes gene annotations, not fusion evidence. Exact-pair
   evidence is cached for 7 days and a fusion-evidence job reuses it.
 
@@ -431,8 +466,10 @@ polling intervals at 15 seconds or longer when you have several jobs running.
   about a gene someone has already looked at is usually quick. Each result says
   whether it was reused (`cache_status`) and when it was produced
   (`cached_at`).
-- Gene annotations are cached by `(gene, tumor_type)` for up to 180 days,
-  depending on the strength of the supporting evidence.
+- Gene annotations are cached by `(gene, tumor_type)` and reused for up to 180
+  days. After that ACGC checks PubMed for newer PMIDs and keeps reusing the
+  stored annotation if none are found, so 180 days is not a hard maximum age
+  (`src/config.py:132-140`, `src/pipeline/orchestrator.py:198-242`).
 - A gene that hasn't been classified recently is classified from scratch. That
   involves PubMed searches and AI model calls, and typically takes 10 to 40
   seconds per gene.
@@ -448,14 +485,19 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 
 ### Whole-request errors
 
+Rows that mention gene symbols, fusions, the 50-gene cap or `view_url` describe
+the **gene query API** (`/v1/genes/...`). `POST /v1/annotate` accepts fusions,
+has no item cap, and does not return `view_url`. The `401`, `403`, `429` and
+`503` cases apply to all endpoints.
+
 | Status | Meaning | What to do |
 | --- | --- | --- |
 | `401` | No key, or the key is wrong, revoked or expired, or its owner is no longer allowed to use ACGC. | Check `ACGC_API_KEY`, or create a new key. |
 | `403` | Your account is waiting for administrator approval, or a key was used to manage keys. | Contact the ACGC team, or manage keys on the API keys page. |
-| `404` | `GET /v1/genes/{symbol}` only: the gene doesn't exist (HGNC or Ensembl confirmed no match). | Check the symbol. |
-| `422` | The request is malformed: a bad gene symbol, a fusion, more than 50 genes, or invalid JSON. | Fix the request. The response says which field is wrong. |
+| `404` | Gene query API, `GET /v1/genes/{symbol}`: the gene doesn't exist (HGNC or Ensembl confirmed no match). Annotate, `GET /v1/annotate/{run_id}`: the run doesn't exist. | Check the symbol or run ID. |
+| `422` | Gene query API: a bad gene symbol, a fusion, more than 50 genes, or invalid JSON. Annotate: an empty `fusions` list or invalid JSON. | Fix the request. The response says which field is wrong. |
 | `429` | You exceeded your key's rate limit. | Wait for the number of seconds in `Retry-After`, then retry. |
-| `500` | ACGC couldn't save the run. No `view_url` is returned, because it wouldn't open. | Retry later. |
+| `500` | Gene query API: ACGC couldn't save the run, so no `view_url` is returned. Annotate: an unexpected pipeline error (run saving is separate and best-effort). | Retry later. |
 | `503` | A gene lookup service (HGNC or Ensembl) was temporarily unavailable, or ACGC can't verify keys right now. | Retry after a short wait. |
 
 ### Per-gene errors in batch requests
@@ -468,8 +510,8 @@ the whole request. That gene's entry has `error` set instead:
 | `Gene symbol could not be resolved.` | The gene doesn't exist. Check the symbol. |
 | `Gene symbol lookup is temporarily unavailable; please retry.` | A lookup service was down. Retry that gene. |
 
-The run is still saved, and `view_url` still works for the genes that
-succeeded.
+For the gene query API, the run is still saved, and `view_url` still works for
+the genes that succeeded.
 
 ## 8. Python example
 
