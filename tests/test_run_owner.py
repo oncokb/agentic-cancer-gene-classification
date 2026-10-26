@@ -8,8 +8,12 @@ real-SQL round trips live in tests/test_run_store.py.
 
 from __future__ import annotations
 
+import base64
+import inspect
+import logging
+import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
 import pymysql
@@ -24,9 +28,11 @@ from src.api_keys import ApiKeyRecord, InMemoryRateLimiter, generate_api_key, ha
 from src.auth import AuthenticatedUser, create_session_token
 from src.config import settings
 from src.models.schema import AnnotationResult, GeneAnnotation
+from src.pipeline import run_store as run_store_module
 from src.pipeline.run_store import (
     INPUT_SUMMARY_MAX_LENGTH,
     RunStore,
+    RunsSchemaUpgradeError,
     _decode_runs_cursor,
     _encode_runs_cursor,
     summarize_run_inputs,
@@ -266,36 +272,48 @@ def test_save_site_with_auth_disabled_records_local_user(store, monkeypatch, met
 
 
 class FakeCursor:
-    """Answers the schema-introspection statements _ensure_runs_schema issues
-    and records every statement; `rows` is returned for any other SELECT."""
+    """Answers the statements _ensure_runs_schema issues and records every
+    statement; `rows` is returned for any other SELECT.
 
-    def __init__(self, columns=(), indexes=(), rows=(), fail_alter_with=None):
+    `alter_errors` holds one MySQL error code (or None for success) per ALTER,
+    consumed in order. A duplicate-column/key error also applies the change,
+    as the concurrent pod that caused it would have, unless
+    `duplicate_applies` is False (that pod added only some columns).
+    """
+
+    def __init__(self, columns=(), indexes=(), rows=(), alter_errors=(), duplicate_applies=True):
         self.columns = set(columns)
         self.indexes = set(indexes)
         self.rows = list(rows)
-        self.fail_alter_with = fail_alter_with
+        self.alter_errors = list(alter_errors)
+        self.duplicate_applies = duplicate_applies
+        self.lock_wait_timeout = 31536000
         self.executed: list[tuple[str, tuple]] = []
         self._result: list = []
 
+    def _apply_alter(self, sql):
+        self.columns.update(part.split()[0] for part in sql.split("ADD COLUMN ")[1:])
+        if "ADD INDEX " in sql:
+            self.indexes.add(sql.split("ADD INDEX ")[1].split()[0])
+
     async def execute(self, sql, params=()):
         self.executed.append((sql, params))
-        if sql.startswith("SHOW COLUMNS FROM runs LIKE"):
-            column = sql.split("'")[1]
-            self._result = [(column,)] if column in self.columns else []
+        if sql == "SELECT @@SESSION.lock_wait_timeout":
+            self._result = [(self.lock_wait_timeout,)]
+        elif sql.startswith("SET SESSION lock_wait_timeout"):
+            self.lock_wait_timeout = params[0]
+        elif sql == "SHOW COLUMNS FROM runs":
+            self._result = [(column,) for column in ["run_id", "created_at", *sorted(self.columns)]]
         elif sql.startswith("SHOW INDEX FROM runs"):
             index = sql.split("'")[1]
             self._result = [("runs", 1, index)] if index in self.indexes else []
         elif sql.startswith("ALTER TABLE runs"):
-            if self.fail_alter_with == "duplicate":
-                # What MySQL raises when another pod already applied this ALTER.
-                code = 1060 if "ADD COLUMN" in sql else 1061
-                raise pymysql.err.OperationalError(code, "already exists")
-            if self.fail_alter_with is not None:
-                raise pymysql.err.OperationalError(self.fail_alter_with, "failed")
-            if "ADD COLUMN" in sql:
-                self.columns.add(sql.split("ADD COLUMN ")[1].split()[0])
-            else:
-                self.indexes.add(sql.split("ADD INDEX ")[1].split()[0])
+            code = self.alter_errors.pop(0) if self.alter_errors else None
+            if code in (1060, 1061) and self.duplicate_applies:
+                self._apply_alter(sql)
+            if code is not None:
+                raise pymysql.err.OperationalError(code, "failed")
+            self._apply_alter(sql)
         else:
             self._result = self.rows
 
@@ -339,7 +357,7 @@ def _alters(cursor: FakeCursor) -> list[str]:
     return [sql for sql, _ in cursor.executed if sql.startswith("ALTER")]
 
 
-async def test_runs_schema_upgrade_adds_missing_columns_and_index_once():
+async def test_runs_schema_upgrade_adds_columns_instantly_and_index_online_once():
     cursor = FakeCursor()  # a pre-ownership `runs` table
     store = RunStore(FakePool(cursor))
 
@@ -347,7 +365,9 @@ async def test_runs_schema_upgrade_adds_missing_columns_and_index_once():
 
     assert cursor.columns == _RUNS_COLUMNS
     assert cursor.indexes == {"idx_runs_owner_created_at"}
-    assert len(_alters(cursor)) == 6
+    add_columns, add_index = _alters(cursor)
+    assert add_columns.count("ADD COLUMN") == 5 and add_columns.endswith(", ALGORITHM=INSTANT")
+    assert add_index.endswith(", ALGORITHM=INPLACE, LOCK=NONE")
 
     cursor.executed.clear()
     await store._ensure_runs_schema(cursor)
@@ -355,19 +375,132 @@ async def test_runs_schema_upgrade_adds_missing_columns_and_index_once():
     assert _alters(cursor) == []
 
 
-async def test_runs_schema_upgrade_tolerates_a_concurrent_upgrade():
-    cursor = FakeCursor(fail_alter_with="duplicate")
+async def test_runs_schema_upgrade_bounds_the_lock_wait_and_restores_it(monkeypatch):
+    monkeypatch.setattr(settings, "runs_ddl_lock_wait_timeout_seconds", 7)
+    cursor = FakeCursor()
 
     await RunStore(FakePool(cursor))._ensure_runs_schema(cursor)
 
-    assert len(_alters(cursor)) == 6
+    timeouts = [params[0] for sql, params in cursor.executed if sql.startswith("SET SESSION lock_wait_timeout")]
+    assert timeouts == [7, 31536000]
+    first_alter = next(i for i, (sql, _) in enumerate(cursor.executed) if sql.startswith("ALTER"))
+    assert cursor.executed[first_alter - 2][0].startswith("SET SESSION lock_wait_timeout")
+
+
+async def test_runs_schema_upgrade_adds_only_missing_columns():
+    cursor = FakeCursor(columns={"owner_email", "source"})
+
+    await RunStore(FakePool(cursor))._ensure_runs_schema(cursor)
+
+    add_columns = _alters(cursor)[0]
+    assert "owner_email" not in add_columns and add_columns.count("ADD COLUMN") == 3
+    assert cursor.columns == _RUNS_COLUMNS
+
+
+@pytest.mark.parametrize("instant_error", [1800, 1845, 1846])
+async def test_runs_schema_upgrade_falls_back_to_inplace_without_instant(instant_error):
+    cursor = FakeCursor(alter_errors=[instant_error])
+    store = RunStore(FakePool(cursor))
+
+    await store._ensure_runs_schema(cursor)
+
+    instant, inplace, _index = _alters(cursor)
+    assert instant.endswith("ALGORITHM=INSTANT")
+    assert inplace.replace(", ALGORITHM=INPLACE, LOCK=NONE", "") == instant.replace(", ALGORITHM=INSTANT", "")
+    assert cursor.columns == _RUNS_COLUMNS
+
+
+async def test_runs_schema_upgrade_tolerates_a_concurrent_upgrade():
+    cursor = FakeCursor(alter_errors=[1060, 1061])
+    store = RunStore(FakePool(cursor))
+
+    await store._ensure_runs_schema(cursor)
+
+    assert len(_alters(cursor)) == 2
+    assert cursor.columns == _RUNS_COLUMNS
 
 
 async def test_runs_schema_upgrade_reraises_other_errors():
-    cursor = FakeCursor(fail_alter_with=1205)  # lock wait timeout
+    cursor = FakeCursor(alter_errors=[1146])  # table doesn't exist
 
     with pytest.raises(pymysql.err.OperationalError):
         await RunStore(FakePool(cursor))._ensure_runs_schema(cursor)
+    assert cursor.lock_wait_timeout == 31536000  # restored even on failure
+
+
+@pytest.mark.parametrize("alter_errors", [[1205], [1845, 1205]], ids=["instant", "inplace-fallback"])
+async def test_column_lock_timeout_fails_startup_with_a_clear_error(alter_errors, monkeypatch):
+    monkeypatch.setattr(settings, "runs_ddl_lock_wait_timeout_seconds", 7)
+    cursor = FakeCursor(alter_errors=alter_errors)
+
+    with pytest.raises(RunsSchemaUpgradeError) as raised:
+        await RunStore(FakePool(cursor))._ensure_runs_schema(cursor)
+
+    message = str(raised.value)
+    assert "Timed out after 7s" in message and "refusing to start" in message
+    assert "ALTER TABLE runs ADD COLUMN owner_email" in message  # the manual fix
+    assert isinstance(raised.value.__cause__, pymysql.err.OperationalError)
+    assert cursor.columns == set()
+    assert not any("ADD INDEX" in sql for sql in _alters(cursor))
+    assert cursor.lock_wait_timeout == 31536000
+
+
+async def test_columns_still_missing_after_a_concurrent_upgrade_fails_startup():
+    cursor = FakeCursor(alter_errors=[1060], duplicate_applies=False)
+
+    with pytest.raises(RunsSchemaUpgradeError, match="still missing run owner columns"):
+        await RunStore(FakePool(cursor))._ensure_runs_schema(cursor)
+
+
+async def test_failed_upgrade_closes_the_pool(monkeypatch):
+    closed = []
+
+    class Pool(FakePool):
+        def close(self):
+            closed.append(True)
+
+        async def wait_closed(self):
+            pass
+
+    async def fake_create_pool(**kwargs):
+        return Pool(FakeCursor(alter_errors=[1205]))
+
+    monkeypatch.setattr("src.pipeline.run_store.aiomysql.create_pool", fake_create_pool)
+    monkeypatch.setattr(RunStore, "_ensure_schema", lambda self: self._ensure_runs_schema(self._pool._cursor))
+
+    with pytest.raises(RunsSchemaUpgradeError):
+        await RunStore.create()
+    assert closed == [True]
+
+
+def test_no_code_path_saves_a_run_without_owner_columns():
+    source = inspect.getsource(run_store_module)
+    inserts = re.findall(r"INSERT INTO runs \(([^)]*)\)", source)
+
+    assert inserts, "expected at least one INSERT INTO runs"
+    for columns in inserts:
+        assert "owner_email" in columns and "source" in columns and "input_summary" in columns
+
+
+async def test_index_lock_timeout_keeps_owner_columns_usable(caplog):
+    cursor = FakeCursor(alter_errors=[None, 1205])
+    store = RunStore(FakePool(cursor))
+
+    with caplog.at_level(logging.WARNING, logger="src.pipeline.run_store"):
+        await store._ensure_runs_schema(cursor)
+
+    assert cursor.columns == _RUNS_COLUMNS
+    assert cursor.indexes == set()
+    assert "idx_runs_owner_created_at" in caplog.text
+    assert cursor.lock_wait_timeout == 31536000
+
+    # Startup continued, and new runs still record their owner.
+    await store.save_run(
+        "run-1", "2026-10-26T12:00:00+00:00", {"gene": "ALK"}, {}, owner_email="A@mskcc.org", source="session"
+    )
+    sql, params = cursor.executed[-1]
+    assert "owner_email, source, input_summary" in sql
+    assert params[4:7] == ("a@mskcc.org", "session", "ALK")
 
 
 async def test_save_run_writes_owner_source_and_summary():
@@ -445,3 +578,80 @@ def test_runs_cursor_round_trip():
     created_at = datetime(2026, 10, 26, 12, 0, 2, tzinfo=timezone.utc)
 
     assert _decode_runs_cursor(_encode_runs_cursor(created_at, "run-b")) == (created_at, "run-b")
+
+
+def test_runs_cursor_round_trip_keeps_fractional_seconds_and_normalizes_to_utc():
+    eastern = timezone(timedelta(hours=-4))
+    created_at = datetime(2026, 10, 26, 8, 0, 2, 406639, tzinfo=eastern)
+
+    decoded, run_id = _decode_runs_cursor(_encode_runs_cursor(created_at, "run-b"))
+
+    assert decoded == datetime(2026, 10, 26, 12, 0, 2, 406639, tzinfo=timezone.utc)
+    assert decoded.utcoffset() == timedelta(0)
+    assert run_id == "run-b"
+
+
+def _raw_cursor(text: str) -> str:
+    return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("not-a-cursor", id="garbage"),
+        pytest.param(_raw_cursor("2026-10-26T12:00:02+00:00|run-b") + "!", id="invalid-base64-char"),
+        pytest.param(_raw_cursor("2026-10-26T12:00:02+00:00|run-b").replace("_", "/") + "+/", id="std-alphabet"),
+        pytest.param(_raw_cursor("2026-10-26T12:00:02+00:00|run-b") + "=", id="stray-padding"),
+        pytest.param("A", id="truncated"),
+        pytest.param(base64.urlsafe_b64encode(b"\xff\xfe|run").decode(), id="not-utf8"),
+        pytest.param(_raw_cursor("2026-10-26T12:00:02+00:00"), id="no-separator"),
+        pytest.param(_raw_cursor("2026-10-26T12:00:02+00:00|"), id="empty-run-id"),
+        pytest.param(_raw_cursor("2026-10-26T12:00:02+00:00|a|b"), id="extra-separator"),
+        pytest.param(_raw_cursor("2026-10-26T12:00:02+00:00|" + "x" * 37), id="run-id-too-long"),
+        pytest.param(_raw_cursor("yesterday|run-b"), id="bad-timestamp"),
+        pytest.param(_raw_cursor("2026-10-26T12:00:02|run-b"), id="naive-timestamp"),
+        pytest.param(_raw_cursor("0001-01-01T00:00:00+05:00|run-b"), id="timezone-underflow"),
+        pytest.param(_raw_cursor("9999-12-31T23:59:59-05:00|run-b"), id="timezone-overflow"),
+        pytest.param(_raw_cursor("0999-12-31T00:00:00+00:00|run-b"), id="before-mysql-datetime"),
+    ],
+)
+def test_malformed_runs_cursor_is_a_value_error(cursor):
+    with pytest.raises(ValueError, match="Invalid runs cursor"):
+        _decode_runs_cursor(cursor)
+
+
+async def test_list_runs_for_owner_rejects_malformed_cursor_before_querying():
+    cursor = FakeCursor()
+
+    with pytest.raises(ValueError):
+        await RunStore(FakePool(cursor)).list_runs_for_owner("a@mskcc.org", cursor=_raw_cursor("x|y"))
+    assert cursor.executed == []
+
+
+async def test_list_runs_limit_one_pages_between_equal_timestamps():
+    same_second = [_row("run-c", 2), _row("run-b", 2), _row("run-a", 2)]
+    cursor = FakeCursor(rows=same_second[:2])
+    store = RunStore(FakePool(cursor))
+
+    page = await store.list_runs_for_owner("a@mskcc.org", limit=1)
+    assert [run.run_id for run in page.runs] == ["run-c"]
+
+    cursor.rows = same_second[1:]
+    page = await store.list_runs_for_owner("a@mskcc.org", limit=1, cursor=page.next_cursor)
+
+    _, params = cursor.executed[-1]
+    # Resumes inside the same second, strictly after run-c.
+    assert params[1:] == (datetime(2026, 10, 26, 12, 0, 2), datetime(2026, 10, 26, 12, 0, 2), "run-c", 2)
+    assert [run.run_id for run in page.runs] == ["run-b"]
+
+
+def test_multibyte_summary_is_bounded_in_characters():
+    payload = {"fusions": [{"fusion": "融合遺伝子" * 40 + f"::{i}"} for i in range(6)]}
+
+    summary, count = summarize_run_inputs(payload)
+
+    assert len(summary) == INPUT_SUMMARY_MAX_LENGTH
+    assert summary.endswith("… (+1 more)")
+    assert summary.encode("utf-8").decode("utf-8") == summary
+    assert count == 6

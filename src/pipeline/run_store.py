@@ -12,6 +12,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -33,7 +34,7 @@ CREATE TABLE IF NOT EXISTS runs (
     result_json JSON NOT NULL,
     owner_email VARCHAR(255) NULL,
     source VARCHAR(16) NULL,
-    input_summary VARCHAR(255) NULL,
+    input_summary VARCHAR(255) CHARACTER SET utf8mb4 NULL,
     input_count INT NULL,
     genes_annotated INT NULL,
     INDEX idx_runs_owner_created_at (owner_email, created_at, run_id)
@@ -45,7 +46,7 @@ CREATE TABLE IF NOT EXISTS runs (
 _RUNS_ADDED_COLUMNS = (
     ("owner_email", "VARCHAR(255) NULL"),
     ("source", "VARCHAR(16) NULL"),
-    ("input_summary", "VARCHAR(255) NULL"),
+    ("input_summary", "VARCHAR(255) CHARACTER SET utf8mb4 NULL"),
     ("input_count", "INT NULL"),
     ("genes_annotated", "INT NULL"),
 )
@@ -54,6 +55,27 @@ _RUNS_OWNER_INDEX = "idx_runs_owner_created_at"
 # MySQL errors for an ALTER that another pod's concurrent startup already applied.
 _ER_DUP_FIELDNAME = 1060
 _ER_DUP_KEYNAME = 1061
+_ER_LOCK_WAIT_TIMEOUT = 1205
+# Errors after which the column ALTER retries with ALGORITHM=INPLACE: INSTANT
+# is an unknown algorithm (MySQL < 8.0, error 1800) or the operation isn't
+# supported with it (1845/1846). Other INSTANT limitations, e.g. too many
+# row versions (4092) or a table that can't take an instant column (4158),
+# are deliberately not listed: they fail startup so an operator can run the
+# upgrade by hand rather than have pods silently rebuild a large table.
+_ER_UNKNOWN_ALTER_ALGORITHM = 1800
+_ER_ALTER_OPERATION_NOT_SUPPORTED = 1845
+_ER_ALTER_OPERATION_NOT_SUPPORTED_REASON = 1846
+_INSTANT_UNSUPPORTED_ERRORS = {
+    _ER_UNKNOWN_ALTER_ALGORITHM,
+    _ER_ALTER_OPERATION_NOT_SUPPORTED,
+    _ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
+}
+
+# Range of a MySQL DATETIME, which a decoded cursor timestamp must fall in.
+_MIN_CURSOR_YEAR = 1000
+_MAX_CURSOR_YEAR = 9999
+_MAX_CURSOR_RUN_ID_LENGTH = 36
+_CURSOR_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 
 INPUT_SUMMARY_MAX_ITEMS = 5
 INPUT_SUMMARY_MAX_LENGTH = 255
@@ -224,12 +246,30 @@ def _encode_runs_cursor(created_at: datetime, run_id: str) -> str:
 
 
 def _decode_runs_cursor(cursor: str) -> tuple[datetime, str]:
+    """Inverse of _encode_runs_cursor, returning an aware UTC timestamp.
+
+    Raises ValueError for anything this module didn't produce."""
     try:
+        if not isinstance(cursor, str) or not _CURSOR_PATTERN.fullmatch(cursor):
+            raise ValueError("not url-safe base64")
         padded = cursor + "=" * (-len(cursor) % 4)
-        created_at, run_id = base64.urlsafe_b64decode(padded).decode().split("|", 1)
-        return datetime.fromisoformat(created_at), run_id
-    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raw = base64.b64decode(padded, altchars=b"-_", validate=True).decode("utf-8")
+        created_at_text, sep, run_id = raw.partition("|")
+        if not sep or not run_id or len(run_id) > _MAX_CURSOR_RUN_ID_LENGTH or "|" in run_id:
+            raise ValueError("bad cursor shape")
+        created_at = datetime.fromisoformat(created_at_text)
+        if created_at.tzinfo is None:
+            raise ValueError("cursor timestamp has no timezone")
+        created_at = created_at.astimezone(timezone.utc)
+        if not _MIN_CURSOR_YEAR <= created_at.year <= _MAX_CURSOR_YEAR:
+            raise ValueError("cursor timestamp out of range")
+        return created_at, run_id
+    except (binascii.Error, UnicodeDecodeError, ValueError, OverflowError) as exc:
         raise ValueError("Invalid runs cursor") from exc
+
+
+def _mysql_errno(exc: pymysql.err.MySQLError) -> Optional[int]:
+    return exc.args[0] if exc.args and isinstance(exc.args[0], int) else None
 
 
 def _mysql_connection_kwargs() -> Dict[str, Any]:
@@ -246,6 +286,10 @@ def _mysql_connection_kwargs() -> Dict[str, Any]:
     }
 
 
+class RunsSchemaUpgradeError(RuntimeError):
+    """Startup couldn't add the run owner columns to `runs`."""
+
+
 class RunStore:
     """Save/fetch runs and reusable gene annotations. Calling code never issues raw SQL."""
 
@@ -259,7 +303,11 @@ class RunStore:
             autocommit=True,
         )
         store = cls(pool)
-        await store._ensure_schema()
+        try:
+            await store._ensure_schema()
+        except BaseException:
+            await store.close()
+            raise
         return store
 
     async def _ensure_schema(self) -> None:
@@ -277,28 +325,88 @@ class RunStore:
                 await cursor.execute(_CREATE_API_KEYS_TABLE_SQL)
 
     async def _ensure_runs_schema(self, cursor) -> None:
-        """Add owner/listing columns and index to `runs` tables created before them."""
-        for column, definition in _RUNS_ADDED_COLUMNS:
-            await cursor.execute(f"SHOW COLUMNS FROM runs LIKE '{column}'")
-            if await cursor.fetchone() is None:
-                await self._alter_ignoring_duplicate(
-                    cursor, f"ALTER TABLE runs ADD COLUMN {column} {definition}", _ER_DUP_FIELDNAME
-                )
+        """Add owner/listing columns and index to `runs` tables created before them.
 
-        await cursor.execute(f"SHOW INDEX FROM runs WHERE Key_name = '{_RUNS_OWNER_INDEX}'")
-        if not await cursor.fetchall():
-            await self._alter_ignoring_duplicate(
-                cursor,
-                f"ALTER TABLE runs ADD INDEX {_RUNS_OWNER_INDEX} (owner_email, created_at, run_id)",
-                _ER_DUP_KEYNAME,
+        `runs` can be large, so the columns go in one ALTER that is
+        metadata-only where the server supports ALGORITHM=INSTANT, and the
+        index is built online (INPLACE, LOCK=NONE). Each DDL waits at most
+        `runs_ddl_lock_wait_timeout_seconds` to acquire the table's metadata
+        lock; that bounds the wait for other queries, not the DDL's own
+        runtime, so an INPLACE fallback or index build on a large table can
+        still take long once it has the lock.
+
+        If the columns can't be added, startup fails (RunsSchemaUpgradeError):
+        every new run must record its owner, and a restart retries. If only the
+        index can't be built, startup continues; listing works without it.
+        """
+        await cursor.execute("SELECT @@SESSION.lock_wait_timeout")
+        previous_timeout = (await cursor.fetchone())[0]
+        await cursor.execute(
+            "SET SESSION lock_wait_timeout = %s", (settings.runs_ddl_lock_wait_timeout_seconds,)
+        )
+        try:
+            await self._add_runs_owner_columns(cursor)
+            await self._add_runs_owner_index(cursor)
+        finally:
+            await cursor.execute("SET SESSION lock_wait_timeout = %s", (previous_timeout,))
+
+    async def _runs_columns(self, cursor) -> set[str]:
+        await cursor.execute("SHOW COLUMNS FROM runs")
+        return {row[0] for row in await cursor.fetchall()}
+
+    async def _add_runs_owner_columns(self, cursor) -> None:
+        present = await self._runs_columns(cursor)
+        missing = [(column, definition) for column, definition in _RUNS_ADDED_COLUMNS if column not in present]
+        if not missing:
+            return
+        add_columns = ", ".join(f"ADD COLUMN {column} {definition}" for column, definition in missing)
+        try:
+            try:
+                await cursor.execute(f"ALTER TABLE runs {add_columns}, ALGORITHM=INSTANT")
+            except pymysql.err.MySQLError as exc:
+                if _mysql_errno(exc) not in _INSTANT_UNSUPPORTED_ERRORS:
+                    raise
+                await cursor.execute(f"ALTER TABLE runs {add_columns}, ALGORITHM=INPLACE, LOCK=NONE")
+        except pymysql.err.MySQLError as exc:
+            if _mysql_errno(exc) == _ER_LOCK_WAIT_TIMEOUT:
+                raise RunsSchemaUpgradeError(
+                    f"Timed out after {settings.runs_ddl_lock_wait_timeout_seconds}s waiting for the "
+                    "metadata lock on `runs` to add the run owner columns, so refusing to start "
+                    "(new runs must record their owner). A restart retries; to avoid this, run "
+                    f"`ALTER TABLE runs {add_columns}, ALGORITHM=INSTANT` off-peak, or raise "
+                    "RUNS_DDL_LOCK_WAIT_TIMEOUT_SECONDS."
+                ) from exc
+            if _mysql_errno(exc) != _ER_DUP_FIELDNAME:
+                raise
+        # Re-read: a concurrent pod's upgrade (a duplicate-column error above)
+        # may have added only some of them.
+        still_missing = [column for column, _ in _RUNS_ADDED_COLUMNS if column not in await self._runs_columns(cursor)]
+        if still_missing:
+            raise RunsSchemaUpgradeError(
+                f"`runs` is still missing run owner columns {still_missing} after the upgrade; "
+                "refusing to start. A restart retries."
             )
 
-    @staticmethod
-    async def _alter_ignoring_duplicate(cursor, sql: str, duplicate_error: int) -> None:
+    async def _add_runs_owner_index(self, cursor) -> None:
+        await cursor.execute(f"SHOW INDEX FROM runs WHERE Key_name = '{_RUNS_OWNER_INDEX}'")
+        if await cursor.fetchall():
+            return
         try:
-            await cursor.execute(sql)
+            await cursor.execute(
+                f"ALTER TABLE runs ADD INDEX {_RUNS_OWNER_INDEX} (owner_email, created_at, run_id), "
+                "ALGORITHM=INPLACE, LOCK=NONE"
+            )
         except pymysql.err.MySQLError as exc:
-            if not exc.args or exc.args[0] != duplicate_error:
+            if _mysql_errno(exc) == _ER_LOCK_WAIT_TIMEOUT:
+                # Owner columns are in place, so runs are still saved with their
+                # owner; listing just scans instead of using the index.
+                logger.warning(
+                    "Timed out after %ss waiting for the metadata lock on `runs` to add index %s; "
+                    "starting without it (run listing is slower until a restart adds it).",
+                    settings.runs_ddl_lock_wait_timeout_seconds,
+                    _RUNS_OWNER_INDEX,
+                )
+            elif _mysql_errno(exc) != _ER_DUP_KEYNAME:
                 raise
 
     async def _ensure_gene_annotation_schema(self, cursor) -> None:
@@ -363,16 +471,17 @@ class RunStore:
         """
         if limit < 1:
             raise ValueError("limit must be at least 1")
+        before = _decode_runs_cursor(cursor) if cursor is not None else None
         sql = (
             "SELECT run_id, created_at, source, input_summary, input_count, genes_annotated "
             "FROM runs WHERE owner_email = %s"
         )
         params: list = [owner_email.strip().lower()]
-        if cursor is not None:
-            before_created_at, before_run_id = _decode_runs_cursor(cursor)
-            before = _to_utc_datetime(before_created_at)
+        if before is not None:
+            before_created_at, before_run_id = before
+            before_naive = _to_utc_datetime(before_created_at)
             sql += " AND (created_at < %s OR (created_at = %s AND run_id < %s))"
-            params += [before, before, before_run_id]
+            params += [before_naive, before_naive, before_run_id]
         # One extra row tells us whether another page exists.
         sql += " ORDER BY created_at DESC, run_id DESC LIMIT %s"
         params.append(limit + 1)

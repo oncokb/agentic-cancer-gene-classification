@@ -8,16 +8,20 @@ MySQL is reachable, so the rest of the suite isn't blocked by it.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
+import aiomysql
 import pytest
 
 from src.config import settings
 from src.models.schema import GeneAnnotation
 from src.pipeline.run_store import (
     RunStore,
+    RunsSchemaUpgradeError,
     _mysql_connection_kwargs,
     _parse_jdbc_mysql_host_port,
+    summarize_run_inputs,
 )
 
 
@@ -284,3 +288,146 @@ async def test_list_runs_for_owner_newest_first_paged_and_scoped(run_store):
     assert [run.run_id for run in second.runs] == ["run-0"]
     assert second.runs[0].source == "api_key"
     assert second.next_cursor is None
+
+
+async def test_list_runs_limit_one_pages_through_same_second_runs(run_store):
+    for run_id in ("run-a", "run-b", "run-c"):
+        await run_store.save_run(
+            run_id, "2026-10-26T12:00:02+00:00", {"gene": "ALK"}, {}, owner_email="a@mskcc.org"
+        )
+
+    seen, cursor = [], None
+    while True:
+        page = await run_store.list_runs_for_owner("a@mskcc.org", limit=1, cursor=cursor)
+        seen += [run.run_id for run in page.runs]
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+    assert seen == ["run-c", "run-b", "run-a"]
+
+
+async def test_list_runs_orders_fractional_and_non_utc_timestamps_by_instant(run_store):
+    saved = {
+        "run-east": "2026-10-26T08:00:01.300000-04:00",  # 12:00:01.3 UTC
+        "run-utc": "2026-10-26T11:00:02.200000+00:00",  # 11:00:02.2 UTC
+        "run-west": "2026-10-26T13:30:03.100000+01:30",  # 12:00:03.1 UTC
+    }
+    for run_id, created_at in saved.items():
+        await run_store.save_run(run_id, created_at, {"gene": "ALK"}, {}, owner_email="a@mskcc.org")
+
+    first = await run_store.list_runs_for_owner("a@mskcc.org", limit=2)
+    rest = await run_store.list_runs_for_owner("a@mskcc.org", limit=2, cursor=first.next_cursor)
+
+    assert [run.run_id for run in first.runs + rest.runs] == ["run-west", "run-east", "run-utc"]
+    # DATETIME keeps whole seconds, in UTC.
+    assert first.runs[0].created_at == datetime(2026, 10, 26, 12, 0, 3, tzinfo=timezone.utc)
+
+
+async def test_update_run_result_keeps_owner_and_listing_fields(run_store):
+    await run_store.save_run(
+        "run-1",
+        "2026-10-26T12:00:00+00:00",
+        {"fusions": [{"fusion": "EML4::ALK"}]},
+        {"run_id": "run-1", "genes_annotated": 2},
+        owner_email="a@mskcc.org",
+        source="api_key",
+    )
+
+    await run_store.update_run_result("run-1", {"run_id": "run-1", "fusion_evidence": []})
+
+    [run] = (await run_store.list_runs_for_owner("a@mskcc.org")).runs
+    assert (run.run_id, run.source, run.input_summary, run.input_count, run.genes_annotated) == (
+        "run-1",
+        "api_key",
+        "EML4::ALK",
+        1,
+        2,
+    )
+    assert await run_store.get_run("run-1") == {"run_id": "run-1", "fusion_evidence": []}
+
+
+async def test_multibyte_input_summary_round_trips(run_store):
+    inputs = ["融合遺伝子" * 40 + f"::{i}" for i in range(6)] + ["ÉML4::ALK 🧬"]
+    expected, _ = summarize_run_inputs({"fusions": inputs})
+
+    await run_store.save_run(
+        "run-1", "2026-10-26T12:00:00+00:00", {"fusions": inputs}, {}, owner_email="a@mskcc.org"
+    )
+    await run_store.save_run(
+        "run-2", "2026-10-26T12:00:01+00:00", {"fusions": ["ÉML4::ALK 🧬"]}, {}, owner_email="a@mskcc.org"
+    )
+
+    runs = (await run_store.list_runs_for_owner("a@mskcc.org")).runs
+    assert [run.input_summary for run in runs] == ["ÉML4::ALK 🧬", expected]
+    assert len(expected) == 255
+
+
+async def _session_lock_wait_timeouts(store) -> set[int]:
+    """@@SESSION.lock_wait_timeout of every idle pooled connection."""
+    conns = [await store._pool.acquire() for _ in range(store._pool.freesize)]
+    try:
+        values = set()
+        for conn in conns:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT @@SESSION.lock_wait_timeout")
+                values.add((await cursor.fetchone())[0])
+        return values
+    finally:
+        for conn in conns:
+            store._pool.release(conn)
+
+
+async def _global_lock_wait_timeout(store) -> int:
+    async with store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT @@GLOBAL.lock_wait_timeout")
+            return (await cursor.fetchone())[0]
+
+
+async def _make_legacy_runs_table(store) -> None:
+    async with store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("DROP TABLE runs")
+            await cursor.execute(_LEGACY_RUNS_SQL)
+
+
+async def test_schema_upgrade_restores_lock_wait_timeout_on_pooled_connections(run_store, monkeypatch):
+    monkeypatch.setattr(settings, "runs_ddl_lock_wait_timeout_seconds", 3)
+    await _make_legacy_runs_table(run_store)
+    default = await _global_lock_wait_timeout(run_store)
+    assert default != 3
+
+    await run_store._ensure_schema()
+
+    assert "owner_email" in await _runs_columns(run_store)
+    assert await _session_lock_wait_timeouts(run_store) == {default}
+
+
+async def test_schema_upgrade_lock_timeout_fails_startup(run_store, monkeypatch):
+    """A long-running reader holding `runs` makes the column ALTER wait; after
+    the bounded wait startup fails rather than saving runs without owners."""
+    await _make_legacy_runs_table(run_store)
+    default = await _global_lock_wait_timeout(run_store)
+    monkeypatch.setattr(settings, "runs_ddl_lock_wait_timeout_seconds", 1)
+
+    holder = await aiomysql.connect(**_mysql_connection_kwargs(), autocommit=False)
+    try:
+        async with holder.cursor() as cursor:
+            await cursor.execute("BEGIN")
+            await cursor.execute("SELECT COUNT(*) FROM runs")  # holds a metadata lock until commit
+        started = time.monotonic()
+        with pytest.raises(RunsSchemaUpgradeError, match="Timed out after 1s"):
+            await run_store._ensure_schema()
+        assert time.monotonic() - started < 10
+    finally:
+        await holder.rollback()
+        holder.close()
+
+    assert "owner_email" not in await _runs_columns(run_store)
+    assert await _session_lock_wait_timeouts(run_store) == {default}
+
+    await run_store._ensure_schema()  # lock released: the restart completes the upgrade
+
+    assert "owner_email" in await _runs_columns(run_store)
+    assert await _session_lock_wait_timeouts(run_store) == {default}
