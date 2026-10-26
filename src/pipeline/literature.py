@@ -1129,11 +1129,18 @@ def _ncbi_params(extra: dict) -> dict:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> List[str]:
-    """Return PMIDs matching a PubMed query string."""
+async def _esearch(
+    query: str,
+    max_results: int,
+    client: httpx.AsyncClient,
+    *,
+    use_cache: bool = True,
+    filter_retracted: bool = True,
+) -> List[str]:
+    """Return matching PMIDs; existence checks can bypass cache and retraction filtering."""
+    search_query = _exclude_retracted_query(query) if filter_retracted else query
 
     async def _fetch() -> List[str]:
-        search_query = _exclude_retracted_query(query)
         params = _ncbi_params(
             {"db": "pubmed", "term": search_query, "retmax": max_results, "sort": "relevance"}
         )
@@ -1142,7 +1149,9 @@ async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> L
             resp.raise_for_status()
         return resp.json().get("esearchresult", {}).get("idlist", [])
 
-    return await cached_call(f"pubmed:esearch:{_exclude_retracted_query(query)}:{max_results}", _fetch)
+    if not use_cache:
+        return await _fetch()
+    return await cached_call(f"pubmed:esearch:{search_query}:{max_results}", _fetch)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))

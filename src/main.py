@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
+from src.api.curation_reevaluate_routes import router as curation_reevaluate_router
 from src.api.run_persistence import save_run_or_raise
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
@@ -2446,6 +2447,7 @@ async def benchmark(
 # import at module load (the router module looks those helpers up on src.main).
 from src.api.gene_query import router as gene_query_router  # noqa: E402
 
+app.include_router(curation_reevaluate_router)
 app.include_router(gene_query_router)
 
 
