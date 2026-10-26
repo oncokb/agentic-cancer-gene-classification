@@ -79,6 +79,14 @@ _NON_PARTNER_WORDS = frozenset(
         "MU", "NU", "XI", "OMICRON", "PI", "RHO", "SIGMA", "TAU", "UPSILON", "PHI", "CHI", "PSI", "OMEGA",
     }
 )
+# Short English words that join hyphenated prose (in-frame, one-two); none is an HGNC symbol.
+_SHORT_ENGLISH_WORDS = frozenset(
+    {
+        "IN", "ON", "OF", "TO", "AT", "BY", "OR", "AN", "AS", "IS", "IT", "BE", "NO", "UP", "SO", "IF",
+        "WE", "ONE", "TWO", "SIX", "TEN", "AND", "THE", "FOR", "NOT", "OUT", "OFF", "END", "NEW", "OLD",
+        "BUT", "ARE", "WAS", "HAS", "TOP", "PRE",
+    }
+)
 # Single-word tumor names and abbreviations. Superset of the single-word terms in
 # literature._TUMOR_TYPE_ALIASES (copied: literature imports this module; a test
 # keeps them in sync).
@@ -103,7 +111,28 @@ HGNC_ALIAS_SEARCH_URL = 'https://rest.genenames.org/search/alias_symbol:"{symbol
 
 def _looks_like_partner(token: str) -> bool:
     upper = token.upper()
-    return not (upper in _NON_PARTNER_WORDS or upper in _TUMOR_TYPE_WORDS or _PROTEIN_CHANGE.match(token))
+    return not (
+        upper in _NON_PARTNER_WORDS
+        or upper in _SHORT_ENGLISH_WORDS
+        or upper in _TUMOR_TYPE_WORDS
+        or _PROTEIN_CHANGE.match(token)
+    )
+
+
+def _has_digit(token: str) -> bool:
+    return any(char.isdigit() for char in token)
+
+
+def _partners_are_symbol_cased(text: str, gene1: str, gene2: str) -> bool:
+    """
+    Case check that keeps hyphenated prose (well-differentiated, Well-Differentiated)
+    from reading as two genes. An all-lowercase input needs a digit in a partner
+    (ewsr1-fli1, bcr-abl1; a bare bcr-abl is an accepted miss); otherwise every
+    partner must be all-uppercase or contain a digit (EWSR1-FLI1, C11orf95-RELA).
+    """
+    if not any(char.isupper() for char in text):
+        return _has_digit(gene1) or _has_digit(gene2)
+    return all(token.isupper() or _has_digit(token) for token in (gene1, gene2))
 
 
 def unparsed_fusion_warning(
@@ -142,6 +171,8 @@ def unparsed_fusion_warning(
 
     gene1, gene2 = match.group("gene1"), match.group("gene2")
     if not (_looks_like_partner(gene1) and _looks_like_partner(gene2)):
+        return None
+    if not _partners_are_symbol_cased(text, gene1, gene2):
         return None
     return (
         f"'{text}' was treated as a single gene. "

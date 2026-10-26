@@ -64,7 +64,7 @@ _HGNC = {
     # Fictional: a hyphenated name known only as a previous symbol.
     "NEWSYM1": ([], ["OLDA-OLDB1"]),
 }
-_ALIAS_QUERY = re.compile(r'alias_symbol:"([^"]+)"')
+_ALIAS_QUERY_CLAUSE = re.compile(r'(alias_symbol|prev_symbol):"([^"]+)"')
 
 
 def _doc(symbol: str) -> dict:
@@ -80,15 +80,19 @@ def _hgnc_handler(offline: bool = False, alias_offline: bool = False):
         requests.append(path)
         if offline:
             raise httpx.ConnectError("HGNC unreachable", request=request)
-        alias_query = _ALIAS_QUERY.search(path)
-        if alias_query:
+        clauses = _ALIAS_QUERY_CLAUSE.findall(path)
+        if clauses:
             if alias_offline:
                 raise httpx.ConnectError("HGNC unreachable", request=request)
-            wanted = alias_query.group(1).upper()
+            # Each clause only searches its own field, so a previous symbol
+            # matches only when the query includes the prev_symbol clause.
             docs = [
                 _doc(symbol)
                 for symbol, (aliases, prev) in _HGNC.items()
-                if wanted in {name.upper() for name in [*aliases, *prev]}
+                if any(
+                    wanted.upper() in {name.upper() for name in (aliases if field == "alias_symbol" else prev)}
+                    for field, wanted in clauses
+                )
             ]
         elif path.startswith("/fetch/symbol/"):
             symbol = path.removeprefix("/fetch/symbol/")
@@ -283,17 +287,64 @@ async def test_warnings_from_real_normalization(fake_hgnc):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        "well-differentiated",
+        "in-frame",
+        "one-two",
+        "low-grade",
+        "x-ray",
+        "Well-Differentiated",
+        "In-Frame",
+        "NF-kB",
+        "anti-EGFR",
+        "TNF-alpha",
+        "bcr-abl",  # all-letter lowercase: accepted miss
+        "EML4 alk fusion",
+    ],
+)
+async def test_hyphenated_prose_and_mixed_case_words_do_not_warn(fake_hgnc, value):
+    assert await _warnings_for([value]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value, suggestion",
+    [
+        ("EWSR1-FLI1", "EWSR1::FLI1"),
+        ("ewsr1-fli1", "EWSR1::FLI1"),
+        ("bcr-abl1", "BCR::ABL1"),
+        ("Ewsr1-Fli1", "EWSR1::FLI1"),
+        ("C11orf95-RELA", "C11ORF95::RELA"),
+        ("EML4 ALK fusion", "EML4::ALK"),
+        ("eml4 alk fusion", "EML4::ALK"),
+    ],
+)
+async def test_symbol_cased_partners_still_warn(fake_hgnc, value, suggestion):
+    assert await _warnings_for([value]) == [_warning(value, suggestion)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("alias", ["GM-CSF", "TNF-alpha", "IL-6"])
 async def test_hyphenated_hgnc_aliases_do_not_warn(fake_hgnc, alias):
     assert await _warnings_for([alias]) == []
 
 
 @pytest.mark.asyncio
-async def test_hyphenated_previous_symbol_does_not_warn(fake_hgnc):
+async def test_hyphenated_previous_symbol_does_not_warn(fake_hgnc, fake_cache, monkeypatch):
     handler = fake_hgnc()
 
     assert await _warnings_for(["OLDA-OLDB1"]) == []
-    assert [path for path in handler.requests if 'alias_symbol:"OLDA-OLDB1"' in path]
+    assert [path for path in handler.requests if 'prev_symbol:"OLDA-OLDB1"' in path]
+
+    # Without the prev_symbol clause the fake HGNC finds nothing, so the match above came from it.
+    fake_cache.clear()
+    monkeypatch.setattr(
+        "src.pipeline.normalization.HGNC_ALIAS_SEARCH_URL",
+        'https://rest.genenames.org/search/alias_symbol:"{symbol}"',
+    )
+    assert await _warnings_for(["OLDA-OLDB1"]) == [_warning("OLDA-OLDB1", "OLDA::OLDB1")]
 
 
 @pytest.mark.asyncio
