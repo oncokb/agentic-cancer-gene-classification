@@ -128,6 +128,12 @@ _RETRACTION_QUERY_EXCLUSION = (
 # Tumor type alias expansion
 # ---------------------------------------------------------------------------
 
+_UTROSCT_TERMS = (
+    "uterine tumor resembling ovarian sex cord tumor",
+    "uterine tumor resembling ovarian sex-cord tumor",
+    "UTROSCT",
+)
+
 _TUMOR_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     # NSCLC subtypes
     "luad": ("lung adenocarcinoma", "LUAD"),
@@ -175,6 +181,19 @@ _TUMOR_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     "hl": ("Hodgkin lymphoma", "HL", "Hodgkin disease"),
     # Gynecologic
     "ov": ("ovarian cancer", "ovarian serous carcinoma", "OV"),
+    # "Ovarian" describes the resemblance in UTROSCT's name, not its primary site.
+    "utrosct": _UTROSCT_TERMS,
+    "uterine tumor resembling ovarian sex cord tumor": _UTROSCT_TERMS,
+    "uterine tumor resembling ovarian sex-cord tumor": _UTROSCT_TERMS,
+    "uterine sarcoma": ("uterine sarcoma", "uterine mesenchymal tumor"),
+    "uterine leiomyosarcoma": ("uterine leiomyosarcoma", "uterine LMS"),
+    "endometrial stromal sarcoma": ("endometrial stromal sarcoma", "uterine stromal sarcoma"),
+    "low-grade endometrial stromal sarcoma": (
+        "low-grade endometrial stromal sarcoma", "low grade endometrial stromal sarcoma", "LG-ESS",
+    ),
+    "high-grade endometrial stromal sarcoma": (
+        "high-grade endometrial stromal sarcoma", "high grade endometrial stromal sarcoma", "HG-ESS",
+    ),
     "ucec": ("uterine corpus endometrial carcinoma", "endometrial cancer", "UCEC"),
     "cesc": ("cervical squamous cell carcinoma", "cervical cancer", "CESC"),
     # Skin
@@ -1343,6 +1362,9 @@ async def _tier1_retrieve(
       3. Evidence-priority queries (clinical > cell line > mouse model)
       4. Tumor-type-specific query with alias expansion when tumor_type is supplied
       5. Co-query with each fusion partner
+
+    Unscoped partner queries run in the first stage so abundant gene-only
+    literature cannot trigger an early return before fusion-context retrieval.
     """
     evidence_queries = _evidence_priority_queries(gene)
     family_by_query: Dict[str, str] = {}
@@ -1365,9 +1387,12 @@ async def _tier1_retrieve(
         _tag(evidence_queries[0], "evidence_priority"),
     ]
     stage_3 = [_tag(q, "evidence_priority") for q in evidence_queries[1:]]
-    for partner in _fusion_partners(gene, fusions or [])[:2]:
-        stage_3.append(_tag(f'"{gene}" AND "{partner}"', "fusion_partner"))
-        if tumor_type:
+    for index, partner in enumerate(_fusion_partners(gene, fusions or [])):
+        # One mandatory query per unique partner; reuse the existing search,
+        # cache, throttle, and PMID deduplication paths. Keep the optional
+        # tumor-scoped fallback budget at its existing two-partner limit.
+        stage_1.append(_tag(f'"{gene}" AND "{partner}"', "fusion_partner"))
+        if tumor_type and index < 2:
             stage_3.append(
                 _tag(
                     f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}',
