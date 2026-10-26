@@ -247,7 +247,7 @@ def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, inclu
         nonlocal active, peak
         if path.endswith("/jobs"):
             assert any(job.phase == "fusion_evidence" and job.status == "running"
-                       for job in main._annotation_jobs.values())
+                       for job, _ in main._annotation_jobs.local.values())
         active += 1
         peak = max(peak, active)
         seen.append((fusion, tumor_type))

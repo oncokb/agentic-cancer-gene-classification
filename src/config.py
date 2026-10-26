@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -121,7 +121,12 @@ class Settings(BaseSettings):
         default=50, ge=1,
         description="Maximum inputs per annotation or fusion-evidence request (ANNOTATE_MAX_INPUTS).",
     )
-    annotation_job_ttl_seconds: int = 3600
+    # Async job status snapshots (annotation, enrichment, gene-query and
+    # fusion-evidence jobs) expire this long after the job's last update.
+    # Unset means 24h; see src.job_store.job_ttl_seconds().
+    job_ttl_seconds: Optional[int] = None
+    # Deprecated: used for every job kind only when JOB_TTL_SECONDS is unset.
+    annotation_job_ttl_seconds: Optional[int] = None
     # Max entries accepted per gene query API request (POST /v1/genes/query[/jobs]).
     gene_query_max_genes: int = 50
 
