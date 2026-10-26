@@ -1300,19 +1300,46 @@ async function runBenchmark() {
 
 let _geneObserver = null;
 
-function rebuildGeneIndex(annotations) {
+function rebuildGeneIndex(entries) {
+  if (_geneObserver) _geneObserver.disconnect();
+  _geneObserver = null;
   elements.geneIndex.replaceChildren();
-  if (!annotations || !annotations.length) return;
+  if (!entries || !entries.length) return;
 
-  annotations.forEach((annotation) => {
+  let previousSection;
+  entries.forEach(({ targetId, label, count, section }) => {
+    if (section && section !== previousSection) {
+      const heading = document.createElement("div");
+      heading.className = "fusion-index-section";
+      heading.textContent = section;
+      elements.geneIndex.appendChild(heading);
+    }
+    previousSection = section;
     const btn = document.createElement("button");
     btn.className = "gene-index-item";
-    btn.textContent = annotation.gene;
-    btn.title = annotation.gene;
+    btn.title = label;
     btn.type = "button";
+    btn.dataset.targetId = targetId;
+    if (count === undefined) {
+      btn.textContent = label;
+    } else {
+      btn.classList.add("fusion-index-item");
+      const name = document.createElement("span");
+      name.className = "fusion-index-name";
+      name.textContent = label;
+      const badge = document.createElement("span");
+      badge.className = "fusion-index-count";
+      badge.textContent = String(count);
+      btn.appendChild(name);
+      btn.appendChild(badge);
+      btn.setAttribute("aria-label", `${label}, ${count} PMIDs`);
+    }
     btn.addEventListener("click", () => {
-      const card = document.getElementById(`gene-${annotation.gene}`);
-      if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
+      const card = document.getElementById(targetId);
+      if (!card) return;
+      const section = card.closest("details.fusion-evidence-section");
+      if (section) section.open = true;
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
     });
     elements.geneIndex.appendChild(btn);
   });
@@ -1325,19 +1352,30 @@ function observeGeneCards() {
   const cards = elements.resultsWindow.querySelectorAll(".annotation-card[id]");
   if (!cards.length) return;
 
+  const visibleCards = new Set();
   _geneObserver = new IntersectionObserver(
     (entries) => {
-      const visible = entries.filter((e) => e.isIntersecting);
-      if (!visible.length) return;
-      const topEntry = visible.reduce((a, b) =>
-        a.boundingClientRect.top < b.boundingClientRect.top ? a : b,
+      // Observer batches contain only changed intersections. Keep the other
+      // visible cards so a lower card entering cannot steal the active item.
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) visibleCards.add(entry.target);
+        else visibleCards.delete(entry.target);
+      });
+      if (!visibleCards.size) return;
+      const topCard = [...visibleCards].reduce((a, b) =>
+        a.getBoundingClientRect().top < b.getBoundingClientRect().top ? a : b,
       );
-      const gene = topEntry.target.id.replace("gene-", "");
+      const targetId = topCard.id;
       elements.geneIndex.querySelectorAll(".gene-index-item").forEach((btn) => {
-        btn.classList.toggle("active", btn.textContent === gene);
+        btn.classList.toggle("active", btn.dataset.targetId === targetId);
       });
     },
-    { root: elements.resultsWindow, threshold: 0.15 },
+    {
+      // The narrow layout scrolls the page rather than the results pane.
+      root: elements.resultsWindow.scrollHeight > elements.resultsWindow.clientHeight
+        ? elements.resultsWindow : null,
+      threshold: 0.15,
+    },
   );
 
   cards.forEach((card) => _geneObserver.observe(card));
@@ -1605,7 +1643,9 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex(visibleAnnotations);
+  rebuildGeneIndex(visibleAnnotations.map((item) => ({
+    targetId: `gene-${item.gene}`, label: item.gene,
+  })));
 }
 
 function renderNoResultView(hiddenAnnotations) {
@@ -1667,7 +1707,9 @@ function renderNoResultView(hiddenAnnotations) {
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex(hiddenAnnotations);
+  rebuildGeneIndex(hiddenAnnotations.map((item) => ({
+    targetId: `gene-${item.gene}`, label: item.gene,
+  })));
 }
 
 function renderFusionEvidenceView(fusionEvidence) {
@@ -1685,75 +1727,144 @@ function renderFusionEvidenceView(fusionEvidence) {
   const list = document.createElement("div");
   list.className = "annotation-list fusion-evidence-list";
 
-  items.forEach((item) => {
-    const card = document.createElement("article");
-    card.className = "annotation-card fusion-evidence-card";
-    card.id = `fusion-${cssSafeId(item.fusion)}`;
-    const pmids = item.pmids || [];
-    const cards = item.evidence_cards || [];
-    card.innerHTML = `
-      <header>
-        <div class="annotation-heading">
-          <h3>${escapeHtml(item.fusion)}</h3>
-          <div class="subtle">${escapeHtml(item.tumor_type || "Any tumor type")}</div>
-        </div>
-        <div class="annotation-card-meta">
-          <span class="review-badge ${item.well_supported ? "high" : "low"}">
-            ${item.well_supported ? "Well supported" : "Exploratory"}
-          </span>
-          <span class="status-pill">
-            ${item.retrieved_count || pmids.length} PMID${(item.retrieved_count || pmids.length) === 1 ? "" : "s"}
-          </span>
-        </div>
-      </header>
-      <div class="field-row field-row-highlight">
-        <span class="field-row-label">Fusion interpretation</span>
-        <div class="field-row-value">${escapeHtml(item.interpretation || "No interpretation available.")}</div>
-      </div>
-      <div class="supporting-evidence fusion-supporting-evidence"></div>
-    `;
-
-    const evidence = card.querySelector(".fusion-supporting-evidence");
-    if (pmids.length) {
-      const links = document.createElement("div");
-      links.className = "citation-links";
-      links.innerHTML = '<span class="field-label">Retrieved PMIDs</span>';
-      const linkRow = document.createElement("div");
-      linkRow.className = "citation-link-list";
-      pmids.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
-      links.appendChild(linkRow);
-      evidence.appendChild(links);
-    }
-
-    if (cards.length) {
-      const cardList = document.createElement("div");
-      cardList.className = "evidence-card-list";
-      cards.forEach((evidenceCard) => {
-        const itemCard = document.createElement("article");
-        itemCard.className = "evidence-card";
-        const evidenceType = String(evidenceCard.evidence_type || "fusion").replace(/_/g, " ");
-        itemCard.innerHTML = `
-          ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
-          <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
-          <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
-          ${preprintBadgeHtml(evidenceCard)}
-          ${aliasMatchNoticeHtml(evidenceCard)}
-          ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
-          ${evidenceCard.quote ? `<blockquote>${escapeHtml(evidenceCard.quote)}</blockquote>` : ""}
-        `;
-        cardList.appendChild(itemCard);
+  const indexEntries = [];
+  fusionEvidenceSections(items).forEach(({ label, items, collapsed }) => {
+    const section = document.createElement("details");
+    section.className = "fusion-evidence-section";
+    section.open = !collapsed;
+    const summary = document.createElement("summary");
+    const heading = document.createElement("h3");
+    heading.textContent = `${label} (${items.length})`;
+    summary.appendChild(heading);
+    section.appendChild(summary);
+    const cards = document.createElement("div");
+    cards.className = "annotation-list";
+    items.forEach((item) => {
+      const card = renderFusionEvidenceCard(item);
+      // Include an ordinal so distinct fusion spellings cannot collide after sanitizing.
+      card.id = `fusion-${cssSafeId(item.fusion)}-${indexEntries.length}`;
+      cards.appendChild(card);
+      indexEntries.push({
+        targetId: card.id, label: item.fusion, count: (item.pmids || []).length, section: label,
       });
-      evidence.appendChild(cardList);
-    }
-
-    const partnerPrecedent = renderFusionPartnerPrecedentForFusionEvidence(item);
-    if (partnerPrecedent) evidence.appendChild(partnerPrecedent);
-
-    list.appendChild(card);
+    });
+    section.appendChild(cards);
+    list.appendChild(section);
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex([]);
+  rebuildGeneIndex(indexEntries);
+}
+
+function fusionEvidenceSections(items) {
+  const sections = new Map();
+  items.forEach((item) => {
+    let label;
+    let order;
+    if (item.retrieval_status === "failed") {
+      label = "Lookup failed";
+      order = 4;
+    } else if (item.literature_scope === "no_literature") {
+      label = "No literature found";
+      order = 3;
+    } else if (item.literature_scope === "requested_tumor" && item.tumor_type) {
+      label = `Found in ${item.tumor_type}`;
+      order = 0;
+    } else if (item.literature_scope === "other_or_unspecified" && item.tumor_type) {
+      label = "Found in other tumor types";
+      order = 1;
+    } else if (item.literature_scope) {
+      label = "Literature found";
+      order = 0;
+    } else if ((item.pmids || []).length || item.retrieved_count > 0) {
+      label = "Literature found (not classified by tumor type)";
+      order = 2;
+    } else {
+      label = "No literature found";
+      order = 3;
+    }
+    if (!sections.has(label)) {
+      sections.set(label, { label, order, collapsed: label === "No literature found", items: [] });
+    }
+    sections.get(label).items.push(item);
+  });
+  return [...sections.values()].sort((a, b) => a.order - b.order);
+}
+
+function appendFusionText(parent, tag, className, text) {
+  const node = document.createElement(tag);
+  node.className = className;
+  if (text !== undefined) node.textContent = text;
+  parent.appendChild(node);
+  return node;
+}
+
+function renderFusionEvidenceCard(item) {
+  const card = document.createElement("article");
+  card.className = "annotation-card fusion-evidence-card";
+  const pmids = item.pmids || [];
+  const header = appendFusionText(card, "header", "fusion-section-card-header");
+  const heading = appendFusionText(header, "div", "annotation-heading");
+  appendFusionText(heading, "h3", "fusion-section-card-name", item.fusion);
+  appendFusionText(heading, "div", "subtle", item.tumor_type || "Any tumor type");
+  const meta = appendFusionText(header, "div", "annotation-card-meta");
+  appendFusionText(meta, "span", `review-badge ${item.well_supported ? "high" : "low"}`,
+    item.well_supported ? "Well supported" : "Exploratory");
+  const count = item.retrieved_count || pmids.length;
+  appendFusionText(meta, "span", "status-pill", `${count} PMID${count === 1 ? "" : "s"}`);
+  if (item.literature_scope === "requested_tumor" && item.tumor_type && item.retrieval_status !== "failed") {
+    appendFusionText(card, "p", "fusion-tumor-match",
+      `Mentions ${item.tumor_type} in ${(item.requested_tumor_pmids || []).length} of ${pmids.length} papers`);
+  }
+  const interpretation = appendFusionText(card, "div", "field-row field-row-highlight");
+  appendFusionText(interpretation, "span", "field-row-label", "Fusion interpretation");
+  appendFusionText(interpretation, "div", "field-row-value", item.interpretation || "No interpretation available.");
+  const evidence = appendFusionText(card, "div", "supporting-evidence fusion-supporting-evidence");
+  if (pmids.length) {
+    const links = appendFusionText(evidence, "div", "citation-links");
+    appendFusionText(links, "span", "field-label", "Retrieved PMIDs");
+    const linkRow = appendFusionText(links, "div", "citation-link-list");
+    pmids.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
+  }
+  if (item.evidence_cards?.length) {
+    const cardList = appendFusionText(evidence, "div", "evidence-card-list");
+    item.evidence_cards.forEach((paper) => {
+      const paperCard = appendFusionText(cardList, "article", "evidence-card");
+      const topline = appendFusionText(paperCard, "div", "evidence-card-topline");
+      const pill = appendFusionText(topline, "span", "pmid-pill");
+      const link = makePubMedLink(paper.pmid);
+      link.textContent = `PMID ${paper.pmid}`;
+      pill.appendChild(link);
+      if (paper.abstract) {
+        const tooltip = appendFusionText(pill, "span", "pmid-abstract-tooltip");
+        tooltip.setAttribute("role", "tooltip");
+        appendFusionText(tooltip, "span", "pmid-abstract-tooltip-label", "Abstract");
+        appendFusionText(tooltip, "span", "", paper.abstract);
+      }
+      appendFusionText(topline, "span", "review-badge context",
+        String(paper.evidence_type || "fusion").replace(/_/g, " "));
+      appendFusionText(paperCard, "h5", "", paper.title || "Untitled PubMed record");
+      appendFusionText(paperCard, "p", "evidence-card-meta", paper.journal || "Journal unavailable");
+      if (paper.is_preprint) {
+        const notice = appendFusionText(paperCard, "p", "evidence-preprint-notice");
+        appendFusionText(notice, "span", "review-badge preprint", "Preprint – not peer-reviewed");
+      }
+      if (paper.matched_via_alias && paper.alias_matches?.length) {
+        const notice = appendFusionText(paperCard, "p", "evidence-alias-notice");
+        appendFusionText(notice, "span", "review-badge alias-match", "Found via alias");
+        appendFusionText(notice, "span", "evidence-alias-notice-detail",
+          paper.alias_matches.map((match) => `${match.alias} (${match.gene})`).join(", "));
+      }
+      if (paper.requested_tumor_terms?.length) {
+        appendFusionText(paperCard, "p", "fusion-tumor-match", `Matched tumor terms: ${paper.requested_tumor_terms.join(", ")}`);
+      }
+      if (paper.selected_reason) appendFusionText(paperCard, "p", "", paper.selected_reason);
+      if (paper.quote) appendFusionText(paperCard, "blockquote", "", paper.quote);
+    });
+  }
+  const partnerPrecedent = renderFusionPartnerPrecedentForFusionEvidence(item);
+  if (partnerPrecedent) evidence.appendChild(partnerPrecedent);
+  return card;
 }
 
 function cssSafeId(value) {
@@ -2888,7 +2999,7 @@ function renderFusionPartnerQueryButton(gene, tumorType) {
 
 function renderFusionPartnerPrecedentForFusionEvidence(item) {
   const retrievedCount = item.retrieved_count ?? (item.pmids || []).length;
-  if (retrievedCount > 0) return null;
+  if (retrievedCount > 0 || item.retrieval_status === "failed") return null;
 
   const partners = [];
   const seen = new Set();
