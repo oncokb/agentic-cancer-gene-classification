@@ -281,3 +281,34 @@ for r in job["results"]:
   [ACGC API Keys (for scripts)](../README.md#acgc-api-keys-for-scripts) and
   [Gene query API](../README.md#gene-query-api).
 - Questions or problems: contact the ACGC team.
+
+## GET /v1/runs
+
+List your saved runs, newest first. Requires a signed-in session or an API key;
+API keys list runs belonging to the key owner. With authentication disabled for
+local development, the owner is `local@internal`.
+
+Query parameters: `limit` (default `20`, range `1`–`100`) and optional opaque
+`cursor` (use the preceding response's `next_cursor` unchanged).
+
+```json
+{
+  "runs": [
+    {
+      "run_id": "example-run-id",
+      "created_at": "2026-10-26T12:00:00+00:00",
+      "source": "session",
+      "input_summary": "ALK, TP53",
+      "input_count": 2,
+      "genes_annotated": 2,
+      "view_url": "/?run=example-run-id"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+`source`, `input_summary`, `input_count`, and `genes_annotated` may be null.
+`next_cursor` is null on the last page, including an empty list. Responses contain
+metadata only, never request or result blobs. Invalid limits or cursors return
+`422`; unauthenticated requests return `401`; unavailable run storage returns `503`.

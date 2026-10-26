@@ -67,6 +67,7 @@ from src.auth import (
 )
 from src.config import settings
 from src.logging_utils import install_secret_redaction_filter
+from src.api.runs import router as runs_router
 from src.models.schema import (
     AnnotateRequest,
     AnnotationMode,
@@ -211,6 +212,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-OpenEvidence-Poll"],
 )
 app.include_router(api_keys_router)
+app.include_router(runs_router)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 if _STATIC_DIR.exists():
