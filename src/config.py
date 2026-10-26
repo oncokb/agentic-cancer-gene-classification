@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     agcg_dev_mode: bool = False
     public_app_base_url: str = "https://acgc.oncokb.org"
     pubmed_max_results: int = 50
+    # Shared per-gene budget for partner queries in retrieval and freshness probes.
+    pubmed_max_partner_queries: int = Field(default=8, ge=1)
     fusion_evidence_max_results: int = 20
     fusion_evidence_cache_ttl_seconds: int = 604800
     fusion_evidence_concurrency: int = 2
@@ -115,6 +117,10 @@ class Settings(BaseSettings):
     context_score_pubtype_case_report_weight: float = 0.3
     context_score_pubtype_editorial_weight: float = 0.15
     context_score_pubtype_preprint_weight: float = 0.3
+    annotate_max_inputs: int = Field(
+        default=50, ge=1,
+        description="Maximum inputs per annotation or fusion-evidence request (ANNOTATE_MAX_INPUTS).",
+    )
     annotation_job_ttl_seconds: int = 3600
     # Max entries accepted per gene query API request (POST /v1/genes/query[/jobs]).
     gene_query_max_genes: int = 50
