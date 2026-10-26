@@ -73,7 +73,7 @@ class FakeRunStore:
         now = datetime.now(timezone.utc)
         return {"annotation": annotation.model_dump(), "updated_at": now, "last_pubmed_checked_at": now}
 
-    async def save_run(self, run_id, timestamp, request_payload, result_payload):
+    async def save_run(self, run_id, timestamp, request_payload, result_payload, **owner):
         if self.fail_saves:
             raise RuntimeError("mysql: SECRET-DB-ERROR")
         self.saved_runs.append((run_id, timestamp, request_payload, result_payload))

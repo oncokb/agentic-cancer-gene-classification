@@ -14,7 +14,7 @@ class FakeRunStore:
     def __init__(self):
         self.saved_runs = []
 
-    async def save_run(self, run_id, timestamp, request_payload, result_payload):
+    async def save_run(self, run_id, timestamp, request_payload, result_payload, **owner):
         self.saved_runs.append((run_id, timestamp, request_payload, result_payload))
 
 

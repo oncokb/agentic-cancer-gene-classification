@@ -343,7 +343,7 @@ async def _run_gene_query(
         logger.exception("Gene query pipeline error")
         raise HTTPException(status_code=500, detail=GENERIC_FAILURE) from exc
 
-    await save_run_or_raise(http_request, annotate_request.model_dump(), result)
+    await save_run_or_raise(http_request, annotate_request.model_dump(), result, current_user)
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
     record_user_action(

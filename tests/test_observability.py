@@ -433,7 +433,7 @@ def test_annotate_endpoint_records_user_header(monkeypatch):
             timings_ms={"total": 2.0},
         )
 
-    async def fake_persist_run_result(http_request, request_payload, result):
+    async def fake_persist_run_result(http_request, request_payload, result, current_user):
         return None
 
     def fake_record_user_seen(user_id, tags=None):

@@ -211,3 +211,76 @@ async def test_gene_annotation_cache_round_trip(run_store):
 
     assert stored is not None
     assert stored["last_pubmed_checked_at"] == updated_at
+
+
+# -- Run ownership ------------------------------------------------------------
+
+_LEGACY_RUNS_SQL = """
+CREATE TABLE runs (
+    run_id VARCHAR(36) PRIMARY KEY,
+    created_at DATETIME NOT NULL,
+    request_json JSON NOT NULL,
+    result_json JSON NOT NULL
+)
+"""
+
+
+async def _runs_columns(store) -> set[str]:
+    async with store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SHOW COLUMNS FROM runs")
+            return {row[0] for row in await cursor.fetchall()}
+
+
+async def test_schema_upgrade_adds_owner_columns_to_a_legacy_runs_table(run_store):
+    async with run_store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("DROP TABLE runs")
+            await cursor.execute(_LEGACY_RUNS_SQL)
+            await cursor.execute(
+                "INSERT INTO runs VALUES (%s, %s, %s, %s)",
+                ("legacy-run", datetime(2026, 1, 1), '{"fusions": ["ALK"]}', '{"run_id": "legacy-run"}'),
+            )
+
+    await run_store._ensure_schema()
+    await run_store._ensure_schema()  # idempotent on an already-upgraded table
+
+    assert {"owner_email", "source", "input_summary", "input_count", "genes_annotated"} <= (
+        await _runs_columns(run_store)
+    )
+    async with run_store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SHOW INDEX FROM runs WHERE Key_name = 'idx_runs_owner_created_at'")
+            assert [row[4] for row in await cursor.fetchall()] == ["owner_email", "created_at", "run_id"]
+            await cursor.execute("SELECT owner_email, source FROM runs WHERE run_id = 'legacy-run'")
+            assert await cursor.fetchone() == (None, None)
+    # Pre-existing runs stay openable by link but are in no one's list.
+    assert await run_store.get_run("legacy-run") == {"run_id": "legacy-run"}
+    assert (await run_store.list_runs_for_owner("local@internal")).runs == []
+
+
+async def test_list_runs_for_owner_newest_first_paged_and_scoped(run_store):
+    for i, (owner, second) in enumerate(
+        [("curator@mskcc.org", 1), ("other@mskcc.org", 2), ("curator@mskcc.org", 3), ("curator@mskcc.org", 3)]
+    ):
+        await run_store.save_run(
+            f"run-{i}",
+            f"2026-10-26T12:00:0{second}+00:00",
+            {"fusions": [{"fusion": "ALK"}, {"fusion": f"GENE{i}"}]},
+            {"run_id": f"run-{i}", "genes_annotated": i, "annotations": [{"gene": "ALK"}]},
+            owner_email=owner,
+            source="session" if i else "api_key",
+        )
+
+    first = await run_store.list_runs_for_owner("Curator@mskcc.org", limit=2)
+    # Same-second runs tie-break on run_id, newest first.
+    assert [run.run_id for run in first.runs] == ["run-3", "run-2"]
+    assert first.runs[0].created_at == datetime(2026, 10, 26, 12, 0, 3, tzinfo=timezone.utc)
+    assert first.runs[0].input_summary == "ALK, GENE3"
+    assert (first.runs[0].input_count, first.runs[0].genes_annotated) == (2, 3)
+    assert not hasattr(first.runs[0], "result")
+
+    second = await run_store.list_runs_for_owner("curator@mskcc.org", limit=2, cursor=first.next_cursor)
+    assert [run.run_id for run in second.runs] == ["run-0"]
+    assert second.runs[0].source == "api_key"
+    assert second.next_cursor is None
