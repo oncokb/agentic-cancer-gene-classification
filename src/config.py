@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     agcg_dev_mode: bool = False
     public_app_base_url: str = "https://acgc.oncokb.org"
     pubmed_max_results: int = 50
+    # Shared per-gene budget for partner queries in retrieval and freshness probes.
+    pubmed_max_partner_queries: int = Field(default=8, ge=1)
     fusion_evidence_max_results: int = 20
     fusion_evidence_cache_ttl_seconds: int = 604800
     fusion_evidence_concurrency: int = 2
