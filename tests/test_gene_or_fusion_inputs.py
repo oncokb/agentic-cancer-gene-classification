@@ -149,6 +149,8 @@ async def test_run_pipeline_preserves_real_fusions_for_partner_context(monkeypat
     (["LUAD", "melanoma", "glioma"], "LUAD", ["melanoma", "glioma"]),
     ([None, "LUAD", "LUAD"], "LUAD", []),
     ([None, None], None, []),
+    ([" Lung  Cancer ", "lung cancer", "LUNG   CANCER"], " Lung  Cancer ", []),
+    (["LUAD", " luad ", "Melanoma", " melanoma  "], "LUAD", ["Melanoma"]),
 ])
 async def test_tumor_type_conflicts_warn_and_keep_first(monkeypatch, tumor_types, expected, ignored):
     async def normalize(inputs):

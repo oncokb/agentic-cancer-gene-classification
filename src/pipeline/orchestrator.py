@@ -613,11 +613,14 @@ async def run_pipeline(
     gene_tumor_type: Dict[str, Optional[str]] = {}
     warnings: List[str] = []
     for canonical, (_, gene_inputs) in gene_map.items():
-        tumor_types = list(dict.fromkeys(
-            tt
-            for value in gene_inputs
-            for submitted, tt in tumor_contexts if submitted == value
-        ))
+        tumor_types_by_key: Dict[str, str] = {}
+        for value in gene_inputs:
+            for submitted, tt in tumor_contexts:
+                if submitted == value:
+                    key = " ".join(tt.strip().lower().split())
+                    if key:
+                        tumor_types_by_key.setdefault(key, tt)
+        tumor_types = list(tumor_types_by_key.values())
         if tumor_types:
             gene_tumor_type[canonical] = tumor_types[0]
         if len(tumor_types) > 1:
