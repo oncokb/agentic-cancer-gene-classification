@@ -6,7 +6,7 @@ abstracts, evidence cards, quotes, clinical actionability — is viewed in the U
 via ``view_url``, which requires an ACGC login.
 
 Route handlers reuse helpers defined in ``src.main`` (run store persistence,
-the in-memory annotation job store, metrics). They are looked up on the module
+the annotation job store, metrics). They are looked up on the module
 at call time rather than imported at load time, because ``src.main`` includes
 this router and tests monkeypatch ``src.main.run_pipeline``.
 """
@@ -343,7 +343,7 @@ async def _run_gene_query(
         logger.exception("Gene query pipeline error")
         raise HTTPException(status_code=500, detail=GENERIC_FAILURE) from exc
 
-    await save_run_or_raise(http_request, annotate_request.model_dump(), result)
+    await save_run_or_raise(http_request, annotate_request.model_dump(), result, current_user)
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
     record_user_action(
@@ -421,12 +421,11 @@ async def get_gene_query_job(
     """Poll an asynchronous gene query."""
     app = _app()
     try:
-        job = await app._get_annotation_job(job_id)
+        job = await app._get_annotation_job(job_id, viewer=current_user)
     except HTTPException:
         job = None
     if job is None or job.kind != "gene_query":
         raise HTTPException(status_code=404, detail="Gene query job not found")
-
 
     run_id = job.result.run_id if job.status == "complete" and job.result else None
     return GeneQueryJobStatusResponse(

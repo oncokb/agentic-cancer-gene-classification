@@ -10,16 +10,36 @@ from src.pipeline import cache as cache_module
 from src.pipeline import literature as literature_module
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "no_real_redis: never build a client for the configured Redis (or flush it); "
+        "the cache client is an in-memory FakeRedis instead",
+    )
+
+
 @pytest.fixture(autouse=True)
-async def _reset_cache_client():
+async def _reset_cache_client(request):
     """Reset the cache module's Redis client singleton before each test.
 
     redis.asyncio.Redis binds its connection pool to the event loop active
     at creation time. pytest-asyncio creates a fresh event loop per test
     function by default, so a client cached from an earlier test becomes
     unusable in a later test's loop — reset it so each test gets its own.
+
+    Tests marked `no_real_redis`, or using the `fake_redis` fixture, never
+    construct (let alone flush) a client for the configured Redis.
     """
     cache_module._client = None
+    if request.node.get_closest_marker("no_real_redis") is not None:
+        cache_module._client = FakeRedis()
+        yield
+        cache_module._client = None
+        return
+    if "fake_redis" in request.fixturenames:
+        yield
+        cache_module._client = None
+        return
     client = cache_module._get_client()
     try:
         await client.flushdb()
@@ -55,6 +75,25 @@ def _reset_ncbi_rate_limiter():
     literature_module._ncbi_rate_limiter = None
     yield
     literature_module._ncbi_rate_limiter = None
+
+
+@pytest.fixture(autouse=True)
+def _job_stores_use_fake_redis(monkeypatch):
+    """Point src.main's job stores at a per-test FakeRedis with empty local
+    state, so job snapshots never reach a real Redis and no job leaks
+    between tests. Only touches src.main if a test already imported it."""
+    main = sys.modules.get("src.main")
+    if main is None:
+        yield
+        return
+    redis = FakeRedis()
+    stores = (main._annotation_jobs, main._enrichment_jobs, main._fusion_evidence_jobs)
+    for store in stores:
+        store.clear_local()
+        monkeypatch.setattr(store, "_redis_client_factory", lambda: redis)
+    yield
+    for store in stores:
+        store.clear_local()
 
 
 @pytest.fixture(autouse=True)

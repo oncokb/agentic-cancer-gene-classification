@@ -128,6 +128,12 @@ _RETRACTION_QUERY_EXCLUSION = (
 # Tumor type alias expansion
 # ---------------------------------------------------------------------------
 
+_UTROSCT_TERMS = (
+    "uterine tumor resembling ovarian sex cord tumor",
+    "uterine tumor resembling ovarian sex-cord tumor",
+    "UTROSCT",
+)
+
 _TUMOR_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     # NSCLC subtypes
     "luad": ("lung adenocarcinoma", "LUAD"),
@@ -175,6 +181,28 @@ _TUMOR_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     "hl": ("Hodgkin lymphoma", "HL", "Hodgkin disease"),
     # Gynecologic
     "ov": ("ovarian cancer", "ovarian serous carcinoma", "OV"),
+    # "Ovarian" describes the resemblance in UTROSCT's name, not its primary site.
+    "utrosct": _UTROSCT_TERMS,
+    "uterine tumor resembling ovarian sex cord tumor": _UTROSCT_TERMS,
+    "uterine tumor resembling ovarian sex-cord tumor": _UTROSCT_TERMS,
+    "uterine sarcoma": ("uterine sarcoma",),
+    "usarc": ("uterine sarcoma",),
+    "uterine leiomyosarcoma": ("uterine leiomyosarcoma", "uterine LMS"),
+    "ulms": ("uterine leiomyosarcoma", "uterine LMS"),
+    "endometrial stromal sarcoma": ("endometrial stromal sarcoma", "uterine stromal sarcoma"),
+    "ess": ("endometrial stromal sarcoma", "uterine stromal sarcoma"),
+    "low-grade endometrial stromal sarcoma": (
+        "low-grade endometrial stromal sarcoma", "low grade endometrial stromal sarcoma", "LG-ESS",
+    ),
+    "lgess": (
+        "low-grade endometrial stromal sarcoma", "low grade endometrial stromal sarcoma", "LG-ESS",
+    ),
+    "high-grade endometrial stromal sarcoma": (
+        "high-grade endometrial stromal sarcoma", "high grade endometrial stromal sarcoma", "HG-ESS",
+    ),
+    "hgess": (
+        "high-grade endometrial stromal sarcoma", "high grade endometrial stromal sarcoma", "HG-ESS",
+    ),
     "ucec": ("uterine corpus endometrial carcinoma", "endometrial cancer", "UCEC"),
     "cesc": ("cervical squamous cell carcinoma", "cervical cancer", "CESC"),
     # Skin
@@ -1159,10 +1187,9 @@ async def search_recent_pubmed_pmids(
     queries = [f'"{gene}" AND (cancer OR tumor OR oncology OR carcinoma)']
     if tumor_type:
         queries.append(f'"{gene}" AND {_tumor_type_query_fragment(tumor_type)}')
-    for partner in _fusion_partners(gene, fusions or [])[:2]:
-        queries.append(f'"{gene}" AND "{partner}"')
-        if tumor_type:
-            queries.append(f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}')
+    partner_queries, scoped_partner_queries = _fusion_partner_search_queries(gene, fusions, tumor_type)
+    queries.extend(partner_queries)
+    queries.extend(scoped_partner_queries)
     queries = list(dict.fromkeys(queries))
 
     client = _get_ncbi_client()
@@ -1328,6 +1355,34 @@ def _fusion_partners(gene: str, fusions: List[str]) -> List[str]:
     return list(dict.fromkeys(partners))
 
 
+def _fusion_partner_search_queries(
+    gene: str, fusions: Optional[List[str]], tumor_type: Optional[str],
+) -> tuple[list[str], list[str]]:
+    """Share a bounded partner-query plan between retrieval and freshness checks.
+
+    Prioritize one unscoped query per unique partner. Any remaining budget can
+    cover up to two tumor-scoped fallbacks, as in the original retrieval plan.
+    """
+    budget = settings.pubmed_max_partner_queries
+    partners = _fusion_partners(gene, fusions or [])
+    dropped = partners[budget:]
+    if dropped:
+        logger.info(
+            "PubMed partner-query cap %d for %s: dropped partners %s",
+            budget, gene, ", ".join(dropped),
+        )
+    partners = partners[:budget]
+    queries = [f'"{gene}" AND "{partner}"' for partner in partners]
+    scoped_queries = []
+    if tumor_type:
+        tt = _tumor_type_query_fragment(tumor_type)
+        scoped_queries = [
+            f'"{gene}" AND "{partner}" AND {tt}'
+            for partner in partners[:min(2, budget - len(queries))]
+        ]
+    return queries, scoped_queries
+
+
 async def _tier1_retrieve(
     gene: str,
     fusions: Optional[List[str]] = None,
@@ -1343,6 +1398,9 @@ async def _tier1_retrieve(
       3. Evidence-priority queries (clinical > cell line > mouse model)
       4. Tumor-type-specific query with alias expansion when tumor_type is supplied
       5. Co-query with each fusion partner
+
+    Unscoped partner queries run in the first stage so abundant gene-only
+    literature cannot trigger an early return before fusion-context retrieval.
     """
     evidence_queries = _evidence_priority_queries(gene)
     family_by_query: Dict[str, str] = {}
@@ -1365,15 +1423,9 @@ async def _tier1_retrieve(
         _tag(evidence_queries[0], "evidence_priority"),
     ]
     stage_3 = [_tag(q, "evidence_priority") for q in evidence_queries[1:]]
-    for partner in _fusion_partners(gene, fusions or [])[:2]:
-        stage_3.append(_tag(f'"{gene}" AND "{partner}"', "fusion_partner"))
-        if tumor_type:
-            stage_3.append(
-                _tag(
-                    f'"{gene}" AND "{partner}" AND {_tumor_type_query_fragment(tumor_type)}',
-                    "fusion_partner",
-                )
-            )
+    partner_queries, scoped_partner_queries = _fusion_partner_search_queries(gene, fusions, tumor_type)
+    stage_1.extend(_tag(query, "fusion_partner") for query in partner_queries)
+    stage_3.extend(_tag(query, "fusion_partner") for query in scoped_partner_queries)
 
     stages = [
         list(dict.fromkeys(stage))

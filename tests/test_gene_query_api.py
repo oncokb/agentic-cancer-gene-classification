@@ -73,7 +73,7 @@ class FakeRunStore:
         now = datetime.now(timezone.utc)
         return {"annotation": annotation.model_dump(), "updated_at": now, "last_pubmed_checked_at": now}
 
-    async def save_run(self, run_id, timestamp, request_payload, result_payload):
+    async def save_run(self, run_id, timestamp, request_payload, result_payload, **owner):
         if self.fail_saves:
             raise RuntimeError("mysql: SECRET-DB-ERROR")
         self.saved_runs.append((run_id, timestamp, request_payload, result_payload))
@@ -913,3 +913,15 @@ def test_gene_query_endpoints_require_auth(client, monkeypatch, pipeline_calls, 
 
     assert response.status_code == 401
     assert pipeline_calls == []
+
+
+@pytest.mark.parametrize("path", ["/v1/genes/query", "/v1/genes/query/jobs"])
+def test_gene_query_uses_its_own_cap(client, pipeline_calls, monkeypatch, path):
+    monkeypatch.setattr(settings, "annotate_max_inputs", 1)
+    monkeypatch.setattr(settings, "gene_query_max_genes", 3)
+    response = client.post(path, json={"genes": ["ALK", "BRAF", "TP53"]})
+    assert response.status_code == 200
+    if path.endswith("/jobs"):
+        body = _poll(client, response.json()["status_url"])
+        assert body["status"] == "complete"
+    assert len(pipeline_calls[-1]["fusions"]) == 3

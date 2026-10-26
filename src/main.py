@@ -19,7 +19,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from html import escape as html_escape
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Coroutine, Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import parse_qs, quote
 
 import httpx
@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
-from src.api.run_persistence import save_run_or_raise
+from src.api.run_persistence import run_owner, save_run_or_raise
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
     AuthenticatedUser,
@@ -66,6 +66,7 @@ from src.auth import (
     verify_oauth_state,
 )
 from src.config import settings
+from src.job_store import JobStore, can_read_job, job_owner
 from src.logging_utils import install_secret_redaction_filter
 from src.models.schema import (
     AnnotateRequest,
@@ -281,6 +282,9 @@ class AnnotationJobCreateResponse(BaseModel):
 class AnnotationJobStatusResponse(BaseModel):
     job_id: str
     status: str
+    phase: Literal["queued", "annotation", "fusion_evidence", "complete", "failed"] = Field(
+        default="queued", description="Current job phase, including optional inline fusion evidence retrieval.",
+    )
     fusions_processed: int
     genes_completed: int = 0
     genes_total: Optional[int] = None
@@ -288,10 +292,11 @@ class AnnotationJobStatusResponse(BaseModel):
     result: Optional[AnnotationResult] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
-    created_at: float = Field(default_factory=time.monotonic, exclude=True)
     # Internal bookkeeping for callers that reuse this job store (e.g. the gene
     # query API): which endpoint family created the job and its request.
     kind: str = Field(default="annotate", exclude=True)
+    # Lowercased email of the submitting user; only they (or an admin) may poll it.
+    owner: Optional[str] = Field(default=None, exclude=True)
 
 
 class FusionContextResponse(BaseModel):
@@ -353,9 +358,12 @@ class EnrichmentJobStatusResponse(BaseModel):
     annotations: List[GeneAnnotation] = Field(default_factory=list)
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    owner: Optional[str] = Field(default=None, exclude=True)
 
 
 class FusionEvidenceJobRequest(AnnotateRequest):
+    # This endpoint always retrieves evidence; the inline annotation flag does not apply.
+    include_fusion_evidence: ClassVar[bool] = False
     run_id: Optional[str] = Field(
         default=None,
         description=(
@@ -378,7 +386,7 @@ class FusionEvidenceJobStatusResponse(BaseModel):
     fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
-    created_at: float = Field(default_factory=time.monotonic, exclude=True)
+    owner: Optional[str] = Field(default=None, exclude=True)
 
 
 class BenchmarkRequest(BaseModel):
@@ -709,65 +717,58 @@ async def _cancel_openevidence_sidecar_lookups() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-_annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
-_annotation_jobs_lock = asyncio.Lock()
-_enrichment_jobs: Dict[str, EnrichmentJobStatusResponse] = {}
-_enrichment_jobs_lock = asyncio.Lock()
-_fusion_evidence_jobs: Dict[str, FusionEvidenceJobStatusResponse] = {}
-_fusion_evidence_jobs_lock = asyncio.Lock()
-
-async def _store_annotation_job(job: AnnotationJobStatusResponse) -> None:
-    async with _annotation_jobs_lock:
-        _annotation_jobs[job.job_id] = job
+# Job status lives in a shared store (Redis + process-local fallback) so any
+# pod can answer a poll; the job's task itself runs in the submitting process.
+# Gene-query jobs are annotation jobs (kind="gene_query"), so their snapshots
+# live under job:annotation:<id> too.
+_annotation_jobs = JobStore("annotation", AnnotationJobStatusResponse)
+_enrichment_jobs = JobStore("enrichment", EnrichmentJobStatusResponse)
+_fusion_evidence_jobs = JobStore("fusion_evidence", FusionEvidenceJobStatusResponse)
 
 
-async def _get_annotation_job(job_id: str) -> AnnotationJobStatusResponse:
-    async with _annotation_jobs_lock:
-        job = _annotation_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Annotation job not found")
+async def _get_job(store: JobStore, job_id: str, viewer: Optional[AuthenticatedUser], not_found: str):
+    """Fetch a job; with `viewer`, a job they may not read is reported as
+    missing (404, not 403) so job IDs don't leak to other users."""
+    job = await store.get(job_id)
+    if job is None or (viewer is not None and not can_read_job(job.owner, viewer)):
+        raise HTTPException(status_code=404, detail=not_found)
     return job
 
 
-async def _evict_stale_annotation_jobs() -> None:
-    """Drop finished jobs older than the TTL so the in-memory job store
-    doesn't grow unbounded over the life of the process. Jobs still queued
-    or running are never evicted, regardless of age."""
-    cutoff = time.monotonic() - settings.annotation_job_ttl_seconds
-    async with _annotation_jobs_lock:
-        stale = [
-            job_id
-            for job_id, job in _annotation_jobs.items()
-            if job.status in ("complete", "failed") and job.created_at < cutoff
-        ]
-        for job_id in stale:
-            del _annotation_jobs[job_id]
+async def _store_annotation_job(job: AnnotationJobStatusResponse) -> None:
+    await _annotation_jobs.put(job)
+
+
+async def _get_annotation_job(
+    job_id: str, viewer: Optional[AuthenticatedUser] = None
+) -> AnnotationJobStatusResponse:
+    return await _get_job(_annotation_jobs, job_id, viewer, "Annotation job not found")
 
 
 async def _store_enrichment_job(job: EnrichmentJobStatusResponse) -> None:
-    async with _enrichment_jobs_lock:
-        _enrichment_jobs[job.job_id] = job
+    await _enrichment_jobs.put(job)
 
 
-async def _get_enrichment_job(job_id: str) -> EnrichmentJobStatusResponse:
-    async with _enrichment_jobs_lock:
-        job = _enrichment_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Enrichment job not found")
-    return job
+async def _get_enrichment_job(
+    job_id: str, viewer: Optional[AuthenticatedUser] = None
+) -> EnrichmentJobStatusResponse:
+    return await _get_job(_enrichment_jobs, job_id, viewer, "Enrichment job not found")
 
 
 async def _store_fusion_evidence_job(job: FusionEvidenceJobStatusResponse) -> None:
-    async with _fusion_evidence_jobs_lock:
-        _fusion_evidence_jobs[job.job_id] = job
+    await _fusion_evidence_jobs.put(job)
 
 
-async def _get_fusion_evidence_job(job_id: str) -> FusionEvidenceJobStatusResponse:
-    async with _fusion_evidence_jobs_lock:
-        job = _fusion_evidence_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Fusion evidence job not found")
-    return job
+async def _get_fusion_evidence_job(
+    job_id: str, viewer: Optional[AuthenticatedUser] = None
+) -> FusionEvidenceJobStatusResponse:
+    return await _get_job(_fusion_evidence_jobs, job_id, viewer, "Fusion evidence job not found")
+
+
+def _check_annotate_input_limit(fusions: List[FusionInput]) -> None:
+    limit = settings.annotate_max_inputs
+    if len(fusions) > limit:
+        raise HTTPException(status_code=422, detail=f"At most {limit} inputs may be annotated per request")
 
 
 def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
@@ -784,15 +785,46 @@ def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
     return inputs
 
 
+async def _retrieve_fusion_evidence_input(
+    item: FusionInput, semaphore: asyncio.Semaphore,
+) -> FusionEvidenceResult:
+    async with semaphore:
+        try:
+            return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
+        except Exception as exc:
+            logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
+            return FusionEvidenceResult(
+                fusion=item.fusion,
+                tumor_type=item.tumor_type,
+                interpretation=f"Fusion evidence retrieval failed: {exc}",
+            )
+
+
+async def _include_inline_fusion_evidence(
+    request: AnnotateRequest, result: AnnotationResult,
+) -> None:
+    if request.include_fusion_evidence:
+        start = time.perf_counter()
+        semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
+        result.fusion_evidence = list(await asyncio.gather(*(
+            _retrieve_fusion_evidence_input(item, semaphore)
+            for item in _fusion_evidence_inputs(request.fusions)
+        )))
+        elapsed = round((time.perf_counter() - start) * 1000, 2)
+        result.timings_ms["fusion_evidence"] = elapsed
+        result.timings_ms["total"] = round(result.timings_ms.get("total", 0.0) + elapsed, 2)
+
+
 async def _save_run_result(
     http_request: Request,
     request_payload: dict,
     result: AnnotationResult,
+    current_user: Optional[AuthenticatedUser],
 ) -> None:
     """Save a run, raising on failure. For callers that hand out a link to the
     run and so must not report success unless it was actually saved."""
     await http_request.app.state.run_store.save_run(
-        result.run_id, result.timestamp, request_payload, result.model_dump()
+        result.run_id, result.timestamp, request_payload, result.model_dump(), **run_owner(current_user)
     )
 
 
@@ -800,9 +832,10 @@ async def _persist_run_result(
     http_request: Request,
     request_payload: dict,
     result: AnnotationResult,
+    current_user: Optional[AuthenticatedUser],
 ) -> None:
     try:
-        await _save_run_result(http_request, request_payload, result)
+        await _save_run_result(http_request, request_payload, result, current_user)
     except Exception:
         # A run's own result always returns even if it can't be persisted for
         # later sharing — the run store isn't on the critical path for the caller.
@@ -1470,6 +1503,7 @@ async def annotate(
     Input supports plain strings or structured objects with optional tumor_type and breakpoint fields:
     `{ "fusions": ["ALK", {"fusion": "EML4::ALK", "tumor_type": "LUAD"}] }`
     """
+    _check_annotate_input_limit(request.fusions)
     _record_annotation_request_metrics(request, http_request, current_user)
     try:
         result = await run_pipeline(
@@ -1484,7 +1518,8 @@ async def annotate(
         logger.exception("Pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    await _persist_run_result(http_request, request.model_dump(), result)
+    await _include_inline_fusion_evidence(request, result)
+    await _persist_run_result(http_request, request.model_dump(), result, current_user)
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
     record_user_action(
@@ -1510,19 +1545,18 @@ async def _launch_annotation_job(
     error_action: str = "job_error",
     extra_details: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Queue a background annotation run in the in-memory job store and
+    """Queue a background annotation run in the job store and
     return its job ID. Shared by /v1/annotate/jobs and the gene query API.
 
     With require_persistence, a failure to save the run fails the job instead
     of being logged and ignored."""
-    await _evict_stale_annotation_jobs()
-
     job_id = str(uuid.uuid4())
     job = AnnotationJobStatusResponse(
         job_id=job_id,
         status="queued",
         fusions_processed=len(request.fusions),
         kind=kind,
+        owner=job_owner(current_user),
     )
     await _store_annotation_job(job)
 
@@ -1541,6 +1575,7 @@ async def _launch_annotation_job(
     async def run_job() -> None:
         current = await _get_annotation_job(job_id)
         current.status = "running"
+        current.phase = "annotation"
         await _store_annotation_job(current)
         try:
             result = await run_pipeline(
@@ -1554,12 +1589,18 @@ async def _launch_annotation_job(
                 on_total_known=on_total_known,
                 **({"strict_gene_lookup": True} if kind == "gene_query" else {}),
             )
+            if request.include_fusion_evidence:
+                current = await _get_annotation_job(job_id)
+                current.phase = "fusion_evidence"
+                await _store_annotation_job(current)
+            await _include_inline_fusion_evidence(request, result)
             if require_persistence:
-                await _save_run_result(http_request, request.model_dump(), result)
+                await _save_run_result(http_request, request.model_dump(), result, current_user)
             else:
-                await _persist_run_result(http_request, request.model_dump(), result)
+                await _persist_run_result(http_request, request.model_dump(), result, current_user)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
+            current.phase = "complete"
             current.result = result
             current.annotations = result.annotations
             current.genes_completed = result.genes_annotated
@@ -1587,6 +1628,7 @@ async def _launch_annotation_job(
             )
             current = await _get_annotation_job(job_id)
             current.status = "failed"
+            current.phase = "failed"
             current.error = str(exc)
             await _store_annotation_job(current)
 
@@ -1600,6 +1642,7 @@ async def create_annotation_job(
     http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> AnnotationJobCreateResponse:
+    _check_annotate_input_limit(request.fusions)
     _record_annotation_request_metrics(request, http_request, current_user)
     job_id = await _launch_annotation_job(request, http_request, current_user)
     return AnnotationJobCreateResponse(
@@ -1613,7 +1656,7 @@ async def get_annotation_job(
     job_id: str,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> AnnotationJobStatusResponse:
-    return await _get_annotation_job(job_id)
+    return await _get_annotation_job(job_id, viewer=current_user)
 
 
 @app.post("/v1/annotate/enrichment/jobs", response_model=EnrichmentJobCreateResponse)
@@ -1627,6 +1670,7 @@ async def create_enrichment_job(
         job_id=job_id,
         status="queued",
         annotations_total=len(request.annotations),
+        owner=job_owner(current_user),
     )
     await _store_enrichment_job(job)
 
@@ -1678,7 +1722,7 @@ async def get_enrichment_job(
     job_id: str,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> EnrichmentJobStatusResponse:
-    return await _get_enrichment_job(job_id)
+    return await _get_enrichment_job(job_id, viewer=current_user)
 
 
 @app.post("/v1/fusion-evidence/jobs", response_model=FusionEvidenceJobCreateResponse)
@@ -1688,26 +1732,16 @@ async def create_fusion_evidence_job(
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> FusionEvidenceJobCreateResponse:
     """Run exact fusion-pair PubMed evidence retrieval outside the annotation critical path."""
+    _check_annotate_input_limit(request.fusions)
     fusion_inputs = _fusion_evidence_inputs(request.fusions)
     job_id = str(uuid.uuid4())
     job = FusionEvidenceJobStatusResponse(
         job_id=job_id,
         status="queued",
         fusions_total=len(fusion_inputs),
+        owner=job_owner(current_user),
     )
     await _store_fusion_evidence_job(job)
-
-    async def run_one(item: FusionInput, semaphore: asyncio.Semaphore) -> FusionEvidenceResult:
-        async with semaphore:
-            try:
-                return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
-            except Exception as exc:
-                logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
-                return FusionEvidenceResult(
-                    fusion=item.fusion,
-                    tumor_type=item.tumor_type,
-                    interpretation=f"Fusion evidence retrieval failed: {exc}",
-                )
 
     async def run_job() -> None:
         start = time.perf_counter()
@@ -1716,7 +1750,10 @@ async def create_fusion_evidence_job(
         await _store_fusion_evidence_job(current)
         try:
             semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
-            tasks = [asyncio.create_task(run_one(item, semaphore)) for item in fusion_inputs]
+            tasks = [
+                asyncio.create_task(_retrieve_fusion_evidence_input(item, semaphore))
+                for item in fusion_inputs
+            ]
             for task in asyncio.as_completed(tasks):
                 result = await task
                 current = await _get_fusion_evidence_job(job_id)
@@ -1751,7 +1788,7 @@ async def get_fusion_evidence_job(
     job_id: str,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> FusionEvidenceJobStatusResponse:
-    return await _get_fusion_evidence_job(job_id)
+    return await _get_fusion_evidence_job(job_id, viewer=current_user)
 
 
 @app.post("/v1/annotate/gene", response_model=GeneAnnotationWithRun)
@@ -1783,7 +1820,7 @@ async def annotate_gene(
         logger.exception("Gene annotation pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    await save_run_or_raise(http_request, request.model_dump(), result)
+    await save_run_or_raise(http_request, request.model_dump(), result, current_user)
 
     if not result.annotations:
         raise HTTPException(status_code=500, detail="No gene annotation was returned")

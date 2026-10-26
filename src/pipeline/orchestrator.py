@@ -532,13 +532,13 @@ async def _annotate_gene(
 
 def _normalize_fusion_inputs(
     fusions: Union[List[str], List[FusionInput]],
-) -> tuple[List[str], Dict[str, str]]:
+) -> tuple[List[str], List[tuple[str, str]]]:
     """
     Accept either plain strings or FusionInput objects.
-    Returns (input_strings, tumor_type_by_input_string).
+    Returns (input_strings, ordered input/tumor-type pairs).
     """
     input_strings: List[str] = []
-    tumor_type_map: Dict[str, str] = {}
+    tumor_contexts: List[tuple[str, str]] = []
 
     for item in fusions:
         if isinstance(item, str):
@@ -546,9 +546,9 @@ def _normalize_fusion_inputs(
         else:
             input_strings.append(item.fusion)
             if item.tumor_type:
-                tumor_type_map[item.fusion] = item.tumor_type
+                tumor_contexts.append((item.fusion, item.tumor_type))
 
-    return input_strings, tumor_type_map
+    return input_strings, tumor_contexts
 
 
 async def run_pipeline(
@@ -575,7 +575,7 @@ async def run_pipeline(
     local_backend = resolve_local_backend(local_mode=local_mode, local_backend=local_backend)
     local_mode = local_backend is not None
 
-    input_strings, tumor_type_by_input = _normalize_fusion_inputs(fusions)
+    input_strings, tumor_contexts = _normalize_fusion_inputs(fusions)
     metric_tags = [
         f"mode:{mode}",
         f"local_backend:{local_backend or 'sdk'}",
@@ -607,16 +607,29 @@ async def run_pipeline(
     increment("genes.queried", value=len(gene_map), tags=metric_tags)
     logger.info("Resolved %d unique genes from %d inputs", len(gene_map), len(input_strings))
     await _maybe_call_total(on_total_known, len(gene_map))
-    warnings = await unparsed_fusion_warnings(input_strings, gene_map)
 
-    # Build per-gene tumor_type: first non-null tumor_type from the gene's submitted inputs.
+    # Preserve normalized input precedence, keeping the first non-null context
+    # for repeated input strings, and disclose conflicting contexts.
     gene_tumor_type: Dict[str, Optional[str]] = {}
+    warnings: List[str] = []
     for canonical, (_, gene_inputs) in gene_map.items():
-        for f in gene_inputs:
-            tt = tumor_type_by_input.get(f)
-            if tt:
-                gene_tumor_type[canonical] = tt
-                break
+        tumor_types_by_key: Dict[str, str] = {}
+        for value in gene_inputs:
+            for submitted, tt in tumor_contexts:
+                if submitted == value:
+                    key = " ".join(tt.strip().lower().split())
+                    if key:
+                        tumor_types_by_key.setdefault(key, tt)
+        tumor_types = list(tumor_types_by_key.values())
+        if tumor_types:
+            gene_tumor_type[canonical] = tumor_types[0]
+        if len(tumor_types) > 1:
+            warnings.append(
+                f"{canonical}: using tumor type {tumor_types[0]!r}; "
+                f"ignored tumor types: {', '.join(repr(tt) for tt in tumor_types[1:])}."
+            )
+    # Shared with the tumor-type notes above: append, never replace.
+    warnings.extend(await unparsed_fusion_warnings(input_strings, gene_map))
 
     # Annotate genes with bounded fan-out. PubMed, Redis, and LLM paths still
     # enforce their own lower-level limits/caches.

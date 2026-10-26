@@ -138,3 +138,39 @@ async def test_run_pipeline_preserves_real_fusions_for_partner_context(monkeypat
     }
     assert result.fusions_processed == 2
     assert result.annotations[0].fusions == ["EML4::ALK"]
+    assert result.warnings == [
+        "ALK: using tumor type 'LUAD'; ignored tumor types: 'lung adenocarcinoma'."
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tumor_types, expected, ignored", [
+    ([None, "LUAD", "melanoma", "LUAD"], "LUAD", ["melanoma"]),
+    (["LUAD", "melanoma", "glioma"], "LUAD", ["melanoma", "glioma"]),
+    ([None, "LUAD", "LUAD"], "LUAD", []),
+    ([None, None], None, []),
+    ([" Lung  Cancer ", "lung cancer", "LUNG   CANCER"], " Lung  Cancer ", []),
+    (["LUAD", " luad ", "Melanoma", " melanoma  "], "LUAD", ["Melanoma"]),
+])
+async def test_tumor_type_conflicts_warn_and_keep_first(monkeypatch, tumor_types, expected, ignored):
+    async def normalize(inputs):
+        return {"ALK": (ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True),
+                        list(dict.fromkeys(inputs)))}
+
+    async def annotate(gene, fusions, tumor_type=None, **kwargs):
+        assert tumor_type == expected
+        return GeneAnnotation(gene=gene, fusions=fusions)
+
+    monkeypatch.setattr("src.pipeline.orchestrator.normalize_fusions", normalize)
+    monkeypatch.setattr("src.pipeline.orchestrator._annotate_gene", annotate)
+    result = await run_pipeline([
+        FusionInput(fusion="ALK", tumor_type=tt) for tt in tumor_types
+    ])
+    assert result.annotations[0].analysis_tumor_type == expected
+    if ignored:
+        assert result.warnings == [
+            f"ALK: using tumor type {expected!r}; "
+            f"ignored tumor types: {', '.join(repr(tt) for tt in ignored)}."
+        ]
+    else:
+        assert result.warnings == []

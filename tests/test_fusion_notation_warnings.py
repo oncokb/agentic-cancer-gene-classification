@@ -499,3 +499,50 @@ def test_annotate_accepts_gene1_gene2_and_rejects_conflicts(client):
     )
     assert conflict.status_code == 422
     assert "conflicts with gene1/gene2" in conflict.text
+
+
+def _annotation_result(client, path: str, payload: dict) -> dict:
+    response = client.post(path, json=payload)
+    assert response.status_code == 200, response.text
+    if not path.endswith("/jobs"):
+        return response.json()
+    status_url = response.json()["status_url"]
+    deadline = time.time() + 5
+    while True:
+        body = client.get(status_url).json()
+        if body["status"] in ("complete", "failed") or time.time() > deadline:
+            break
+        time.sleep(0.02)
+    assert body["status"] == "complete", body
+    return body["result"]
+
+
+@pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
+@pytest.mark.parametrize("reused", [False, True], ids=["fresh", "cache_hit"])
+def test_tumor_type_and_notation_warnings_are_both_returned(client, monkeypatch, path, reused):
+    # #124's tumor-type conflict warnings and the notation warnings share one list.
+    if reused:
+        async def cached_annotation(*, gene, fusions, **kwargs):
+            return GeneAnnotation(gene=gene, fusions=fusions, cache_status="reused")
+
+        monkeypatch.setattr("src.pipeline.orchestrator._maybe_reuse_cached_annotation", cached_annotation)
+
+    result = _annotation_result(
+        client,
+        path,
+        {
+            "fusions": [
+                {"fusion": "ALK", "tumor_type": "LUAD"},
+                {"fusion": "ALK", "tumor_type": "melanoma"},
+                "EWSR1-FLI1",
+            ]
+        },
+    )
+
+    assert result["warnings"] == [
+        "ALK: using tumor type 'LUAD'; ignored tumor types: 'melanoma'.",
+        _EWSR1_FLI1_WARNING,
+    ]
+    assert {annotation["cache_status"] for annotation in result["annotations"]} == (
+        {"reused"} if reused else {None}
+    )
