@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -117,7 +117,10 @@ class Settings(BaseSettings):
     context_score_pubtype_preprint_weight: float = 0.3
     # Async job status snapshots (annotation, enrichment, gene-query and
     # fusion-evidence jobs) expire this long after the job's last update.
-    job_ttl_seconds: int = 86400
+    # Unset means 24h; see src.job_store.job_ttl_seconds().
+    job_ttl_seconds: Optional[int] = None
+    # Deprecated: used for every job kind only when JOB_TTL_SECONDS is unset.
+    annotation_job_ttl_seconds: Optional[int] = None
     # Max entries accepted per gene query API request (POST /v1/genes/query[/jobs]).
     gene_query_max_genes: int = 50
 

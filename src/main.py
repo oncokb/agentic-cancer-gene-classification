@@ -714,6 +714,8 @@ async def _cancel_openevidence_sidecar_lookups() -> None:
 
 # Job status lives in a shared store (Redis + process-local fallback) so any
 # pod can answer a poll; the job's task itself runs in the submitting process.
+# Gene-query jobs are annotation jobs (kind="gene_query"), so their snapshots
+# live under job:annotation:<id> too.
 _annotation_jobs = JobStore("annotation", AnnotationJobStatusResponse)
 _enrichment_jobs = JobStore("enrichment", EnrichmentJobStatusResponse)
 _fusion_evidence_jobs = JobStore("fusion_evidence", FusionEvidenceJobStatusResponse)
