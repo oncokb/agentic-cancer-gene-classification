@@ -11,7 +11,7 @@ from src import api_keys, auth, main
 from src.api_keys import ApiKeyRecord, InMemoryRateLimiter, generate_api_key, hash_api_key
 from src.auth import AuthenticatedUser, create_session_token
 from src.config import settings
-from src.pipeline.run_store import RunSummary, RunSummaryPage, _decode_runs_cursor, _encode_runs_cursor
+from src.pipeline.run_store import RunSummary, RunSummaryPage, _encode_runs_cursor
 
 
 def summary(run_id, day=1, **overrides):
@@ -46,6 +46,7 @@ def session(email="a@mskcc.org"):
 
 
 def test_owner_scoping_and_metadata_contract(client):
+    # Session tokens normalize email already; API-key tests cover owner normalization.
     http, store = client
     rows = {"a@mskcc.org": [summary("a", 3)], "b@mskcc.org": [summary("b", 2)]}
 
@@ -112,13 +113,10 @@ def test_paging_until_null(client):
 def test_bad_cursor_422(client, cursor):
     http, store = client
 
-    async def invalid_cursor(owner, limit, cursor):
-        _decode_runs_cursor(cursor)
-
-    store.list_runs_for_owner.side_effect = invalid_cursor
     response = http.get("/v1/runs", params={"cursor": cursor}, headers=session())
     assert response.status_code == 422
-    assert "cursor" in response.json()["detail"].lower()
+    assert response.json()["detail"] == "Invalid cursor"
+    store.list_runs_for_owner.assert_not_awaited()
 
 
 @pytest.mark.parametrize("limit", ["0", "-1", "101", "abc", "1.5"])
@@ -137,12 +135,14 @@ def test_valid_limit_bounds(client, limit):
     store.list_runs_for_owner.assert_awaited_once_with("a@mskcc.org", limit=limit, cursor=None)
 
 
-def test_store_validation_error_422(client):
-    http, store = client
-    store.list_runs_for_owner.side_effect = ValueError("limit must be at least 1")
+def test_store_value_error_returns_500(client):
+    _, store = client
+    store.list_runs_for_owner.side_effect = ValueError("private row handling error")
+    http = TestClient(main.app, raise_server_exceptions=False)
     response = http.get("/v1/runs", headers=session())
-    assert response.status_code == 422
-    assert response.json()["detail"] == "limit must be at least 1"
+    http.close()
+    assert response.status_code == 500
+    assert "private row handling error" not in response.text
 
 
 def test_unauthenticated_401(client):

@@ -7,7 +7,9 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from src.api.run_persistence import run_owner
 from src.auth import AuthenticatedUser, require_auth
+from src.pipeline.run_store import _decode_runs_cursor
 
 router = APIRouter()
 
@@ -42,12 +44,14 @@ async def list_runs(
     store = getattr(request.app.state, "run_store", None)
     if store is None:
         raise HTTPException(status_code=503, detail="Run storage is unavailable.")
-    try:
-        page = await store.list_runs_for_owner(
-            current_user.email.strip().lower(), limit=limit, cursor=cursor,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if cursor is not None:
+        try:
+            _decode_runs_cursor(cursor)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid cursor") from exc
+    page = await store.list_runs_for_owner(
+        run_owner(current_user)["owner_email"], limit=limit, cursor=cursor,
+    )
     return RunListResponse(
         runs=[
             RunSummaryResponse(

@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
 from src.api.run_persistence import run_owner, save_run_or_raise
+from src.api.runs import router as runs_router
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
     AuthenticatedUser,
@@ -67,7 +68,6 @@ from src.auth import (
 )
 from src.config import settings
 from src.logging_utils import install_secret_redaction_filter
-from src.api.runs import router as runs_router
 from src.models.schema import (
     AnnotateRequest,
     AnnotationMode,

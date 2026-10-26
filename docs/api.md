@@ -311,4 +311,8 @@ Query parameters: `limit` (default `20`, range `1`–`100`) and optional opaque
 `source`, `input_summary`, `input_count`, and `genes_annotated` may be null.
 `next_cursor` is null on the last page, including an empty list. Responses contain
 metadata only, never request or result blobs. Invalid limits or cursors return
-`422`; unauthenticated requests return `401`; unavailable run storage returns `503`.
+`422`, whose `detail` may be a string or FastAPI's validation-error list.
+Unauthenticated requests return `401`. Run storage that isn't configured returns
+`503`; a database outage returns `500`, like `GET /v1/annotate/{run_id}`.
+`created_at` is an ISO-8601 UTC timestamp and may include microseconds.
+The `run_id` in `view_url` is URL-encoded.
