@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import xml.etree.ElementTree as ET
+from bisect import bisect_left
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple
@@ -263,7 +264,7 @@ def _tumor_type_prompt_note(tumor_type: str) -> str:
 # in UTROSCT describes a resemblance; the tumor is uterine (issue #121).
 _TUMOR_MENTION_EXCLUSIONS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"uterine[\s-]+tumou?rs?[\s-]+resembling[\s-]+ovarian[\s-]+sex[\s-]+cord"
+        r"uterine[\s-]+tumou?rs?[\s-]+resembling[\s-]+ovarian[\s-]+sex[\s-]*cord"
         r"(?:[\s-]+(?:stromal[\s-]+)?tumou?rs?)?",
         re.IGNORECASE,
     ),
@@ -367,34 +368,52 @@ def _requested_tumor_matchers(tumor_identity: str) -> tuple[tuple[str, re.Patter
     return tuple(matchers)
 
 
-def _mask_tumor_mention_exclusions(text: str, tumor_identity: str) -> str:
+def _tumor_mention_exclusion_spans(text: str, tumor_identity: str) -> list[tuple[int, int]]:
     terms = {normalize_tumor_identity(term) for term, _ in _requested_tumor_match_terms(tumor_identity)}
     if terms & _UTROSCT_TERM_KEYS:
-        return text
-    for pattern in _TUMOR_MENTION_EXCLUSIONS:
-        text = pattern.sub(lambda match: " " * len(match.group()), text)
-    return text
+        return []
+    return [match.span() for pattern in _TUMOR_MENTION_EXCLUSIONS for match in pattern.finditer(text)]
 
 
-def _tumor_match_texts(text: str, tumor_identity: str) -> tuple[str, str, list[int]]:
-    """Keep original offsets to check dehyphenated matches against guarded text."""
+_TumorMatchTexts = tuple[str, str, list[int], list[tuple[int, int]]]
+
+
+def _tumor_match_texts(text: str, tumor_identity: str) -> _TumorMatchTexts:
+    """Map both normalizations and their exclusions to the hyphenated text's offsets."""
     soft_text = " ".join(text.translate(_TUMOR_SOFT_TEXT_TRANSLATION).split())
-    guarded = _mask_tumor_mention_exclusions(soft_text.replace("\u00ad", "-"), tumor_identity)
-    positions = [i for i, char in enumerate(soft_text) if char != "\u00ad" or guarded[i] == " "]
-    joined = _mask_tumor_mention_exclusions("".join(guarded[i] for i in positions), tumor_identity)
-    return guarded, joined, positions
+    hyphenated = soft_text.replace("\u00ad", "-")
+    positions = [i for i, char in enumerate(soft_text) if char != "\u00ad"]
+    joined = "".join(soft_text[i] for i in positions)
+    excluded = _tumor_mention_exclusion_spans(hyphenated, tumor_identity)
+    excluded.extend(
+        (positions[start], positions[end - 1] + 1)
+        for start, end in _tumor_mention_exclusion_spans(joined, tumor_identity)
+    )
+    return hyphenated, joined, positions, excluded
 
 
-def _matches_tumor_text(pattern: re.Pattern[str], texts: tuple[str, str, list[int]]) -> bool:
-    guarded, joined, positions = texts
-    if pattern.search(guarded):
-        return True
-    for match in pattern.finditer(joined):
-        start, end = positions[match.start()], positions[match.end() - 1] + 1
-        # Removing an internal soft hyphen can restore a word, but cannot
-        # remove an excluded phrase or bypass the original word-edge guards.
-        if _TUMOR_START_GUARD.match(guarded, start) and _TUMOR_END_GUARD.match(guarded, end):
-            return True
+def _matches_tumor_text(pattern: re.Pattern[str], texts: _TumorMatchTexts) -> bool:
+    hyphenated, joined, positions, excluded = texts
+    for text, is_joined in ((hyphenated, False), (joined, True)):
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if is_joined:
+                start, end = positions[start], positions[end - 1] + 1
+            if any(start < excluded_end and end > excluded_start
+                   for excluded_start, excluded_end in excluded):
+                continue
+            joined_start = bisect_left(positions, start)
+            joined_end = bisect_left(positions, end)
+            # A candidate from either form must pass the edges of BOTH forms.
+            # This retains B-ALL/B\u00adALL while rejecting no\u00adn small cell,
+            # non-\u00adsmall cell and breast\u00adfeeding in their original context.
+            if (
+                _TUMOR_START_GUARD.match(hyphenated, start)
+                and _TUMOR_END_GUARD.match(hyphenated, end)
+                and _TUMOR_START_GUARD.match(joined, joined_start)
+                and _TUMOR_END_GUARD.match(joined, joined_end)
+            ):
+                return True
     return False
 
 
@@ -966,7 +985,8 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
             # 4: compatibility dashes, soft hyphen as "-", dash-folded identity, "non- ".
             # 5: remove internal soft hyphens while retaining guards and exclusions.
-            "tumor_scope_version": 5,
+            # 6: exclusions and edge guards from either soft-hyphen normalization veto a span.
+            "tumor_scope_version": 6,
         },
         sort_keys=True,
     )

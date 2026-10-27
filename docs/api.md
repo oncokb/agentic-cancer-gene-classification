@@ -539,6 +539,8 @@ polling intervals at 15 seconds or longer when you have several jobs running.
   use it only when you need a fresh answer. It also bypasses and replaces the
   fusion-evidence cache when inline evidence is requested. For a separate
   fusion-evidence job, set `force_refresh: true` on that job request too.
+  Refreshing the fusion-evidence result still reuses the underlying PubMed
+  search and fetch caches (default TTL: 24 hours) to limit NCBI load.
 - For more than a handful of uncached genes, use a background job rather than
   holding one request open.
 

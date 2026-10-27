@@ -432,7 +432,7 @@ def test_cache_key_is_bumped_for_tumor_scope(monkeypatch):
     )
 
     assert key != pre_scope_key
-    assert json.loads(key.removeprefix("fusion_evidence:"))["tumor_scope_version"] == 5
+    assert json.loads(key.removeprefix("fusion_evidence:"))["tumor_scope_version"] == 6
 
 
 async def test_retrieve_fusion_evidence_uses_the_bumped_cache_key(monkeypatch):
@@ -581,3 +581,24 @@ def test_free_text_query_fallback_uses_cache_identity():
     queries = [literature._fusion_evidence_queries("A::B", form, [], []) for form in forms]
     assert queries[0] == queries[1] == queries[2]
     assert all(literature._expand_tumor_type_terms(form) == ["breast-cancer"] for form in forms)
+
+
+@pytest.mark.parametrize("tumor_type, text, expected", [
+    ("ovarian", "Uterine tumor resembling ovar\u00adian sex\u00adcord tumor.", []),
+    ("ovarian", "Uterine tu\u00admor resembling ovarian sex cord tumor.", []),
+    ("ovarian", "Uterine tumor resem\u00adbling ovarian sex cord tumor.", []),
+    ("ovarian", "Uterine tumor resembling ovarian sexcord tumor.", []),
+    ("SCLC", "Seen in no\u00adn small cell lung cancer.", []),
+    ("SCLC", "Seen in non-\u00adsmall cell lung cancer.", []),
+    ("SCLC", "Seen in non\u00ad-small cell lung cancer.", []),
+    ("ALL", "Recurrent fusions in B-ALL.", ["B-ALL"]),
+    ("ALL", "Recurrent fusions in B\u00adALL.", ["B-ALL"]),
+    ("breast", "Exposure through breastfeeding.", []),
+    ("breast", "Exposure through breast\u00adfeeding.", []),
+    # A veto applies only to its own span, preserving independent true mentions.
+    ("ovarian", "Uterine tu\u00admor resembling ovarian sexcord tumor; ovarian carcinoma.", ["ovarian"]),
+    ("SCLC", "No\u00adn small cell lung cancer; small cell lung cancer.", ["small cell lung cancer"]),
+])
+@pytest.mark.parametrize("field", ["title", "abstract"])
+def test_either_normalization_can_veto_a_tumor_span(tumor_type, text, expected, field):
+    assert _terms(tumor_type, **{field: text}) == expected
