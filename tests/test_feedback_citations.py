@@ -162,12 +162,30 @@ def test_explicit_double_colon_fusion_is_preferred_over_slash():
     assert extract_subject("TP53/EGFR and EML4::ALK fusion.") == ("EML4::ALK", True)
 
 
+def test_explicit_double_colon_wins_over_structured_gene():
+    assert extract_subject("Review GREB1::BCL9L fusion.", "TP53") == ("GREB1::BCL9L", True)
+
+
+def test_slash_pair_is_only_a_fusion_when_a_fusion_word_is_adjacent():
+    assert extract_subject("TP53/EGFR co-mutation; GREB1-BCL9L fusion") == (
+        "GREB1::BCL9L",
+        True,
+    )
+    assert extract_subject("Review TP53/EGFR co-mutation.") == (None, False)
+    assert extract_subject("BCR/ABL1 fusion") == ("BCR::ABL1", True)
+    assert extract_subject("fusion BCR/ABL1") == ("BCR::ABL1", True)
+    assert extract_subject("BCR/ABL1 rearrangement") == ("BCR::ABL1", True)
+    assert extract_subject("BCR/ABL1 translocation") == ("BCR::ABL1", True)
+
+
 def test_clinical_acronyms_are_not_fusion_partners():
     assert extract_subject("ER/PR status; GREB1-BCL9L fusion") == ("GREB1::BCL9L", True)
 
 
-def test_extract_subject_prefers_structured_gene():
-    assert extract_subject("Review GREB1::BCL9L fusion.", "TP53") == ("TP53", False)
+def test_structured_gene_wins_over_adjacent_slash_pair():
+    assert extract_subject(
+        "TP53/EGFR co-mutation; GREB1-BCL9L fusion", "TP53"
+    ) == ("TP53", False)
 
 
 def test_hyphenated_gene_symbol_is_not_mistaken_for_a_fusion():

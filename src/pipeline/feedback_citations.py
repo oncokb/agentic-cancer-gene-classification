@@ -117,8 +117,19 @@ _ASSAY_NAMES = frozenset({
 # as fusions just because they contain a hyphen.
 _HYPHENATED_GENE_PREFIXES = frozenset({"HLA", "MT", "TRB", "TRA", "IGH", "IGK", "IGL"})
 _VARIANT_PREFIXES = ("EXON", "DEL", "INS", "MUT")
-_FUSION_CONTEXT = re.compile(
-    r"\b(fusion|fusions|fused|chimeric|rearrangement|rearranged|translocation)\b",
+_FUSION_KEYWORD = (
+    r"(?:fusion|fusions|fused|chimeric|rearrangement|rearranged|translocation)"
+)
+# A "/" or "-" pair is only a fusion when one of the fusion words is directly
+# adjacent to it. Arbitrary fusion wording elsewhere in the message (e.g. after
+# an unrelated "TP53/EGFR co-mutation") must not turn every pair into a fusion.
+_FUSION_BEFORE_PAIR = re.compile(
+    rf"{_FUSION_KEYWORD}"
+    r"(?:\s*[-/]?\s*(?:positive|negative|driven|associated))?\s*$",
+    re.IGNORECASE,
+)
+_FUSION_AFTER_PAIR = re.compile(
+    rf"^\s*-?\s*(?:positive|negative|driven|associated)?\s*{_FUSION_KEYWORD}\b",
     re.IGNORECASE,
 )
 _TUMOR_DASHES = str.maketrans({
@@ -279,32 +290,45 @@ def _valid_fusion_pair(left: str, right: str, separator: str) -> bool:
     return True
 
 
+def _fusion_keyword_adjacent(message: str, start: int, end: int) -> bool:
+    """Return True when a fusion word directly precedes or follows the pair."""
+    return bool(
+        _FUSION_BEFORE_PAIR.search(message[:start])
+        or _FUSION_AFTER_PAIR.match(message[end:])
+    )
+
+
 def _fusion_matches(message: str) -> List[Tuple[str, str, str]]:
     matches = []
     for match in _FUSION_SUBJECT.finditer(message or ""):
         left, separator, right = match.group(1), match.group(2), match.group(3)
         if not _valid_fusion_pair(left, right, separator):
             continue
-        if separator in ("-", "/") and not _FUSION_CONTEXT.search(message or ""):
+        if separator in ("-", "/") and not _fusion_keyword_adjacent(
+            message, match.start(), match.end()
+        ):
             continue
         matches.append((left, separator, right))
     return matches
 
 
 def extract_subject(message: str, gene: Optional[str] = None) -> Tuple[Optional[str], bool]:
-    """Return (subject, is_fusion) from the structured field or message.
+    """Return (subject, is_fusion) following the documented precedence.
 
-    The structured gene keeps its submitted case. Free-text fusions prefer an
-    explicit "::" match anywhere in the message over a "-" or "/" match, so a
-    real fusion is not lost behind an earlier slash-separated phrase.
+    An explicit "::" anywhere in the message wins over everything, then the
+    structured field (kept in its submitted case), then "-"/"/" pairs only
+    when a fusion word is directly adjacent to them.
     """
+    matches = _fusion_matches(message)
+    explicit = [item for item in matches if ":" in item[1]]
+    if explicit:
+        left, _, right = explicit[0]
+        return f"{left}::{right}", True
     if gene and gene.strip():
         subject = gene.strip()
         _, right = _split_subject(subject)
         return subject, right is not None
-    matches = _fusion_matches(message)
-    preferred = [item for item in matches if "::" in item[1]]
-    for left, _, right in preferred or matches:
+    for left, _, right in matches:
         return f"{left}::{right}", True
     match = _NAMED_GENE_SUBJECT.search(message or "")
     if match:
