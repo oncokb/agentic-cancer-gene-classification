@@ -88,10 +88,12 @@ curl -s -X POST https://acgc.oncokb.org/v1/genes/query \
 
 Accepted gene identifiers for the gene query API:
 
-- HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`, and Ensembl gene IDs such
-  as `ENSG00000141510` or `ENSG00000141510.17`.
-- Letters, digits, `-` and `.` only, starting and ending with a letter or
-  digit.
+- HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`, and Ensembl gene,
+  transcript and protein IDs such as `ENSG00000141510.17`, `ENST00000269305`
+  or `ENSP00000269305`, also as `TP53(ENST00000269305)` or
+  `ENST00000269305:c.215C>G`. See [Gene identifiers](#gene-identifiers).
+- Symbols: letters, digits, `-` and `.` only, starting and ending with a
+  letter or digit.
 - **Not fusions.** `EML4::ALK`, `ALK::` and similar are rejected with `422`.
   Use the full `/v1/annotate` endpoint for fusions (see the
   [README](../README.md#acgc-api-keys-for-scripts)).
@@ -131,6 +133,8 @@ Accepted gene identifiers for the gene query API:
 | `run_id` | ID of the saved run that holds these results. |
 | `view_url` | Link to the full report in the ACGC web app. Whoever opens it signs in first if they aren't already, then lands on the report. |
 | `gene` | The gene symbol ACGC classified. This can differ from what you sent, for example when an Ensembl ID or an old alias resolves to the current symbol. |
+| `submitted_inputs` | What you sent, when it was rewritten to `gene` (for example an Ensembl transcript ID). Empty otherwise. |
+| `warnings` | Caveats about how an input was read, for example an HGVS variant that was not interpreted. |
 | `tumor_type` | The tumor type the classification actually used, or `null`. |
 | `cancer_associated` | Whether ACGC classifies the gene as cancer-associated. |
 | `gene_class` | Functional class, for example a kinase. |
@@ -146,6 +150,48 @@ Accepted gene identifiers for the gene query API:
 The gene query API deliberately leaves out abstracts, quotes, evidence cards
 and OpenEvidence content. Open its `view_url` to see them. (The annotate
 endpoints return full annotations, including evidence cards.)
+
+### Gene identifiers
+
+Every endpoint that takes genes or fusions (`/v1/genes/...`, `/v1/annotate`,
+`/v1/annotate/jobs`, `/v1/annotate/gene`, `/v1/fusion-evidence/jobs`) accepts,
+alone or as either fusion partner:
+
+| Input | Read as |
+| --- | --- |
+| `TP53` | HGNC symbol (aliases and previous symbols resolve to the current symbol). |
+| `ENSG00000141510`, `ENSG00000141510.17` | The Ensembl gene's symbol. |
+| `ENST00000269305`, `ENST00000269305.9` | The symbol of the gene that owns the transcript. |
+| `ENSP00000269305` | Protein → its transcript → that transcript's gene. |
+| `TP53(ENST00000269305)` | `TP53`, after checking the transcript belongs to TP53. In a fusion, the transcript is used as that partner's breakpoint transcript. |
+| `ENST00000269305:c.215C>G`, `ENSP00000269305:p.Arg72Pro` | The transcript's gene, with a warning: the variant itself is **not** interpreted. |
+
+So `ENST00000318522::ENST00000389048` is annotated as `EML4::ALK`, and fusion
+evidence searches PubMed for the symbols, not the IDs. Only human stable IDs
+(`ENSG`/`ENST`/`ENSP` plus 11 digits, optional `.version`) are accepted.
+Ensembl IDs are never fuzzy-matched to a gene.
+
+Your original input stays in the result: `resolved_inputs` on each annotation
+(`input`, `resolved`, `five_transcript`, `three_transcript`, `warnings`),
+`submitted_inputs` in gene-query results, and `input` on fusion-evidence
+results. Request-level `warnings` repeat any caveats and errors.
+
+An identifier that can't be used gets its own error row and is not annotated
+as any gene. That covers an unknown or malformed ID, an Ensembl lookup that
+failed (retry), and `GENE(ENST...)` where the transcript belongs to a different
+gene. In the gene query API the last case reads "The Ensembl ID belongs to a
+different gene than the one named."
+
+In a fusion, only the bad partner is rejected: the other partner is still
+annotated on its own. For `EML4(ENST00000256078)::ALK` (a KRAS transcript),
+ALK is annotated, and the error row and request `warnings` say "5′ partner of
+'EML4(ENST00000256078)::ALK' rejected — ... belongs to KRAS, not EML4". Fix
+the partner and resubmit to annotate the fusion as a pair.
+
+Fusion evidence for a fusion with a rejected partner is not searched. The entry
+has `retrieval_status: "failed"` and `literature_scope: null`, and its
+`interpretation` gives the reason. The empty result does not mean there is no
+literature.
 
 ## 4. Gene query background jobs
 
@@ -492,16 +538,11 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 - `POST /v1/annotate` (and its jobs) returns `fusion_evidence: []` by default.
   Set `include_fusion_evidence: true` or run `POST /v1/fusion-evidence/jobs`
   separately for exact fusion-pair evidence.
-- Only one tumor type is used per gene per request, chosen in two stages. If
-  the **same input string** is repeated with different tumor types, the first
-  non-empty `tumor_type` is kept. Then, from the merged input list for a gene,
-  the first non-null tumor type is used; ignored conflicting types are named
-  in the response-level `warnings`. That list preserves submission order
-  only among inputs using the same symbol. Across aliases or Ensembl IDs, the
-  inputs are resolved and merged in an identifier-dependent order (sorted
-  Ensembl IDs before sorted HGNC symbols;
-  `src/pipeline/normalization.py:245-268`), so the chosen tumor type is **not
-  guaranteed** to be the first one you submitted. If the tumor type matters,
+- Only one tumor type is used per gene per request: the first non-empty
+  `tumor_type` in submission order among all inputs that resolve to that gene,
+  whatever their spelling (`TP53`, an alias, `ENSG...`, `ENST...`, `ENSP...`
+  or `TP53(ENST...)`). Ignored conflicting types are named in the
+  response-level `warnings`. To annotate a gene in more than one tumor type,
   send one request per tumor type.
 - Fusion separators are `::`, `--` and `/` only. A single hyphen is **not** a
   separator: `EWSR1-FLI1` is treated as one gene symbol, not a fusion. Write

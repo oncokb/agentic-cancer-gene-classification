@@ -151,6 +151,8 @@ def test_slim_mapping_is_an_allowlist():
 
     assert set(GeneRationale.model_fields) == {
         "gene",
+        "submitted_inputs",
+        "warnings",
         "tumor_type",
         "cancer_associated",
         "gene_class",
@@ -427,48 +429,47 @@ def _reported(response_json):
 
 
 _COLLISIONS = [
-    # Ensembl ID and symbol for the same gene: production resolves Ensembl IDs first.
-    ({"gene": "TP53", "tumor_type": "LUAD"}, {"gene": _TP53_ENSEMBL, "tumor_type": "AML"}, "TP53", "AML"),
-    # Alias and symbol: production resolves HGNC symbols in sorted order (KAT6A < MOZ).
-    ({"gene": "MOZ", "tumor_type": "AML"}, {"gene": "KAT6A", "tumor_type": "LUAD"}, "KAT6A", "LUAD"),
+    # Two spellings of one gene: the first-submitted tumor type wins, whatever
+    # the identifier type (Ensembl ID vs symbol, alias vs symbol).
+    ({"gene": "TP53", "tumor_type": "LUAD"}, {"gene": _TP53_ENSEMBL, "tumor_type": "AML"}, "TP53"),
+    ({"gene": "MOZ", "tumor_type": "AML"}, {"gene": "KAT6A", "tumor_type": "LUAD"}, "KAT6A"),
 ]
 
 
-@pytest.mark.parametrize("first,second,gene,expected", _COLLISIONS)
+@pytest.mark.parametrize("first,second,gene", _COLLISIONS)
 @pytest.mark.parametrize("reverse", [False, True])
-def test_collision_reports_tumor_type_the_pipeline_used(client, real_pipeline, first, second, gene, expected, reverse):
+def test_collision_reports_tumor_type_the_pipeline_used(client, real_pipeline, first, second, gene, reverse):
     genes = [second, first] if reverse else [first, second]
 
     response = client.post("/v1/genes/query", json={"genes": genes})
 
     assert response.status_code == 200
     assert _reported(response.json()) == {gene: real_pipeline["used"][gene]}
-    assert real_pipeline["used"][gene] == expected
+    assert real_pipeline["used"][gene] == genes[0]["tumor_type"]
 
 
-@pytest.mark.parametrize("first,second,gene,expected", _COLLISIONS)
+@pytest.mark.parametrize("first,second,gene", _COLLISIONS)
 @pytest.mark.parametrize("reverse", [False, True])
-def test_collision_in_job_reports_tumor_type_the_pipeline_used(
-    client, real_pipeline, first, second, gene, expected, reverse
-):
+def test_collision_in_job_reports_tumor_type_the_pipeline_used(client, real_pipeline, first, second, gene, reverse):
     genes = [second, first] if reverse else [first, second]
 
     created = client.post("/v1/genes/query/jobs", json={"genes": genes})
     body = _poll(client, created.json()["status_url"])
 
     assert body["status"] == "complete"
-    assert _reported(body) == {gene: real_pipeline["used"][gene]} == {gene: expected}
+    assert _reported(body) == {gene: real_pipeline["used"][gene]} == {gene: genes[0]["tumor_type"]}
 
 
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("route", ["sync", "job"])
 def test_cached_annotation_reports_tumor_type_the_pipeline_used(client, real_pipeline, reverse, route):
-    # Only the AML-context TP53 annotation is cached; the pipeline picks AML for
-    # this collision, so it must reuse that entry and report AML.
-    real_pipeline["store"].gene_cache[("TP53", "aml")] = _rich_annotation("TP53")
+    # Only the first-submitted tumor type's TP53 annotation is cached; the
+    # pipeline picks that tumor type, so it must reuse that entry and report it.
     genes = [{"gene": "TP53", "tumor_type": "LUAD"}, {"gene": _TP53_ENSEMBL, "tumor_type": "AML"}]
     if reverse:
         genes.reverse()
+    first = genes[0]["tumor_type"]
+    real_pipeline["store"].gene_cache[("TP53", first.lower())] = _rich_annotation("TP53")
 
     if route == "sync":
         body = client.post("/v1/genes/query", json={"genes": genes}).json()
@@ -476,9 +477,9 @@ def test_cached_annotation_reports_tumor_type_the_pipeline_used(client, real_pip
         body = _poll(client, client.post("/v1/genes/query/jobs", json={"genes": genes}).json()["status_url"])
 
     assert real_pipeline["used"] == {}  # served from cache, no fresh annotation
-    assert real_pipeline["store"].gene_cache_lookups == [("TP53", "aml")]
+    assert real_pipeline["store"].gene_cache_lookups == [("TP53", first.lower())]
     assert body["results"][0]["cache_status"] == "reused"
-    assert _reported(body) == {"TP53": "AML"}
+    assert _reported(body) == {"TP53": first}
 
 
 def test_mixed_and_alias_tumor_types_with_real_pipeline(client, real_pipeline):

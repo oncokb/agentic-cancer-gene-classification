@@ -1606,6 +1606,8 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
       <div class="annotation-fields"></div>
     `;
 
+    const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
+    if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);
     const cacheBadge = renderCacheBadge(annotation);
     if (cacheBadge) card.querySelector(".cache-badge-slot").appendChild(cacheBadge);
     card.querySelector(".status-line-slot").appendChild(renderStatusLine(annotation));
@@ -1692,6 +1694,8 @@ function renderNoResultView(hiddenAnnotations) {
         <div class="field-row-value">${escapeHtml(reason)}</div>
       </div>
     `;
+    const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
+    if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);
     const summary = String(annotation.gene_summary || "").trim();
     if (summary) {
       const summaryRow = document.createElement("div");
@@ -1727,6 +1731,36 @@ function resetFusionEvidenceSections(resultKey = null) {
 
 function fusionEvidencePmidCount(item) {
   return item.retrieved_count || (item.pmids || []).length;
+}
+
+// "TP53 — from ENST00000269305" for each input the server rewrote (Ensembl
+// IDs resolved to symbols), plus that input's warnings. Text only: these
+// strings echo user input, so never go through innerHTML.
+function renderSubmittedInputNote(resolutions) {
+  const rows = (resolutions || []).filter(
+    (entry) => entry && entry.input && (entry.input !== entry.resolved || (entry.warnings || []).length),
+  );
+  if (!rows.length) return null;
+  const note = document.createElement("div");
+  note.className = "subtle submitted-input-note";
+  rows.forEach((entry) => {
+    if (entry.input !== entry.resolved) {
+      const line = document.createElement("div");
+      line.textContent = `${entry.resolved} — from ${entry.input}`;
+      note.appendChild(line);
+    }
+    (entry.warnings || []).forEach((warning) => {
+      const line = document.createElement("div");
+      line.className = "submitted-input-warning";
+      line.textContent = warning;
+      note.appendChild(line);
+    });
+  });
+  return note;
+}
+
+function fusionEvidenceInputNote(item) {
+  return renderSubmittedInputNote(item.input ? [{ input: item.input, resolved: item.fusion, warnings: [] }] : []);
 }
 
 function renderFusionEvidenceView(fusionEvidence) {
@@ -1832,6 +1866,8 @@ function renderFusionEvidenceCard(item) {
   const heading = appendFusionText(header, "div", "annotation-heading");
   appendFusionText(heading, "h4", "fusion-section-card-name", item.fusion);
   appendFusionText(heading, "div", "subtle", item.tumor_type || "Any tumor type");
+  const inputNote = fusionEvidenceInputNote(item);
+  if (inputNote) heading.appendChild(inputNote);
   const meta = appendFusionText(header, "div", "annotation-card-meta");
   appendFusionText(meta, "span", `review-badge ${item.well_supported ? "high" : "low"}`,
     item.well_supported ? "Well supported" : "Exploratory");
@@ -2136,11 +2172,20 @@ function renderSupportingEvidence(annotation) {
 // from the fusion-annotation service response, never through the LLM. This
 // keeps latency and clutter off the default card: nothing here fetches until
 // a curator explicitly expands the section for a given fusion.
-function fetchFusionContext(fusionKey) {
+// Submitted input row for an annotated fusion string. The server rewrites
+// Ensembl-form inputs (ENST...::ENST..., GENE(ENST...)::...) to symbols, so
+// fall back to the submitted form it reports in resolved_inputs.
+function lastInputForFusion(annotation, fusion) {
+  if (state.lastInputsByFusion[fusion]) return state.lastInputsByFusion[fusion];
+  const resolution = (annotation.resolved_inputs || []).find((entry) => entry.resolved === fusion);
+  return resolution ? state.lastInputsByFusion[resolution.input] || { fusion: resolution.input } : undefined;
+}
+
+function fetchFusionContext(fusionKey, annotation) {
   if (state.fusionContextByFusion[fusionKey]) {
     return state.fusionContextByFusion[fusionKey];
   }
-  const requestBody = { fusion: fusionKey, ...(state.lastInputsByFusion[fusionKey] || {}) };
+  const requestBody = { fusion: fusionKey, ...(lastInputForFusion(annotation, fusionKey) || {}) };
   const promise = fetch("/v1/fusion-context", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2279,7 +2324,7 @@ function renderDomainsAndTreatments(annotation) {
   details.addEventListener("toggle", () => {
     if (!details.open || loaded) return;
     loaded = true;
-    fetchFusionContext(fusionKey)
+    fetchFusionContext(fusionKey, annotation)
       .then((response) => renderFusionContextResult(body, response))
       .catch(() => {
         body.textContent = "Domain and treatment data not available for this fusion.";
@@ -2837,7 +2882,7 @@ function fusionPartnerGenes(annotation) {
 
 function tumorTypeForAnnotation(annotation) {
   for (const fusion of annotation.fusions || []) {
-    const match = state.lastInputsByFusion[fusion];
+    const match = lastInputForFusion(annotation, fusion);
     if (match && match.tumor_type) return match.tumor_type;
   }
   return null;

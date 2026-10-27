@@ -276,7 +276,26 @@ function testResultsAndNoResultSidebarUnchanged() {
   }
 }
 
-const tests = [testSectioningAndOrder, testEmptySectionsOmitted,
+function testSectionedCardShowsSubmittedInputNote() {
+  const sandbox = app();
+  const submitted = "ENST00000318522::<b>ENST00000389048</b>";
+  sandbox.renderFusionEvidenceView([
+    { fusion: "EML4::ALK", input: submitted, tumor_type: "Lung", literature_scope: "requested_tumor", pmids: ["1"] },
+    { fusion: "KIF5B::RET", tumor_type: "Lung", literature_scope: "requested_tumor", pmids: ["2"] },
+  ]);
+  const [section] = sandbox.elements.resultsWindow.children[0].children;
+  assert.strictEqual(section.children[0].children[0].textContent, "Found in Lung (2)");
+  const [noted, plain] = section.children[1].children;
+  const heading = noted.children[0].children[0];
+  assert.strictEqual(heading.children[0].tagName, "h4");
+  const note = heading.children.find((node) => hasClass(node, "submitted-input-note"));
+  assert.ok(note, "sectioned fusion card should carry the submitted-input note");
+  assert.deepStrictEqual(note.children.map((line) => line.textContent), [`EML4::ALK — from ${submitted}`]);
+  assert.ok(!walk(note).some((node) => node.innerHTML), "note must be text-only");
+  assert.ok(!walk(plain).some((node) => hasClass(node, "submitted-input-note")));
+}
+
+const tests = [testSectioningAndOrder, testSectionedCardShowsSubmittedInputNote, testEmptySectionsOmitted,
   testSidebarNavigationAndActiveTracking, testActiveTrackingAcrossObserverBatches,
   testHighlightsAndSafeCardContent, testSharedPmidCountAndFutureScopes,
   testExpansionPersistsAndResetsForNewResults, testResultsAndNoResultSidebarUnchanged];

@@ -106,7 +106,7 @@ from src.pipeline.fusion_context import annotate_fusion_position_contexts, parse
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline import openevidence_metrics as oe_metrics
-from src.pipeline.normalization import is_fusion_input
+from src.pipeline.normalization import has_ensembl_identifier, is_fusion_input, read_gene_input
 from src.pipeline.openevidence import (
     OpenEvidenceClient,
     claim_lookup,
@@ -1885,15 +1885,26 @@ async def fusion_context(
     if not settings.fusion_annotation_api_enabled or not settings.fusion_annotation_api_base_url.strip():
         return FusionContextResponse(available=False)
 
+    fusion = request.fusion
+    five_transcript, three_transcript = request.five_transcript, request.three_transcript
+    if has_ensembl_identifier(fusion):
+        # ENST...::ENST... or GENE(ENST...)::GENE(ENST...): annotate the resolved
+        # genes, taking each partner's transcript unless one was given explicitly.
+        reading = await read_gene_input(fusion)
+        if reading.errors:
+            raise HTTPException(status_code=503 if reading.lookup_failed else 400, detail=" ".join(reading.errors))
+        fusion = reading.canonical
+        five_transcript = five_transcript or reading.five_transcript
+        three_transcript = three_transcript or reading.three_transcript
     try:
         parsed = parsed_input_from_fields(
-            request.fusion,
+            fusion,
             five_exon=request.five_exon,
             three_exon=request.three_exon,
             five_genomic=request.five_genomic,
             three_genomic=request.three_genomic,
-            five_transcript=request.five_transcript,
-            three_transcript=request.three_transcript,
+            five_transcript=five_transcript,
+            three_transcript=three_transcript,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
