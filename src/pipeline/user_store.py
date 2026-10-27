@@ -48,6 +48,13 @@ STATUSES = ("pending", "active", "disabled")
 REQUEST_STATUSES = ("pending", "approved", "rejected")
 ROLE_CHANGE_FIELDS = ("role", "status")
 
+# Bootstrap admin grants (grant_bootstrap_admin) are logged under this fixed
+# actor, which is how a later grant attempt recognizes an earlier one.
+BOOTSTRAP_ACTOR = "system:migration"
+BOOTSTRAP_GRANTED = "granted"
+BOOTSTRAP_ALREADY_ADMIN = "already admin"
+BOOTSTRAP_PREVIOUSLY_GRANTED = "previously granted"
+
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 500
 
@@ -284,6 +291,8 @@ class UserStore(Protocol):
     ) -> UserRecord: ...
 
     async def import_user(self, user: UserRecord) -> bool: ...
+
+    async def grant_bootstrap_admin(self, email: str, *, reason: str) -> str: ...
 
     async def set_role(
         self, email: str, role: str, *, actor: str, reason: Optional[str] = None,
@@ -727,6 +736,36 @@ class UserStoreMixin:
                     return False
                 raise
         return True
+
+    async def grant_bootstrap_admin(self, email: str, *, reason: str) -> str:
+        """Make a user admin unless they already are or a bootstrap grant was
+        ever logged for them (so a later demotion is never undone). The check
+        and the change are one transaction holding the user's row lock, so
+        concurrent callers grant at most once. Returns BOOTSTRAP_GRANTED,
+        BOOTSTRAP_ALREADY_ADMIN or BOOTSTRAP_PREVIOUSLY_GRANTED; raises
+        UserNotFound for an unknown email."""
+        clean = normalize_email(email)
+        now = _to_db(utc_now())
+        async with _store_errors("grant_bootstrap_admin"):
+            async with self._user_transaction() as cursor:
+                user = await self._fetch_user(cursor, clean, for_update=True)
+                if user is None:
+                    raise UserNotFound(clean)
+                if user.role == "admin":
+                    return BOOTSTRAP_ALREADY_ADMIN
+                # A locking read sees the latest committed grant, not a snapshot.
+                await cursor.execute(
+                    "SELECT 1 FROM role_changes WHERE email = %s AND field = 'role' "
+                    "AND new_value = 'admin' AND actor = %s LIMIT 1 FOR SHARE",
+                    (clean, BOOTSTRAP_ACTOR),
+                )
+                if await cursor.fetchone():
+                    return BOOTSTRAP_PREVIOUSLY_GRANTED
+                await self._apply_user_field(
+                    cursor, "role", clean, "admin", actor=BOOTSTRAP_ACTOR, reason=reason,
+                    request_id=None, now=now,
+                )
+                return BOOTSTRAP_GRANTED
 
     async def _set_user_field(
         self,

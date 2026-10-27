@@ -12,19 +12,23 @@ Redis layout read (see src/auth.py): the `agcg:users` set of emails, one
 hashes with usage counted since usage moved out of the profile. Redis is only
 read (SMEMBERS, SCAN, GET, HGETALL); it stays the fallback for one release.
 
-MySQL is only written through the UserStore API (import_user, set_role), so
-emails, search columns and JSON are normalized exactly as on login. An email
-already in MySQL is never overwritten: differences are reported. A bootstrap
-admin is granted the admin role once, logged in role_changes under the
-migration actor; it is not re-granted if someone later changed that role.
+MySQL is only written through the UserStore API (import_user,
+grant_bootstrap_admin), so emails, search columns and JSON are normalized
+exactly as on login. Before writing, every table the run uses (users,
+role_changes) must be readable. An email already in MySQL is never
+overwritten: differences are reported. A bootstrap admin is granted the admin
+role once, logged in role_changes under the fixed actor `system:migration`;
+the store checks for an earlier grant and changes the role in one
+transaction, so a later demotion is never undone, even by a concurrent run.
 
-Output never includes tokens, claims contents or connection URLs, and emails
-only with --show-emails (otherwise users are numbered in email order).
+Output never includes tokens, claims contents, connection URLs or unknown
+provider values, and emails only with --show-emails (otherwise users are
+numbered in email order).
 
-Exit status: 0 on success; 1 when the --apply verification fails (MySQL
-user count differs from the Redis profile count, a Redis user is missing, a
-created row differs from Redis, or a bootstrap admin is not admin); 2 when
-MySQL or Redis can't be used.
+Exit status: 0 on success; 1 when the --apply verification fails (a Redis
+profile was skipped, a Redis user is missing from MySQL, a created row
+differs from Redis, or a bootstrap admin is not admin); 2 when MySQL or Redis
+can't be used or a required table is missing.
 """
 
 from __future__ import annotations
@@ -41,10 +45,14 @@ from pydantic import ValidationError
 
 from src.auth import UserProfile, UserStoreUnavailable, _activity_key, _with_activity
 from src.pipeline.user_store import (
+    BOOTSTRAP_ACTOR,
+    BOOTSTRAP_ALREADY_ADMIN,
+    BOOTSTRAP_GRANTED,
+    BOOTSTRAP_PREVIOUSLY_GRANTED,
     UserFilters,
+    UserNotFound,
     UserRecord,
     UserStore,
-    normalize_actor,
     normalize_email,
     prepare_import,
     utc_now,
@@ -53,11 +61,13 @@ from src.pipeline.user_store import (
 USERS_SET_KEY = "agcg:users"
 PROFILE_PREFIX = "agcg:user:"
 ACTIVITY_PREFIX = _activity_key("")
-DEFAULT_ACTOR = "system:migration"
+# Providers src/auth.py and src/main.py set; any other value prints as "other".
+KNOWN_PROVIDERS = ("api_key", "dev", "google", "header", "keycloak", "local", "saml")
 BOOTSTRAP_REASON = "bootstrap admin grant (migrate_users_to_mysql)"
 
-# Fields compared between Redis and MySQL. updated_at/created_at are set by
-# the import itself and role_updated_* only by role changes, so they're not.
+# Fields compared between Redis and MySQL. updated_at is set by the import and
+# role_updated_* only by role changes. created_at is compared only for rows
+# this run created (a pre-existing row was created by its first login).
 COMPARED_FIELDS = (
     "name", "picture", "domain", "provider", "role", "status", "groups", "claims",
     "first_login_at", "last_login_at", "login_count", "annotation_count", "last_annotation_at",
@@ -220,24 +230,28 @@ async def read_redis(redis: ReadOnlyRedis, now: Optional[datetime] = None) -> Re
     )
 
 
-def diff_fields(redis_user: UserRecord, mysql_user: UserRecord, *, bootstrap: bool) -> List[str]:
+def diff_fields(
+    redis_user: UserRecord, mysql_user: UserRecord, *, bootstrap: bool,
+    fields: Sequence[str] = COMPARED_FIELDS,
+) -> List[str]:
     """Names (never values) of compared fields that differ. A bootstrap
     admin's admin role in MySQL is expected, not a difference."""
-    fields = []
-    for name in COMPARED_FIELDS:
+    differing = []
+    for name in fields:
         if name == "role" and bootstrap and mysql_user.role == "admin":
             continue
         if getattr(redis_user, name) != getattr(mysql_user, name):
-            fields.append(name)
-    return fields
+            differing.append(name)
+    return differing
 
 
-async def _previous_grant(store: UserStore, email: str, actor: str) -> bool:
+async def _previous_grant(store: UserStore, email: str) -> bool:
     cursor = None
     while True:
         page = await store.list_role_changes(email=email, limit=500, cursor=cursor)
         if any(
-            c.field == "role" and c.new_value == "admin" and c.actor == actor for c in page.changes
+            c.field == "role" and c.new_value == "admin" and c.actor == BOOTSTRAP_ACTOR
+            for c in page.changes
         ):
             return True
         if page.next_cursor is None:
@@ -246,20 +260,20 @@ async def _previous_grant(store: UserStore, email: str, actor: str) -> bool:
 
 
 async def _bootstrap_state(
-    store: UserStore, email: str, actor: str, existing: Optional[UserRecord], in_redis: bool
+    store: UserStore, email: str, existing: Optional[UserRecord], in_redis: bool
 ) -> str:
+    """What a grant would do now; for the report only. --apply decides again,
+    atomically, in grant_bootstrap_admin."""
     if existing is None:
         return "grant" if in_redis else "missing"
     if existing.role == "admin":
-        return "already admin"
-    if await _previous_grant(store, email, actor):
-        return f"previously granted; role since changed to {existing.role}, left as is"
+        return BOOTSTRAP_ALREADY_ADMIN
+    if await _previous_grant(store, email):
+        return f"{BOOTSTRAP_PREVIOUSLY_GRANTED}; role since changed to {existing.role}, left as is"
     return "grant"
 
 
-async def build_plan(
-    snapshot: RedisSnapshot, store: UserStore, bootstrap_admins: Sequence[str], actor: str
-) -> Plan:
+async def build_plan(snapshot: RedisSnapshot, store: UserStore, bootstrap_admins: Sequence[str]) -> Plan:
     plan = Plan()
     existing: Dict[str, Optional[UserRecord]] = {}
     for user in snapshot.users:
@@ -276,17 +290,17 @@ async def build_plan(
     redis_emails = {u.email for u in snapshot.users}
     for email in bootstrap_admins:
         current = existing[email] if email in existing else await store.get_user(email)
-        plan.bootstrap[email] = await _bootstrap_state(store, email, actor, current, email in redis_emails)
+        plan.bootstrap[email] = await _bootstrap_state(store, email, current, email in redis_emails)
     return plan
 
 
-async def _mysql_total(store: UserStore) -> int:
-    total, cursor = 0, None
+async def _mysql_emails(store: UserStore) -> List[str]:
+    emails, cursor = [], None
     while True:
         page = await store.list_users(UserFilters(), limit=500, cursor=cursor)
-        total += len(page.users)
+        emails.extend(u.email for u in page.users)
         if page.next_cursor is None:
-            return total
+            return emails
         cursor = page.next_cursor
 
 
@@ -308,8 +322,13 @@ class Report:
         self.out(text)
 
 
-def _breakdown(users: Sequence[UserRecord], attr: str) -> str:
-    counts = Counter(getattr(u, attr) for u in users)
+def _shown_provider(user: UserRecord) -> str:
+    # Provider is free text in Redis; print only values the app itself sets.
+    return user.provider if user.provider in KNOWN_PROVIDERS else "other"
+
+
+def _breakdown(values: Sequence[str]) -> str:
+    counts = Counter(values)
     return ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"
 
 
@@ -321,9 +340,10 @@ def _print_summary(report: Report, snapshot: RedisSnapshot, plan: Plan, apply: b
     report.line(f"  unparseable (skipped): {len(snapshot.unparseable)}")
     for item in snapshot.unparseable:
         report.line(f"    - {report.who(item.key_email)}: {item.reason}")
-    report.line(f"  by role: {_breakdown(users, 'role')}")
-    report.line(f"  by status: {_breakdown(users, 'status')}")
-    report.line(f"  by provider: {_breakdown(users, 'provider')}")
+    # Role and status were validated against the store's fixed values.
+    report.line(f"  by role: {_breakdown([u.role for u in users])}")
+    report.line(f"  by status: {_breakdown([u.status for u in users])}")
+    report.line(f"  by provider: {_breakdown([_shown_provider(u) for u in users])}")
     report.line(f"  admins in Redis: {sum(1 for u in users if u.role == 'admin')}")
     report.line(
         f"Redis usage records: {snapshot.usage_records} "
@@ -336,9 +356,10 @@ def _print_summary(report: Report, snapshot: RedisSnapshot, plan: Plan, apply: b
         report.line(f"    - {report.who(email)}: {', '.join(fields)}")
     report.line(f"Bootstrap admins: {len(plan.bootstrap)}")
     for email, state in plan.bootstrap.items():
-        shown = {"grant": "grant admin" if apply else "would grant admin"}.get(state, state)
-        if state == "missing":
-            shown = "not in Redis or MySQL; cannot grant"
+        shown = {
+            "grant": "grant admin" if apply else "would grant admin",
+            "missing": "not in Redis or MySQL; cannot grant",
+        }.get(state, state)
         report.line(f"    - {report.who(email)}: {shown}")
 
 
@@ -346,29 +367,39 @@ async def verify(
     report: Report, snapshot: RedisSnapshot, store: UserStore, created: Sequence[str],
     bootstrap_admins: Sequence[str],
 ) -> bool:
-    redis_by_email = {u.email: u for u in snapshot.users}
+    """Per email: every parseable Redis profile is in MySQL, rows created by
+    this run match Redis (created_at included), bootstrap admins are admin.
+    Fails whenever any Redis profile was skipped, since it was not copied."""
     missing, created_mismatch, differs = [], [], []
-    for email, redis_user in redis_by_email.items():
+    for redis_user in snapshot.users:
+        email = redis_user.email
         mysql_user = await store.get_user(email)
         if mysql_user is None:
             missing.append(email)
             continue
-        fields = diff_fields(redis_user, mysql_user, bootstrap=email in bootstrap_admins)
+        is_created = email in created
+        fields = diff_fields(
+            redis_user, mysql_user, bootstrap=email in bootstrap_admins,
+            fields=COMPARED_FIELDS + ("created_at",) if is_created else COMPARED_FIELDS,
+        )
         if fields:
-            (created_mismatch if email in created else differs).append((email, fields))
+            (created_mismatch if is_created else differs).append((email, fields))
     not_admin = []
     for email in bootstrap_admins:
         user = await store.get_user(email)
         if user is None or user.role != "admin":
             not_admin.append(email)
-    total = await _mysql_total(store)
+    mysql_emails = await _mysql_emails(store)
+    not_in_redis = set(mysql_emails) - {u.email for u in snapshot.users}
     admins = await store.count_admins(active_only=False)
 
     report.line("Verification:")
-    report.line(f"  Redis profiles: {snapshot.profiles_found}; MySQL users: {total}")
+    report.line(f"  Redis profiles: {snapshot.profiles_found}; MySQL users: {len(mysql_emails)}")
+    report.line(f"  Redis profiles skipped (not copied): {len(snapshot.unparseable)}")
     report.line(f"  Redis users missing from MySQL: {len(missing)}")
     for email in missing:
         report.line(f"    - {report.who(email)}")
+    report.line(f"  MySQL users not in Redis (left as is): {len(not_in_redis)}")
     report.line(f"  MySQL admins: {admins}")
     report.line(f"  Bootstrap admins without the admin role: {len(not_admin)}")
     for email in not_admin:
@@ -379,9 +410,28 @@ async def verify(
     report.line(f"  Pre-existing users differing from Redis (left as is): {len(differs)}")
     for email, fields in differs:
         report.line(f"    - {report.who(email)}: {', '.join(fields)}")
-    ok = total == snapshot.profiles_found and not (missing or not_admin or created_mismatch)
+    ok = not (snapshot.unparseable or missing or not_admin or created_mismatch)
     report.line(f"  Result: {'OK' if ok else 'MISMATCH'}")
     return ok
+
+
+async def _preflight(store: UserStore, report: Report) -> bool:
+    """Every table the run reads or writes must be usable before anything is
+    written, so a missing table can't leave a partial copy."""
+    checks = (
+        ("users", lambda: store.list_users(limit=1)),
+        ("role_changes", lambda: store.list_role_changes(limit=1)),
+    )
+    for table, check in checks:
+        try:
+            await check()
+        except UserStoreUnavailable:
+            report.line(
+                f"MySQL table `{table}` is not readable; deploy the user store (#147) first. "
+                "Nothing was written."
+            )
+            return False
+    return True
 
 
 async def migrate(
@@ -390,14 +440,14 @@ async def migrate(
     *,
     apply: bool,
     bootstrap_admins: Sequence[str] = (),
-    actor: str = DEFAULT_ACTOR,
     show_emails: bool = False,
     out: Callable[[str], None] = print,
 ) -> int:
     admins = list(dict.fromkeys(normalize_email(e) for e in bootstrap_admins))
-    actor = normalize_actor(actor)
+    if not await _preflight(store, Report((), show_emails, out)):
+        return 2
     snapshot = await read_redis(redis)
-    plan = await build_plan(snapshot, store, admins, actor)
+    plan = await build_plan(snapshot, store, admins)
     report = Report(
         [u.email for u in snapshot.users] + [u.key_email for u in snapshot.unparseable] + admins,
         show_emails,
@@ -415,10 +465,15 @@ async def migrate(
             report.line(f"  {report.who(user.email)} appeared in MySQL meanwhile; left as is")
     report.line(f"Created: {len(created)}")
     granted = 0
-    for email, state in plan.bootstrap.items():
-        if state == "grant":
-            change = await store.set_role(email, "admin", actor=actor, reason=BOOTSTRAP_REASON)
-            granted += change is not None
+    for email in admins:
+        # The store re-checks role and earlier grants atomically, so a plan
+        # made before another run's grant or a demotion can't re-grant.
+        try:
+            outcome = await store.grant_bootstrap_admin(email, reason=BOOTSTRAP_REASON)
+        except UserNotFound:
+            outcome = "not in MySQL; cannot grant"
+        granted += outcome == BOOTSTRAP_GRANTED
+        report.line(f"  bootstrap {report.who(email)}: {outcome}")
     report.line(f"Bootstrap admin grants logged: {granted}")
     ok = await verify(report, snapshot, store, created, admins)
     return 0 if ok else 1
@@ -437,10 +492,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="append",
         default=[],
         metavar="EMAIL",
-        help="Grant this user the admin role (once, logged in role_changes). Repeatable.",
-    )
-    parser.add_argument(
-        "--actor", default=DEFAULT_ACTOR, help=f"role_changes actor for grants (default {DEFAULT_ACTOR})."
+        help=f"Grant this user the admin role (once, logged in role_changes as {BOOTSTRAP_ACTOR}). Repeatable.",
     )
     parser.add_argument("--show-emails", action="store_true", help="Print emails instead of user numbers.")
     parser.add_argument(
@@ -468,7 +520,12 @@ async def _run(args: argparse.Namespace) -> int:
     if not redis_url:
         print("No Redis configured (REDIS_URL or --redis-url).", file=sys.stderr)
         return 2
-    client = redis_asyncio.from_url(redis_url, decode_responses=True)
+    try:
+        client = redis_asyncio.from_url(redis_url, decode_responses=True)
+    except Exception as exc:
+        # The parser's message can quote the URL, password included.
+        print(f"Invalid Redis URL ({type(exc).__name__}); the URL is not shown.", file=sys.stderr)
+        return 2
     try:
         # A pool on the existing schema, not RunStore.create(): the app has
         # already created the user tables, and this script runs no DDL.
@@ -479,26 +536,19 @@ async def _run(args: argparse.Namespace) -> int:
         return 2
     store = RunStore(pool)
     try:
-        try:
-            await store.list_users(limit=1)
-        except UserStoreUnavailable:
-            print("MySQL `users` table is not readable; deploy the user store (#147) first.", file=sys.stderr)
-            return 2
-        try:
-            return await migrate(
-                ReadOnlyRedis(client),
-                store,
-                apply=args.apply,
-                bootstrap_admins=args.bootstrap_admin,
-                actor=args.actor,
-                show_emails=args.show_emails,
-            )
-        except UserStoreUnavailable as exc:
-            print(f"MySQL error: {exc}", file=sys.stderr)
-            return 2
-        except redis_asyncio.RedisError as exc:
-            print(f"Redis error: {type(exc).__name__}", file=sys.stderr)
-            return 2
+        return await migrate(
+            ReadOnlyRedis(client),
+            store,
+            apply=args.apply,
+            bootstrap_admins=args.bootstrap_admin,
+            show_emails=args.show_emails,
+        )
+    except UserStoreUnavailable as exc:
+        print(f"MySQL error: {exc}", file=sys.stderr)
+        return 2
+    except redis_asyncio.RedisError as exc:
+        print(f"Redis error: {type(exc).__name__}", file=sys.stderr)
+        return 2
     finally:
         await store.close()
         await client.aclose()

@@ -46,6 +46,7 @@ class _BrokenPool:
         ),
         lambda s: s.set_role("a@x.example", "curator", actor="b@x.example"),
         lambda s: s.incr_activity("a@x.example", 1),
+        lambda s: s.grant_bootstrap_admin("a@x.example", reason="r"),
         lambda s: s.import_user(
             UserRecord(
                 email="a@x.example", name="A", picture=None, domain="x.example", provider="google",

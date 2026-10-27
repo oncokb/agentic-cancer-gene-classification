@@ -8,10 +8,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from src.auth import UserStoreUnavailable
 from src.pipeline.user_store import LoginIdentity
 from src.pipeline.user_store_fake import FakeUserStore
 from src.scripts import migrate_users_to_mysql as migration
-from src.scripts.migrate_users_to_mysql import ReadOnlyRedis, migrate, parse_args
+from src.scripts.migrate_users_to_mysql import ReadOnlyRedis, main, migrate, parse_args
 
 T0 = datetime(2026, 3, 1, 9, 30, 0, 123456, tzinfo=timezone.utc)
 ADMIN = "kuangf@mskcc.org"
@@ -333,3 +334,122 @@ def test_read_only_wrapper_exposes_no_write_commands():
     for command in ("set", "delete", "sadd", "srem", "hset", "hincrby", "expire", "flushdb"):
         assert not hasattr(wrapper, command)
     assert migration.ACTIVITY_PREFIX == "agcg:user_activity:"
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: each test failed on the first version of the script
+# ---------------------------------------------------------------------------
+
+
+async def test_any_skipped_profile_fails_verification_even_when_totals_match():
+    redis = UserRedis()
+    _put(redis, _profile("valid@mskcc.org"))
+    _put(redis, None, raw=("broken@mskcc.org", "{not json"))
+    store = FakeUserStore()
+    await store.upsert_login(
+        LoginIdentity(email="unrelated@mskcc.org", name="U"), default_role="viewer", default_status="active",
+    )
+
+    code, out = await _run(redis, store, apply=True, admins=())
+
+    assert code == 1, out  # 2 Redis profiles, 2 MySQL users, but one profile was not copied
+    assert "Redis profiles: 2; MySQL users: 2" in out
+    assert "Redis profiles skipped (not copied): 1" in out
+    assert "MySQL users not in Redis (left as is): 1" in out
+    assert "Result: MISMATCH" in out
+
+
+class _ConcurrentRunStore(FakeUserStore):
+    """Right after the bootstrap admin's row is imported, another migration
+    run grants it admin and a human then demotes it, all before this run gets
+    to its own grant step."""
+
+    async def import_user(self, user):
+        created = await super().import_user(user)
+        if user.email == ADMIN:
+            await self.set_role(ADMIN, "admin", actor="system:migration", reason="other run")
+            await self.set_role(ADMIN, "curator", actor="someone@mskcc.org", reason="demoted")
+        return created
+
+
+async def test_grant_planned_before_a_concurrent_grant_and_demotion_is_not_applied():
+    redis, _ = _production_like()
+    store = _ConcurrentRunStore()
+
+    code, out = await _run(redis, store, apply=True)
+
+    assert (await store.get_user(ADMIN)).role == "curator"
+    assert [c.new_value for c in (await store.list_role_changes(email=ADMIN)).changes] == ["curator", "admin"]
+    assert "Bootstrap admin grants logged: 0" in out
+    assert code == 1  # the bootstrap admin is not admin; reported, not forced
+
+
+def test_actor_is_not_configurable():
+    with pytest.raises(SystemExit):
+        parse_args(["--actor", "someone-else"])
+
+
+class _NoRoleChangesTable(FakeUserStore):
+    """Like a MySQL database where `users` exists but `role_changes` doesn't."""
+
+    async def list_role_changes(self, **kwargs):
+        raise UserStoreUnavailable("User store list_role_changes failed")
+
+    async def set_role(self, *args, **kwargs):
+        raise UserStoreUnavailable("User store set_role failed")
+
+    async def grant_bootstrap_admin(self, *args, **kwargs):
+        raise UserStoreUnavailable("User store grant_bootstrap_admin failed")
+
+
+async def test_missing_role_changes_table_fails_before_any_write():
+    redis, _ = _production_like()
+    store = _NoRoleChangesTable()
+
+    code, out = await _run(redis, store, apply=True)
+
+    assert code == 2
+    assert "`role_changes` is not readable" in out and "Nothing was written" in out
+    assert await _all_users(store) == {}
+
+
+def test_malformed_redis_url_is_never_printed(capsys):
+    code = main(["--redis-url", "redis://user:pw-SECRET@host:PORT-SECRET/0"])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "Invalid Redis URL" in captured.err
+    assert "SECRET" not in captured.out + captured.err
+
+
+async def test_unknown_provider_values_are_not_printed():
+    redis = UserRedis()
+    _put(redis, _profile("a@mskcc.org", provider="private@example.org/SECRET_TOKEN"))
+    _put(redis, _profile("b@mskcc.org", provider="keycloak"))
+
+    code, out = await _run(redis, FakeUserStore(), apply=False, admins=())
+
+    assert code == 0
+    assert "by provider: keycloak=1, other=1" in out
+    assert "SECRET_TOKEN" not in out and "@" not in out
+    redis_store = FakeUserStore()
+    await _run(redis, redis_store, apply=True, admins=())
+    assert (await redis_store.get_user("a@mskcc.org")).provider == "private@example.org/SECRET_TOKEN"
+
+
+class _ImportDropsCreatedAt(FakeUserStore):
+    async def import_user(self, user):
+        from dataclasses import replace
+
+        return await super().import_user(replace(user, created_at=user.updated_at))
+
+
+async def test_created_at_is_verified_for_rows_created_by_the_run():
+    redis = UserRedis()
+    _put(redis, _profile("a@mskcc.org"))
+
+    code, out = await _run(redis, _ImportDropsCreatedAt(), apply=True, admins=())
+
+    assert code == 1
+    assert "Created this run but differing from Redis: 1" in out
+    assert "user #1: created_at" in out

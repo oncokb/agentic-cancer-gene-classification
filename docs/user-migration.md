@@ -10,25 +10,30 @@ What it does:
   Redis stays the fallback for one release.
 - Reads the same Redis as sign-in (`REDIS_URL`, or `--redis-url`) and the same
   MySQL as the app (`MYSQL_*` / `DB_URL`, `DB_USERNAME`, `DB_PASSWORD`). It runs
-  no DDL: the app must already have created the user tables (#147).
-- Writes only through the user store (`import_user`, `set_role`). It creates
+  no DDL: the app must already have created the user tables (#147). Before
+  writing anything it checks that `users` and `role_changes` are readable.
+- Writes only through the user store (`import_user`, `grant_bootstrap_admin`). It creates
   users missing from MySQL with their role, status, provider, groups, claims,
   first/last login, login count and usage (profile count plus the separate
   `agcg:user_activity:*` record). It never changes a user that is already in
   MySQL; it reports which fields differ.
 - `--bootstrap-admin EMAIL` (repeatable) grants the admin role once, logged in
-  `role_changes` with actor `system:migration`. If someone later changes that
-  role, a re-run leaves it alone.
+  `role_changes` with the fixed actor `system:migration`. The store checks for
+  an earlier grant and changes the role in one transaction. If someone later
+  changes that role, no re-run (concurrent ones included) grants it again.
 - Prints counts. Emails are printed only with `--show-emails`; otherwise users
-  are shown as `user #N`. It never prints tokens, claims or connection URLs.
+  are shown as `user #N`. It never prints tokens, claims or connection URLs
+  (not even a malformed one). Provider values the app doesn't set are counted
+  as `other`.
 - Dry run is the default. `--apply` writes, then checks the result.
 
-Exit codes: `0` OK. `1` the post-apply check failed: the MySQL user count is
-not the Redis profile count, a Redis user is missing from MySQL, a row created
-by this run differs from Redis, or a bootstrap admin lacks the admin role. `2`
-MySQL or Redis can't be reached, or the `users` table is missing.
-Records it can't parse are skipped and listed. Because of them the counts
-differ, so `--apply` exits `1`.
+Exit codes: `0` OK. `1` the post-apply check failed: a Redis profile was
+skipped (unparseable or a duplicate after email normalization), a Redis user
+is missing from MySQL, a row created by this run differs from Redis
+(`created_at` included), or a bootstrap admin lacks the admin role. `2` MySQL
+or Redis can't be reached, the Redis URL is malformed, or a required table is
+missing (nothing written). The check is per email. MySQL users that aren't in
+Redis are counted but don't fail it.
 
 ## Steps
 
@@ -71,7 +76,8 @@ differ, so `--apply` exits `1`.
    ```
 
    Expect `Created: 16`, `Bootstrap admin grants logged: 1`,
-   `Redis profiles: 16; MySQL users: 16`, `MySQL admins: 1`, `Result: OK`, and
+   `Redis profiles: 16; MySQL users: 16`, `Redis profiles skipped (not copied): 0`,
+   `Redis users missing from MySQL: 0`, `MySQL admins: 1`, `Result: OK`, and
    exit code 0 (`echo $?`).
 
 4. **Verify again.** Run the dry run from step 2. It should report
