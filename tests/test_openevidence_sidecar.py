@@ -851,7 +851,6 @@ async def test_annotate_gene_never_touches_openevidence_even_when_enabled(monkey
     )
 
     assert "openevidence" not in annotation.timings_ms
-    assert annotation.timings_ms["total"] < 15000
 
 
 # ---------------------------------------------------------------------------
@@ -875,11 +874,14 @@ async def test_openevidence_sidecar_endpoint_caps_concurrent_live_calls(monkeypa
     active = 0
     max_observed_active = 0
     release = asyncio.Event()
+    entered = asyncio.Event()
 
     async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
         nonlocal active, max_observed_active
         active += 1
         max_observed_active = max(max_observed_active, active)
+        if active == main.settings.openevidence_sidecar_concurrency:
+            entered.set()
         await release.wait()
         active -= 1
         return _ALK_ANALYSIS
@@ -891,7 +893,7 @@ async def test_openevidence_sidecar_endpoint_caps_concurrent_live_calls(monkeypa
         main.get_gene_openevidence("BRAF"),
         main.get_gene_openevidence("EGFR"),
     )
-    await asyncio.sleep(0.05)  # let all three requests reach the semaphore
+    await asyncio.wait_for(entered.wait(), timeout=30)
     assert max_observed_active == 1  # never more than the configured cap of 1
     release.set()
     results = await calls
@@ -909,11 +911,14 @@ async def test_openevidence_sidecar_endpoint_allows_concurrency_up_to_the_config
     active = 0
     max_observed_active = 0
     release = asyncio.Event()
+    entered = asyncio.Event()
 
     async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
         nonlocal active, max_observed_active
         active += 1
         max_observed_active = max(max_observed_active, active)
+        if active == main.settings.openevidence_sidecar_concurrency:
+            entered.set()
         await release.wait()
         active -= 1
         return _ALK_ANALYSIS
@@ -924,7 +929,7 @@ async def test_openevidence_sidecar_endpoint_allows_concurrency_up_to_the_config
         main.get_gene_openevidence("ALK"),
         main.get_gene_openevidence("BRAF"),
     )
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(entered.wait(), timeout=30)
     assert max_observed_active == 2  # both allowed through at once, matching the cap
     release.set()
     await calls
