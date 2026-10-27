@@ -88,10 +88,12 @@ curl -s -X POST https://acgc.oncokb.org/v1/genes/query \
 
 Accepted gene identifiers for the gene query API:
 
-- HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`, and Ensembl gene,
+- HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`; Ensembl gene,
   transcript and protein IDs such as `ENSG00000141510.17`, `ENST00000269305`
-  or `ENSP00000269305`, also as `TP53(ENST00000269305)` or
-  `ENST00000269305:c.215C>G`. See [Gene identifiers](#gene-identifiers).
+  or `ENSP00000269305`; and RefSeq accessions such as `NM_000546.6` or
+  `NP_000537`. Either kind also works as `TP53(ENST00000269305)`,
+  `TP53(NM_000546.6)`, `ENST00000269305:c.215C>G` or `NM_000546.6:c.215C>G`.
+  See [Gene identifiers](#gene-identifiers).
 - Symbols: letters, digits, `-` and `.` only, starting and ending with a
   letter or digit.
 - **Not fusions.** `EML4::ALK`, `ALK::` and similar are rejected with `422`.
@@ -168,11 +170,21 @@ alone or as either fusion partner:
 | `ENSP00000269305` | Protein → its transcript → that transcript's gene. |
 | `TP53(ENST00000269305)` | `TP53`, after checking the transcript belongs to TP53. In a fusion, the transcript is used as that partner's breakpoint transcript. |
 | `ENST00000269305:c.215C>G`, `ENSP00000269305:p.Arg72Pro` | The transcript's gene, with a warning: the variant itself is **not** interpreted. |
+| `NM_000546`, `NM_000546.6`, `NR_003051`, `XM_...`, `XR_...` | The symbol of the gene NCBI lists for the RefSeq transcript. |
+| `NP_000537`, `NP_000537.3`, `XP_...` | The symbol of the gene NCBI lists for the RefSeq protein. |
+| `TP53(NM_000546.6)` | `TP53`, after checking the accession belongs to TP53. In a fusion, a transcript accession is used as that partner's breakpoint transcript, e.g. `EML4(NM_019063.5)::ALK(NM_004304.5)`. |
+| `NM_000546.6:c.215C>G`, `NM_000546.6(TP53):c.215C>G`, `NP_000537.3:p.Arg72Pro` | The accession's gene, with a warning: the variant itself is **not** interpreted. |
 
-So `ENST00000318522::ENST00000389048` is annotated as `EML4::ALK`, and fusion
-evidence searches PubMed for the symbols, not the IDs. Only human stable IDs
-(`ENSG`/`ENST`/`ENSP` plus 11 digits, optional `.version`) are accepted.
-Ensembl IDs are never fuzzy-matched to a gene.
+So `ENST00000318522::ENST00000389048` and `NM_019063.5::NM_004304.5` are both
+annotated as `EML4::ALK`, and fusion evidence searches PubMed for the symbols,
+not the IDs. Only human stable IDs (`ENSG`/`ENST`/`ENSP` plus 11 digits,
+optional `.version`) and human RefSeq transcript/protein accessions (`NM_`,
+`NR_`, `XM_`, `XR_`, `NP_`, `XP_` plus digits, optional `.version`) are
+accepted; other RefSeq types such as `NC_` (chromosomes) or `NG_` (genomic
+regions) are rejected. RefSeq accessions are looked up in NCBI (Datasets gene
+API); NCBI reports the gene for an accession regardless of version, so the
+version is kept in your input but not checked. Neither kind is ever
+fuzzy-matched to a gene.
 
 Your original input stays in the result: `resolved_inputs` on each annotation
 (`input`, `resolved`, `five_transcript`, `three_transcript`, `warnings`),
@@ -180,10 +192,11 @@ Your original input stays in the result: `resolved_inputs` on each annotation
 results. Request-level `warnings` repeat any caveats and errors.
 
 An identifier that can't be used gets its own error row and is not annotated
-as any gene. That covers an unknown or malformed ID, an Ensembl lookup that
-failed (retry), and `GENE(ENST...)` where the transcript belongs to a different
-gene. In the gene query API the last case reads "The Ensembl ID belongs to a
-different gene than the one named."
+as any gene. That covers an unknown, non-human or malformed ID, an Ensembl or
+NCBI lookup that failed (retry), and `GENE(ENST...)` / `GENE(NM_...)` where the
+transcript belongs to a different gene. In the gene query API the last case
+reads "The Ensembl ID belongs to a different gene than the one named." or "The
+RefSeq accession belongs to a different gene than the one named."
 
 In a fusion, only the bad partner is rejected: the other partner is still
 annotated on its own. For `EML4(ENST00000256078)::ALK` (a KRAS transcript),

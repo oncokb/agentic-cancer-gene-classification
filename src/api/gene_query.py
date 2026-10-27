@@ -25,7 +25,7 @@ from src.api.run_persistence import GENERIC_FAILURE, save_run_or_raise
 from src.config import settings
 from src.models.schema import AnnotateRequest, AnnotationResult, CacheStatus, FusionInput, GeneAnnotation
 from src.observability import record_user_action, record_user_seen, tag_current_span
-from src.pipeline.normalization import FUSION_SEPARATORS, has_ensembl_identifier
+from src.pipeline.normalization import FUSION_SEPARATORS, has_accession_identifier
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -41,9 +41,14 @@ _MAX_SYMBOL_LENGTH = 64
 # including dangling forms like 'ALK::' that would normalize into one gene.
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?$")
 _UNRESOLVABLE_PREFIX = "Unresolvable gene symbol"
-# Normalization's error for GENE(ENST...) whose transcript is another gene's.
-_ENSEMBL_MISMATCH_MARKER = re.compile(r"^Unresolvable gene symbol — .*: Ensembl ENS[TPG]\S* belongs to \S+, not ")
-_ENSEMBL_MISMATCH_ERROR = "The Ensembl ID belongs to a different gene than the one named."
+# Normalization's error for GENE(ENST...) / GENE(NM_...) whose transcript is another gene's.
+_MISMATCH_MARKER = re.compile(
+    r"^Unresolvable gene symbol — .*: (?P<source>Ensembl ENS[TPG]|RefSeq [NX][MRP]_)\S* belongs to \S+, not "
+)
+_MISMATCH_ERRORS = {
+    "Ensembl": "The Ensembl ID belongs to a different gene than the one named.",
+    "RefSeq": "The RefSeq accession belongs to a different gene than the one named.",
+}
 _UNRESOLVABLE_ERROR = "Gene symbol could not be resolved."
 _LOOKUP_FAILED_ERROR = "Gene symbol lookup is temporarily unavailable; please retry."
 _GENE_NOT_FOUND = "Gene symbol not found."
@@ -69,8 +74,9 @@ class GeneQueryItem(BaseModel):
         description=(
             "HGNC-style gene symbol or Ensembl ID, e.g. `ALK`, `HLA-A`: letters, digits, `-` and `.`, "
             "starting and ending with a letter or digit. Ensembl gene/transcript/protein IDs "
-            "(`ENSG...`, `ENST...`, `ENSP...`), `GENE(ENST...)` and `ENST...:c....` are resolved to "
-            "the gene. Fusions are not accepted."
+            "(`ENSG...`, `ENST...`, `ENSP...`), RefSeq accessions (`NM_...`, `NR_...`, `XM_...`, "
+            "`XR_...`, `NP_...`, `XP_...`), `GENE(ENST...)`/`GENE(NM_...)` and `ENST...:c....`/"
+            "`NM_...:c....` are resolved to the gene. Fusions are not accepted."
         ),
     )
     tumor_type: Optional[str] = Field(
@@ -241,7 +247,7 @@ def _validate_symbol(value: str) -> str:
         raise ValueError(f"Gene symbol must be at most {_MAX_SYMBOL_LENGTH} characters")
     if FUSION_SEPARATORS.search(symbol):
         raise ValueError("Fusions are not supported by the gene query API; use POST /v1/annotate")
-    if not (_SYMBOL_PATTERN.match(symbol) or has_ensembl_identifier(symbol)):
+    if not (_SYMBOL_PATTERN.match(symbol) or has_accession_identifier(symbol)):
         raise ValueError(
             "Gene symbol may contain only letters, digits, '-' and '.', "
             "and must start and end with a letter or digit"
@@ -266,8 +272,9 @@ def _slim_error(annotation: GeneAnnotation) -> Optional[str]:
     if _is_unresolvable(annotation):
         if annotation.symbol_lookup_failed:
             return _LOOKUP_FAILED_ERROR
-        if _ENSEMBL_MISMATCH_MARKER.match(annotation.error):
-            return _ENSEMBL_MISMATCH_ERROR
+        mismatch = _MISMATCH_MARKER.match(annotation.error)
+        if mismatch:
+            return _MISMATCH_ERRORS[mismatch.group("source").split(" ", 1)[0]]
         return _UNRESOLVABLE_ERROR
     return _GENERIC_GENE_ERROR
 

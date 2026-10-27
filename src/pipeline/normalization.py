@@ -2,20 +2,27 @@
 Gene symbol normalization via the HGNC and Ensembl REST APIs.
 Splits fusion inputs into partner genes and resolves each symbol to its
 canonical HUGO identifier. Ensembl gene, transcript and protein IDs (also as
-GENE(ENST...) and ENST...:c.... forms) are resolved through Ensembl, never
-HGNC search; unannotated loci are routed to the insufficient-evidence path.
+GENE(ENST...) and ENST...:c.... forms) are resolved through Ensembl, and
+RefSeq transcript/protein accessions (NM_..., NP_..., GENE(NM_...),
+NM_...:c....) through NCBI, never HGNC search; unannotated loci are routed to
+the insufficient-evidence path.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import httpx
 
+from src.config import settings
 from src.models.schema import ResolvedGene
 from src.pipeline.cache import cached_call
 
@@ -24,25 +31,46 @@ logger = logging.getLogger(__name__)
 HGNC_FETCH_URL = "https://rest.genenames.org/fetch/symbol/{symbol}"
 HGNC_SEARCH_URL = "https://rest.genenames.org/search/symbol/{symbol}"
 ENSEMBL_LOOKUP_URL = "https://rest.ensembl.org/lookup/id"
+# NCBI Datasets gene report for an RNA or protein accession (one call, any version).
+NCBI_GENE_BY_ACCESSION_URL = "https://api.ncbi.nlm.nih.gov/datasets/v2/gene/accession/{accession}"
 _ENSEMBL_ID = r"ENS[GTP]\d{11}(?:\.\d+)?"
 # Human Ensembl gene/transcript/protein stable ID, optionally versioned.
 ENSEMBL_PATTERN = re.compile(rf"^{_ENSEMBL_ID}$", re.IGNORECASE)
-# GENE(ENST...): a symbol annotated with the transcript (or gene/protein) it was called on.
+# RefSeq transcript (NM_/NR_/XM_/XR_) or protein (NP_/XP_) accession, optionally versioned.
+_REFSEQ_ID = r"[NX][MRP]_\d{6,9}(?:\.\d+)?"
+REFSEQ_PATTERN = re.compile(rf"^{_REFSEQ_ID}$", re.IGNORECASE)
+# GENE(ENST...) / GENE(NM_...): a symbol annotated with the transcript (or gene/protein) it was called on.
 _DECORATED_PATTERN = re.compile(
-    rf"^(?P<gene>[A-Za-z0-9][A-Za-z0-9.\-]*)\s*\(\s*(?P<id>{_ENSEMBL_ID})\s*\)$", re.IGNORECASE
+    rf"^(?P<gene>[A-Za-z0-9][A-Za-z0-9.\-]*)\s*\(\s*(?P<id>{_ENSEMBL_ID}|{_REFSEQ_ID})\s*\)$", re.IGNORECASE
 )
-# HGVS on an Ensembl transcript/protein: ENST...:c.215C>G, ENST...(TP53):c.215C>G, ENSP...:p.R72P.
+# HGVS on an Ensembl or RefSeq transcript/protein: ENST...:c.215C>G,
+# NM_000546.6(TP53):c.215C>G, NP_000537.3:p.Arg72Pro.
 _HGVS_PATTERN = re.compile(
-    r"^(?P<id>ENS[TP]\d{11}(?:\.\d+)?)(?:\((?P<gene>[A-Za-z0-9][A-Za-z0-9.\-]*)\))?:(?P<variant>[cnrp]\..+)$",
+    rf"^(?P<id>ENS[TP]\d{{11}}(?:\.\d+)?|{_REFSEQ_ID})"
+    r"(?:\((?P<gene>[A-Za-z0-9][A-Za-z0-9.\-]*)\))?:(?P<variant>[cnrp]\..+)$",
     re.IGNORECASE,
 )
 # Contains something Ensembl-like outside the forms above (ENSG123,
 # ENSMUSG00000017167, ENST...:x, 'EML4(ENST...) ALK(ENST...) fusion'):
 # rejected outright, never sent to HGNC search, which would fuzzy-match it.
 _ENSEMBL_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9])ENS[A-Z]{0,4}[EGTPR]\d{3,}", re.IGNORECASE)
+# Likewise RefSeq-like text (NM_12, NC_000017.11, NM_000546:x): HGNC symbols
+# never contain '_', so two letters and '_' before a digit is an accession attempt.
+_REFSEQ_LIKE_PATTERN = re.compile(r"(?<![A-Za-z0-9])[A-Z]{2}_\d", re.IGNORECASE)
 HGNC_ID_PATTERN = re.compile(r"Acc:(HGNC:\d+)")
 HGNC_TIMEOUT_SECONDS = 5.0
 ENSEMBL_TIMEOUT_SECONDS = 8.0
+NCBI_TIMEOUT_SECONDS = 8.0
+# NCBI answers 429 when a burst outruns its per-second budget, even under the
+# shared limiter (it bursts its full allowance); retry a few times, waiting as
+# long as Retry-After says (else exponential backoff). Everything, limiter
+# waits included, fits in one deadline; a wait that would overrun it fails fast.
+NCBI_RATE_LIMIT_RETRIES = 3
+NCBI_RATE_LIMIT_BACKOFF_SECONDS = 0.5
+NCBI_RETRY_DEADLINE_SECONDS = 15.0
+# Indirection so tests can drive the retry loop with a fake clock.
+_monotonic = time.monotonic
+_sleep = asyncio.sleep
 NORMALIZATION_CONCURRENCY = 6
 
 
@@ -193,7 +221,7 @@ def unparsed_fusion_warning(
     is not case-checked ('fus erg fusion' warns).
     """
     text = value.strip()
-    if is_fusion_input(text) or has_ensembl_identifier(text):
+    if is_fusion_input(text) or has_accession_identifier(text):
         return None
 
     match = _WHITESPACE_PAIR.match(text)
@@ -289,40 +317,52 @@ def _ensembl_lookup_id(symbol: str) -> str:
     return symbol.split(".", 1)[0]
 
 
+def _is_refseq_id(symbol: str) -> bool:
+    return bool(REFSEQ_PATTERN.match(symbol))
+
+
 @dataclass(frozen=True)
-class _EnsemblToken:
-    """A fusion partner (or single gene input) written with an Ensembl ID."""
+class _AccessionToken:
+    """A fusion partner (or single gene input) written with an Ensembl ID or RefSeq accession."""
 
     raw: str
-    ensembl_id: Optional[str]  # upper-cased, version kept; None when malformed
+    accession: Optional[str]  # upper-cased, version kept; None when malformed
     named_gene: Optional[str] = None  # GENE in GENE(ENST...) or ENST...(GENE):c....
     variant: Optional[str] = None  # HGVS suffix, e.g. c.215C>G
+    refseq: bool = False  # RefSeq (NCBI) rather than Ensembl
+
+    @property
+    def source(self) -> str:
+        return "RefSeq" if self.refseq else "Ensembl"
+
+    @property
+    def id_noun(self) -> str:
+        return "accession" if self.refseq else "ID"
 
 
-def _parse_ensembl_token(token: str) -> Optional[_EnsemblToken]:
-    """Parse an Ensembl-form partner token; None for anything else (plain symbols)."""
+def _parse_accession_token(token: str) -> Optional[_AccessionToken]:
+    """Parse an Ensembl- or RefSeq-form partner token; None for anything else (plain symbols)."""
     text = token.strip()
-    if ENSEMBL_PATTERN.match(text):
-        return _EnsemblToken(raw=text, ensembl_id=text.upper())
-    match = _DECORATED_PATTERN.match(text)
-    if match:
-        return _EnsemblToken(raw=text, ensembl_id=match.group("id").upper(), named_gene=match.group("gene"))
-    match = _HGVS_PATTERN.match(text)
-    if match:
-        return _EnsemblToken(
-            raw=text,
-            ensembl_id=match.group("id").upper(),
-            named_gene=match.group("gene"),
-            variant=match.group("variant"),
-        )
-    if _ENSEMBL_LIKE_PATTERN.search(text):
-        return _EnsemblToken(raw=text, ensembl_id=None)
-    return None
+    if ENSEMBL_PATTERN.match(text) or REFSEQ_PATTERN.match(text):
+        accession, named_gene, variant = text.upper(), None, None
+    elif match := _DECORATED_PATTERN.match(text):
+        accession, named_gene, variant = match.group("id").upper(), match.group("gene"), None
+    elif match := _HGVS_PATTERN.match(text):
+        accession, named_gene, variant = match.group("id").upper(), match.group("gene"), match.group("variant")
+    elif _ENSEMBL_LIKE_PATTERN.search(text):
+        return _AccessionToken(raw=text, accession=None)
+    elif _REFSEQ_LIKE_PATTERN.search(text):
+        return _AccessionToken(raw=text, accession=None, refseq=True)
+    else:
+        return None
+    return _AccessionToken(
+        raw=text, accession=accession, named_gene=named_gene, variant=variant, refseq=_is_refseq_id(accession)
+    )
 
 
-def has_ensembl_identifier(value: str) -> bool:
-    """True when a gene or fusion input names a partner with an Ensembl ID (valid or not)."""
-    return any(_parse_ensembl_token(token) for token in split_fusion(value) if token)
+def has_accession_identifier(value: str) -> bool:
+    """True when a gene or fusion input names a partner with an Ensembl ID or RefSeq accession (valid or not)."""
+    return any(_parse_accession_token(token) for token in split_fusion(value) if token)
 
 
 def _unresolvable_gene(
@@ -478,15 +518,141 @@ async def _resolve_ensembl_ids(
     return resolved
 
 
+def _refseq_absent(symbol: str) -> ResolvedGene:
+    return _unresolvable_gene(symbol, resolution_error=f"NCBI has no human RefSeq transcript or protein {symbol}.")
+
+
+def _refseq_failed(symbol: str) -> ResolvedGene:
+    return _unresolvable_gene(
+        symbol, lookup_failed=True, resolution_error=f"The NCBI RefSeq lookup for {symbol} failed; please retry."
+    )
+
+
+def _retry_after_seconds(resp: httpx.Response) -> Optional[float]:
+    """Retry-After as seconds to wait (delta-seconds or HTTP-date); None if absent or unparseable."""
+    value = (resp.headers.get("Retry-After") or "").strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    if math.isnan(seconds):
+        return None
+    return max(seconds, 0.0)
+
+
+async def _ncbi_get(url: str, headers: dict, client: httpx.AsyncClient) -> httpx.Response:
+    """GET from NCBI under the shared limiter, retrying 429s within NCBI_RETRY_DEADLINE_SECONDS.
+    Returns the last response (possibly still a 429); raises httpx.TimeoutException
+    when the deadline runs out while waiting for the limiter or the request."""
+    # Lazy: literature imports this module. Shares the NCBI request budget with PubMed.
+    from src.pipeline.literature import _get_ncbi_rate_limiter
+
+    async def _attempt() -> httpx.Response:
+        async with _get_ncbi_rate_limiter():
+            return await client.get(url, headers=headers, timeout=NCBI_TIMEOUT_SECONDS)
+
+    deadline = _monotonic() + NCBI_RETRY_DEADLINE_SECONDS
+    for attempt in range(NCBI_RATE_LIMIT_RETRIES + 1):
+        remaining = deadline - _monotonic()
+        try:
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            resp = await asyncio.wait_for(_attempt(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise httpx.TimeoutException(f"NCBI lookup exceeded its {NCBI_RETRY_DEADLINE_SECONDS:g}s deadline") from exc
+        if resp.status_code != 429 or attempt == NCBI_RATE_LIMIT_RETRIES:
+            return resp
+        delay = _retry_after_seconds(resp)
+        if delay is None:
+            delay = NCBI_RATE_LIMIT_BACKOFF_SECONDS * 2**attempt
+        if delay >= deadline - _monotonic():
+            return resp  # NCBI asks for longer than we have left: fail fast, retryable
+        await _sleep(delay)
+    return resp
+
+
+async def _refseq_gene_lookup(accession: str, client: httpx.AsyncClient) -> Optional[dict]:
+    """NCBI's gene for a RefSeq accession, cached by unversioned accession (NCBI
+    reports the gene for any version). None when NCBI has no gene for it;
+    raises httpx.HTTPError / ValueError when the lookup itself failed."""
+    lookup_id = _ensembl_lookup_id(accession).upper()
+
+    async def _fetch() -> Optional[dict]:
+        headers = {"Accept": "application/json"}
+        if settings.ncbi_api_key:
+            headers["api-key"] = settings.ncbi_api_key
+        resp = await _ncbi_get(NCBI_GENE_BY_ACCESSION_URL.format(accession=lookup_id), headers, client)
+        if resp.status_code in (400, 404):
+            return None
+        resp.raise_for_status()
+        reports = resp.json().get("reports") or []
+        genes = [report.get("gene") or {} for report in reports]
+        human = [gene for gene in genes if str(gene.get("tax_id")) == "9606" and gene.get("symbol")]
+        if not human:
+            return None
+        gene = human[0]
+        authority = gene.get("nomenclature_authority") or {}
+        return {
+            "symbol": gene["symbol"],
+            "name": gene.get("description"),
+            "hgnc_id": authority.get("identifier") if authority.get("authority") == "HGNC" else None,
+        }
+
+    return await cached_call(f"ncbi:refseq_gene:{lookup_id}", _fetch)
+
+
+async def _resolve_refseq_id(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
+    """RefSeq transcript/protein accession -> its human gene's symbol."""
+    try:
+        doc = await _refseq_gene_lookup(symbol, client)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("NCBI RefSeq lookup failed for %s: %s", symbol, exc)
+        return _refseq_failed(symbol)
+    if not doc:
+        return _refseq_absent(symbol)
+    accession = symbol.upper()
+    return ResolvedGene(
+        input_symbol=symbol,
+        canonical_symbol=doc["symbol"],
+        hgnc_id=doc.get("hgnc_id"),
+        name=doc.get("name"),
+        resolved=True,
+        # Proteins (NP_/XP_) name no transcript.
+        refseq_transcript_id=accession if accession[1] in "MR" else None,
+    )
+
+
+async def _resolve_refseq_ids(symbols: Iterable[str], client: httpx.AsyncClient) -> Dict[str, ResolvedGene]:
+    symbol_list = list(dict.fromkeys(symbols))
+    semaphore = asyncio.Semaphore(NORMALIZATION_CONCURRENCY)
+
+    async def resolve_one(symbol: str) -> ResolvedGene:
+        async with semaphore:
+            return await _resolve_refseq_id(symbol, client)
+
+    return dict(zip(symbol_list, await asyncio.gather(*(resolve_one(symbol) for symbol in symbol_list))))
+
+
 async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
     """
     Resolve a gene symbol to its canonical HGNC entry.
-    Ensembl IDs are resolved through Ensembl before falling back to insufficient evidence.
+    Ensembl IDs are resolved through Ensembl and RefSeq accessions through NCBI
+    before falling back to insufficient evidence.
     """
     if _is_ensembl_id(symbol):
         return (await _resolve_ensembl_ids([symbol], client))[symbol]
-    if _parse_ensembl_token(symbol):
-        # Decorated, HGVS or malformed Ensembl forms: HGNC search would
+    if _is_refseq_id(symbol):
+        return await _resolve_refseq_id(symbol, client)
+    if _parse_accession_token(symbol):
+        # Decorated, HGVS or malformed Ensembl/RefSeq forms: HGNC search would
         # fuzzy-match 'EML4(ENST...)' to EML4, so never send them there.
         return _unresolvable_gene(symbol, resolution_error=f"'{symbol}' is not a gene symbol.")
 
@@ -576,15 +742,15 @@ class CanonicalInput:
     """How one submitted gene/fusion input was read before HGNC normalization."""
 
     submitted: str
-    # The input with each resolved Ensembl-form partner replaced by its gene
-    # symbol ('ENST...::ENST...' -> 'EML4::ALK'); the submitted string itself
+    # The input with each resolved Ensembl/RefSeq-form partner replaced by its
+    # gene symbol ('ENST...::ENST...' -> 'EML4::ALK'); the submitted string itself
     # when nothing was rewritten.
     canonical: str
     five_transcript: Optional[str] = None
     three_transcript: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
-    # True when an error is only a failed (retryable) Ensembl/HGNC lookup.
+    # True when an error is only a failed (retryable) Ensembl/NCBI/HGNC lookup.
     lookup_failed: bool = False
 
 
@@ -599,13 +765,13 @@ class GeneMap(Dict[str, Tuple[ResolvedGene, List[str]]]):
         self.submitted: Dict[str, List[str]] = {}
 
 
-def _read_ensembl_token(
-    token: _EnsemblToken,
-    ensembl: Dict[str, ResolvedGene],
+def _read_accession_token(
+    token: _AccessionToken,
+    by_accession: Dict[str, ResolvedGene],
     hgnc: Dict[str, ResolvedGene],
 ) -> Tuple[Optional[str], ResolvedGene, Optional[str], Optional[str]]:
     """
-    Decide what an Ensembl-form token means.
+    Decide what an Ensembl- or RefSeq-form token means.
 
     Returns (symbol, resolved, transcript, warning). `symbol` is the gene name
     the canonical input uses; it is None when the token can't be used, in
@@ -613,21 +779,25 @@ def _read_ensembl_token(
     GENE(ENST...) whose transcript belongs to GENE, `symbol` is GENE as
     written and the caller resolves it through HGNC like a plain symbol.
     """
-    if token.ensembl_id is None:
+    if token.accession is None:
+        expected = (
+            "NM_, NR_, XM_, XR_, NP_ or XP_ followed by digits and an optional .version, "
+            "GENE(NM_...), or NM_...:c...."
+            if token.refseq
+            else "ENSG, ENST or ENSP followed by 11 digits and an optional .version, GENE(ENST...), or ENST...:c...."
+        )
+        noun = "human RefSeq transcript or protein accession" if token.refseq else "human Ensembl ID"
         return None, _unresolvable_gene(
             token.raw,
-            resolution_error=(
-                f"'{token.raw}' is not a valid human Ensembl ID or supported form (expected ENSG, ENST "
-                "or ENSP followed by 11 digits and an optional .version, GENE(ENST...), or ENST...:c....)."
-            ),
+            resolution_error=f"'{token.raw}' is not a valid {noun} or supported form (expected {expected}).",
         ), None, None
 
-    by_id = ensembl[token.ensembl_id]
+    by_id = by_accession[token.accession]
     if by_id.unresolvable:
         return None, by_id.model_copy(update={"input_symbol": token.raw, "canonical_symbol": token.raw}), None, None
 
     ensembl_symbol = by_id.canonical_symbol or ""
-    transcript = by_id.ensembl_transcript_id
+    transcript = by_id.ensembl_transcript_id or by_id.refseq_transcript_id
     named = token.named_gene
     if named and named.upper() != ensembl_symbol.upper():
         named_resolved = hgnc.get(named)
@@ -636,7 +806,7 @@ def _read_ensembl_token(
                 token.raw,
                 lookup_failed=True,
                 resolution_error=(
-                    f"Could not check that {token.ensembl_id} belongs to {named}: the HGNC lookup failed; "
+                    f"Could not check that {token.accession} belongs to {named}: the HGNC lookup failed; "
                     "please retry."
                 ),
             ), None, None
@@ -645,15 +815,15 @@ def _read_ensembl_token(
             return None, _unresolvable_gene(
                 token.raw,
                 resolution_error=(
-                    f"'{token.raw}': Ensembl {token.ensembl_id} belongs to {ensembl_symbol}, not {named}. "
-                    "Correct the gene or the Ensembl ID."
+                    f"'{token.raw}': {token.source} {token.accession} belongs to {ensembl_symbol}, not {named}. "
+                    f"Correct the gene or the {token.source} {token.id_noun}."
                 ),
             ), None, None
 
     warning = None
     if token.variant:
         warning = (
-            f"'{token.raw}' was annotated as gene {ensembl_symbol} (from {token.ensembl_id}); "
+            f"'{token.raw}' was annotated as gene {ensembl_symbol} (from {token.accession}); "
             f"variant-level interpretation of {token.variant} is not supported."
         )
     if named and not token.variant:
@@ -672,31 +842,36 @@ async def normalize_fusions(
     canonical_symbol -> (ResolvedGene, [canonical input strings involving this gene]).
 
     Each gene appears once regardless of how many inputs involve it. Ensembl
-    IDs (bare, GENE(ENST...) or ENST...:c....) are resolved through Ensembl and
-    replaced by their gene symbol in the canonical input strings; see
+    IDs (bare, GENE(ENST...) or ENST...:c....) are resolved through Ensembl,
+    RefSeq accessions (bare, GENE(NM_...) or NM_...:c....) through NCBI, and
+    both are replaced by their gene symbol in the canonical input strings; see
     GeneMap.inputs for how each submitted input was read.
     """
-    tokens_by_input: Dict[str, list[tuple[str, Optional[_EnsemblToken]]]] = {}
+    tokens_by_input: Dict[str, list[tuple[str, Optional[_AccessionToken]]]] = {}
     for fusion in dict.fromkeys(fusions):
         g1, g2 = split_fusion(fusion)
-        tokens_by_input[fusion] = [(g, _parse_ensembl_token(g)) for g in filter(None, [g1, g2])]
-    ensembl_tokens = [token for tokens in tokens_by_input.values() for _, token in tokens if token]
-    ensembl_ids = sorted({token.ensembl_id for token in ensembl_tokens if token.ensembl_id})
+        tokens_by_input[fusion] = [(g, _parse_accession_token(g)) for g in filter(None, [g1, g2])]
+    accession_tokens = [token for tokens in tokens_by_input.values() for _, token in tokens if token]
+    ensembl_ids = sorted({token.accession for token in accession_tokens if token.accession and not token.refseq})
+    refseq_ids = sorted({token.accession for token in accession_tokens if token.accession and token.refseq})
     plain_symbols = {g for tokens in tokens_by_input.values() for g, token in tokens if token is None}
 
     async with httpx.AsyncClient() as client:
-        ensembl = await _resolve_ensembl_ids(ensembl_ids, client)
-        # GENE in GENE(ENST...) is resolved alongside the plain symbols (one
-        # HGNC pass), both to check it against the transcript's gene and,
-        # when it matches, to annotate it like a plain symbol.
+        ensembl, refseq = await asyncio.gather(
+            _resolve_ensembl_ids(ensembl_ids, client), _resolve_refseq_ids(refseq_ids, client)
+        )
+        by_accession = {**ensembl, **refseq}
+        # GENE in GENE(ENST...) / GENE(NM_...) is resolved alongside the plain
+        # symbols (one HGNC pass), both to check it against the transcript's
+        # gene and, when it matches, to annotate it like a plain symbol.
         named_symbols = {
             token.named_gene
-            for token in ensembl_tokens
-            if token.named_gene and token.ensembl_id and ensembl[token.ensembl_id].resolved
+            for token in accession_tokens
+            if token.named_gene and token.accession and by_accession[token.accession].resolved
         }
         hgnc = await _resolve_hgnc_symbols_concurrently(sorted(plain_symbols | named_symbols), client)
 
-    # Ensembl-resolved (or failed) tokens keep their own ResolvedGene, keyed by
+    # Ensembl/RefSeq-resolved (or failed) tokens keep their own ResolvedGene, keyed by
     # the submitted token; everything else is keyed by the HGNC symbol.
     ensembl_resolved: Dict[str, ResolvedGene] = {}
     # A failed token's row is shared by every input that used it, so it
@@ -710,7 +885,8 @@ async def normalize_fusions(
         transcripts: list[Optional[str]] = []
         keys: list[str] = []
         readings = [
-            (raw, token, _read_ensembl_token(token, ensembl, hgnc) if token else None) for raw, token in tokens
+            (raw, token, _read_accession_token(token, by_accession, hgnc) if token else None)
+            for raw, token in tokens
         ]
         for index, (raw, token, reading) in enumerate(readings):
             if reading is None:

@@ -32,11 +32,13 @@ class ResolvedGene(BaseModel):
     # True when unresolvable only because the lookup service failed (timeout,
     # 5xx, ...), as opposed to the service confirming the symbol doesn't exist.
     lookup_failed: bool = False
-    # Why an Ensembl-form input (ENST..., GENE(ENST...), ENST...:c....) could
-    # not be used, e.g. an unknown ID or a transcript of a different gene.
+    # Why an Ensembl/RefSeq-form input (ENST..., GENE(NM_...), NM_...:c....)
+    # could not be used, e.g. an unknown ID or a transcript of a different gene.
     resolution_error: Optional[str] = None
     # Transcript an ENST/ENSP input resolved through (ENSP -> its parent ENST).
     ensembl_transcript_id: Optional[str] = None
+    # RefSeq transcript (NM_/NR_/XM_/XR_) an input named; None for NP_/XP_ proteins.
+    refseq_transcript_id: Optional[str] = None
 
 
 class LiteratureRecord(BaseModel):
@@ -399,8 +401,9 @@ class GeneAnnotation(BaseModel):
     resolved_inputs: List[ResolvedInput] = Field(
         default_factory=list,
         description=(
-            "Submitted inputs for this gene that were rewritten before annotation (Ensembl IDs, "
-            "GENE(ENST...) and ENST...:c.... forms), with what each resolved to."
+            "Submitted inputs for this gene that were rewritten before annotation (Ensembl IDs, RefSeq "
+            "accessions, GENE(ENST...)/GENE(NM_...) and ENST...:c..../NM_...:c.... forms), with what each "
+            "resolved to."
         ),
     )
     in_oncokb: Optional[bool] = None  # None when OncoKB token not configured

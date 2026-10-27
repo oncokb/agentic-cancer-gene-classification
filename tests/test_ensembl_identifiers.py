@@ -21,7 +21,7 @@ from src.models.schema import FusionEvidenceResult, FusionPositionContext, GeneA
 from src.pipeline import literature, normalization, orchestrator
 from src.pipeline.fusion_context import input_position_context
 from src.pipeline.normalization import (
-    has_ensembl_identifier,
+    has_accession_identifier,
     normalize_fusions,
     unparsed_fusion_warning,
     unparsed_fusion_warnings,
@@ -143,12 +143,12 @@ def _hgnc_requests(handler) -> list[str]:
     ],
 )
 def test_ensembl_forms_are_recognized(value):
-    assert has_ensembl_identifier(value)
+    assert has_accession_identifier(value)
 
 
-@pytest.mark.parametrize("value", ["TP53", "ENSA", "ENSAP1", "EML4::ALK", "HLA-A", "C1orf112", "TP53(NM_000546)"])
-def test_plain_symbols_are_not_ensembl_forms(value):
-    assert not has_ensembl_identifier(value)
+@pytest.mark.parametrize("value", ["TP53", "ENSA", "ENSAP1", "EML4::ALK", "HLA-A", "C1orf112", "BRAF_V600E"])
+def test_plain_symbols_are_not_accession_forms(value):
+    assert not has_accession_identifier(value)
 
 
 @pytest.mark.parametrize(
