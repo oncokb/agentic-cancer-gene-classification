@@ -301,7 +301,6 @@ async def test_warnings_from_real_normalization(fake_hgnc):
         "anti-EGFR",
         "TNF-alpha",
         "bcr-abl",  # all-letter lowercase: accepted miss
-        "EML4 alk fusion",
     ],
 )
 async def test_hyphenated_prose_and_mixed_case_words_do_not_warn(fake_hgnc, value):
@@ -319,10 +318,126 @@ async def test_hyphenated_prose_and_mixed_case_words_do_not_warn(fake_hgnc, valu
         ("C11orf95-RELA", "C11ORF95::RELA"),
         ("EML4 ALK fusion", "EML4::ALK"),
         ("eml4 alk fusion", "EML4::ALK"),
+        ("KMT2A-AFF1", "KMT2A::AFF1"),
     ],
 )
 async def test_symbol_cased_partners_still_warn(fake_hgnc, value, suggestion):
     assert await _warnings_for([value]) == [_warning(value, suggestion)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value, suggestion",
+    [
+        ("fus erg fusion", "FUS::ERG"),
+        ("Fusion eml4 alk", "EML4::ALK"),
+        ("EML4 alk fusion", "EML4::ALK"),
+        ("Eml4 Alk rearrangement", "EML4::ALK"),
+    ],
+)
+async def test_keyword_form_warns_whatever_the_case(fake_hgnc, value, suggestion):
+    # The case check only applies to the hyphen form; a capitalized keyword
+    # ('Fusion') must not make lowercase partners look like prose.
+    assert await _warnings_for([value]) == [_warning(value, suggestion)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["novel kinase fusion", "fusion of genes", "lung cancer fusion"])
+async def test_keyword_form_still_needs_gene_like_partners(fake_hgnc, value):
+    assert await _warnings_for([value]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        "EGFR-exon19del",
+        "EGFR-exon20ins",
+        "EGFR-Exon19Deletion",
+        "EGFR-ex19del",
+        "ERBB2-exon20insertion",
+        "KIT-exon11",
+        "KIT-exon11mut",
+        "MET-exon14skipping",
+        "MET-ex14skip",
+        "EGFR-exon19delins",
+        "FLT3-ITD",
+        "FLT3-TKD",
+        "EGFR-vIII",
+        "EGFR-KDD",
+    ],
+)
+async def test_exon_and_mutation_shorthand_does_not_warn(fake_hgnc, value):
+    assert await _warnings_for([value]) == []
+
+
+# Written independently of literature._TUMOR_TYPE_ALIASES (the sync test above
+# only covers that table): pediatric, CNS and sarcoma names and OncoTree codes.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tumor",
+    [
+        "DIPG", "DSRCT", "MEDULLOBLASTOMA", "EPENDYMOMA", "ATRT", "ETMR", "HGG", "DMG", "PXA",
+        "ASTROCYTOMA", "RHABDOMYOSARCOMA", "RMS", "ERMS", "EWING", "OSTEOSARCOMA", "SYNS", "MPNST",
+        "IFS", "FIBROSARCOMA", "DFSP", "WILMS", "HEPATOBLASTOMA", "RETINOBLASTOMA", "LCH", "JMML",
+        "pediatric", "Medulloblastoma",
+    ],
+)
+async def test_gene_hyphen_tumor_type_does_not_warn(fake_hgnc, tumor):
+    assert await _warnings_for([f"ALK-{tumor}"]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["cd4-cd8", "CD4-CD8", "CD34-CD38", "CD45RA-CD62L", "Cd4-Cd8"])
+async def test_cd_marker_pairs_do_not_warn(fake_hgnc, value):
+    assert await _warnings_for([value]) == []
+
+
+@pytest.mark.asyncio
+async def test_cd_gene_with_a_non_cd_partner_still_warns(fake_hgnc):
+    assert await _warnings_for(["CD74-ROS1"]) == [_warning("CD74-ROS1", "CD74::ROS1")]
+
+
+_QUIET_CONTROLS = [
+    "HLA-A", "NKX2-1", "IL-6", "GM-CSF", "TNF-alpha", "Ki-67", "HER2-low", "PD-L1", "NF-kB",
+    "anti-EGFR", "in-frame", "low-grade", "x-ray", "BRAF melanoma", "KRAS G12C",
+]
+_WARNING_CONTROLS = [
+    ("EWSR1-FLI1", "EWSR1::FLI1"),
+    ("ewsr1-fli1", "EWSR1::FLI1"),
+    ("bcr-abl1", "BCR::ABL1"),
+    ("EML4 ALK fusion", "EML4::ALK"),
+    ("KMT2A-AFF1", "KMT2A::AFF1"),
+    ("C11orf95-RELA", "C11ORF95::RELA"),
+]
+
+
+@pytest.mark.asyncio
+async def test_controls_in_one_request(fake_hgnc):
+    inputs = _QUIET_CONTROLS + [value for value, _ in _WARNING_CONTROLS]
+
+    assert await _warnings_for(inputs) == [_warning(value, suggestion) for value, suggestion in _WARNING_CONTROLS]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ENSG00000146648",
+        "ENST00000275493",
+        "ENST00000275493.7",
+        "ENSP00000275493",
+        "ENST00000275493:c.2573T>G",
+        "NM_005228.5",
+        "NM_005228",
+        "NP_005219.2",
+        "NM_005228.5:c.2573T>G",
+        "NM-005228",
+        "EGFR(NM_005228.5)",
+    ],
+)
+async def test_ensembl_and_refseq_looking_inputs_do_not_warn(fake_hgnc, value):
+    assert await _warnings_for([value]) == []
 
 
 @pytest.mark.asyncio

@@ -539,6 +539,10 @@ _SAME_GENE_SPELLINGS = [
     (f"TP53({_TP53_TX})", "TP53"),
     (_TP53_PROTEIN, f"{_TP53_TX}.9"),
     (f"{_TP53_TX}:c.215C>G", "TP53"),
+    # Case variants merge into one gene; request order, not spelling sort order, decides.
+    ("tp53", "TP53"),
+    ("Tp53", "tp53"),
+    ("tp53", _TP53_TX),
 ]
 
 
