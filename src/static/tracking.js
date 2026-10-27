@@ -9,7 +9,7 @@
   const ENDPOINT = "/v1/events";
   const BATCH_SIZE = 50;
   const FLUSH_INTERVAL_MS = 5000;
-  const MAX_QUEUE = 500;
+  const MAX_QUEUE = 2000; // a 200-gene first render queues ~600 events at once
   const MAX_NETWORK_RETRIES = 3;
   const DEFAULT_RETRY_AFTER_MS = 30000;
   const DWELL_MS = 1000;

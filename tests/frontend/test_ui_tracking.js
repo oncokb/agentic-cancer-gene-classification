@@ -518,8 +518,8 @@ test("429 waits for Retry-After and resends the same batch; 4xx drops; network e
 
 test("the queue is capped", async () => {
   const t = setup({ enabled: null });
-  for (let i = 0; i < 2000; i += 1) t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: "1" });
-  assert.strictEqual(t.queued().length, 500);
+  for (let i = 0; i < 5000; i += 1) t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: "1" });
+  assert.strictEqual(t.queued().length, 2000);
 });
 
 test("delegated PMID link clicks (click + middle auxclick) carry the card's context", async () => {
