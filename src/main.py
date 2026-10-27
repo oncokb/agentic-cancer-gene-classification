@@ -62,6 +62,7 @@ from src.auth import (
     render_access_denied_html,
     require_admin,
     require_auth,
+    session_store_unavailable,
     set_session_cookie,
     validate_redirect_to,
     verify_oauth_state,
@@ -945,9 +946,23 @@ def _record_annotation_request_metrics(
         )
 
 
-def _login_redirect(request: Request) -> Optional[RedirectResponse]:
+def _require_session_store(request: Request) -> None:
+    """Fail closed (503) when the session couldn't be checked against the user store,
+    rather than treating the caller as signed out (or signed in on token claims)."""
+    if session_store_unavailable(request):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session verification is temporarily unavailable. Please retry shortly.",
+        )
+
+
+async def _login_redirect(request: Request) -> Optional[RedirectResponse]:
     """Send a signed-out browser to /login, returning to this page afterwards."""
-    if not settings.auth_enabled or get_current_user(request):
+    if not settings.auth_enabled:
+        return None
+    user = await get_request_user(request)
+    _require_session_store(request)
+    if user:
         return None
     target = request.url.path
     if request.url.query:
@@ -960,7 +975,7 @@ def _login_redirect(request: Request) -> Optional[RedirectResponse]:
 
 @app.get("/")
 async def root(request: Request) -> Response:
-    redirect = _login_redirect(request)
+    redirect = await _login_redirect(request)
     if redirect:
         return redirect
     return FileResponse(_STATIC_DIR / "index.html")
@@ -968,7 +983,7 @@ async def root(request: Request) -> Response:
 
 @app.get("/api-keys")
 async def api_keys_page(request: Request) -> Response:
-    redirect = _login_redirect(request)
+    redirect = await _login_redirect(request)
     if redirect:
         return redirect
     public_base_url = (settings.public_app_base_url or str(request.base_url)).rstrip("/")
@@ -982,7 +997,7 @@ async def api_keys_page(request: Request) -> Response:
 
 @app.get("/runs")
 async def runs_page(request: Request) -> Response:
-    redirect = _login_redirect(request)
+    redirect = await _login_redirect(request)
     if redirect:
         return redirect
     return FileResponse(_STATIC_DIR / "runs.html")
@@ -992,7 +1007,8 @@ async def runs_page(request: Request) -> Response:
 async def login_page(request: Request, redirect_to: Optional[str] = "/") -> Response:
     if not settings.auth_enabled:
         return RedirectResponse(url="/", status_code=303)
-    user = get_current_user(request)
+    user = await get_request_user(request)
+    _require_session_store(request)
     if user:
         return RedirectResponse(url=validate_redirect_to(redirect_to), status_code=303)
     login_html = _STATIC_DIR / "login.html"
@@ -1008,7 +1024,8 @@ async def health() -> dict:
 
 @app.get("/auth/me", response_model=AuthMeResponse)
 async def auth_me(request: Request) -> AuthMeResponse:
-    user = get_current_user(request)
+    user = await get_request_user(request)
+    _require_session_store(request)
     return AuthMeResponse(
         auth_enabled=settings.auth_enabled,
         authenticated=bool(user),
@@ -1460,6 +1477,7 @@ async def auth_dev_login(
         domain=clean_email.split("@")[-1],
         provider="dev",
         groups=["admin-group"] if role == "admin" else [],
+        role=role,
     )
     user = AuthenticatedUser(
         email=profile.email,

@@ -13,7 +13,6 @@ from src.auth import (
     AuthenticatedUser,
     build_saml_authn_request,
     create_oauth_state,
-    create_session_token,
     decode_session_token,
     exchange_keycloak_code,
     get_keycloak_auth_url,
@@ -28,6 +27,7 @@ from src.auth import (
 )
 from src.config import settings
 from src.main import app
+from tests.auth_helpers import session_token_for
 
 
 def test_is_email_allowed_domains(monkeypatch):
@@ -88,7 +88,7 @@ def test_session_token_lifecycle(monkeypatch):
         provider="google",
     )
 
-    token = create_session_token(user, ttl_seconds=3600)
+    token = session_token_for(user, ttl_seconds=3600)
     assert "." in token
 
     decoded = decode_session_token(token)
@@ -103,7 +103,7 @@ def test_session_token_lifecycle(monkeypatch):
     assert decode_session_token(tampered) is None
 
     # Expired token
-    expired_token = create_session_token(user, ttl_seconds=-10)
+    expired_token = session_token_for(user, ttl_seconds=-10)
     assert decode_session_token(expired_token) is None
 
 
@@ -143,7 +143,7 @@ def test_auth_me_endpoint(monkeypatch):
         name="Curation Lead",
         domain="openevidence.com",
     )
-    token = create_session_token(user)
+    token = session_token_for(user)
     client.cookies.set(settings.auth_cookie_name, token)
 
     resp2 = client.get("/auth/me")
@@ -227,7 +227,7 @@ def test_protected_routes_enforce_auth_when_enabled(monkeypatch):
         name="Oncologist",
         domain="mskcc.org",
     )
-    token = create_session_token(user)
+    token = session_token_for(user)
     client.cookies.set(settings.auth_cookie_name, token)
 
     resp2 = client.get("/v1/annotate/jobs/nonexistent-id")
@@ -584,7 +584,7 @@ def test_auth_users_admin_endpoint(monkeypatch):
         domain="mskcc.org",
         role="curator",
     )
-    curator_token = create_session_token(curator_user)
+    curator_token = session_token_for(curator_user)
     client.cookies.set(settings.auth_cookie_name, curator_token)
     resp_curator = client.get("/auth/users")
     assert resp_curator.status_code == 403
@@ -597,7 +597,7 @@ def test_auth_users_admin_endpoint(monkeypatch):
         domain="mskcc.org",
         role="admin",
     )
-    admin_token = create_session_token(admin_user)
+    admin_token = session_token_for(admin_user)
     client.cookies.set(settings.auth_cookie_name, admin_token)
     resp_admin = client.get("/auth/users")
     assert resp_admin.status_code == 200
@@ -688,7 +688,7 @@ def test_user_context_middleware_populates_context_from_cookie(monkeypatch):
         domain="mskcc.org",
         role="curator",
     )
-    token = create_session_token(user)
+    token = session_token_for(user)
 
     client = TestClient(app)
     client.cookies.set(settings.auth_cookie_name, token)
@@ -718,7 +718,7 @@ def test_login_page_and_root_redirects(monkeypatch):
         name="Doctor",
         domain="mskcc.org",
     )
-    token = create_session_token(user)
+    token = session_token_for(user)
     client.cookies.set(settings.auth_cookie_name, token)
 
     resp_auth_login = client.get("/login", follow_redirects=False)
@@ -751,7 +751,7 @@ def test_logout_redirects_to_login(monkeypatch):
         name="Doctor",
         domain="mskcc.org",
     )
-    token = create_session_token(user)
+    token = session_token_for(user)
     client.cookies.set(settings.auth_cookie_name, token)
 
     resp = client.get("/auth/logout", follow_redirects=False)

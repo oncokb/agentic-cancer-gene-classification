@@ -11,8 +11,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import main
-from src.auth import AuthenticatedUser, create_session_token
+from src.auth import AuthenticatedUser
 from src.config import settings
+from tests.auth_helpers import session_token_for
 
 _STATIC_DIR = Path(__file__).parent.parent / "src" / "static"
 
@@ -32,7 +33,7 @@ def test_runs_page_signed_in_serves_page(monkeypatch):
     monkeypatch.setattr(settings, "auth_secret_key", "runs-page-test-secret")
     client = TestClient(main.app)
     user = AuthenticatedUser(email="user@mskcc.org", name="User", domain="mskcc.org")
-    client.cookies.set(settings.auth_cookie_name, create_session_token(user))
+    client.cookies.set(settings.auth_cookie_name, session_token_for(user))
     response = client.get("/runs")
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-cache"

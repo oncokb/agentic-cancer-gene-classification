@@ -145,7 +145,16 @@ async def _get_auth_redis_client():
     return _redis_client
 
 
-async def get_user_profile(email: str) -> Optional[UserProfile]:
+class UserStoreUnavailable(RuntimeError):
+    """The user profile store could not be read; callers must fail closed."""
+
+
+async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
+    """Read a user profile, raising UserStoreUnavailable on a store error.
+
+    Unlike get_user_profile, a Redis failure is not masked by the in-process
+    fallback store, which may hold a stale (or no) copy of the profile.
+    """
     clean_email = email.strip().lower()
     redis_client = await _get_auth_redis_client()
     if redis_client is not None:
@@ -154,10 +163,20 @@ async def get_user_profile(email: str) -> Optional[UserProfile]:
             if payload:
                 return UserProfile.model_validate_json(payload)
         except Exception as exc:
-            logger.debug("Redis error reading user %s: %s", clean_email, exc)
+            raise UserStoreUnavailable(f"Failed to read user {clean_email}") from exc
 
     async with _user_store_lock:
         return _user_store.get(clean_email)
+
+
+async def get_user_profile(email: str) -> Optional[UserProfile]:
+    try:
+        return await load_user_profile_strict(email)
+    except UserStoreUnavailable as exc:
+        clean_email = email.strip().lower()
+        logger.debug("Redis error reading user %s: %s", clean_email, exc.__cause__)
+        async with _user_store_lock:
+            return _user_store.get(clean_email)
 
 
 async def save_user_profile(profile: UserProfile) -> None:
@@ -728,23 +747,83 @@ def _uses_api_key(request: Request) -> bool:
 # so the observability middleware and require_auth share a single DB lookup.
 _API_KEY_STATE_ATTR = "acgc_api_key_auth"
 _API_KEY_RATE_CHECKED_ATTR = "acgc_api_key_rate_checked"
+# Same idea for session tokens: (user, failure reason) after the live profile
+# check, so each request reads the user profile at most once.
+_SESSION_STATE_ATTR = "acgc_session_auth"
+
+
+def _session_token(request: Request) -> Optional[str]:
+    return request.cookies.get(settings.auth_cookie_name) or bearer_token(request.headers.get("Authorization"))
 
 
 def get_current_user(request: Request) -> Optional[AuthenticatedUser]:
+    """The caller's identity as already verified for this request.
+
+    API keys and session tokens both need an async lookup (the key record and
+    the live user profile respectively), so this sync helper only returns what
+    resolve_api_key_user() / resolve_session_user() verified, and None
+    otherwise. user_context_middleware resolves both on every request.
+    """
+    attr = _API_KEY_STATE_ATTR if _uses_api_key(request) else _SESSION_STATE_ATTR
+    cached = getattr(request.state, attr, None)
+    return cached[0] if cached else None
+
+
+async def _verify_session(token: str) -> Tuple[Optional[AuthenticatedUser], Optional[str]]:
+    claims = decode_session_token(token)
+    if claims is None:
+        return None, "invalid"
+
+    # The token's role/status are a snapshot from login. Authorize against the
+    # current profile so demotions take effect on already-issued sessions.
+    try:
+        profile = await load_user_profile_strict(claims.email)
+    except UserStoreUnavailable:
+        logger.exception("User profile lookup failed for session of %s", claims.email)
+        return None, "unavailable"
+
+    if profile is None:
+        if claims.provider == "keycloak" and not settings.jit_provisioning_enabled:
+            # Keycloak logins without JIT provisioning never write a profile;
+            # the IdP's claims are the only record to authorize against.
+            return claims, None
+        logger.warning("Session rejected for %s: user profile no longer exists", claims.email)
+        return None, "invalid"
+
+    if profile.status != "active":
+        logger.warning("Session rejected for %s: account status is %s", claims.email, profile.status)
+        return None, "inactive"
+
+    return claims.model_copy(update={"role": profile.role, "status": profile.status}), None
+
+
+async def resolve_session_user(request: Request) -> Optional[AuthenticatedUser]:
+    """Verify the session cookie / session bearer token (once per request, cached).
+
+    Returns None for API-key requests, a missing/invalid/expired token, a
+    deleted or non-active profile, or an unreadable profile store; the cached
+    failure reason ("invalid", "inactive", "unavailable") tells them apart.
+    """
     if _uses_api_key(request):
-        # API keys need an async DB lookup; this sync helper only sees a key
-        # that resolve_api_key_user() already verified for this request.
-        cached = getattr(request.state, _API_KEY_STATE_ATTR, None)
-        return cached[0] if cached else None
-
-    token = request.cookies.get(settings.auth_cookie_name)
-    if not token:
-        token = bearer_token(request.headers.get("Authorization"))
-
-    if not token:
         return None
+    cached = getattr(request.state, _SESSION_STATE_ATTR, None)
+    if cached is None:
+        token = _session_token(request)
+        if not token:
+            cached = (None, None)
+        elif not settings.auth_enabled:
+            # Auth disabled: nothing to authorize against, keep the token's claims.
+            cached = (decode_session_token(token), None)
+        else:
+            cached = await _verify_session(token)
+        setattr(request.state, _SESSION_STATE_ATTR, cached)
+    return cached[0]
 
-    return decode_session_token(token)
+
+def session_store_unavailable(request: Request) -> bool:
+    """True when this request's session couldn't be checked against the user store."""
+    cached = getattr(request.state, _SESSION_STATE_ATTR, None)
+    return bool(cached) and cached[1] == "unavailable"
 
 
 async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[AuthenticatedUser], Optional[str]]:
@@ -821,8 +900,9 @@ async def resolve_api_key_user(request: Request) -> Optional[AuthenticatedUser]:
 
 
 async def get_request_user(request: Request) -> Optional[AuthenticatedUser]:
-    """Async counterpart of get_current_user that also resolves API keys."""
+    """Async counterpart of get_current_user that resolves API keys and sessions."""
     await resolve_api_key_user(request)
+    await resolve_session_user(request)
     return get_current_user(request)
 
 
@@ -841,6 +921,9 @@ async def _enforce_api_key_rate_limit(request: Request, user: AuthenticatedUser)
             detail="API key rate limit exceeded. Please slow down and retry later.",
             headers={"Retry-After": str(retry_after)},
         )
+
+
+_INACTIVE_ACCOUNT_DETAIL = "Your account is pending administrator approval. Please contact your AGCG administrator."
 
 
 async def require_auth(request: Request) -> AuthenticatedUser:
@@ -869,7 +952,15 @@ async def require_auth(request: Request) -> AuthenticatedUser:
                 headers={"WWW-Authenticate": "Bearer"},
             )
     else:
-        user = get_current_user(request)
+        user = await resolve_session_user(request)
+        reason = getattr(request.state, _SESSION_STATE_ATTR, (None, None))[1]
+        if reason == "unavailable":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Session verification is temporarily unavailable. Please retry shortly.",
+            )
+        if reason == "inactive":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_INACTIVE_ACCOUNT_DETAIL)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -880,7 +971,7 @@ async def require_auth(request: Request) -> AuthenticatedUser:
     if user.status != "active":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account is pending administrator approval. Please contact your AGCG administrator.",
+            detail=_INACTIVE_ACCOUNT_DETAIL,
         )
 
     if uses_api_key:

@@ -104,6 +104,24 @@ def _default_auth_disabled(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _auth_profiles_in_memory(monkeypatch):
+    """Keep JIT user profiles in src.auth's in-process store, empty per test.
+
+    Session auth reads the live profile on every request and fails closed
+    (503) when Redis errors, so the auth module never talks to the configured
+    Redis in tests; tests that exercise a store failure patch
+    _get_auth_redis_client themselves.
+    """
+    from src import auth
+
+    async def _no_redis():
+        return None
+
+    monkeypatch.setattr(auth, "_get_auth_redis_client", _no_redis)
+    monkeypatch.setattr(auth, "_user_store", {})
+
+
+@pytest.fixture(autouse=True)
 async def _reset_openevidence_sidecar(monkeypatch):
     """Cancel any OpenEvidence sidecar lookup a test left running and clear
     the sidecar's module-level state (task registry, result/failure memos,
