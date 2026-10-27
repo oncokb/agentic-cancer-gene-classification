@@ -34,7 +34,6 @@ from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
 from src.api.run_persistence import run_owner, save_run_or_raise
 from src.api.runs import router as runs_router
 from src.api_keys_routes import router as api_keys_router
-from src.ui_events import router as ui_events_router
 from src.auth import (
     AuthenticatedUser,
     AuthMeResponse,
@@ -125,6 +124,7 @@ from src.pipeline.openevidence import (
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.result_sanitizer import sanitize_annotation_result
 from src.pipeline.run_store import RunStore
+from src.ui_events import router as ui_events_router
 
 _log_record_factory = logging.getLogRecordFactory()
 
@@ -135,7 +135,7 @@ def _datadog_log_record_factory(*args, **kwargs):
     usr_id = user_ctx.get("user_id") or "-"
     usr_email = user_ctx.get("email") or "-"
     usr_name = user_ctx.get("name") or "-"
-    if record.msg == "ui_event %s":
+    if record.name == "src.ui_events" and record.levelno == logging.INFO:
         usr_id = stable_user_key(usr_id) if usr_id != "-" else "-"
         usr_email = "-"
         usr_name = "-"
