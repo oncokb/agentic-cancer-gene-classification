@@ -2613,6 +2613,14 @@ body.api-keys-body {
   }
 }
 
+.submitted-input-note {
+  margin-top: 2px;
+}
+
+.submitted-input-warning {
+  color: var(--warning);
+}
+
 /* Fusion evidence sections reuse the results sidebar sizing at every zoom. */
 .fusion-section-heading {
   margin: 0;
