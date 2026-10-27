@@ -45,6 +45,9 @@ class Settings(BaseSettings):
         default_factory=lambda: ["feedback", "needs-triage"]
     )
     feedback_rate_limit_per_hour: int = Field(default=10, ge=1)
+    ui_events_enabled: bool = False
+    ui_events_rate_limit_per_minute: int = Field(default=120, ge=1)
+    ui_events_metric_flag_keys: str = ""
     # Best-effort check of PMIDs cited in feedback. The check is appended to the
     # issue body; a timeout or any PubMed/HGNC error renders "check unavailable"
     # instead of failing the submission.
