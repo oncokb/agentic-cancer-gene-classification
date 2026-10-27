@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 import pymysql
@@ -11,20 +12,24 @@ from src.pipeline import schema_migrations
 
 
 class FakeCursor:
-    """Records SQL; `columns` is the live schema, `on_alter` simulates what
-    happens when this instance's ALTER runs (e.g. another instance won)."""
+    """Records SQL; `columns` is the live schema and `errors` simulates ALTER races."""
 
     def __init__(self, columns: Dict[str, set], errors: Optional[List[Any]] = None) -> None:
         self.columns = columns
         self.errors = list(errors or [])  # popped per ALTER: an errno, or None for success
         self.sql: List[str] = []
+        self.params: List[Any] = []
         self._result: Any = None
 
     async def execute(self, sql, params=None):
         self.sql.append(sql)
+        self.params.append(params)
         if sql.startswith("SHOW COLUMNS"):
             table = sql.split()[3]
-            self._result = (params[0],) if params[0] in self.columns.get(table, set()) else None
+            self._result = next(
+                ((name,) for name in self.columns.get(table, set()) if _like_matches(name, params[0])),
+                None,
+            )
         elif sql.startswith("ALTER TABLE"):
             outcome = self.errors.pop(0) if self.errors else None
             table = sql.split()[2]
@@ -38,6 +43,24 @@ class FakeCursor:
 
     async def fetchone(self):
         return self._result
+
+
+def _like_matches(value: str, pattern: str) -> bool:
+    regex = ""
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\" and index + 1 < len(pattern):
+            index += 1
+            regex += re.escape(pattern[index])
+        elif character == "_":
+            regex += "."
+        elif character == "%":
+            regex += ".*"
+        else:
+            regex += re.escape(character)
+        index += 1
+    return re.fullmatch(regex, value) is not None
 
 
 def _won_race(table, column):
@@ -85,6 +108,24 @@ async def test_present_column_skips_alter():
     cursor = FakeCursor({"runs": {"revision"}})
     await schema_migrations.add_column_if_missing(cursor, "runs", "revision", "INT NOT NULL DEFAULT 0")
     assert not any(sql.startswith("ALTER") for sql in cursor.sql)
+
+
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [("runs; DROP TABLE users", "revision"), ("runs", "owner-email"), ("1runs", "revision")],
+)
+async def test_invalid_identifier_is_rejected_before_sql(table, column):
+    cursor = FakeCursor({"runs": set()})
+    with pytest.raises(ValueError, match="Invalid SQL identifier"):
+        await schema_migrations.add_column_if_missing(cursor, table, column, "INT")
+    assert cursor.sql == []
+
+
+async def test_show_columns_escapes_underscore_in_column_name():
+    cursor = FakeCursor({"runs": {"ownerXemail"}})
+    await schema_migrations.add_column_if_missing(cursor, "runs", "owner_email", "VARCHAR(255)")
+    assert cursor.params[0] == (r"owner\_email",)
+    assert "owner_email" in cursor.columns["runs"]
 
 
 @pytest.mark.parametrize("duplicate_errno", [1060, 1061, 1068])

@@ -60,6 +60,30 @@ def test_pool_settings_defaults():
     assert fields["mysql_pool_recycle_seconds"].default == 3600
 
 
+def test_mysql_pool_maxsize_reads_environment_variable(monkeypatch):
+    monkeypatch.setenv("MYSQL_POOL_MAXSIZE", "17")
+    assert Settings(_env_file=None).mysql_pool_maxsize == 17
+
+
+def test_mysql_pool_minsize_cannot_exceed_maxsize(monkeypatch):
+    monkeypatch.setenv("MYSQL_POOL_MINSIZE", "18")
+    monkeypatch.setenv("MYSQL_POOL_MAXSIZE", "17")
+    with pytest.raises(ValueError, match="MYSQL_POOL_MINSIZE.*MYSQL_POOL_MAXSIZE"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("recycle_seconds", [-1, 1])
+def test_mysql_pool_recycle_accepts_disabled_or_positive(monkeypatch, recycle_seconds):
+    monkeypatch.setenv("MYSQL_POOL_RECYCLE_SECONDS", str(recycle_seconds))
+    assert Settings(_env_file=None).mysql_pool_recycle_seconds == recycle_seconds
+
+
+def test_mysql_pool_recycle_rejects_zero(monkeypatch):
+    monkeypatch.setenv("MYSQL_POOL_RECYCLE_SECONDS", "0")
+    with pytest.raises(ValueError, match="MYSQL_POOL_RECYCLE_SECONDS"):
+        Settings(_env_file=None)
+
+
 def test_parse_jdbc_mysql_host_port_bare():
     assert _parse_jdbc_mysql_host_port("jdbc:mysql://db.example.com:3306") == (
         "db.example.com",

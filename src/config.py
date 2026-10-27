@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -172,6 +172,19 @@ class Settings(BaseSettings):
     mysql_pool_minsize: int = Field(default=1, ge=0)
     mysql_pool_maxsize: int = Field(default=10, ge=1)
     mysql_pool_recycle_seconds: int = Field(default=3600, ge=-1)
+
+    @field_validator("mysql_pool_recycle_seconds")
+    @classmethod
+    def validate_mysql_pool_recycle_seconds(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("MYSQL_POOL_RECYCLE_SECONDS must be -1 or at least 1")
+        return value
+
+    @model_validator(mode="after")
+    def validate_mysql_pool_sizes(self) -> "Settings":
+        if self.mysql_pool_minsize > self.mysql_pool_maxsize:
+            raise ValueError("MYSQL_POOL_MINSIZE must be <= MYSQL_POOL_MAXSIZE")
+        return self
 
     # Alternative to MYSQL_HOST/MYSQL_PORT: a JDBC-style connection string
     # (e.g. "jdbc:mysql://host:3306"), as used by this org's shared RDS
