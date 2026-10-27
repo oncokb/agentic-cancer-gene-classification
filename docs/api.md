@@ -383,8 +383,11 @@ Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
       "well_supported": false,
       "retrieved_count": 2,
       "pmids": ["17625570", "20979469"],
-      "interpretation": "EML4::ALK in LUAD has 2 non-retracted PubMed record(s) from exact fusion-pair searches, below the well-supported threshold.",
-      "evidence_cards": [ ... ]
+      "interpretation": "EML4::ALK has 2 non-retracted PubMed record(s) from exact fusion-pair searches, below the well-supported threshold. Papers mentioning LUAD in the title or abstract: 1 of 2.",
+      "evidence_cards": [ ... ],
+      "literature_scope": "requested_tumor",
+      "requested_tumor_pmids": ["17625570"],
+      "retrieval_status": "ok"
     }
   ],
   "error": null,
@@ -395,6 +398,34 @@ Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
 - `status` is `queued`, `running`, `complete` or `failed`.
 - `fusion_evidence` fills in as fusions finish; `fusions_completed` and
   `fusions_total` show progress.
+
+Each `fusion_evidence` entry (the same shape is returned inline by
+`include_fusion_evidence: true`):
+
+| Field | Meaning |
+| --- | --- |
+| `fusion`, `tumor_type` | The input pair and the tumor type you sent, or `null`. |
+| `pmids`, `retrieved_count` | Every non-retracted PMID whose title or abstract discusses the exact pair, in ranked order. Both a tumor-scoped and a tumor-agnostic search are run when `tumor_type` is set. |
+| `evidence_cards` | Cards for the top 5 `pmids` only. Each card's `requested_tumor_terms` lists the requested tumor type or alias terms found in that paper's title or abstract. |
+| `literature_scope` | Computed over all `pmids`, not just the cards. `requested_tumor`: at least one paper **mentions** the requested tumor type; this does not mean the fusion was shown in that tumor. `other_or_unspecified`: a tumor type was sent but no paper mentions it. `any_tumor`: no tumor type was sent and papers were found. `no_literature`: the search succeeded and found none. `null` when retrieval failed, the input is not a two-partner fusion, or the result predates this field. |
+| `requested_tumor_pmids` | The `pmids` that mention the requested tumor type, in ranked order. These can include papers without a card. |
+| `retrieval_status` | `ok`, or `failed` when retrieval raised an error. A failed entry is empty because the lookup failed, not because no literature exists; retry it. |
+
+Tumor mentions are matched deterministically on word boundaries against the
+same expanded terms as the tumor-scoped query (for example `LUAD` also matches
+"lung adenocarcinoma"). The case of `tumor_type` does not matter. A hyphenated
+neighbour ends a match, so `breast` does not match "breast-feeding"; this covers
+Unicode dashes (en and em dashes, non-breaking, soft and full-width hyphens,
+minus signs) as well as `-`, and these dashes in `tumor_type` itself are treated
+as `-`. A preceding "non" also ends a match, so `SCLC` does not match
+"non-small cell lung cancer", "non small cell lung cancer" or a line-broken
+"non- small cell lung cancer".
+`ALL` also matches "B-ALL" and "T-ALL".
+Abbreviations match case-sensitively as uppercase tokens; an unlisted
+`tumor_type` of up to 5 letters or digits (such as `dsrct`) is treated as an
+abbreviation unless it is a common word such as `lung`. Two-letter
+abbreviations such as `MM` or `os` count only in titles, and "uterine tumor
+resembling ovarian sex cord tumor" does not count as an ovarian tumor mention.
 - **The job status response is the authoritative source for the evidence.** If
   `run_id` was supplied, the job marks itself `complete` first and then
   best-effort attaches the evidence to that run. A missing run is silently
