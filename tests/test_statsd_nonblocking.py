@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
+import time
 
 import pytest
 from fastapi import Response
@@ -131,7 +132,9 @@ async def test_shutdown_stops_the_sender_without_hanging(metrics_on):
 
     try:
         assert await asyncio.to_thread(client.socket.entered.wait, 30)
+        started = time.monotonic()
         await asyncio.to_thread(observability.shutdown_statsd, 0.2)
+        assert time.monotonic() - started < 5.0
         assert not client.socket.release.is_set()
         assert not client.socket.expired.is_set()
     finally:
@@ -230,13 +233,15 @@ class _LockHolder:
 
     def __init__(self) -> None:
         self._held = threading.Event()
+        self.expired = threading.Event()
         self._release = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
         with observability._statsd_lock:
             self._held.set()
-            assert self._release.wait(30)
+            if not self._release.wait(30):
+                self.expired.set()
 
     def __enter__(self) -> "_LockHolder":
         self._thread.start()
@@ -258,9 +263,11 @@ async def _wait_for_state(state: str) -> None:
         await asyncio.sleep(0.01)
 
 
-async def test_shutdown_is_bounded_and_final_even_when_the_lifecycle_lock_is_held(counting_dogstatsd):
+async def test_shutdown_is_bounded_and_final_even_when_the_lifecycle_lock_is_held(counting_dogstatsd, caplog):
     with _LockHolder() as holder:
         await asyncio.to_thread(observability.shutdown_statsd, 0.05)
+        assert not holder.expired.is_set(), "shutdown waited until the lock holder expired"
+        assert "timed out after 0.05s waiting for the client lock" in caplog.text
         assert not holder._release.is_set()
         assert holder._thread.is_alive()
         holder.release()
@@ -373,7 +380,9 @@ async def test_stop_without_timeout_support_stays_bounded(metrics_on, caplog):
     observability._statsd_state = observability._READY
 
     try:
+        started = time.monotonic()
         await asyncio.to_thread(observability.shutdown_statsd, 0.1)
+        assert time.monotonic() - started < 5.0
         assert await asyncio.to_thread(stop_called.wait, 30)
         assert not release.is_set()
     finally:

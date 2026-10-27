@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -120,9 +121,11 @@ def _asgi_client() -> httpx.AsyncClient:
 
 async def test_cache_miss_returns_pending_fast_even_when_upstream_is_slow(fake_redis, upstream):
     async with _asgi_client() as client:
+        started = time.monotonic()
         http = await asyncio.wait_for(
             client.get("/v1/genes/ALK/openevidence", params={"tumor_type": "NSCLC"}), timeout=30.0
         )
+        assert time.monotonic() - started < 5.0
     assert not upstream._gate.is_set()
     # No X-OpenEvidence-Poll header = an old cached frontend: HTTP 503 +
     # Retry-After is deliberate (it treats that as a transient, non-memoized
@@ -315,6 +318,8 @@ def sidecar_asyncio(monkeypatch):
 @pytest.fixture
 def inline_lookup(sidecar_asyncio):
     async def wait_for_completion(tasks, **kwargs):
+        assert kwargs["timeout"] == main.settings.openevidence_sidecar_pending_wait_seconds
+        assert kwargs["timeout"] > 0
         await asyncio.gather(*tasks)
         return set(tasks), set()
 
@@ -328,6 +333,19 @@ async def test_fast_failure_answers_failed_inline(fake_redis, upstream, inline_l
     assert response.status_code == 200
     assert result.status == "failed"
     assert result.error == "bad request"
+    assert len(upstream.calls) == 1
+
+
+async def test_successful_lookup_answers_ready_inline(fake_redis, upstream, inline_lookup):
+    upstream.release()
+    result, response = await _request("ALK")
+
+    assert response.status_code == 200
+    assert result.status == "ready"
+    assert result.available is True
+    assert result.distilled is not None
+    assert result.error is None
+    assert result.retry_after_seconds is None
     assert len(upstream.calls) == 1
 
 

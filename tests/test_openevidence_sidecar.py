@@ -875,6 +875,22 @@ async def test_openevidence_sidecar_endpoint_caps_concurrent_live_calls(monkeypa
     max_observed_active = 0
     release = asyncio.Event()
     entered = asyncio.Event()
+    queued = asyncio.Event()
+    waiting = 0
+    semaphore = main._openevidence_sidecar_semaphore()
+    original_acquire = semaphore.acquire
+
+    async def track_acquire():
+        nonlocal waiting
+        if semaphore.locked():
+            waiting += 1
+            if waiting == 2:
+                queued.set()
+        # No yield between signalling and registering the real waiter: the
+        # test resumes only after this acquire has queued on the semaphore.
+        return await original_acquire()
+
+    monkeypatch.setattr(semaphore, "acquire", track_acquire)
 
     async def fake_get_gene_analysis(self, gene, tumor_type=None, fusion=None, client=None):
         nonlocal active, max_observed_active
@@ -894,6 +910,8 @@ async def test_openevidence_sidecar_endpoint_caps_concurrent_live_calls(monkeypa
         main.get_gene_openevidence("EGFR"),
     )
     await asyncio.wait_for(entered.wait(), timeout=30)
+    await asyncio.wait_for(queued.wait(), timeout=30)
+    assert len(semaphore._waiters) == 2
     assert max_observed_active == 1  # never more than the configured cap of 1
     release.set()
     results = await calls
