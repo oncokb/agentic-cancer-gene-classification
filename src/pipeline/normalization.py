@@ -92,7 +92,8 @@ _NON_PARTNER_WORDS = frozenset(
         "POSITIVE", "NEGATIVE", "POS", "NEG", "AMPLIFICATION", "AMPLIFIED", "AMP", "DELETION", "DELETED",
         "DEL", "LOSS", "GAIN", "EXPRESSION", "OVEREXPRESSION", "WILDTYPE", "WT", "NULL", "INHIBITOR",
         "ANTI", "NON", "KB", "CELL", "SMALL", "LARGE", "HIGH", "LOW",
-        "ITD", "TKD", "KDD", "VIII", "SKIP", "SKIPPING", "INSERTION", "DUPLICATION",
+        # Not SKIP or VIII: both are HGNC aliases (SNW1, COX8A).
+        "ITD", "TKD", "KDD", "SKIPPING", "INSERTION", "DUPLICATION",
         "NOVEL", "KINASE", "PARTNER", "PARTNERS", "RECURRENT", "ONCOGENIC", "ACTIVATING", "SOMATIC",
         "GERMLINE", "DETECTED", "KNOWN", "UNKNOWN", "OTHER",
         "ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA", "THETA", "IOTA", "KAPPA", "LAMBDA",
@@ -123,13 +124,14 @@ _TUMOR_TYPE_WORDS = frozenset(
         "THYROID", "PROSTATE", "BLADDER", "OVARIAN", "RENAL", "KIDNEY", "LIVER", "SKIN", "BRAIN",
         "ESOPHAGOGASTRIC", "ESS", "HGESS", "LGESS", "ULMS", "USARC", "UTROSCT",
         # Pediatric, CNS and sarcoma names with OncoTree-style codes. Codes that
-        # are also HGNC symbols or aliases (MB, CCS, NUT, ARMS) are left out.
+        # are also HGNC symbols, aliases or previous symbols (MB, CCS, NUT, ARMS,
+        # EPM, OS) are left out; a test pins the known collisions.
         "PEDIATRIC", "PAEDIATRIC", "CNS", "BONE", "SOFT", "TISSUE", "UTERINE", "CERVICAL",
-        "DIPG", "DMG", "HGG", "PHGG", "PLGG", "MEDULLOBLASTOMA", "EPENDYMOMA", "EPM", "ASTROCYTOMA",
+        "DIPG", "DMG", "HGG", "PHGG", "PLGG", "MEDULLOBLASTOMA", "EPENDYMOMA", "ASTROCYTOMA",
         "OLIGODENDROGLIOMA", "GANGLIOGLIOMA", "PXA", "ATRT", "ETMR", "PNET", "CRANIOPHARYNGIOMA",
         "MENINGIOMA", "SCHWANNOMA", "RHABDOID", "RETINOBLASTOMA", "HEPATOBLASTOMA", "WILMS",
         "NEPHROBLASTOMA", "DSRCT", "EWING", "EWINGS", "ES", "RHABDOMYOSARCOMA", "RMS", "ERMS",
-        "OSTEOSARCOMA", "OS", "CHONDROSARCOMA", "LIPOSARCOMA", "DDLS", "MLPS", "WDLS",
+        "OSTEOSARCOMA", "CHONDROSARCOMA", "LIPOSARCOMA", "DDLS", "MLPS", "WDLS",
         "LEIOMYOSARCOMA", "ANGIOSARCOMA", "FIBROSARCOMA", "IFS", "SYNOVIAL", "SYNS", "MPNST", "DFSP",
         "EHE", "SPINDLE", "HISTIOCYTOSIS", "LCH", "JMML", "CMML",
     }

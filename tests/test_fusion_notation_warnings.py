@@ -16,6 +16,7 @@ from src import main
 from src.pipeline import literature
 from src.models.schema import AnnotateRequest, FusionInput, GeneAnnotation, ResolvedGene
 from src.pipeline.normalization import (
+    _NON_PARTNER_WORDS,
     _TUMOR_TYPE_WORDS,
     normalize_fusions,
     unparsed_fusion_warning,
@@ -385,6 +386,45 @@ async def test_exon_and_mutation_shorthand_does_not_warn(fake_hgnc, value):
 )
 async def test_gene_hyphen_tumor_type_does_not_warn(fake_hgnc, tumor):
     assert await _warnings_for([f"ALK-{tumor}"]) == []
+
+
+# Exclusion candidates that are HGNC symbols, aliases or previous symbols
+# (hgnc_complete_set.txt, checked 2026-10-26). An excluded word can never be
+# reported as a partner, so excluding one of these hides a real gene.
+_HGNC_NAME_COLLISIONS = {
+    "EPM": "STX2", "OS": "MID1", "SKIP": "SNW1", "VIII": "COX8A", "MB": "MB", "CCS": "CCS",
+    "NUT": "NUTM1", "ARMS": "KIDINS220",
+    # Excluded before the HGNC check (some are required by the literature sync test).
+    "ALL": "BCR", "CCA": "FBN2", "CML": "BCR", "GC": "GC", "HCC": "HYCC1", "HL": "HMGCL", "MCL": "CLEC4D",
+    "MDS": "PAFAH1B1", "MPN": "PRSS27", "NHL": "RTEL1", "RCC": "XRCC1", "AMP": "MFAP1", "CELL": "CELP",
+    "DELTA": "PSMB6", "IOTA": "PSMA6", "LARGE": "LARGE1", "MU": "GSTM1", "NU": "PSMA1", "PI": "SERPINA1",
+    "RHO": "RHO", "TAU": "MAPT", "ZETA": "PSMA5",
+}
+_ACCEPTED_COLLISIONS = {
+    "ALL", "CCA", "CML", "GC", "HCC", "HL", "MCL", "MDS", "MPN", "NHL", "RCC",
+    "AMP", "CELL", "DELTA", "IOTA", "LARGE", "MU", "NU", "PI", "RHO", "TAU", "ZETA",
+}
+
+
+def test_exclusion_words_add_no_new_hgnc_collisions():
+    excluded = _TUMOR_TYPE_WORDS | _NON_PARTNER_WORDS
+    assert excluded & _HGNC_NAME_COLLISIONS.keys() == _ACCEPTED_COLLISIONS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value, suggestion",
+    [
+        ("ALK-OS", "ALK::OS"),
+        ("ALK-EPM", "ALK::EPM"),
+        ("ALK OS fusion", "ALK::OS"),
+        ("ALK EPM fusion", "ALK::EPM"),
+        ("ALK-SKIP", "ALK::SKIP"),
+        ("ALK-VIII", "ALK::VIII"),
+    ],
+)
+async def test_hgnc_alias_partners_still_warn(fake_hgnc, value, suggestion):
+    assert await _warnings_for([value]) == [_warning(value, suggestion)]
 
 
 @pytest.mark.asyncio
