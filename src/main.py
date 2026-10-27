@@ -789,11 +789,13 @@ def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
 
 
 async def _retrieve_fusion_evidence_input(
-    item: FusionInput, semaphore: asyncio.Semaphore,
+    item: FusionInput, semaphore: asyncio.Semaphore, force_refresh: bool = False,
 ) -> FusionEvidenceResult:
     async with semaphore:
         try:
-            return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
+            return await retrieve_fusion_evidence(
+                item.fusion, tumor_type=item.tumor_type, force_refresh=force_refresh,
+            )
         except Exception as exc:
             logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
             return FusionEvidenceResult(
@@ -811,7 +813,7 @@ async def _include_inline_fusion_evidence(
         start = time.perf_counter()
         semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
         result.fusion_evidence = list(await asyncio.gather(*(
-            _retrieve_fusion_evidence_input(item, semaphore)
+            _retrieve_fusion_evidence_input(item, semaphore, force_refresh=request.force_refresh)
             for item in _fusion_evidence_inputs(request.fusions)
         )))
         elapsed = round((time.perf_counter() - start) * 1000, 2)
@@ -1755,7 +1757,9 @@ async def create_fusion_evidence_job(
         try:
             semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
             tasks = [
-                asyncio.create_task(_retrieve_fusion_evidence_input(item, semaphore))
+                asyncio.create_task(_retrieve_fusion_evidence_input(
+                    item, semaphore, force_refresh=request.force_refresh,
+                ))
                 for item in fusion_inputs
             ]
             for task in asyncio.as_completed(tasks):

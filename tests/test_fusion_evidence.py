@@ -29,7 +29,7 @@ _CREBBP_PREV_SYMBOLS = ["RSTS"]
 _CREBBP_ALIASES = _CREBBP_ALIAS_SYMBOLS + _CREBBP_PREV_SYMBOLS
 
 
-async def _uncached(_key, compute, ttl_seconds=None):
+async def _uncached(_key, compute, ttl_seconds=None, force_refresh=False):
     return await compute()
 
 
@@ -235,7 +235,7 @@ async def test_resolve_fusion_partner_aliases_is_independent_per_partner(monkeyp
 async def test_retrieve_fusion_evidence_uses_cache_and_marks_supported(monkeypatch):
     cache_keys = []
 
-    async def fake_cached_call(key, compute, ttl_seconds=None):
+    async def fake_cached_call(key, compute, ttl_seconds=None, force_refresh=False):
         cache_keys.append((key, ttl_seconds))
         return await compute()
 
@@ -497,3 +497,41 @@ def test_record_discusses_exact_fusion_self_fusion_literal_guard():
         publication_types=["Journal Article"],
     )
     assert record_discusses_exact_fusion(genuine_self_fusion, "KAT6A::KAT6A") is True
+
+
+async def test_force_refresh_bypasses_and_overwrites_fusion_evidence_cache(monkeypatch):
+    from src.pipeline import cache
+    import json
+
+    class MemoryRedis:
+        def __init__(self):
+            self.values = {}
+            self.writes = []
+            self.reads = 0
+
+        async def get(self, key):
+            self.reads += 1
+            return self.values.get(key)
+
+        async def set(self, key, value, ex):
+            self.values[key] = value
+            self.writes.append((key, ex))
+
+    redis = MemoryRedis()
+    monkeypatch.setattr(cache, "_get_client", lambda: redis)
+    key = literature._fusion_evidence_cache_key("EML4::ALK", "LUAD", 10)
+    redis.values[key] = json.dumps({"fusion": "EML4::ALK", "pmids": ["old"]})
+    calls = []
+
+    async def compute(*args, **kwargs):
+        calls.append(1)
+        return literature.FusionEvidenceResult(fusion="EML4::ALK", pmids=["new"])
+
+    monkeypatch.setattr(literature, "_retrieve_fusion_evidence_uncached", compute)
+    assert (await retrieve_fusion_evidence("EML4::ALK", "LUAD", 10)).pmids == ["old"]
+    assert not calls
+    assert (await retrieve_fusion_evidence("EML4::ALK", "LUAD", 10, force_refresh=True)).pmids == ["new"]
+    assert redis.reads == 1
+    assert redis.writes == [(key, literature.settings.fusion_evidence_cache_ttl_seconds)]
+    assert (await retrieve_fusion_evidence("EML4::ALK", "LUAD", 10)).pmids == ["new"]
+    assert calls == [1]

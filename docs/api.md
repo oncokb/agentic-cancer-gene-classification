@@ -213,7 +213,7 @@ curl -s -X POST https://acgc.oncokb.org/v1/annotate \
 | `fusions` | Required, at least one entry. Each entry is a gene or fusion string, or an object with `fusion` (aliases `gene`, `input` and `query` also work) and an optional `tumor_type`. |
 | `include_fusion_evidence` | Optional, default `false`. Retrieves exact-pair evidence inline before saving and returning the run; also supported by `/v1/annotate/jobs`. |
 | `mode` | `"full"` (default) or `"core"`. `"core"` prioritizes the cancer association, rationale, summary and citations. |
-| `force_refresh` | Optional, default `false`. Bypasses saved gene annotations and recomputes them. |
+| `force_refresh` | Optional, default `false`. Bypasses saved gene annotations and fusion evidence and recomputes them. |
 | `skip_literature_for_oncokb` | Optional, default `false`. Genes confirmed in OncoKB return a deterministic OncoKB-based annotation without PubMed retrieval or LLM synthesis. |
 
 Each fusion is split into its partner genes, and every unique gene is annotated
@@ -355,6 +355,7 @@ curl -s -X POST https://acgc.oncokb.org/v1/fusion-evidence/jobs \
 | Field | Meaning |
 | --- | --- |
 | `fusions` | Required, at least one entry in the same string-or-object form as `POST /v1/annotate`. Only entries with a fusion separator and two non-empty partners are processed; gene-only entries and entries such as `ALK::` are ignored. |
+| `force_refresh` | Optional, default `false`. Bypasses and replaces the 7-day fusion-evidence cache. |
 | `run_id` | Optional. When set, ACGC best-effort saves the completed evidence onto that existing run, so a later `GET /v1/annotate/{run_id}` may include it. |
 
 The same `ANNOTATE_MAX_INPUTS` cap (default 50) applies before filtering or
@@ -516,8 +517,8 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 - Fusion-evidence jobs only process entries that contain a fusion separator and
   have two non-empty partners. Gene-only entries and malformed entries such as
   `ALK::` are silently skipped.
-- `force_refresh` refreshes gene annotations, not fusion evidence. Exact-pair
-  evidence is cached for 7 days and a fusion-evidence job reuses it.
+- Exact-pair evidence is cached for 7 days. Set `force_refresh: true` on an
+  inline annotation request or fusion-evidence job to bypass and replace it.
 
 ## 6. Speed and freshness
 
@@ -535,8 +536,9 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 - Exact fusion-pair evidence is cached separately for 7 days.
 - `force_refresh: true` (or `?force_refresh=true` on the `GET`) ignores saved
   gene results and classifies every gene again. It's slower and costs more, so
-  use it only when you need a fresh answer. It does not bypass the fusion
-  evidence cache.
+  use it only when you need a fresh answer. It also bypasses and replaces the
+  fusion-evidence cache when inline evidence is requested. For a separate
+  fusion-evidence job, set `force_refresh: true` on that job request too.
 - For more than a handful of uncached genes, use a background job rather than
   holding one request open.
 
