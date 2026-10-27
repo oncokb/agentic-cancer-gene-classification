@@ -1312,6 +1312,8 @@ async function runBenchmark() {
 // ---------------------------------------------------------------------------
 
 let _geneObserver = null;
+// Cards currently intersecting the viewport, as reported by _geneObserver.
+let _geneVisibleCards = new Set();
 // The rendered sidebar entries ({ btn, heading, haystack, label }) the
 // filter box toggles; filtering never touches the result cards themselves.
 let _geneIndexEntries = [];
@@ -1354,6 +1356,7 @@ function syncGeneIndexFilterInput() {
 function rebuildGeneIndex(entries) {
   if (_geneObserver) _geneObserver.disconnect();
   _geneObserver = null;
+  _geneVisibleCards = new Set();
   _geneIndexEntries = [];
   elements.geneIndex.replaceChildren();
   elements.geneIndexPanel.classList.toggle("hidden", !entries || !entries.length);
@@ -1401,6 +1404,10 @@ function rebuildGeneIndex(entries) {
       const toggle = sectionContainer?.querySelector(".fusion-section-toggle");
       if (toggle?.getAttribute("aria-expanded") === "false") toggle.click();
       card.scrollIntoView({ behavior: "smooth", block: "start" });
+      // Land keyboard and screen-reader users on the card they jumped to;
+      // the smooth scroll above does the scrolling.
+      if (card.getAttribute("tabindex") === null) card.setAttribute("tabindex", "-1");
+      card.focus({ preventScroll: true });
     });
     elements.geneIndex.appendChild(btn);
     // One string per term, joined by a character the normalizer never emits,
@@ -1430,6 +1437,7 @@ function applyGeneIndexFilter() {
   _geneIndexEntries.forEach(({ heading }) => {
     if (heading) heading.hidden = !visibleHeadings.has(heading);
   });
+  updateGeneIndexActive();
   const filtering = Boolean(query) && _geneIndexEntries.length > 0;
   elements.geneIndexFilterCount.textContent = filtering ? `${shown} of ${_geneIndexEntries.length}` : "";
   elements.geneIndexNoMatches.hidden = !filtering || shown > 0;
@@ -1490,12 +1498,36 @@ function bindGeneIndexFilter() {
   });
 }
 
+// Mark the sidebar entry of the topmost on-screen card active. While the
+// filter hides entries, only cards whose entry is shown are candidates, so a
+// hidden entry never holds the highlight; if none of the on-screen cards
+// match, nothing is active.
+function updateGeneIndexActive() {
+  if (!_geneVisibleCards.size) {
+    // Nothing on screen yet: keep the current highlight unless it was just
+    // filtered out.
+    _geneIndexEntries.forEach(({ btn }) => {
+      if (btn.hidden) btn.classList.remove("active");
+    });
+    return;
+  }
+  const shownIds = new Set(_geneIndexEntries.filter(({ btn }) => !btn.hidden).map(({ btn }) => btn.dataset.targetId));
+  const candidates = [..._geneVisibleCards].filter((card) => shownIds.has(card.id));
+  const topCard = candidates.length
+    ? candidates.reduce((a, b) => (a.getBoundingClientRect().top < b.getBoundingClientRect().top ? a : b))
+    : null;
+  _geneIndexEntries.forEach(({ btn }) => {
+    btn.classList.toggle("active", Boolean(topCard) && btn.dataset.targetId === topCard.id);
+  });
+}
+
 function observeGeneCards() {
   if (_geneObserver) _geneObserver.disconnect();
   const cards = elements.resultsWindow.querySelectorAll(".annotation-card[id]");
   if (!cards.length) return;
 
   const visibleCards = new Set();
+  _geneVisibleCards = visibleCards;
   _geneObserver = new IntersectionObserver(
     (entries) => {
       // Observer batches contain only changed intersections. Keep the other
@@ -1504,14 +1536,7 @@ function observeGeneCards() {
         if (entry.isIntersecting) visibleCards.add(entry.target);
         else visibleCards.delete(entry.target);
       });
-      if (!visibleCards.size) return;
-      const topCard = [...visibleCards].reduce((a, b) =>
-        a.getBoundingClientRect().top < b.getBoundingClientRect().top ? a : b,
-      );
-      const targetId = topCard.id;
-      elements.geneIndex.querySelectorAll(".gene-index-item").forEach((btn) => {
-        btn.classList.toggle("active", btn.dataset.targetId === targetId);
-      });
+      updateGeneIndexActive();
     },
     {
       // Viewport intersections are also clipped by scrolling ancestors, so

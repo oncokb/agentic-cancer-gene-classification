@@ -3,7 +3,8 @@
 // code: matching by symbol, fusion (any separator), and submitted ENST/NM_
 // input; the "N of M" count and No matches state; Enter jumping to the first
 // match (opening a collapsed section); Escape clearing; empty section
-// headings hidden; per-tab filters kept across redraws and reset on new runs.
+// headings hidden; per-tab filters kept across redraws and reset on new runs;
+// hidden entries never hold the active highlight; jumps move focus to the card.
 // Run via tests/test_frontend_gene_index_filter.py (invokes this with node).
 "use strict";
 
@@ -32,6 +33,11 @@ FakeElement.prototype.click = function () {
   (this._listeners.get("click") || []).forEach((handler) => handler());
 };
 FakeElement.prototype.scrollIntoView = function () { this.scrolled = true; };
+let focusedElement = null;
+FakeElement.prototype.focus = function (options) {
+  focusedElement = this;
+  this.focusOptions = options;
+};
 
 const DEBOUNCE_WAIT_MS = 120;
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -284,10 +290,71 @@ async function testObserverNotLeakedByFilteringOrTabSwitch() {
   assert.ok(items(sandbox)[1].classList.contains("active"));
 }
 
+async function testHiddenEntriesNeverTakeTheActiveHighlight() {
+  const sandbox = app();
+  renderResults(sandbox);
+  const observerCount = sandbox.observers.length;
+  const observer = sandbox.observers.at(-1);
+  const card = (gene) => sandbox.document.getElementById(`gene-${gene}`);
+  card("ALK").getBoundingClientRect = () => ({ top: 0 });
+  card("TP53").getBoundingClientRect = () => ({ top: 300 });
+  const active = () => items(sandbox).filter((n) => n.classList.contains("active")).map((n) => n.title);
+  observer.callback([{ isIntersecting: true, target: card("ALK") }, { isIntersecting: true, target: card("TP53") }]);
+  assert.deepStrictEqual(active(), ["ALK"]);
+  // The topmost on-screen card (ALK) is filtered out: the highlight moves to
+  // the topmost on-screen card that still matches, never a hidden entry.
+  await type(sandbox, "tp53");
+  assert.deepStrictEqual(active(), ["TP53"]);
+  // Scrolling the matching card away leaves only a filtered-out card on
+  // screen: nothing is highlighted rather than the hidden ALK entry.
+  observer.callback([{ isIntersecting: false, target: card("TP53") }]);
+  assert.deepStrictEqual(active(), []);
+  observer.callback([{ isIntersecting: true, target: card("ALK") }]);
+  assert.deepStrictEqual(active(), []);
+  await type(sandbox, "kras");
+  assert.deepStrictEqual(active(), []);
+  // Clearing the filter restores normal tracking.
+  press(sandbox, "Escape");
+  assert.deepStrictEqual(active(), ["ALK"]);
+  assert.strictEqual(sandbox.observers.length, observerCount, "filtering creates no observers");
+  // A hidden entry that was active before any intersection report loses it.
+  const fresh = app();
+  renderResults(fresh);
+  items(fresh)[0].classList.add("active");
+  await type(fresh, "tp53");
+  assert.ok(!items(fresh)[0].classList.contains("active"));
+}
+
+async function testJumpMovesFocusToTheCard() {
+  const sandbox = app();
+  renderResults(sandbox);
+  await type(sandbox, "braf");
+  focusedElement = null;
+  press(sandbox, "Enter");
+  const braf = sandbox.document.getElementById("gene-BRAF");
+  assert.strictEqual(focusedElement, braf, "Enter moves focus to the target card");
+  assert.strictEqual(braf.getAttribute("tabindex"), "-1");
+  assert.deepStrictEqual({ ...braf.focusOptions }, { preventScroll: true });
+  assert.ok(braf.scrolled, "the card is still scrolled into view");
+  // Mouse clicks on an entry behave the same way.
+  press(sandbox, "Escape");
+  items(sandbox).find((n) => n.title === "KRAS").click();
+  assert.strictEqual(focusedElement, sandbox.document.getElementById("gene-KRAS"));
+  // Fusion tab: the collapsed section opens and focus lands on its card.
+  sandbox.state.currentResult = { run_id: "r1", fusion_evidence: FUSIONS };
+  renderFusions(sandbox);
+  await type(sandbox, "foo::bar");
+  press(sandbox, "Enter");
+  const empty = sandbox.elements.resultsWindow.children[0].children.at(-1);
+  assert.strictEqual(empty.children[1].hidden, false);
+  assert.strictEqual(focusedElement, empty.children[1].children[0]);
+}
+
 const tests = [testFiltersBySymbolCaseInsensitive, testFiltersByFusionWithAnySeparator,
   testFiltersBySubmittedInput, testNoMatchesAndQueryIsNotRegexOrHtml, testEnterJumpsAndEscapeClears,
   testSectionsHiddenAndCollapsedSectionOpens, testPerTabFiltersSurviveRedrawsAndResetOnNewRun,
-  testObserverNotLeakedByFilteringOrTabSwitch];
+  testObserverNotLeakedByFilteringOrTabSwitch, testHiddenEntriesNeverTakeTheActiveHighlight,
+  testJumpMovesFocusToTheCard];
 (async () => {
   for (const test of tests) {
     await test();

@@ -555,6 +555,17 @@ textarea {
   transition: background 0.1s, color 0.1s;
 }
 
+/* Sidebar jumps focus the target card (tabindex=-1); show the ring only for
+   keyboard-initiated jumps. */
+.annotation-card:focus {
+  outline: none;
+}
+
+.annotation-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .gene-index-item:hover {
   background: var(--surface-strong);
   color: var(--text);
