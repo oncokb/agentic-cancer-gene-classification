@@ -671,7 +671,7 @@ async def test_fusion_evidence_with_unresolvable_partner_skips_pubmed(fake_http,
 async def test_fusion_evidence_cache_key_and_tumor_scope_use_symbols(fake_http, monkeypatch):
     keys, scoped = [], []
 
-    async def fake_cached_call(key, compute, ttl_seconds=None):
+    async def fake_cached_call(key, compute, ttl_seconds=None, force_refresh=False):
         keys.append(key)
         return await compute()
 

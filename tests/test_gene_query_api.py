@@ -471,7 +471,7 @@ def test_tumor_type_warning_returned_and_matches_saved_run(client, real_pipeline
         body = _poll(client, created.json()["status_url"])
         assert body["status"] == "complete"
 
-    assert body["warnings"] == ["KAT6A: using tumor type 'LUAD'; ignored tumor types: 'AML'."]
+    assert body["warnings"] == ["KAT6A: using tumor type 'AML'; ignored tumor types: 'LUAD'."]
     assert main.app.state.run_store.saved_runs[-1][3]["warnings"] == body["warnings"]
 
 
