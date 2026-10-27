@@ -57,6 +57,9 @@ _CREATE_USERS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     name VARCHAR(255) NOT NULL,
+    -- search_key(name) / search_key(email), computed in Python (see search_key).
+    name_search VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    email_search VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     picture VARCHAR(2048) NULL,
     domain VARCHAR(255) NOT NULL,
     provider VARCHAR(32) NOT NULL,
@@ -358,11 +361,30 @@ def normalize_name(name: Optional[str]) -> str:
     return unicodedata.normalize("NFC", name or "").strip()
 
 
-def _json_round_trip(value: Any, what: str) -> Any:
+def search_key(value: Optional[str]) -> str:
+    """The form names and emails are searched in: NFKC + full case folding.
+
+    Both stores compare search_key(needle) as a plain substring of
+    search_key(name) / search_key(email): MySQL against stored, binary-collated
+    columns, so its LOWER()/collation rules never come into it. Under case
+    folding 'ß' matches 'ss', 'İ' folds to 'i̇', and composed/decomposed
+    accents are equal."""
+    return unicodedata.normalize(
+        "NFKC", unicodedata.normalize("NFKC", value or "").casefold()
+    ).strip()
+
+
+def to_json(value: Any, what: str) -> str:
+    """Strict JSON text: no NaN/Infinity (MySQL's JSON type rejects them),
+    no non-JSON types. Raises ValueError before anything touches storage."""
     try:
-        return json.loads(json.dumps(value))
+        return json.dumps(value, allow_nan=False)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{what} must be JSON-serializable") from exc
+        raise ValueError(f"{what} must be JSON-serializable (no NaN or Infinity)") from exc
+
+
+def _json_round_trip(value: Any, what: str) -> Any:
+    return json.loads(to_json(value, what))
 
 
 def normalize_groups(groups: Any) -> List[Any]:
@@ -600,24 +622,29 @@ class UserStoreMixin:
         check_status(default_status)
         now = _to_db(at or utc_now())
         domain = identity.domain or email.split("@")[-1]
-        name = normalize_name(identity.name) or email
+        given_name = normalize_name(identity.name)
+        name = given_name or email
         groups = normalize_groups(identity.groups)
         claims = normalize_claims(identity.claims)
         params = (
-            email, name, identity.picture or None, domain, identity.provider,
-            default_status, default_role, json.dumps(groups), json.dumps(claims), now, now, now, now,
+            email, name, search_key(name), search_key(email), identity.picture or None, domain,
+            identity.provider, default_status, default_role, to_json(groups, "groups"),
+            to_json(claims, "claims"), now, now, now, now, bool(given_name), bool(given_name),
         )
         async with _store_errors("upsert_login"):
             async with self._user_transaction() as cursor:
                 await cursor.execute(
                     """
                     INSERT INTO users (
-                        email, name, picture, domain, provider, status, role,
-                        groups_json, claims_json, first_login_at, last_login_at, login_count,
-                        created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s) AS new
+                        email, name, name_search, email_search, picture, domain, provider,
+                        status, role, groups_json, claims_json, first_login_at, last_login_at,
+                        login_count, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s
+                    ) AS new
                     ON DUPLICATE KEY UPDATE
-                        name = IF(new.name = new.email, users.name, new.name),
+                        name = IF(%s, new.name, users.name),
+                        name_search = IF(%s, new.name_search, users.name_search),
                         picture = COALESCE(new.picture, users.picture),
                         domain = new.domain,
                         provider = new.provider,
@@ -756,10 +783,11 @@ class UserStoreMixin:
         if filters.status is not None:
             where.append("status = %s")
             params.append(check_status(filters.status))
-        if filters.search:
-            # Exact (binary) matching, like FakeUserStore's substring test.
-            pattern = f"%{escape_like(normalize_identity(filters.search))}%"
-            where.append("(email LIKE %s OR LOWER(name) COLLATE utf8mb4_bin LIKE %s)")
+        needle = search_key(filters.search)
+        if needle:
+            # Binary substring match on Python-computed keys, like FakeUserStore.
+            pattern = f"%{escape_like(needle)}%"
+            where.append("(email_search LIKE %s OR name_search LIKE %s)")
             params.extend([pattern, pattern])
         if cursor is not None:
             after_at, after_email = decode_user_cursor(cursor)

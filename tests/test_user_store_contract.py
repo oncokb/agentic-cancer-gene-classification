@@ -251,6 +251,32 @@ async def test_groups_and_claims_come_back_as_json(store, email):
     assert await store.get_user(email("bad-json")) is None
 
 
+_NON_JSON_NUMBERS = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("bad", _NON_JSON_NUMBERS, ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize(
+    "where",
+    [
+        lambda v: {"claims": {"score": v}},
+        lambda v: {"claims": {"scores": [1, v]}},
+        lambda v: {"claims": {"nested": {"deep": [{"x": v}]}}},
+        lambda v: {"groups": [v]},
+        lambda v: {"groups": ["ok", [v]]},
+    ],
+    ids=["claim", "claim-list", "claim-nested", "group", "group-nested"],
+)
+async def test_non_json_numbers_are_rejected_before_storage(store, email, bad, where):
+    with pytest.raises(ValueError, match="JSON"):
+        await _login(store, email("nan-new"), **where(bad))
+    assert await store.get_user(email("nan-new")) is None
+
+    before = await _login(store, email("nan-existing"))
+    with pytest.raises(ValueError, match="JSON"):
+        await _login(store, email("nan-existing"), **where(bad))
+    assert await store.get_user(email("nan-existing")) == before
+
+
 async def test_upsert_login_rejects_unknown_defaults(store, email):
     with pytest.raises(ValueError):
         await _login(store, email("x"), role="superuser")
@@ -407,6 +433,52 @@ async def test_list_users_search_escapes_like_wildcards(store, email, backend):
     await _login(store, email("axb"))
     page = await store.list_users(UserFilters(search="a_b@" + backend[2]))
     assert [u.email for u in page.users] == [email("a_b")]
+
+
+async def _search(store, domain, needle):
+    """Emails in this test's domain matching `needle` (the MySQL database may
+    hold other rows)."""
+    page = await store.list_users(UserFilters(search=needle), limit=500)
+    return sorted(u.email for u in page.users if u.email.endswith("@" + domain))
+
+
+async def test_search_uses_full_case_folding(store, email, backend):
+    domain = backend[2]
+    await _login(store, email("ipek"), name="\u0130pek Y\u0131lmaz")  # İpek Yılmaz
+    await _login(store, email("strasse"), name="Hans Stra\u00dfe")  # Straße
+    await _login(store, email("ross"), name="Hans Strasse")
+
+    for needle in ("\u0130pek", "\u0130PEK", "\u0130pek y\u0131lmaz"):
+        assert await _search(store, domain, needle) == [email("ipek")], needle
+    # Rule: ß folds to ss, so ß and ss find each other, in names and emails.
+    both = sorted([email("strasse"), email("ross")])
+    for needle in ("stra\u00dfe", "STRASSE", "Strasse"):
+        assert await _search(store, domain, needle) == both, needle
+    await _login(store, email("gro\u00df"), name="Anna")  # groß@
+    assert await _search(store, domain, "gross@") == [email("gro\u00df")]
+
+
+async def test_search_treats_composed_and_decomposed_accents_alike(store, email, backend):
+    domain = backend[2]
+    await _login(store, email("composed"), name="Jos\u00e9 Garc\u00eda")
+    await _login(store, email("decomposed"), name="Rene\u0301e Dupont")
+    for needle in ("jose\u0301", "JOS\u00c9", "garci\u0301a"):
+        assert await _search(store, domain, needle) == [email("composed")], needle
+    for needle in ("ren\u00e9e", "RENE\u0301E"):
+        assert await _search(store, domain, needle) == [email("decomposed")], needle
+    assert await _search(store, domain, "jose garcia") == []
+
+
+async def test_search_escapes_like_wildcards_in_names(store, email, backend):
+    domain = backend[2]
+    await _login(store, email("pct"), name="Sure 100% Today")
+    await _login(store, email("pct-no"), name="Sure 1000 Today")
+    await _login(store, email("under"), name="Mary_Ann")
+    await _login(store, email("under-no"), name="MaryxAnn")
+    await _login(store, email("slash"), name="back\\slash")
+    assert await _search(store, domain, "100%") == [email("pct")]
+    assert await _search(store, domain, "y_a") == [email("under")]
+    assert await _search(store, domain, "k\\s") == [email("slash")]
 
 
 async def test_count_admins(store, email):

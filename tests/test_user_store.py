@@ -67,6 +67,13 @@ async def test_invalid_input_is_value_error_before_touching_storage():
         await store.set_role("a@x.example", "owner", actor="b@x.example")
     with pytest.raises(ValueError):
         await store.list_users(cursor="%%%")
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            await store.upsert_login(
+                LoginIdentity(email="a@x.example", name="A", claims={"x": [bad]}),
+                default_role="viewer",
+                default_status="active",
+            )
 
 
 class _DyingCursor:

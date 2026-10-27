@@ -44,8 +44,8 @@ from src.pipeline.user_store import (
     normalize_claims,
     normalize_email,
     normalize_groups,
-    normalize_identity,
     normalize_name,
+    search_key,
     to_utc,
     utc_now,
 )
@@ -90,7 +90,8 @@ class FakeUserStore:
         self._check_available("upsert_login")
         now = _db_time(at)
         domain = identity.domain or email.split("@")[-1]
-        name = normalize_name(identity.name) or email
+        given_name = normalize_name(identity.name)
+        name = given_name or email
         groups = normalize_groups(identity.groups)
         claims = normalize_claims(identity.claims)
         async with self._lock:
@@ -119,8 +120,8 @@ class FakeUserStore:
             else:
                 user = replace(
                     existing,
-                    # An empty name (stored as the email) keeps the known one.
-                    name=existing.name if name == email else name,
+                    # A login without a name keeps the known one.
+                    name=name if given_name else existing.name,
                     picture=identity.picture or existing.picture,
                     domain=domain,
                     provider=identity.provider,
@@ -233,13 +234,13 @@ class FakeUserStore:
             check_status(filters.status)
         after = decode_user_cursor(cursor) if cursor is not None else None
         self._check_available("list_users")
-        search = normalize_identity(filters.search or "")
+        needle = search_key(filters.search)
         async with self._lock:
             users = [
                 u for u in self._users.values()
                 if (filters.role is None or u.role == filters.role)
                 and (filters.status is None or u.status == filters.status)
-                and (not search or search in u.email or search in u.name.lower())
+                and (not needle or needle in search_key(u.email) or needle in search_key(u.name))
                 and (after is None or (u.last_login_at, u.email) < after)
             ]
             users.sort(key=lambda u: (u.last_login_at, u.email), reverse=True)
