@@ -188,6 +188,22 @@ const editableFields = [
   ["error", "Error", "text"],
 ];
 
+// UI engagement tracker (tracking.js, docs/ui-events.md); a no-op when absent.
+const UI_TRACK_NOOP = new Proxy({}, { get: () => () => {} });
+function uiTrack() {
+  return (typeof window !== "undefined" && window.ACGCTracking) || UI_TRACK_NOOP;
+}
+
+// Shared context for one annotation's card and everything inside it.
+function geneTrackContext(annotation, surface, displayPosition) {
+  const position = (state.currentResult?.annotations || []).indexOf(annotation);
+  return {
+    surface, subject_kind: "gene", subject_id: annotation.gene, tab: state.resultsViewMode,
+    position: position < 0 ? null : position, display_position: displayPosition,
+    tumor_type_given: Boolean(tumorTypeForAnnotation(annotation)),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Sidebar resizing
 // ---------------------------------------------------------------------------
@@ -331,12 +347,14 @@ async function loadDevStatus() {
       elements.navBenchmark.classList.add("hidden");
       elements.annotateBackendField.classList.add("hidden");
       state.openevidenceEnabled = false;
+      uiTrack().setEnabled(false);
       if (state.currentView === "benchmark") switchView("annotate");
       return;
     }
     const payload = await response.json();
     elements.navBenchmark.classList.toggle("hidden", !payload.enabled);
     elements.annotateBackendField.classList.toggle("hidden", !payload.enabled);
+    uiTrack().setEnabled(payload.ui_events_enabled === true);
     const openevidenceEnabled = Boolean(payload.openevidence_enabled);
     state.openevidenceEnabled = openevidenceEnabled;
     // Startup fires loadDevStatus() and loadSharedRun() concurrently (see
@@ -355,6 +373,7 @@ async function loadDevStatus() {
     elements.navBenchmark.classList.add("hidden");
     elements.annotateBackendField.classList.add("hidden");
     state.openevidenceEnabled = false;
+    uiTrack().setEnabled(false);
     if (state.currentView === "benchmark") switchView("annotate");
   }
 }
@@ -376,6 +395,7 @@ function switchView(view) {
   // The results panel is only hidden, so its cards stay connected — stop
   // their OpenEvidence polling explicitly. Coming back re-renders them.
   if (isBenchmark) cancelOpenEvidenceCardLoads();
+  uiTrack().setActiveTab(isBenchmark ? "benchmark" : state.resultsViewMode);
 
   if (isBenchmark) {
     renderBenchmarkResult(state.currentBenchmark);
@@ -1400,6 +1420,10 @@ function rebuildGeneIndex(entries) {
     btn.addEventListener("click", () => {
       const card = document.getElementById(targetId);
       if (!card) return;
+      uiTrack().event({
+        type: "action", state: "jump", surface: "sidebar", section: "sidebar_entry",
+        subject_kind: count === undefined ? "gene" : "fusion", subject_id: label,
+      });
       const sectionContainer = card.closest(".fusion-evidence-section");
       const toggle = sectionContainer?.querySelector(".fusion-section-toggle");
       if (toggle?.getAttribute("aria-expanded") === "false") toggle.click();
@@ -1445,6 +1469,13 @@ function applyGeneIndexFilter() {
 }
 
 function setGeneIndexFilter(value) {
+  if (Boolean(_geneIndexFilters[geneIndexFilterMode()]) !== Boolean(value)) {
+    // Only that the filter was used or cleared — never the query text.
+    uiTrack().event({
+      type: "action", state: value ? "filter_used" : "filter_cleared", surface: "sidebar",
+      section: "sidebar_filter", item_id: geneIndexFilterMode(),
+    });
+  }
   _geneIndexFilters[geneIndexFilterMode()] = value;
   elements.geneIndexFilterClear.hidden = !value;
   clearTimeout(_geneIndexFilterTimer);
@@ -1609,10 +1640,12 @@ function showFeedbackModal() {
   }
 
   elements.feedbackModal.classList.remove("hidden");
+  uiTrack().event({ type: "open", surface: "feedback", section: "feedback_modal" });
 }
 
 function hideFeedbackModal() {
   elements.feedbackModal.classList.add("hidden");
+  uiTrack().event({ type: "close", surface: "feedback", section: "feedback_modal" });
 }
 
 function githubIssueUrl(title, body) {
@@ -1648,6 +1681,7 @@ async function submitFeedbackForm() {
       throw new Error(text || "Failed to submit feedback");
     }
     const payload = await response.json();
+    uiTrack().event({ type: "action", state: "submit", surface: "feedback", section: "feedback_modal" });
     if (payload.issue_url) {
       setInstallOutput("Thanks!", `Your feedback was filed as a GitHub issue: ${payload.issue_url}`);
     } else if (payload.issue_title && payload.issue_body) {
@@ -1659,6 +1693,7 @@ async function submitFeedbackForm() {
     elements.feedbackMessage.value = "";
     elements.feedbackEmail.value = "";
   } catch (error) {
+    uiTrack().event({ type: "action", state: "submit_failed", surface: "feedback", section: "feedback_modal" });
     setInstallOutput("Couldn't submit feedback", error.message, "error");
   } finally {
     elements.submitFeedback.disabled = false;
@@ -1668,6 +1703,8 @@ async function submitFeedbackForm() {
 function switchResultsView(mode) {
   if (state.resultsViewMode === mode || !state.currentResult) return;
   state.resultsViewMode = mode;
+  uiTrack().event({ type: "open", surface: "global", section: "tab", item_id: mode });
+  uiTrack().setActiveTab(mode);
   elements.tabResultsView.classList.toggle("active", mode === "results");
   elements.tabFusionEvidenceView.classList.toggle("active", mode === "fusion");
   elements.tabNoResultView.classList.toggle("active", mode === "noresult");
@@ -1680,6 +1717,7 @@ function switchResultsView(mode) {
 
 function renderAnnotationResult(result) {
   syncOpenEvidenceRun(result.run_id);
+  uiTrack().setRunScope(result.run_id);
   const allAnnotations = result.annotations || [];
   const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
   const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
@@ -1711,7 +1749,9 @@ function renderAnnotationResult(result) {
     state.resultsViewMode = visibleAnnotations.length > 0
       ? "results"
       : (showFusionTab ? "fusion" : "noresult");
+    uiTrack().event({ type: "state", surface: "global", section: "tab", item_id: state.resultsViewMode });
   }
+  uiTrack().setActiveTab(state.currentView === "annotate" ? state.resultsViewMode : state.currentView);
   elements.tabResultsView.classList.toggle("active", state.resultsViewMode === "results");
   elements.tabFusionEvidenceView.classList.toggle("active", state.resultsViewMode === "fusion");
   elements.tabNoResultView.classList.toggle("active", state.resultsViewMode === "noresult");
@@ -1750,10 +1790,11 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
   const list = document.createElement("div");
   list.className = "annotation-list";
 
-  visibleAnnotations.forEach((annotation) => {
+  visibleAnnotations.forEach((annotation, index) => {
     const card = document.createElement("article");
     card.className = "annotation-card";
     card.id = `gene-${annotation.gene}`;
+    uiTrack().surfaced(card, { ...geneTrackContext(annotation, "results", index), section: "gene_card" });
     card.innerHTML = `
       <header>
         <div class="annotation-heading">
@@ -1783,6 +1824,9 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
         continue;
       }
       const row = renderField(annotation, field, label, type);
+      if (field === "cancer_association_rationale" || field === "gene_summary") {
+        uiTrack().observe(row, { section: field === "gene_summary" ? "gene_summary" : "rationale" });
+      }
       if (field === "cancer_association_rationale") {
         row.classList.add("field-row-highlight");
         fields.appendChild(row);
@@ -1808,7 +1852,7 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
     // above. Omitted entirely (not shown broken/empty) when OpenEvidence is
     // disabled, gated out client-side (see renderOpenEvidenceCard), or the
     // lookup fails.
-    const openEvidenceCard = renderOpenEvidenceCard(annotation);
+    const openEvidenceCard = renderOpenEvidenceCard(annotation, index);
     if (openEvidenceCard) list.appendChild(openEvidenceCard);
   });
 
@@ -1828,7 +1872,7 @@ function renderNoResultView(hiddenAnnotations) {
   const list = document.createElement("div");
   list.className = "annotation-list";
 
-  hiddenAnnotations.forEach((annotation) => {
+  hiddenAnnotations.forEach((annotation, index) => {
     const isError = Boolean(annotation.error);
     const reason =
       annotation.error ||
@@ -1855,6 +1899,7 @@ function renderNoResultView(hiddenAnnotations) {
         <div class="field-row-value">${escapeHtml(reason)}</div>
       </div>
     `;
+    uiTrack().surfaced(card, { ...geneTrackContext(annotation, "no_result", index), section: "gene_card" });
     const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
     if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);
     const summary = String(annotation.gene_summary || "").trim();
@@ -1865,6 +1910,7 @@ function renderNoResultView(hiddenAnnotations) {
         <span class="field-row-label">Interpreted gene summary</span>
         <div class="field-row-value">${escapeHtml(summary)}</div>
       `;
+      uiTrack().observe(summaryRow, { section: "gene_summary" });
       card.appendChild(summaryRow);
     }
     const evidence = renderSupportingEvidence(annotation);
@@ -1954,11 +2000,14 @@ function renderFusionEvidenceView(fusionEvidence) {
   list.className = "annotation-list fusion-evidence-list";
 
   const indexEntries = [];
-  fusionEvidenceSections(items).forEach(({ label, items, collapsed }) => {
+  fusionEvidenceSections(items).forEach(({ label, key, items: sectionItems, collapsed }) => {
     const section = document.createElement("section");
     section.className = "fusion-evidence-section";
+    uiTrack().surfaced(section, {
+      surface: "fusion_evidence", subject_kind: "none", tab: "fusion", section: "fusion_section", item_id: key,
+    });
     const heading = appendFusionText(section, "h3", "fusion-section-heading");
-    const toggle = appendFusionText(heading, "button", "fusion-section-toggle", `${label} (${items.length})`);
+    const toggle = appendFusionText(heading, "button", "fusion-section-toggle", `${label} (${sectionItems.length})`);
     toggle.type = "button";
     const cards = document.createElement("div");
     cards.className = "annotation-list fusion-section-cards";
@@ -1970,9 +2019,17 @@ function renderFusionEvidenceView(fusionEvidence) {
       _fusionSectionOpen.set(label, open);
     };
     setOpen(_fusionSectionOpen.get(label) ?? !collapsed);
-    toggle.addEventListener("click", () => setOpen(cards.hidden));
-    items.forEach((item) => {
+    toggle.addEventListener("click", (event) => {
+      setOpen(cards.hidden);
+      uiTrack().toggled(section, !cards.hidden, event);
+    });
+    sectionItems.forEach((item) => {
       const card = renderFusionEvidenceCard(item);
+      uiTrack().surfaced(card, {
+        surface: "fusion_evidence", subject_kind: "fusion", subject_id: item.fusion, tab: "fusion",
+        section: "fusion_card", position: items.indexOf(item), display_position: indexEntries.length,
+        tumor_type_given: Boolean(item.tumor_type),
+      });
       // Include an ordinal so distinct fusion spellings cannot collide after sanitizing.
       card.id = `fusion-${cssSafeId(item.fusion)}-${indexEntries.length}`;
       cards.appendChild(card);
@@ -1994,30 +2051,38 @@ function fusionEvidenceSections(items) {
   items.forEach((item) => {
     let label;
     let order;
+    let key; // stable tracking id; the label can carry the tumor type
     if (item.retrieval_status === "failed") {
       label = "Lookup failed";
       order = 4;
+      key = "failed";
     } else if (item.literature_scope === "no_literature") {
       label = "No literature found";
       order = 3;
+      key = "no_literature";
     } else if (item.literature_scope === "requested_tumor" && item.tumor_type) {
       label = `Found in ${item.tumor_type}`;
       order = 0;
+      key = "requested_tumor";
     } else if (item.literature_scope === "other_or_unspecified" && item.tumor_type) {
       label = "Found in other tumor types";
       order = 1;
+      key = "other_tumor";
     } else if (item.literature_scope === "any_tumor") {
       label = "Literature found";
       order = 0;
+      key = "any_tumor";
     } else if (item.literature_scope || (item.pmids || []).length || item.retrieved_count > 0) {
       label = "Literature found — not classified by tumor type";
       order = 2;
+      key = "unclassified";
     } else {
       label = "No literature found";
       order = 3;
+      key = "no_literature";
     }
     if (!sections.has(label)) {
-      sections.set(label, { label, order, collapsed: label === "No literature found", items: [] });
+      sections.set(label, { label, key, order, collapsed: label === "No literature found", items: [] });
     }
     sections.get(label).items.push(item);
   });
@@ -2060,11 +2125,13 @@ function renderFusionEvidenceCard(item) {
     appendFusionText(links, "span", "field-label", "Retrieved PMIDs");
     const linkRow = appendFusionText(links, "div", "citation-link-list");
     pmids.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
+    uiTrack().observe(links, { section: "retrieved_pmids" });
   }
   if (item.evidence_cards?.length) {
     const cardList = appendFusionText(evidence, "div", "evidence-card-list");
     item.evidence_cards.forEach((paper) => {
       const paperCard = appendFusionText(cardList, "article", "evidence-card");
+      uiTrack().observe(paperCard, { section: "fusion_paper", item_id: paper.pmid });
       const topline = appendFusionText(paperCard, "div", "evidence-card-topline");
       const pill = appendFusionText(topline, "span", "pmid-pill");
       const link = makePubMedLink(paper.pmid);
@@ -2208,6 +2275,7 @@ function renderSupportingEvidence(annotation) {
   if (count > 0) {
     const details = document.createElement("details");
     details.className = "retrieval-details";
+    uiTrack().details(details, { section: "retrieved_pmids" });
     const summary = document.createElement("summary");
     summary.className = "retrieval-summary";
     summary.innerHTML = `
@@ -2248,6 +2316,7 @@ function renderSupportingEvidence(annotation) {
 
   const cardDetails = document.createElement("details");
   cardDetails.className = "evidence-card-details";
+  uiTrack().details(cardDetails, { section: "evidence_cards" });
   const cardSummary = document.createElement("summary");
   cardSummary.className = "retrieval-summary";
   cardSummary.innerHTML = `
@@ -2265,6 +2334,7 @@ function renderSupportingEvidence(annotation) {
     evidenceCards.forEach((card) => {
       const item = document.createElement("article");
       item.className = "evidence-card";
+      uiTrack().observe(item, { section: "evidence_card", item_id: card.pmid });
       const evidenceType = String(card.evidence_type || "other").replace(/_/g, " ");
       item.innerHTML = `
         ${evidenceCardTopline(card.pmid, evidenceType, card.abstract)}
@@ -2304,6 +2374,7 @@ function renderSupportingEvidence(annotation) {
   if (quotes.length) {
     const quoteDetails = document.createElement("details");
     quoteDetails.className = "quote-details";
+    uiTrack().details(quoteDetails, { section: "supporting_quotes" });
     const quoteSummary = document.createElement("summary");
     quoteSummary.className = "quote-summary retrieval-summary";
     quoteSummary.innerHTML = `
@@ -2315,9 +2386,10 @@ function renderSupportingEvidence(annotation) {
 
     const quoteList = document.createElement("div");
     quoteList.className = "quote-list";
-    quotes.forEach((q) => {
+    quotes.forEach((q, index) => {
       const blockquote = document.createElement("blockquote");
       blockquote.className = "supporting-quote";
+      uiTrack().observe(blockquote, { section: "supporting_quote", item_id: `${q.pmid}:${index}` });
       const p = document.createElement("p");
       p.textContent = q.quote;
       const cite = document.createElement("cite");
@@ -2484,6 +2556,7 @@ function renderDomainsAndTreatments(annotation) {
 
   const details = document.createElement("details");
   details.className = "retrieval-details";
+  uiTrack().details(details, { section: "domains_treatments" });
   const summary = document.createElement("summary");
   summary.className = "retrieval-summary";
   summary.innerHTML = `<span class="retrieval-count-label">Domains &amp; treatments</span>`;
@@ -2586,6 +2659,7 @@ const OPENEVIDENCE_MESSAGES = {
 
 // Replaces the card body with a one-line status note (failed/timed out).
 function renderOpenEvidenceCardNotice(body, message, kind) {
+  uiTrack().state(body, kind);
   const note = document.createElement("div");
   note.className = `subtle openevidence-card-notice openevidence-card-${kind}`;
   note.setAttribute("role", "status");
@@ -2640,6 +2714,7 @@ function syncOpenEvidenceRun(runId) {
 // only if the current run really is that job's.
 function adoptOpenEvidenceRunId(jobId, runId) {
   if (openEvidenceTerminal.runId === jobId) openEvidenceTerminal.runId = runId;
+  uiTrack().aliasRunScope(jobId, runId);
 }
 
 function openEvidenceKey(gene, tumorType, fusion) {
@@ -2719,6 +2794,8 @@ function createOpenEvidenceLifecycle(key, request) {
       return;
     }
     if (response?.status !== "pending") {
+      const outcome = !response?.available || !response.distilled ? "unavailable" : lifecycle.pending ? "ready" : "cached";
+      lifecycle.subscribers.forEach((subscriber) => uiTrack().state(subscriber.card, outcome));
       finish((subscriber) => renderOpenEvidenceCardBody(subscriber.card, subscriber.body, response));
       return;
     }
@@ -2755,7 +2832,9 @@ function createOpenEvidenceLifecycle(key, request) {
     });
     inflight = request(controller ? controller.signal : undefined);
     const settled = inflight.then(handle, () => {
-      if (!lifecycle.finished) finish((subscriber) => subscriber.card.remove());
+      if (lifecycle.finished) return;
+      lifecycle.subscribers.forEach((subscriber) => uiTrack().state(subscriber.card, "failed"));
+      finish((subscriber) => subscriber.card.remove());
     });
     return Promise.race([settled, slotReleased]).finally(() => {
       releaseSlot = null;
@@ -2773,6 +2852,7 @@ function createOpenEvidenceLifecycle(key, request) {
 }
 
 function showOpenEvidencePending(subscriber) {
+  uiTrack().state(subscriber.card, "pending");
   subscriber.body.replaceChildren(renderLoadingState(OPENEVIDENCE_MESSAGES.pending));
 }
 
@@ -2888,10 +2968,11 @@ function renderOpenEvidenceGuidelines(distilled) {
 
   const list = document.createElement("ul");
   list.className = "openevidence-guideline-list";
-  distilled.guidelines.forEach((guideline) => {
+  distilled.guidelines.forEach((guideline, index) => {
     const item = document.createElement("li");
     const link = document.createElement("a");
     link.href = guideline.url;
+    Object.assign(link.dataset, { trackSection: "openevidence_guideline_link", trackItem: String(index) });
     link.target = "_blank";
     link.rel = "noopener noreferrer";
     link.textContent = guideline.title || guideline.url;
@@ -2960,6 +3041,7 @@ function renderOpenEvidenceCardBody(card, body, response) {
     body.appendChild(note);
   }
 
+  uiTrack().surfaced(body, { section: "openevidence_content" });
   const footnote = document.createElement("div");
   footnote.className = "subtle openevidence-footnote";
   footnote.textContent =
@@ -2967,7 +3049,7 @@ function renderOpenEvidenceCardBody(card, body, response) {
   body.appendChild(footnote);
 }
 
-function renderOpenEvidenceCard(annotation) {
+function renderOpenEvidenceCard(annotation, displayPosition = null) {
   // Feature-flag gate: settings.openevidence_enabled, learned from GET
   // /v1/dev/status on page load (see loadDevStatus). When off, render no
   // card at all and never call fetchGeneOpenEvidence, so the client issues
@@ -3004,6 +3086,8 @@ function renderOpenEvidenceCard(annotation) {
   `;
   const body = card.querySelector(".openevidence-card-body");
   body.appendChild(renderLoadingState("Checking OpenEvidence…"));
+  uiTrack().surfaced(card, { ...geneTrackContext(annotation, "results", displayPosition), section: "openevidence" });
+  uiTrack().state(card, "loading");
 
   const tumorType = tumorTypeForAnnotation(annotation);
   const fusion = annotation.fusions?.[0];
@@ -3169,6 +3253,7 @@ function appendFusionPartnerAgnosticFollowUp(body, gene, tumorType, seenPmids) {
 function renderFusionPartnerCheck(gene, tumorType) {
   const details = document.createElement("details");
   details.className = "field-row lazy-field-row";
+  uiTrack().details(details, { section: "fusion_partner_check", item_id: gene });
 
   const summary = document.createElement("summary");
   summary.className = "lazy-field-summary";
@@ -3221,6 +3306,7 @@ function renderFusionPartnerQueryButton(gene, tumorType) {
   resultBox.className = "fusion-partner-query-result hidden";
 
   button.addEventListener("click", () => {
+    uiTrack().event(container, { type: "open", section: "fusion_partner_check", item_id: gene });
     button.disabled = true;
     resultBox.classList.remove("hidden");
     resultBox.replaceChildren(renderLoadingState(`Searching PubMed for ${gene} fusion precedent`));
@@ -3440,6 +3526,7 @@ function hasFieldValue(annotation, field) {
 function renderLazyField(annotation, field, label, type) {
   const details = document.createElement("details");
   details.className = "field-row lazy-field-row";
+  uiTrack().details(details, { section: "lazy_field", item_id: field });
 
   const summary = document.createElement("summary");
   summary.className = "lazy-field-summary";
@@ -3500,6 +3587,7 @@ function renderClinicalActionability(annotation) {
 
   const section = document.createElement("div");
   section.className = "clinical-actionability";
+  uiTrack().observe(section, { section: "clinical_actionability" });
 
   const header = document.createElement("div");
   header.className = "clinical-actionability-header";
@@ -3554,6 +3642,7 @@ function renderClinicalActionabilityBreakdown(actionability, abstractByPmid) {
 
   const details = document.createElement("details");
   details.className = "clinical-actionability-breakdown";
+  uiTrack().details(details, { section: "score_breakdown" });
 
   const summary = document.createElement("summary");
   summary.className = "clinical-actionability-breakdown-summary";
