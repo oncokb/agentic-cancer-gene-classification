@@ -18,8 +18,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import main
-from src.auth import AuthenticatedUser, create_session_token
+from src.auth import AuthenticatedUser
 from src.config import settings
+from tests.auth_helpers import session_token_for
 
 _FRONTEND_DIR = Path(__file__).parent / "frontend"
 _STATIC_DIR = Path(__file__).parent.parent / "src" / "static"
@@ -51,7 +52,7 @@ def client(monkeypatch):
 
 def _sign_in(client: TestClient) -> None:
     user = AuthenticatedUser(email="user@mskcc.org", name="User", domain="mskcc.org")
-    client.cookies.set(settings.auth_cookie_name, create_session_token(user))
+    client.cookies.set(settings.auth_cookie_name, session_token_for(user))
 
 
 def test_signed_out_redirects_through_login_back_to_page(client):

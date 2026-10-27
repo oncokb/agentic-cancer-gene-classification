@@ -17,11 +17,11 @@ from src.auth import (
     AuthenticatedUser,
     SAMLAssertionData,
     create_oauth_state,
-    create_session_token,
     validate_redirect_to,
     verify_oauth_state,
 )
 from src.config import settings
+from tests.auth_helpers import save_profile_for, session_token_for
 
 
 TARGET = "/?run=abc&view=details"
@@ -53,6 +53,8 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, "google_client_id", "test-client")
     monkeypatch.setattr(settings, "dev_login_enabled", True)
     user = AuthenticatedUser(email="user@mskcc.org", name="User", domain="mskcc.org")
+    # provision_or_update_user is mocked out, so store the profile it would have written.
+    save_profile_for(user)
     monkeypatch.setattr(main, "provision_or_update_user", AsyncMock(return_value=user))
     monkeypatch.setattr(main, "record_user_action", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -95,7 +97,7 @@ def test_root_login_redirect(client, session):
     if session != "missing":
         browser.cookies.set(
             settings.auth_cookie_name,
-            create_session_token(
+            session_token_for(
                 user,
                 ttl_seconds=-10 if session == "expired" else 3600,
             ),
@@ -186,7 +188,7 @@ def test_callback_rejects_unsafe_legacy_state(client, provider, target):
 @pytest.mark.parametrize("target", [TARGET, *BAD_TARGETS[:6]])
 def test_authenticated_login_page(client, target):
     browser, user = client
-    browser.cookies.set(settings.auth_cookie_name, create_session_token(user))
+    browser.cookies.set(settings.auth_cookie_name, session_token_for(user))
     response = browser.get("/login", params={"redirect_to": target}, follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"] == validate_redirect_to(target)

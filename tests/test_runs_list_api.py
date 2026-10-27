@@ -9,9 +9,10 @@ from fastapi.testclient import TestClient
 
 from src import api_keys, auth, main
 from src.api_keys import ApiKeyRecord, InMemoryRateLimiter, generate_api_key, hash_api_key
-from src.auth import AuthenticatedUser, create_session_token
+from src.auth import AuthenticatedUser
 from src.config import settings
 from src.pipeline.run_store import RunSummary, RunSummaryPage, _encode_runs_cursor
+from tests.auth_helpers import session_token_for
 
 
 def summary(run_id, day=1, **overrides):
@@ -41,7 +42,7 @@ def client(monkeypatch):
 
 
 def session(email="a@mskcc.org"):
-    token = create_session_token(AuthenticatedUser(email=email, name="User", domain="mskcc.org"))
+    token = session_token_for(AuthenticatedUser(email=email, name="User", domain="mskcc.org"))
     return {"Authorization": f"Bearer {token}"}
 
 

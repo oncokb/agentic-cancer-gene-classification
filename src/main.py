@@ -39,6 +39,7 @@ from src.auth import (
     AuthMeResponse,
     AuthUserResponse,
     UserProfile,
+    UserStoreUnavailable,
     build_saml_authn_request,
     clear_session_cookie,
     create_oauth_state,
@@ -62,6 +63,7 @@ from src.auth import (
     render_access_denied_html,
     require_admin,
     require_auth,
+    session_store_unavailable,
     set_session_cookie,
     validate_redirect_to,
     verify_oauth_state,
@@ -234,9 +236,14 @@ async def no_cache_static(request: Request, call_next):
     return response
 
 
+_SKIP_IDENTITY_PREFIXES = ("/static/", "/auth/callback/", "/auth/saml/acs", "/auth/dev/login")
+
+
 @app.middleware("http")
 async def user_context_middleware(request: Request, call_next):
-    user = await get_request_user(request)
+    # Static assets need no identity, and login callbacks read the profile to
+    # provision it; skip resolving any session they carry (a profile read).
+    user = None if request.url.path.startswith(_SKIP_IDENTITY_PREFIXES) else await get_request_user(request)
     if not user:
         header_val = request.headers.get(settings.datadog_user_id_header)
         if header_val and header_val.strip():
@@ -945,9 +952,23 @@ def _record_annotation_request_metrics(
         )
 
 
-def _login_redirect(request: Request) -> Optional[RedirectResponse]:
+def _require_session_store(request: Request) -> None:
+    """Fail closed (503) when the session couldn't be checked against the user store,
+    rather than treating the caller as signed out (or signed in on token claims)."""
+    if session_store_unavailable(request):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session verification is temporarily unavailable. Please retry shortly.",
+        )
+
+
+async def _login_redirect(request: Request) -> Optional[RedirectResponse]:
     """Send a signed-out browser to /login, returning to this page afterwards."""
-    if not settings.auth_enabled or get_current_user(request):
+    if not settings.auth_enabled:
+        return None
+    user = await get_request_user(request)
+    _require_session_store(request)
+    if user:
         return None
     target = request.url.path
     if request.url.query:
@@ -960,7 +981,7 @@ def _login_redirect(request: Request) -> Optional[RedirectResponse]:
 
 @app.get("/")
 async def root(request: Request) -> Response:
-    redirect = _login_redirect(request)
+    redirect = await _login_redirect(request)
     if redirect:
         return redirect
     return FileResponse(_STATIC_DIR / "index.html")
@@ -968,7 +989,7 @@ async def root(request: Request) -> Response:
 
 @app.get("/api-keys")
 async def api_keys_page(request: Request) -> Response:
-    redirect = _login_redirect(request)
+    redirect = await _login_redirect(request)
     if redirect:
         return redirect
     public_base_url = (settings.public_app_base_url or str(request.base_url)).rstrip("/")
@@ -982,7 +1003,7 @@ async def api_keys_page(request: Request) -> Response:
 
 @app.get("/runs")
 async def runs_page(request: Request) -> Response:
-    redirect = _login_redirect(request)
+    redirect = await _login_redirect(request)
     if redirect:
         return redirect
     return FileResponse(_STATIC_DIR / "runs.html")
@@ -992,7 +1013,8 @@ async def runs_page(request: Request) -> Response:
 async def login_page(request: Request, redirect_to: Optional[str] = "/") -> Response:
     if not settings.auth_enabled:
         return RedirectResponse(url="/", status_code=303)
-    user = get_current_user(request)
+    user = await get_request_user(request)
+    _require_session_store(request)
     if user:
         return RedirectResponse(url=validate_redirect_to(redirect_to), status_code=303)
     login_html = _STATIC_DIR / "login.html"
@@ -1008,7 +1030,8 @@ async def health() -> dict:
 
 @app.get("/auth/me", response_model=AuthMeResponse)
 async def auth_me(request: Request) -> AuthMeResponse:
-    user = get_current_user(request)
+    user = await get_request_user(request)
+    _require_session_store(request)
     return AuthMeResponse(
         auth_enabled=settings.auth_enabled,
         authenticated=bool(user),
@@ -1136,7 +1159,7 @@ async def auth_callback_google(
         domain=profile.domain,
         role=profile.role,
         status=profile.status,
-        provider=profile.provider,
+        provider="google",
         groups=profile.groups,
     )
     session_token = create_session_token(user)
@@ -1256,7 +1279,7 @@ async def auth_saml_acs(request: Request) -> Response:
         domain=profile.domain,
         role=profile.role,
         status=profile.status,
-        provider=profile.provider,
+        provider="saml",
         groups=profile.groups,
     )
     session_token = create_session_token(user)
@@ -1367,7 +1390,9 @@ async def auth_callback_keycloak(
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
-    # JIT Provisioning
+    # JIT Provisioning. Without it, admission is unchanged (no approval gate for
+    # new users) but the login still stores the authorization profile that
+    # every session request checks, merged exactly like a JIT returning user.
     if settings.jit_provisioning_enabled:
         profile = await provision_or_update_user(
             email=user.email,
@@ -1378,16 +1403,27 @@ async def auth_callback_keycloak(
             role=user.role,
             groups=user.groups,
         )
-        if profile.status == "pending":
-            return HTMLResponse(
-                render_access_denied_html(
-                    email=user.email,
-                    reason="Your account has been provisioned but is pending administrator approval before access is granted.",
-                ),
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        user.role = profile.role
-        user.status = profile.status
+    else:
+        profile = await provision_or_update_user(
+            email=user.email,
+            name=user.name,
+            picture=user.picture,
+            domain=user.domain,
+            provider="keycloak",
+            role=user.role,
+            groups=user.groups,
+            require_approval=False,
+        )
+    if profile.status == "pending":
+        return HTMLResponse(
+            render_access_denied_html(
+                email=user.email,
+                reason="Your account has been provisioned but is pending administrator approval before access is granted.",
+            ),
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    user.role = profile.role
+    user.status = profile.status
 
     session_token = create_session_token(user)
     response = RedirectResponse(url=redirect_to, status_code=status.HTTP_303_SEE_OTHER)
@@ -1460,6 +1496,7 @@ async def auth_dev_login(
         domain=clean_email.split("@")[-1],
         provider="dev",
         groups=["admin-group"] if role == "admin" else [],
+        role=role,
     )
     user = AuthenticatedUser(
         email=profile.email,
@@ -2548,6 +2585,20 @@ async def benchmark(
 from src.api.gene_query import router as gene_query_router  # noqa: E402
 
 app.include_router(gene_query_router)
+
+
+@app.exception_handler(UserStoreUnavailable)
+async def user_store_unavailable_handler(request: Request, exc: UserStoreUnavailable):
+    """Fail closed when the user profile store can't be read (e.g. during login
+    provisioning): never provision or authorize from a stale in-process copy."""
+    logger.error("User profile store unavailable for %s: %s", request.url.path, exc)
+    detail = "Sign-in is temporarily unavailable. Please retry shortly."
+    if request.url.path.startswith("/auth/"):
+        return HTMLResponse(
+            render_access_denied_html(email="", reason=detail),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": detail})
 
 
 @app.exception_handler(Exception)

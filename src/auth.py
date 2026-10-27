@@ -127,6 +127,8 @@ class SAMLAssertionData(BaseModel):
 # ---------------------------------------------------------------------------
 
 _user_store: Dict[str, UserProfile] = {}
+# Usage counters kept beside (not in) the profile; see record_user_annotation_activity.
+_user_activity: Dict[str, Dict[str, Any]] = {}
 _user_store_lock = asyncio.Lock()
 
 
@@ -143,6 +145,46 @@ async def _get_auth_redis_client():
             logger.debug("Failed to initialize Redis auth client: %s", exc)
             return None
     return _redis_client
+
+
+class UserStoreUnavailable(RuntimeError):
+    """The user profile store could not be read; callers must fail closed."""
+
+
+async def _profile_store_redis():
+    """The Redis client backing authoritative profile reads.
+
+    Returns None only when Redis is intentionally unconfigured (REDIS_URL
+    empty), in which case the in-process store is the profile store. Raises
+    UserStoreUnavailable when Redis is configured but the client failed to
+    initialize, rather than silently degrading to the in-process copy.
+    """
+    if not settings.redis_url.strip():
+        return None
+    redis_client = await _get_auth_redis_client()
+    if redis_client is None:
+        raise UserStoreUnavailable("Redis is configured but the auth client could not be initialized")
+    return redis_client
+
+
+async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
+    """Read a user profile from the authoritative store, failing closed.
+
+    With Redis configured, Redis alone decides: a miss means the profile was
+    deleted (None) and any error raises UserStoreUnavailable. The in-process
+    store, which save_user_profile also populates, may hold a stale copy and
+    is consulted only when Redis is intentionally unconfigured.
+    """
+    clean_email = email.strip().lower()
+    redis_client = await _profile_store_redis()
+    if redis_client is None:
+        async with _user_store_lock:
+            return _user_store.get(clean_email)
+    try:
+        payload = await redis_client.get(f"agcg:user:{clean_email}")
+        return UserProfile.model_validate_json(payload) if payload else None
+    except Exception as exc:
+        raise UserStoreUnavailable(f"Failed to read user {clean_email}") from exc
 
 
 async def get_user_profile(email: str) -> Optional[UserProfile]:
@@ -174,6 +216,22 @@ async def save_user_profile(profile: UserProfile) -> None:
         _user_store[clean_email] = profile
 
 
+def _with_activity(profile: UserProfile, activity: Dict[str, Any]) -> UserProfile:
+    """Overlay the separately stored usage counters on a profile.
+
+    A profile's own annotation_count/last_annotation_at are the totals from
+    before usage moved to its own record; new usage only lands in `activity`.
+    """
+    if not activity:
+        return profile
+    return profile.model_copy(
+        update={
+            "annotation_count": profile.annotation_count + int(activity.get("annotation_count") or 0),
+            "last_annotation_at": activity.get("last_annotation_at") or profile.last_annotation_at,
+        }
+    )
+
+
 async def list_user_profiles() -> List[UserProfile]:
     redis_client = await _get_auth_redis_client()
     if redis_client is not None:
@@ -183,7 +241,7 @@ async def list_user_profiles() -> List[UserProfile]:
             for email in emails:
                 u = await get_user_profile(email)
                 if u:
-                    users.append(u)
+                    users.append(_with_activity(u, await redis_client.hgetall(_activity_key(u.email))))
             if users:
                 users.sort(key=lambda x: x.last_login_at, reverse=True)
                 return users
@@ -191,7 +249,7 @@ async def list_user_profiles() -> List[UserProfile]:
             logger.debug("Redis error listing users: %s", exc)
 
     async with _user_store_lock:
-        users = list(_user_store.values())
+        users = [_with_activity(u, _user_activity.get(u.email, {})) for u in _user_store.values()]
         users.sort(key=lambda x: x.last_login_at, reverse=True)
         return users
 
@@ -205,10 +263,19 @@ async def provision_or_update_user(
     groups: Optional[List[str]] = None,
     claims: Optional[Dict[str, Any]] = None,
     role: Optional[str] = None,
+    require_approval: Optional[bool] = None,
 ) -> UserProfile:
     """
     Just-In-Time (JIT) provisioning: creates a new user profile on first login,
     or updates login timestamp, groups, and claims for returning users.
+
+    Reads the profile from the authoritative store (load_user_profile_strict):
+    with Redis configured, a profile missing there is a new user subject to the
+    new-user rules (incl. approval), even if a stale in-process copy exists, and
+    a store error raises UserStoreUnavailable instead of provisioning from that
+    copy. `require_approval` overrides JIT_REQUIRE_ADMIN_APPROVAL for new users
+    (logins admitted without JIT provisioning pass False); returning users
+    always get the same merge rules.
     """
     clean_email = email.strip().lower()
     extracted_domain = domain or clean_email.split("@")[-1]
@@ -223,9 +290,11 @@ async def provision_or_update_user(
     if any(g in settings.keycloak_admin_roles_list for g in user_groups):
         effective_role = "admin"
 
-    existing = await get_user_profile(clean_email)
+    existing = await load_user_profile_strict(clean_email)
     if existing is None:
-        status_val = "pending" if settings.jit_require_admin_approval else "active"
+        if require_approval is None:
+            require_approval = settings.jit_require_admin_approval
+        status_val = "pending" if require_approval else "active"
         logger.info(
             "JIT provisioning new user: %s (domain=%s, role=%s, provider=%s, status=%s, groups=%s)",
             clean_email, extracted_domain, effective_role, provider, status_val, user_groups,
@@ -264,19 +333,39 @@ async def provision_or_update_user(
     return profile
 
 
+def _activity_key(email: str) -> str:
+    return f"agcg:user_activity:{email}"
+
+
 async def record_user_annotation_activity(email: str, count: int = 1) -> None:
-    """Updates user profile usage metrics in the user store upon annotation completion."""
+    """Records usage metrics upon annotation completion (shown by list_user_profiles).
+
+    Write-only: the counters live beside the profile instead of in it, so
+    recording usage neither adds a profile read to the request nor rewrites
+    the profile (a read-modify-write here could undo a concurrent demotion).
+    """
     clean_email = email.strip().lower()
-    profile = await get_user_profile(clean_email)
-    if profile:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        updated = profile.model_copy(
-            update={
-                "annotation_count": profile.annotation_count + max(1, count),
-                "last_annotation_at": now_iso,
-            }
-        )
-        await save_user_profile(updated)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if settings.redis_url.strip():
+        # Redis is the store: on failure drop the increment rather than buffer
+        # it in-process, where it would never reach Redis after recovery.
+        redis_client = await _get_auth_redis_client()
+        if redis_client is None:
+            logger.warning("Dropped annotation activity for %s: Redis auth client unavailable", clean_email)
+            return
+        try:
+            pipe = redis_client.pipeline()
+            pipe.hincrby(_activity_key(clean_email), "annotation_count", max(1, count))
+            pipe.hset(_activity_key(clean_email), "last_annotation_at", now_iso)
+            await pipe.execute()
+        except Exception as exc:
+            logger.warning("Dropped annotation activity for %s: Redis error: %s", clean_email, exc)
+        return
+
+    async with _user_store_lock:
+        activity = _user_activity.setdefault(clean_email, {})
+        activity["annotation_count"] = int(activity.get("annotation_count") or 0) + max(1, count)
+        activity["last_annotation_at"] = now_iso
 
 
 # ---------------------------------------------------------------------------
@@ -406,18 +495,15 @@ def decode_session_token(token: str) -> Optional[AuthenticatedUser]:
             logger.warning("Session token rejected for %s: %s", email, reason)
             return None
 
-        status_val = payload.get("status", "active")
-        if status_val != "active":
-            logger.warning("Session rejected for %s: account status is %s", email, status_val)
-            return None
-
+        # role/status are login-time snapshots, informational only: session
+        # requests are authorized with the live profile's (_verify_session).
         return AuthenticatedUser(
             email=email,
             name=payload.get("name") or email,
             picture=payload.get("picture"),
             domain=payload.get("domain") or email.split("@")[-1],
             role=payload.get("role", settings.jit_default_role),
-            status=status_val,
+            status=payload.get("status", "active"),
             provider=payload.get("provider", "google"),
             groups=payload.get("groups", []),
         )
@@ -728,23 +814,81 @@ def _uses_api_key(request: Request) -> bool:
 # so the observability middleware and require_auth share a single DB lookup.
 _API_KEY_STATE_ATTR = "acgc_api_key_auth"
 _API_KEY_RATE_CHECKED_ATTR = "acgc_api_key_rate_checked"
+# Same idea for session tokens: (user, failure reason) after the live profile
+# check, so each request reads the user profile at most once.
+_SESSION_STATE_ATTR = "acgc_session_auth"
+
+
+def _session_token(request: Request) -> Optional[str]:
+    return request.cookies.get(settings.auth_cookie_name) or bearer_token(request.headers.get("Authorization"))
 
 
 def get_current_user(request: Request) -> Optional[AuthenticatedUser]:
+    """The caller's identity as already verified for this request.
+
+    API keys and session tokens both need an async lookup (the key record and
+    the live user profile respectively), so this sync helper only returns what
+    resolve_api_key_user() / resolve_session_user() verified, and None
+    otherwise. user_context_middleware resolves both on every request.
+    """
+    attr = _API_KEY_STATE_ATTR if _uses_api_key(request) else _SESSION_STATE_ATTR
+    cached = getattr(request.state, attr, None)
+    return cached[0] if cached else None
+
+
+async def _verify_session(token: str) -> Tuple[Optional[AuthenticatedUser], Optional[str]]:
+    claims = decode_session_token(token)
+    if claims is None:
+        return None, "invalid"
+
+    # The token's role/status are a snapshot from login. Authorize against the
+    # current profile so demotions take effect on already-issued sessions.
+    try:
+        profile = await load_user_profile_strict(claims.email)
+    except UserStoreUnavailable:
+        logger.exception("User profile lookup failed for session of %s", claims.email)
+        return None, "unavailable"
+
+    if profile is None:
+        logger.warning("Session rejected for %s: user profile no longer exists", claims.email)
+        return None, "invalid"
+
+    if profile.status != "active":
+        logger.warning("Session rejected for %s: account status is %s", claims.email, profile.status)
+        return None, "inactive"
+
+    return claims.model_copy(update={"role": profile.role, "status": profile.status}), None
+
+
+async def resolve_session_user(request: Request) -> Optional[AuthenticatedUser]:
+    """Verify the session cookie / session bearer token (once per request, cached).
+
+    Returns None for API-key requests, a missing/invalid/expired token, a
+    deleted or non-active profile, or an unreadable profile store; the cached
+    failure reason ("invalid", "inactive", "unavailable") tells them apart.
+    """
     if _uses_api_key(request):
-        # API keys need an async DB lookup; this sync helper only sees a key
-        # that resolve_api_key_user() already verified for this request.
-        cached = getattr(request.state, _API_KEY_STATE_ATTR, None)
-        return cached[0] if cached else None
-
-    token = request.cookies.get(settings.auth_cookie_name)
-    if not token:
-        token = bearer_token(request.headers.get("Authorization"))
-
-    if not token:
         return None
+    cached = getattr(request.state, _SESSION_STATE_ATTR, None)
+    if cached is None:
+        token = _session_token(request)
+        if not token:
+            cached = (None, None)
+        elif not settings.auth_enabled:
+            # Auth disabled: nothing to authorize against, so keep the token's
+            # claims (and its pre-existing rejection of inactive snapshots).
+            claims = decode_session_token(token)
+            cached = (claims if claims and claims.status == "active" else None, None)
+        else:
+            cached = await _verify_session(token)
+        setattr(request.state, _SESSION_STATE_ATTR, cached)
+    return cached[0]
 
-    return decode_session_token(token)
+
+def session_store_unavailable(request: Request) -> bool:
+    """True when this request's session couldn't be checked against the user store."""
+    cached = getattr(request.state, _SESSION_STATE_ATTR, None)
+    return bool(cached) and cached[1] == "unavailable"
 
 
 async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[AuthenticatedUser], Optional[str]]:
@@ -783,7 +927,18 @@ async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[Au
         except Exception as exc:
             logger.warning("Failed to update last_used_at for API key %s: %s", record.id, exc)
 
-    profile = await get_user_profile(owner_email)
+    # Same authoritative read as sessions: with Redis configured, an owner
+    # missing there was deleted. Without Redis the in-process store is lost on
+    # restart, so a missing owner keeps the default-role behaviour.
+    try:
+        profile = await load_user_profile_strict(owner_email)
+    except UserStoreUnavailable:
+        logger.exception("User profile lookup failed for API key %s owner %s", record.id, owner_email)
+        return None, "unavailable"
+    if profile is None and settings.redis_url.strip():
+        logger.warning("API key %s rejected: owner %s has no user profile", record.id, owner_email)
+        return None, "invalid"
+
     return (
         AuthenticatedUser(
             email=owner_email,
@@ -821,8 +976,9 @@ async def resolve_api_key_user(request: Request) -> Optional[AuthenticatedUser]:
 
 
 async def get_request_user(request: Request) -> Optional[AuthenticatedUser]:
-    """Async counterpart of get_current_user that also resolves API keys."""
+    """Async counterpart of get_current_user that resolves API keys and sessions."""
     await resolve_api_key_user(request)
+    await resolve_session_user(request)
     return get_current_user(request)
 
 
@@ -841,6 +997,9 @@ async def _enforce_api_key_rate_limit(request: Request, user: AuthenticatedUser)
             detail="API key rate limit exceeded. Please slow down and retry later.",
             headers={"Retry-After": str(retry_after)},
         )
+
+
+_INACTIVE_ACCOUNT_DETAIL = "Your account is pending administrator approval. Please contact your AGCG administrator."
 
 
 async def require_auth(request: Request) -> AuthenticatedUser:
@@ -869,7 +1028,15 @@ async def require_auth(request: Request) -> AuthenticatedUser:
                 headers={"WWW-Authenticate": "Bearer"},
             )
     else:
-        user = get_current_user(request)
+        user = await resolve_session_user(request)
+        reason = getattr(request.state, _SESSION_STATE_ATTR, (None, None))[1]
+        if reason == "unavailable":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Session verification is temporarily unavailable. Please retry shortly.",
+            )
+        if reason == "inactive":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_INACTIVE_ACCOUNT_DETAIL)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -880,7 +1047,7 @@ async def require_auth(request: Request) -> AuthenticatedUser:
     if user.status != "active":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account is pending administrator approval. Please contact your AGCG administrator.",
+            detail=_INACTIVE_ACCOUNT_DETAIL,
         )
 
     if uses_api_key:

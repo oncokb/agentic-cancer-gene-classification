@@ -11,9 +11,10 @@ from fastapi.testclient import TestClient
 
 from src import auth as auth_module
 from src import main
-from src.auth import AuthenticatedUser, create_session_token
+from src.auth import AuthenticatedUser
 from src.models.schema import AnnotationResult, FusionEvidenceResult, GeneAnnotation, ResolvedGene
 from src.pipeline import orchestrator, result_sanitizer
+from tests.auth_helpers import session_token_for
 
 
 class FakeRunStore:
@@ -357,7 +358,7 @@ def test_inline_fusion_evidence_run_is_saved_with_its_owner(monkeypatch, path):
     monkeypatch.setattr(result_sanitizer, "resolve_fusion_partner_aliases", no_aliases)
     monkeypatch.setattr(main, "run_pipeline", fake_pipeline)
     monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_retrieve)
-    token = create_session_token(
+    token = session_token_for(
         AuthenticatedUser(email="Curator@MSKCC.org", name="Curator", domain="mskcc.org")
     )
     with TestClient(main.app) as client:

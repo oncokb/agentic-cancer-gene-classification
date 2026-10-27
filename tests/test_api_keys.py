@@ -34,9 +34,10 @@ from src.api_keys import (
     rate_limit_window,
     should_touch_last_used,
 )
-from src.auth import AuthenticatedUser, UserProfile, create_session_token
+from src.auth import AuthenticatedUser, UserProfile
 from src.config import settings
 from src.main import app
+from tests.auth_helpers import session_token_for
 
 # ---------------------------------------------------------------------------
 # Pure logic
@@ -74,7 +75,7 @@ def test_parse_api_key_rejects_malformed(token):
 
 def test_looks_like_api_key_distinguishes_session_tokens(monkeypatch):
     monkeypatch.setattr(settings, "auth_secret_key", "unit-secret")
-    session = create_session_token(AuthenticatedUser(email="a@mskcc.org", name="A", domain="mskcc.org"))
+    session = session_token_for(AuthenticatedUser(email="a@mskcc.org", name="A", domain="mskcc.org"))
     assert looks_like_api_key(generate_api_key())
     assert not looks_like_api_key(session)
     assert not looks_like_api_key(None)
@@ -238,7 +239,7 @@ def store(monkeypatch):
 
 
 def _session_client(email: str = "curator@mskcc.org", role: str = "curator") -> TestClient:
-    token = create_session_token(
+    token = session_token_for(
         AuthenticatedUser(email=email, name="Curator", domain=email.split("@")[-1], role=role)
     )
     client = TestClient(app)
@@ -321,7 +322,7 @@ def test_bearer_key_authenticates_protected_route(store, monkeypatch):
 
 
 def test_session_bearer_token_still_works(store):
-    token = create_session_token(AuthenticatedUser(email="curator@mskcc.org", name="C", domain="mskcc.org"))
+    token = session_token_for(AuthenticatedUser(email="curator@mskcc.org", name="C", domain="mskcc.org"))
     resp = TestClient(app).get(PROTECTED, headers=_bearer(token))
     assert resp.status_code == 404
 

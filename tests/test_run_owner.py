@@ -25,7 +25,7 @@ from src import auth as auth_module
 from src import main
 from src.api.run_persistence import run_owner
 from src.api_keys import ApiKeyRecord, InMemoryRateLimiter, generate_api_key, hash_api_key
-from src.auth import AuthenticatedUser, create_session_token
+from src.auth import AuthenticatedUser
 from src.config import settings
 from src.models.schema import AnnotationResult, GeneAnnotation
 from src.pipeline import run_store as run_store_module
@@ -37,6 +37,7 @@ from src.pipeline.run_store import (
     _encode_runs_cursor,
     summarize_run_inputs,
 )
+from tests.auth_helpers import session_token_for
 
 # ---------------------------------------------------------------------------
 # Input summary
@@ -197,7 +198,7 @@ def _api_key_headers(store: RecordingStore, owner_email: str = "Scripter@mskcc.o
 
 
 def _session_cookies(email: str = "curator@mskcc.org") -> dict:
-    token = create_session_token(AuthenticatedUser(email=email, name="Curator", domain="mskcc.org"))
+    token = session_token_for(AuthenticatedUser(email=email, name="Curator", domain="mskcc.org"))
     return {settings.auth_cookie_name: token}
 
 
