@@ -404,8 +404,10 @@ def keycloak_login(monkeypatch):
     monkeypatch.setattr(main_module, "exchange_keycloak_code", AsyncMock(return_value={"access_token": "t"}))
     monkeypatch.setattr(main_module, "get_keycloak_user_info", AsyncMock(return_value={}))
 
-    def login(role: str = "curator"):
-        user = AuthenticatedUser(email=EMAIL, name="KC User", domain="mskcc.org", role=role, provider="keycloak")
+    def login(role: str = "curator", groups=None):
+        user = AuthenticatedUser(
+            email=EMAIL, name="KC User", domain="mskcc.org", role=role, provider="keycloak", groups=groups or []
+        )
         monkeypatch.setattr(main_module, "parse_keycloak_user", lambda *args: user)
         browser = TestClient(app)
         resp = browser.get(
@@ -439,17 +441,28 @@ def test_keycloak_login_without_jit_keeps_stored_status(keycloak_login):
     assert auth_module._user_store[EMAIL].status == "pending"
 
 
-def test_google_login_token_provider_comes_from_login_path(monkeypatch):
+@pytest.fixture
+def google_login(monkeypatch):
     monkeypatch.setattr(settings, "google_client_id", "test-client")
     monkeypatch.setattr(main_module, "exchange_google_code", AsyncMock(return_value={"access_token": "t"}))
     monkeypatch.setattr(
         main_module, "get_google_user_info", AsyncMock(return_value={"email": EMAIL, "email_verified": True})
     )
+
+    def login(browser: TestClient | None = None):
+        browser = browser or TestClient(app)
+        resp = browser.get(
+            "/auth/callback/google", params={"code": "c", "state": create_oauth_state("/")}, follow_redirects=False
+        )
+        return browser, resp
+
+    return login
+
+
+def test_google_login_token_provider_comes_from_login_path(google_login):
     _set_profile(provider="keycloak")  # e.g. first provisioned through Keycloak
 
-    resp = TestClient(app).get(
-        "/auth/callback/google", params={"code": "c", "state": create_oauth_state("/")}, follow_redirects=False
-    )
+    _, resp = google_login()
     assert resp.status_code == 303
     assert decode_session_token(resp.cookies.get(settings.auth_cookie_name)).provider == "google"
 
@@ -468,28 +481,141 @@ def test_saml_login_token_provider_comes_from_login_path(monkeypatch):
     assert decode_session_token(resp.cookies.get(settings.auth_cookie_name)).provider == "saml"
 
 
+def test_jit_off_and_jit_on_returning_user_merges_agree(keycloak_login, monkeypatch):
+    # Returning-user merge rules are shared: admin stickiness, merged groups,
+    # stored status preserved. Only new-user admission differs between them.
+    merged = {}
+    for jit in (True, False):
+        monkeypatch.setattr(settings, "jit_provisioning_enabled", jit)
+        monkeypatch.setattr(auth_module, "_user_store", {})
+        _set_profile(role="admin", status="disabled", groups=["existing-group"], login_count=3)
+        _, resp = keycloak_login(role="curator", groups=["idp-group"])
+        assert resp.status_code == 303
+        merged[jit] = auth_module._user_store[EMAIL].model_dump(exclude={"first_login_at", "last_login_at"})
+
+    assert merged[True] == merged[False]
+    assert merged[False]["role"] == "admin"
+    assert merged[False]["status"] == "disabled"
+    assert merged[False]["groups"] == ["existing-group", "idp-group"]
+    assert merged[False]["login_count"] == 4
+
+
 # ---------------------------------------------------------------------------
-# Unchanged paths
+# Login provisioning and API-key owners use the authoritative store too
 # ---------------------------------------------------------------------------
 
 
-def test_api_key_path_does_not_use_session_profile_check(auth_env, monkeypatch):
+def test_relogin_after_redis_delete_is_a_new_user_subject_to_approval(redis_store, google_login, monkeypatch):
+    monkeypatch.setattr(settings, "jit_require_admin_approval", True)
+    old_session = _login(role="admin", redis=redis_store)
+    assert old_session.get(ADMIN_ONLY).status_code == 200
+
+    # Deleted only from Redis; a stale active/admin in-process copy remains.
+    del redis_store.data[f"agcg:user:{EMAIL}"]
+    assert old_session.get(PROTECTED).status_code == 401
+
+    _, resp = google_login()
+    assert resp.status_code == 403
+    assert "pending administrator approval" in resp.text
+    assert settings.auth_cookie_name not in resp.cookies
+    stored = UserProfile.model_validate_json(redis_store.data[f"agcg:user:{EMAIL}"])
+    assert (stored.status, stored.role) == ("pending", settings.jit_default_role)
+    # The old token doesn't come back to life either.
+    assert old_session.get(PROTECTED).status_code == 403
+    assert old_session.get(ADMIN_ONLY).status_code == 403
+
+
+def test_login_fails_closed_with_503_on_profile_store_error(redis_store, google_login):
+    _set_profile(redis=redis_store)
+    redis_store.fail = True
+
+    _, resp = google_login()
+    assert resp.status_code == 503
+    assert "temporarily unavailable" in resp.text
+    assert "set-cookie" not in resp.headers
+
+
+def test_login_fails_closed_with_503_on_redis_init_failure(google_login, monkeypatch):
+    import redis.asyncio as redis_asyncio
+
+    def broken_from_url(*args, **kwargs):
+        raise ValueError("bad redis url")
+
+    monkeypatch.setattr(settings, "redis_url", FAKE_REDIS_URL)
+    monkeypatch.setattr(auth_module, "_redis_client", None)
+    monkeypatch.setattr(auth_module, "_get_auth_redis_client", REAL_GET_AUTH_REDIS)
+    if REAL_PROFILE_STORE is not None:
+        monkeypatch.setattr(auth_module, "_profile_store_redis", REAL_PROFILE_STORE)
+    monkeypatch.setattr(redis_asyncio, "from_url", broken_from_url)
+    _set_profile()  # only an in-process copy
+
+    _, resp = google_login()
+    assert resp.status_code == 503
+    assert "set-cookie" not in resp.headers
+
+
+def _add_api_key(store) -> dict:
     key = generate_api_key()
-    auth_env.keys["key-1"] = ApiKeyRecord(
+    store.keys["key-1"] = ApiKeyRecord(
         id="key-1",
         key_hash=hash_api_key(key),
         owner_email=EMAIL,
         name="script",
         created_at=datetime.now(timezone.utc),
     )
+    return {"Authorization": f"Bearer {key}"}
+
+
+def test_api_key_owner_deleted_from_redis_is_rejected(auth_env, redis_store):
+    headers = _add_api_key(auth_env)
+    _set_profile(redis=redis_store, role="admin")
+    client = TestClient(app)
+    assert client.get(ADMIN_ONLY, headers=headers).status_code == 200
+
+    del redis_store.data[f"agcg:user:{EMAIL}"]  # stale in-process copy remains
+    assert client.get(PROTECTED, headers=headers).status_code == 401
+    assert client.get(ADMIN_ONLY, headers=headers).status_code == 401
+
+
+def test_api_key_owner_store_error_is_503(auth_env, redis_store):
+    headers = _add_api_key(auth_env)
+    _set_profile(redis=redis_store)
+    redis_store.fail = True
+    assert TestClient(app).get(PROTECTED, headers=headers).status_code == 503
+
+
+def test_login_callback_with_existing_session_reads_profile_once(redis_store, google_login):
+    browser = _login(redis=redis_store)
+    _, resp = google_login(browser)
+    assert resp.status_code == 303
+    assert len(redis_store.gets) == 1  # provisioning only; the old session isn't resolved
+
+
+async def test_failed_activity_write_is_not_buffered_in_memory(redis_store):
+    _set_profile(redis=redis_store)
+    redis_store.fail = True
+    await auth_module.record_user_annotation_activity(EMAIL, count=3)
+    redis_store.fail = False
+
+    assert auth_module._user_activity == {}
+    [listed] = await auth_module.list_user_profiles()
+    assert listed.annotation_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Unchanged paths
+# ---------------------------------------------------------------------------
+
+
+def test_api_key_path_does_not_use_session_profile_check(auth_env, monkeypatch):
+    headers = _add_api_key(auth_env)
 
     async def must_not_be_called(token):
         raise AssertionError("API keys keep their own profile lookup")
 
     monkeypatch.setattr(auth_module, "_verify_session", must_not_be_called)
     client = TestClient(app)
-    headers = {"Authorization": f"Bearer {key}"}
-    # Unchanged: a key owner without a profile is an active default-role user...
+    # Unchanged without Redis: a key owner without a profile is an active default-role user...
     assert client.get(PROTECTED, headers=headers).status_code == 404
     assert client.get(ADMIN_ONLY, headers=headers).status_code == 403
     # ...and a pending owner is rejected with the existing message.

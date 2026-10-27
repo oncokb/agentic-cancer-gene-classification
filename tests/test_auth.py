@@ -656,6 +656,8 @@ def test_mskcc_email_works_out_of_the_box(monkeypatch):
 async def test_user_annotation_usage_tracking(monkeypatch):
     monkeypatch.setattr(settings, "auth_enabled", True)
     monkeypatch.setattr(settings, "auth_secret_key", "secret-usage-key-12345")
+    # In-process store mode: with Redis configured, usage only goes to Redis.
+    monkeypatch.setattr(settings, "redis_url", "")
 
     profile = await provision_or_update_user(
         email="power.curator@mskcc.org",

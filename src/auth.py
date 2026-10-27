@@ -263,10 +263,19 @@ async def provision_or_update_user(
     groups: Optional[List[str]] = None,
     claims: Optional[Dict[str, Any]] = None,
     role: Optional[str] = None,
+    require_approval: Optional[bool] = None,
 ) -> UserProfile:
     """
     Just-In-Time (JIT) provisioning: creates a new user profile on first login,
     or updates login timestamp, groups, and claims for returning users.
+
+    Reads the profile from the authoritative store (load_user_profile_strict):
+    with Redis configured, a profile missing there is a new user subject to the
+    new-user rules (incl. approval), even if a stale in-process copy exists, and
+    a store error raises UserStoreUnavailable instead of provisioning from that
+    copy. `require_approval` overrides JIT_REQUIRE_ADMIN_APPROVAL for new users
+    (logins admitted without JIT provisioning pass False); returning users
+    always get the same merge rules.
     """
     clean_email = email.strip().lower()
     extracted_domain = domain or clean_email.split("@")[-1]
@@ -281,9 +290,11 @@ async def provision_or_update_user(
     if any(g in settings.keycloak_admin_roles_list for g in user_groups):
         effective_role = "admin"
 
-    existing = await get_user_profile(clean_email)
+    existing = await load_user_profile_strict(clean_email)
     if existing is None:
-        status_val = "pending" if settings.jit_require_admin_approval else "active"
+        if require_approval is None:
+            require_approval = settings.jit_require_admin_approval
+        status_val = "pending" if require_approval else "active"
         logger.info(
             "JIT provisioning new user: %s (domain=%s, role=%s, provider=%s, status=%s, groups=%s)",
             clean_email, extracted_domain, effective_role, provider, status_val, user_groups,
@@ -335,61 +346,26 @@ async def record_user_annotation_activity(email: str, count: int = 1) -> None:
     """
     clean_email = email.strip().lower()
     now_iso = datetime.now(timezone.utc).isoformat()
-    redis_client = await _get_auth_redis_client()
-    if redis_client is not None:
+    if settings.redis_url.strip():
+        # Redis is the store: on failure drop the increment rather than buffer
+        # it in-process, where it would never reach Redis after recovery.
+        redis_client = await _get_auth_redis_client()
+        if redis_client is None:
+            logger.warning("Dropped annotation activity for %s: Redis auth client unavailable", clean_email)
+            return
         try:
             pipe = redis_client.pipeline()
             pipe.hincrby(_activity_key(clean_email), "annotation_count", max(1, count))
             pipe.hset(_activity_key(clean_email), "last_annotation_at", now_iso)
             await pipe.execute()
         except Exception as exc:
-            logger.debug("Redis error recording activity for %s: %s", clean_email, exc)
+            logger.warning("Dropped annotation activity for %s: Redis error: %s", clean_email, exc)
+        return
 
     async with _user_store_lock:
         activity = _user_activity.setdefault(clean_email, {})
         activity["annotation_count"] = int(activity.get("annotation_count") or 0) + max(1, count)
         activity["last_annotation_at"] = now_iso
-
-
-async def record_login_profile(user: AuthenticatedUser) -> UserProfile:
-    """Persist the authorization profile for a login admitted without JIT provisioning.
-
-    Sessions are authorized against the stored profile on every request, so
-    every admitted login needs one. Admission itself is unchanged (no approval
-    gate here): a new user is stored active with the IdP-derived role. A
-    returning user keeps their stored status, so an administrator's
-    pending/disabled sticks, and takes the IdP role, which is authoritative
-    when JIT provisioning is off.
-    """
-    clean_email = user.email.strip().lower()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    existing = await get_user_profile(clean_email)
-    if existing is None:
-        profile = UserProfile(
-            email=clean_email,
-            name=user.name or clean_email,
-            picture=user.picture,
-            domain=user.domain,
-            role=user.role,
-            status="active",
-            provider=user.provider,
-            groups=user.groups,
-            first_login_at=now_iso,
-            last_login_at=now_iso,
-        )
-    else:
-        profile = existing.model_copy(
-            update={
-                "name": user.name or existing.name,
-                "picture": user.picture or existing.picture,
-                "role": user.role,
-                "groups": user.groups,
-                "last_login_at": now_iso,
-                "login_count": existing.login_count + 1,
-            }
-        )
-    await save_user_profile(profile)
-    return profile
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +927,18 @@ async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[Au
         except Exception as exc:
             logger.warning("Failed to update last_used_at for API key %s: %s", record.id, exc)
 
-    profile = await get_user_profile(owner_email)
+    # Same authoritative read as sessions: with Redis configured, an owner
+    # missing there was deleted. Without Redis the in-process store is lost on
+    # restart, so a missing owner keeps the default-role behaviour.
+    try:
+        profile = await load_user_profile_strict(owner_email)
+    except UserStoreUnavailable:
+        logger.exception("User profile lookup failed for API key %s owner %s", record.id, owner_email)
+        return None, "unavailable"
+    if profile is None and settings.redis_url.strip():
+        logger.warning("API key %s rejected: owner %s has no user profile", record.id, owner_email)
+        return None, "invalid"
+
     return (
         AuthenticatedUser(
             email=owner_email,

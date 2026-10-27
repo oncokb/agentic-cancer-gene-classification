@@ -39,6 +39,7 @@ from src.auth import (
     AuthMeResponse,
     AuthUserResponse,
     UserProfile,
+    UserStoreUnavailable,
     build_saml_authn_request,
     clear_session_cookie,
     create_oauth_state,
@@ -58,7 +59,6 @@ from src.auth import (
     parse_keycloak_user,
     parse_saml_response,
     provision_or_update_user,
-    record_login_profile,
     record_user_annotation_activity,
     render_access_denied_html,
     require_admin,
@@ -236,10 +236,14 @@ async def no_cache_static(request: Request, call_next):
     return response
 
 
+_SKIP_IDENTITY_PREFIXES = ("/static/", "/auth/callback/", "/auth/saml/acs", "/auth/dev/login")
+
+
 @app.middleware("http")
 async def user_context_middleware(request: Request, call_next):
-    # Public static assets need no identity; skip the per-request profile read.
-    user = None if request.url.path.startswith("/static/") else await get_request_user(request)
+    # Static assets need no identity, and login callbacks read the profile to
+    # provision it; skip resolving any session they carry (a profile read).
+    user = None if request.url.path.startswith(_SKIP_IDENTITY_PREFIXES) else await get_request_user(request)
     if not user:
         header_val = request.headers.get(settings.datadog_user_id_header)
         if header_val and header_val.strip():
@@ -1386,8 +1390,9 @@ async def auth_callback_keycloak(
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
-    # JIT Provisioning. Without it, admission is unchanged but the login still
-    # stores the authorization profile that every session request checks.
+    # JIT Provisioning. Without it, admission is unchanged (no approval gate for
+    # new users) but the login still stores the authorization profile that
+    # every session request checks, merged exactly like a JIT returning user.
     if settings.jit_provisioning_enabled:
         profile = await provision_or_update_user(
             email=user.email,
@@ -1399,7 +1404,16 @@ async def auth_callback_keycloak(
             groups=user.groups,
         )
     else:
-        profile = await record_login_profile(user)
+        profile = await provision_or_update_user(
+            email=user.email,
+            name=user.name,
+            picture=user.picture,
+            domain=user.domain,
+            provider="keycloak",
+            role=user.role,
+            groups=user.groups,
+            require_approval=False,
+        )
     if profile.status == "pending":
         return HTMLResponse(
             render_access_denied_html(
@@ -2571,6 +2585,20 @@ async def benchmark(
 from src.api.gene_query import router as gene_query_router  # noqa: E402
 
 app.include_router(gene_query_router)
+
+
+@app.exception_handler(UserStoreUnavailable)
+async def user_store_unavailable_handler(request: Request, exc: UserStoreUnavailable):
+    """Fail closed when the user profile store can't be read (e.g. during login
+    provisioning): never provision or authorize from a stale in-process copy."""
+    logger.error("User profile store unavailable for %s: %s", request.url.path, exc)
+    detail = "Sign-in is temporarily unavailable. Please retry shortly."
+    if request.url.path.startswith("/auth/"):
+        return HTMLResponse(
+            render_access_denied_html(email="", reason=detail),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": detail})
 
 
 @app.exception_handler(Exception)
