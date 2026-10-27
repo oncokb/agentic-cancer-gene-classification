@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -58,9 +62,15 @@ HGNC_TIMEOUT_SECONDS = 5.0
 ENSEMBL_TIMEOUT_SECONDS = 8.0
 NCBI_TIMEOUT_SECONDS = 8.0
 # NCBI answers 429 when a burst outruns its per-second budget, even under the
-# shared limiter (it bursts its full allowance); back off and retry a few times.
+# shared limiter (it bursts its full allowance); retry a few times, waiting as
+# long as Retry-After says (else exponential backoff). Everything, limiter
+# waits included, fits in one deadline; a wait that would overrun it fails fast.
 NCBI_RATE_LIMIT_RETRIES = 3
 NCBI_RATE_LIMIT_BACKOFF_SECONDS = 0.5
+NCBI_RETRY_DEADLINE_SECONDS = 15.0
+# Indirection so tests can drive the retry loop with a fake clock.
+_monotonic = time.monotonic
+_sleep = asyncio.sleep
 NORMALIZATION_CONCURRENCY = 6
 
 
@@ -489,29 +499,68 @@ def _refseq_failed(symbol: str) -> ResolvedGene:
     )
 
 
+def _retry_after_seconds(resp: httpx.Response) -> Optional[float]:
+    """Retry-After as seconds to wait (delta-seconds or HTTP-date); None if absent or unparseable."""
+    value = (resp.headers.get("Retry-After") or "").strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    if math.isnan(seconds):
+        return None
+    return max(seconds, 0.0)
+
+
+async def _ncbi_get(url: str, headers: dict, client: httpx.AsyncClient) -> httpx.Response:
+    """GET from NCBI under the shared limiter, retrying 429s within NCBI_RETRY_DEADLINE_SECONDS.
+    Returns the last response (possibly still a 429); raises httpx.TimeoutException
+    when the deadline runs out while waiting for the limiter or the request."""
+    # Lazy: literature imports this module. Shares the NCBI request budget with PubMed.
+    from src.pipeline.literature import _get_ncbi_rate_limiter
+
+    async def _attempt() -> httpx.Response:
+        async with _get_ncbi_rate_limiter():
+            return await client.get(url, headers=headers, timeout=NCBI_TIMEOUT_SECONDS)
+
+    deadline = _monotonic() + NCBI_RETRY_DEADLINE_SECONDS
+    for attempt in range(NCBI_RATE_LIMIT_RETRIES + 1):
+        remaining = deadline - _monotonic()
+        try:
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            resp = await asyncio.wait_for(_attempt(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise httpx.TimeoutException(f"NCBI lookup exceeded its {NCBI_RETRY_DEADLINE_SECONDS:g}s deadline") from exc
+        if resp.status_code != 429 or attempt == NCBI_RATE_LIMIT_RETRIES:
+            return resp
+        delay = _retry_after_seconds(resp)
+        if delay is None:
+            delay = NCBI_RATE_LIMIT_BACKOFF_SECONDS * 2**attempt
+        if delay >= deadline - _monotonic():
+            return resp  # NCBI asks for longer than we have left: fail fast, retryable
+        await _sleep(delay)
+    return resp
+
+
 async def _refseq_gene_lookup(accession: str, client: httpx.AsyncClient) -> Optional[dict]:
     """NCBI's gene for a RefSeq accession, cached by unversioned accession (NCBI
     reports the gene for any version). None when NCBI has no gene for it;
     raises httpx.HTTPError / ValueError when the lookup itself failed."""
-    # Lazy: literature imports this module. Shares the NCBI request budget with PubMed.
-    from src.pipeline.literature import _get_ncbi_rate_limiter
-
     lookup_id = _ensembl_lookup_id(accession).upper()
 
     async def _fetch() -> Optional[dict]:
         headers = {"Accept": "application/json"}
         if settings.ncbi_api_key:
             headers["api-key"] = settings.ncbi_api_key
-        for attempt in range(NCBI_RATE_LIMIT_RETRIES + 1):
-            async with _get_ncbi_rate_limiter():
-                resp = await client.get(
-                    NCBI_GENE_BY_ACCESSION_URL.format(accession=lookup_id),
-                    headers=headers,
-                    timeout=NCBI_TIMEOUT_SECONDS,
-                )
-            if resp.status_code != 429 or attempt == NCBI_RATE_LIMIT_RETRIES:
-                break
-            await asyncio.sleep(NCBI_RATE_LIMIT_BACKOFF_SECONDS * 2**attempt)
+        resp = await _ncbi_get(NCBI_GENE_BY_ACCESSION_URL.format(accession=lookup_id), headers, client)
         if resp.status_code in (400, 404):
             return None
         resp.raise_for_status()
