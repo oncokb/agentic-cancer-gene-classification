@@ -276,11 +276,18 @@ async def _dedupe(user_key: str, events: list[Event]) -> Optional[tuple[list[Eve
 def _metric_flags() -> dict[str, set[str]]:
     allowed = {}
     for entry in settings.ui_events_metric_flag_keys.split(","):
-        key, separator, values = entry.strip().partition(":")
-        if separator and _FLAG_KEY.fullmatch(key):
-            variants = {value for value in values.split("|") if _VARIANT.fullmatch(value)}
-            if variants:
-                allowed[key] = variants
+        entry = entry.strip()
+        if not entry:
+            continue
+        key, separator, values = entry.partition(":")
+        key = key.strip()
+        variants = [value.strip() for value in values.split("|")]
+        if not separator or not _FLAG_KEY.fullmatch(key) or not all(
+            _VARIANT.fullmatch(value) for value in variants
+        ):
+            logger.warning("Invalid UI_EVENTS_METRIC_FLAG_KEYS entry: %r", entry)
+            continue
+        allowed[key] = set(variants)
     return allowed
 
 

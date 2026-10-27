@@ -160,6 +160,37 @@ def test_streaming_body_limit(client):
     assert response.status_code == 413
 
 
+@pytest.mark.parametrize("content_length,max_reads", [(False, 3), (True, 0)])
+async def test_asgi_body_limit_stops_receiving(client, content_length, max_reads):
+    reads = 0
+    messages = []
+    headers = [(b"x-acgc-events", b"1"), (b"content-type", b"application/json")]
+    if content_length:
+        headers.append((b"content-length", b"1000000000"))
+    else:
+        headers.append((b"transfer-encoding", b"chunked"))
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": "/v1/events",
+        "raw_path": b"/v1/events", "query_string": b"", "root_path": "",
+        "headers": headers, "client": ("127.0.0.1", 1234), "server": ("testserver", 80),
+    }
+
+    async def receive():
+        nonlocal reads
+        reads += 1
+        if reads <= 100:
+            return {"type": "http.request", "body": b"x" * 16384, "more_body": reads < 100}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        messages.append(message)
+
+    await app(scope, receive, send)
+    assert next(message["status"] for message in messages if message["type"] == "http.response.start") == 413
+    assert reads <= max_reads
+
+
 def test_invalid_batches_are_rate_limited(client, monkeypatch):
     monkeypatch.setattr(settings, "ui_events_rate_limit_per_minute", 2)
     for status_code in (422, 422, 429):
@@ -193,6 +224,18 @@ def test_variant_allowlist_is_per_key(client, monkeypatch):
     tags = next(tags for name, tags in calls if name == "ui.events")
     assert "variant:flag_b.a" in tags
     assert not any(tag.startswith("variant:flag_a") for tag in tags)
+
+
+def test_metric_flag_config_whitespace_and_invalid_entries(client, monkeypatch, caplog):
+    monkeypatch.setattr(settings, "ui_events_metric_flag_keys",
+                        " flag_a : control | treatment , malformed , bad key:a, flag_b:a|b ")
+    with caplog.at_level(logging.WARNING, logger="src.ui_events"):
+        allowed = ui_events._metric_flags()
+    assert allowed == {"flag_a": {"control", "treatment"}, "flag_b": {"a", "b"}}
+    warnings = [record for record in caplog.records if record.name == "src.ui_events"]
+    assert len(warnings) == 2
+    assert "malformed" in warnings[0].message
+    assert "bad key:a" in warnings[1].message
 
 
 def test_rate_limit(client, monkeypatch):
