@@ -262,7 +262,24 @@
         </div>
 
         <div class="results-layout">
-          <nav class="gene-index" id="gene-index" aria-label="Results jump index"></nav>
+          <div class="gene-index-panel hidden" id="gene-index-panel">
+            <div class="gene-index-search" role="search">
+              <label class="visually-hidden" for="gene-index-filter" id="gene-index-filter-label">Filter genes</label>
+              <input
+                type="search"
+                id="gene-index-filter"
+                placeholder="Filter genes"
+                autocomplete="off"
+                spellcheck="false"
+                aria-controls="gene-index"
+                aria-describedby="gene-index-filter-count"
+              />
+              <button type="button" class="gene-index-filter-clear" id="gene-index-filter-clear" aria-label="Clear filter" title="Clear filter" hidden>&times;</button>
+            </div>
+            <div class="gene-index-filter-count" id="gene-index-filter-count" aria-live="polite"></div>
+            <p class="gene-index-no-matches" id="gene-index-no-matches" hidden>No matches</p>
+            <nav class="gene-index" id="gene-index" aria-label="Results jump index"></nav>
+          </div>
           <section class="results-window" id="results-window">
             <div class="empty-state">
               <h3>No results yet</h3>
