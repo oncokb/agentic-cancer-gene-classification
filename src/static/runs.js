@@ -26,13 +26,15 @@
     return run.run_id ? `/?run=${encodeURIComponent(run.run_id)}` : null;
   }
 
-  function friendlyError(status) {
+  function friendlyError(error) {
+    const { status, network } = error;
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
-    if (status === 403) return "Your account is pending administrator approval. Please contact your AGCG administrator to view your runs.";
+    if (status === 403) return "Your account isn't active yet — it may be pending administrator approval. Please contact your AGCG administrator to view your runs.";
     if (status === 503) return "The run store is unavailable right now. Please try again later.";
-    if (status === 422) return "This page link is invalid. Please refresh.";
+    if (status === 422) return "This page cursor is invalid. Start over to reload your runs.";
     if (status >= 500) return "The server couldn't load your runs right now. Please try again later.";
-    return "Couldn't load your runs. Check your connection and try again.";
+    if (network) return "Couldn't load your runs. Check your connection and try again.";
+    return "Couldn't load your runs. Try again.";
   }
 
   function createRunsPage({ document: doc, window: win, fetch: fetchFn }) {
@@ -53,8 +55,9 @@
       show(el.loading, state.loading && state.runs.length === 0);
       show(el.empty, state.loaded && !state.loading && !state.error && state.runs.length === 0);
       show(el.error, Boolean(state.error));
-      el.error.textContent = state.error ? friendlyError(state.error.status) : "";
-      show(el.retry, Boolean(state.error) && state.error.status !== 401);
+      el.error.textContent = state.error ? friendlyError(state.error) : "";
+      show(el.retry, Boolean(state.error) && ![401, 403].includes(state.error.status));
+      el.retry.textContent = state.error && state.error.status === 422 ? "Start over" : "Retry";
       el.retry.disabled = state.loading;
       show(el.table, state.runs.length > 0);
       show(el["load-more"], Boolean(state.nextCursor) && !state.error);
@@ -89,9 +92,14 @@
       try {
         let url = "/v1/runs?limit=20";
         if (state.nextCursor) url += `&cursor=${encodeURIComponent(state.nextCursor)}`;
-        const response = await fetchFn(url, {
-          method: "GET", credentials: "same-origin", headers: { Accept: "application/json" },
-        });
+        let response;
+        try {
+          response = await fetchFn(url, {
+            method: "GET", credentials: "same-origin", headers: { Accept: "application/json" },
+          });
+        } catch (_) {
+          throw { network: true };
+        }
         if (response.status === 401) win.location.href = "/login?redirect_to=%2Fruns";
         if (!response.ok) throw { status: response.status };
         const data = await response.json();
@@ -111,7 +119,15 @@
     el["load-more"].addEventListener("click", () => {
       if (state.nextCursor) return load();
     });
-    el.retry.addEventListener("click", load);
+    el.retry.addEventListener("click", () => {
+      if (state.loading || !state.error || [401, 403].includes(state.error.status)) return;
+      if (state.error.status === 422) {
+        state.nextCursor = null;
+        state.runs = [];
+        state.loaded = false;
+      }
+      return load();
+    });
     return { init: load };
   }
 

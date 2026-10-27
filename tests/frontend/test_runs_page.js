@@ -132,6 +132,57 @@ test("native anchors reject unsafe API links and render untrusted strings as tex
   }
 });
 
+test("invalid cursor offers Start over and replaces rows from the first page", async () => {
+  const firstPage = deferred();
+  const e = env([
+    response({ runs: [RUN], next_cursor: "bad-cursor" }), response({}, 422), firstPage.promise,
+  ]);
+  await e.app.init();
+  await e.nodes["load-more"].fire("click");
+  assert.ok(!e.nodes.retry.hidden);
+  assert.strictEqual(e.nodes.retry.textContent, "Start over");
+  assert.ok(e.nodes["load-more"].hidden);
+  const restart = e.nodes.retry.fire("click");
+  await e.nodes.retry.fire("click");
+  assert.strictEqual(e.calls.length, 3);
+  assert.strictEqual(e.calls[2].url, "/v1/runs?limit=20");
+  assert.ok(e.nodes.empty.hidden);
+  firstPage.resolve(response({ runs: [{ ...RUN, input_summary: "BRAF" }], next_cursor: "fresh" }));
+  await restart;
+  assert.strictEqual(e.nodes.tbody.children.length, 1);
+  assert.strictEqual(e.nodes.tbody.children[0].children[1].textContent, "BRAF (2)");
+  assert.ok(e.nodes.error.hidden);
+  assert.ok(e.nodes.retry.hidden);
+  assert.ok(!e.nodes["load-more"].hidden);
+});
+
+test("malformed responses use neutral errors; network failures alone suggest checking connection", async () => {
+  for (const failure of [
+    response({}, 200), response(null),
+    { ...response({}), json: async () => { throw new SyntaxError("Invalid JSON"); } },
+    { ...response({}), json: async () => { throw new TypeError("Response body unavailable"); } },
+  ]) {
+    const e = env([failure]);
+    await e.app.init();
+    assert.strictEqual(e.nodes.error.textContent, "Couldn't load your runs. Try again.");
+    assert.ok(e.nodes.empty.hidden);
+    assert.ok(!e.nodes.retry.hidden);
+  }
+  const e = env([new TypeError("Failed to fetch")]);
+  await e.app.init();
+  assert.strictEqual(e.nodes.error.textContent, "Couldn't load your runs. Check your connection and try again.");
+});
+
+test("row without a URL or run ID renders its date as plain text", async () => {
+  const { view_url, run_id, ...unlinked } = RUN;
+  const e = env([response({ runs: [unlinked], next_cursor: null })]);
+  await e.app.init();
+  const row = e.nodes.tbody.children[0];
+  assert.strictEqual(row.children[0].textContent, formatDateTime(RUN.created_at));
+  assert.strictEqual(row.children[0].children.length, 0);
+  assert.ok(row.children.every((cell) => cell.children.length === 0));
+});
+
 test("Safari-compatible timestamps normalize microseconds and absent timezones, with raw fallback", () => {
   const NativeDate = global.Date;
   const inputs = [];
@@ -157,10 +208,12 @@ test("Safari-compatible timestamps normalize microseconds and absent timezones, 
 test("pending approval gets clear guidance; expired sessions redirect back to runs", async () => {
   const pending = env([response({ detail: "internal data" }, 403)]);
   await pending.app.init();
-  assert.ok(pending.nodes.error.textContent.includes("pending administrator approval"));
+  assert.ok(pending.nodes.error.textContent.includes("Your account isn't active yet — it may be pending administrator approval."));
   assert.ok(pending.nodes.error.textContent.includes("contact your AGCG administrator"));
   assert.ok(pending.nodes.empty.hidden);
-  assert.ok(!pending.nodes.retry.hidden);
+  assert.ok(pending.nodes.retry.hidden);
+  await pending.nodes.retry.fire("click");
+  assert.strictEqual(pending.calls.length, 1);
   const expired = env([response({}, 401)]);
   await expired.app.init();
   assert.strictEqual(expired.window.location.href, "/login?redirect_to=%2Fruns");

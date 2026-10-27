@@ -2377,7 +2377,14 @@ body.login-body {
    API keys page (/api-keys)
    --------------------------------------------------------------------------- */
 
+.user-menu-links {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 12px;
+}
+
 .user-menu-link {
+  white-space: nowrap;
   align-self: flex-start;
   margin-top: 2px;
   font-size: 12px;
