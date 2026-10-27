@@ -17,7 +17,7 @@ const GENES = ["AHI1", "COMMD10::AHI1", "SEMA3A-AS1", "ZC3H7B::BCOR"];
 
 function testItemsCarryTitleTooltip() {
   const app = loadApp({ fetchImpl: async () => ({ ok: false, json: async () => ({}) }) });
-  app.rebuildGeneIndex(GENES.map((gene) => ({ gene })));
+  app.rebuildGeneIndex(GENES.map((gene) => ({ targetId: `gene-${gene}`, label: gene })));
   const items = app.elements.geneIndex.children;
   assert.deepStrictEqual(
     items.map((btn) => [btn.className, btn.textContent, btn.title]),
