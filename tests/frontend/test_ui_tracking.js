@@ -691,34 +691,58 @@ test("429 waits for Retry-After and resends the same batch; 4xx drops; network e
   assert.strictEqual(t.posts.length, 1, "204 (server switched off) stops sending");
 });
 
-test("a 503/network backoff holds back size-triggered flushes; pagehide may beacon once", async () => {
-  // Repro from review: queue 50, the server answers 503, then one event every 10 ms.
-  const t = setup({ fetchImpl: async () => response(503) });
-  const click = (i) => t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: String(i) });
-  for (let i = 0; i < 50; i += 1) click(i);
-  await flushMicrotasks();
-  assert.strictEqual(t.posts.length, 1);
-  for (let i = 0; i < 100; i += 1) {
-    click(100 + i);
-    await t.clock.advance(10);
+test("a 503/network-error backoff holds back size-triggered flushes and every beacon", async () => {
+  // Repro from review: queue 50 -> failure -> 100 more events at 10 ms ->
+  // pagehide at 1000 ms, before the 2000 ms deadline: nothing may be sent.
+  for (const failure of ["503", "network error"]) {
+    let failing = true;
+    const t = setup({
+      fetchImpl: async () => {
+        if (!failing) return response(202);
+        if (failure === "503") return response(503);
+        throw new TypeError("offline");
+      },
+    });
+    const click = (i) => t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: String(i) });
+    for (let i = 0; i < 50; i += 1) click(i);
+    await flushMicrotasks();
+    assert.strictEqual(t.posts.length, 1, failure);
+    for (let i = 0; i < 100; i += 1) {
+      click(100 + i);
+      await t.clock.advance(10);
+    }
+    assert.strictEqual(t.clock.now() - 1_700_000_000_000, 1000);
+    assert.strictEqual(t.posts.length, 1, `${failure}: no fetch inside the 2 s backoff`);
+    assert.strictEqual(t.queued().length, 150, `${failure}: the failed batch is kept for retry`);
+
+    t.window.dispatch("pagehide");
+    t.document.visibilityState = "hidden";
+    t.document.dispatch("visibilitychange");
+    assert.strictEqual(t.beacons.length, 0, `${failure}: no beacon inside the backoff`);
+    assert.strictEqual(t.posts.length, 1, `${failure}: and no fetch either`);
+
+    // Once the deadline passes the retry goes out, and pagehide beacons as usual.
+    failing = false;
+    t.document.visibilityState = "visible";
+    t.document.dispatch("visibilitychange");
+    await t.clock.advance(1000);
+    assert.ok(t.posts.length > 1, `${failure}: retried at the deadline`);
+    await t.clock.advance(0);
+    click(999);
+    t.window.dispatch("pagehide");
+    assert.strictEqual(t.beacons.length, 1, `${failure}: pagehide beacons outside a backoff`);
+    assert.strictEqual(new Set(t.sent().map((e) => e.event_id)).size, 150, `${failure}: queued events all delivered once`);
   }
-  assert.strictEqual(t.posts.length, 1, "nothing sent inside the 2 s backoff");
-  assert.strictEqual(t.queued().length, 150, "the failed batch is kept for retry");
 
-  t.window.dispatch("pagehide");
-  assert.strictEqual(t.beacons.length, 3, "one exit beacon pass (150 events = 3 batches)");
-  for (let i = 0; i < 60; i += 1) click(300 + i);
-  t.document.visibilityState = "hidden";
-  t.document.dispatch("visibilitychange");
-  assert.strictEqual(t.beacons.length, 3, "only once per backoff");
-  assert.strictEqual(t.posts.length, 1, "still no fetch inside the backoff");
-
-  // Retries follow the backoff: 2 s, 4 s, 8 s, then the batch is dropped.
+  // With the server still failing, retries follow the backoff: 2 s, 4 s, 8 s.
+  const t = setup({ fetchImpl: async () => response(503) });
+  for (let i = 0; i < 50; i += 1) t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: String(i) });
+  await flushMicrotasks();
   const at = [];
-  const before = t.posts.length;
   for (let ms = 0; ms < 40000; ms += 100) {
+    t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: "x" });
     await t.clock.advance(100);
-    if (t.posts.length > before + at.length) at.push(t.clock.now());
+    if (t.posts.length > 1 + at.length) at.push(t.clock.now());
   }
   const gaps = at.slice(1).map((time, i) => time - at[i]);
   assert.ok(at.length >= 3, `retries happened (${at.length})`);

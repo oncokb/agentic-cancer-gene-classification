@@ -110,12 +110,11 @@
 
     let queue = [];
     let flushTimer = null;
+    let flushAt = 0;
     let inflight = false;
     // One deadline for both a 429's Retry-After and the backoff after a
     // network error / 5xx; every fetch flush waits for it.
     let blockedUntil = 0;
-    let blockedBy429 = false;
-    let beaconUsedWhileBlocked = false;
     let networkFailures = 0;
     const stats = { sent: 0, dropped: 0, batches: 0, beacons: 0 };
 
@@ -349,8 +348,15 @@
 
     // ---- transport ---------------------------------------------------------
 
+    // Keeps the earliest requested flush (a retry deadline can be sooner
+    // than the regular interval already pending).
     function scheduleFlush(delayMs) {
-      if (flushTimer) return;
+      const at = now() + delayMs;
+      if (flushTimer) {
+        if (flushAt <= at) return;
+        clearTimer(flushTimer);
+      }
+      flushAt = at;
       flushTimer = setTimer(() => {
         flushTimer = null;
         flush();
@@ -398,7 +404,6 @@
     function backOff() {
       networkFailures += 1;
       blockedUntil = now() + 1000 * 2 ** Math.min(networkFailures, 5);
-      blockedBy429 = false;
     }
 
     function requeue(batch) {
@@ -450,7 +455,6 @@
         const header = response.headers && response.headers.get ? response.headers.get("Retry-After") : null;
         const seconds = Number(header);
         blockedUntil = now() + (Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : DEFAULT_RETRY_AFTER_MS);
-        blockedBy429 = true;
         requeue(batch);
         scheduleFlush(blockedUntil - now());
         return;
@@ -460,7 +464,6 @@
         return;
       }
       networkFailures = 0;
-      beaconUsedWhileBlocked = false;
       if (status === 204) {
         // The server has events switched off: stop sending for this page.
         setEnabled(false);
@@ -474,17 +477,15 @@
 
     // Page is going away or hidden: hand what's queued to sendBeacon, which
     // can't set headers, hence ?beacon=1 (see the contract's Transport).
-    // A Retry-After is always honoured; during a network/5xx backoff the
-    // page may still beacon once, since it may not get another chance.
+    // Honours the same deadline as fetch (Retry-After or network/5xx
+    // backoff): inside it nothing is sent, and whatever is queued is lost
+    // if the page unloads — the server is already failing or throttling.
     function flushBeacon() {
-      if (enabled !== true || !queue.length) return;
-      const blocked = blockedUntil > now();
-      if (blocked && (blockedBy429 || beaconUsedWhileBlocked)) return;
+      if (enabled !== true || !queue.length || blockedUntil > now()) return;
       if (!nav || typeof nav.sendBeacon !== "function") {
         flush();
         return;
       }
-      if (blocked) beaconUsedWhileBlocked = true;
       for (;;) {
         const batch = nextBatch();
         if (!batch) break;
