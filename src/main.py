@@ -800,6 +800,7 @@ async def _retrieve_fusion_evidence_input(
                 fusion=item.fusion,
                 tumor_type=item.tumor_type,
                 interpretation=f"Fusion evidence retrieval failed: {exc}",
+                retrieval_status="failed",
             )
 
 

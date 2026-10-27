@@ -17,6 +17,8 @@ from src.models.schema import (
 from src.pipeline.literature import (
     find_retracted_pmids,
     fusion_evidence_alias_match,
+    fusion_evidence_scope_note,
+    fusion_literature_scope,
     resolve_fusion_partner_aliases,
 )
 from src.pipeline.normalization import split_fusion
@@ -120,6 +122,8 @@ async def sanitize_fusion_evidence_result(
 ) -> bool:
     original_pmids = list(result.pmids)
     original_card_count = len(result.evidence_cards)
+    original_scope = result.literature_scope
+    original_requested_tumor_pmids = list(result.requested_tumor_pmids)
 
     # Re-resolve HGNC aliases fresh rather than trusting whatever alias_matches
     # a card claims. A card's stored alias_matches is not verified ground
@@ -164,13 +168,40 @@ async def sanitize_fusion_evidence_result(
 
     kept_pmids = {card.pmid for card in kept_cards}
     result.evidence_cards = kept_cards
-    result.pmids = [
-        pmid
-        for pmid in result.pmids
-        if pmid in kept_pmids and pmid not in retracted_pmids
+    if result.literature_scope is not None:
+        # Results that carry a literature_scope were produced by the current
+        # exact-pair filter (the cache key was bumped with the field), so
+        # PMIDs beyond the evidence cards were verified at retrieval time.
+        # Keep them, so a reopened run classifies like the live result; drop
+        # only retracted PMIDs and PMIDs whose own card failed re-verification.
+        failed_card_pmids = {card.pmid for card in non_retracted_cards} - kept_pmids
+        result.pmids = [
+            pmid
+            for pmid in result.pmids
+            if pmid not in retracted_pmids and pmid not in failed_card_pmids
+        ]
+    else:
+        # Older results can predate the exact-pair filter, and only carded
+        # PMIDs have stored text to re-verify.
+        result.pmids = [
+            pmid
+            for pmid in result.pmids
+            if pmid in kept_pmids and pmid not in retracted_pmids
+        ]
+    retained_pmids = set(result.pmids)
+    result.requested_tumor_pmids = [
+        pmid for pmid in result.requested_tumor_pmids if pmid in retained_pmids
     ]
+    if result.literature_scope is not None:
+        result.literature_scope = fusion_literature_scope(
+            result.tumor_type, len(result.pmids), len(result.requested_tumor_pmids)
+        )
     result.retrieved_count = len(result.pmids)
-    result.well_supported = result.retrieved_count >= settings.min_papers_for_strong_association
+    # Removing papers can only weaken support, never establish it.
+    result.well_supported = (
+        result.well_supported
+        and result.retrieved_count >= settings.min_papers_for_strong_association
+    )
     if result.retrieved_count == 0 and original_pmids:
         result.well_supported = False
         result.interpretation = (
@@ -181,11 +212,18 @@ async def sanitize_fusion_evidence_result(
         result.interpretation = (
             f"{result.fusion} has {result.retrieved_count} non-retracted PubMed record(s) "
             "that explicitly discuss the exact fusion pair."
+        ) + fusion_evidence_scope_note(
+            tumor_type=result.tumor_type,
+            literature_scope=result.literature_scope,
+            retained_count=result.retrieved_count,
+            requested_tumor_count=len(result.requested_tumor_pmids),
         )
     return (
         result.pmids != original_pmids
         or len(result.evidence_cards) != original_card_count
         or label_changed
+        or result.literature_scope != original_scope
+        or result.requested_tumor_pmids != original_requested_tumor_pmids
     )
 
 

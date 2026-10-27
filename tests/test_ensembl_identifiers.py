@@ -663,6 +663,30 @@ async def test_fusion_evidence_with_unresolvable_partner_skips_pubmed(fake_http,
     assert evidence_calls == []
     assert result.interpretation.startswith("Fusion evidence was not retrieved:")
     assert _UNKNOWN_TX in result.interpretation
+    # Rejected before any search: not evidence of missing literature.
+    assert result.retrieval_status == "failed" and result.literature_scope is None
+
+
+@pytest.mark.asyncio
+async def test_fusion_evidence_cache_key_and_tumor_scope_use_symbols(fake_http, monkeypatch):
+    keys, scoped = [], []
+
+    async def fake_cached_call(key, compute, ttl_seconds=None):
+        keys.append(key)
+        return await compute()
+
+    async def fake_uncached(fusion, tumor_type, max_results):
+        scoped.append((fusion, tumor_type))
+        return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, literature_scope="requested_tumor")
+
+    monkeypatch.setattr(literature, "cached_call", fake_cached_call)
+    monkeypatch.setattr(literature, "_retrieve_fusion_evidence_uncached", fake_uncached)
+
+    result = await literature.retrieve_fusion_evidence(f"{_EML4_TX}::{_ALK_TX}", tumor_type="NSCLC", max_results=5)
+
+    assert scoped == [("EML4::ALK", "NSCLC")]
+    assert keys == [literature._fusion_evidence_cache_key("EML4::ALK", "NSCLC", 5)]
+    assert result.literature_scope == "requested_tumor" and result.input == f"{_EML4_TX}::{_ALK_TX}"
 
 
 @pytest.mark.asyncio

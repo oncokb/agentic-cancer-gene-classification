@@ -135,6 +135,14 @@ class FusionEvidenceCard(EvidenceCard):
     # literal match, which behaves exactly as before this field existed.
     matched_via_alias: bool = False
     alias_matches: List[AliasMatch] = Field(default_factory=list)
+    requested_tumor_terms: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Requested-tumor terms (the tumor type and its known aliases) found in this paper's "
+            "title or abstract. Empty when no tumor type was requested or none is mentioned. A "
+            "mention only; it does not mean the paper shows the fusion in that tumor type."
+        ),
+    )
 
 
 class FusionEvidenceResult(BaseModel):
@@ -149,6 +157,34 @@ class FusionEvidenceResult(BaseModel):
     pmids: List[str] = Field(default_factory=list)
     interpretation: str = ""
     evidence_cards: List[FusionEvidenceCard] = Field(default_factory=list)
+    literature_scope: Optional[
+        Literal["requested_tumor", "other_or_unspecified", "any_tumor", "no_literature"]
+    ] = Field(
+        default=None,
+        description=(
+            "How the exact-pair literature relates to the requested tumor type, computed over every "
+            "retained PMID (not just the evidence cards). requested_tumor: at least one paper's "
+            "title or abstract MENTIONS the requested tumor type or an alias; it does not mean the "
+            "fusion was shown in that tumor type. other_or_unspecified: a tumor type was requested "
+            "but no retained paper mentions it. any_tumor: no tumor type was requested and papers "
+            "were found. no_literature: retrieval succeeded and no paper was retained. null when "
+            "retrieval failed, no exact-pair search ran, or the result predates this field."
+        ),
+    )
+    requested_tumor_pmids: List[str] = Field(
+        default_factory=list,
+        description=(
+            "PMIDs, in ranked order, whose title or abstract mentions the requested tumor type. "
+            "A subset of pmids; may include papers without an evidence card."
+        ),
+    )
+    retrieval_status: Literal["ok", "failed"] = Field(
+        default="ok",
+        description=(
+            "failed when exact-pair retrieval raised an error. An empty failed result is not "
+            "evidence of missing literature, and its literature_scope is null."
+        ),
+    )
 
 
 class FusionPartnerEvidenceRequest(BaseModel):

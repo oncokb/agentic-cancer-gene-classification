@@ -260,9 +260,11 @@ def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, inclu
         active -= 1
         if fusion == "BCR::ABL1":
             raise RuntimeError("upstream unavailable")
+        # 456 has no card; only it mentions the requested tumor.
         return FusionEvidenceResult(
-            fusion=fusion, tumor_type=tumor_type, pmids=["123"], retrieved_count=1,
+            fusion=fusion, tumor_type=tumor_type, pmids=["123", "456"], retrieved_count=2,
             evidence_cards=[{"pmid": "123", "title": "EML4-ALK fusion in lung cancer", "fusion": fusion}],
+            literature_scope="requested_tumor", requested_tumor_pmids=["456"],
         )
 
     async def no_retractions(pmids):
@@ -301,8 +303,15 @@ def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, inclu
             assert payload["timings_ms"]["fusion_evidence"] > 0
             assert payload["timings_ms"]["total"] >= payload["timings_ms"]["fusion_evidence"]
             assert peak == 1
-            assert payload["fusion_evidence"][0]["pmids"] == ["123"]
-            assert "upstream unavailable" in payload["fusion_evidence"][1]["interpretation"]
+            evidence, failed = payload["fusion_evidence"]
+            assert evidence["pmids"] == ["123", "456"]
+            assert evidence["literature_scope"] == "requested_tumor"
+            assert evidence["requested_tumor_pmids"] == ["456"]
+            assert evidence["retrieval_status"] == "ok"
+            assert evidence["evidence_cards"][0]["requested_tumor_terms"] == []
+            assert "upstream unavailable" in failed["interpretation"]
+            assert failed["retrieval_status"] == "failed"
+            assert failed["literature_scope"] is None
         else:
             assert seen == []
             assert payload["fusion_evidence"] == []

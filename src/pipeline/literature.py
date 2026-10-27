@@ -22,6 +22,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple
 
 import anthropic
@@ -171,7 +172,7 @@ _TUMOR_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     # Hematologic malignancies
     "aml": ("acute myeloid leukemia", "AML"),
     "cml": ("chronic myeloid leukemia", "CML"),
-    "all": ("acute lymphoblastic leukemia", "ALL", "acute lymphocytic leukemia"),
+    "all": ("acute lymphoblastic leukemia", "ALL", "acute lymphocytic leukemia", "B-ALL", "T-ALL"),
     "cll": ("chronic lymphocytic leukemia", "CLL"),
     "mm": ("multiple myeloma", "MM"),
     "dlbcl": ("diffuse large B-cell lymphoma", "DLBCL"),
@@ -228,7 +229,9 @@ _TUMOR_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
 
 def _expand_tumor_type_terms(tumor_type: str) -> list[str]:
     """Return PubMed search phrases for tumor_type, expanding abbreviations/aliases."""
-    aliases = _TUMOR_TYPE_ALIASES.get(tumor_type.strip().lower())
+    # Looked up by the cache-key identity, so requests sharing a cache entry
+    # (e.g. en dash vs "-") also share their query expansion.
+    aliases = _TUMOR_TYPE_ALIASES.get(normalize_tumor_identity(tumor_type))
     return list(aliases) if aliases else [tumor_type.strip()]
 
 
@@ -246,6 +249,144 @@ def _tumor_type_prompt_note(tumor_type: str) -> str:
     if len(expanded) > 1:
         return f"{tumor_type} (also search: {', '.join(expanded)})"
     return tumor_type
+
+
+# ---------------------------------------------------------------------------
+# Requested-tumor mention matching
+#
+# Deterministic check of whether a paper's title/abstract MENTIONS the
+# requested tumor type, using the same expanded terms as the tumor-scoped
+# query. A mention is not proof the fusion was observed in that tumor.
+# ---------------------------------------------------------------------------
+
+# Contexts where a requested tumor's words name a different tumor. "Ovarian"
+# in UTROSCT describes a resemblance; the tumor is uterine (issue #121).
+_TUMOR_MENTION_EXCLUSIONS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"uterine[\s-]+tumou?rs?[\s-]+resembling[\s-]+ovarian[\s-]+sex[\s-]+cord"
+        r"(?:[\s-]+(?:stromal[\s-]+)?tumou?rs?)?",
+        re.IGNORECASE,
+    ),
+)
+_TUMOR_ABBREVIATION_TITLE_ONLY_LENGTH = 2
+# A tumor type outside the alias table counts as a code (DSRCT, OS) when it is
+# one alphanumeric token of at most this many characters...
+_FREE_TEXT_ABBREVIATION_MAX_LENGTH = 5
+# ...unless it is one of these ordinary words, which match as words.
+_SHORT_TUMOR_WORDS = frozenset({
+    "anal", "anus", "blood", "bone", "bones", "brain", "colon", "ear", "ewing", "eye", "eyes",
+    "gland", "head", "heart", "liver", "lung", "lungs", "neck", "nerve", "nasal", "oral",
+    "ovary", "penis", "renal", "skin", "spine", "tumor", "uvea", "vulva", "wilms",
+})
+# The one dash class: hyphen-minus, U+2010-U+2015 (hyphen, non-breaking hyphen,
+# figure dash, en dash, em dash, horizontal bar), U+2043 hyphen bullet, U+2212
+# minus sign, the compatibility forms U+FE58, U+FE63 and U+FF0D, and U+00AD soft
+# hyphen. Text, terms and the tumor identity are folded to "-" before matching,
+# so the patterns below only need "-". A soft hyphen is folded rather than
+# dropped so "sex\u00adcord" stays "sex-cord" and the hyphen guards still apply.
+_TUMOR_TEXT_DASHES = (
+    "-\u2010\u2011\u2012\u2013\u2014\u2015\u2043\u2212\ufe58\ufe63\uff0d\u00ad"
+)
+_TUMOR_TEXT_TRANSLATION = str.maketrans({dash: "-" for dash in _TUMOR_TEXT_DASHES})
+# Word edges. A hyphenated neighbour also ends the match ("breast-feeding",
+# "non-small"), as does a preceding "non " or "non- " ("non small cell lung
+# cancer" and a line-broken "non-\nsmall cell lung cancer" are not SCLC);
+# hyphens inside an alias such as "non-small cell" are part of it.
+_TUMOR_TERM_START = (
+    r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]-)(?<!\b[Nn][Oo][Nn] )(?<!\b[Nn][Oo][Nn]- )"
+)
+_TUMOR_TERM_END = r"(?![A-Za-z0-9])(?!-[A-Za-z0-9])"
+
+
+def _normalize_tumor_text(text: str) -> str:
+    """Fold every dash (soft hyphens included) to "-" and collapse whitespace before matching."""
+    return " ".join(text.translate(_TUMOR_TEXT_TRANSLATION).split())
+
+
+def normalize_tumor_identity(tumor_type: Optional[str]) -> str:
+    """Case-, dash- and whitespace-insensitive tumor identity, shared by the cache key,
+    alias expansion and the matcher."""
+    return _normalize_tumor_text((tumor_type or "").lower())
+
+
+_UTROSCT_TERM_KEYS = frozenset(normalize_tumor_identity(term) for term in _UTROSCT_TERMS)
+
+
+def _is_tumor_abbreviation(term: str) -> bool:
+    """Alias-table form with an uppercase letter after the first character: ALL, MM, ccRCC, LG-ESS."""
+    return not any(char.isspace() for char in term) and any(char.isupper() for char in term[1:])
+
+
+def _requested_tumor_match_terms(tumor_identity: str) -> List[Tuple[str, bool]]:
+    """(term, is_abbreviation) for a normalized tumor identity.
+
+    Alias-table forms are fixed, so they are classified as written. Anything
+    else is classified from the lowercased identity alone, so "os", "OS" and
+    "Os" (one cache entry) are always matched the same way.
+    """
+    aliases = _TUMOR_TYPE_ALIASES.get(tumor_identity)
+    if aliases:
+        return [(term, _is_tumor_abbreviation(term)) for term in aliases]
+    if (
+        re.fullmatch(rf"[a-z0-9]{{1,{_FREE_TEXT_ABBREVIATION_MAX_LENGTH}}}", tumor_identity)
+        and tumor_identity not in _SHORT_TUMOR_WORDS
+    ):
+        return [(tumor_identity.upper(), True)]
+    return [(tumor_identity, False)]
+
+
+@lru_cache(maxsize=256)
+def _requested_tumor_matchers(tumor_identity: str) -> tuple[tuple[str, re.Pattern[str], bool], ...]:
+    """(term, pattern, title_only) for each match term of a normalized tumor identity.
+
+    Abbreviations match case-sensitively as whole tokens, so "all" and "5 mm"
+    never count as ALL or MM; two-letter abbreviations are matched in titles
+    only. Other terms match case-insensitively on word boundaries, tolerating
+    space/hyphen variation inside the term and a simple plural.
+    """
+    matchers = []
+    for term, is_abbreviation in _requested_tumor_match_terms(tumor_identity):
+        term = _normalize_tumor_text(term)
+        if not term:
+            continue
+        if is_abbreviation:
+            body = re.escape(term) + "s?"
+            flags = 0
+            title_only = len(re.sub(r"[^A-Za-z0-9]", "", term)) <= _TUMOR_ABBREVIATION_TITLE_ONLY_LENGTH
+        else:
+            body = r"[\s-]+".join(re.escape(token) for token in re.split(r"[\s-]+", term)) + "(?:e?s)?"
+            flags = re.IGNORECASE
+            title_only = False
+        pattern = re.compile(_TUMOR_TERM_START + body + _TUMOR_TERM_END, flags)
+        matchers.append((term, pattern, title_only))
+    return tuple(matchers)
+
+
+def _mask_tumor_mention_exclusions(text: str, tumor_identity: str) -> str:
+    terms = {normalize_tumor_identity(term) for term, _ in _requested_tumor_match_terms(tumor_identity)}
+    if terms & _UTROSCT_TERM_KEYS:
+        return text
+    for pattern in _TUMOR_MENTION_EXCLUSIONS:
+        text = pattern.sub(" ", text)
+    return text
+
+
+def requested_tumor_terms_in_record(record: LiteratureRecord, tumor_type: Optional[str]) -> List[str]:
+    """Requested-tumor terms mentioned in the record's title or abstract, in alias-table order.
+
+    Depends only on normalize_tumor_identity(tumor_type), so requests that
+    share a cache entry always classify identically.
+    """
+    tumor_identity = normalize_tumor_identity(tumor_type)
+    if not tumor_identity:
+        return []
+    title = _mask_tumor_mention_exclusions(_normalize_tumor_text(record.title), tumor_identity)
+    abstract = _mask_tumor_mention_exclusions(_normalize_tumor_text(record.abstract), tumor_identity)
+    matched: List[str] = []
+    for term, pattern, title_only in _requested_tumor_matchers(tumor_identity):
+        if pattern.search(title) or (not title_only and pattern.search(abstract)):
+            matched.append(term)
+    return list(dict.fromkeys(matched))
 
 
 def _exclude_retracted_query(query: str) -> str:
@@ -682,8 +823,10 @@ def _build_fusion_evidence_cards(
     records: List[LiteratureRecord],
     alias_matches: Optional[Dict[str, List[Tuple[str, str]]]] = None,
     limit: int = 5,
+    requested_tumor_terms: Optional[Dict[str, List[str]]] = None,
 ) -> List[FusionEvidenceCard]:
     alias_matches = alias_matches or {}
+    requested_tumor_terms = requested_tumor_terms or {}
     cards: List[FusionEvidenceCard] = []
     for record in records[:limit]:
         evidence_type = _fusion_evidence_type(record)
@@ -713,9 +856,39 @@ def _build_fusion_evidence_cards(
                 alias_matches=[
                     AliasMatch(gene=gene, alias=alias) for gene, alias in record_alias_matches
                 ],
+                requested_tumor_terms=list(requested_tumor_terms.get(record.pmid, [])),
             )
         )
     return cards
+
+
+def fusion_literature_scope(
+    tumor_type: Optional[str], retained_count: int, requested_tumor_count: int,
+) -> str:
+    """literature_scope for a successful retrieval; see FusionEvidenceResult."""
+    if not retained_count:
+        return "no_literature"
+    if not (tumor_type or "").strip():
+        return "any_tumor"
+    return "requested_tumor" if requested_tumor_count else "other_or_unspecified"
+
+
+def fusion_evidence_scope_note(
+    *,
+    tumor_type: Optional[str],
+    literature_scope: Optional[str],
+    retained_count: int,
+    requested_tumor_count: int,
+) -> str:
+    """Sentence appended to the interpretation saying whether papers mention the requested tumor."""
+    if literature_scope == "requested_tumor":
+        return (
+            f" Papers mentioning {tumor_type} in the title or abstract: "
+            f"{requested_tumor_count} of {retained_count}."
+        )
+    if literature_scope == "other_or_unspecified":
+        return f" None of the retrieved papers mention {tumor_type}."
+    return ""
 
 
 def _fusion_evidence_interpretation(
@@ -724,22 +897,49 @@ def _fusion_evidence_interpretation(
     tumor_type: Optional[str],
     records: List[LiteratureRecord],
     well_supported: bool,
+    literature_scope: str,
+    requested_tumor_count: int,
 ) -> str:
-    tumor_note = f" in {tumor_type}" if tumor_type else ""
     novelty_count = _novelty_record_count(records)
+    scope_note = fusion_evidence_scope_note(
+        tumor_type=tumor_type,
+        literature_scope=literature_scope,
+        retained_count=len(records),
+        requested_tumor_count=requested_tumor_count,
+    )
     if well_supported:
         return (
-            f"{fusion}{tumor_note} has {len(records)} non-retracted PubMed record(s) from exact "
+            f"{fusion} has {len(records)} non-retracted PubMed record(s) from exact "
             "fusion-pair searches, suggesting this is a studied fusion event rather than a "
-            "single novelty-only report."
+            f"single novelty-only report.{scope_note}"
         )
     if records:
         novelty_note = " Most retrieved records look novelty or case-report driven." if novelty_count else ""
         return (
-            f"{fusion}{tumor_note} has {len(records)} non-retracted PubMed record(s) from exact "
-            f"fusion-pair searches, below the well-supported threshold.{novelty_note}"
+            f"{fusion} has {len(records)} non-retracted PubMed record(s) from exact "
+            f"fusion-pair searches, below the well-supported threshold.{novelty_note}{scope_note}"
         )
-    return f"No non-retracted PubMed records were found for exact {fusion}{tumor_note} fusion-pair searches."
+    return f"No non-retracted PubMed records were found for exact {fusion} fusion-pair searches."
+
+
+def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_results: int) -> str:
+    return "fusion_evidence:" + json.dumps(
+        {
+            "fusion": fusion.strip(),
+            "tumor_type": normalize_tumor_identity(tumor_type),
+            "max_results": max_results,
+            "min_papers": settings.min_papers_for_strong_association,
+            "exact_fusion_filter_version": 2,
+            "retraction_filter_version": 2,
+            "alias_expansion_version": 1,
+            # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
+            # 2: hyphen-aware word edges; case-independent free-text abbreviations.
+            # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
+            # 4: compatibility dashes, soft hyphen as "-", dash-folded identity, "non- ".
+            "tumor_scope_version": 4,
+        },
+        sort_keys=True,
+    )
 
 
 async def retrieve_fusion_evidence(
@@ -757,21 +957,12 @@ async def retrieve_fusion_evidence(
                 fusion=fusion,
                 tumor_type=tumor_type,
                 interpretation="Fusion evidence was not retrieved: " + " ".join(reading.errors),
+                # No search ran, so an empty result is not evidence of missing literature.
+                retrieval_status="failed",
             )
         fusion = reading.canonical
     max_results = max_results or settings.fusion_evidence_max_results
-    cache_key = "fusion_evidence:" + json.dumps(
-        {
-            "fusion": fusion.strip(),
-            "tumor_type": " ".join((tumor_type or "").strip().lower().split()),
-            "max_results": max_results,
-            "min_papers": settings.min_papers_for_strong_association,
-            "exact_fusion_filter_version": 2,
-            "retraction_filter_version": 2,
-            "alias_expansion_version": 1,
-        },
-        sort_keys=True,
-    )
+    cache_key = _fusion_evidence_cache_key(fusion, tumor_type, max_results)
 
     async def _compute() -> dict:
         result = await _retrieve_fusion_evidence_uncached(
@@ -846,6 +1037,16 @@ async def _retrieve_fusion_evidence_uncached(
         len(records) >= settings.min_papers_for_strong_association
         and novelty_count < len(records)
     )
+    # Classify every retained record, not just the carded ones. Membership in
+    # the tumor-scoped search is not used: PubMed can match MeSH/full-text
+    # fields we never see, so only a title/abstract mention counts.
+    requested_tumor_terms = {
+        record.pmid: terms
+        for record in records
+        if (terms := requested_tumor_terms_in_record(record, tumor_type))
+    }
+    requested_tumor_pmids = [record.pmid for record in records if record.pmid in requested_tumor_terms]
+    literature_scope = fusion_literature_scope(tumor_type, len(records), len(requested_tumor_pmids))
     return FusionEvidenceResult(
         fusion=fusion,
         tumor_type=tumor_type,
@@ -857,8 +1058,14 @@ async def _retrieve_fusion_evidence_uncached(
             tumor_type=tumor_type,
             records=records,
             well_supported=well_supported,
+            literature_scope=literature_scope,
+            requested_tumor_count=len(requested_tumor_pmids),
         ),
-        evidence_cards=_build_fusion_evidence_cards(fusion, records, alias_matches),
+        evidence_cards=_build_fusion_evidence_cards(
+            fusion, records, alias_matches, requested_tumor_terms=requested_tumor_terms,
+        ),
+        literature_scope=literature_scope,
+        requested_tumor_pmids=requested_tumor_pmids,
     )
 
 
