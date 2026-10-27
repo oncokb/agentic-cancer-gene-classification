@@ -25,7 +25,7 @@ from src.api.run_persistence import GENERIC_FAILURE, save_run_or_raise
 from src.config import settings
 from src.models.schema import AnnotateRequest, AnnotationResult, CacheStatus, FusionInput, GeneAnnotation
 from src.observability import record_user_action, record_user_seen, tag_current_span
-from src.pipeline.normalization import FUSION_SEPARATORS
+from src.pipeline.normalization import FUSION_SEPARATORS, has_accession_identifier
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -41,6 +41,14 @@ _MAX_SYMBOL_LENGTH = 64
 # including dangling forms like 'ALK::' that would normalize into one gene.
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?$")
 _UNRESOLVABLE_PREFIX = "Unresolvable gene symbol"
+# Normalization's error for GENE(ENST...) / GENE(NM_...) whose transcript is another gene's.
+_MISMATCH_MARKER = re.compile(
+    r"^Unresolvable gene symbol — .*: (?P<source>Ensembl ENS[TPG]|RefSeq [NX][MRP]_)\S* belongs to \S+, not "
+)
+_MISMATCH_ERRORS = {
+    "Ensembl": "The Ensembl ID belongs to a different gene than the one named.",
+    "RefSeq": "The RefSeq accession belongs to a different gene than the one named.",
+}
 _UNRESOLVABLE_ERROR = "Gene symbol could not be resolved."
 _LOOKUP_FAILED_ERROR = "Gene symbol lookup is temporarily unavailable; please retry."
 _GENE_NOT_FOUND = "Gene symbol not found."
@@ -65,7 +73,10 @@ class GeneQueryItem(BaseModel):
         ...,
         description=(
             "HGNC-style gene symbol or Ensembl ID, e.g. `ALK`, `HLA-A`: letters, digits, `-` and `.`, "
-            "starting and ending with a letter or digit. Fusions are not accepted."
+            "starting and ending with a letter or digit. Ensembl gene/transcript/protein IDs "
+            "(`ENSG...`, `ENST...`, `ENSP...`), RefSeq accessions (`NM_...`, `NR_...`, `XM_...`, "
+            "`XR_...`, `NP_...`, `XP_...`), `GENE(ENST...)`/`GENE(NM_...)` and `ENST...:c....`/"
+            "`NM_...:c....` are resolved to the gene. Fusions are not accepted."
         ),
     )
     tumor_type: Optional[str] = Field(
@@ -136,6 +147,14 @@ class GeneRationale(BaseModel):
     deliberately omitted — open `view_url` for the full report."""
 
     gene: str = Field(..., description="Canonical gene symbol the pipeline annotated.")
+    submitted_inputs: List[str] = Field(
+        default_factory=list,
+        description="Inputs as submitted that were rewritten to `gene`, e.g. an Ensembl transcript ID.",
+    )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description="Caveats about how a submitted input was read, e.g. an HGVS variant that was not interpreted.",
+    )
     tumor_type: Optional[str] = Field(
         default=None,
         description=(
@@ -176,6 +195,13 @@ class GeneQueryResponse(BaseModel):
     run_id: str = Field(..., description="ID of the saved annotation run.")
     view_url: str = Field(..., description="Absolute link that opens the full run in the ACGC UI (requires login).")
     results: List[GeneRationale] = Field(default_factory=list, description="One entry per annotated gene.")
+    warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Request-level warnings for the saved run, such as conflicting tumor types "
+            "or fusion-like notation. Same list as AnnotationResult.warnings."
+        ),
+    )
 
 
 class GeneQueryJobCreateResponse(BaseModel):
@@ -198,6 +224,13 @@ class GeneQueryJobStatusResponse(BaseModel):
     results: List[GeneRationale] = Field(
         default_factory=list, description="Slim results for genes completed so far."
     )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Request-level warnings for the saved run, such as conflicting tumor types "
+            "or fusion-like notation. Same list as AnnotationResult.warnings."
+        ),
+    )
     error: Optional[str] = Field(default=None, description="Generic failure message when `status` is `failed`.")
 
 
@@ -214,7 +247,7 @@ def _validate_symbol(value: str) -> str:
         raise ValueError(f"Gene symbol must be at most {_MAX_SYMBOL_LENGTH} characters")
     if FUSION_SEPARATORS.search(symbol):
         raise ValueError("Fusions are not supported by the gene query API; use POST /v1/annotate")
-    if not _SYMBOL_PATTERN.match(symbol):
+    if not (_SYMBOL_PATTERN.match(symbol) or has_accession_identifier(symbol)):
         raise ValueError(
             "Gene symbol may contain only letters, digits, '-' and '.', "
             "and must start and end with a letter or digit"
@@ -237,7 +270,12 @@ def _slim_error(annotation: GeneAnnotation) -> Optional[str]:
     # Fixed messages only: per-gene errors can embed raw exception text, which
     # stays in the UI behind view_url.
     if _is_unresolvable(annotation):
-        return _LOOKUP_FAILED_ERROR if annotation.symbol_lookup_failed else _UNRESOLVABLE_ERROR
+        if annotation.symbol_lookup_failed:
+            return _LOOKUP_FAILED_ERROR
+        mismatch = _MISMATCH_MARKER.match(annotation.error)
+        if mismatch:
+            return _MISMATCH_ERRORS[mismatch.group("source").split(" ", 1)[0]]
+        return _UNRESOLVABLE_ERROR
     return _GENERIC_GENE_ERROR
 
 
@@ -249,6 +287,8 @@ def to_gene_rationale(annotation: GeneAnnotation) -> GeneRationale:
     always the context the classification ran with, including for aliases."""
     return GeneRationale(
         gene=annotation.gene,
+        submitted_inputs=[resolution.input for resolution in annotation.resolved_inputs],
+        warnings=[warning for resolution in annotation.resolved_inputs for warning in resolution.warnings],
         tumor_type=annotation.analysis_tumor_type,
         cancer_associated=annotation.cancer_associated,
         gene_class=annotation.gene_class,
@@ -365,6 +405,7 @@ def _response(http_request: Request, result: AnnotationResult) -> GeneQueryRespo
         run_id=result.run_id,
         view_url=_app()._run_view_url(http_request, result.run_id),
         results=[to_gene_rationale(annotation) for annotation in result.annotations],
+        warnings=result.warnings,
     )
 
 
@@ -436,6 +477,7 @@ async def get_gene_query_job(
         run_id=run_id,
         view_url=app._run_view_url(http_request, run_id) if run_id else None,
         results=[to_gene_rationale(annotation) for annotation in job.annotations],
+        warnings=job.result.warnings if job.status == "complete" and job.result else [],
         error=GENERIC_FAILURE if job.status == "failed" else None,
     )
 

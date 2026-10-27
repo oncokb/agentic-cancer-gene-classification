@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import xml.etree.ElementTree as ET
+from bisect import bisect_left
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Dict, List, Optional, Set, Tuple
@@ -40,7 +41,7 @@ from src.models.schema import (
     LiteraturePaperScore,
     LiteratureRecord,
 )
-from src.pipeline.normalization import resolve_gene, split_fusion
+from src.pipeline.normalization import has_accession_identifier, read_gene_input, resolve_gene, split_fusion
 from src.pipeline.cache import cached_call
 from src.pipeline.llm_client import (
     complete_with_tool,
@@ -232,7 +233,7 @@ def _expand_tumor_type_terms(tumor_type: str) -> list[str]:
     # Looked up by the cache-key identity, so requests sharing a cache entry
     # (e.g. en dash vs "-") also share their query expansion.
     aliases = _TUMOR_TYPE_ALIASES.get(normalize_tumor_identity(tumor_type))
-    return list(aliases) if aliases else [tumor_type.strip()]
+    return list(aliases) if aliases else [normalize_tumor_identity(tumor_type)]
 
 
 def _tumor_type_query_fragment(tumor_type: str) -> str:
@@ -263,7 +264,7 @@ def _tumor_type_prompt_note(tumor_type: str) -> str:
 # in UTROSCT describes a resemblance; the tumor is uterine (issue #121).
 _TUMOR_MENTION_EXCLUSIONS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"uterine[\s-]+tumou?rs?[\s-]+resembling[\s-]+ovarian[\s-]+sex[\s-]+cord"
+        r"uterine[\s-]+tumou?rs?[\s-]+resembling[\s-]+ovarian[\s-]+sex[\s-]*cord"
         r"(?:[\s-]+(?:stromal[\s-]+)?tumou?rs?)?",
         re.IGNORECASE,
     ),
@@ -282,12 +283,15 @@ _SHORT_TUMOR_WORDS = frozenset({
 # figure dash, en dash, em dash, horizontal bar), U+2043 hyphen bullet, U+2212
 # minus sign, the compatibility forms U+FE58, U+FE63 and U+FF0D, and U+00AD soft
 # hyphen. Text, terms and the tumor identity are folded to "-" before matching,
-# so the patterns below only need "-". A soft hyphen is folded rather than
-# dropped so "sex\u00adcord" stays "sex-cord" and the hyphen guards still apply.
+# so the patterns below only need "-". A second matching pass removes soft
+# hyphens inside words while preserving the original guards and exclusions.
 _TUMOR_TEXT_DASHES = (
     "-\u2010\u2011\u2012\u2013\u2014\u2015\u2043\u2212\ufe58\ufe63\uff0d\u00ad"
 )
 _TUMOR_TEXT_TRANSLATION = str.maketrans({dash: "-" for dash in _TUMOR_TEXT_DASHES})
+_TUMOR_SOFT_TEXT_TRANSLATION = str.maketrans({
+    dash: "-" for dash in _TUMOR_TEXT_DASHES if dash != "\u00ad"
+})
 # Word edges. A hyphenated neighbour also ends the match ("breast-feeding",
 # "non-small"), as does a preceding "non " or "non- " ("non small cell lung
 # cancer" and a line-broken "non-\nsmall cell lung cancer" are not SCLC);
@@ -296,6 +300,8 @@ _TUMOR_TERM_START = (
     r"(?<![A-Za-z0-9])(?<![A-Za-z0-9]-)(?<!\b[Nn][Oo][Nn] )(?<!\b[Nn][Oo][Nn]- )"
 )
 _TUMOR_TERM_END = r"(?![A-Za-z0-9])(?!-[A-Za-z0-9])"
+_TUMOR_START_GUARD = re.compile(_TUMOR_TERM_START)
+_TUMOR_END_GUARD = re.compile(_TUMOR_TERM_END)
 
 
 def _normalize_tumor_text(text: str) -> str:
@@ -362,13 +368,53 @@ def _requested_tumor_matchers(tumor_identity: str) -> tuple[tuple[str, re.Patter
     return tuple(matchers)
 
 
-def _mask_tumor_mention_exclusions(text: str, tumor_identity: str) -> str:
+def _tumor_mention_exclusion_spans(text: str, tumor_identity: str) -> list[tuple[int, int]]:
     terms = {normalize_tumor_identity(term) for term, _ in _requested_tumor_match_terms(tumor_identity)}
     if terms & _UTROSCT_TERM_KEYS:
-        return text
-    for pattern in _TUMOR_MENTION_EXCLUSIONS:
-        text = pattern.sub(" ", text)
-    return text
+        return []
+    return [match.span() for pattern in _TUMOR_MENTION_EXCLUSIONS for match in pattern.finditer(text)]
+
+
+_TumorMatchTexts = tuple[str, str, list[int], list[tuple[int, int]]]
+
+
+def _tumor_match_texts(text: str, tumor_identity: str) -> _TumorMatchTexts:
+    """Map both normalizations and their exclusions to the hyphenated text's offsets."""
+    soft_text = " ".join(text.translate(_TUMOR_SOFT_TEXT_TRANSLATION).split())
+    hyphenated = soft_text.replace("\u00ad", "-")
+    positions = [i for i, char in enumerate(soft_text) if char != "\u00ad"]
+    joined = "".join(soft_text[i] for i in positions)
+    excluded = _tumor_mention_exclusion_spans(hyphenated, tumor_identity)
+    excluded.extend(
+        (positions[start], positions[end - 1] + 1)
+        for start, end in _tumor_mention_exclusion_spans(joined, tumor_identity)
+    )
+    return hyphenated, joined, positions, excluded
+
+
+def _matches_tumor_text(pattern: re.Pattern[str], texts: _TumorMatchTexts) -> bool:
+    hyphenated, joined, positions, excluded = texts
+    for text, is_joined in ((hyphenated, False), (joined, True)):
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if is_joined:
+                start, end = positions[start], positions[end - 1] + 1
+            if any(start < excluded_end and end > excluded_start
+                   for excluded_start, excluded_end in excluded):
+                continue
+            joined_start = bisect_left(positions, start)
+            joined_end = bisect_left(positions, end)
+            # A candidate from either form must pass the edges of BOTH forms.
+            # This retains B-ALL/B\u00adALL while rejecting no\u00adn small cell,
+            # non-\u00adsmall cell and breast\u00adfeeding in their original context.
+            if (
+                _TUMOR_START_GUARD.match(hyphenated, start)
+                and _TUMOR_END_GUARD.match(hyphenated, end)
+                and _TUMOR_START_GUARD.match(joined, joined_start)
+                and _TUMOR_END_GUARD.match(joined, joined_end)
+            ):
+                return True
+    return False
 
 
 def requested_tumor_terms_in_record(record: LiteratureRecord, tumor_type: Optional[str]) -> List[str]:
@@ -380,11 +426,13 @@ def requested_tumor_terms_in_record(record: LiteratureRecord, tumor_type: Option
     tumor_identity = normalize_tumor_identity(tumor_type)
     if not tumor_identity:
         return []
-    title = _mask_tumor_mention_exclusions(_normalize_tumor_text(record.title), tumor_identity)
-    abstract = _mask_tumor_mention_exclusions(_normalize_tumor_text(record.abstract), tumor_identity)
+    title = _tumor_match_texts(record.title, tumor_identity)
+    abstract = _tumor_match_texts(record.abstract, tumor_identity)
     matched: List[str] = []
     for term, pattern, title_only in _requested_tumor_matchers(tumor_identity):
-        if pattern.search(title) or (not title_only and pattern.search(abstract)):
+        if _matches_tumor_text(pattern, title) or (
+            not title_only and _matches_tumor_text(pattern, abstract)
+        ):
             matched.append(term)
     return list(dict.fromkeys(matched))
 
@@ -936,7 +984,9 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             # 2: hyphen-aware word edges; case-independent free-text abbreviations.
             # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
             # 4: compatibility dashes, soft hyphen as "-", dash-folded identity, "non- ".
-            "tumor_scope_version": 4,
+            # 5: remove internal soft hyphens while retaining guards and exclusions.
+            # 6: exclusions and edge guards from either soft-hyphen normalization veto a span.
+            "tumor_scope_version": 6,
         },
         sort_keys=True,
     )
@@ -946,8 +996,22 @@ async def retrieve_fusion_evidence(
     fusion: str,
     tumor_type: Optional[str] = None,
     max_results: Optional[int] = None,
+    force_refresh: bool = False,
 ) -> FusionEvidenceResult:
     """Return deterministic fusion-level PubMed evidence for exact gene-pair queries."""
+    submitted = fusion
+    if has_accession_identifier(fusion):
+        # PubMed knows symbols, not Ensembl IDs or RefSeq accessions: query the resolved pair.
+        reading = await read_gene_input(fusion)
+        if reading.errors:
+            return FusionEvidenceResult(
+                fusion=fusion,
+                tumor_type=tumor_type,
+                interpretation="Fusion evidence was not retrieved: " + " ".join(reading.errors),
+                # No search ran, so an empty result is not evidence of missing literature.
+                retrieval_status="failed",
+            )
+        fusion = reading.canonical
     max_results = max_results or settings.fusion_evidence_max_results
     cache_key = _fusion_evidence_cache_key(fusion, tumor_type, max_results)
 
@@ -963,8 +1027,12 @@ async def retrieve_fusion_evidence(
         cache_key,
         _compute,
         ttl_seconds=settings.fusion_evidence_cache_ttl_seconds,
+        force_refresh=force_refresh,
     )
-    return FusionEvidenceResult(**payload)
+    result = FusionEvidenceResult(**payload)
+    if fusion != submitted:
+        result.input = submitted
+    return result
 
 
 async def _retrieve_fusion_evidence_uncached(

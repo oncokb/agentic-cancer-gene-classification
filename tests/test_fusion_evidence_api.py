@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from src import main
 from src.models.schema import FusionEvidenceResult
 
 
-def test_fusion_evidence_job_runs_in_background_and_ignores_gene_inputs(monkeypatch):
+@pytest.mark.parametrize("force_refresh", [False, True])
+def test_fusion_evidence_job_runs_in_background_and_ignores_gene_inputs(monkeypatch, force_refresh):
     main._fusion_evidence_jobs.clear_local()
     seen = []
 
-    async def fake_retrieve_fusion_evidence(fusion, tumor_type=None):
-        seen.append((fusion, tumor_type))
+    async def fake_retrieve_fusion_evidence(fusion, tumor_type=None, force_refresh=False):
+        seen.append((fusion, tumor_type, force_refresh))
         return FusionEvidenceResult(
             fusion=fusion,
             tumor_type=tumor_type,
@@ -36,6 +39,7 @@ def test_fusion_evidence_job_runs_in_background_and_ignores_gene_inputs(monkeypa
                 "BRAF",
             ],
             "mode": "core",
+            "force_refresh": force_refresh,
         },
     )
 
@@ -57,7 +61,7 @@ def test_fusion_evidence_job_runs_in_background_and_ignores_gene_inputs(monkeypa
     assert payload["fusions_completed"] == 1
     assert payload["fusion_evidence"][0]["fusion"] == "EML4::ALK"
     assert payload["fusion_evidence"][0]["well_supported"] is True
-    assert seen == [("EML4::ALK", "LUAD")]
+    assert seen == [("EML4::ALK", "LUAD", force_refresh)]
     main._fusion_evidence_jobs.clear_local()
 
 
@@ -77,7 +81,7 @@ class _FakeRunStore:
 def test_fusion_evidence_job_persists_result_onto_run_when_run_id_given(monkeypatch):
     main._fusion_evidence_jobs.clear_local()
 
-    async def fake_retrieve_fusion_evidence(fusion, tumor_type=None):
+    async def fake_retrieve_fusion_evidence(fusion, tumor_type=None, force_refresh=False):
         return FusionEvidenceResult(
             fusion=fusion,
             tumor_type=tumor_type,

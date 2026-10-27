@@ -117,8 +117,52 @@ _ASSAY_NAMES = frozenset({
 # as fusions just because they contain a hyphen.
 _HYPHENATED_GENE_PREFIXES = frozenset({"HLA", "MT", "TRB", "TRA", "IGH", "IGK", "IGL"})
 _VARIANT_PREFIXES = ("EXON", "DEL", "INS", "MUT")
-_FUSION_CONTEXT = re.compile(
-    r"\b(fusion|fusions|fused|chimeric|rearrangement|rearranged|translocation)\b",
+_FUSION_KEYWORD = (
+    r"(?:fusion|fusions|fused|chimeric|rearrangement|rearranged|translocation)"
+)
+# A "/" or "-" pair is only a fusion when one of the fusion words is directly
+# adjacent to it, or when it is explicitly "-positive" / " positive". Arbitrary
+# fusion wording elsewhere in the message (e.g. after an unrelated
+# "TP53/EGFR co-mutation") must not turn every pair into a fusion.
+_FUSION_BEFORE_PAIR = re.compile(
+    rf"{_FUSION_KEYWORD}"
+    r"(?:\s*[-/]?\s*(?:positive|driven|associated))?"
+    r"[\s:,(]*$",
+    re.IGNORECASE,
+)
+_FUSION_AFTER_PAIR = re.compile(
+    rf"^\s*-?\s*(?:positive|driven|associated)?\s*{_FUSION_KEYWORD}\b",
+    re.IGNORECASE,
+)
+# A "/" pair is not a fusion just because it is "rearranged" (double-hit
+# lymphoma: MYC/BCL2 rearranged); keep that wording for "-" pairs only.
+_FUSION_AFTER_PAIR_SLASH = re.compile(
+    r"^\s*-?\s*(?:positive|driven|associated)?\s*"
+    r"(?:fusion|fusions|fused|chimeric|rearrangement|translocation)\b",
+    re.IGNORECASE,
+)
+# "BCR-ABL1-positive"/"BCR-ABL1 positive CML" is a common fusion notation even
+# without the word "fusion"; both sides still have to be valid gene symbols.
+# Only "-" pairs qualify: "TP53/KRAS-positive" is co-expression, not a fusion.
+_POSITIVE_AFTER_PAIR = re.compile(r"^\s*-?\s*positive\b", re.IGNORECASE)
+_NEGATIVE_QUALIFIERS = r"(?:negative|wild[\s-]*type|absent)"
+# Negation next to the pair always wins: "fusion-negative EGFR/ALK",
+# "EGFR/ALK fusion-negative", "wild-type BCR/ABL1", "no BCR/ABL1 fusion",
+# "no evidence of BCR-ABL1 fusion", "BCR-ABL1 fusion not detected".
+_NEGATIVE_BEFORE_PAIR = re.compile(
+    rf"(?:\bno\s+(?:evidence\s+of\s+)?(?:{_FUSION_KEYWORD}\s*)?$)"
+    rf"|(?:(?:{_FUSION_KEYWORD})\s*[-:]?\s*)?(?:{_NEGATIVE_QUALIFIERS})\s*$",
+    re.IGNORECASE,
+)
+_NEGATIVE_AFTER_PAIR = re.compile(
+    rf"^\s*(?:(?:{_FUSION_KEYWORD})\s*[-:]?\s*)?"
+    rf"(?:{_NEGATIVE_QUALIFIERS}|no|not\s+detected)\b",
+    re.IGNORECASE,
+)
+# Co-mutation/co-occurrence wording directly after a pair means the pair is not
+# a fusion, even when a fusion word sits before it.
+_COOCCURRENCE_AFTER_PAIR = re.compile(
+    r"^\s*[- ]?\s*(?:co-(?:mut|occur|alter)\w*|mutat\w*)\b",
     re.IGNORECASE,
 )
 _TUMOR_DASHES = str.maketrans({
@@ -279,32 +323,80 @@ def _valid_fusion_pair(left: str, right: str, separator: str) -> bool:
     return True
 
 
+_IMMUNE_MARKER_PREFIXES = ("CD", "CK")
+
+
+def _is_immune_marker(token: str) -> bool:
+    upper = token.upper()
+    return any(
+        upper.startswith(prefix)
+        and len(upper) > len(prefix)
+        and upper[len(prefix)].isdigit()
+        for prefix in _IMMUNE_MARKER_PREFIXES
+    )
+
+
+def _positive_pair_notation(
+    separator: str, left: str, right: str, after: str
+) -> bool:
+    """Return True for the hyphen-pair "-positive"/" positive" shorthand."""
+    if separator != "-" or _is_immune_marker(left) or _is_immune_marker(right):
+        return False
+    return bool(_POSITIVE_AFTER_PAIR.match(after))
+
+
+def _fusion_keyword_adjacent(
+    message: str, start: int, end: int, separator: str, left: str, right: str
+) -> bool:
+    """Return True when fusion wording directly supports this pair.
+
+    A negative qualifier or co-mutation/co-occurrence wording next to the pair
+    always rejects it, even if a fusion word is also adjacent.
+    """
+    before = message[:start]
+    after = message[end:]
+    if _NEGATIVE_BEFORE_PAIR.search(before) or _NEGATIVE_AFTER_PAIR.match(after):
+        return False
+    if _COOCCURRENCE_AFTER_PAIR.match(after):
+        return False
+    fusion_after = (
+        _FUSION_AFTER_PAIR_SLASH if separator == "/" else _FUSION_AFTER_PAIR
+    )
+    return bool(
+        _FUSION_BEFORE_PAIR.search(before)
+        or fusion_after.match(after)
+        or _positive_pair_notation(separator, left, right, after)
+    )
+
+
 def _fusion_matches(message: str) -> List[Tuple[str, str, str]]:
     matches = []
     for match in _FUSION_SUBJECT.finditer(message or ""):
         left, separator, right = match.group(1), match.group(2), match.group(3)
         if not _valid_fusion_pair(left, right, separator):
             continue
-        if separator in ("-", "/") and not _FUSION_CONTEXT.search(message or ""):
+        if separator in ("-", "--", "/") and not _fusion_keyword_adjacent(
+            message, match.start(), match.end(), separator, left, right
+        ):
             continue
         matches.append((left, separator, right))
     return matches
 
 
 def extract_subject(message: str, gene: Optional[str] = None) -> Tuple[Optional[str], bool]:
-    """Return (subject, is_fusion) from the structured field or message.
+    """Return (subject, is_fusion) following the documented precedence.
 
-    The structured gene keeps its submitted case. Free-text fusions prefer an
-    explicit "::" match anywhere in the message over a "-" or "/" match, so a
-    real fusion is not lost behind an earlier slash-separated phrase.
+    The structured field (kept in its submitted case) wins over the message,
+    then an explicit "::" anywhere in the message wins over a "-" or "/" pair,
+    then "-"/"/" pairs only when a fusion word is directly adjacent to them.
     """
     if gene and gene.strip():
         subject = gene.strip()
         _, right = _split_subject(subject)
         return subject, right is not None
     matches = _fusion_matches(message)
-    preferred = [item for item in matches if "::" in item[1]]
-    for left, _, right in preferred or matches:
+    explicit = [item for item in matches if ":" in item[1]]
+    for left, _, right in explicit or matches:
         return f"{left}::{right}", True
     match = _NAMED_GENE_SUBJECT.search(message or "")
     if match:

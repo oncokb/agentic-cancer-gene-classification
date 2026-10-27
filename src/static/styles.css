@@ -2377,7 +2377,14 @@ body.login-body {
    API keys page (/api-keys)
    --------------------------------------------------------------------------- */
 
+.user-menu-links {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 12px;
+}
+
 .user-menu-link {
+  white-space: nowrap;
   align-self: flex-start;
   margin-top: 2px;
   font-size: 12px;
@@ -2611,6 +2618,14 @@ body.api-keys-body {
   .api-keys-form {
     grid-template-columns: 1fr;
   }
+}
+
+.submitted-input-note {
+  margin-top: 2px;
+}
+
+.submitted-input-warning {
+  color: var(--warning);
 }
 
 /* Fusion evidence sections reuse the results sidebar sizing at every zoom. */

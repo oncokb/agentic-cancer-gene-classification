@@ -231,7 +231,8 @@ def test_enrichment_job_endpoint_streams_enriched_annotations(monkeypatch):
 
 @pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
 @pytest.mark.parametrize("include", [None, False, True])
-def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, include):
+@pytest.mark.parametrize("force_refresh", [False, True])
+def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, include, force_refresh):
     store = FakeRunStore()
     monkeypatch.setattr(main.app.state, "run_store", store, raising=False)
     async def create_store():
@@ -248,7 +249,8 @@ def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, inclu
             genes_annotated=0, annotations=[],
         )
 
-    async def fake_retrieve(fusion, tumor_type=None):
+    async def fake_retrieve(fusion, tumor_type=None, **kwargs):
+        assert kwargs["force_refresh"] is force_refresh
         nonlocal active, peak
         if path.endswith("/jobs"):
             assert any(job.phase == "fusion_evidence" and job.status == "running"
@@ -278,7 +280,7 @@ def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, inclu
     monkeypatch.setattr(main, "run_pipeline", fake_pipeline)
     monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_retrieve)
     monkeypatch.setattr(main.settings, "fusion_evidence_concurrency", 1)
-    request = {"fusions": [
+    request = {"force_refresh": force_refresh, "fusions": [
         {"fusion": "EML4::ALK", "tumor_type": "LUAD"},
         {"fusion": "EML4::ALK", "tumor_type": "LUAD"},
         "BRAF", "BCR::ABL1",
@@ -335,7 +337,7 @@ def test_inline_fusion_evidence_run_is_saved_with_its_owner(monkeypatch, path):
             genes_annotated=0, annotations=[],
         )
 
-    async def fake_retrieve(fusion, tumor_type=None):
+    async def fake_retrieve(fusion, tumor_type=None, force_refresh=False):
         return FusionEvidenceResult(fusion=fusion, pmids=["123"], retrieved_count=1)
 
     async def no_retractions(pmids):
@@ -406,7 +408,7 @@ def test_annotation_input_cap_accepts_exact_limit(monkeypatch, path):
         return AnnotationResult(run_id="limit", timestamp="2026-10-26", annotations=[],
                                 fusions_processed=len(fusions), genes_annotated=0)
 
-    async def retrieve(fusion, tumor_type=None):
+    async def retrieve(fusion, tumor_type=None, force_refresh=False):
         return FusionEvidenceResult(fusion=fusion)
 
     monkeypatch.setattr(main.RunStore, "create", create_store)

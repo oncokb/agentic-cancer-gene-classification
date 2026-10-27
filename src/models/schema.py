@@ -32,6 +32,13 @@ class ResolvedGene(BaseModel):
     # True when unresolvable only because the lookup service failed (timeout,
     # 5xx, ...), as opposed to the service confirming the symbol doesn't exist.
     lookup_failed: bool = False
+    # Why an Ensembl/RefSeq-form input (ENST..., GENE(NM_...), NM_...:c....)
+    # could not be used, e.g. an unknown ID or a transcript of a different gene.
+    resolution_error: Optional[str] = None
+    # Transcript an ENST/ENSP input resolved through (ENSP -> its parent ENST).
+    ensembl_transcript_id: Optional[str] = None
+    # RefSeq transcript (NM_/NR_/XM_/XR_) an input named; None for NP_/XP_ proteins.
+    refseq_transcript_id: Optional[str] = None
 
 
 class LiteratureRecord(BaseModel):
@@ -142,6 +149,10 @@ class FusionEvidenceCard(EvidenceCard):
 
 class FusionEvidenceResult(BaseModel):
     fusion: str
+    input: Optional[str] = Field(
+        default=None,
+        description="The fusion as submitted, when it differs from `fusion` (e.g. Ensembl IDs resolved to symbols).",
+    )
     tumor_type: Optional[str] = None
     well_supported: bool = False
     retrieved_count: int = 0
@@ -371,11 +382,30 @@ class DistilledOpenEvidence(BaseModel):
     redundant_citation_count: int = 0
 
 
+class ResolvedInput(BaseModel):
+    """A submitted input that was rewritten before annotation, e.g. an Ensembl
+    transcript ID resolved to its gene symbol."""
+
+    input: str = Field(..., description="The input as submitted, e.g. `ENST00000269305`.")
+    resolved: str = Field(..., description="The gene or fusion string that was annotated, e.g. `TP53`.")
+    five_transcript: Optional[str] = Field(default=None, description="5' partner transcript taken from the input.")
+    three_transcript: Optional[str] = Field(default=None, description="3' partner transcript taken from the input.")
+    warnings: List[str] = Field(default_factory=list, description="Caveats about how the input was read.")
+
+
 class GeneAnnotation(BaseModel):
     """One row in Nicole's spreadsheet, keyed by gene."""
 
     gene: str
     fusions: List[str] = Field(default_factory=list)
+    resolved_inputs: List[ResolvedInput] = Field(
+        default_factory=list,
+        description=(
+            "Submitted inputs for this gene that were rewritten before annotation (Ensembl IDs, RefSeq "
+            "accessions, GENE(ENST...)/GENE(NM_...) and ENST...:c..../NM_...:c.... forms), with what each "
+            "resolved to."
+        ),
+    )
     in_oncokb: Optional[bool] = None  # None when OncoKB token not configured
 
     cancer_associated: Optional[bool] = None
@@ -457,6 +487,13 @@ class GeneAnnotationWithRun(GeneAnnotation):
         default=None,
         description="Absolute link that opens the full run in the ACGC UI (requires login).",
     )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Request-level warnings for the saved run, such as conflicting tumor types "
+            "or fusion-like notation. Same list as AnnotationResult.warnings."
+        ),
+    )
 
 
 class FusionInput(BaseModel):
@@ -523,7 +560,7 @@ class AnnotateRequest(BaseModel):
     )
     force_refresh: bool = Field(
         default=False,
-        description="Bypass stored gene annotations and recompute results.",
+        description="Bypass stored gene annotations and fusion evidence and recompute results.",
     )
     skip_literature_for_oncokb: bool = Field(
         default=False,

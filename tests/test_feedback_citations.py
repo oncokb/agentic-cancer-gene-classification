@@ -162,12 +162,105 @@ def test_explicit_double_colon_fusion_is_preferred_over_slash():
     assert extract_subject("TP53/EGFR and EML4::ALK fusion.") == ("EML4::ALK", True)
 
 
+def test_slash_pair_is_only_a_fusion_when_a_fusion_word_is_adjacent():
+    assert extract_subject("TP53/EGFR co-mutation; GREB1-BCL9L fusion") == (
+        "GREB1::BCL9L",
+        True,
+    )
+    assert extract_subject("Review TP53/EGFR co-mutation.") == (None, False)
+    assert extract_subject("BCR/ABL1 fusion") == ("BCR::ABL1", True)
+    assert extract_subject("fusion BCR/ABL1") == ("BCR::ABL1", True)
+    assert extract_subject("BCR/ABL1 rearrangement") == ("BCR::ABL1", True)
+    assert extract_subject("BCR/ABL1 translocation") == ("BCR::ABL1", True)
+
+
+def test_negative_qualifiers_never_confirm_a_pair():
+    for message in (
+        "fusion-negative EGFR/ALK",
+        "fusion negative EGFR/ALK",
+        "EGFR/ALK fusion-negative",
+        "TP53/EGFR fusion-negative",
+        "wild-type BCR/ABL1",
+        "absent EML4/ALK fusion",
+        "no BCR/ABL1 fusion",
+    ):
+        assert extract_subject(message) == (None, False), message
+
+
+def test_co_occurrence_wording_never_confirms_a_pair():
+    for message in (
+        "fusion-positive KRAS/TP53 co-mutated",
+        "fusion TP53/EGFR co-mutation",
+        "TP53--EGFR co-mutation",
+        "fusion-positive KRAS/TP53 co-occurring",
+        "fusion-positive KRAS/TP53 co-altered",
+        "TP53/EGFR mutation",
+    ):
+        assert extract_subject(message) == (None, False), message
+
+
+def test_positive_qualifier_recovers_common_fusions():
+    assert extract_subject("BCR-ABL1-positive") == ("BCR::ABL1", True)
+    assert extract_subject("BCR-ABL1 positive CML") == ("BCR::ABL1", True)
+    assert extract_subject("EML4-ALK-positive NSCLC") == ("EML4::ALK", True)
+    assert extract_subject("ER/PR-positive") == (None, False)
+
+
+def test_positive_qualifier_does_not_apply_to_slash_pairs():
+    for message in (
+        "TP53/KRAS-positive",
+        "TP53/KRAS positive",
+        "ALK/ROS1-positive",
+        "ALK/ROS1 positive NSCLC",
+        "CD4/CD8-positive",
+        "EGFR/HER2-positive",
+        "BRCA1/BRCA2-positive",
+        "MLH1/PMS2 positive",
+        "CD20/CD79A-positive",
+        "CK7/CK20-positive",
+        "p16/HPV-positive",
+        "KIT/PDGFRA-positive GIST",
+    ):
+        assert extract_subject(message) == (None, False), message
+
+
+def test_positive_qualifier_ignores_immune_marker_prefixes():
+    assert extract_subject("CD4-CD8 positive") == (None, False)
+    assert extract_subject("CD4-CD8-positive") == (None, False)
+    assert extract_subject("CK7-CK20-positive") == (None, False)
+
+
+def test_slash_pair_rearranged_is_not_a_fusion():
+    assert extract_subject("MYC/BCL2 rearranged") == (None, False)
+    assert extract_subject("MYC-BCL2 rearranged") == ("MYC::BCL2", True)
+
+
+def test_negation_before_or_after_the_pair_rejects_it():
+    assert extract_subject("no evidence of BCR-ABL1 fusion") == (None, False)
+    assert extract_subject("BCR-ABL1 fusion not detected") == (None, False)
+
+
+def test_fusion_word_allows_punctuation_before_the_pair():
+    assert extract_subject("fusion: EML4-ALK") == ("EML4::ALK", True)
+    assert extract_subject("fusions: EML4-ALK") == ("EML4::ALK", True)
+    assert extract_subject("fusion (EML4-ALK)") == ("EML4::ALK", True)
+    assert extract_subject("fusion, EML4-ALK") == ("EML4::ALK", True)
+
+
+def test_variant_and_assay_tokens_are_not_fusions():
+    assert extract_subject("KRAS-G12C fusion") == (None, False)
+    assert extract_subject("RNA-Seq fusion detection") == (None, False)
+
+
 def test_clinical_acronyms_are_not_fusion_partners():
     assert extract_subject("ER/PR status; GREB1-BCL9L fusion") == ("GREB1::BCL9L", True)
 
 
 def test_extract_subject_prefers_structured_gene():
     assert extract_subject("Review GREB1::BCL9L fusion.", "TP53") == ("TP53", False)
+    assert extract_subject(
+        "TP53/EGFR co-mutation; GREB1-BCL9L fusion", "TP53"
+    ) == ("TP53", False)
 
 
 def test_hyphenated_gene_symbol_is_not_mistaken_for_a_fusion():

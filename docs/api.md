@@ -88,10 +88,14 @@ curl -s -X POST https://acgc.oncokb.org/v1/genes/query \
 
 Accepted gene identifiers for the gene query API:
 
-- HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`, and Ensembl gene IDs such
-  as `ENSG00000141510` or `ENSG00000141510.17`.
-- Letters, digits, `-` and `.` only, starting and ending with a letter or
-  digit.
+- HGNC symbols such as `ALK`, `HLA-A` or `C1orf112`; Ensembl gene,
+  transcript and protein IDs such as `ENSG00000141510.17`, `ENST00000269305`
+  or `ENSP00000269305`; and RefSeq accessions such as `NM_000546.6` or
+  `NP_000537`. Either kind also works as `TP53(ENST00000269305)`,
+  `TP53(NM_000546.6)`, `ENST00000269305:c.215C>G` or `NM_000546.6:c.215C>G`.
+  See [Gene identifiers](#gene-identifiers).
+- Symbols: letters, digits, `-` and `.` only, starting and ending with a
+  letter or digit.
 - **Not fusions.** `EML4::ALK`, `ALK::` and similar are rejected with `422`.
   Use the full `/v1/annotate` endpoint for fusions (see the
   [README](../README.md#acgc-api-keys-for-scripts)).
@@ -120,17 +124,22 @@ Accepted gene identifiers for the gene query API:
       "cached_at": "2026-10-01T14:03:11+00:00",
       "error": null
     }
-  ]
+  ],
+  "warnings": []
 }
 ```
 
 `GET /v1/genes/{symbol}` returns the same shape, with one entry in `results`.
+`warnings` is the run-level list described under [annotate warnings](#post-v1annotate).
 
 | Field | Meaning |
 | --- | --- |
 | `run_id` | ID of the saved run that holds these results. |
 | `view_url` | Link to the full report in the ACGC web app. Whoever opens it signs in first if they aren't already, then lands on the report. |
+| `warnings` | Run-level warnings, such as conflicting tumor types or fusion-like notation. Empty when there are none. |
 | `gene` | The gene symbol ACGC classified. This can differ from what you sent, for example when an Ensembl ID or an old alias resolves to the current symbol. |
+| `submitted_inputs` | What you sent, when it was rewritten to `gene` (for example an Ensembl transcript ID). Empty otherwise. |
+| `warnings` | Caveats about how an input was read, for example an HGVS variant that was not interpreted. |
 | `tumor_type` | The tumor type the classification actually used, or `null`. |
 | `cancer_associated` | Whether ACGC classifies the gene as cancer-associated. |
 | `gene_class` | Functional class, for example a kinase. |
@@ -146,6 +155,59 @@ Accepted gene identifiers for the gene query API:
 The gene query API deliberately leaves out abstracts, quotes, evidence cards
 and OpenEvidence content. Open its `view_url` to see them. (The annotate
 endpoints return full annotations, including evidence cards.)
+
+### Gene identifiers
+
+Every endpoint that takes genes or fusions (`/v1/genes/...`, `/v1/annotate`,
+`/v1/annotate/jobs`, `/v1/annotate/gene`, `/v1/fusion-evidence/jobs`) accepts,
+alone or as either fusion partner:
+
+| Input | Read as |
+| --- | --- |
+| `TP53` | HGNC symbol (aliases and previous symbols resolve to the current symbol). |
+| `ENSG00000141510`, `ENSG00000141510.17` | The Ensembl gene's symbol. |
+| `ENST00000269305`, `ENST00000269305.9` | The symbol of the gene that owns the transcript. |
+| `ENSP00000269305` | Protein → its transcript → that transcript's gene. |
+| `TP53(ENST00000269305)` | `TP53`, after checking the transcript belongs to TP53. In a fusion, the transcript is used as that partner's breakpoint transcript. |
+| `ENST00000269305:c.215C>G`, `ENSP00000269305:p.Arg72Pro` | The transcript's gene, with a warning: the variant itself is **not** interpreted. |
+| `NM_000546`, `NM_000546.6`, `NR_003051`, `XM_...`, `XR_...` | The symbol of the gene NCBI lists for the RefSeq transcript. |
+| `NP_000537`, `NP_000537.3`, `XP_...` | The symbol of the gene NCBI lists for the RefSeq protein. |
+| `TP53(NM_000546.6)` | `TP53`, after checking the accession belongs to TP53. In a fusion, a transcript accession is used as that partner's breakpoint transcript, e.g. `EML4(NM_019063.5)::ALK(NM_004304.5)`. |
+| `NM_000546.6:c.215C>G`, `NM_000546.6(TP53):c.215C>G`, `NP_000537.3:p.Arg72Pro` | The accession's gene, with a warning: the variant itself is **not** interpreted. |
+
+So `ENST00000318522::ENST00000389048` and `NM_019063.5::NM_004304.5` are both
+annotated as `EML4::ALK`, and fusion evidence searches PubMed for the symbols,
+not the IDs. Only human stable IDs (`ENSG`/`ENST`/`ENSP` plus 11 digits,
+optional `.version`) and human RefSeq transcript/protein accessions (`NM_`,
+`NR_`, `XM_`, `XR_`, `NP_`, `XP_` plus digits, optional `.version`) are
+accepted; other RefSeq types such as `NC_` (chromosomes) or `NG_` (genomic
+regions) are rejected. RefSeq accessions are looked up in NCBI (Datasets gene
+API); NCBI reports the gene for an accession regardless of version, so the
+version is kept in your input but not checked. Neither kind is ever
+fuzzy-matched to a gene.
+
+Your original input stays in the result: `resolved_inputs` on each annotation
+(`input`, `resolved`, `five_transcript`, `three_transcript`, `warnings`),
+`submitted_inputs` in gene-query results, and `input` on fusion-evidence
+results. Request-level `warnings` repeat any caveats and errors.
+
+An identifier that can't be used gets its own error row and is not annotated
+as any gene. That covers an unknown, non-human or malformed ID, an Ensembl or
+NCBI lookup that failed (retry), and `GENE(ENST...)` / `GENE(NM_...)` where the
+transcript belongs to a different gene. In the gene query API the last case
+reads "The Ensembl ID belongs to a different gene than the one named." or "The
+RefSeq accession belongs to a different gene than the one named."
+
+In a fusion, only the bad partner is rejected: the other partner is still
+annotated on its own. For `EML4(ENST00000256078)::ALK` (a KRAS transcript),
+ALK is annotated, and the error row and request `warnings` say "5′ partner of
+'EML4(ENST00000256078)::ALK' rejected — ... belongs to KRAS, not EML4". Fix
+the partner and resubmit to annotate the fusion as a pair.
+
+Fusion evidence for a fusion with a rejected partner is not searched. The entry
+has `retrieval_status: "failed"` and `literature_scope: null`, and its
+`interpretation` gives the reason. The empty result does not mean there is no
+literature.
 
 ## 4. Gene query background jobs
 
@@ -175,6 +237,7 @@ curl -s "https://acgc.oncokb.org/v1/genes/query/jobs/$JOB_ID" \
   "run_id": "...",
   "view_url": "https://acgc.oncokb.org/?run=...",
   "results": [ ... ],
+  "warnings": [],
   "error": null
 }
 ```
@@ -183,6 +246,8 @@ curl -s "https://acgc.oncokb.org/v1/genes/query/jobs/$JOB_ID" \
 - `genes_completed` and `genes_total` show progress. `results` fills in as
   genes finish.
 - `run_id` and `view_url` are set only once `status` is `complete`.
+- `warnings` is an empty list (`[]`) until `status` is `complete`, then holds
+  the same warnings as `POST /v1/genes/query` would return.
 - If `status` is `failed`, `error` holds a short message. Start a new job to
   retry.
 
@@ -213,7 +278,7 @@ curl -s -X POST https://acgc.oncokb.org/v1/annotate \
 | `fusions` | Required, at least one entry. Each entry is a gene or fusion string, or an object with `fusion` (aliases `gene`, `input` and `query` also work) and an optional `tumor_type`. |
 | `include_fusion_evidence` | Optional, default `false`. Retrieves exact-pair evidence inline before saving and returning the run; also supported by `/v1/annotate/jobs`. |
 | `mode` | `"full"` (default) or `"core"`. `"core"` prioritizes the cancer association, rationale, summary and citations. |
-| `force_refresh` | Optional, default `false`. Bypasses saved gene annotations and recomputes them. |
+| `force_refresh` | Optional, default `false`. Bypasses saved gene annotations and fusion evidence and recomputes them. |
 | `skip_literature_for_oncokb` | Optional, default `false`. Genes confirmed in OncoKB return a deterministic OncoKB-based annotation without PubMed retrieval or LLM synthesis. |
 
 Each fusion is split into its partner genes, and every unique gene is annotated
@@ -355,6 +420,7 @@ curl -s -X POST https://acgc.oncokb.org/v1/fusion-evidence/jobs \
 | Field | Meaning |
 | --- | --- |
 | `fusions` | Required, at least one entry in the same string-or-object form as `POST /v1/annotate`. Only entries with a fusion separator and two non-empty partners are processed; gene-only entries and entries such as `ALK::` are ignored. |
+| `force_refresh` | Optional, default `false`. Bypasses and replaces the 7-day fusion-evidence cache. |
 | `run_id` | Optional. When set, ACGC best-effort saves the completed evidence onto that existing run, so a later `GET /v1/annotate/{run_id}` may include it. |
 
 The same `ANNOTATE_MAX_INPUTS` cap (default 50) applies before filtering or
@@ -458,6 +524,24 @@ That is the same link format the app uses (`_run_view_url` in `src/main.py`).
 `include_fusion_evidence: true` or a fusion-evidence job successfully attached
 it to this run; otherwise it is `[]`. An unknown `run_id` returns `404`.
 
+### `POST /v1/annotate/gene`
+
+Annotate one gene and return its full `GeneAnnotation` fields, plus the saved
+run's `run_id` and a `view_url`. The request body takes `gene` and an optional
+`tumor_type`:
+
+```bash
+curl -s -X POST https://acgc.oncokb.org/v1/annotate/gene \
+  -H "Authorization: Bearer $ACGC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"gene": "ALK", "tumor_type": "LUAD"}'
+```
+
+The response also includes the run-level `warnings` list, with the same shape
+and meaning as `POST /v1/annotate`; it is `[]` when there are none. Because
+this endpoint takes one input, its warnings are normally about notation (for
+example `EWSR1-FLI1`), not conflicting tumor types.
+
 ### Batch workflow
 
 For a large gene/fusion list, this sequence avoids request timeouts and gives
@@ -492,16 +576,11 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 - `POST /v1/annotate` (and its jobs) returns `fusion_evidence: []` by default.
   Set `include_fusion_evidence: true` or run `POST /v1/fusion-evidence/jobs`
   separately for exact fusion-pair evidence.
-- Only one tumor type is used per gene per request, chosen in two stages. If
-  the **same input string** is repeated with different tumor types, the first
-  non-empty `tumor_type` is kept. Then, from the merged input list for a gene,
-  the first non-null tumor type is used; ignored conflicting types are named
-  in the response-level `warnings`. That list preserves submission order
-  only among inputs using the same symbol. Across aliases or Ensembl IDs, the
-  inputs are resolved and merged in an identifier-dependent order (sorted
-  Ensembl IDs before sorted HGNC symbols;
-  `src/pipeline/normalization.py:245-268`), so the chosen tumor type is **not
-  guaranteed** to be the first one you submitted. If the tumor type matters,
+- Only one tumor type is used per gene per request: the first non-empty
+  `tumor_type` in submission order among all inputs that resolve to that gene,
+  whatever their spelling (`TP53`, an alias, `ENSG...`, `ENST...`, `ENSP...`
+  or `TP53(ENST...)`). Ignored conflicting types are named in the
+  response-level `warnings`. To annotate a gene in more than one tumor type,
   send one request per tumor type.
 - Fusion separators are `::`, `--` and `/` only. A single hyphen is **not** a
   separator: `EWSR1-FLI1` is treated as one gene symbol, not a fusion. Write
@@ -516,8 +595,8 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 - Fusion-evidence jobs only process entries that contain a fusion separator and
   have two non-empty partners. Gene-only entries and malformed entries such as
   `ALK::` are silently skipped.
-- `force_refresh` refreshes gene annotations, not fusion evidence. Exact-pair
-  evidence is cached for 7 days and a fusion-evidence job reuses it.
+- Exact-pair evidence is cached for 7 days. Set `force_refresh: true` on an
+  inline annotation request or fusion-evidence job to bypass and replace it.
 
 ## 6. Speed and freshness
 
@@ -535,8 +614,11 @@ polling intervals at 15 seconds or longer when you have several jobs running.
 - Exact fusion-pair evidence is cached separately for 7 days.
 - `force_refresh: true` (or `?force_refresh=true` on the `GET`) ignores saved
   gene results and classifies every gene again. It's slower and costs more, so
-  use it only when you need a fresh answer. It does not bypass the fusion
-  evidence cache.
+  use it only when you need a fresh answer. It also bypasses and replaces the
+  fusion-evidence cache when inline evidence is requested. For a separate
+  fusion-evidence job, set `force_refresh: true` on that job request too.
+  Refreshing the fusion-evidence result still reuses the underlying PubMed
+  search and fetch caches (default TTL: 24 hours) to limit NCBI load.
 - For more than a handful of uncached genes, use a background job rather than
   holding one request open.
 
