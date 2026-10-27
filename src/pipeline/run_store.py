@@ -301,6 +301,9 @@ class RunStore:
         pool = await aiomysql.create_pool(
             **_mysql_connection_kwargs(),
             autocommit=True,
+            minsize=settings.mysql_pool_minsize,
+            maxsize=settings.mysql_pool_maxsize,
+            pool_recycle=settings.mysql_pool_recycle_seconds,
         )
         store = cls(pool)
         try:

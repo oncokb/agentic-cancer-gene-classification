@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import aiomysql
 import pytest
 
-from src.config import settings
+from src.config import Settings, settings
 from src.models.schema import GeneAnnotation
 from src.pipeline.run_store import (
     RunStore,
@@ -22,6 +22,42 @@ from src.pipeline.run_store import (
     _parse_jdbc_mysql_host_port,
     summarize_run_inputs,
 )
+
+
+async def test_create_pool_uses_configured_limits(monkeypatch):
+    passed = {}
+    pool = object()
+
+    async def fake_create_pool(**kwargs):
+        passed.update(kwargs)
+        return pool
+
+    async def skip_schema(self):
+        pass
+
+    monkeypatch.setattr("src.pipeline.run_store.aiomysql.create_pool", fake_create_pool)
+    monkeypatch.setattr(RunStore, "_ensure_schema", skip_schema)
+    monkeypatch.setattr(settings, "mysql_pool_minsize", 2)
+    monkeypatch.setattr(settings, "mysql_pool_maxsize", 17)
+    monkeypatch.setattr(settings, "mysql_pool_recycle_seconds", 7200)
+
+    store = await RunStore.create()
+
+    assert store._pool is pool
+    assert passed == {
+        **_mysql_connection_kwargs(),
+        "autocommit": True,
+        "minsize": 2,
+        "maxsize": 17,
+        "pool_recycle": 7200,
+    }
+
+
+def test_pool_settings_defaults():
+    fields = Settings.model_fields
+    assert fields["mysql_pool_minsize"].default == 1
+    assert fields["mysql_pool_maxsize"].default == 10
+    assert fields["mysql_pool_recycle_seconds"].default == 3600
 
 
 def test_parse_jdbc_mysql_host_port_bare():

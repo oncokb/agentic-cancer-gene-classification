@@ -169,6 +169,9 @@ class Settings(BaseSettings):
     mysql_user: str = "acgc"
     mysql_password: str = ""
     mysql_database: str = "acgc"
+    mysql_pool_minsize: int = Field(default=1, ge=0)
+    mysql_pool_maxsize: int = Field(default=10, ge=1)
+    mysql_pool_recycle_seconds: int = Field(default=3600, ge=-1)
 
     # Alternative to MYSQL_HOST/MYSQL_PORT: a JDBC-style connection string
     # (e.g. "jdbc:mysql://host:3306"), as used by this org's shared RDS
