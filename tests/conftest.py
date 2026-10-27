@@ -108,17 +108,25 @@ def _auth_profiles_in_memory(monkeypatch):
     """Keep JIT user profiles in src.auth's in-process store, empty per test.
 
     Session auth reads the live profile on every request and fails closed
-    (503) when Redis errors, so the auth module never talks to the configured
-    Redis in tests; tests that exercise a store failure patch
-    _get_auth_redis_client themselves.
+    (503) when the configured Redis errors or can't be reached, so the auth
+    module never talks to the configured Redis in tests. Yields the real
+    store hooks so tests can exercise the Redis code path with a fake client.
     """
     from src import auth
+
+    originals = {
+        "_get_auth_redis_client": auth._get_auth_redis_client,
+        "_profile_store_redis": auth._profile_store_redis,
+    }
 
     async def _no_redis():
         return None
 
     monkeypatch.setattr(auth, "_get_auth_redis_client", _no_redis)
+    monkeypatch.setattr(auth, "_profile_store_redis", _no_redis)
     monkeypatch.setattr(auth, "_user_store", {})
+    monkeypatch.setattr(auth, "_user_activity", {})
+    yield originals
 
 
 @pytest.fixture(autouse=True)

@@ -127,6 +127,8 @@ class SAMLAssertionData(BaseModel):
 # ---------------------------------------------------------------------------
 
 _user_store: Dict[str, UserProfile] = {}
+# Usage counters kept beside (not in) the profile; see record_user_annotation_activity.
+_user_activity: Dict[str, Dict[str, Any]] = {}
 _user_store_lock = asyncio.Lock()
 
 
@@ -149,12 +151,43 @@ class UserStoreUnavailable(RuntimeError):
     """The user profile store could not be read; callers must fail closed."""
 
 
-async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
-    """Read a user profile, raising UserStoreUnavailable on a store error.
+async def _profile_store_redis():
+    """The Redis client backing authoritative profile reads.
 
-    Unlike get_user_profile, a Redis failure is not masked by the in-process
-    fallback store, which may hold a stale (or no) copy of the profile.
+    Returns None only when Redis is intentionally unconfigured (REDIS_URL
+    empty), in which case the in-process store is the profile store. Raises
+    UserStoreUnavailable when Redis is configured but the client failed to
+    initialize, rather than silently degrading to the in-process copy.
     """
+    if not settings.redis_url.strip():
+        return None
+    redis_client = await _get_auth_redis_client()
+    if redis_client is None:
+        raise UserStoreUnavailable("Redis is configured but the auth client could not be initialized")
+    return redis_client
+
+
+async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
+    """Read a user profile from the authoritative store, failing closed.
+
+    With Redis configured, Redis alone decides: a miss means the profile was
+    deleted (None) and any error raises UserStoreUnavailable. The in-process
+    store, which save_user_profile also populates, may hold a stale copy and
+    is consulted only when Redis is intentionally unconfigured.
+    """
+    clean_email = email.strip().lower()
+    redis_client = await _profile_store_redis()
+    if redis_client is None:
+        async with _user_store_lock:
+            return _user_store.get(clean_email)
+    try:
+        payload = await redis_client.get(f"agcg:user:{clean_email}")
+        return UserProfile.model_validate_json(payload) if payload else None
+    except Exception as exc:
+        raise UserStoreUnavailable(f"Failed to read user {clean_email}") from exc
+
+
+async def get_user_profile(email: str) -> Optional[UserProfile]:
     clean_email = email.strip().lower()
     redis_client = await _get_auth_redis_client()
     if redis_client is not None:
@@ -163,20 +196,10 @@ async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
             if payload:
                 return UserProfile.model_validate_json(payload)
         except Exception as exc:
-            raise UserStoreUnavailable(f"Failed to read user {clean_email}") from exc
+            logger.debug("Redis error reading user %s: %s", clean_email, exc)
 
     async with _user_store_lock:
         return _user_store.get(clean_email)
-
-
-async def get_user_profile(email: str) -> Optional[UserProfile]:
-    try:
-        return await load_user_profile_strict(email)
-    except UserStoreUnavailable as exc:
-        clean_email = email.strip().lower()
-        logger.debug("Redis error reading user %s: %s", clean_email, exc.__cause__)
-        async with _user_store_lock:
-            return _user_store.get(clean_email)
 
 
 async def save_user_profile(profile: UserProfile) -> None:
@@ -193,6 +216,22 @@ async def save_user_profile(profile: UserProfile) -> None:
         _user_store[clean_email] = profile
 
 
+def _with_activity(profile: UserProfile, activity: Dict[str, Any]) -> UserProfile:
+    """Overlay the separately stored usage counters on a profile.
+
+    A profile's own annotation_count/last_annotation_at are the totals from
+    before usage moved to its own record; new usage only lands in `activity`.
+    """
+    if not activity:
+        return profile
+    return profile.model_copy(
+        update={
+            "annotation_count": profile.annotation_count + int(activity.get("annotation_count") or 0),
+            "last_annotation_at": activity.get("last_annotation_at") or profile.last_annotation_at,
+        }
+    )
+
+
 async def list_user_profiles() -> List[UserProfile]:
     redis_client = await _get_auth_redis_client()
     if redis_client is not None:
@@ -202,7 +241,7 @@ async def list_user_profiles() -> List[UserProfile]:
             for email in emails:
                 u = await get_user_profile(email)
                 if u:
-                    users.append(u)
+                    users.append(_with_activity(u, await redis_client.hgetall(_activity_key(u.email))))
             if users:
                 users.sort(key=lambda x: x.last_login_at, reverse=True)
                 return users
@@ -210,7 +249,7 @@ async def list_user_profiles() -> List[UserProfile]:
             logger.debug("Redis error listing users: %s", exc)
 
     async with _user_store_lock:
-        users = list(_user_store.values())
+        users = [_with_activity(u, _user_activity.get(u.email, {})) for u in _user_store.values()]
         users.sort(key=lambda x: x.last_login_at, reverse=True)
         return users
 
@@ -283,19 +322,74 @@ async def provision_or_update_user(
     return profile
 
 
+def _activity_key(email: str) -> str:
+    return f"agcg:user_activity:{email}"
+
+
 async def record_user_annotation_activity(email: str, count: int = 1) -> None:
-    """Updates user profile usage metrics in the user store upon annotation completion."""
+    """Records usage metrics upon annotation completion (shown by list_user_profiles).
+
+    Write-only: the counters live beside the profile instead of in it, so
+    recording usage neither adds a profile read to the request nor rewrites
+    the profile (a read-modify-write here could undo a concurrent demotion).
+    """
     clean_email = email.strip().lower()
-    profile = await get_user_profile(clean_email)
-    if profile:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        updated = profile.model_copy(
+    now_iso = datetime.now(timezone.utc).isoformat()
+    redis_client = await _get_auth_redis_client()
+    if redis_client is not None:
+        try:
+            pipe = redis_client.pipeline()
+            pipe.hincrby(_activity_key(clean_email), "annotation_count", max(1, count))
+            pipe.hset(_activity_key(clean_email), "last_annotation_at", now_iso)
+            await pipe.execute()
+        except Exception as exc:
+            logger.debug("Redis error recording activity for %s: %s", clean_email, exc)
+
+    async with _user_store_lock:
+        activity = _user_activity.setdefault(clean_email, {})
+        activity["annotation_count"] = int(activity.get("annotation_count") or 0) + max(1, count)
+        activity["last_annotation_at"] = now_iso
+
+
+async def record_login_profile(user: AuthenticatedUser) -> UserProfile:
+    """Persist the authorization profile for a login admitted without JIT provisioning.
+
+    Sessions are authorized against the stored profile on every request, so
+    every admitted login needs one. Admission itself is unchanged (no approval
+    gate here): a new user is stored active with the IdP-derived role. A
+    returning user keeps their stored status, so an administrator's
+    pending/disabled sticks, and takes the IdP role, which is authoritative
+    when JIT provisioning is off.
+    """
+    clean_email = user.email.strip().lower()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    existing = await get_user_profile(clean_email)
+    if existing is None:
+        profile = UserProfile(
+            email=clean_email,
+            name=user.name or clean_email,
+            picture=user.picture,
+            domain=user.domain,
+            role=user.role,
+            status="active",
+            provider=user.provider,
+            groups=user.groups,
+            first_login_at=now_iso,
+            last_login_at=now_iso,
+        )
+    else:
+        profile = existing.model_copy(
             update={
-                "annotation_count": profile.annotation_count + max(1, count),
-                "last_annotation_at": now_iso,
+                "name": user.name or existing.name,
+                "picture": user.picture or existing.picture,
+                "role": user.role,
+                "groups": user.groups,
+                "last_login_at": now_iso,
+                "login_count": existing.login_count + 1,
             }
         )
-        await save_user_profile(updated)
+    await save_user_profile(profile)
+    return profile
 
 
 # ---------------------------------------------------------------------------
@@ -425,18 +519,15 @@ def decode_session_token(token: str) -> Optional[AuthenticatedUser]:
             logger.warning("Session token rejected for %s: %s", email, reason)
             return None
 
-        status_val = payload.get("status", "active")
-        if status_val != "active":
-            logger.warning("Session rejected for %s: account status is %s", email, status_val)
-            return None
-
+        # role/status are login-time snapshots, informational only: session
+        # requests are authorized with the live profile's (_verify_session).
         return AuthenticatedUser(
             email=email,
             name=payload.get("name") or email,
             picture=payload.get("picture"),
             domain=payload.get("domain") or email.split("@")[-1],
             role=payload.get("role", settings.jit_default_role),
-            status=status_val,
+            status=payload.get("status", "active"),
             provider=payload.get("provider", "google"),
             groups=payload.get("groups", []),
         )
@@ -783,10 +874,6 @@ async def _verify_session(token: str) -> Tuple[Optional[AuthenticatedUser], Opti
         return None, "unavailable"
 
     if profile is None:
-        if claims.provider == "keycloak" and not settings.jit_provisioning_enabled:
-            # Keycloak logins without JIT provisioning never write a profile;
-            # the IdP's claims are the only record to authorize against.
-            return claims, None
         logger.warning("Session rejected for %s: user profile no longer exists", claims.email)
         return None, "invalid"
 
@@ -812,8 +899,10 @@ async def resolve_session_user(request: Request) -> Optional[AuthenticatedUser]:
         if not token:
             cached = (None, None)
         elif not settings.auth_enabled:
-            # Auth disabled: nothing to authorize against, keep the token's claims.
-            cached = (decode_session_token(token), None)
+            # Auth disabled: nothing to authorize against, so keep the token's
+            # claims (and its pre-existing rejection of inactive snapshots).
+            claims = decode_session_token(token)
+            cached = (claims if claims and claims.status == "active" else None, None)
         else:
             cached = await _verify_session(token)
         setattr(request.state, _SESSION_STATE_ATTR, cached)

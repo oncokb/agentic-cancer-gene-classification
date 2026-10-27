@@ -58,6 +58,7 @@ from src.auth import (
     parse_keycloak_user,
     parse_saml_response,
     provision_or_update_user,
+    record_login_profile,
     record_user_annotation_activity,
     render_access_denied_html,
     require_admin,
@@ -237,7 +238,8 @@ async def no_cache_static(request: Request, call_next):
 
 @app.middleware("http")
 async def user_context_middleware(request: Request, call_next):
-    user = await get_request_user(request)
+    # Public static assets need no identity; skip the per-request profile read.
+    user = None if request.url.path.startswith("/static/") else await get_request_user(request)
     if not user:
         header_val = request.headers.get(settings.datadog_user_id_header)
         if header_val and header_val.strip():
@@ -1153,7 +1155,7 @@ async def auth_callback_google(
         domain=profile.domain,
         role=profile.role,
         status=profile.status,
-        provider=profile.provider,
+        provider="google",
         groups=profile.groups,
     )
     session_token = create_session_token(user)
@@ -1273,7 +1275,7 @@ async def auth_saml_acs(request: Request) -> Response:
         domain=profile.domain,
         role=profile.role,
         status=profile.status,
-        provider=profile.provider,
+        provider="saml",
         groups=profile.groups,
     )
     session_token = create_session_token(user)
@@ -1384,7 +1386,8 @@ async def auth_callback_keycloak(
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
-    # JIT Provisioning
+    # JIT Provisioning. Without it, admission is unchanged but the login still
+    # stores the authorization profile that every session request checks.
     if settings.jit_provisioning_enabled:
         profile = await provision_or_update_user(
             email=user.email,
@@ -1395,16 +1398,18 @@ async def auth_callback_keycloak(
             role=user.role,
             groups=user.groups,
         )
-        if profile.status == "pending":
-            return HTMLResponse(
-                render_access_denied_html(
-                    email=user.email,
-                    reason="Your account has been provisioned but is pending administrator approval before access is granted.",
-                ),
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        user.role = profile.role
-        user.status = profile.status
+    else:
+        profile = await record_login_profile(user)
+    if profile.status == "pending":
+        return HTMLResponse(
+            render_access_denied_html(
+                email=user.email,
+                reason="Your account has been provisioned but is pending administrator approval before access is granted.",
+            ),
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    user.role = profile.role
+    user.status = profile.status
 
     session_token = create_session_token(user)
     response = RedirectResponse(url=redirect_to, status_code=status.HTTP_303_SEE_OTHER)
