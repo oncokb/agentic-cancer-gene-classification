@@ -176,6 +176,13 @@ class GeneQueryResponse(BaseModel):
     run_id: str = Field(..., description="ID of the saved annotation run.")
     view_url: str = Field(..., description="Absolute link that opens the full run in the ACGC UI (requires login).")
     results: List[GeneRationale] = Field(default_factory=list, description="One entry per annotated gene.")
+    warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Request-level warnings for the saved run, such as conflicting tumor types "
+            "or fusion-like notation. Same list as AnnotationResult.warnings."
+        ),
+    )
 
 
 class GeneQueryJobCreateResponse(BaseModel):
@@ -197,6 +204,13 @@ class GeneQueryJobStatusResponse(BaseModel):
     view_url: Optional[str] = Field(default=None, description="Link to the full run in the UI, once complete.")
     results: List[GeneRationale] = Field(
         default_factory=list, description="Slim results for genes completed so far."
+    )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Request-level warnings for the saved run, such as conflicting tumor types "
+            "or fusion-like notation. Same list as AnnotationResult.warnings."
+        ),
     )
     error: Optional[str] = Field(default=None, description="Generic failure message when `status` is `failed`.")
 
@@ -365,6 +379,7 @@ def _response(http_request: Request, result: AnnotationResult) -> GeneQueryRespo
         run_id=result.run_id,
         view_url=_app()._run_view_url(http_request, result.run_id),
         results=[to_gene_rationale(annotation) for annotation in result.annotations],
+        warnings=result.warnings,
     )
 
 
@@ -436,6 +451,7 @@ async def get_gene_query_job(
         run_id=run_id,
         view_url=app._run_view_url(http_request, run_id) if run_id else None,
         results=[to_gene_rationale(annotation) for annotation in job.annotations],
+        warnings=job.result.warnings if job.status == "complete" and job.result else [],
         error=GENERIC_FAILURE if job.status == "failed" else None,
     )
 

@@ -460,6 +460,21 @@ def test_collision_in_job_reports_tumor_type_the_pipeline_used(
     assert _reported(body) == {gene: real_pipeline["used"][gene]} == {gene: expected}
 
 
+@pytest.mark.parametrize("route", ["sync", "job"])
+def test_tumor_type_warning_returned_and_matches_saved_run(client, real_pipeline, route):
+    genes = [{"gene": "MOZ", "tumor_type": "AML"}, {"gene": "KAT6A", "tumor_type": "LUAD"}]
+
+    if route == "sync":
+        body = client.post("/v1/genes/query", json={"genes": genes}).json()
+    else:
+        created = client.post("/v1/genes/query/jobs", json={"genes": genes})
+        body = _poll(client, created.json()["status_url"])
+        assert body["status"] == "complete"
+
+    assert body["warnings"] == ["KAT6A: using tumor type 'LUAD'; ignored tumor types: 'AML'."]
+    assert main.app.state.run_store.saved_runs[-1][3]["warnings"] == body["warnings"]
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("route", ["sync", "job"])
 def test_cached_annotation_reports_tumor_type_the_pipeline_used(client, real_pipeline, reverse, route):

@@ -120,16 +120,19 @@ Accepted gene identifiers for the gene query API:
       "cached_at": "2026-10-01T14:03:11+00:00",
       "error": null
     }
-  ]
+  ],
+  "warnings": []
 }
 ```
 
 `GET /v1/genes/{symbol}` returns the same shape, with one entry in `results`.
+`warnings` is the run-level list described under [annotate warnings](#post-v1annotate).
 
 | Field | Meaning |
 | --- | --- |
 | `run_id` | ID of the saved run that holds these results. |
 | `view_url` | Link to the full report in the ACGC web app. Whoever opens it signs in first if they aren't already, then lands on the report. |
+| `warnings` | Run-level warnings, such as conflicting tumor types or fusion-like notation. Empty when there are none. |
 | `gene` | The gene symbol ACGC classified. This can differ from what you sent, for example when an Ensembl ID or an old alias resolves to the current symbol. |
 | `tumor_type` | The tumor type the classification actually used, or `null`. |
 | `cancer_associated` | Whether ACGC classifies the gene as cancer-associated. |
@@ -175,6 +178,7 @@ curl -s "https://acgc.oncokb.org/v1/genes/query/jobs/$JOB_ID" \
   "run_id": "...",
   "view_url": "https://acgc.oncokb.org/?run=...",
   "results": [ ... ],
+  "warnings": [],
   "error": null
 }
 ```
@@ -182,7 +186,8 @@ curl -s "https://acgc.oncokb.org/v1/genes/query/jobs/$JOB_ID" \
 - `status` is `queued`, `running`, `complete` or `failed`.
 - `genes_completed` and `genes_total` show progress. `results` fills in as
   genes finish.
-- `run_id` and `view_url` are set only once `status` is `complete`.
+- `run_id`, `view_url` and `warnings` are set only once `status` is `complete`;
+  `warnings` has the same meaning as in `POST /v1/genes/query`.
 - If `status` is `failed`, `error` holds a short message. Start a new job to
   retry.
 
@@ -457,6 +462,24 @@ That is the same link format the app uses (`_run_view_url` in `src/main.py`).
 `fusion_evidence` is populated if the annotation request set
 `include_fusion_evidence: true` or a fusion-evidence job successfully attached
 it to this run; otherwise it is `[]`. An unknown `run_id` returns `404`.
+
+### `POST /v1/annotate/gene`
+
+Annotate one gene and return its full `GeneAnnotation` fields, plus the saved
+run's `run_id` and a `view_url`. The request body takes `gene` and an optional
+`tumor_type`:
+
+```bash
+curl -s -X POST https://acgc.oncokb.org/v1/annotate/gene \
+  -H "Authorization: Bearer $ACGC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"gene": "ALK", "tumor_type": "LUAD"}'
+```
+
+The response also includes the run-level `warnings` list, with the same shape
+and meaning as `POST /v1/annotate`; it is `[]` when there are none. Because
+this endpoint takes one input, its warnings are normally about notation (for
+example `EWSR1-FLI1`), not conflicting tumor types.
 
 ### Batch workflow
 
