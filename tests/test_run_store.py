@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import aiomysql
 import pytest
 
-from src.config import settings
+from src.config import Settings, settings
 from src.models.schema import GeneAnnotation
 from src.pipeline.run_store import (
     RunStore,
@@ -22,6 +22,66 @@ from src.pipeline.run_store import (
     _parse_jdbc_mysql_host_port,
     summarize_run_inputs,
 )
+
+
+async def test_create_pool_uses_configured_limits(monkeypatch):
+    passed = {}
+    pool = object()
+
+    async def fake_create_pool(**kwargs):
+        passed.update(kwargs)
+        return pool
+
+    async def skip_schema(self):
+        pass
+
+    monkeypatch.setattr("src.pipeline.run_store.aiomysql.create_pool", fake_create_pool)
+    monkeypatch.setattr(RunStore, "_ensure_schema", skip_schema)
+    monkeypatch.setattr(settings, "mysql_pool_minsize", 2)
+    monkeypatch.setattr(settings, "mysql_pool_maxsize", 17)
+    monkeypatch.setattr(settings, "mysql_pool_recycle_seconds", 7200)
+
+    store = await RunStore.create()
+
+    assert store._pool is pool
+    assert passed == {
+        **_mysql_connection_kwargs(),
+        "autocommit": True,
+        "minsize": 2,
+        "maxsize": 17,
+        "pool_recycle": 7200,
+    }
+
+
+def test_pool_settings_defaults():
+    fields = Settings.model_fields
+    assert fields["mysql_pool_minsize"].default == 1
+    assert fields["mysql_pool_maxsize"].default == 10
+    assert fields["mysql_pool_recycle_seconds"].default == 3600
+
+
+def test_mysql_pool_maxsize_reads_environment_variable(monkeypatch):
+    monkeypatch.setenv("MYSQL_POOL_MAXSIZE", "17")
+    assert Settings(_env_file=None).mysql_pool_maxsize == 17
+
+
+def test_mysql_pool_minsize_cannot_exceed_maxsize(monkeypatch):
+    monkeypatch.setenv("MYSQL_POOL_MINSIZE", "18")
+    monkeypatch.setenv("MYSQL_POOL_MAXSIZE", "17")
+    with pytest.raises(ValueError, match="MYSQL_POOL_MINSIZE.*MYSQL_POOL_MAXSIZE"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("recycle_seconds", [-1, 1])
+def test_mysql_pool_recycle_accepts_disabled_or_positive(monkeypatch, recycle_seconds):
+    monkeypatch.setenv("MYSQL_POOL_RECYCLE_SECONDS", str(recycle_seconds))
+    assert Settings(_env_file=None).mysql_pool_recycle_seconds == recycle_seconds
+
+
+def test_mysql_pool_recycle_rejects_zero(monkeypatch):
+    monkeypatch.setenv("MYSQL_POOL_RECYCLE_SECONDS", "0")
+    with pytest.raises(ValueError, match="MYSQL_POOL_RECYCLE_SECONDS"):
+        Settings(_env_file=None)
 
 
 def test_parse_jdbc_mysql_host_port_bare():
