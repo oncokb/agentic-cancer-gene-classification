@@ -93,6 +93,12 @@ const elements = {
   shareRun: document.querySelector("#share-run"),
   appShell: document.querySelector(".app-shell"),
   geneIndex: document.querySelector("#gene-index"),
+  geneIndexPanel: document.querySelector("#gene-index-panel"),
+  geneIndexFilter: document.querySelector("#gene-index-filter"),
+  geneIndexFilterLabel: document.querySelector("#gene-index-filter-label"),
+  geneIndexFilterClear: document.querySelector("#gene-index-filter-clear"),
+  geneIndexFilterCount: document.querySelector("#gene-index-filter-count"),
+  geneIndexNoMatches: document.querySelector("#gene-index-no-matches"),
   openFeedback: document.querySelector("#open-feedback"),
   closeFeedback: document.querySelector("#close-feedback"),
   feedbackModal: document.querySelector("#feedback-modal"),
@@ -455,6 +461,7 @@ function clearQueue() {
 
 function clearResults() {
   resetFusionEvidenceSections();
+  resetGeneIndexFilters();
   state.currentResult = null;
   state.resultsViewMode = "results";
   state.fusionEvidenceStatus = null;
@@ -936,6 +943,7 @@ async function runAnnotation() {
   }
 
   resetFusionEvidenceSections();
+  resetGeneIndexFilters();
 
   // Collapse the expanded batch sidebar so results have room
   document.body.classList.remove("batch-active");
@@ -1243,6 +1251,7 @@ async function loadSharedRun() {
       state.fusionEvidenceStatus = "complete";
     }
     resetFusionEvidenceSections();
+    resetGeneIndexFilters();
     state.currentResult = result;
     renderAnnotationResult(result);
     setMessage("Shared run restored.", "info");
@@ -1303,20 +1312,67 @@ async function runBenchmark() {
 // ---------------------------------------------------------------------------
 
 let _geneObserver = null;
+// The rendered sidebar entries ({ btn, heading, haystack, label }) the
+// filter box toggles; filtering never touches the result cards themselves.
+let _geneIndexEntries = [];
+let _geneIndexFilterTimer = null;
+// Filter text per results tab. Survives redraws (polling re-renders the
+// cards and sidebar every few seconds); reset only when a new run loads,
+// results are cleared, or a shared run is opened — see resetGeneIndexFilters.
+const _geneIndexFilters = { results: "", noresult: "", fusion: "" };
+const GENE_INDEX_FILTER_DEBOUNCE_MS = 80;
+
+function resetGeneIndexFilters() {
+  Object.keys(_geneIndexFilters).forEach((mode) => { _geneIndexFilters[mode] = ""; });
+  clearTimeout(_geneIndexFilterTimer);
+  _geneIndexFilterTimer = null;
+  syncGeneIndexFilterInput();
+}
+
+function geneIndexFilterMode() {
+  return state.resultsViewMode in _geneIndexFilters ? state.resultsViewMode : "results";
+}
+
+// Lowercase and fold fusion separators ("::", "-", "/", whitespace) to one
+// space, so "eml4 alk", "EML4-ALK" and "EML4::ALK" compare equal. Matching
+// is plain substring search on the result — the query never becomes a regex.
+function normalizeGeneIndexText(value) {
+  return String(value ?? "").toLowerCase().replace(/[\s:/-]+/g, " ").trim();
+}
+
+function syncGeneIndexFilterInput() {
+  const mode = geneIndexFilterMode();
+  const value = _geneIndexFilters[mode];
+  const label = mode === "fusion" ? "Filter fusions" : "Filter genes";
+  // Only write when it differs so a redraw mid-typing keeps the caret.
+  if (elements.geneIndexFilter.value !== value) elements.geneIndexFilter.value = value;
+  elements.geneIndexFilter.placeholder = label;
+  elements.geneIndexFilterLabel.textContent = label;
+  elements.geneIndexFilterClear.hidden = !value;
+}
 
 function rebuildGeneIndex(entries) {
   if (_geneObserver) _geneObserver.disconnect();
   _geneObserver = null;
+  _geneIndexEntries = [];
   elements.geneIndex.replaceChildren();
-  if (!entries || !entries.length) return;
+  elements.geneIndexPanel.classList.toggle("hidden", !entries || !entries.length);
+  syncGeneIndexFilterInput();
+  if (!entries || !entries.length) {
+    applyGeneIndexFilter();
+    return;
+  }
 
   let previousSection;
-  entries.forEach(({ targetId, label, count, section }) => {
+  let heading = null;
+  entries.forEach(({ targetId, label, count, section, searchTerms }) => {
     if (section && section !== previousSection) {
-      const heading = document.createElement("div");
+      heading = document.createElement("div");
       heading.className = "fusion-index-section";
       heading.textContent = section;
       elements.geneIndex.appendChild(heading);
+    } else if (!section) {
+      heading = null;
     }
     previousSection = section;
     const btn = document.createElement("button");
@@ -1347,9 +1403,91 @@ function rebuildGeneIndex(entries) {
       card.scrollIntoView({ behavior: "smooth", block: "start" });
     });
     elements.geneIndex.appendChild(btn);
+    // One string per term, joined by a character the normalizer never emits,
+    // so a query cannot match across two terms.
+    const haystack = [label, ...(searchTerms || [])].map(normalizeGeneIndexText).join("\n");
+    _geneIndexEntries.push({ btn, heading, haystack, label: normalizeGeneIndexText(label) });
   });
 
+  applyGeneIndexFilter();
   observeGeneCards();
+}
+
+// Show only the sidebar entries matching the current tab's filter, hide
+// section headings left without entries, and update the count / No matches.
+function applyGeneIndexFilter() {
+  const query = normalizeGeneIndexText(_geneIndexFilters[geneIndexFilterMode()]);
+  const visibleHeadings = new Set();
+  let shown = 0;
+  _geneIndexEntries.forEach((entry) => {
+    const match = !query || entry.haystack.includes(query);
+    entry.btn.hidden = !match;
+    if (match) {
+      shown += 1;
+      if (entry.heading) visibleHeadings.add(entry.heading);
+    }
+  });
+  _geneIndexEntries.forEach(({ heading }) => {
+    if (heading) heading.hidden = !visibleHeadings.has(heading);
+  });
+  const filtering = Boolean(query) && _geneIndexEntries.length > 0;
+  elements.geneIndexFilterCount.textContent = filtering ? `${shown} of ${_geneIndexEntries.length}` : "";
+  elements.geneIndexNoMatches.hidden = !filtering || shown > 0;
+  return shown;
+}
+
+function setGeneIndexFilter(value) {
+  _geneIndexFilters[geneIndexFilterMode()] = value;
+  elements.geneIndexFilterClear.hidden = !value;
+  clearTimeout(_geneIndexFilterTimer);
+  _geneIndexFilterTimer = null;
+}
+
+function onGeneIndexFilterInput() {
+  setGeneIndexFilter(elements.geneIndexFilter.value);
+  _geneIndexFilterTimer = setTimeout(() => {
+    _geneIndexFilterTimer = null;
+    applyGeneIndexFilter();
+  }, GENE_INDEX_FILTER_DEBOUNCE_MS);
+}
+
+function clearGeneIndexFilter() {
+  elements.geneIndexFilter.value = "";
+  setGeneIndexFilter("");
+  applyGeneIndexFilter();
+}
+
+// Enter: jump to the first match — preferring an exact name, then a name
+// containing the query, over a hit on a related term (e.g. "eml" finds EML4
+// before ALK via EML4::ALK) — through the entry's own click handler, which
+// also opens a collapsed fusion section. Escape: clear the filter.
+function onGeneIndexFilterKeydown(event) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    clearGeneIndexFilter();
+    return;
+  }
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  setGeneIndexFilter(elements.geneIndexFilter.value);
+  applyGeneIndexFilter();
+  const query = normalizeGeneIndexText(elements.geneIndexFilter.value);
+  const matches = _geneIndexEntries.filter((entry) => !entry.btn.hidden);
+  const target = matches.find((entry) => entry.label === query)
+    || matches.find((entry) => entry.label.includes(query))
+    || matches[0];
+  if (!target) return;
+  target.btn.click();
+  _geneIndexEntries.forEach(({ btn }) => btn.classList.toggle("active", btn === target.btn));
+}
+
+function bindGeneIndexFilter() {
+  elements.geneIndexFilter.addEventListener("input", onGeneIndexFilterInput);
+  elements.geneIndexFilter.addEventListener("keydown", onGeneIndexFilterKeydown);
+  elements.geneIndexFilterClear.addEventListener("click", () => {
+    clearGeneIndexFilter();
+    elements.geneIndexFilter.focus();
+  });
 }
 
 function observeGeneCards() {
@@ -1650,9 +1788,7 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex(visibleAnnotations.map((item) => ({
-    targetId: `gene-${item.gene}`, label: item.gene,
-  })));
+  rebuildGeneIndex(visibleAnnotations.map(geneIndexEntryForAnnotation));
 }
 
 function renderNoResultView(hiddenAnnotations) {
@@ -1716,9 +1852,21 @@ function renderNoResultView(hiddenAnnotations) {
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex(hiddenAnnotations.map((item) => ({
-    targetId: `gene-${item.gene}`, label: item.gene,
-  })));
+  rebuildGeneIndex(hiddenAnnotations.map(geneIndexEntryForAnnotation));
+}
+
+// Besides the symbol, a gene's sidebar entry is findable by the fusions it
+// came from and by any submitted input the server rewrote to it (the
+// "— from ENST…/NM_…" note on its card).
+function geneIndexEntryForAnnotation(annotation) {
+  const submitted = (annotation.resolved_inputs || [])
+    .filter((entry) => entry && entry.input && entry.input !== entry.resolved)
+    .map((entry) => entry.input);
+  return {
+    targetId: `gene-${annotation.gene}`,
+    label: annotation.gene,
+    searchTerms: [...(annotation.fusions || []), ...submitted],
+  };
 }
 
 let _fusionSectionResultKey = null;
@@ -1805,6 +1953,7 @@ function renderFusionEvidenceView(fusionEvidence) {
       cards.appendChild(card);
       indexEntries.push({
         targetId: card.id, label: item.fusion, count: fusionEvidencePmidCount(item), section: label,
+        searchTerms: item.input ? [item.input] : [],
       });
     });
     section.appendChild(cards);
@@ -3838,6 +3987,7 @@ function escapeAttr(value) {
 
 function bindEvents() {
   elements.runButton.addEventListener("click", runAnnotation);
+  bindGeneIndexFilter();
   elements.runBenchmarkButton.addEventListener("click", runBenchmark);
   elements.navAnnotate.addEventListener("click", () => switchView("annotate"));
   elements.navBenchmark.addEventListener("click", () => switchView("benchmark"));

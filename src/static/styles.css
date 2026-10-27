@@ -437,17 +437,101 @@ textarea {
   margin-top: 16px;
 }
 
-.gene-index {
+/* Search box on top, list below: only the list scrolls, so the box stays put. */
+.gene-index-panel {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  width: 130px;
+  gap: 4px;
+  width: 140px;
   flex-shrink: 0;
+  min-height: 0;
+}
+
+.gene-index-search {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.gene-index-search input {
+  width: 100%;
+  min-height: 0;
+  padding: 5px 24px 5px 8px;
+  font-size: 12px;
+}
+
+/* The custom × replaces the browser's own search clear control. */
+.gene-index-search input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.gene-index-filter-clear {
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  transform: translateY(-50%);
+  min-height: 0;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.gene-index-filter-clear:hover {
+  background: var(--surface-strong);
+  color: var(--text);
+}
+
+.gene-index-filter-clear[hidden] {
+  display: none;
+}
+
+.gene-index-filter-count {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--muted);
+  padding: 0 8px;
+}
+
+.gene-index-filter-count:empty {
+  display: none;
+}
+
+.gene-index-no-matches {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.gene-index-no-matches[hidden] {
+  display: none;
+}
+
+.gene-index {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
   overflow-y: auto;
   padding: 4px 0;
 }
 
 .gene-index:empty {
+  display: none;
+}
+
+/* Filtered-out entries and emptied section headings (several of these set
+   display: flex, which would otherwise beat the hidden attribute). */
+.gene-index [hidden] {
   display: none;
 }
 
@@ -1891,10 +1975,21 @@ details[open] > .retrieval-summary::after {
     flex-direction: column;
   }
 
+  .gene-index-panel {
+    width: auto;
+  }
+
+  .gene-index-search {
+    max-width: 320px;
+  }
+
+  /* Cap the wrapped list's height so it scrolls under the search box
+     instead of pushing the results far down the page. */
   .gene-index {
     flex-direction: row;
-    width: auto;
     flex-wrap: wrap;
+    align-content: flex-start;
+    max-height: 40vh;
     overflow-x: auto;
   }
 
