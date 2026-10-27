@@ -16,6 +16,7 @@ from src.pipeline.run_store import RunStore
 from src.pipeline.user_store import (
     LoginIdentity,
     UserNotFound,
+    UserRecord,
     decode_id_cursor,
     decode_user_cursor,
     encode_id_cursor,
@@ -23,6 +24,8 @@ from src.pipeline.user_store import (
     escape_like,
 )
 from src.pipeline.user_store_fake import FakeUserStore
+
+T = datetime(2026, 10, 1, tzinfo=timezone.utc)
 
 
 class _BrokenPool:
@@ -43,6 +46,14 @@ class _BrokenPool:
         ),
         lambda s: s.set_role("a@x.example", "curator", actor="b@x.example"),
         lambda s: s.incr_activity("a@x.example", 1),
+        lambda s: s.import_user(
+            UserRecord(
+                email="a@x.example", name="A", picture=None, domain="x.example", provider="google",
+                status="active", role="curator", role_updated_by=None, role_updated_at=None,
+                groups=[], claims={}, first_login_at=T, last_login_at=T, login_count=1,
+                annotation_count=0, last_annotation_at=None, created_at=T, updated_at=T,
+            )
+        ),
         lambda s: s.list_users(),
         lambda s: s.count_admins(),
         lambda s: s.create_curator_request("a@x.example", reason="r", affiliation="a", expertise="e"),

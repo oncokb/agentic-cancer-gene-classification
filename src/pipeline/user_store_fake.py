@@ -45,6 +45,7 @@ from src.pipeline.user_store import (
     normalize_email,
     normalize_groups,
     normalize_name,
+    prepare_import,
     search_key,
     to_utc,
     utc_now,
@@ -133,6 +134,15 @@ class FakeUserStore:
                 )
             self._users[email] = user
             return copy.deepcopy(user)
+
+    async def import_user(self, user: UserRecord) -> bool:
+        user = prepare_import(user)
+        self._check_available("import_user")
+        async with self._lock:
+            if user.email in self._users:
+                return False
+            self._users[user.email] = user
+            return True
 
     def _apply_user_field(
         self,

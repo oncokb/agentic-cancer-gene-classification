@@ -33,7 +33,7 @@ import json
 import logging
 import unicodedata
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Tuple
 
@@ -283,6 +283,8 @@ class UserStore(Protocol):
         at: Optional[datetime] = None,
     ) -> UserRecord: ...
 
+    async def import_user(self, user: UserRecord) -> bool: ...
+
     async def set_role(
         self, email: str, role: str, *, actor: str, reason: Optional[str] = None,
         request_id: Optional[int] = None,
@@ -407,6 +409,33 @@ def check_status(status: str) -> str:
     if status not in STATUSES:
         raise ValueError(f"Unknown status {status!r}; expected one of {STATUSES}")
     return status
+
+
+def prepare_import(user: UserRecord) -> UserRecord:
+    """A complete user row for import_user, normalized like upsert_login
+    (email, name, groups, claims, UTC times) and validated before any
+    storage access; ValueError for anything the users table would reject."""
+    email = normalize_email(user.email)
+    check_role(user.role)
+    check_status(user.status)
+    if user.login_count < 0 or user.annotation_count < 0:
+        raise ValueError("login_count and annotation_count must not be negative")
+    return replace(
+        user,
+        email=email,
+        name=normalize_name(user.name) or email,
+        picture=user.picture or None,
+        domain=user.domain or email.split("@")[-1],
+        role_updated_by=None if user.role_updated_by is None else normalize_actor(user.role_updated_by),
+        role_updated_at=None if user.role_updated_at is None else to_utc(user.role_updated_at),
+        groups=normalize_groups(user.groups),
+        claims=normalize_claims(user.claims),
+        first_login_at=to_utc(user.first_login_at),
+        last_login_at=to_utc(user.last_login_at),
+        last_annotation_at=None if user.last_annotation_at is None else to_utc(user.last_annotation_at),
+        created_at=to_utc(user.created_at),
+        updated_at=to_utc(user.updated_at),
+    )
 
 
 def check_limit(limit: int) -> int:
@@ -660,6 +689,44 @@ class UserStoreMixin:
         if user is None:
             raise UserStoreUnavailable(f"User {email} missing right after upsert")
         return user
+
+    async def import_user(self, user: UserRecord) -> bool:
+        """Insert a complete user row (counters and timestamps as given) unless
+        the email already exists; True when inserted. An existing row is never
+        modified. For one-off migrations; logins go through upsert_login."""
+        user = prepare_import(user)
+        params = (
+            user.email, user.name, search_key(user.name), search_key(user.email), user.picture,
+            user.domain, user.provider, user.status, user.role, user.role_updated_by,
+            _to_db(user.role_updated_at), to_json(user.groups, "groups"),
+            to_json(user.claims, "claims"), _to_db(user.first_login_at),
+            _to_db(user.last_login_at), user.login_count, user.annotation_count,
+            _to_db(user.last_annotation_at), _to_db(user.created_at), _to_db(user.updated_at),
+        )
+        async with _store_errors("import_user"):
+            try:
+                async with self._pool.acquire() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(
+                            """
+                            INSERT INTO users (
+                                email, name, name_search, email_search, picture, domain,
+                                provider, status, role, role_updated_by, role_updated_at,
+                                groups_json, claims_json, first_login_at, last_login_at,
+                                login_count, annotation_count, last_annotation_at, created_at,
+                                updated_at
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s
+                            )
+                            """,
+                            params,
+                        )
+            except pymysql.err.IntegrityError as exc:
+                if exc.args and exc.args[0] == _ER_DUP_ENTRY:
+                    return False
+                raise
+        return True
 
     async def _set_user_field(
         self,
