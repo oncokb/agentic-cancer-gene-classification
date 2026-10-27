@@ -40,7 +40,7 @@ from src.models.schema import (
     LiteraturePaperScore,
     LiteratureRecord,
 )
-from src.pipeline.normalization import has_ensembl_identifier, read_gene_input, resolve_gene, split_fusion
+from src.pipeline.normalization import has_accession_identifier, read_gene_input, resolve_gene, split_fusion
 from src.pipeline.cache import cached_call
 from src.pipeline.llm_client import (
     complete_with_tool,
@@ -949,8 +949,8 @@ async def retrieve_fusion_evidence(
 ) -> FusionEvidenceResult:
     """Return deterministic fusion-level PubMed evidence for exact gene-pair queries."""
     submitted = fusion
-    if has_ensembl_identifier(fusion):
-        # PubMed knows symbols, not Ensembl IDs: query the resolved pair.
+    if has_accession_identifier(fusion):
+        # PubMed knows symbols, not Ensembl IDs or RefSeq accessions: query the resolved pair.
         reading = await read_gene_input(fusion)
         if reading.errors:
             return FusionEvidenceResult(

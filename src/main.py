@@ -106,7 +106,7 @@ from src.pipeline.fusion_context import annotate_fusion_position_contexts, parse
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline import openevidence_metrics as oe_metrics
-from src.pipeline.normalization import has_ensembl_identifier, is_fusion_input, read_gene_input
+from src.pipeline.normalization import has_accession_identifier, is_fusion_input, read_gene_input
 from src.pipeline.openevidence import (
     OpenEvidenceClient,
     claim_lookup,
@@ -1887,8 +1887,8 @@ async def fusion_context(
 
     fusion = request.fusion
     five_transcript, three_transcript = request.five_transcript, request.three_transcript
-    if has_ensembl_identifier(fusion):
-        # ENST...::ENST... or GENE(ENST...)::GENE(ENST...): annotate the resolved
+    if has_accession_identifier(fusion):
+        # ENST...::ENST..., GENE(ENST...)::GENE(NM_...) and the like: annotate the resolved
         # genes, taking each partner's transcript unless one was given explicitly.
         reading = await read_gene_input(fusion)
         if reading.errors:
