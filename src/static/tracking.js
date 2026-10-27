@@ -50,11 +50,31 @@
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
-  const idOrNull = (value, max) => {
-    if (value === null || value === undefined || value === "") return null;
-    const text = String(value);
-    return text.length <= max ? text : null;
+  // Field rules from docs/ui-events.md (mirrored by the server's
+  // validator): anything that doesn't fit is sent as null, never as-is.
+  const SYMBOL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+  const UUID4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const ITEM_ID = /^[A-Za-z0-9_.:-]{1,32}$/;
+  const FLAG_KEY = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
+  const FLAG_VARIANT = /^[A-Za-z0-9_.-]{1,32}$/;
+  const SUBJECT_RULES = {
+    gene: (id) => SYMBOL.test(id),
+    fusion: (id) => {
+      const parts = id.split("::");
+      return parts.length === 2 && parts.every((part) => SYMBOL.test(part));
+    },
+    run: (id) => UUID4.test(id),
   };
+
+  const matchOrNull = (value, valid) => {
+    if (typeof value !== "string" && typeof value !== "number") return null;
+    const text = String(value);
+    return valid(text) ? text : null;
+  };
+  const subjectIdOrNull = (kind, value) =>
+    SUBJECT_RULES[kind] ? matchOrNull(value, (id) => id.length <= 64 && SUBJECT_RULES[kind](id)) : null;
+  const runIdOrNull = (value) => matchOrNull(value, (id) => UUID4.test(id));
+  const itemIdOrNull = (value) => matchOrNull(value, (id) => ITEM_ID.test(id));
   const intOrNull = (value) => (Number.isInteger(value) && value >= 0 ? value : null);
   const boolOrNull = (value) => (typeof value === "boolean" ? value : null);
 
@@ -140,8 +160,8 @@
         const out = {};
         for (const key of keys) {
           const flag = value[key];
-          const variant = idOrNull(flag && flag.variant, 32);
-          if (variant === null || !Number.isInteger(flag.version)) return null;
+          const variant = matchOrNull(flag && flag.variant, (v) => FLAG_VARIANT.test(v));
+          if (!FLAG_KEY.test(key) || variant === null || !Number.isInteger(flag.version)) return null;
           out[key] = { variant, version: flag.version };
         }
         return out;
@@ -156,7 +176,9 @@
       const type = desc.type;
       const stateValue = STATES[type] ? desc.state : null;
       if (!TYPES.has(type) || !SURFACES.has(desc.surface) || !SECTIONS.has(desc.section)) return null;
-      if (STATES[type] && !STATES[type].has(stateValue) && !(type === "state" && stateValue == null)) return null;
+      if (STATES[type] && !STATES[type].has(stateValue)) return null;
+      // State transitions exist only for the OpenEvidence card.
+      if (type === "state" && desc.section !== "openevidence") return null;
       const subjectKind = SUBJECT_KINDS.has(desc.subject_kind) ? desc.subject_kind : "none";
       return {
         event_id: newId(),
@@ -166,9 +188,9 @@
         section: desc.section,
         state: stateValue ?? null,
         subject_kind: subjectKind,
-        subject_id: subjectKind === "none" ? null : idOrNull(desc.subject_id, 64),
-        run_id: idOrNull(desc.run_id !== undefined ? desc.run_id : runId, 64),
-        item_id: idOrNull(desc.item_id, 32),
+        subject_id: subjectIdOrNull(subjectKind, desc.subject_id),
+        run_id: runIdOrNull(desc.run_id !== undefined ? desc.run_id : runId),
+        item_id: itemIdOrNull(desc.item_id),
         position: intOrNull(desc.position),
         display_position: intOrNull(desc.display_position),
         tumor_type_given: boolOrNull(desc.tumor_type_given),

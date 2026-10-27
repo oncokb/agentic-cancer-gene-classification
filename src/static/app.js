@@ -1749,7 +1749,8 @@ function renderAnnotationResult(result) {
     state.resultsViewMode = visibleAnnotations.length > 0
       ? "results"
       : (showFusionTab ? "fusion" : "noresult");
-    uiTrack().event({ type: "state", surface: "global", section: "tab", item_id: state.resultsViewMode });
+    // Automatic fallback (not the user's switch): the tab was offered, not opened.
+    uiTrack().event({ type: "surfaced", surface: "global", section: "tab", item_id: state.resultsViewMode });
   }
   uiTrack().setActiveTab(state.currentView === "annotate" ? state.resultsViewMode : state.currentView);
   elements.tabResultsView.classList.toggle("active", state.resultsViewMode === "results");

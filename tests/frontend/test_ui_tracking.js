@@ -148,6 +148,14 @@ function setup({ enabled = true, fetchImpl, beacon = true } = {}) {
   return { tracker, clock, document, window, io, posts, beacons, queued, sent, all, of };
 }
 
+// Run and job ids are UUID4 (contract: anything else is sent as null).
+const RUN_1 = "1b4e28ba-2fa1-4d2e-9b1c-0a1b2c3d4e5f";
+const RUN_2 = "2c5f39cb-3ab2-4e3f-8c2d-1b2c3d4e5f60";
+const RUN_X = "3d6a4adc-4bc3-4f40-ad3e-2c3d4e5f6071";
+const JOB_1 = "4e7b5bed-5cd4-4051-be4f-3d4e5f607182";
+const JOB_OTHER = "5f8c6cfe-6de5-4162-8f50-4e5f60718293";
+const RUNS = ["6a9d7d0f-7ef6-4273-9061-5f6071829304", "7bae8e10-8f07-4384-a172-607182930415", "8cbf9f21-9018-4495-b283-718293041526"];
+
 const CARD = { surface: "results", subject_kind: "gene", subject_id: "ALK", section: "gene_card", tab: "results", position: 0 };
 
 // ---- tests -----------------------------------------------------------------
@@ -157,7 +165,7 @@ const test = (name, fn) => TESTS.push({ name, fn });
 
 test("surfaced and impression dedupe on the logical key across re-rendered nodes", async () => {
   const t = setup();
-  t.tracker.setRunScope("run-1");
+  t.tracker.setRunScope(RUN_1);
   t.tracker.setActiveTab("results");
   let node = new Node("article");
   for (let render = 0; render < 5; render += 1) {
@@ -173,7 +181,7 @@ test("surfaced and impression dedupe on the logical key across re-rendered nodes
   assert.strictEqual(t.of("impression").length, 1);
   const [impression] = t.of("impression");
   assert.strictEqual(impression.subject_id, "ALK");
-  assert.strictEqual(impression.run_id, "run-1");
+  assert.strictEqual(impression.run_id, RUN_1);
   assert.strictEqual(impression.position, 0);
   assert.ok(!("tab" in impression), "internal tab field must not be sent");
 });
@@ -309,31 +317,31 @@ test("a re-render mid-dwell carries the dwell over to the replacement node", asy
 test("job_id aliases to run_id without resetting dedupe; a new run resets it", async () => {
   const t = setup();
   t.tracker.setActiveTab("results");
-  t.tracker.setRunScope("job-1");
+  t.tracker.setRunScope(JOB_1);
   t.tracker.surfaced(new Node(), CARD);
   await flushMicrotasks();
-  t.tracker.aliasRunScope("job-1", "run-1");
-  t.tracker.setRunScope("run-1");
+  t.tracker.aliasRunScope(JOB_1, RUN_1);
+  t.tracker.setRunScope(RUN_1);
   const node = new Node();
   t.tracker.surfaced(node, CARD);
   await flushMicrotasks();
   assert.strictEqual(t.of("surfaced").length, 1);
-  assert.strictEqual(t.of("surfaced")[0].run_id, "job-1");
+  assert.strictEqual(t.of("surfaced")[0].run_id, JOB_1);
   t.io.report(node, 1);
   await t.clock.advance(1000);
-  assert.strictEqual(t.of("impression")[0].run_id, "run-1", "later events carry the final run id");
-  t.tracker.aliasRunScope("job-other", "run-x"); // not this run's job: ignored
-  t.tracker.setRunScope("run-2");
+  assert.strictEqual(t.of("impression")[0].run_id, RUN_1, "later events carry the final run id");
+  t.tracker.aliasRunScope(JOB_OTHER, RUN_X); // not this run's job: ignored
+  t.tracker.setRunScope(RUN_2);
   t.tracker.surfaced(new Node(), CARD);
   await flushMicrotasks();
   assert.strictEqual(t.of("surfaced").length, 2, "new run surfaces again");
-  assert.strictEqual(t.of("surfaced")[1].run_id, "run-2");
+  assert.strictEqual(t.of("surfaced")[1].run_id, RUN_2);
 });
 
 test("OpenEvidence: loading impression doesn't consume the ready one; states once per transition", async () => {
   const t = setup();
   t.tracker.setActiveTab("results");
-  t.tracker.setRunScope("run-1");
+  t.tracker.setRunScope(RUN_1);
   const oe = { ...CARD, section: "openevidence" };
   const card = new Node("article");
   t.tracker.surfaced(card, oe);
@@ -411,7 +419,7 @@ test("disabled (or a server without the flag) means zero network", async () => {
     },
   ]) {
     const t = make();
-    t.tracker.setRunScope("run-1");
+    t.tracker.setRunScope(RUN_1);
     t.tracker.setActiveTab("results");
     const node = new Node();
     t.tracker.surfaced(node, CARD);
@@ -466,6 +474,128 @@ test("payloads carry only contract fields: no free text, bad values rejected", a
   events.forEach((e) => assert.deepStrictEqual(Object.keys(e).sort(), FIELDS));
   assert.strictEqual(events[1].item_id, null, "over-long ids are nulled, never truncated");
   assert.ok(events.every((e) => e.flags === null));
+});
+
+// One event per value through the real build path; returns the sent field.
+async function sentField(field, cases, base) {
+  const t = setup();
+  cases.forEach(([value]) => t.tracker.event({ type: "click", surface: "results", section: "pmid_link", ...base(value) }));
+  await t.clock.advance(5000);
+  const events = t.sent();
+  assert.strictEqual(events.length, cases.length);
+  cases.forEach(([value, expected], i) => assert.strictEqual(events[i][field], expected, `${field} for ${JSON.stringify(value)}`));
+}
+
+test("subject_id: symbols, canonical fusions and UUID4 run ids pass; anything else is null", async () => {
+  const longSide = "A".repeat(40);
+  await sentField("subject_id", [
+    ["HLA-A", "HLA-A"],
+    ["TP53", "TP53"], // resolved from an ENST input
+    ["ENST00000269305", "ENST00000269305"], // an unresolved Ensembl id is still symbol-shaped
+    ["C11orf95", "C11orf95"],
+    ["NKX2-1.1_x", "NKX2-1.1_x"],
+    ["G".repeat(64), "G".repeat(64)],
+    ["G".repeat(65), null],
+    ["TP53(ENST00000269305)", null],
+    ["my gene", null],
+    ["please look at this gene", null],
+    ["-ALK", null],
+    ["EML4::ALK", null], // a fusion is not a gene symbol
+    ["", null],
+    [null, null],
+  ], (id) => ({ subject_kind: "gene", subject_id: id }));
+  await sentField("subject_id", [
+    ["EML4::ALK", "EML4::ALK"],
+    ["KMT2A::MLLT3", "KMT2A::MLLT3"],
+    ["HLA-A::ROS1", "HLA-A::ROS1"],
+    ["EML4-ALK", null],
+    ["EML4--ALK", null],
+    ["EML4/ALK", null],
+    ["EML4::ALK::RET", null],
+    ["EML4 :: ALK", null],
+    ["::ALK", null],
+    [`${longSide}::${longSide}`, null], // each side fits, the whole is > 64
+  ], (id) => ({ subject_kind: "fusion", subject_id: id }));
+  await sentField("subject_id", [
+    [RUN_1, RUN_1],
+    [RUN_1.toUpperCase(), RUN_1.toUpperCase()],
+    ["run-1", null],
+    ["1b4e28ba-2fa1-1d2e-9b1c-0a1b2c3d4e5f", null], // UUID1
+    ["1b4e28ba2fa14d2e9b1c0a1b2c3d4e5f", null], // not canonical
+    ["ALK", null],
+  ], (id) => ({ subject_kind: "run", subject_id: id }));
+  await sentField("subject_id", [["ALK", null]], (id) => ({ subject_kind: "none", subject_id: id }));
+});
+
+test("run_id: only UUID4 run/job ids are sent", async () => {
+  await sentField("run_id", [
+    [RUN_1, RUN_1],
+    [JOB_1, JOB_1],
+    ["run-1", null],
+    ["stub-run", null],
+    ["1b4e28ba-2fa1-1d2e-9b1c-0a1b2c3d4e5f", null],
+    ["1b4e28ba-2fa1-4d2e-7b1c-0a1b2c3d4e5f", null], // wrong variant
+    [`${RUN_1} `, null],
+    [null, null],
+  ], (id) => ({ run_id: id }));
+  // The run scope goes through the same rule.
+  const t = setup();
+  t.tracker.setRunScope("not-a-uuid");
+  t.tracker.event({ type: "click", surface: "results", section: "pmid_link" });
+  t.tracker.setRunScope(RUN_2);
+  t.tracker.event({ type: "click", surface: "results", section: "pmid_link" });
+  await t.clock.advance(5000);
+  assert.deepStrictEqual(t.sent().map((e) => e.run_id), [null, RUN_2]);
+});
+
+test("item_id: PMIDs, field names, tab names and section keys pass; anything else is null", async () => {
+  await sentField("item_id", [
+    ["12345678", "12345678"],
+    [12345678, "12345678"],
+    ["cancer_type_prevalence", "cancer_type_prevalence"],
+    ["noresult", "noresult"],
+    ["requested_tumor", "requested_tumor"],
+    ["30000001:0", "30000001:0"],
+    ["HLA-A", "HLA-A"],
+    ["x".repeat(32), "x".repeat(32)],
+    ["x".repeat(33), null],
+    ["has space", null],
+    ["a/b", null],
+    ["Found in Lung adenocarcinoma", null],
+    ["", null],
+    [{}, null],
+  ], (id) => ({ item_id: id }));
+});
+
+test("flags: keys and variants must match the contract or flags is null", async () => {
+  const t = setup();
+  const cases = [
+    [{ "exp.oe_layout-v2": { variant: "Treatment_B.1", version: 2 } }, { "exp.oe_layout-v2": { variant: "Treatment_B.1", version: 2 } }],
+    [{ OE_Layout: { variant: "b", version: 1 } }, null], // uppercase key
+    [{ "bad key": { variant: "b", version: 1 } }, null],
+    [{ _leading: { variant: "b", version: 1 } }, null],
+    [{ ["k".repeat(65)]: { variant: "b", version: 1 } }, null],
+    [{ ok: { variant: "with space", version: 1 } }, null],
+    [{ ok: { variant: "v".repeat(33), version: 1 } }, null],
+    [{ ok: { variant: "a:b", version: 1 } }, null],
+    [{ ok: { variant: "b", version: "1" } }, null],
+  ];
+  for (const [value] of cases) {
+    t.tracker.setFlagsProvider(() => value);
+    t.tracker.event({ type: "click", surface: "global", section: "pmid_link" });
+  }
+  await t.clock.advance(5000);
+  cases.forEach(([value, expected], i) => assert.deepStrictEqual(t.sent()[i].flags, expected, JSON.stringify(value)));
+});
+
+test("state events are only sent for the OpenEvidence card", async () => {
+  const t = setup();
+  t.tracker.event({ type: "state", surface: "global", section: "tab", item_id: "results" });
+  t.tracker.event({ type: "state", state: "ready", surface: "results", section: "gene_card" });
+  t.tracker.event({ type: "state", surface: "results", section: "openevidence" }); // no state
+  t.tracker.event({ type: "state", state: "ready", surface: "results", section: "openevidence" });
+  await t.clock.advance(5000);
+  assert.deepStrictEqual(t.sent().map((e) => [e.section, e.state]), [["openevidence", "ready"]]);
 });
 
 test("flags provider supplies {key: {variant, version}}", async () => {
@@ -524,7 +654,7 @@ test("the queue is capped", async () => {
 
 test("delegated PMID link clicks (click + middle auxclick) carry the card's context", async () => {
   const t = setup();
-  t.tracker.setRunScope("run-1");
+  t.tracker.setRunScope(RUN_1);
   const card = new Node("article");
   t.tracker.surfaced(card, CARD);
   const details = new Node("details", card);
@@ -552,7 +682,7 @@ test("delegated PMID link clicks (click + middle auxclick) carry the card's cont
   clicks.forEach((e) => {
     assert.strictEqual(e.surface, "results");
     assert.strictEqual(e.subject_id, "ALK");
-    assert.strictEqual(e.run_id, "run-1");
+    assert.strictEqual(e.run_id, RUN_1);
   });
   const open = t.of("open")[0];
   assert.strictEqual(open.section, "retrieved_pmids");
@@ -606,21 +736,48 @@ function appWithTracker(fetchImpl) {
 test("app.js: progress re-renders and the job->run switch surface each gene card once", async () => {
   const { sandbox, events, clock } = appWithTracker();
   const genes = ["ALK", "EML4", "TP53"];
-  const partial = { run_id: "job-1", annotations: genes.map((g) => annotation(g)), genes_annotated: 3 };
+  const partial = { run_id: JOB_1, annotations: genes.map((g) => annotation(g)), genes_annotated: 3 };
   for (let i = 0; i < 3; i += 1) {
     sandbox.state.currentResult = partial;
     sandbox.renderAnnotationResult(partial);
     await flushMicrotasks();
   }
-  sandbox.adoptOpenEvidenceRunId("job-1", "run-1");
-  const done = { ...partial, run_id: "run-1" };
+  sandbox.adoptOpenEvidenceRunId(JOB_1, RUN_1);
+  const done = { ...partial, run_id: RUN_1 };
   sandbox.state.currentResult = done;
   sandbox.renderAnnotationResult(done);
   await clock.advance(5000);
   const cards = events().filter((e) => e.type === "surfaced" && e.section === "gene_card");
   assert.deepStrictEqual(cards.map((e) => e.subject_id), genes);
   assert.deepStrictEqual(cards.map((e) => e.display_position), [0, 1, 2]);
-  assert.ok(cards.every((e) => e.run_id === "job-1" && e.surface === "results"));
+  assert.ok(cards.every((e) => e.run_id === JOB_1 && e.surface === "results"));
+});
+
+test("app.js: real gene and fusion names pass the subject rules; non-conforming ones are null", async () => {
+  const { sandbox, events, clock } = appWithTracker();
+  const result = {
+    run_id: RUN_1,
+    annotations: [
+      annotation("HLA-A"),
+      annotation("TP53", { resolved_inputs: [{ input: "ENST00000269305", resolved: "TP53", warnings: [] }] }),
+      annotation("not a gene symbol"),
+    ],
+    fusion_evidence: [
+      { fusion: "EML4::ALK", pmids: ["1"], literature_scope: "any_tumor" },
+      { fusion: "EML4 ALK free text", pmids: ["2"], literature_scope: "any_tumor" },
+    ],
+    genes_annotated: 3,
+  };
+  sandbox.state.currentResult = result;
+  sandbox.renderAnnotationResult(result);
+  await flushMicrotasks();
+  sandbox.switchResultsView("fusion");
+  await clock.advance(5000);
+  const subjects = (section) => events().filter((e) => e.type === "surfaced" && e.section === section).map((e) => e.subject_id);
+  assert.deepStrictEqual(subjects("gene_card"), ["HLA-A", "TP53", null]);
+  assert.deepStrictEqual(subjects("fusion_card"), ["EML4::ALK", null]);
+  assert.ok(events().every((e) => e.run_id === RUN_1));
+  assert.ok(!JSON.stringify(events()).includes("free text"));
 });
 
 test("app.js: sidebar filter and feedback events never carry the typed text", async () => {
@@ -650,7 +807,7 @@ test("app.js: sidebar filter and feedback events never carry the typed text", as
 test("app.js: user tab switches vs automatic fallback", async () => {
   const { sandbox, events, clock } = appWithTracker();
   const result = {
-    run_id: "run-1",
+    run_id: RUN_1,
     annotations: [annotation("ALK"), annotation("BRAF", { insufficient_evidence: true })],
     genes_annotated: 2,
   };
@@ -659,12 +816,12 @@ test("app.js: user tab switches vs automatic fallback", async () => {
   sandbox.switchResultsView("noresult");
   await flushMicrotasks();
   // A new run without insufficient-evidence genes forces the tab back.
-  const next = { run_id: "run-2", annotations: [annotation("ALK")], genes_annotated: 1 };
+  const next = { run_id: RUN_2, annotations: [annotation("ALK")], genes_annotated: 1 };
   sandbox.state.currentResult = next;
   sandbox.renderAnnotationResult(next);
   await clock.advance(5000);
   const tabs = events().filter((e) => e.section === "tab").map((e) => [e.type, e.item_id, e.run_id]);
-  assert.deepStrictEqual(tabs, [["open", "noresult", "run-1"], ["state", "results", "run-2"]]);
+  assert.deepStrictEqual(tabs, [["open", "noresult", RUN_1], ["surfaced", "results", RUN_2]]);
   const noResultCard = events().find((e) => e.surface === "no_result" && e.section === "gene_card");
   assert.strictEqual(noResultCard.subject_id, "BRAF");
   assert.strictEqual(noResultCard.position, 1);
@@ -694,8 +851,8 @@ test("runs.js: rows surface once across load-more re-renders; opened_run and loa
   for (const name of ["error", "empty", "loading", "table", "tbody", "load-more", "retry", "page"]) nodes[name] = new El("div");
   const run = (id) => ({ run_id: id, created_at: "2026-10-26T12:00:00", view_url: `/?run=${id}`, input_summary: "secret input" });
   const pages = [
-    { runs: [run("r1"), run("r2")], next_cursor: "c" },
-    { runs: [run("r3")], next_cursor: null },
+    { runs: [run(RUNS[0]), run(RUNS[1])], next_cursor: "c" },
+    { runs: [run(RUNS[2])], next_cursor: null },
   ];
   const app = createRunsPage({
     document: { getElementById: (id) => nodes[id.slice(5)], createElement: (tag) => new El(tag) },
@@ -706,16 +863,16 @@ test("runs.js: rows surface once across load-more re-renders; opened_run and loa
   await app.init();
   await nodes["load-more"].map.get("click")[0]();
   const link = nodes.tbody.children[2].children[0].children[0];
-  link.href = "https://acgc.example.org/?run=r3";
+  link.href = `https://acgc.example.org/?run=${RUNS[2]}`;
   nodes.tbody.dispatch("click", { target: link });
   nodes.tbody.dispatch("auxclick", { target: link, button: 2 });
   await flushMicrotasks();
   const events = tracker._debug().queue;
   const rows = events.filter((e) => e.type === "surfaced" && e.section === "runs_row");
-  assert.deepStrictEqual(rows.map((e) => [e.subject_id, e.position]), [["r1", 0], ["r2", 1], ["r3", 2]]);
+  assert.deepStrictEqual(rows.map((e) => [e.subject_id, e.position]), [[RUNS[0], 0], [RUNS[1], 1], [RUNS[2], 2]]);
   assert.deepStrictEqual(
     events.filter((e) => e.type === "action").map((e) => [e.state, e.section, e.subject_id]),
-    [["load_more", "runs_pagination", null], ["opened_run", "runs_row", "r3"]],
+    [["load_more", "runs_pagination", null], ["opened_run", "runs_row", RUNS[2]]],
   );
   assert.strictEqual(events.filter((e) => e.type === "surfaced" && e.section === "runs_page").length, 1);
   assert.ok(!JSON.stringify(events).includes("secret"));
