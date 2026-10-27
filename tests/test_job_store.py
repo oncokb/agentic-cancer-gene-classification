@@ -422,7 +422,7 @@ def job_backends(monkeypatch):
                 await on_annotation(annotation)
         return annotations
 
-    async def fake_fusion_evidence(fusion, tumor_type=None):
+    async def fake_fusion_evidence(fusion, tumor_type=None, force_refresh=False):
         return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, well_supported=True)
 
     async def noop(*args, **kwargs):
@@ -623,7 +623,7 @@ def test_inline_evidence_job_phase_is_visible_to_other_pods(store, job_backends,
     other_pod = JobStore("annotation", AnnotationJobStatusResponse, redis_client_factory=lambda: job_backends)
     seen_by_other_pod = []
 
-    async def fake_fusion_evidence(fusion, tumor_type=None):
+    async def fake_fusion_evidence(fusion, tumor_type=None, force_refresh=False):
         # Runs mid-job: another pod reads the job's snapshot from Redis.
         (job_id,) = [key.rsplit(":", 1)[1] for key in job_backends.keys_with_prefix("job:annotation:")]
         snapshot = await other_pod.get(job_id)

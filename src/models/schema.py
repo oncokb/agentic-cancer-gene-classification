@@ -550,7 +550,7 @@ class AnnotateRequest(BaseModel):
     )
     force_refresh: bool = Field(
         default=False,
-        description="Bypass stored gene annotations and recompute results.",
+        description="Bypass stored gene annotations and fusion evidence and recompute results.",
     )
     skip_literature_for_oncokb: bool = Field(
         default=False,
