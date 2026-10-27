@@ -92,6 +92,10 @@ _NON_PARTNER_WORDS = frozenset(
         "POSITIVE", "NEGATIVE", "POS", "NEG", "AMPLIFICATION", "AMPLIFIED", "AMP", "DELETION", "DELETED",
         "DEL", "LOSS", "GAIN", "EXPRESSION", "OVEREXPRESSION", "WILDTYPE", "WT", "NULL", "INHIBITOR",
         "ANTI", "NON", "KB", "CELL", "SMALL", "LARGE", "HIGH", "LOW",
+        # Not SKIP or VIII: both are HGNC aliases (SNW1, COX8A).
+        "ITD", "TKD", "KDD", "SKIPPING", "INSERTION", "DUPLICATION",
+        "NOVEL", "KINASE", "PARTNER", "PARTNERS", "RECURRENT", "ONCOGENIC", "ACTIVATING", "SOMATIC",
+        "GERMLINE", "DETECTED", "KNOWN", "UNKNOWN", "OTHER",
         "ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA", "THETA", "IOTA", "KAPPA", "LAMBDA",
         "MU", "NU", "XI", "OMICRON", "PI", "RHO", "SIGMA", "TAU", "UPSILON", "PHI", "CHI", "PSI", "OMEGA",
     }
@@ -119,10 +123,27 @@ _TUMOR_TYPE_WORDS = frozenset(
         "BLASTOMA", "LUNG", "BREAST", "COLON", "RECTAL", "COLORECTAL", "GASTRIC", "PANCREATIC",
         "THYROID", "PROSTATE", "BLADDER", "OVARIAN", "RENAL", "KIDNEY", "LIVER", "SKIN", "BRAIN",
         "ESOPHAGOGASTRIC", "ESS", "HGESS", "LGESS", "ULMS", "USARC", "UTROSCT",
+        # Pediatric, CNS and sarcoma names with OncoTree-style codes. Codes that
+        # are also HGNC symbols, aliases or previous symbols (MB, CCS, NUT, ARMS,
+        # EPM, OS) are left out; a test pins the known collisions.
+        "PEDIATRIC", "PAEDIATRIC", "CNS", "BONE", "SOFT", "TISSUE", "UTERINE", "CERVICAL",
+        "DIPG", "DMG", "HGG", "PHGG", "PLGG", "MEDULLOBLASTOMA", "EPENDYMOMA", "ASTROCYTOMA",
+        "OLIGODENDROGLIOMA", "GANGLIOGLIOMA", "PXA", "ATRT", "ETMR", "PNET", "CRANIOPHARYNGIOMA",
+        "MENINGIOMA", "SCHWANNOMA", "RHABDOID", "RETINOBLASTOMA", "HEPATOBLASTOMA", "WILMS",
+        "NEPHROBLASTOMA", "DSRCT", "EWING", "EWINGS", "ES", "RHABDOMYOSARCOMA", "RMS", "ERMS",
+        "OSTEOSARCOMA", "CHONDROSARCOMA", "LIPOSARCOMA", "DDLS", "MLPS", "WDLS",
+        "LEIOMYOSARCOMA", "ANGIOSARCOMA", "FIBROSARCOMA", "IFS", "SYNOVIAL", "SYNS", "MPNST", "DFSP",
+        "EHE", "SPINDLE", "HISTIOCYTOSIS", "LCH", "JMML", "CMML",
     }
 )
-# Protein changes and exon references (V600E, G12C, T790M, Q61fs, exon19, ex20).
-_PROTEIN_CHANGE = re.compile(r"^(?:[A-Z]\d+(?:[A-Z]|FS|DEL|INS|DUP)?|(?:EXON|EX)\d+)$", re.IGNORECASE)
+# Protein changes and exon shorthand (V600E, G12C, T790M, Q61fs, exon19,
+# ex20, exon19del, exon20ins, exon14skipping, exon11mut).
+_EXON_EVENT = r"(?:del|deletion|ins|insertion|dup|duplication|delins|skip|skipping|mut|mutation|mutant|mutated)"
+_PROTEIN_CHANGE = re.compile(
+    rf"^(?:[A-Z]\d+(?:[A-Z]|FS|DEL|INS|DUP)?|(?:EXON|EX)\d+{_EXON_EVENT}?)$", re.IGNORECASE
+)
+# Immunophenotype pairs (CD4-CD8, CD34-CD38) rather than a fusion; CD74-ROS1 still warns.
+_CD_MARKER = re.compile(r"^CD\d+[A-Z]{0,2}$", re.IGNORECASE)
 HGNC_ALIAS_SEARCH_URL = 'https://rest.genenames.org/search/alias_symbol:"{symbol}"+OR+prev_symbol:"{symbol}"'
 
 
@@ -168,13 +189,16 @@ def unparsed_fusion_warning(
     The whitespace form must name a fusion explicitly and ignores `resolved`:
     symbols never contain spaces, and HGNC's fuzzy search fallback "resolves"
     'EML4 ALK fusion' to EML4.
+    Its keyword already marks the partners, so unlike the hyphen form it
+    is not case-checked ('fus erg fusion' warns).
     """
     text = value.strip()
     if is_fusion_input(text) or has_ensembl_identifier(text):
         return None
 
     match = _WHITESPACE_PAIR.match(text)
-    if match is not None:
+    keyword_form = match is not None
+    if keyword_form:
         if not (match.group("lead") or match.group("trail")):
             return None
     else:
@@ -189,8 +213,13 @@ def unparsed_fusion_warning(
     gene1, gene2 = match.group("gene1"), match.group("gene2")
     if not (_looks_like_partner(gene1) and _looks_like_partner(gene2)):
         return None
-    if not _partners_are_symbol_cased(text, gene1, gene2):
-        return None
+    # The fusion keyword already says these are partners; only the hyphen form
+    # needs the case check to tell genes from hyphenated prose.
+    if not keyword_form:
+        if _CD_MARKER.match(gene1) and _CD_MARKER.match(gene2):
+            return None
+        if not _partners_are_symbol_cased(text, gene1, gene2):
+            return None
     return (
         f"'{text}' was treated as a single gene. "
         f"To annotate it as a fusion, write '{gene1.upper()}::{gene2.upper()}'."
