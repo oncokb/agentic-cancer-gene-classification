@@ -420,8 +420,14 @@ def test_gene1_without_gene2_is_rejected():
 
 
 class FakeRunStore:
-    async def save_run(self, run_id, timestamp, request_payload, result_payload):
-        pass
+    def __init__(self):
+        self.saved_runs = []
+
+    async def get_run(self, run_id):
+        return next((row[3] for row in self.saved_runs if row[0] == run_id), None)
+
+    async def save_run(self, run_id, timestamp, request_payload, result_payload, **owner):
+        self.saved_runs.append((run_id, timestamp, request_payload, result_payload))
 
 
 @pytest.fixture
@@ -470,6 +476,17 @@ def test_annotate_job_result_carries_unparsed_fusion_warning(client):
 
     assert body["status"] == "complete"
     assert body["result"]["warnings"] == [_EWSR1_FLI1_WARNING]
+
+
+def test_annotate_gene_returns_unparsed_fusion_warning_and_saved_run_matches(client):
+    response = client.post("/v1/annotate/gene", json={"gene": "EWSR1-FLI1"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["warnings"] == [_EWSR1_FLI1_WARNING]
+
+    stored = client.get(f"/v1/annotate/{body['run_id']}").json()
+    assert stored["warnings"] == body["warnings"]
 
 
 def test_annotate_returns_warning_when_annotation_is_reused_from_cache(client, monkeypatch):

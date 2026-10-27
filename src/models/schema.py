@@ -484,6 +484,13 @@ class GeneAnnotationWithRun(GeneAnnotation):
         default=None,
         description="Absolute link that opens the full run in the ACGC UI (requires login).",
     )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Request-level warnings for the saved run, such as conflicting tumor types "
+            "or fusion-like notation. Same list as AnnotationResult.warnings."
+        ),
+    )
 
 
 class FusionInput(BaseModel):

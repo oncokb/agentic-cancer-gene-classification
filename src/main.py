@@ -1855,6 +1855,7 @@ async def annotate_gene(
         **result.annotations[0].model_dump(),
         run_id=result.run_id,
         view_url=_run_view_url(http_request, result.run_id),
+        warnings=result.warnings,
     )
 
 
