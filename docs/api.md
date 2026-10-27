@@ -186,8 +186,9 @@ curl -s "https://acgc.oncokb.org/v1/genes/query/jobs/$JOB_ID" \
 - `status` is `queued`, `running`, `complete` or `failed`.
 - `genes_completed` and `genes_total` show progress. `results` fills in as
   genes finish.
-- `run_id`, `view_url` and `warnings` are set only once `status` is `complete`;
-  `warnings` has the same meaning as in `POST /v1/genes/query`.
+- `run_id` and `view_url` are set only once `status` is `complete`.
+- `warnings` is an empty list (`[]`) until `status` is `complete`, then holds
+  the same warnings as `POST /v1/genes/query` would return.
 - If `status` is `failed`, `error` holds a short message. Start a new job to
   retry.
 
