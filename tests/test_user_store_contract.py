@@ -3,7 +3,8 @@
 Every test runs against FakeUserStore and against the MySQL UserStoreMixin
 on RunStore. The MySQL variant needs a reachable MySQL (e.g. `docker compose
 up -d mysql`, or MYSQL_* env vars) and is skipped without one, like
-tests/test_run_store.py. Each test uses its own email domain and deletes
+tests/test_run_store.py; any other startup error (bad schema SQL, ...)
+fails. Each test uses its own email domain and deletes
 only those rows, so it never touches other data in the database.
 """
 
@@ -11,12 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
+import aiomysql
+import pymysql
 import pytest
 
 from src.pipeline import user_store
-from src.pipeline.run_store import RunStore
+from src.pipeline.run_store import RunStore, _mysql_connection_kwargs
 from src.pipeline.user_store import (
     CuratorRequestAlreadyDecided,
     CuratorRequestNotFound,
@@ -29,6 +33,16 @@ from src.pipeline.user_store_fake import FakeUserStore
 
 T0 = datetime(2026, 10, 1, 12, 0, 0, 123456, tzinfo=timezone.utc)
 
+# MySQL errors meaning "no usable database here": can't connect / unknown
+# host / connection lost, and no credentials or database configured.
+_MYSQL_UNAVAILABLE_ERRNOS = {2002, 2003, 2005, 2006, 2013, 1045, 1049}
+
+
+def _mysql_unavailable(exc: BaseException) -> bool:
+    if isinstance(exc, pymysql.err.OperationalError):
+        return bool(exc.args) and exc.args[0] in _MYSQL_UNAVAILABLE_ERRNOS
+    return isinstance(exc, OSError)
+
 
 @pytest.fixture(params=["fake", "mysql"])
 async def backend(request):
@@ -39,6 +53,8 @@ async def backend(request):
     try:
         store = await RunStore.create()
     except Exception as exc:
+        if not _mysql_unavailable(exc):
+            raise
         pytest.skip(f"MySQL not reachable: {exc}")
     try:
         yield "mysql", store, domain
@@ -82,6 +98,31 @@ def break_audit_insert(backend, monkeypatch):
             monkeypatch.setattr(FakeUserStore, "_append_role_change", _fail)
 
     return _break
+
+
+@pytest.fixture
+def hold_user_lock(backend):
+    """Block writers to a user: a row lock from another MySQL connection, or
+    the fake's store lock."""
+    kind, store, _ = backend
+
+    @asynccontextmanager
+    async def _hold(address):
+        if kind == "fake":
+            async with store._lock:
+                yield
+            return
+        conn = await aiomysql.connect(**_mysql_connection_kwargs(), autocommit=False)
+        try:
+            await conn.begin()
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT email FROM users WHERE email = %s FOR UPDATE", (address,))
+            yield
+        finally:
+            await conn.rollback()
+            conn.close()
+
+    return _hold
 
 
 async def _login(store, address, *, role="viewer", status="active", at=None, **identity):
@@ -161,6 +202,55 @@ async def test_concurrent_first_logins_create_one_user(store, email):
     assert user.login_count == 10 and user.role == "viewer"
 
 
+async def test_emails_differing_by_accent_or_collation_are_distinct_users(store, email):
+    jose, jose_accent = email("jose"), email("jos\u00e9")
+    await _login(store, jose, name="Jose")
+    await store.set_role(jose, "admin", actor=email("boss"))
+
+    accented = await _login(store, jose_accent, name="José")
+    assert (accented.email, accented.role, accented.login_count) == (jose_accent, "viewer", 1)
+    assert (await store.get_user(jose)).role == "admin"
+
+    # NFC + lowercase: decomposed and upper-case spellings are the same user.
+    again = await _login(store, email("JOSE\u0301"), name="José")
+    assert (again.email, again.login_count) == (jose_accent, 2)
+    assert (await store.get_user(email("jose\u0301"))).email == jose_accent
+
+    # ß and ss compare equal under utf8mb4_0900_ai_ci; here they must not.
+    await _login(store, email("strasse"))
+    assert await store.get_user(email("stra\u00dfe")) is None
+    await _login(store, email("stra\u00dfe"))
+    assert (await store.get_user(email("strasse"))).login_count == 1
+
+    await _request(store, jose)
+    assert await store.get_pending_request(jose_accent) is None
+    await _request(store, jose_accent)
+    assert (await store.list_role_changes(email=jose_accent)).changes == []
+    assert len((await store.list_role_changes(email=jose)).changes) == 1
+
+
+async def test_actor_is_normalized(store, email):
+    address = email("acted-on")
+    await _login(store, address)
+    change = await store.set_role(address, "curator", actor="  " + email("ADMIN") + " ")
+    assert change.actor == email("admin")
+    assert (await store.get_user(address)).role_updated_by == email("admin")
+    with pytest.raises(ValueError):
+        await store.set_role(address, "admin", actor="  ")
+
+
+async def test_groups_and_claims_come_back_as_json(store, email):
+    user = await _login(
+        store, email("json"), groups=("g1", "g2"), claims={"roles": ("a", "b"), "nested": {"t": (1, 2)}}
+    )
+    expected_claims = {"roles": ["a", "b"], "nested": {"t": [1, 2]}}
+    assert (user.groups, user.claims) == (["g1", "g2"], expected_claims)
+    assert (await store.get_user(email("json"))).claims == expected_claims
+    with pytest.raises(ValueError):
+        await _login(store, email("bad-json"), claims={"s": {1, 2}})
+    assert await store.get_user(email("bad-json")) is None
+
+
 async def test_upsert_login_rejects_unknown_defaults(store, email):
     with pytest.raises(ValueError):
         await _login(store, email("x"), role="superuser")
@@ -225,6 +315,23 @@ async def test_failed_audit_insert_rolls_back_the_change(store, email, break_aud
         await getattr(store, method)(address, value, actor=email("admin"))
     assert await store.get_user(address) == before
     assert (await store.list_role_changes(email=address)).changes == []
+
+
+async def test_cancelled_set_role_propagates_and_writes_nothing(store, email, backend, hold_user_lock):
+    address = email("cancelled")
+    before = await _login(store, address)
+    async with hold_user_lock(address):
+        task = asyncio.create_task(store.set_role(address, "admin", actor=email("admin")))
+        await asyncio.sleep(0.5)  # now waiting on the lock
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert await store.get_user(address) == before
+    assert (await store.list_role_changes(email=address)).changes == []
+    if backend[0] == "mysql":
+        assert all(not conn.closed for conn in store._pool._free)
+    assert await store.set_role(address, "admin", actor=email("admin")) is not None
 
 
 async def test_concurrent_set_role_audits_each_real_change_once(store, email):

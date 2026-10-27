@@ -40,7 +40,12 @@ from src.pipeline.user_store import (
     decode_user_cursor,
     encode_id_cursor,
     encode_user_cursor,
+    normalize_actor,
+    normalize_claims,
     normalize_email,
+    normalize_groups,
+    normalize_identity,
+    normalize_name,
     to_utc,
     utc_now,
 )
@@ -85,12 +90,15 @@ class FakeUserStore:
         self._check_available("upsert_login")
         now = _db_time(at)
         domain = identity.domain or email.split("@")[-1]
+        name = normalize_name(identity.name) or email
+        groups = normalize_groups(identity.groups)
+        claims = normalize_claims(identity.claims)
         async with self._lock:
             existing = self._users.get(email)
             if existing is None:
                 user = UserRecord(
                     email=email,
-                    name=identity.name or email,
+                    name=name,
                     picture=identity.picture or None,
                     domain=domain,
                     provider=identity.provider,
@@ -98,8 +106,8 @@ class FakeUserStore:
                     role=default_role,
                     role_updated_by=None,
                     role_updated_at=None,
-                    groups=list(identity.groups),
-                    claims=copy.deepcopy(dict(identity.claims)),
+                    groups=groups,
+                    claims=claims,
                     first_login_at=now,
                     last_login_at=now,
                     login_count=1,
@@ -112,12 +120,12 @@ class FakeUserStore:
                 user = replace(
                     existing,
                     # An empty name (stored as the email) keeps the known one.
-                    name=existing.name if (identity.name or email) == email else identity.name,
+                    name=existing.name if name == email else name,
                     picture=identity.picture or existing.picture,
                     domain=domain,
                     provider=identity.provider,
-                    groups=list(identity.groups),
-                    claims=copy.deepcopy(dict(identity.claims)),
+                    groups=groups,
+                    claims=claims,
                     last_login_at=max(existing.last_login_at, now),
                     login_count=existing.login_count + 1,
                     updated_at=now,
@@ -173,6 +181,7 @@ class FakeUserStore:
     ) -> Optional[RoleChange]:
         clean = normalize_email(email)
         check_role(role)
+        actor = normalize_actor(actor)
         self._check_available("set_role")
         async with self._lock:
             return self._apply_user_field(
@@ -186,6 +195,7 @@ class FakeUserStore:
     ) -> Optional[RoleChange]:
         clean = normalize_email(email)
         check_status(status)
+        actor = normalize_actor(actor)
         self._check_available("set_status")
         async with self._lock:
             return self._apply_user_field(
@@ -223,7 +233,7 @@ class FakeUserStore:
             check_status(filters.status)
         after = decode_user_cursor(cursor) if cursor is not None else None
         self._check_available("list_users")
-        search = (filters.search or "").strip().lower()
+        search = normalize_identity(filters.search or "")
         async with self._lock:
             users = [
                 u for u in self._users.values()
@@ -305,6 +315,7 @@ class FakeUserStore:
     async def decide_request(
         self, request_id: int, approve: bool, reviewer: str, note: Optional[str] = None
     ) -> CuratorRequest:
+        reviewer = normalize_actor(reviewer)
         self._check_available("decide_request")
         now = _db_time()
         async with self._lock:

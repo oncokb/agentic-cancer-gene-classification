@@ -13,6 +13,12 @@ most one pending request, enforced by the database.
 
 `role_changes` is insert-only: this module never updates or deletes it.
 
+Emails and actors are normalized at every entry point (normalize_identity:
+Unicode NFC, stripped, lowercased) and stored in utf8mb4_bin columns, so
+MySQL compares them exactly like FakeUserStore does; an accent- or
+case-insensitive collation would make `jose@` and `josé@` the same user.
+Requires MySQL >= 8.0.19 (INSERT ... AS alias) and >= 8.0.16 (enforced CHECK).
+
 FakeUserStore (src/pipeline/user_store_fake.py) implements the same
 UserStore protocol in memory; tests/test_user_store_contract.py runs one
 suite against both.
@@ -25,6 +31,7 @@ import base64
 import binascii
 import json
 import logging
+import unicodedata
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -48,14 +55,14 @@ _ER_DUP_ENTRY = 1062
 
 _CREATE_USERS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-    email VARCHAR(255) NOT NULL,
+    email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     name VARCHAR(255) NOT NULL,
     picture VARCHAR(2048) NULL,
     domain VARCHAR(255) NOT NULL,
     provider VARCHAR(32) NOT NULL,
     status VARCHAR(16) NOT NULL,
     role VARCHAR(16) NOT NULL,
-    role_updated_by VARCHAR(255) NULL,
+    role_updated_by VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
     role_updated_at DATETIME(6) NULL,
     groups_json JSON NOT NULL,
     claims_json JSON NOT NULL,
@@ -80,17 +87,17 @@ CREATE TABLE IF NOT EXISTS users (
 _CREATE_CURATOR_REQUESTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS curator_requests (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    email VARCHAR(255) NOT NULL,
+    email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     reason TEXT NOT NULL,
     affiliation VARCHAR(255) NOT NULL,
     expertise TEXT NOT NULL,
     orcid VARCHAR(32) NULL,
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
-    reviewer_email VARCHAR(255) NULL,
+    reviewer_email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
     decided_at DATETIME(6) NULL,
     review_note TEXT NULL,
     created_at DATETIME(6) NOT NULL,
-    pending_email VARCHAR(255)
+    pending_email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
         GENERATED ALWAYS AS (CASE WHEN status = 'pending' THEN email ELSE NULL END) STORED,
     UNIQUE INDEX uq_curator_requests_pending_email (pending_email),
     INDEX idx_curator_requests_email (email, id),
@@ -102,11 +109,11 @@ CREATE TABLE IF NOT EXISTS curator_requests (
 _CREATE_ROLE_CHANGES_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS role_changes (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    email VARCHAR(255) NOT NULL,
+    email VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     field VARCHAR(16) NOT NULL,
     old_value VARCHAR(16) NULL,
     new_value VARCHAR(16) NOT NULL,
-    actor VARCHAR(255) NOT NULL,
+    actor VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
     reason TEXT NULL,
     request_id BIGINT NULL,
     created_at DATETIME(6) NOT NULL,
@@ -321,11 +328,51 @@ class UserStore(Protocol):
 # ---------------------------------------------------------------------------
 
 
+def normalize_identity(value: str) -> str:
+    """Canonical form of an email or actor: Unicode NFC, stripped, lowercased.
+
+    Every email/actor entering either store goes through this, and MySQL
+    compares the result byte for byte (utf8mb4_bin), so two addresses are the
+    same user only when their canonical forms are identical: `jose@` and
+    `josé@` stay distinct, while a decomposed `jose\u0301@` is `josé@`."""
+    return unicodedata.normalize("NFC", value or "").strip().lower()
+
+
 def normalize_email(email: str) -> str:
-    clean = (email or "").strip().lower()
+    clean = normalize_identity(email)
     if not clean or "@" not in clean:
         raise ValueError(f"Invalid email: {email!r}")
     return clean
+
+
+def normalize_actor(actor: str) -> str:
+    """An actor/reviewer: usually an email, but service actors (e.g. a
+    migration) need not contain '@'."""
+    clean = normalize_identity(actor)
+    if not clean:
+        raise ValueError("actor must not be empty")
+    return clean
+
+
+def normalize_name(name: Optional[str]) -> str:
+    return unicodedata.normalize("NFC", name or "").strip()
+
+
+def _json_round_trip(value: Any, what: str) -> Any:
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{what} must be JSON-serializable") from exc
+
+
+def normalize_groups(groups: Any) -> List[Any]:
+    """Groups as MySQL's JSON column returns them (tuples become lists)."""
+    return _json_round_trip(list(groups or []), "groups")
+
+
+def normalize_claims(claims: Any) -> Dict[str, Any]:
+    """Claims as MySQL's JSON column returns them; non-JSON values are rejected."""
+    return _json_round_trip(dict(claims or {}), "claims")
 
 
 def check_role(role: str) -> str:
@@ -500,7 +547,12 @@ class UserStoreMixin:
     @asynccontextmanager
     async def _user_transaction(self) -> AsyncIterator[Any]:
         """A cursor inside BEGIN/COMMIT on one pooled connection; rolls back
-        on any exception (domain errors included) and re-raises it."""
+        on any exception (domain errors included) and re-raises it.
+
+        A cancelled statement makes aiomysql close the connection, so the
+        rollback then fails too. That failure must not replace the original
+        exception (a CancelledError has to stay one), and the connection is
+        closed so the pool discards it instead of reusing it."""
         async with self._pool.acquire() as conn:
             await conn.begin()
             try:
@@ -508,7 +560,13 @@ class UserStoreMixin:
                     yield cursor
                 await conn.commit()
             except BaseException:
-                await conn.rollback()
+                try:
+                    await conn.rollback()
+                except BaseException as rollback_exc:
+                    logger.warning("User store rollback failed; discarding connection: %r", rollback_exc)
+                    conn.close()
+                    if not isinstance(rollback_exc, Exception):
+                        raise
                 raise
 
     async def _fetch_user(self, cursor, email: str, *, for_update: bool = False) -> Optional[UserRecord]:
@@ -542,10 +600,12 @@ class UserStoreMixin:
         check_status(default_status)
         now = _to_db(at or utc_now())
         domain = identity.domain or email.split("@")[-1]
+        name = normalize_name(identity.name) or email
+        groups = normalize_groups(identity.groups)
+        claims = normalize_claims(identity.claims)
         params = (
-            email, identity.name or email, identity.picture or None, domain, identity.provider,
-            default_status, default_role, json.dumps(list(identity.groups)),
-            json.dumps(dict(identity.claims)), now, now, now, now,
+            email, name, identity.picture or None, domain, identity.provider,
+            default_status, default_role, json.dumps(groups), json.dumps(claims), now, now, now, now,
         )
         async with _store_errors("upsert_login"):
             async with self._user_transaction() as cursor:
@@ -585,6 +645,7 @@ class UserStoreMixin:
         request_id: Optional[int],
     ) -> Optional[RoleChange]:
         clean = normalize_email(email)
+        actor = normalize_actor(actor)
         now = _to_db(utc_now())
         async with _store_errors(f"set_{field_name}"):
             async with self._user_transaction() as cursor:
@@ -696,8 +757,9 @@ class UserStoreMixin:
             where.append("status = %s")
             params.append(check_status(filters.status))
         if filters.search:
-            pattern = f"%{escape_like(filters.search.strip().lower())}%"
-            where.append("(email LIKE %s OR LOWER(name) LIKE %s)")
+            # Exact (binary) matching, like FakeUserStore's substring test.
+            pattern = f"%{escape_like(normalize_identity(filters.search))}%"
+            where.append("(email LIKE %s OR LOWER(name) COLLATE utf8mb4_bin LIKE %s)")
             params.extend([pattern, pattern])
         if cursor is not None:
             after_at, after_email = decode_user_cursor(cursor)
@@ -831,6 +893,7 @@ class UserStoreMixin:
         Raises CuratorRequestNotFound, CuratorRequestAlreadyDecided, or
         UserNotFound (approval for an email with no user); on any error
         nothing is written."""
+        reviewer = normalize_actor(reviewer)
         now = _to_db(utc_now())
         new_status = "approved" if approve else "rejected"
         async with _store_errors("decide_request"):

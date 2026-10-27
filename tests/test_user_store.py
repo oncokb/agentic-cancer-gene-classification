@@ -4,6 +4,7 @@ behavior lives in tests/test_user_store_contract.py."""
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -14,6 +15,7 @@ from src.auth import UserStoreUnavailable
 from src.pipeline.run_store import RunStore
 from src.pipeline.user_store import (
     LoginIdentity,
+    UserNotFound,
     decode_id_cursor,
     decode_user_cursor,
     encode_id_cursor,
@@ -65,6 +67,89 @@ async def test_invalid_input_is_value_error_before_touching_storage():
         await store.set_role("a@x.example", "owner", actor="b@x.example")
     with pytest.raises(ValueError):
         await store.list_users(cursor="%%%")
+
+
+class _DyingCursor:
+    """execute() blocks forever ("hang"), raises a deadlock ("deadlock"), or
+    returns no row ("empty")."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, sql, params=None):
+        if self.conn.mode == "hang":
+            self.conn.executing.set()
+            await asyncio.Event().wait()
+        if self.conn.mode == "deadlock":
+            raise pymysql.err.OperationalError(1213, "Deadlock found")
+
+    async def fetchone(self):
+        return None
+
+
+class _DyingConn:
+    """Like an aiomysql connection whose statement was cancelled: rollback
+    fails because the connection is already gone."""
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.executing = asyncio.Event()
+        self.closed = False
+
+    async def begin(self):
+        pass
+
+    async def commit(self):
+        pass
+
+    async def rollback(self):
+        raise pymysql.err.InterfaceError(0, "Not connected")
+
+    def close(self):
+        self.closed = True
+
+    def cursor(self):
+        return _DyingCursor(self)
+
+
+class _DyingPool:
+    def __init__(self, mode):
+        self.conn = _DyingConn(mode)
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self.conn
+
+
+async def test_cancellation_survives_failed_rollback_and_discards_connection():
+    pool = _DyingPool("hang")
+    task = asyncio.create_task(RunStore(pool).set_role("a@x.example", "admin", actor="b@x.example"))
+    await pool.conn.executing.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert pool.conn.closed
+
+
+async def test_store_error_keeps_original_cause_when_rollback_fails():
+    pool = _DyingPool("deadlock")
+    with pytest.raises(UserStoreUnavailable) as raised:
+        await RunStore(pool).set_role("a@x.example", "admin", actor="b@x.example")
+    assert raised.value.__cause__.args[0] == 1213
+    assert pool.conn.closed
+
+
+async def test_domain_error_survives_failed_rollback():
+    pool = _DyingPool("empty")
+    with pytest.raises(UserNotFound):
+        await RunStore(pool).set_role("a@x.example", "admin", actor="b@x.example")
+    assert pool.conn.closed
 
 
 def test_cursor_round_trips():
