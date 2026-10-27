@@ -8,15 +8,18 @@
   const SCHEMA_VERSION = 1;
   const ENDPOINT = "/v1/events";
   const BATCH_SIZE = 50;
+  // The server answers 413 above 32 KB; stay under it with some headroom.
+  const MAX_BODY_BYTES = 32000;
   const FLUSH_INTERVAL_MS = 5000;
   const MAX_QUEUE = 2000; // a 200-gene first render queues ~600 events at once
   const MAX_NETWORK_RETRIES = 3;
   const DEFAULT_RETRY_AFTER_MS = 30000;
   const DWELL_MS = 1000;
+  // Impression = at least half of the ELEMENT visible (contract). An element
+  // more than twice the visible area's height can never qualify, so it gets
+  // no impression at all; its smaller tracked sections still can.
   const VISIBLE_RATIO = 0.5;
-  // 0.5 is the impression threshold; the lower steps let an element taller
-  // than the viewport qualify once it fills half of it.
-  const IO_THRESHOLDS = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1];
+  const IO_THRESHOLDS = [0, VISIBLE_RATIO];
 
   const TYPES = new Set(["surfaced", "impression", "open", "close", "click", "state", "action"]);
   const SURFACES = new Set(["results", "fusion_evidence", "no_result", "sidebar", "runs", "feedback", "global"]);
@@ -108,7 +111,11 @@
     let queue = [];
     let flushTimer = null;
     let inflight = false;
+    // One deadline for both a 429's Retry-After and the backoff after a
+    // network error / 5xx; every fetch flush waits for it.
     let blockedUntil = 0;
+    let blockedBy429 = false;
+    let beaconUsedWhileBlocked = false;
     let networkFailures = 0;
     const stats = { sent: 0, dropped: 0, batches: 0, beacons: 0 };
 
@@ -207,6 +214,7 @@
         return;
       }
       queue.push(event);
+      // flush() itself waits out any backoff or Retry-After.
       if (queue.length >= BATCH_SIZE) flush();
       else scheduleFlush(FLUSH_INTERVAL_MS);
     }
@@ -262,10 +270,7 @@
     }
 
     function qualifies(record) {
-      if (!record.isIntersecting) return false;
-      if (record.intersectionRatio >= VISIBLE_RATIO) return true;
-      const rootHeight = record.rootBounds ? record.rootBounds.height : win && win.innerHeight;
-      return Boolean(rootHeight) && record.intersectionRect.height >= VISIBLE_RATIO * rootHeight;
+      return record.isIntersecting && record.intersectionRatio >= VISIBLE_RATIO;
     }
 
     function onIntersect(records) {
@@ -302,7 +307,6 @@
       let left = Math.max(rect.left, 0);
       let bottom = Math.min(rect.bottom, win.innerHeight);
       let right = Math.min(rect.right, win.innerWidth);
-      let clipHeight = win.innerHeight;
       if (typeof win.getComputedStyle === "function") {
         for (let p = node.parentElement; p && p !== doc.documentElement; p = p.parentElement) {
           const style = win.getComputedStyle(p);
@@ -312,13 +316,12 @@
           left = Math.max(left, clip.left);
           bottom = Math.min(bottom, clip.bottom);
           right = Math.min(right, clip.right);
-          clipHeight = Math.min(clipHeight, clip.height);
         }
       }
       const height = Math.max(0, bottom - top);
       const width = Math.max(0, right - left);
       if (!height || !width) return false;
-      return (height * width) / area >= VISIBLE_RATIO || height >= VISIBLE_RATIO * clipHeight;
+      return (height * width) / area >= VISIBLE_RATIO;
     }
 
     function expire(entry) {
@@ -354,12 +357,65 @@
       }, delayMs);
     }
 
+    function utf8Bytes(text) {
+      let bytes = 0;
+      for (let i = 0; i < text.length; i += 1) {
+        const code = text.charCodeAt(i);
+        if (code < 0x80) bytes += 1;
+        else if (code < 0x800) bytes += 2;
+        else if (code >= 0xd800 && code <= 0xdbff) {
+          bytes += 4; // surrogate pair
+          i += 1;
+        } else bytes += 3;
+      }
+      return bytes;
+    }
+
     function envelope(events) {
       return JSON.stringify({ schema_version: SCHEMA_VERSION, page_view_id: pageViewId, events });
     }
 
+    // The next batch from the head of the queue: at most BATCH_SIZE events
+    // and MAX_BODY_BYTES of body. An event too big to send on its own is
+    // dropped. Returns null when the queue is empty.
+    function nextBatch() {
+      let bytes = utf8Bytes(envelope([]));
+      let count = 0;
+      while (count < queue.length && count < BATCH_SIZE) {
+        const size = utf8Bytes(JSON.stringify(queue[count])) + (count ? 1 : 0);
+        if (bytes + size > MAX_BODY_BYTES) {
+          if (count) break;
+          queue.shift();
+          stats.dropped += 1;
+          continue;
+        }
+        bytes += size;
+        count += 1;
+      }
+      return count ? queue.slice(0, count) : null;
+    }
+
+    function backOff() {
+      networkFailures += 1;
+      blockedUntil = now() + 1000 * 2 ** Math.min(networkFailures, 5);
+      blockedBy429 = false;
+    }
+
     function requeue(batch) {
       queue = batch.concat(queue).slice(0, MAX_QUEUE);
+    }
+
+    // Network error or 5xx: retry the batch after a growing backoff, at most
+    // MAX_NETWORK_RETRIES times, then drop it and start over.
+    function retryLater(batch) {
+      backOff();
+      if (networkFailures > MAX_NETWORK_RETRIES) {
+        networkFailures = 0;
+        stats.dropped += batch.length;
+      } else {
+        requeue(batch);
+      }
+      scheduleFlush(blockedUntil - now());
     }
 
     async function flush() {
@@ -369,7 +425,9 @@
         scheduleFlush(wait);
         return;
       }
-      const batch = queue.splice(0, BATCH_SIZE);
+      const batch = nextBatch();
+      if (!batch) return;
+      queue.splice(0, batch.length);
       inflight = true;
       let response;
       try {
@@ -382,14 +440,7 @@
         });
       } catch (_) {
         inflight = false;
-        networkFailures += 1;
-        if (networkFailures > MAX_NETWORK_RETRIES) {
-          networkFailures = 0;
-          stats.dropped += batch.length;
-        } else {
-          requeue(batch);
-        }
-        scheduleFlush(1000 * 2 ** Math.min(networkFailures, 5));
+        retryLater(batch);
         return;
       }
       inflight = false;
@@ -399,22 +450,17 @@
         const header = response.headers && response.headers.get ? response.headers.get("Retry-After") : null;
         const seconds = Number(header);
         blockedUntil = now() + (Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : DEFAULT_RETRY_AFTER_MS);
+        blockedBy429 = true;
         requeue(batch);
         scheduleFlush(blockedUntil - now());
         return;
       }
       if (status >= 500) {
-        networkFailures += 1;
-        if (networkFailures > MAX_NETWORK_RETRIES) {
-          networkFailures = 0;
-          stats.dropped += batch.length;
-        } else {
-          requeue(batch);
-        }
-        scheduleFlush(1000 * 2 ** Math.min(networkFailures, 5));
+        retryLater(batch);
         return;
       }
       networkFailures = 0;
+      beaconUsedWhileBlocked = false;
       if (status === 204) {
         // The server has events switched off: stop sending for this page.
         setEnabled(false);
@@ -428,14 +474,20 @@
 
     // Page is going away or hidden: hand what's queued to sendBeacon, which
     // can't set headers, hence ?beacon=1 (see the contract's Transport).
+    // A Retry-After is always honoured; during a network/5xx backoff the
+    // page may still beacon once, since it may not get another chance.
     function flushBeacon() {
-      if (enabled !== true || !queue.length || blockedUntil > now()) return;
+      if (enabled !== true || !queue.length) return;
+      const blocked = blockedUntil > now();
+      if (blocked && (blockedBy429 || beaconUsedWhileBlocked)) return;
       if (!nav || typeof nav.sendBeacon !== "function") {
         flush();
         return;
       }
-      while (queue.length) {
-        const batch = queue.slice(0, BATCH_SIZE);
+      if (blocked) beaconUsedWhileBlocked = true;
+      for (;;) {
+        const batch = nextBatch();
+        if (!batch) break;
         let accepted = false;
         try {
           accepted = nav.sendBeacon(`${ENDPOINT}?beacon=1`, envelope(batch));

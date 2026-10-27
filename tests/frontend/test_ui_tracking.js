@@ -202,16 +202,61 @@ test("impression needs a continuous 1 s dwell at >= 50% visibility", async () =>
   assert.strictEqual(t.of("impression").length, 1);
 });
 
-test("an element taller than the viewport qualifies once it fills half of it", async () => {
-  const t = setup();
+test("impressions need >= 50% of the element visible; a 3000px card with 800px on screen never counts", async () => {
+  // Repro from review: 800 of 3000 px visible (26.7%) while it fills the viewport.
+  let t = setup();
   t.tracker.setActiveTab("results");
-  const node = new Node();
+  let node = new Node();
   node.rect = { top: -500, left: 0, bottom: 2500, right: 400, width: 400, height: 3000 };
   t.tracker.observe(node, CARD);
   await flushMicrotasks();
-  t.io.report(node, 0.27, { intersectionRect: { height: 800 } });
+  t.io.report(node, 800 / 3000, { intersectionRect: { height: 800 } });
+  await t.clock.advance(5000);
+  assert.strictEqual(t.of("impression").length, 0, "3000px / 800px");
+
+  // The observer check alone: even if the re-measure at expiry would pass,
+  // a 26.7% report must not start a dwell.
+  t = setup();
+  t.tracker.setActiveTab("results");
+  node = new Node();
+  t.tracker.observe(node, CARD);
+  await flushMicrotasks();
+  t.io.report(node, 800 / 3000, { intersectionRect: { height: 800 } });
+  await t.clock.advance(5000);
+  assert.strictEqual(t.of("impression").length, 0, "observer check");
+
+  // A stale observer report can't sneak it through: the expiry re-measure
+  // also needs half of the element.
+  t = setup();
+  t.tracker.setActiveTab("results");
+  node = new Node();
+  node.rect = { top: 0, left: 0, bottom: 1000, right: 400, width: 400, height: 1000 };
+  t.tracker.observe(node, CARD);
+  await flushMicrotasks();
+  t.io.report(node, 0.5);
+  node.rect = { top: -500, left: 0, bottom: 2500, right: 400, width: 400, height: 3000 };
   await t.clock.advance(1000);
-  assert.strictEqual(t.of("impression").length, 1);
+  assert.strictEqual(t.of("impression").length, 0, "expiry check");
+
+  // Exactly half of the element visible counts.
+  t = setup();
+  t.tracker.setActiveTab("results");
+  node = new Node();
+  node.rect = { top: 400, left: 0, bottom: 1200, right: 400, width: 400, height: 800 };
+  t.tracker.observe(node, CARD);
+  await flushMicrotasks();
+  t.io.report(node, 0.5);
+  await t.clock.advance(1000);
+  assert.strictEqual(t.of("impression").length, 1, "50% exactly");
+
+  t = setup();
+  t.tracker.setActiveTab("results");
+  node = new Node();
+  t.tracker.observe(node, CARD);
+  await flushMicrotasks();
+  t.io.report(node, 0.49);
+  await t.clock.advance(5000);
+  assert.strictEqual(t.of("impression").length, 0, "49%");
 });
 
 test("dwell cancels on scroll-away, tab switch, hidden document and removal", async () => {
@@ -646,6 +691,60 @@ test("429 waits for Retry-After and resends the same batch; 4xx drops; network e
   assert.strictEqual(t.posts.length, 1, "204 (server switched off) stops sending");
 });
 
+test("a 503/network backoff holds back size-triggered flushes; pagehide may beacon once", async () => {
+  // Repro from review: queue 50, the server answers 503, then one event every 10 ms.
+  const t = setup({ fetchImpl: async () => response(503) });
+  const click = (i) => t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: String(i) });
+  for (let i = 0; i < 50; i += 1) click(i);
+  await flushMicrotasks();
+  assert.strictEqual(t.posts.length, 1);
+  for (let i = 0; i < 100; i += 1) {
+    click(100 + i);
+    await t.clock.advance(10);
+  }
+  assert.strictEqual(t.posts.length, 1, "nothing sent inside the 2 s backoff");
+  assert.strictEqual(t.queued().length, 150, "the failed batch is kept for retry");
+
+  t.window.dispatch("pagehide");
+  assert.strictEqual(t.beacons.length, 3, "one exit beacon pass (150 events = 3 batches)");
+  for (let i = 0; i < 60; i += 1) click(300 + i);
+  t.document.visibilityState = "hidden";
+  t.document.dispatch("visibilitychange");
+  assert.strictEqual(t.beacons.length, 3, "only once per backoff");
+  assert.strictEqual(t.posts.length, 1, "still no fetch inside the backoff");
+
+  // Retries follow the backoff: 2 s, 4 s, 8 s, then the batch is dropped.
+  const at = [];
+  const before = t.posts.length;
+  for (let ms = 0; ms < 40000; ms += 100) {
+    await t.clock.advance(100);
+    if (t.posts.length > before + at.length) at.push(t.clock.now());
+  }
+  const gaps = at.slice(1).map((time, i) => time - at[i]);
+  assert.ok(at.length >= 3, `retries happened (${at.length})`);
+  gaps.slice(0, 2).forEach((gap) => assert.ok(gap >= 2000, `retry gap ${gap} ms honours the backoff`));
+});
+
+test("batches stay under the server's 32 KB body limit, for fetch and beacon", async () => {
+  const bigFlags = {};
+  for (let i = 0; i < 10; i += 1) bigFlags[`flag_${i}_${"k".repeat(50)}`] = { variant: "v".repeat(32), version: 1 };
+  for (const via of ["fetch", "beacon"]) {
+    // Held until enabled, so the size trigger can't fetch before the beacon.
+    const t = setup({ enabled: null });
+    t.tracker.setFlagsProvider(() => bigFlags);
+    for (let i = 0; i < 50; i += 1) t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: String(i) });
+    t.tracker.setEnabled(true);
+    if (via === "beacon") t.window.dispatch("pagehide");
+    await t.clock.advance(60000);
+    const bodies = via === "fetch" ? t.posts.map((p) => p.init.body) : t.beacons.map((b) => b.body);
+    assert.ok(bodies.length > 1, `${via}: one 50-event body would exceed 32 KB, so it is split`);
+    bodies.forEach((body) => assert.ok(Buffer.byteLength(body, "utf8") <= 32000, `${via}: ${Buffer.byteLength(body)} bytes`));
+    const sentEvents = bodies.flatMap((body) => JSON.parse(body).events);
+    assert.strictEqual(sentEvents.length, 50, `${via}: nothing lost`);
+    assert.deepStrictEqual(sentEvents.map((e) => e.item_id), Array.from({ length: 50 }, (_, i) => String(i)), "order kept");
+  }
+});
+
 test("the queue is capped", async () => {
   const t = setup({ enabled: null });
   for (let i = 0; i < 5000; i += 1) t.tracker.event({ type: "click", surface: "global", section: "pmid_link", item_id: "1" });
@@ -804,7 +903,7 @@ test("app.js: sidebar filter and feedback events never carry the typed text", as
   ]);
 });
 
-test("app.js: user tab switches vs automatic fallback", async () => {
+test("app.js: user tab switches are tracked; the automatic fallback sends nothing", async () => {
   const { sandbox, events, clock } = appWithTracker();
   const result = {
     run_id: RUN_1,
@@ -821,7 +920,7 @@ test("app.js: user tab switches vs automatic fallback", async () => {
   sandbox.renderAnnotationResult(next);
   await clock.advance(5000);
   const tabs = events().filter((e) => e.section === "tab").map((e) => [e.type, e.item_id, e.run_id]);
-  assert.deepStrictEqual(tabs, [["open", "noresult", RUN_1], ["surfaced", "results", RUN_2]]);
+  assert.deepStrictEqual(tabs, [["open", "noresult", RUN_1]]);
   const noResultCard = events().find((e) => e.surface === "no_result" && e.section === "gene_card");
   assert.strictEqual(noResultCard.subject_id, "BRAF");
   assert.strictEqual(noResultCard.position, 1);
