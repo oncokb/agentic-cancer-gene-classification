@@ -157,7 +157,12 @@ async def test_gene_total_duration_excludes_concurrency_slot_wait(monkeypatch):
     slot must not have that wait folded into gene.total_duration_ms."""
     metric_calls = []
     genes = [f"GENE{i}" for i in range(6)]
-    work_s = 0.1
+    clock = 0.0
+    started = {gene: asyncio.Event() for gene in genes}
+    release = {gene: asyncio.Event() for gene in genes}
+
+    async def cache_miss(**kwargs):
+        return None
 
     async def fake_normalize_fusions(inputs):
         return {
@@ -166,9 +171,12 @@ async def test_gene_total_duration_excludes_concurrency_slot_wait(monkeypatch):
         }
 
     async def fake_annotate_gene(*, gene, fusions, **kwargs):
-        await asyncio.sleep(work_s)
+        started[gene].set()
+        await release[gene].wait()
         return GeneAnnotation(gene=gene, fusions=list(fusions), cache_status="refreshed")
 
+    monkeypatch.setattr(orchestrator, "perf_counter", lambda: clock)
+    monkeypatch.setattr(orchestrator, "_maybe_reuse_cached_annotation", cache_miss)
     monkeypatch.setattr(orchestrator.settings, "annotation_gene_concurrency", 2)
     monkeypatch.setattr(orchestrator, "normalize_fusions", fake_normalize_fusions)
     monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
@@ -180,20 +188,24 @@ async def test_gene_total_duration_excludes_concurrency_slot_wait(monkeypatch):
     )
     monkeypatch.setattr(orchestrator, "trace", noop_trace)
 
-    await orchestrator.run_pipeline(genes, mode="core")
+    pipeline = asyncio.create_task(orchestrator.run_pipeline(genes, mode="core"))
+    for offset in range(0, len(genes), 2):
+        wave = genes[offset:offset + 2]
+        await asyncio.gather(*(started[gene].wait() for gene in wave))
+        # Every queued gene has reached the semaphore before advancing time.
+        clock += 1.0
+        for gene in wave:
+            release[gene].set()
+    await pipeline
 
     totals = [value for metric, value, _ in metric_calls if metric == "gene.total_duration_ms"]
     waits = sorted(value for metric, value, _ in metric_calls if metric == "gene.queue_wait_ms")
     assert len(totals) == len(genes)
     assert len(waits) == len(genes)
-    # 6 genes / 2 slots = 3 waves of ~100ms. Previously the last wave reported
-    # ~300ms; each gene's own work is ~100ms regardless of its position.
-    for total in totals:
-        assert work_s * 1000 * 0.9 <= total < work_s * 1000 * 1.8
-    # Wait time is still captured: 2 genes start immediately, 2 wait ~1 wave, 2 wait ~2 waves.
-    assert waits[0] < 20 and waits[1] < 20
-    assert all(wait >= work_s * 1000 * 0.9 for wait in waits[2:4])
-    assert all(wait >= work_s * 1000 * 1.8 for wait in waits[4:6])
+    # Three controlled waves: one second of work per gene, with zero,
+    # one, or two seconds spent queued. No wall-clock scheduling assumptions.
+    assert totals == [1000.0] * len(genes)
+    assert waits == [0.0, 0.0, 1000.0, 1000.0, 2000.0, 2000.0]
     # Queue wait uses the same tags as total duration.
     total_tags = sorted(tuple(tags) for metric, _, tags in metric_calls if metric == "gene.total_duration_ms")
     wait_tags = sorted(tuple(tags) for metric, _, tags in metric_calls if metric == "gene.queue_wait_ms")

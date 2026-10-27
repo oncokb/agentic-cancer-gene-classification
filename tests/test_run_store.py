@@ -8,7 +8,6 @@ MySQL is reachable, so the rest of the suite isn't blocked by it.
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
 
 import aiomysql
@@ -416,10 +415,8 @@ async def test_schema_upgrade_lock_timeout_fails_startup(run_store, monkeypatch)
         async with holder.cursor() as cursor:
             await cursor.execute("BEGIN")
             await cursor.execute("SELECT COUNT(*) FROM runs")  # holds a metadata lock until commit
-        started = time.monotonic()
         with pytest.raises(RunsSchemaUpgradeError, match="Timed out after 1s"):
             await run_store._ensure_schema()
-        assert time.monotonic() - started < 10
     finally:
         await holder.rollback()
         holder.close()

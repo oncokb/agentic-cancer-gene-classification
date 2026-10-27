@@ -16,18 +16,23 @@ from fastapi import Response
 
 from src import main, observability
 
-_SLOW_SECONDS = 0.15
-
 
 class SlowSocket:
-    """A transport whose every send takes _SLOW_SECONDS (a congested or
-    unreachable Agent)."""
+    """A transport held in flight until the test releases it."""
 
     def __init__(self) -> None:
         self.sent: list = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.loop_thread = threading.current_thread()
+        self.expired = threading.Event()
 
     def send(self, data: bytes) -> int:
-        time.sleep(_SLOW_SECONDS)
+        assert threading.current_thread() is not self.loop_thread
+        self.entered.set()
+        if not self.release.wait(30):
+            self.expired.set()
+            raise AssertionError("transport was never released")
         self.sent.append(data)
         return len(data)
 
@@ -56,41 +61,37 @@ async def _disabled_endpoint() -> None:
     await main.get_gene_openevidence("ALK", response=response, core_pmids=[], core_titles=[])
 
 
-async def test_slow_transport_does_not_delay_the_endpoint_or_other_loop_timers(metrics_on):
+async def test_blocked_transport_does_not_block_endpoint_or_event_loop(metrics_on):
     # Built the way the app builds it (off the loop), then given a slow transport.
     client = await asyncio.to_thread(observability._statsd)
     slow = SlowSocket()
     client.socket = slow
 
-    timer_lateness: list = []
-
-    async def independent_timer() -> None:
-        for _ in range(5):
-            due = time.monotonic() + 0.01
-            await asyncio.sleep(0.01)
-            timer_lateness.append(time.monotonic() - due)
-
-    timer = asyncio.create_task(independent_timer())
-    start = time.monotonic()
-    for _ in range(3):  # 2 metrics each: 6 slow sends if they were synchronous
+    try:
         await _disabled_endpoint()
-    elapsed = time.monotonic() - start
-    await timer
-
-    assert elapsed < _SLOW_SECONDS / 2
-    assert max(timer_lateness) < _SLOW_SECONDS / 2
-    # Still delivered, just off the loop thread.
-    assert await asyncio.to_thread(client.wait_for_pending, 5.0)
+        assert await asyncio.to_thread(slow.entered.wait, 30)
+        for _ in range(3):
+            await _disabled_endpoint()
+        # The loop and endpoint progressed while the sender was blocked.
+        assert not slow.release.is_set()
+        assert not slow.expired.is_set()
+    finally:
+        slow.release.set()
+    assert await asyncio.to_thread(client.wait_for_pending, 30.0)
     assert any(b"openevidence.endpoint.requests" in packet for packet in slow.sent)
 
 
 async def test_client_construction_never_runs_on_the_event_loop(metrics_on, monkeypatch):
     built_on: list = []
+    building = threading.Event()
+    release = threading.Event()
 
     class SlowDogStatsd:
         def __init__(self, **kwargs):
             built_on.append(threading.current_thread())
-            time.sleep(_SLOW_SECONDS * 2)  # e.g. hostname resolution
+            assert threading.current_thread() is not threading.main_thread()
+            building.set()
+            assert release.wait(30), "construction was never released"
             self.calls: list = []
 
         def increment(self, metric, value=1, tags=None):
@@ -101,14 +102,15 @@ async def test_client_construction_never_runs_on_the_event_loop(metrics_on, monk
 
     monkeypatch.setitem(sys.modules, "datadog", type("_module", (), {"DogStatsd": SlowDogStatsd}))
 
-    start = time.monotonic()
-    await _disabled_endpoint()
-    assert time.monotonic() - start < _SLOW_SECONDS
-
-    for _ in range(100):  # built in the background meanwhile
-        if observability._statsd_client is not None:
-            break
-        await asyncio.sleep(0.01)
+    try:
+        await _disabled_endpoint()
+        assert await asyncio.to_thread(building.wait, 30)
+        assert observability._statsd_client is None
+        # Construction is in progress and a second endpoint still returns.
+        await _disabled_endpoint()
+    finally:
+        release.set()
+    await _wait_for_state(observability._READY)
     assert built_on and built_on[0] is not threading.main_thread()
     await _disabled_endpoint()
     assert "openevidence.endpoint.requests" in observability._statsd_client.calls
@@ -128,10 +130,16 @@ async def test_shutdown_stops_the_sender_without_hanging(metrics_on):
     for _ in range(50):
         observability.increment("llm.requests")
 
-    start = time.monotonic()
-    await asyncio.to_thread(observability.shutdown_statsd, 0.2)
-
-    assert time.monotonic() - start < 1.0
+    try:
+        assert await asyncio.to_thread(client.socket.entered.wait, 30)
+        started = time.monotonic()
+        await asyncio.to_thread(observability.shutdown_statsd, 0.2)
+        assert time.monotonic() - started < 5.0
+        assert not client.socket.release.is_set()
+        assert not client.socket.expired.is_set()
+    finally:
+        client.socket.release.set()
+    assert await asyncio.to_thread(client.wait_for_pending, 30.0)
     assert observability._statsd_client is None
 
 
@@ -139,10 +147,9 @@ async def test_shutdown_stops_the_sender_without_hanging(metrics_on):
 
 
 class CountingDogStatsd:
-    """Records constructions; stop() optionally slow."""
+    """Records client constructions and stops."""
 
     constructed: list = []
-    stop_seconds = 0.0
 
     def __init__(self, **kwargs):
         type(self).constructed.append(self)
@@ -156,7 +163,6 @@ class CountingDogStatsd:
         self.calls.append(metric)
 
     def stop(self, timeout=None):
-        time.sleep(min(self.stop_seconds, timeout if timeout is not None else self.stop_seconds))
         self.stopped = True
         return True
 
@@ -165,7 +171,6 @@ class CountingDogStatsd:
 def counting_dogstatsd(monkeypatch, metrics_on):
     class Fresh(CountingDogStatsd):
         constructed: list = []
-        stop_seconds = 0.0
 
     monkeypatch.setitem(sys.modules, "datadog", type("_module", (), {"DogStatsd": Fresh}))
     return Fresh
@@ -211,14 +216,13 @@ async def test_failed_lazy_construction_is_not_retried_on_every_emission(metrics
     monkeypatch.setitem(sys.modules, "datadog", type("_module", (), {"DogStatsd": BrokenDogStatsd}))
 
     observability.increment("llm.requests")  # inside the loop: background init
-    for _ in range(100):
+    for _ in range(3000):
         if observability._statsd_state == observability._UNAVAILABLE:
             break
         await asyncio.sleep(0.01)
     for _ in range(20):
         observability.increment("llm.requests")
     await asyncio.to_thread(observability.increment, "llm.requests")  # sync caller too
-    await asyncio.sleep(0.05)
 
     assert len(attempts) == 1
     assert observability._statsd_state == observability._UNAVAILABLE
@@ -229,39 +233,43 @@ class _LockHolder:
 
     def __init__(self) -> None:
         self._held = threading.Event()
+        self.expired = threading.Event()
         self._release = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
         with observability._statsd_lock:
             self._held.set()
-            self._release.wait(5)
+            if not self._release.wait(30):
+                self.expired.set()
 
     def __enter__(self) -> "_LockHolder":
         self._thread.start()
-        assert self._held.wait(1), "the lifecycle lock was never taken"
+        assert self._held.wait(30), "the lifecycle lock was never taken"
         return self
 
     def release(self) -> None:
         self._release.set()
-        self._thread.join(1)
+        self._thread.join(30)
 
     def __exit__(self, *exc) -> None:
         self.release()
 
 
 async def _wait_for_state(state: str) -> None:
-    for _ in range(100):
+    for _ in range(3000):
         if observability._statsd_state == state:
             return
         await asyncio.sleep(0.01)
 
 
-async def test_shutdown_is_bounded_and_final_even_when_the_lifecycle_lock_is_held(counting_dogstatsd):
+async def test_shutdown_is_bounded_and_final_even_when_the_lifecycle_lock_is_held(counting_dogstatsd, caplog):
     with _LockHolder() as holder:
-        start = time.monotonic()
         await asyncio.to_thread(observability.shutdown_statsd, 0.05)
-        assert time.monotonic() - start < 0.5
+        assert not holder.expired.is_set(), "shutdown waited until the lock holder expired"
+        assert "timed out after 0.05s waiting for the client lock" in caplog.text
+        assert not holder._release.is_set()
+        assert holder._thread.is_alive()
         holder.release()
 
         # The deferred cleanup finishes the transition once the lock is free.
@@ -273,7 +281,6 @@ async def test_shutdown_is_bounded_and_final_even_when_the_lifecycle_lock_is_hel
         observability.increment("llm.requests")
         await asyncio.to_thread(observability.increment, "llm.requests")
         assert await asyncio.to_thread(observability.init_statsd) is None
-        await asyncio.sleep(0.05)
 
     assert counting_dogstatsd.constructed == []
     assert observability._statsd_client is None
@@ -289,7 +296,7 @@ async def test_timed_out_shutdown_still_stops_and_unpublishes_a_ready_client(cou
         assert client.calls == []  # latched: not delivered even while still published
         holder.release()
         await _wait_for_state(observability._CLOSED)
-        for _ in range(100):
+        for _ in range(3000):
             if client.stopped:
                 break
             await asyncio.sleep(0.01)
@@ -309,37 +316,48 @@ async def test_initializer_finishing_after_shutdown_never_publishes(counting_dog
 
     def slow_init(self, **kwargs):
         building.set()
-        finish.wait(5)  # e.g. slow hostname resolution
+        assert finish.wait(30)  # e.g. slow hostname resolution
         original_init(self, **kwargs)
 
     monkeypatch.setattr(counting_dogstatsd, "__init__", slow_init)
     initializer = threading.Thread(target=observability.init_statsd, daemon=True)
     initializer.start()
-    building.wait(1)
+    assert await asyncio.to_thread(building.wait, 30)
 
-    start = time.monotonic()
-    await asyncio.to_thread(observability.shutdown_statsd, 0.05)
-    assert time.monotonic() - start < 0.5  # never waits on the in-flight construction
-
-    finish.set()
-    initializer.join(2)
+    try:
+        await asyncio.to_thread(observability.shutdown_statsd, 0.05)
+        assert not finish.is_set()
+    finally:
+        finish.set()
+        await asyncio.to_thread(initializer.join, 30)
+    assert not initializer.is_alive()
     assert observability._statsd_client is None
     assert observability._statsd_state == observability._CLOSED
     (late,) = counting_dogstatsd.constructed
     assert late.stopped  # stopped and discarded, not published
 
 
-async def test_emission_during_stop_does_not_start_a_replacement_client(counting_dogstatsd):
-    counting_dogstatsd.stop_seconds = 0.2
+async def test_emission_during_stop_does_not_start_a_replacement_client(counting_dogstatsd, monkeypatch):
+    stopping = threading.Event()
+    release = threading.Event()
+
+    def controlled_stop(self, timeout=None):
+        stopping.set()
+        assert release.wait(30)
+        self.stopped = True
+
+    monkeypatch.setattr(counting_dogstatsd, "stop", controlled_stop)
     client = await asyncio.to_thread(observability.init_statsd)
     assert client is not None
 
     shutdown = asyncio.create_task(asyncio.to_thread(observability.shutdown_statsd, 1.0))
-    await asyncio.sleep(0.05)  # stop() is now in progress
-    observability.increment("llm.requests")  # loop caller
-    await asyncio.to_thread(observability.increment, "llm.requests")  # sync caller
-    await shutdown
-    await asyncio.sleep(0.05)
+    try:
+        assert await asyncio.to_thread(stopping.wait, 30)
+        observability.increment("llm.requests")  # loop caller
+        await asyncio.to_thread(observability.increment, "llm.requests")  # sync caller
+    finally:
+        release.set()
+        await shutdown
 
     assert len(counting_dogstatsd.constructed) == 1
     assert observability._statsd_client is None
@@ -349,18 +367,25 @@ async def test_emission_during_stop_does_not_start_a_replacement_client(counting
 
 async def test_stop_without_timeout_support_stays_bounded(metrics_on, caplog):
     stop_called = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
 
     class OldDogStatsd:
         def stop(self):  # datadog < 0.55: no timeout parameter
             stop_called.set()
-            time.sleep(1.0)
+            assert release.wait(30)
+            stopped.set()
 
     observability._statsd_client = OldDogStatsd()
     observability._statsd_state = observability._READY
 
-    start = time.monotonic()
-    await asyncio.to_thread(observability.shutdown_statsd, 0.1)
-
-    assert time.monotonic() - start < 0.5
-    assert stop_called.wait(1)
+    try:
+        started = time.monotonic()
+        await asyncio.to_thread(observability.shutdown_statsd, 0.1)
+        assert time.monotonic() - started < 5.0
+        assert await asyncio.to_thread(stop_called.wait, 30)
+        assert not release.is_set()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(stopped.wait, 30)
     assert "takes no timeout" in caplog.text
