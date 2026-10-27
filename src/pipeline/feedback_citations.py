@@ -315,20 +315,17 @@ def _fusion_matches(message: str) -> List[Tuple[str, str, str]]:
 def extract_subject(message: str, gene: Optional[str] = None) -> Tuple[Optional[str], bool]:
     """Return (subject, is_fusion) following the documented precedence.
 
-    An explicit "::" anywhere in the message wins over everything, then the
-    structured field (kept in its submitted case), then "-"/"/" pairs only
-    when a fusion word is directly adjacent to them.
+    The structured field (kept in its submitted case) wins over the message,
+    then an explicit "::" anywhere in the message wins over a "-" or "/" pair,
+    then "-"/"/" pairs only when a fusion word is directly adjacent to them.
     """
-    matches = _fusion_matches(message)
-    explicit = [item for item in matches if ":" in item[1]]
-    if explicit:
-        left, _, right = explicit[0]
-        return f"{left}::{right}", True
     if gene and gene.strip():
         subject = gene.strip()
         _, right = _split_subject(subject)
         return subject, right is not None
-    for left, _, right in matches:
+    matches = _fusion_matches(message)
+    explicit = [item for item in matches if ":" in item[1]]
+    for left, _, right in explicit or matches:
         return f"{left}::{right}", True
     match = _NAMED_GENE_SUBJECT.search(message or "")
     if match:
