@@ -121,15 +121,39 @@ _FUSION_KEYWORD = (
     r"(?:fusion|fusions|fused|chimeric|rearrangement|rearranged|translocation)"
 )
 # A "/" or "-" pair is only a fusion when one of the fusion words is directly
-# adjacent to it. Arbitrary fusion wording elsewhere in the message (e.g. after
-# an unrelated "TP53/EGFR co-mutation") must not turn every pair into a fusion.
+# adjacent to it, or when it is explicitly "-positive" / " positive". Arbitrary
+# fusion wording elsewhere in the message (e.g. after an unrelated
+# "TP53/EGFR co-mutation") must not turn every pair into a fusion.
 _FUSION_BEFORE_PAIR = re.compile(
     rf"{_FUSION_KEYWORD}"
-    r"(?:\s*[-/]?\s*(?:positive|negative|driven|associated))?\s*$",
+    r"(?:\s*[-/]?\s*(?:positive|driven|associated))?"
+    r"[\s:,(]*$",
     re.IGNORECASE,
 )
 _FUSION_AFTER_PAIR = re.compile(
-    rf"^\s*-?\s*(?:positive|negative|driven|associated)?\s*{_FUSION_KEYWORD}\b",
+    rf"^\s*-?\s*(?:positive|driven|associated)?\s*{_FUSION_KEYWORD}\b",
+    re.IGNORECASE,
+)
+# "BCR-ABL1-positive"/"BCR-ABL1 positive CML" is a common fusion notation even
+# without the word "fusion"; both sides still have to be valid gene symbols.
+_POSITIVE_AFTER_PAIR = re.compile(r"^\s*-?\s*positive\b", re.IGNORECASE)
+_NEGATIVE_QUALIFIERS = r"(?:negative|wild[\s-]*type|absent)"
+# Negation next to the pair always wins: "fusion-negative EGFR/ALK",
+# "EGFR/ALK fusion-negative", "wild-type BCR/ABL1", "no BCR/ABL1 fusion".
+_NEGATIVE_BEFORE_PAIR = re.compile(
+    rf"(?:\bno\s+(?:{_FUSION_KEYWORD}\s*)?$)"
+    rf"|(?:(?:{_FUSION_KEYWORD})\s*[-:]?\s*)?(?:{_NEGATIVE_QUALIFIERS})\s*$",
+    re.IGNORECASE,
+)
+_NEGATIVE_AFTER_PAIR = re.compile(
+    rf"^\s*(?:(?:{_FUSION_KEYWORD})\s*[-:]?\s*)?"
+    rf"(?:{_NEGATIVE_QUALIFIERS}|no)\b",
+    re.IGNORECASE,
+)
+# Co-mutation/co-occurrence wording directly after a pair means the pair is not
+# a fusion, even when a fusion word sits before it.
+_COOCCURRENCE_AFTER_PAIR = re.compile(
+    r"^\s*[- ]?\s*(?:co-(?:mut|occur|alter)\w*|mutat\w*)\b",
     re.IGNORECASE,
 )
 _TUMOR_DASHES = str.maketrans({
@@ -291,10 +315,21 @@ def _valid_fusion_pair(left: str, right: str, separator: str) -> bool:
 
 
 def _fusion_keyword_adjacent(message: str, start: int, end: int) -> bool:
-    """Return True when a fusion word directly precedes or follows the pair."""
+    """Return True when fusion wording directly supports this pair.
+
+    A negative qualifier or co-mutation/co-occurrence wording next to the pair
+    always rejects it, even if a fusion word is also adjacent.
+    """
+    before = message[:start]
+    after = message[end:]
+    if _NEGATIVE_BEFORE_PAIR.search(before) or _NEGATIVE_AFTER_PAIR.match(after):
+        return False
+    if _COOCCURRENCE_AFTER_PAIR.match(after):
+        return False
     return bool(
-        _FUSION_BEFORE_PAIR.search(message[:start])
-        or _FUSION_AFTER_PAIR.match(message[end:])
+        _FUSION_BEFORE_PAIR.search(before)
+        or _FUSION_AFTER_PAIR.match(after)
+        or _POSITIVE_AFTER_PAIR.match(after)
     )
 
 
@@ -304,7 +339,7 @@ def _fusion_matches(message: str) -> List[Tuple[str, str, str]]:
         left, separator, right = match.group(1), match.group(2), match.group(3)
         if not _valid_fusion_pair(left, right, separator):
             continue
-        if separator in ("-", "/") and not _fusion_keyword_adjacent(
+        if separator in ("-", "--", "/") and not _fusion_keyword_adjacent(
             message, match.start(), match.end()
         ):
             continue
