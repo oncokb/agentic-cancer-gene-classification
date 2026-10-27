@@ -134,20 +134,29 @@ _FUSION_AFTER_PAIR = re.compile(
     rf"^\s*-?\s*(?:positive|driven|associated)?\s*{_FUSION_KEYWORD}\b",
     re.IGNORECASE,
 )
+# A "/" pair is not a fusion just because it is "rearranged" (double-hit
+# lymphoma: MYC/BCL2 rearranged); keep that wording for "-" pairs only.
+_FUSION_AFTER_PAIR_SLASH = re.compile(
+    r"^\s*-?\s*(?:positive|driven|associated)?\s*"
+    r"(?:fusion|fusions|fused|chimeric|rearrangement|translocation)\b",
+    re.IGNORECASE,
+)
 # "BCR-ABL1-positive"/"BCR-ABL1 positive CML" is a common fusion notation even
 # without the word "fusion"; both sides still have to be valid gene symbols.
+# Only "-" pairs qualify: "TP53/KRAS-positive" is co-expression, not a fusion.
 _POSITIVE_AFTER_PAIR = re.compile(r"^\s*-?\s*positive\b", re.IGNORECASE)
 _NEGATIVE_QUALIFIERS = r"(?:negative|wild[\s-]*type|absent)"
 # Negation next to the pair always wins: "fusion-negative EGFR/ALK",
-# "EGFR/ALK fusion-negative", "wild-type BCR/ABL1", "no BCR/ABL1 fusion".
+# "EGFR/ALK fusion-negative", "wild-type BCR/ABL1", "no BCR/ABL1 fusion",
+# "no evidence of BCR-ABL1 fusion", "BCR-ABL1 fusion not detected".
 _NEGATIVE_BEFORE_PAIR = re.compile(
-    rf"(?:\bno\s+(?:{_FUSION_KEYWORD}\s*)?$)"
+    rf"(?:\bno\s+(?:evidence\s+of\s+)?(?:{_FUSION_KEYWORD}\s*)?$)"
     rf"|(?:(?:{_FUSION_KEYWORD})\s*[-:]?\s*)?(?:{_NEGATIVE_QUALIFIERS})\s*$",
     re.IGNORECASE,
 )
 _NEGATIVE_AFTER_PAIR = re.compile(
     rf"^\s*(?:(?:{_FUSION_KEYWORD})\s*[-:]?\s*)?"
-    rf"(?:{_NEGATIVE_QUALIFIERS}|no)\b",
+    rf"(?:{_NEGATIVE_QUALIFIERS}|no|not\s+detected)\b",
     re.IGNORECASE,
 )
 # Co-mutation/co-occurrence wording directly after a pair means the pair is not
@@ -314,7 +323,31 @@ def _valid_fusion_pair(left: str, right: str, separator: str) -> bool:
     return True
 
 
-def _fusion_keyword_adjacent(message: str, start: int, end: int) -> bool:
+_IMMUNE_MARKER_PREFIXES = ("CD", "CK")
+
+
+def _is_immune_marker(token: str) -> bool:
+    upper = token.upper()
+    return any(
+        upper.startswith(prefix)
+        and len(upper) > len(prefix)
+        and upper[len(prefix)].isdigit()
+        for prefix in _IMMUNE_MARKER_PREFIXES
+    )
+
+
+def _positive_pair_notation(
+    separator: str, left: str, right: str, after: str
+) -> bool:
+    """Return True for the hyphen-pair "-positive"/" positive" shorthand."""
+    if separator != "-" or _is_immune_marker(left) or _is_immune_marker(right):
+        return False
+    return bool(_POSITIVE_AFTER_PAIR.match(after))
+
+
+def _fusion_keyword_adjacent(
+    message: str, start: int, end: int, separator: str, left: str, right: str
+) -> bool:
     """Return True when fusion wording directly supports this pair.
 
     A negative qualifier or co-mutation/co-occurrence wording next to the pair
@@ -326,10 +359,13 @@ def _fusion_keyword_adjacent(message: str, start: int, end: int) -> bool:
         return False
     if _COOCCURRENCE_AFTER_PAIR.match(after):
         return False
+    fusion_after = (
+        _FUSION_AFTER_PAIR_SLASH if separator == "/" else _FUSION_AFTER_PAIR
+    )
     return bool(
         _FUSION_BEFORE_PAIR.search(before)
-        or _FUSION_AFTER_PAIR.match(after)
-        or _POSITIVE_AFTER_PAIR.match(after)
+        or fusion_after.match(after)
+        or _positive_pair_notation(separator, left, right, after)
     )
 
 
@@ -340,7 +376,7 @@ def _fusion_matches(message: str) -> List[Tuple[str, str, str]]:
         if not _valid_fusion_pair(left, right, separator):
             continue
         if separator in ("-", "--", "/") and not _fusion_keyword_adjacent(
-            message, match.start(), match.end()
+            message, match.start(), match.end(), separator, left, right
         ):
             continue
         matches.append((left, separator, right))
