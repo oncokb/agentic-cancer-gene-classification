@@ -453,9 +453,8 @@ async def test_malformed_archive_answer_is_retried_never_cached_never_raised(ens
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flag", ["", "0", 0, False, "false"])
-async def test_archive_not_current_flags_mean_retired(ensembl, monkeypatch, flag):
-    monkeypatch.setitem(_ARCHIVE, _RETIRED, {**_ARCHIVE[_RETIRED], "is_current": flag})
+async def test_archive_empty_string_flag_means_retired(ensembl):
+    assert _ARCHIVE[_RETIRED]["is_current"] == ""  # Ensembl's wire value for "not current"
 
     gene_map = await normalize_fusions([_RETIRED])
 
@@ -463,14 +462,33 @@ async def test_archive_not_current_flags_mean_retired(ensembl, monkeypatch, flag
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flag", ["1", 1, True, "true"])
-async def test_archive_current_flags_are_inconsistent(ensembl, monkeypatch, flag):
-    monkeypatch.setitem(_ARCHIVE, _RETIRED, {**_ARCHIVE[_RETIRED], "is_current": flag})
+async def test_archive_one_flag_is_inconsistent(ensembl, monkeypatch):
+    monkeypatch.setitem(_ARCHIVE, _RETIRED, {**_ARCHIVE[_RETIRED], "is_current": "1"})
 
     gene_map = await normalize_fusions([_RETIRED])
 
     assert gene_map[_RETIRED][0].lookup_failed
     assert "(inconsistent response)" in _error(gene_map, _RETIRED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["false", "0", 0, False, "true", 1, True, None, "True", " "])
+async def test_archive_flag_other_than_wire_values_is_untrusted_and_not_cached(ensembl, monkeypatch, flag):
+    archive_key = f"GET /archive/id/{_RETIRED}"
+    monkeypatch.setitem(_ARCHIVE, _RETIRED, {**_ARCHIVE[_RETIRED], "is_current": flag})
+
+    first = await normalize_fusions([_RETIRED])
+
+    assert first[_RETIRED][0].lookup_failed
+    assert _error(first, _RETIRED) == "Ensembl lookup temporarily unavailable (invalid response); retry later."
+    assert ensembl.requests.count(archive_key) == normalization.ENSEMBL_ATTEMPTS
+    requests = len(ensembl.requests)
+
+    second = await normalize_fusions([_RETIRED])
+
+    # Nothing was cached: the second run asks Ensembl again and is still temporary.
+    assert ensembl.requests[requests:] == ["POST /lookup/id"] + [archive_key] * normalization.ENSEMBL_ATTEMPTS
+    assert second[_RETIRED][0].lookup_failed
 
 
 @pytest.mark.asyncio

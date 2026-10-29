@@ -439,10 +439,10 @@ def _parse_lookup_doc(data: object) -> dict:
     return data  # type: ignore[return-value]
 
 
-# The archive's is_current flag: Ensembl sends "1" or "", the rest are the
-# other unambiguous spellings of true/false.
-_ARCHIVE_CURRENT = frozenset({"1", "true"})
-_ARCHIVE_NOT_CURRENT = frozenset({"", "0", "false"})
+# The archive's is_current flag on the wire (ensembl-rest t/archive.t): "1"
+# for current, "" for not current. Any other form is untrusted, never classified.
+_ARCHIVE_CURRENT = "1"
+_ARCHIVE_NOT_CURRENT = ""
 
 
 def _parse_archive(data: object) -> dict:
@@ -453,13 +453,9 @@ def _parse_archive(data: object) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"unexpected archive JSON {type(data).__name__}")
     flag = data.get("is_current")
-    if isinstance(flag, bool):
-        flag = "true" if flag else "false"
-    elif isinstance(flag, int):
-        flag = str(flag)
-    if not isinstance(flag, str) or flag.lower() not in _ARCHIVE_CURRENT | _ARCHIVE_NOT_CURRENT:
-        raise ValueError(f"unexpected archive is_current {data.get('is_current')!r}")
-    if flag.lower() in _ARCHIVE_CURRENT:
+    if not isinstance(flag, str) or flag not in (_ARCHIVE_CURRENT, _ARCHIVE_NOT_CURRENT):
+        raise ValueError(f"unexpected archive is_current {flag!r}")
+    if flag == _ARCHIVE_CURRENT:
         raise _EnsemblUnavailable("inconsistent response")
     release = data.get("release")
     if release is not None and (isinstance(release, bool) or not isinstance(release, (str, int))):
