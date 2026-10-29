@@ -575,6 +575,20 @@ class RunStore(UserStoreMixin):
             return None
         return json.loads(row[0])
 
+    async def get_run_request(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """The request a run was saved with, or None for an unknown run. A
+        stored request that isn't a JSON object comes back as {}."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT request_json FROM runs WHERE run_id = %s", (run_id,)
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row[0]) if row[0] is not None else None
+        return payload if isinstance(payload, dict) else {}
+
     async def get_run_metadata(self, run_id: str) -> Optional[Dict[str, Optional[str]]]:
         """Owner attribution for a saved run, or None when it doesn't exist."""
         async with self._pool.acquire() as conn:

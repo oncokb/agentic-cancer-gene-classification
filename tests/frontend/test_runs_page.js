@@ -16,6 +16,7 @@ class Element {
     };
   }
   appendChild(child) { this.children.push(child); }
+  setAttribute(name, value) { this[`attr:${name}`] = String(value); }
   replaceChildren() { this.children = []; }
   addEventListener(name, fn) { this.listeners[name] = fn; }
   fire(name) { return this.listeners[name](); }
@@ -31,13 +32,22 @@ const deferred = () => {
   const promise = new Promise((done) => { resolve = done; });
   return { promise, resolve };
 };
-function env(queue) {
+function memoryStorage() {
+  const items = new Map();
+  return {
+    items,
+    getItem: (key) => (items.has(key) ? items.get(key) : null),
+    setItem: (key, value) => items.set(key, String(value)),
+    removeItem: (key) => items.delete(key),
+  };
+}
+function env(queue, { sessionStorage = memoryStorage() } = {}) {
   const nodes = {};
   for (const name of ["error", "empty", "loading", "table", "tbody", "load-more", "retry"]) {
     nodes[name] = new Element("div");
   }
   const calls = [];
-  const window = { location: { origin: "https://acgc.example.org", href: "/runs" } };
+  const window = { location: { origin: "https://acgc.example.org", href: "/runs" }, sessionStorage };
   const app = createRunsPage({
     document: { getElementById: (id) => nodes[id.slice(5)], createElement: (tag) => new Element(tag) },
     window,
@@ -218,6 +228,51 @@ test("pending approval gets clear guidance; expired sessions redirect back to ru
   await expired.app.init();
   assert.strictEqual(expired.window.location.href, "/login?redirect_to=%2Fruns");
   assert.ok(expired.nodes.empty.hidden);
+});
+
+test("each row has a Rerun button that hands the run to the run page, cached by default", async () => {
+  const e = env([response({ runs: [RUN], next_cursor: null })]);
+  await e.app.init();
+  const cell = e.nodes.tbody.children[0].children[4];
+  const [mode, button] = cell.children;
+  assert.strictEqual(mode.tagName, "select");
+  assert.deepStrictEqual(mode.children.map((option) => [option.value, option.textContent]), [
+    ["cached", "Use cached results"], ["refresh", "Refresh (force_refresh)"],
+  ]);
+  assert.strictEqual(mode.value, "cached");
+  assert.strictEqual(button.tagName, "button");
+  assert.strictEqual(button.textContent, "Rerun");
+  assert.strictEqual(e.calls.length, 1);
+  button.fire("click");
+  // No request from this page: the run page starts the rerun and polls it.
+  assert.strictEqual(e.calls.length, 1);
+  const handoff = JSON.parse(e.window.sessionStorage.items.get("agcg.pendingRerun"));
+  assert.ok(Math.abs(Date.now() - handoff.created_at) < 5000, "hand-off is timestamped");
+  assert.deepStrictEqual({ ...handoff, created_at: undefined }, {
+    run_id: "run/1", force_refresh: false, created_at: undefined,
+  });
+  assert.strictEqual(e.window.location.href, "https://acgc.example.org/?run=run%2F1");
+});
+
+test("Rerun with Refresh selected requests force_refresh", async () => {
+  const e = env([response({ runs: [RUN, { ...RUN, run_id: "two", view_url: "/?run=two" }], next_cursor: null })]);
+  await e.app.init();
+  const [mode, button] = e.nodes.tbody.children[1].children[4].children;
+  mode.value = "refresh";
+  button.fire("click");
+  const handoff = JSON.parse(e.window.sessionStorage.items.get("agcg.pendingRerun"));
+  assert.strictEqual(handoff.run_id, "two");
+  assert.strictEqual(handoff.force_refresh, true);
+  assert.strictEqual(typeof handoff.created_at, "number");
+  assert.strictEqual(e.window.location.href, "https://acgc.example.org/?run=two");
+});
+
+test("Rerun still opens the run when sessionStorage is unavailable", async () => {
+  const blocked = { setItem: () => { throw new Error("SecurityError"); } };
+  const e = env([response({ runs: [RUN], next_cursor: null })], { sessionStorage: blocked });
+  await e.app.init();
+  e.nodes.tbody.children[0].children[4].children[1].fire("click");
+  assert.strictEqual(e.window.location.href, "https://acgc.example.org/?run=run%2F1");
 });
 
 (async () => {

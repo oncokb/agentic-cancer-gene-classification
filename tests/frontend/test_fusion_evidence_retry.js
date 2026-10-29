@@ -261,9 +261,63 @@ function testSidebarFilterSurvivesItemMovingSections() {
   assert.deepStrictEqual(headings(), ["Found in LUAD"], "item now sits under its new section");
 }
 
+
+async function testLateRetryResponseNeverWritesIntoAnotherRun() {
+  // A retry whose run is replaced before the job answers — by another result
+  // (different run id) or by clearing results — must not touch the new state.
+  for (const switchRun of [
+    (sandbox) => {
+      sandbox.state.currentResult = {
+        run_id: "run-2", annotations: [{ gene: "BRAF" }],
+        fusion_evidence: [{ fusion: "KIAA1549::BRAF", tumor_type: "LGG", pmids: ["9"] }],
+      };
+      sandbox.state.fusionEvidenceStatus = "complete";
+      sandbox.setMessage("Shared run restored.", "info");
+    },
+    (sandbox) => sandbox.clearResults(),
+  ]) {
+    for (const lateStatus of [
+      { status: "complete", fusions_total: 1, fusions_completed: 1, fusion_evidence: [{
+        fusion: "EML4::ALK", input: "ENST00000318522::ENST00000389048",
+        tumor_type: "LUAD", retrieval_status: "ok", pmids: ["3"],
+      }] },
+      { status: "failed", error: "upstream timeout" },
+    ]) {
+      let release;
+      const late = new Promise((resolve) => { release = resolve; });
+      const sandbox = app(async (url, options = {}) => {
+        if (url === "/v1/fusion-evidence/jobs" && options.method === "POST") {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ job_id: "job-3", status_url: "/v1/fusion-evidence/jobs/job-3" }),
+            text: async () => "",
+          };
+        }
+        if (url === "/v1/fusion-evidence/jobs/job-3") return late;
+        throw new Error(`unexpected fetch ${url}`);
+      });
+      sandbox.state.canModifyRun = true;
+      renderForRetry(sandbox);
+
+      const retry = sandbox.retryFailedFusionEvidence();
+      for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+      switchRun(sandbox);
+      const before = JSON.stringify(sandbox.state.currentResult);
+      const statusBefore = sandbox.state.fusionEvidenceStatus;
+      const messageBefore = sandbox.elements.messageBox.textContent;
+      release({ ok: true, status: 200, json: async () => lateStatus, text: async () => "" });
+      await retry;
+
+      assert.strictEqual(JSON.stringify(sandbox.state.currentResult), before, "late retry left the new run alone");
+      assert.strictEqual(sandbox.state.fusionEvidenceStatus, statusBefore);
+      assert.strictEqual(sandbox.elements.messageBox.textContent, messageBefore);
+    }
+  }
+}
+
 const tests = [testButtonOnlyWithFailedItemsAndPermission, testRetrySendsOnlyFailedFusionsAndMergesInPlace,
   testRetryErrorKeepsOldItems, testRetryPollingErrorKeepsOriginalItems, testDuplicateIncomingKeysMergeOnce,
-  testSidebarFilterSurvivesItemMovingSections];
+  testSidebarFilterSurvivesItemMovingSections, testLateRetryResponseNeverWritesIntoAnotherRun];
 (async () => {
   for (const test of tests) {
     await test();

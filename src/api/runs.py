@@ -19,7 +19,7 @@ class RunSummaryResponse(BaseModel):
 
     run_id: str = Field(description="Unique saved run identifier.")
     created_at: str = Field(description="Run creation time as an ISO-8601 UTC timestamp.")
-    source: Optional[str] = Field(description="Run origin: session, api_key, local, or null.")
+    source: Optional[str] = Field(description="Run origin: session, api_key, local, rerun, or null.")
     input_summary: Optional[str] = Field(description="Short summary of the run's inputs.")
     input_count: Optional[int] = Field(description="Number of inputs, or null for older runs.")
     genes_annotated: Optional[int] = Field(description="Number of genes annotated, if recorded.")

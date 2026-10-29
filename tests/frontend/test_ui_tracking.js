@@ -965,6 +965,9 @@ test("runs.js: rows surface once across load-more re-renders; opened_run and loa
       child.parentNode = this;
       this.children.push(child);
     }
+    setAttribute(name, value) {
+      this[`attr:${name}`] = String(value);
+    }
     replaceChildren() {
       this.children.forEach((child) => { child.isConnected = false; });
       this.children = [];
