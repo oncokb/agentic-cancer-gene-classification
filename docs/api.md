@@ -191,12 +191,29 @@ Your original input stays in the result: `resolved_inputs` on each annotation
 `submitted_inputs` in gene-query results, and `input` on fusion-evidence
 results. Request-level `warnings` repeat any caveats and errors.
 
+Some current human Ensembl genes (for example novel lncRNAs such as
+`ENSG00000225718`) have neither an HGNC symbol nor an Ensembl name. Such a gene
+is annotated under its unversioned Ensembl gene ID, with a warning like
+"ENSG00000225718 is a current human lncRNA with no HGNC symbol or Ensembl name;
+the Ensembl ID is used as its name." The ID is not an HGNC symbol, so fusion
+evidence searches PubMed for the ID itself (e.g. `PTPRN2::ENSG00000225718`),
+plus the other partner's aliases.
+
 An identifier that can't be used gets its own error row and is not annotated
 as any gene. That covers an unknown, non-human or malformed ID, an Ensembl or
 NCBI lookup that failed (retry), and `GENE(ENST...)` / `GENE(NM_...)` where the
 transcript belongs to a different gene. In the gene query API the last case
 reads "The Ensembl ID belongs to a different gene than the one named." or "The
 RefSeq accession belongs to a different gene than the one named."
+
+For Ensembl IDs Ensembl doesn't know, the archive tells the two permanent
+cases apart: "Ensembl ID ENSG... is retired (last seen in release N)." (naming
+a replacement only when Ensembl suggests one) or "Ensembl did not find ID
+ENSG...". Timeouts, network errors, HTTP 429 and 5xx are retried with backoff
+(honouring `Retry-After`) for up to about 15 seconds per lookup, then reported
+as "Ensembl lookup temporarily unavailable (timeout); retry later." (or
+`(HTTP 429)`, `(HTTP 503)`, ...); only those are worth retrying. Successful lookups
+and retired/not-found answers are cached per ID; failed lookups are not.
 
 In a fusion, only the bad partner is rejected: the other partner is still
 annotated on its own. For `EML4(ENST00000256078)::ALK` (a KRAS transcript),
