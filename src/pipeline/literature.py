@@ -24,12 +24,13 @@ import xml.etree.ElementTree as ET
 from bisect import bisect_left
 from datetime import datetime, timezone
 from functools import lru_cache
+from time import monotonic
 from typing import Dict, List, Optional, Set, Tuple
 
 import anthropic
 import httpx
 from aiolimiter import AsyncLimiter
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import RetryError
 
 from src.config import settings
 from src.models.schema import (
@@ -41,7 +42,13 @@ from src.models.schema import (
     LiteraturePaperScore,
     LiteratureRecord,
 )
-from src.pipeline.normalization import has_accession_identifier, read_gene_input, resolve_gene, split_fusion
+from src.pipeline.normalization import (
+    _retry_after_seconds,
+    has_accession_identifier,
+    read_gene_input,
+    resolve_gene,
+    split_fusion,
+)
 from src.pipeline.cache import cached_call
 from src.pipeline.llm_client import (
     complete_with_tool,
@@ -529,6 +536,12 @@ async def resolve_fusion_partner_aliases(
 # (_match_fusion_evidence) is uncapped — it only runs regexes against already-
 # retrieved abstracts, which is cheap regardless of alias count.
 _MAX_QUERY_ALIASES_PER_PARTNER = 6
+_MAX_FUSION_QUERY_PHRASES = 120
+_JUNK_QUERY_ALIAS = re.compile(r"^(?:FLJ\d+|KIAA\d+|DKFZp.*|MGC\d+)$|.*-OT\d+", re.I)
+
+
+def _query_aliases(aliases: Optional[List[str]]) -> List[str]:
+    return [alias for alias in aliases or [] if not _JUNK_QUERY_ALIAS.fullmatch(alias)]
 
 
 def _fusion_query_variants(
@@ -544,22 +557,24 @@ def _fusion_query_variants(
     five_prime, three_prime = split_fusion(fusion)
     if not five_prime or not three_prime:
         return []
-    five_options = _partner_symbol_options(five_prime, five_aliases)[
+    five_options = _partner_symbol_options(five_prime, _query_aliases(five_aliases))[
         : _MAX_QUERY_ALIASES_PER_PARTNER + 1
     ]
-    three_options = _partner_symbol_options(three_prime, three_aliases)[
+    three_options = _partner_symbol_options(three_prime, _query_aliases(three_aliases))[
         : _MAX_QUERY_ALIASES_PER_PARTNER + 1
     ]
     variants: List[str] = []
-    for five in five_options:
-        for three in three_options:
-            variants.extend([
-                f"{five}::{three}",
-                f"{five}-{three}",
-                f"{five}/{three}",
-                f"{five} {three}",
-            ])
-    return list(dict.fromkeys(variants))
+    pairs = [(five, three) for five in five_options for three in three_options]
+    # Keep all canonical/alias combinations ahead of alias/alias combinations.
+    pairs.sort(key=lambda pair: pair[0] != five_options[0] and pair[1] != three_options[0])
+    for five, three in pairs:
+        variants.extend([
+            f"{five}::{three}",
+            f"{five}-{three}",
+            f"{five}/{three}",
+            f"{five} {three}",
+        ])
+    return list(dict.fromkeys(variants))[:_MAX_FUSION_QUERY_PHRASES]
 
 
 def _gene_boundary_pattern(gene: str) -> str:
@@ -945,7 +960,7 @@ def _fusion_evidence_interpretation(
     tumor_type: Optional[str],
     records: List[LiteratureRecord],
     well_supported: bool,
-    literature_scope: str,
+    literature_scope: Optional[str],
     requested_tumor_count: int,
 ) -> str:
     novelty_count = _novelty_record_count(records)
@@ -979,7 +994,8 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             "min_papers": settings.min_papers_for_strong_association,
             "exact_fusion_filter_version": 2,
             "retraction_filter_version": 2,
-            "alias_expansion_version": 1,
+            "alias_expansion_version": 3,
+            "partial_search_version": 2,
             # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
             # 2: hyphen-aware word edges; case-independent free-text abbreviations.
             # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
@@ -990,6 +1006,14 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
         },
         sort_keys=True,
     )
+
+
+class _PartialFusionEvidence(Exception):
+    """Carry a usable result through cached_call without writing it to Redis."""
+
+    def __init__(self, result: FusionEvidenceResult):
+        self.result = result
+        super().__init__("Partial fusion evidence must not be cached")
 
 
 async def retrieve_fusion_evidence(
@@ -1021,15 +1045,20 @@ async def retrieve_fusion_evidence(
             tumor_type=tumor_type,
             max_results=max_results,
         )
+        if result.partial:
+            raise _PartialFusionEvidence(result)
         return result.model_dump()
 
-    payload = await cached_call(
-        cache_key,
-        _compute,
-        ttl_seconds=settings.fusion_evidence_cache_ttl_seconds,
-        force_refresh=force_refresh,
-    )
-    result = FusionEvidenceResult(**payload)
+    try:
+        payload = await cached_call(
+            cache_key,
+            _compute,
+            ttl_seconds=settings.fusion_evidence_cache_ttl_seconds,
+            force_refresh=force_refresh,
+        )
+        result = FusionEvidenceResult(**payload)
+    except _PartialFusionEvidence as exc:
+        result = exc.result
     if fusion != submitted:
         result.input = submitted
     return result
@@ -1055,7 +1084,18 @@ async def _retrieve_fusion_evidence_uncached(
         )
 
     client = _get_ncbi_client()
-    pmid_lists = await asyncio.gather(*[_esearch(query, max_results, client) for query in queries])
+    search_results = await asyncio.gather(
+        *[_esearch(query, max_results, client) for query in queries], return_exceptions=True,
+    )
+    for result in search_results:
+        if isinstance(result, BaseException) and not isinstance(result, Exception):
+            raise result
+    failures = [result for result in search_results if isinstance(result, Exception)]
+    for failure in failures:
+        logger.warning("Fusion evidence for %s: %s", fusion, pubmed_error_message(failure))
+    if len(failures) == len(queries):
+        raise failures[0]
+    pmid_lists = [result for result in search_results if not isinstance(result, BaseException)]
     seen_pmids: Set[str] = set()
     pmids: List[str] = []
     for pmid_list in pmid_lists:
@@ -1099,6 +1139,8 @@ async def _retrieve_fusion_evidence_uncached(
     }
     requested_tumor_pmids = [record.pmid for record in records if record.pmid in requested_tumor_terms]
     literature_scope = fusion_literature_scope(tumor_type, len(records), len(requested_tumor_pmids))
+    if failures and (not records or (tumor_type and isinstance(search_results[0], Exception))):
+        literature_scope = None
     return FusionEvidenceResult(
         fusion=fusion,
         tumor_type=tumor_type,
@@ -1112,7 +1154,11 @@ async def _retrieve_fusion_evidence_uncached(
             well_supported=well_supported,
             literature_scope=literature_scope,
             requested_tumor_count=len(requested_tumor_pmids),
+        ) + (
+            f" One search failed; results are partial: {pubmed_error_message(failures[0])}."
+            if failures else ""
         ),
+        partial=bool(failures),
         evidence_cards=_build_fusion_evidence_cards(
             fusion, records, alias_matches, requested_tumor_terms=requested_tumor_terms,
         ),
@@ -1394,6 +1440,66 @@ def _evidence_priority_queries(subject: str) -> list[str]:
 # Shared NCBI helpers (used by both tiers)
 # ---------------------------------------------------------------------------
 
+NCBI_RETRY_DEADLINE_SECONDS = 60.0
+NCBI_MAX_ATTEMPTS = 3
+
+
+def pubmed_error_message(exc: Exception) -> str:
+    """Describe HTTP failures without storing request URLs or API keys."""
+    if isinstance(exc, RetryError):
+        cause = exc.last_attempt.exception()
+        if isinstance(cause, Exception):
+            return pubmed_error_message(cause)
+        return "PubMed search failed (retrieval error)"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"PubMed search failed (HTTP {exc.response.status_code})"
+    if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+        return "PubMed search failed (timeout)"
+    if isinstance(exc, httpx.RequestError):
+        return "PubMed search failed (connection error)"
+    return f"Fusion evidence retrieval failed: {exc}"
+
+
+async def _ncbi_post(url: str, params: dict, client: httpx.AsyncClient, timeout: float) -> httpx.Response:
+    """Bound requests, limiter waits and retry sleeps by one overall deadline.
+
+    Consolidation with normalization._ncbi_get needs explicit policy handling:
+    that helper returns HTTP responses under a 15s deadline and retries only
+    429s; this helper raises terminal errors and retries transport/5xx failures
+    under a 60s deadline. Keep those caller contracts until a shared policy is tested.
+    """
+    deadline = monotonic() + NCBI_RETRY_DEADLINE_SECONDS
+
+    async def _attempt() -> httpx.Response:
+        async with _get_ncbi_rate_limiter():
+            response = await client.post(url, data=params, timeout=timeout)
+            response.raise_for_status()
+            return response
+
+    for attempt in range(NCBI_MAX_ATTEMPTS):
+        try:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            return await asyncio.wait_for(_attempt(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise httpx.TimeoutException("PubMed request deadline exceeded") from exc
+        except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+            delay = min(2**attempt, 8)
+            if isinstance(exc, httpx.HTTPStatusError):
+                status = exc.response.status_code
+                logger.warning("PubMed request failed (HTTP %s)", status)
+                if status != 429 and not 500 <= status < 600:
+                    raise
+                if status == 429:
+                    retry_after = _retry_after_seconds(exc.response)
+                    if retry_after is not None:
+                        delay = retry_after
+            if attempt == NCBI_MAX_ATTEMPTS - 1 or delay >= deadline - monotonic():
+                raise
+            await asyncio.sleep(delay)
+
+
 def _ncbi_params(extra: dict) -> dict:
     params = {"retmode": "json", **extra}
     if settings.ncbi_api_key:
@@ -1401,7 +1507,6 @@ def _ncbi_params(extra: dict) -> dict:
     return params
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
 async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> List[str]:
     """Return PMIDs matching a PubMed query string."""
 
@@ -1410,15 +1515,12 @@ async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> L
         params = _ncbi_params(
             {"db": "pubmed", "term": search_query, "retmax": max_results, "sort": "relevance"}
         )
-        async with _get_ncbi_rate_limiter():
-            resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
-            resp.raise_for_status()
+        resp = await _ncbi_post(ESEARCH_URL, params, client, timeout=15.0)
         return resp.json().get("esearchresult", {}).get("idlist", [])
 
     return await cached_call(f"pubmed:esearch:{_exclude_retracted_query(query)}:{max_results}", _fetch)
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
 async def _esearch_since(
     query: str,
     since: datetime,
@@ -1438,9 +1540,7 @@ async def _esearch_since(
             "mindate": since_utc.strftime("%Y/%m/%d"),
         }
     )
-    async with _get_ncbi_rate_limiter():
-        resp = await client.get(ESEARCH_URL, params=params, timeout=15.0)
-        resp.raise_for_status()
+    resp = await _ncbi_post(ESEARCH_URL, params, client, timeout=15.0)
     return resp.json().get("esearchresult", {}).get("idlist", [])
 
 
@@ -1499,8 +1599,20 @@ def _parse_pub_year(pub_date_el: Optional[ET.Element]) -> Optional[int]:
     return None
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
 async def _efetch(
+    pmids: List[str], client: httpx.AsyncClient, *, filter_retracted: bool = True,
+) -> List[LiteratureRecord]:
+    """Fetch and cache chunks of at most 200 PMIDs, preserving input order."""
+    records = []
+    for start in range(0, len(pmids), 200):
+        records.extend(await _efetch_chunk(
+            pmids[start:start + 200], client, filter_retracted=filter_retracted,
+        ))
+    by_pmid = {record.pmid: record for record in records}
+    return [by_pmid[pmid] for pmid in pmids if pmid in by_pmid]
+
+
+async def _efetch_chunk(
     pmids: List[str],
     client: httpx.AsyncClient,
     *,
@@ -1511,13 +1623,10 @@ async def _efetch(
         return []
 
     async def _fetch() -> List[dict]:
-        params = {"db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml"}
-        if settings.ncbi_api_key:
-            params["api_key"] = settings.ncbi_api_key
-
-        async with _get_ncbi_rate_limiter():
-            resp = await client.get(EFETCH_URL, params=params, timeout=30.0)
-            resp.raise_for_status()
+        params = _ncbi_params({
+            "db": "pubmed", "id": ",".join(pmids), "rettype": "abstract", "retmode": "xml",
+        })
+        resp = await _ncbi_post(EFETCH_URL, params, client, timeout=30.0)
 
         records: List[dict] = []
         try:
