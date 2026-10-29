@@ -1,13 +1,58 @@
 """Shared test fixtures."""
 
+import functools
+import os
 import sys
 import threading
 from typing import Dict, List, Optional, Tuple
 
+import aiomysql
 import pytest
 
 from src.pipeline import cache as cache_module
 from src.pipeline import literature as literature_module
+
+# Tests FLUSHDB the configured Redis and drop/truncate MySQL tables, so they
+# only touch real backends when explicitly opted in (CI sets this against its
+# throwaway service containers) — never a developer's local Redis/MySQL.
+DESTRUCTIVE_TESTS_ENV = "ACGC_ALLOW_DESTRUCTIVE_TESTS"
+
+
+def destructive_tests_allowed() -> bool:
+    return os.environ.get(DESTRUCTIVE_TESTS_ENV) == "1"
+
+
+# Port 1 refuses connections immediately: Redis-backed tests skip or fail open.
+_UNREACHABLE_REDIS_URL = "redis://127.0.0.1:1/0"
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_backends(monkeypatch):
+    """Without the opt-in, point the configured Redis at nothing. Refuse real
+    MySQL connections unless opted in AND the database name contains "test".
+    The refusal is a connection error, so MySQL-backed tests skip as if no
+    MySQL were reachable. Tests that fake redis/aiomysql patch over this."""
+    from src.config import settings
+
+    if not destructive_tests_allowed():
+        monkeypatch.setattr(settings, "redis_url", _UNREACHABLE_REDIS_URL)
+        monkeypatch.setattr(settings, "redis_sentinel_enabled", False)
+
+    def guarded(real):
+        @functools.wraps(real)
+        def connect(*args, **kwargs):
+            db = kwargs.get("db") or ""
+            if not destructive_tests_allowed() or "test" not in db:
+                raise ConnectionRefusedError(
+                    f"tests refuse real MySQL database {db!r}: set {DESTRUCTIVE_TESTS_ENV}=1 "
+                    "and point MYSQL_DATABASE at a disposable database whose name contains 'test'"
+                )
+            return real(*args, **kwargs)
+
+        return connect
+
+    monkeypatch.setattr(aiomysql, "create_pool", guarded(aiomysql.create_pool))
+    monkeypatch.setattr(aiomysql, "connect", guarded(aiomysql.connect))
 
 
 def pytest_configure(config):
@@ -19,7 +64,7 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
-async def _reset_cache_client(request):
+async def _reset_cache_client(request, _guard_real_backends):
     """Reset the cache module's Redis client singleton before each test.
 
     redis.asyncio.Redis binds its connection pool to the event loop active
