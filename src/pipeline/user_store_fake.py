@@ -19,6 +19,10 @@ from typing import Dict, List, Optional
 
 from src.auth import UserStoreUnavailable
 from src.pipeline.user_store import (
+    BOOTSTRAP_ACTOR,
+    BOOTSTRAP_ALREADY_ADMIN,
+    BOOTSTRAP_GRANTED,
+    BOOTSTRAP_PREVIOUSLY_GRANTED,
     DEFAULT_PAGE_LIMIT,
     REQUEST_STATUSES,
     CuratorRequest,
@@ -45,6 +49,7 @@ from src.pipeline.user_store import (
     normalize_email,
     normalize_groups,
     normalize_name,
+    prepare_import,
     search_key,
     to_utc,
     utc_now,
@@ -133,6 +138,36 @@ class FakeUserStore:
                 )
             self._users[email] = user
             return copy.deepcopy(user)
+
+    async def import_user(self, user: UserRecord) -> bool:
+        user = prepare_import(user)
+        self._check_available("import_user")
+        async with self._lock:
+            if user.email in self._users:
+                return False
+            self._users[user.email] = user
+            return True
+
+    async def grant_bootstrap_admin(self, email: str, *, reason: str) -> str:
+        clean = normalize_email(email)
+        self._check_available("grant_bootstrap_admin")
+        async with self._lock:
+            user = self._users.get(clean)
+            if user is None:
+                raise UserNotFound(clean)
+            if user.role == "admin":
+                return BOOTSTRAP_ALREADY_ADMIN
+            if any(
+                c.email == clean and c.field == "role" and c.new_value == "admin"
+                and c.actor == BOOTSTRAP_ACTOR
+                for c in self._role_changes
+            ):
+                return BOOTSTRAP_PREVIOUSLY_GRANTED
+            self._apply_user_field(
+                "role", clean, "admin", actor=BOOTSTRAP_ACTOR, reason=reason, request_id=None,
+                now=_db_time(),
+            )
+            return BOOTSTRAP_GRANTED
 
     def _apply_user_field(
         self,
