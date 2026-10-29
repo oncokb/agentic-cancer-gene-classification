@@ -26,6 +26,9 @@
     return run.run_id ? `/?run=${encodeURIComponent(run.run_id)}` : null;
   }
 
+  // Read by app.js on the run page it opens (see takePendingRerun there).
+  const PENDING_RERUN_KEY = "agcg.pendingRerun";
+
   function friendlyError(error) {
     const { status, network } = error;
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
@@ -48,6 +51,36 @@
     function cell(value) {
       const td = doc.createElement("td");
       td.textContent = value == null ? "" : String(value);
+      return td;
+    }
+
+    function rerunCell(run, href) {
+      const td = doc.createElement("td");
+      if (!href || !run.run_id) return td;
+      const mode = doc.createElement("select");
+      mode.setAttribute("aria-label", "Rerun with");
+      for (const [value, label] of [["cached", "Use cached results"], ["refresh", "Refresh (force_refresh)"]]) {
+        const option = doc.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        mode.appendChild(option);
+      }
+      mode.value = "cached";
+      const button = doc.createElement("button");
+      button.type = "button";
+      button.className = "runs-rerun";
+      button.textContent = "Rerun";
+      button.title = "Start a new run with this run's inputs; this run is left unchanged";
+      button.addEventListener("click", () => {
+        try {
+          win.sessionStorage.setItem(PENDING_RERUN_KEY, JSON.stringify({
+            run_id: run.run_id, force_refresh: mode.value === "refresh",
+          }));
+        } catch (_) { /* Without storage the run still opens, with its own Rerun button. */ }
+        win.location.href = href;
+      });
+      td.appendChild(mode);
+      td.appendChild(button);
       return td;
     }
 
@@ -80,6 +113,7 @@
         row.appendChild(cell(run.input_count == null ? summary : `${summary ? summary + " " : ""}(${run.input_count})`));
         row.appendChild(cell(run.genes_annotated));
         row.appendChild(cell(run.source));
+        row.appendChild(rerunCell(run, href));
         el.tbody.appendChild(row);
       }
     }

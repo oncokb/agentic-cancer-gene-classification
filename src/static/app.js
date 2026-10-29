@@ -46,6 +46,9 @@ const state = {
   currentView: "annotate",
   resultsViewMode: "results",
   fusionEvidenceStatus: null,
+  // run_id of the saved run opened from a link (or produced by a rerun),
+  // which the Rerun controls rerun; null for fresh submissions.
+  openedRunId: null,
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -91,6 +94,9 @@ const elements = {
   exportButton: document.querySelector("#export-button"),
   exportFormat: document.querySelector("#export-format"),
   shareRun: document.querySelector("#share-run"),
+  rerunControls: document.querySelector("#rerun-controls"),
+  rerunMode: document.querySelector("#rerun-mode"),
+  rerunRun: document.querySelector("#rerun-run"),
   appShell: document.querySelector(".app-shell"),
   geneIndex: document.querySelector("#gene-index"),
   geneIndexPanel: document.querySelector("#gene-index-panel"),
@@ -372,6 +378,7 @@ function switchView(view) {
   elements.shareRun.classList.toggle("hidden", isBenchmark);
   elements.clearResults.disabled = isBenchmark || !state.currentResult;
   elements.shareRun.disabled = isBenchmark || !state.currentResult?.run_id;
+  syncRerunControls();
   updateExportState();
   // The results panel is only hidden, so its cards stay connected — stop
   // their OpenEvidence polling explicitly. Coming back re-renders them.
@@ -468,6 +475,8 @@ function clearResults() {
   updateExportState();
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
+  state.openedRunId = null;
+  syncRerunControls();
   elements.resultsViewTabs.classList.add("hidden");
   elements.tabFusionEvidenceView.classList.add("hidden");
   rebuildGeneIndex([]);
@@ -881,6 +890,7 @@ function setRunning(isRunning) {
   state.isRunning = isRunning;
   elements.runButton.textContent = isRunning ? "Running..." : "Run";
   elements.runButton.disabled = isRunning;
+  syncRerunControls();
 }
 
 function sleep(ms) {
@@ -944,6 +954,7 @@ async function runAnnotation() {
 
   resetFusionEvidenceSections();
   resetGeneIndexFilters();
+  state.openedRunId = null;
 
   // Collapse the expanded batch sidebar so results have room
   document.body.classList.remove("batch-active");
@@ -1056,7 +1067,7 @@ function fusionEvidenceInputs(inputs) {
   return fusionInputs;
 }
 
-async function startFusionEvidenceJob(inputs, runId) {
+async function startFusionEvidenceJob(inputs, runId, mode = elements.annotateMode.value || "full") {
   const fusions = fusionEvidenceInputs(inputs);
   if (!fusions.length || !state.currentResult) return;
 
@@ -1072,7 +1083,7 @@ async function startFusionEvidenceJob(inputs, runId) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       fusions,
-      mode: elements.annotateMode.value || "full",
+      mode,
       run_id: runId || null,
     }),
   });
@@ -1253,10 +1264,104 @@ async function loadSharedRun() {
     resetFusionEvidenceSections();
     resetGeneIndexFilters();
     state.currentResult = result;
+    state.openedRunId = result.run_id || sharedRunId;
     renderAnnotationResult(result);
+    syncRerunControls();
     setMessage("Shared run restored.", "info");
   } catch (error) {
+    takePendingRerun(sharedRunId);
     setMessage(formatRunError(error.message), "error");
+    return;
+  }
+  await startPendingRerun(sharedRunId);
+}
+
+// ---------------------------------------------------------------------------
+// Rerunning a saved run
+// ---------------------------------------------------------------------------
+
+// The My runs page hands a Rerun click over in sessionStorage (never the URL,
+// so a crafted link can't start a run), then opens the run here.
+const PENDING_RERUN_KEY = "agcg.pendingRerun";
+
+function syncRerunControls() {
+  const visible = Boolean(state.openedRunId) && state.currentView !== "benchmark";
+  elements.rerunControls.classList.toggle("hidden", !visible);
+  elements.rerunRun.disabled = !visible || state.isRunning;
+  elements.rerunMode.disabled = !visible || state.isRunning;
+}
+
+function takePendingRerun(runId) {
+  let pending = null;
+  try {
+    pending = JSON.parse(sessionStorage.getItem(PENDING_RERUN_KEY) || "null");
+    sessionStorage.removeItem(PENDING_RERUN_KEY);
+  } catch {
+    return null;
+  }
+  if (!pending || pending.run_id !== runId) return null;
+  return { forceRefresh: pending.force_refresh === true };
+}
+
+async function startPendingRerun(runId) {
+  const pending = takePendingRerun(runId);
+  if (pending) await rerunSavedRun(runId, pending.forceRefresh);
+}
+
+async function rerunSavedRun(runId, forceRefresh = false) {
+  if (!runId || state.isRunning) return;
+  setRunning(true);
+  updateExportState({ annotationExportDisabled: true });
+  clearMessage();
+  setMessage(forceRefresh ? "Rerunning this run with refreshed results..." : "Rerunning this run...", "info");
+
+  try {
+    const response = await fetch(`/v1/runs/${encodeURIComponent(runId)}/rerun`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force_refresh: forceRefresh }),
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      const text = await response.text();
+      try {
+        detail = JSON.parse(text).detail || detail;
+      } catch {
+        detail = text || detail;
+      }
+      throw new Error(typeof detail === "string" && detail ? detail : "Rerun failed");
+    }
+
+    const job = await response.json();
+    resetFusionEvidenceSections();
+    resetGeneIndexFilters();
+    const inputs = job.fusions || [];
+    inputs.forEach((item) => {
+      if (item.fusion) state.lastInputsByFusion[item.fusion] = item;
+    });
+    state.fusionEvidenceStatus = null;
+    state.currentResult = null;
+    const result = await pollAnnotationJob(job.status_url);
+    state.openedRunId = result?.run_id || null;
+    if (result?.run_id) {
+      history.replaceState(null, "", `${location.pathname}?run=${encodeURIComponent(result.run_id)}`);
+    }
+    if (result?.fusion_evidence?.length) {
+      // Run with include_fusion_evidence: evidence is already on the result.
+      state.fusionEvidenceStatus = "complete";
+      renderAnnotationResult(result);
+    } else {
+      startFusionEvidenceJob(inputs, result?.run_id, job.mode || "full").catch((error) => {
+        state.fusionEvidenceStatus = "failed";
+        setMessage(formatRunError(error.message), "error");
+        if (state.currentResult) renderAnnotationResult(state.currentResult);
+      });
+    }
+    setMessage("Rerun complete. Review fields before exporting.", "info");
+  } catch (error) {
+    setMessage(formatRunError(error.message), "error");
+  } finally {
+    setRunning(false);
   }
 }
 
@@ -4061,6 +4166,9 @@ function bindEvents() {
   elements.batchUploadInput.addEventListener("change", handleBatchFileUpload);
 
   elements.shareRun.addEventListener("click", copyShareLink);
+  elements.rerunRun.addEventListener("click", () => {
+    rerunSavedRun(state.openedRunId, elements.rerunMode.value === "refresh");
+  });
   elements.clearResults.addEventListener("click", clearResults);
   elements.exportButton.addEventListener("click", async () => {
     try {

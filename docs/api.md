@@ -524,6 +524,49 @@ That is the same link format the app uses (`_run_view_url` in `src/main.py`).
 `include_fusion_evidence: true` or a fusion-evidence job successfully attached
 it to this run; otherwise it is `[]`. An unknown `run_id` returns `404`.
 
+### `POST /v1/runs/{run_id}/rerun`
+
+Start a **new** annotation job with a saved run's original request: the same
+inputs (tumor types, exon, genomic and transcript fields), `mode`,
+`include_fusion_evidence`, `skip_literature_for_oncokb` and `local_backend`.
+It behaves exactly like `POST /v1/annotate/jobs`, including the input cap and
+API-key rate limits. The original run is never modified, so links to it keep
+working.
+
+The body is optional. `force_refresh` (default `false`) chooses between
+reusing cached results and recomputing them; the original run's own
+`force_refresh` is not reused.
+
+```bash
+curl -s -X POST "https://acgc.oncokb.org/v1/runs/$RUN_ID/rerun" \
+  -H "Authorization: Bearer $ACGC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"force_refresh": false}'
+```
+
+```json
+{
+  "job_id": "6f2d8a1c-7b3e-4a9d-9c11-8f0e2d4b6a70",
+  "status_url": "/v1/annotate/jobs/6f2d8a1c-7b3e-4a9d-9c11-8f0e2d4b6a70",
+  "rerun_of": "example-run-id",
+  "fusions": [{"fusion": "EML4::ALK", "tumor_type": "LUAD", "five_exon": 13, "three_exon": 20}],
+  "mode": "full"
+}
+```
+
+Poll `status_url` as for `POST /v1/annotate/jobs`; the completed job's
+`result.run_id` is the new run. `fusions` and `mode` are the inputs the new run
+was started with, e.g. for a follow-up `POST /v1/fusion-evidence/jobs`.
+
+Any signed-in, active user (or API key) may rerun any run they can open. The
+new run belongs to the caller and is saved with `source` `"rerun"` and
+`rerun_of` (the original `run_id`) in its stored request. Runs saved by
+`POST /v1/annotate/gene` are rerun as a one-input annotate request. Errors:
+`401` unauthenticated, `403` account pending or disabled, `404` unknown run,
+`422` if the run's stored request can't be rerun (for example an older run
+saved without its inputs) or exceeds the input cap, and `503` if run storage
+isn't configured.
+
 ### `POST /v1/annotate/gene`
 
 Annotate one gene and return its full `GeneAnnotation` fields, plus the saved
@@ -738,7 +781,8 @@ Query parameters: `limit` (default `20`, range `1`–`100`) and optional opaque
 }
 ```
 
-`source`, `input_summary`, `input_count`, and `genes_annotated` may be null.
+`source` is `session`, `api_key`, `local` or `rerun` (started with
+`POST /v1/runs/{run_id}/rerun`). `source`, `input_summary`, `input_count`, and `genes_annotated` may be null.
 `next_cursor` is null on the last page, including an empty list. Responses contain
 metadata only, never request or result blobs. Invalid limits or cursors return
 `422`, whose `detail` may be a string or FastAPI's validation-error list.

@@ -358,6 +358,16 @@ textarea {
   padding: 8px 28px 8px 10px;
 }
 
+.rerun-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.runs-rerun {
+  margin-left: 6px;
+}
+
 .status-box {
   margin-top: 12px;
   border: 1px solid var(--line);
