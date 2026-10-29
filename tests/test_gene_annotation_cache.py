@@ -373,3 +373,28 @@ async def test_run_pipeline_force_refresh_bypasses_cache(monkeypatch):
     assert result.annotations[0].cache_status == "refreshed"
     assert result.annotations[0].cache_reason == "force_refresh"
     assert store.saved[0][0].gene == "BRAF"
+
+
+@pytest.mark.parametrize("age_days", [1, 1000])
+async def test_retraction_failure_keeps_cached_annotation_without_reannotation(monkeypatch, age_days):
+    updated_at = datetime.now(timezone.utc) - timedelta(days=age_days)
+    annotation = GeneAnnotation(gene="BRAF", cancer_associated=True, citations=["12345"])
+    store = FakeGeneStore({"BRAF": {"annotation": annotation.model_dump(), "updated_at": updated_at}})
+
+    async def normalize(_fusions):
+        return {"BRAF": (_resolved_gene("BRAF"), ["TP53::BRAF"])}
+
+    async def failed_check(_annotation):
+        raise RuntimeError("PubMed unavailable")
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("failed retraction validation must not spend LLM tokens")
+
+    monkeypatch.setattr(orchestrator, "normalize_fusions", normalize)
+    monkeypatch.setattr(orchestrator, "find_retracted_annotation_pmids", failed_check)
+    monkeypatch.setattr(orchestrator, "_annotate_gene", fail_if_called)
+    result = await run_pipeline(["TP53::BRAF"], run_store=store)
+    assert result.annotations[0].cache_status == "reused"
+    assert result.annotations[0].cache_reason == "retraction_check_failed"
+    assert result.annotations[0].citations == ["12345"]
+    assert store.saved == []

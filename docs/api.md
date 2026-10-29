@@ -475,7 +475,8 @@ Each `fusion_evidence` entry (the same shape is returned inline by
 | `evidence_cards` | Cards for the top 5 `pmids` only. Each card's `requested_tumor_terms` lists the requested tumor type or alias terms found in that paper's title or abstract. |
 | `literature_scope` | Computed over all `pmids`, not just the cards. `requested_tumor`: at least one paper **mentions** the requested tumor type; this does not mean the fusion was shown in that tumor. `other_or_unspecified`: a tumor type was sent but no paper mentions it. `any_tumor`: no tumor type was sent and papers were found. `no_literature`: the search succeeded and found none. `null` when retrieval failed, the input is not a two-partner fusion, or the result predates this field. |
 | `requested_tumor_pmids` | The `pmids` that mention the requested tumor type, in ranked order. These can include papers without a card. |
-| `retrieval_status` | `ok`, or `failed` when retrieval raised an error. A failed entry is empty because the lookup failed, not because no literature exists; retry it. |
+| `partial` | Boolean, default `false`. One exact-pair search failed; evidence from successful searches is retained and the interpretation describes the failure. Tumor scope still reflects retained papers. |
+| `retrieval_status` | `ok` when at least one search succeeded, or `failed` when retrieval raised an error. A failed entry is empty because the lookup failed, not because no literature exists; retry it. |
 
 Tumor mentions are matched deterministically on word boundaries against the
 same expanded terms as the tumor-scoped query (for example `LUAD` also matches

@@ -218,6 +218,8 @@ async def sanitize_fusion_evidence_result(
             retained_count=result.retrieved_count,
             requested_tumor_count=len(result.requested_tumor_pmids),
         )
+    if result.partial and result.pmids != original_pmids:
+        result.interpretation += " One search failed; results are partial."
     return (
         result.pmids != original_pmids
         or len(result.evidence_cards) != original_card_count

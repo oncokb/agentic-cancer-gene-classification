@@ -105,7 +105,9 @@ from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.feedback_citations import build_citation_check_section
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
-from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
+from src.pipeline.literature import (
+    pubmed_error_message, retrieve_fusion_evidence, retrieve_fusion_partner_evidence,
+)
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline import openevidence_metrics as oe_metrics
 from src.pipeline.normalization import has_accession_identifier, is_fusion_input, read_gene_input
@@ -808,7 +810,7 @@ async def _retrieve_fusion_evidence_input(
             return FusionEvidenceResult(
                 fusion=item.fusion,
                 tumor_type=item.tumor_type,
-                interpretation=f"Fusion evidence retrieval failed: {exc}",
+                interpretation=pubmed_error_message(exc),
                 retrieval_status="failed",
             )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib.parse import parse_qs
+
 import httpx
 
 from src.models.schema import LiteratureRecord
@@ -66,7 +68,9 @@ async def test_esearch_sends_retracted_publication_exclusion(monkeypatch):
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["term"] = request.url.params["term"]
+        assert request.method == "POST"
+        assert not request.url.query
+        seen["term"] = parse_qs(request.content.decode())["term"][0]
         return httpx.Response(200, json={"esearchresult": {"idlist": ["1"]}})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:

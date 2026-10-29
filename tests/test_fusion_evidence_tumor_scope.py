@@ -388,7 +388,7 @@ async def test_non_pair_input_is_not_classified(monkeypatch):
     result = await retrieve_fusion_evidence("ALK", tumor_type="LUAD", max_results=10)
 
     assert result.literature_scope is None
-    assert result.retrieval_status == "ok"
+    assert result.retrieval_status == "failed"
 
 
 # ---------------------------------------------------------------------------

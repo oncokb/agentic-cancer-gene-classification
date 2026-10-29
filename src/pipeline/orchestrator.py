@@ -182,8 +182,11 @@ async def _maybe_reuse_cached_annotation(
     try:
         retracted_pmids = await find_retracted_annotation_pmids(annotation)
     except Exception:
-        logger.exception("Refreshing cached annotation for %s because retraction validation failed", gene)
-        return None
+        logger.exception("Keeping cached annotation for %s because retraction validation failed", gene)
+        return _cached_annotation_for_request(
+            cached["annotation"], fusions, "retraction_check_failed",
+            cached.get("updated_at"), cached.get("last_pubmed_checked_at"),
+        )
     if retracted_pmids:
         logger.info(
             "Refreshing cached annotation for %s because referenced PMID(s) are retracted: %s",

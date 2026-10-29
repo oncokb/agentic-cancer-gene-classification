@@ -149,6 +149,10 @@ class FusionEvidenceCard(EvidenceCard):
 
 class FusionEvidenceResult(BaseModel):
     fusion: str
+    partial: bool = Field(
+        default=False,
+        description="True when one exact-pair search failed; retained evidence is incomplete.",
+    )
     input: Optional[str] = Field(
         default=None,
         description="The fusion as submitted, when it differs from `fusion` (e.g. Ensembl IDs resolved to symbols).",
