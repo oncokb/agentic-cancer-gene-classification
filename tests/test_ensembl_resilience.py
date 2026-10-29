@@ -391,9 +391,86 @@ async def test_lookup_null_but_archive_current_is_retryable_and_not_cached(ensem
     )
     requests = len(ensembl.requests)
 
+    # The contradiction was retried like any transient failure.
+    assert ensembl.requests == ["POST /lookup/id"] + [archive_key] * normalization.ENSEMBL_ATTEMPTS
+
     await normalize_fusions([fusion])
 
-    assert ensembl.requests[requests:] == ["POST /lookup/id", archive_key]  # nothing was cached
+    # Nothing was cached.
+    assert ensembl.requests[requests:] == ["POST /lookup/id"] + [archive_key] * normalization.ENSEMBL_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_archive_current_once_then_retired_is_retried_to_the_retired_answer(ensembl):
+    archive_key = f"GET /archive/id/{_RETIRED}"
+    answers = [
+        httpx.Response(200, json={**_ARCHIVE[_RETIRED], "is_current": "1"}),
+        httpx.Response(200, json=_ARCHIVE[_RETIRED]),
+    ]
+    ensembl.routes[archive_key] = lambda: answers.pop(0)
+
+    gene_map = await normalize_fusions([_RETIRED])
+
+    assert ensembl.requests.count(archive_key) == 2
+    assert not gene_map[_RETIRED][0].lookup_failed
+    assert _error(gene_map, _RETIRED) == f"Ensembl ID {_RETIRED} is retired (last seen in release 110)."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "archive",
+    [
+        {"is_current": None},
+        {"is_current": "unavailable"},
+        {"is_current": 2},
+        {"release": "110"},
+        {"is_current": "", "possible_replacement": 7},
+        {"is_current": "", "possible_replacement": [{"stable_id": 5}]},
+        {"is_current": "", "possible_replacement": [{"score": 0.9}]},
+        {"is_current": "", "possible_replacement": ["ENSG00000155093"]},
+        {"is_current": "", "release": {"n": 110}},
+        {"is_current": "", "release": True},
+        [],
+    ],
+)
+async def test_malformed_archive_answer_is_retried_never_cached_never_raised(ensembl, archive):
+    archive_key = f"GET /archive/id/{_RETIRED}"
+    ensembl.routes[archive_key] = lambda: httpx.Response(200, json=archive)
+
+    first = await normalize_fusions([f"PTPRN2::{_RETIRED}"])
+
+    assert first[_RETIRED][0].lookup_failed
+    assert _error(first, _RETIRED).endswith(
+        "Ensembl lookup temporarily unavailable (invalid response); retry later."
+    )
+    assert ensembl.requests.count(archive_key) == normalization.ENSEMBL_ATTEMPTS
+
+    del ensembl.routes[archive_key]
+    second = await normalize_fusions([_RETIRED])
+
+    assert ensembl.requests.count(archive_key) == normalization.ENSEMBL_ATTEMPTS + 1  # asked again
+    assert "is retired (last seen in release 110)" in _error(second, _RETIRED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["", "0", 0, False, "false"])
+async def test_archive_not_current_flags_mean_retired(ensembl, monkeypatch, flag):
+    monkeypatch.setitem(_ARCHIVE, _RETIRED, {**_ARCHIVE[_RETIRED], "is_current": flag})
+
+    gene_map = await normalize_fusions([_RETIRED])
+
+    assert _error(gene_map, _RETIRED) == f"Ensembl ID {_RETIRED} is retired (last seen in release 110)."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["1", 1, True, "true"])
+async def test_archive_current_flags_are_inconsistent(ensembl, monkeypatch, flag):
+    monkeypatch.setitem(_ARCHIVE, _RETIRED, {**_ARCHIVE[_RETIRED], "is_current": flag})
+
+    gene_map = await normalize_fusions([_RETIRED])
+
+    assert gene_map[_RETIRED][0].lookup_failed
+    assert "(inconsistent response)" in _error(gene_map, _RETIRED)
 
 
 @pytest.mark.asyncio
@@ -452,16 +529,51 @@ async def test_single_id_lookup_with_empty_json_is_not_absence(ensembl, body):
 
 
 @pytest.mark.asyncio
-async def test_batch_entry_missing_is_retryable_but_explicit_null_is_checked(ensembl):
+async def test_empty_batch_answer_is_retried(ensembl):
+    ensembl.failures = [httpx.Response(200, json={})]
+
+    gene_map = await normalize_fusions([f"ATG5::{_LNCRNA}"])
+
+    assert ensembl.requests == ["POST /lookup/id", "POST /lookup/id"]
+    assert gene_map[_LNCRNA][0].resolved
+
+
+@pytest.mark.asyncio
+async def test_single_id_batch_that_stays_incomplete_is_retryable(ensembl):
+    ensembl.routes["POST /lookup/id"] = lambda: httpx.Response(200, json={_PTPRN2: {"bogus": True}})
+
+    gene_map = await normalize_fusions([_PTPRN2])
+
+    assert ensembl.requests == ["POST /lookup/id"] * normalization.ENSEMBL_ATTEMPTS
+    assert gene_map[_PTPRN2][0].lookup_failed
+    assert _error(gene_map, _PTPRN2) == "Ensembl lookup temporarily unavailable (incomplete response); retry later."
+
+
+@pytest.mark.asyncio
+async def test_batch_that_stays_incomplete_falls_back_per_id(ensembl):
     ensembl.routes["POST /lookup/id"] = lambda: httpx.Response(200, json={_UNKNOWN: None, _PTPRN2: _GENES[_PTPRN2]})
 
     gene_map = await normalize_fusions([_UNKNOWN, _PTPRN2, _LNCRNA])
 
-    assert gene_map["PTPRN2"][0].resolved
-    assert _error(gene_map, _UNKNOWN) == f"Ensembl did not find ID {_UNKNOWN}."  # null: archive says unknown
-    assert gene_map[_LNCRNA][0].lookup_failed  # no entry at all
-    assert _error(gene_map, _LNCRNA) == "Ensembl lookup temporarily unavailable (invalid response); retry later."
-    assert f"GET /archive/id/{_LNCRNA}" not in ensembl.requests
+    # The entry missing for the lncRNA is retried, then each ID is looked up alone.
+    assert ensembl.requests.count("POST /lookup/id") == normalization.ENSEMBL_ATTEMPTS
+    assert f"GET /lookup/id/{_LNCRNA}" in ensembl.requests
+    assert gene_map["PTPRN2"][0].resolved and gene_map[_LNCRNA][0].resolved
+    assert _error(gene_map, _UNKNOWN) == f"Ensembl did not find ID {_UNKNOWN}."  # explicit null: archive checked
+
+
+@pytest.mark.asyncio
+async def test_successful_lookup_replaces_a_cached_null(ensembl):
+    from src.pipeline import cache as cache_module
+
+    # An earlier version cached lookup misses as null.
+    await cache_module._get_client().set(f"ensembl:lookup:{_LNCRNA}", "null")
+
+    assert (await normalize_fusions([_LNCRNA]))[_LNCRNA][0].resolved
+    requests = len(ensembl.requests)
+
+    assert (await normalize_fusions([_LNCRNA]))[_LNCRNA][0].resolved
+    assert len(ensembl.requests) == requests  # served from the refreshed cache
 
 
 # --- one deadline and one concurrency bound per resolution ---------------------

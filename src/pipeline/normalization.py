@@ -433,20 +433,65 @@ def _is_lookup_doc(data: object) -> bool:
     return isinstance(data, dict) and bool(data.get("object_type"))
 
 
+def _parse_lookup_doc(data: object) -> dict:
+    if not _is_lookup_doc(data):
+        raise ValueError(f"unexpected lookup JSON {type(data).__name__}")
+    return data  # type: ignore[return-value]
+
+
+# The archive's is_current flag: Ensembl sends "1" or "", the rest are the
+# other unambiguous spellings of true/false.
+_ARCHIVE_CURRENT = frozenset({"1", "true"})
+_ARCHIVE_NOT_CURRENT = frozenset({"", "0", "false"})
+
+
+def _parse_archive(data: object) -> dict:
+    """An archive answer for an ID the lookup lacks, as a cacheable absence:
+    {"status": "retired", "release", "replacements"}. Raises ValueError for
+    any shape not exactly as Ensembl documents it, and _EnsemblUnavailable
+    when the archive calls the ID current, contradicting the lookup."""
+    if not isinstance(data, dict):
+        raise ValueError(f"unexpected archive JSON {type(data).__name__}")
+    flag = data.get("is_current")
+    if isinstance(flag, bool):
+        flag = "true" if flag else "false"
+    elif isinstance(flag, int):
+        flag = str(flag)
+    if not isinstance(flag, str) or flag.lower() not in _ARCHIVE_CURRENT | _ARCHIVE_NOT_CURRENT:
+        raise ValueError(f"unexpected archive is_current {data.get('is_current')!r}")
+    if flag.lower() in _ARCHIVE_CURRENT:
+        raise _EnsemblUnavailable("inconsistent response")
+    release = data.get("release")
+    if release is not None and (isinstance(release, bool) or not isinstance(release, (str, int))):
+        raise ValueError(f"unexpected archive release {release!r}")
+    candidates = data.get("possible_replacement", [])
+    if not isinstance(candidates, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("stable_id"), str) and ENSEMBL_PATTERN.match(item["stable_id"])
+        for item in candidates
+    ):
+        raise ValueError(f"unexpected archive possible_replacement {candidates!r}")
+    return {
+        "status": "retired",
+        "release": str(release) if release not in (None, "") else None,
+        "replacements": [item["stable_id"] for item in candidates],
+    }
+
+
 async def _ensembl_json(
     stable_ids: List[str],
     client: httpx.AsyncClient,
     budget: _EnsemblBudget,
     url: str,
     *,
-    valid: Callable[[object], bool],
+    parse: Callable[[object], object],
     body: Optional[dict] = None,
 ) -> Optional[object]:
-    """GET `url` (or POST `body` to it) and return the JSON; None when Ensembl
-    answers 400/404 (it doesn't know the ID). Timeouts, network errors, 429,
-    5xx and bodies that aren't JSON or fail `valid` are retried, up to
-    ENSEMBL_ATTEMPTS in all and within the budget's deadline, then raise
-    _EnsemblUnavailable."""
+    """GET `url` (or POST `body` to it) and return parse(JSON); None when
+    Ensembl answers 400/404 (it doesn't know the ID). `parse` raises
+    ValueError for a body of the wrong shape, or _EnsemblUnavailable for one
+    that can't be trusted yet. Those, timeouts, network errors, 429, 5xx and
+    non-JSON bodies are retried, up to ENSEMBL_ATTEMPTS in all and within the
+    budget's deadline, then raise _EnsemblUnavailable."""
     headers = {"Accept": "application/json"}
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -469,10 +514,7 @@ async def _ensembl_json(
                 retry_after = _retry_after_seconds(resp)
                 raise _EnsemblUnavailable(f"HTTP {resp.status_code}")
             resp.raise_for_status()
-            data = resp.json()
-            if not valid(data):
-                raise ValueError(f"unexpected JSON {type(data).__name__}")
-            return data
+            return parse(resp.json())
         except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as exc:
             error, failure = exc, _EnsemblUnavailable("timeout")
         except httpx.HTTPStatusError as exc:
@@ -524,12 +566,13 @@ async def _cache_probe(key: str) -> Optional[object]:
 
 
 async def _cache_store(key: str, value: object) -> None:
-    """Store value under a key _cache_probe just missed."""
+    """Store value under key, replacing whatever is there (e.g. a lookup null
+    an earlier version cached, which _cache_probe's callers ignore)."""
 
     async def _value() -> object:
         return value
 
-    await cached_call(key, _value)
+    await cached_call(key, _value, force_refresh=True)
 
 
 async def _ensembl_cached_doc(stable_id: str) -> Tuple[bool, Optional[dict]]:
@@ -545,7 +588,7 @@ async def _ensembl_cached_doc(stable_id: str) -> Tuple[bool, Optional[dict]]:
 
 async def _ensembl_fetch_doc(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> Optional[dict]:
     """GET /lookup/id/{id}: its doc (then cached), or None when the lookup lacks it."""
-    doc = await _ensembl_json([stable_id], client, budget, f"{ENSEMBL_LOOKUP_URL}/{stable_id}", valid=_is_lookup_doc)
+    doc = await _ensembl_json([stable_id], client, budget, f"{ENSEMBL_LOOKUP_URL}/{stable_id}", parse=_parse_lookup_doc)
     if doc is not None:
         await _cache_store(_ensembl_lookup_key(stable_id), doc)
     return doc  # type: ignore[return-value]
@@ -573,9 +616,11 @@ async def _ensembl_lookup_many(
 ) -> Dict[str, Optional[dict] | _EnsemblUnavailable]:
     """Each ID's lookup doc, None when Ensembl's lookup lacks it, or the failure.
 
-    Uncached IDs go to Ensembl in one batch POST; if Ensembl rejects a
-    multi-ID batch with 400/404, each ID is looked up on its own so one bad
-    ID can't fail the rest."""
+    Uncached IDs go to Ensembl in one batch POST. A batch answer missing an
+    entry for an ID, or with a malformed one, is retried like any transient
+    failure. If Ensembl rejects a multi-ID batch with 400/404, or keeps
+    answering it incompletely, each ID is looked up on its own so one bad ID
+    can't fail the rest."""
     results: Dict[str, Optional[dict] | _EnsemblUnavailable] = {}
     misses: List[str] = []
     for stable_id, (hit, doc) in zip(stable_ids, await asyncio.gather(*map(_ensembl_cached_doc, stable_ids))):
@@ -586,31 +631,36 @@ async def _ensembl_lookup_many(
     if not misses:
         return results
 
-    try:
-        data = await _ensembl_json(
-            misses, client, budget, ENSEMBL_LOOKUP_URL, body={"ids": misses}, valid=lambda d: isinstance(d, dict)
-        )
-    except _EnsemblUnavailable as exc:
-        return {**results, **{stable_id: exc for stable_id in misses}}
-
-    if isinstance(data, dict):
+    def parse_batch(data: object) -> dict:
         # One entry per ID: a doc, or null when the lookup lacks it. A missing
         # or malformed entry can't be trusted either way.
+        if not isinstance(data, dict):
+            raise ValueError(f"unexpected batch JSON {type(data).__name__}")
+        bad = [i for i in misses if i not in data or not (data[i] is None or _is_lookup_doc(data[i]))]
+        if bad:
+            raise _EnsemblUnavailable(f"incomplete response for {', '.join(bad)}")
+        return data
+
+    try:
+        data = await _ensembl_json(misses, client, budget, ENSEMBL_LOOKUP_URL, body={"ids": misses}, parse=parse_batch)
+    except _EnsemblUnavailable as exc:
+        if not (exc.reason.startswith("incomplete response") and len(misses) > 1):
+            reason = "incomplete response" if exc.reason.startswith("incomplete response") else exc.reason
+            return {**results, **{stable_id: _EnsemblUnavailable(reason) for stable_id in misses}}
+        data = None  # still incomplete: fall back to per-ID lookups below
+
+    if isinstance(data, dict):
         for stable_id in misses:
-            entry = data.get(stable_id, _CacheMiss)
-            if entry is None or _is_lookup_doc(entry):
-                results[stable_id] = entry  # type: ignore[assignment]
-                if entry is not None:
-                    await _cache_store(_ensembl_lookup_key(stable_id), entry)
-            else:
-                logger.warning("Ensembl batch lookup returned no usable entry for %s", stable_id)
-                results[stable_id] = _EnsemblUnavailable("invalid response")
+            entry = data[stable_id]
+            results[stable_id] = entry
+            if entry is not None:
+                await _cache_store(_ensembl_lookup_key(stable_id), entry)
         return results
     if len(misses) == 1:
         results[misses[0]] = None  # 400/404 for a single ID: the lookup lacks it
         return results
 
-    logger.info("Ensembl rejected a batch of %d IDs; looking each up on its own", len(misses))
+    logger.info("Ensembl rejected or garbled a batch of %d IDs; looking each up on its own", len(misses))
 
     async def lookup_one(stable_id: str) -> Optional[dict] | _EnsemblUnavailable:
         try:
@@ -625,28 +675,15 @@ async def _ensembl_lookup_many(
 async def _ensembl_absence(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> dict:
     """Why Ensembl's lookup lacks stable_id, per its archive (cached):
     {"status": "retired", "release", "replacements"} or {"status": "unknown"}.
-    Raises _EnsemblUnavailable (never cached) when the archive can't be had or
-    says the ID is current, contradicting the lookup."""
+    Raises _EnsemblUnavailable (never cached) when the archive can't be had,
+    answers in an unexpected shape, or keeps calling the ID current,
+    contradicting the lookup; all of those are retried first."""
 
     async def _fetch() -> dict:
-        archive = await _ensembl_json(
-            [stable_id],
-            client,
-            budget,
-            f"{ENSEMBL_ARCHIVE_URL}/{stable_id}",
-            valid=lambda d: isinstance(d, dict) and "is_current" in d,
+        absence = await _ensembl_json(
+            [stable_id], client, budget, f"{ENSEMBL_ARCHIVE_URL}/{stable_id}", parse=_parse_archive
         )
-        if archive is None:
-            return {"status": "unknown"}
-        if str(archive.get("is_current") or "").lower() in ("1", "true"):  # type: ignore[union-attr]
-            logger.warning("Ensembl lookup lacks %s but its archive says it is current", stable_id)
-            raise _EnsemblUnavailable("inconsistent response")
-        replacements = [
-            item["stable_id"]
-            for item in archive.get("possible_replacement") or []  # type: ignore[union-attr]
-            if isinstance(item, dict) and item.get("stable_id")
-        ]
-        return {"status": "retired", "release": archive.get("release"), "replacements": replacements}  # type: ignore[union-attr]
+        return {"status": "unknown"} if absence is None else absence  # type: ignore[return-value]
 
     return await cached_call(_ensembl_absent_key(stable_id), _fetch)
 
