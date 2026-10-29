@@ -285,7 +285,7 @@ def test_feedback_submit_falls_back_when_llm_fails(monkeypatch):
 @pytest.fixture
 def intake(monkeypatch):
     store = FakeRunStore()
-    monkeypatch.setattr(main.app.state, "run_store", store, raising=False)
+    monkeypatch.setitem(main.app.state._state, "run_store", store)
     llm = AsyncMock(return_value={
         "title": "Improve export behavior",
         "problem_summary": "Export is confusing.",

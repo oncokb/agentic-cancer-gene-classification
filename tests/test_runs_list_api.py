@@ -34,7 +34,10 @@ def client(monkeypatch):
     monkeypatch.setattr(auth, "_redis_client", None)
     monkeypatch.setattr(api_keys, "_memory_limiter", InMemoryRateLimiter())
     store = SimpleNamespace(list_runs_for_owner=AsyncMock(return_value=RunSummaryPage([], None)))
-    monkeypatch.setattr(main.app.state, "run_store", store, raising=False)
+    # Patch State's backing dict, not the attribute: pytest>=9.2 records
+    # setattr's old value from __dict__, which State never uses, so undo
+    # would delattr twice and abort the rest of the teardown.
+    monkeypatch.setitem(main.app.state._state, "run_store", store)
     # No lifespan: these API tests intentionally do not connect to MySQL.
     test_client = TestClient(main.app)
     yield test_client, store
@@ -156,9 +159,9 @@ def test_unauthenticated_401(client):
 def test_store_missing_503(client, monkeypatch, missing_attribute):
     http, _ = client
     if missing_attribute:
-        monkeypatch.delattr(main.app.state, "run_store")
+        monkeypatch.delitem(main.app.state._state, "run_store")
     else:
-        monkeypatch.setattr(main.app.state, "run_store", None)
+        monkeypatch.setitem(main.app.state._state, "run_store", None)
     response = http.get("/v1/runs", headers=session())
     assert response.status_code == 503
     assert response.json()["detail"] == "Run storage is unavailable."
