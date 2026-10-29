@@ -2829,3 +2829,15 @@ body.api-keys-body {
   font-size: 18px;
   overflow-wrap: anywhere;
 }
+
+.rerun-fusion-evidence {
+  min-height: 0;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+.fusion-rerun-error {
+  margin: 0 0 8px;
+  color: var(--danger);
+  font-size: 13px;
+}

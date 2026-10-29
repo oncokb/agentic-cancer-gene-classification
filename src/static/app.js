@@ -53,6 +53,11 @@ const state = {
   // starts; a fusion-evidence poll from an older generation is dropped so it
   // can't write into a newer result (see startFusionEvidenceJob).
   fusionEvidenceGeneration: 0,
+  // fusionEvidenceKey of the card whose single-fusion re-run is in flight, and
+  // the last re-run failure ({ key, runId, message }) shown inline on its card.
+  // Both are dropped with the job when the run changes or another job starts.
+  rerunningFusionEvidenceKey: null,
+  fusionEvidenceRerunError: null,
   // Whether the signed-in viewer may change the current saved run (owner or
   // admin). Shared links are readable by peers, but only these users may
   // retry failed fusion-evidence lookups onto the stored run.
@@ -1105,6 +1110,8 @@ function fusionEvidenceInputs(inputs) {
 // "Fusion evidence (0...)".
 function invalidateFusionEvidenceJobs() {
   state.fusionEvidenceGeneration += 1;
+  state.rerunningFusionEvidenceKey = null;
+  state.fusionEvidenceRerunError = null;
   if (state.fusionEvidenceStatus === "running") state.fusionEvidenceStatus = null;
 }
 
@@ -1152,6 +1159,65 @@ function mergeFusionEvidence(existing, incoming) {
 
 function retryableFusionEvidence(items) {
   return (items || []).filter((item) => item.retrieval_status === "failed");
+}
+
+// Re-runs one card's fusion with force_refresh through the same job + merge
+// path as retryFailedFusionEvidence. Only one fusion-evidence job runs at a
+// time (every retry/re-run control is disabled while one is running), so a
+// section retry and a single re-run can never overwrite each other.
+async function rerunFusionEvidence(item) {
+  if (!state.currentResult || !state.canModifyRun || state.fusionEvidenceStatus === "running") return;
+  const key = fusionEvidenceKey(item);
+  const token = claimFusionEvidenceJob(state.currentResult.run_id);
+  state.rerunningFusionEvidenceKey = key;
+  state.fusionEvidenceStatus = "running";
+  uiTrack().event({
+    type: "action", state: "retry", surface: "fusion_evidence", section: "fusion_card",
+    subject_kind: "fusion", subject_id: item.fusion, tumor_type_given: Boolean(item.tumor_type),
+  });
+  renderAnnotationResult(state.currentResult);
+
+  try {
+    const response = await fetch("/v1/fusion-evidence/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fusions: [{ fusion: item.input || item.fusion, tumor_type: item.tumor_type || undefined }],
+        mode: elements.annotateMode.value || "full",
+        run_id: state.currentResult.run_id || null,
+        force_refresh: true,
+      }),
+    });
+    if (fusionEvidenceJobIsStale(token)) return;
+    if (!response.ok) {
+      const body = await response.text();
+      let detail = body || response.statusText;
+      try { detail = JSON.parse(body).detail || detail; } catch { /* Plain-text error. */ }
+      throw new Error(detail || "Fusion evidence re-run failed");
+    }
+    const job = await response.json();
+    if (fusionEvidenceJobIsStale(token)) return;
+    const evidence = await pollRetriedFusionEvidenceJob(job.status_url, token);
+    if (evidence === null) return;
+    state.currentResult = {
+      ...state.currentResult,
+      fusion_evidence: mergeFusionEvidence(state.currentResult.fusion_evidence || [], evidence),
+    };
+    state.fusionEvidenceStatus = "complete";
+    state.rerunningFusionEvidenceKey = null;
+    renderAnnotationResult(state.currentResult);
+    setMessage(`Fusion evidence re-run complete for ${item.fusion}.`, "info");
+  } catch (error) {
+    if (fusionEvidenceJobIsStale(token)) return;
+    // Leave the card exactly as it was; the error is shown inline on it.
+    state.fusionEvidenceStatus = "complete";
+    state.rerunningFusionEvidenceKey = null;
+    state.fusionEvidenceRerunError = {
+      key, runId: token.runId, message: formatRunError(error.message),
+    };
+    renderAnnotationResult(state.currentResult);
+    clearMessage();
+  }
 }
 
 async function retryFailedFusionEvidence() {
@@ -2327,7 +2393,8 @@ function renderFusionEvidenceView(fusionEvidence) {
         heading,
         "button",
         "retry-failed-fusions",
-        state.fusionEvidenceStatus === "running" ? "Retrying..." : "Retry failed lookups",
+        state.fusionEvidenceStatus === "running" && !state.rerunningFusionEvidenceKey
+          ? "Retrying..." : "Retry failed lookups",
       );
       retry.type = "button";
       retry.disabled = state.fusionEvidenceStatus === "running";
@@ -2434,6 +2501,21 @@ function renderFusionEvidenceCard(item) {
   const inputNote = fusionEvidenceInputNote(item);
   if (inputNote) heading.appendChild(inputNote);
   const meta = appendFusionText(header, "div", "annotation-card-meta");
+  const key = fusionEvidenceKey(item);
+  if (state.canModifyRun) {
+    const rerunning = state.fusionEvidenceStatus === "running" && state.rerunningFusionEvidenceKey === key;
+    const rerun = appendFusionText(meta, "button", "rerun-fusion-evidence", rerunning ? "Re-running..." : "Re-run");
+    rerun.type = "button";
+    rerun.title = "Re-run this fusion's evidence lookup, bypassing cached results";
+    rerun.disabled = state.fusionEvidenceStatus === "running";
+    if (rerunning) card.setAttribute("aria-busy", "true");
+    rerun.addEventListener("click", () => { rerunFusionEvidence(item).catch(() => {}); });
+  }
+  const rerunError = state.fusionEvidenceRerunError;
+  if (rerunError?.key === key && rerunError.runId === (state.currentResult?.run_id || null)) {
+    const error = appendFusionText(card, "p", "fusion-rerun-error", rerunError.message);
+    error.setAttribute("role", "alert");
+  }
   appendFusionText(meta, "span", `review-badge ${item.well_supported ? "high" : "low"}`,
     item.well_supported ? "Well supported" : "Exploratory");
   if (item.partial) appendFusionText(meta, "span", "status-pill", "Partial lookup");
