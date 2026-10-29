@@ -6,13 +6,14 @@ boundary is mocked (and the retry sleep, which is recorded instead).
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from urllib.parse import unquote
 
 import httpx
 import pytest
 
-from src.models.schema import FusionEvidenceResult
 from src.pipeline import literature, normalization
 from src.pipeline.normalization import normalize_fusions
 
@@ -46,27 +47,54 @@ _ARCHIVE = {
 
 
 class FakeEnsembl:
-    """Ensembl + HGNC over httpx.MockTransport. `failures` are served (in order)
-    to Ensembl requests before the normal answers; each is a Response or an
-    exception to raise."""
+    """Ensembl, HGNC and PubMed over httpx.MockTransport.
+
+    `failures` are served (in order) to Ensembl requests before the normal
+    answers; each is a Response or an exception to raise. `routes` overrides
+    the answer for one "METHOD /path" with a Response factory. `get_delay`
+    makes every Ensembl GET take that long; `max_in_flight` records the most
+    concurrent Ensembl requests seen."""
 
     def __init__(self):
         self.requests: list[str] = []
         self.failures: list = []
         self.batch_status: int | None = None
+        self.routes: dict = {}
+        self.get_delay = 0.0
+        self.in_flight = self.max_in_flight = 0
+        self.pubmed_terms: list[str] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
         path = unquote(request.url.path)
         if request.url.host == "rest.genenames.org":
             symbol = path.rsplit("/", 1)[-1].upper()
-            docs = [{"symbol": symbol, "hgnc_id": f"HGNC:{symbol}"}] if symbol == "PTPRN2" else []
+            docs = (
+                [{"symbol": symbol, "hgnc_id": f"HGNC:{symbol}", "alias_symbol": ["IA-2beta"]}]
+                if symbol == "PTPRN2"
+                else []
+            )
             return httpx.Response(200, json={"response": {"docs": docs}})
-        self.requests.append(f"{request.method} {path}")
+        if request.url.host == "eutils.ncbi.nlm.nih.gov":
+            return self._pubmed(request)
+        key = f"{request.method} {path}"
+        self.requests.append(key)
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            if self.get_delay and request.method == "GET":
+                await asyncio.sleep(self.get_delay)
+            return self._ensembl(request, key, path)
+        finally:
+            self.in_flight -= 1
+
+    def _ensembl(self, request: httpx.Request, key: str, path: str) -> httpx.Response:
         if self.failures:
             failure = self.failures.pop(0)
             if isinstance(failure, Exception):
                 raise failure
             return failure
+        if key in self.routes:
+            return self.routes[key]()
         if request.method == "POST":
             if self.batch_status:
                 return httpx.Response(self.batch_status, json={"error": "bad batch"})
@@ -78,11 +106,33 @@ class FakeEnsembl:
             return httpx.Response(400, json={"error": f"ID '{stable_id}' not found"})
         return httpx.Response(200, json=doc)
 
+    def _pubmed(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("esearch.fcgi"):
+            term = request.url.params["term"]
+            self.pubmed_terms.append(term)
+            ids = ["111", "222"] if _LNCRNA in term else []
+            return httpx.Response(200, json={"esearchresult": {"idlist": ids}})
+        articles = "".join(
+            f"<PubmedArticle><MedlineCitation><PMID>{pmid}</PMID><Article>"
+            f"<ArticleTitle>{title}</ArticleTitle><Abstract><AbstractText>{title}.</AbstractText></Abstract>"
+            "</Article></MedlineCitation></PubmedArticle>"
+            for pmid, title in _PUBMED.items()
+            if pmid in request.url.params["id"].split(",")
+        )
+        return httpx.Response(200, text=f"<PubmedArticleSet>{articles}</PubmedArticleSet>")
+
+
+_PUBMED = {
+    "111": f"A recurrent PTPRN2::{_LNCRNA} fusion in glioma",
+    "222": "PTPRN2 expression in neuroendocrine tumors",  # never names the pair
+}
+
 
 @pytest.fixture
 def ensembl(monkeypatch):
     fake = FakeEnsembl()
     real_client = httpx.AsyncClient
+    # httpx is one module: this also routes literature's NCBI client to the fake.
     monkeypatch.setattr(
         "src.pipeline.normalization.httpx.AsyncClient",
         lambda *args, **kwargs: real_client(transport=httpx.MockTransport(fake)),
@@ -145,20 +195,21 @@ async def test_fusion_with_nameless_partner_is_annotated(ensembl):
 
 
 @pytest.mark.asyncio
-async def test_fusion_evidence_runs_for_nameless_partner(ensembl, monkeypatch):
-    searched = []
+async def test_fusion_evidence_runs_for_nameless_partner(ensembl):
+    # Real alias expansion, PubMed query building, EFetch parsing and pair
+    # matching; only HTTP is mocked.
+    fusion = f"PTPRN2::{_LNCRNA}"
 
-    async def fake_uncached(fusion, tumor_type, max_results):
-        searched.append(fusion)
-        return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, interpretation="ok")
+    result = await literature.retrieve_fusion_evidence(fusion)
 
-    monkeypatch.setattr(literature, "_retrieve_fusion_evidence_uncached", fake_uncached)
-
-    result = await literature.retrieve_fusion_evidence(f"PTPRN2::{_LNCRNA}")
-
-    assert searched == [f"PTPRN2::{_LNCRNA}"]
     assert result.retrieval_status != "failed"
-    assert not result.interpretation.startswith("Fusion evidence was not retrieved")
+    assert result.fusion == fusion
+    assert ensembl.pubmed_terms and all(_LNCRNA in term for term in ensembl.pubmed_terms)
+    # PTPRN2's HGNC alias is searched too; the ID partner has none.
+    assert any("IA-2beta" in term for term in ensembl.pubmed_terms)
+    # Only the record naming the pair survives matching.
+    assert result.pmids == ["111"]
+    assert result.retrieved_count == 1
 
 
 # --- retired and unknown IDs ---------------------------------------------------
@@ -230,13 +281,13 @@ def _timeout():
     ],
 )
 async def test_transient_failures_are_retried_then_reported(ensembl, failure, reason):
-    ensembl.failures = [failure() for _ in range(normalization.ENSEMBL_RETRIES + 1)]
+    ensembl.failures = [failure() for _ in range(normalization.ENSEMBL_ATTEMPTS)]
     fusion = f"PTPRN2::{_LNCRNA}"
 
     gene_map = await normalize_fusions([fusion])
 
-    assert ensembl.requests == ["POST /lookup/id"] * (normalization.ENSEMBL_RETRIES + 1)
-    assert len(ensembl.sleeps) == normalization.ENSEMBL_RETRIES
+    assert ensembl.requests == ["POST /lookup/id"] * (normalization.ENSEMBL_ATTEMPTS)
+    assert len(ensembl.sleeps) == normalization.ENSEMBL_ATTEMPTS - 1
     resolved = gene_map[_LNCRNA][0]
     assert resolved.unresolvable and resolved.lookup_failed
     assert gene_map.inputs[fusion].lookup_failed
@@ -278,7 +329,7 @@ async def test_retry_after_beyond_the_deadline_fails_fast(ensembl):
 @pytest.mark.asyncio
 async def test_html_200_on_transcript_lookup_does_not_escape(ensembl):
     transcript = "ENST00000000001"
-    ensembl.failures = [httpx.Response(200, text="<html>down</html>")] * (normalization.ENSEMBL_RETRIES + 1)
+    ensembl.failures = [httpx.Response(200, text="<html>down</html>")] * (normalization.ENSEMBL_ATTEMPTS)
 
     gene_map = await normalize_fusions([transcript])
 
@@ -291,7 +342,7 @@ async def test_html_200_on_transcript_lookup_does_not_escape(ensembl):
 
 @pytest.mark.asyncio
 async def test_transient_failures_are_not_cached(ensembl):
-    ensembl.failures = [httpx.Response(503)] * (normalization.ENSEMBL_RETRIES + 1)
+    ensembl.failures = [httpx.Response(503)] * (normalization.ENSEMBL_ATTEMPTS)
     failed = await normalize_fusions([_LNCRNA])
     assert failed[_LNCRNA][0].lookup_failed
 
@@ -314,3 +365,156 @@ async def test_resolutions_and_not_found_are_cached_per_id(ensembl):
     assert gene_map[_LNCRNA][0].resolved
     assert "retired" in _error(gene_map, _RETIRED)
     assert _error(gene_map, _UNKNOWN) == f"Ensembl did not find ID {_UNKNOWN}."
+
+
+# --- lookup misses are only cached once the archive confirms them --------------
+
+_ATG5_PARTNER = "ENSG00000286084"
+
+
+@pytest.mark.asyncio
+async def test_lookup_null_but_archive_current_is_retryable_and_not_cached(ensembl):
+    archive_key = f"GET /archive/id/{_ATG5_PARTNER}"
+    ensembl.routes[archive_key] = lambda: httpx.Response(
+        200, json={"id": _ATG5_PARTNER, "is_current": "1", "release": "112", "possible_replacement": []}
+    )
+    fusion = f"ATG5::{_ATG5_PARTNER}"
+
+    first = await normalize_fusions([fusion])
+
+    resolved = first[_ATG5_PARTNER][0]
+    assert resolved.unresolvable and resolved.lookup_failed
+    assert first.inputs[fusion].lookup_failed
+    assert resolved.resolution_error == (
+        f"3′ partner of '{fusion}' rejected — "
+        "Ensembl lookup temporarily unavailable (inconsistent response); retry later."
+    )
+    requests = len(ensembl.requests)
+
+    await normalize_fusions([fusion])
+
+    assert ensembl.requests[requests:] == ["POST /lookup/id", archive_key]  # nothing was cached
+
+
+@pytest.mark.asyncio
+async def test_archive_outage_is_retryable_and_not_cached(ensembl):
+    archive_key = f"GET /archive/id/{_RETIRED}"
+    ensembl.routes[archive_key] = lambda: httpx.Response(503)
+
+    failed = await normalize_fusions([_RETIRED])
+
+    assert failed[_RETIRED][0].lookup_failed
+    assert _error(failed, _RETIRED) == "Ensembl lookup temporarily unavailable (HTTP 503); retry later."
+    assert ensembl.requests.count(archive_key) == normalization.ENSEMBL_ATTEMPTS
+
+    del ensembl.routes[archive_key]
+    recovered = await normalize_fusions([_RETIRED])
+
+    assert not recovered[_RETIRED][0].lookup_failed
+    assert "is retired (last seen in release 110)" in _error(recovered, _RETIRED)
+
+
+@pytest.mark.asyncio
+async def test_parent_missing_from_lookup_is_retryable(ensembl, monkeypatch):
+    transcript = "ENST00000000002"
+    monkeypatch.setitem(
+        _GENES,
+        transcript,
+        {"id": transcript, "object_type": "Transcript", "species": "homo_sapiens", "Parent": _UNKNOWN},
+    )
+
+    gene_map = await normalize_fusions([transcript])
+
+    assert gene_map[transcript][0].lookup_failed
+    assert "(inconsistent response)" in _error(gene_map, transcript)
+
+
+# --- response shapes ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[], {}])
+async def test_single_id_lookup_with_empty_json_is_not_absence(ensembl, body):
+    transcript = "ENST00000000001"
+    ensembl.routes[f"GET /lookup/id/{transcript}"] = lambda: httpx.Response(200, json=body)
+
+    failed = await normalize_fusions([transcript])
+
+    assert failed[transcript][0].lookup_failed
+    assert _error(failed, transcript) == "Ensembl lookup temporarily unavailable (invalid response); retry later."
+    del ensembl.routes[f"GET /lookup/id/{transcript}"]
+    requests = len(ensembl.requests)
+
+    again = await normalize_fusions([transcript])
+
+    assert ensembl.requests[requests] == f"GET /lookup/id/{transcript}"  # not cached as absent
+    assert _error(again, transcript) == f"Ensembl did not find ID {transcript}."
+
+
+@pytest.mark.asyncio
+async def test_batch_entry_missing_is_retryable_but_explicit_null_is_checked(ensembl):
+    ensembl.routes["POST /lookup/id"] = lambda: httpx.Response(200, json={_UNKNOWN: None, _PTPRN2: _GENES[_PTPRN2]})
+
+    gene_map = await normalize_fusions([_UNKNOWN, _PTPRN2, _LNCRNA])
+
+    assert gene_map["PTPRN2"][0].resolved
+    assert _error(gene_map, _UNKNOWN) == f"Ensembl did not find ID {_UNKNOWN}."  # null: archive says unknown
+    assert gene_map[_LNCRNA][0].lookup_failed  # no entry at all
+    assert _error(gene_map, _LNCRNA) == "Ensembl lookup temporarily unavailable (invalid response); retry later."
+    assert f"GET /archive/id/{_LNCRNA}" not in ensembl.requests
+
+
+# --- one deadline and one concurrency bound per resolution ---------------------
+
+
+@pytest.mark.asyncio
+async def test_deadline_bounds_a_slowly_streamed_response(ensembl, monkeypatch):
+    monkeypatch.setattr(normalization, "ENSEMBL_RETRY_DEADLINE_SECONDS", 0.05)
+
+    async def trickle():
+        for _ in range(8):
+            await asyncio.sleep(0.03)
+            yield b" "
+
+    ensembl.routes["POST /lookup/id"] = lambda: httpx.Response(200, content=trickle())
+
+    started = time.monotonic()
+    gene_map = await normalize_fusions([_PTPRN2])
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.15
+    assert _error(gene_map, _PTPRN2) == "Ensembl lookup temporarily unavailable (timeout); retry later."
+
+
+def _ids(count: int, start: int = 900000) -> list[str]:
+    return [f"ENSG00000{start + i}" for i in range(count)]
+
+
+@pytest.mark.asyncio
+async def test_per_id_fallback_shares_the_resolution_deadline(ensembl, monkeypatch):
+    monkeypatch.setattr(normalization, "ENSEMBL_RETRY_DEADLINE_SECONDS", 0.2)
+    ensembl.batch_status = 400
+    ensembl.get_delay = 1.0
+    ids = _ids(20)
+
+    started = time.monotonic()
+    gene_map = await normalize_fusions(ids)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.6
+    assert ensembl.max_in_flight <= normalization.NORMALIZATION_CONCURRENCY
+    for stable_id in ids:
+        assert gene_map[stable_id][0].lookup_failed
+        assert _error(gene_map, stable_id) == "Ensembl lookup temporarily unavailable (timeout); retry later."
+
+
+@pytest.mark.asyncio
+async def test_archive_checks_are_concurrency_bounded(ensembl):
+    ensembl.get_delay = 0.01
+    ids = _ids(20)
+
+    gene_map = await normalize_fusions(ids)
+
+    assert sum(request.startswith("GET /archive/id/") for request in ensembl.requests) == 20
+    assert ensembl.max_in_flight <= normalization.NORMALIZATION_CONCURRENCY
+    assert all(_error(gene_map, stable_id) == f"Ensembl did not find ID {stable_id}." for stable_id in ids)

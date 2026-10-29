@@ -206,14 +206,18 @@ transcript belongs to a different gene. In the gene query API the last case
 reads "The Ensembl ID belongs to a different gene than the one named." or "The
 RefSeq accession belongs to a different gene than the one named."
 
-For Ensembl IDs Ensembl doesn't know, the archive tells the two permanent
-cases apart: "Ensembl ID ENSG... is retired (last seen in release N)." (naming
-a replacement only when Ensembl suggests one) or "Ensembl did not find ID
-ENSG...". Timeouts, network errors, HTTP 429 and 5xx are retried with backoff
-(honouring `Retry-After`) for up to about 15 seconds per lookup, then reported
-as "Ensembl lookup temporarily unavailable (timeout); retry later." (or
-`(HTTP 429)`, `(HTTP 503)`, ...); only those are worth retrying. Successful lookups
-and retired/not-found answers are cached per ID; failed lookups are not.
+For Ensembl IDs Ensembl's lookup doesn't know, the archive tells the two
+permanent cases apart: "Ensembl ID ENSG... is retired (last seen in release
+N)." (naming a replacement only when Ensembl suggests one) or "Ensembl did not
+find ID ENSG...". Timeouts, network errors, HTTP 429, 5xx and unreadable
+responses are retried with backoff (honouring `Retry-After`), up to 3 attempts
+per request, and all Ensembl requests for one submission share a deadline of
+about 15 seconds. Then the error reads "Ensembl lookup temporarily unavailable
+(timeout); retry later." (or `(HTTP 429)`, `(HTTP 503)`, `(invalid response)`,
+...). The same message, with `(inconsistent response)`, is used when Ensembl
+contradicts itself, e.g. its lookup lacks an ID its archive calls current. Only
+these are worth retrying. Successful lookups, and retired or not-found IDs the
+archive has confirmed, are cached per ID; failures are not.
 
 In a fusion, only the bad partner is rejected: the other partner is still
 annotated on its own. For `EML4(ENST00000256078)::ALK` (a KRAS transcript),

@@ -18,8 +18,9 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+import anyio
 import httpx
 
 from src.config import settings
@@ -64,9 +65,10 @@ HGNC_TIMEOUT_SECONDS = 5.0
 ENSEMBL_TIMEOUT_SECONDS = 8.0
 NCBI_TIMEOUT_SECONDS = 8.0
 # Ensembl has outages (timeouts, 5xx, HTML maintenance pages) and rate limits
-# (429): retry those a few times, waiting as long as Retry-After says (else
-# exponential backoff), all within one deadline per lookup.
-ENSEMBL_RETRIES = 3
+# (429): make up to ENSEMBL_ATTEMPTS requests, waiting as long as Retry-After
+# says (else exponential backoff) between them. All of one resolution's
+# Ensembl requests share one deadline.
+ENSEMBL_ATTEMPTS = 3
 ENSEMBL_RETRY_BACKOFF_SECONDS = 0.5
 ENSEMBL_RETRY_DEADLINE_SECONDS = 15.0
 # NCBI answers 429 when a burst outruns its per-second budget, even under the
@@ -402,36 +404,65 @@ def _ensembl_failed(symbol: str, reason: str) -> ResolvedGene:
 
 
 class _EnsemblUnavailable(Exception):
-    """An Ensembl request failed transiently (timeout, network, 429, 5xx, unreadable body)."""
+    """An Ensembl answer couldn't be had or trusted (timeout, network, 429, 5xx,
+    unreadable or inconsistent body): retryable, never cached."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason  # 'timeout', 'HTTP 503', ... for the user-facing message
 
 
+@dataclass
+class _EnsemblBudget:
+    """One resolution's Ensembl budget: every request it makes (batch, per-ID
+    fallback, transcript chain, archive) shares one deadline and one bound on
+    concurrent requests."""
+
+    deadline: float
+    semaphore: asyncio.Semaphore
+
+    @classmethod
+    def start(cls) -> "_EnsemblBudget":
+        return cls(_monotonic() + ENSEMBL_RETRY_DEADLINE_SECONDS, asyncio.Semaphore(NORMALIZATION_CONCURRENCY))
+
+    def remaining(self) -> float:
+        return self.deadline - _monotonic()
+
+
+def _is_lookup_doc(data: object) -> bool:
+    return isinstance(data, dict) and bool(data.get("object_type"))
+
+
 async def _ensembl_json(
-    stable_ids: List[str], client: httpx.AsyncClient, url: str, body: Optional[dict] = None
+    stable_ids: List[str],
+    client: httpx.AsyncClient,
+    budget: _EnsemblBudget,
+    url: str,
+    *,
+    valid: Callable[[object], bool],
+    body: Optional[dict] = None,
 ) -> Optional[object]:
     """GET `url` (or POST `body` to it) and return the JSON; None when Ensembl
     answers 400/404 (it doesn't know the ID). Timeouts, network errors, 429,
-    5xx and unreadable bodies are retried within ENSEMBL_RETRY_DEADLINE_SECONDS,
-    then raise _EnsemblUnavailable."""
+    5xx and bodies that aren't JSON or fail `valid` are retried, up to
+    ENSEMBL_ATTEMPTS in all and within the budget's deadline, then raise
+    _EnsemblUnavailable."""
     headers = {"Accept": "application/json"}
     if body is not None:
         headers["Content-Type"] = "application/json"
-    deadline = _monotonic() + ENSEMBL_RETRY_DEADLINE_SECONDS
-    for attempt in range(ENSEMBL_RETRIES + 1):
+    for attempt in range(ENSEMBL_ATTEMPTS):
         retry_after = None
-        remaining = deadline - _monotonic()
         try:
+            remaining = budget.remaining()
             if remaining <= 0:
-                raise asyncio.TimeoutError
-            # No request may run past the deadline.
-            timeout = min(ENSEMBL_TIMEOUT_SECONDS, remaining)
-            if body is None:
-                resp = await client.get(url, headers=headers, timeout=timeout)
-            else:
-                resp = await client.post(url, headers=headers, json=body, timeout=timeout)
+                raise TimeoutError
+            # Bounds the wait for a request slot and the whole request, body included.
+            with anyio.fail_after(remaining):
+                async with budget.semaphore:
+                    if body is None:
+                        resp = await client.get(url, headers=headers, timeout=ENSEMBL_TIMEOUT_SECONDS)
+                    else:
+                        resp = await client.post(url, headers=headers, json=body, timeout=ENSEMBL_TIMEOUT_SECONDS)
             if resp.status_code in (400, 404):
                 return None
             if resp.status_code == 429 or resp.status_code >= 500:
@@ -439,84 +470,115 @@ async def _ensembl_json(
                 raise _EnsemblUnavailable(f"HTTP {resp.status_code}")
             resp.raise_for_status()
             data = resp.json()
-            if not isinstance(data, (dict, list)):
+            if not valid(data):
                 raise ValueError(f"unexpected JSON {type(data).__name__}")
             return data
-        except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+        except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as exc:
             error, failure = exc, _EnsemblUnavailable("timeout")
         except httpx.HTTPStatusError as exc:
             error, failure = exc, _EnsemblUnavailable(f"HTTP {exc.response.status_code}")
         except httpx.HTTPError as exc:
             error, failure = exc, _EnsemblUnavailable("network error")
-        except ValueError as exc:  # 200 with an HTML maintenance page or other non-JSON
+        except ValueError as exc:  # 200 with an HTML maintenance page, or JSON of the wrong shape
             error, failure = exc, _EnsemblUnavailable("invalid response")
         except _EnsemblUnavailable as exc:
             error, failure = exc, exc
         logger.warning(
-            "Ensembl request for %s failed (attempt %d): %s %s",
-            ", ".join(stable_ids), attempt + 1, type(error).__name__, error,
+            "Ensembl request for %s failed (attempt %d of %d): %s %s",
+            ", ".join(stable_ids), attempt + 1, ENSEMBL_ATTEMPTS, type(error).__name__, error,
         )
-        if attempt == ENSEMBL_RETRIES or (failure.reason.startswith("HTTP 4") and failure.reason != "HTTP 429"):
+        if attempt == ENSEMBL_ATTEMPTS - 1 or (failure.reason.startswith("HTTP 4") and failure.reason != "HTTP 429"):
             raise failure
         delay = retry_after if retry_after is not None else ENSEMBL_RETRY_BACKOFF_SECONDS * 2**attempt
-        if delay >= deadline - _monotonic():
+        if delay >= budget.remaining():
             raise failure  # Ensembl asks for longer than we have left: fail fast, retryable
         await _sleep(delay)
     raise AssertionError("unreachable")
 
 
-def _ensembl_cache_key(stable_id: str) -> str:
+# Only answers Ensembl gives deterministically are cached: a lookup doc, and an
+# archive-confirmed retired or never-existing ID. A lookup that merely came
+# back empty is not (an outage can do that), nor is any failure.
+def _ensembl_lookup_key(stable_id: str) -> str:
     return f"ensembl:lookup:{stable_id}"
+
+
+def _ensembl_absent_key(stable_id: str) -> str:
+    return f"ensembl:absent:{stable_id}"
 
 
 class _CacheMiss(Exception):
     pass
 
 
-async def _cached_ensembl_doc(stable_id: str) -> Tuple[bool, Optional[dict]]:
-    """(True, doc-or-None) when a lookup for stable_id is cached, else (False, None)."""
+async def _cache_probe(key: str) -> Optional[object]:
+    """The cached value for key, or None on a miss. Never computes anything."""
 
     async def _miss() -> None:
         raise _CacheMiss
 
     try:
-        return True, await cached_call(_ensembl_cache_key(stable_id), _miss)
+        return await cached_call(key, _miss)
     except _CacheMiss:
-        return False, None
+        return None
 
 
-async def _cache_ensembl_doc(stable_id: str, doc: Optional[dict]) -> None:
-    """Store a batch-fetched doc (or None) for an ID _cached_ensembl_doc just missed."""
+async def _cache_store(key: str, value: object) -> None:
+    """Store value under a key _cache_probe just missed."""
 
-    async def _value() -> Optional[dict]:
+    async def _value() -> object:
+        return value
+
+    await cached_call(key, _value)
+
+
+async def _ensembl_cached_doc(stable_id: str) -> Tuple[bool, Optional[dict]]:
+    """(True, doc) for a cached lookup, (True, None) for a cached confirmed
+    absence, (False, None) when Ensembl must be asked."""
+    doc = await _cache_probe(_ensembl_lookup_key(stable_id))
+    if _is_lookup_doc(doc):
+        return True, doc  # type: ignore[return-value]
+    if await _cache_probe(_ensembl_absent_key(stable_id)) is not None:
+        return True, None
+    return False, None
+
+
+async def _ensembl_fetch_doc(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> Optional[dict]:
+    """GET /lookup/id/{id}: its doc (then cached), or None when the lookup lacks it."""
+    doc = await _ensembl_json([stable_id], client, budget, f"{ENSEMBL_LOOKUP_URL}/{stable_id}", valid=_is_lookup_doc)
+    if doc is not None:
+        await _cache_store(_ensembl_lookup_key(stable_id), doc)
+    return doc  # type: ignore[return-value]
+
+
+async def _ensembl_lookup(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> Optional[dict]:
+    """stable_id's lookup doc, or None when Ensembl's lookup lacks it (see
+    _ensembl_unknown for why). Raises _EnsemblUnavailable."""
+    hit, doc = await _ensembl_cached_doc(stable_id)
+    if hit:
         return doc
+    return await _ensembl_fetch_doc(stable_id, client, budget)
 
-    await cached_call(_ensembl_cache_key(stable_id), _value)
 
-
-async def _ensembl_lookup(stable_id: str, client: httpx.AsyncClient) -> Optional[dict]:
-    """GET /lookup/id/{id}, cached (a doc, or None when Ensembl doesn't know
-    the ID). Raises _EnsemblUnavailable when the lookup itself failed; that is
-    never cached."""
-
-    async def _fetch() -> Optional[dict]:
-        doc = await _ensembl_json([stable_id], client, f"{ENSEMBL_LOOKUP_URL}/{stable_id}")
-        return doc if isinstance(doc, dict) else None
-
-    return await cached_call(_ensembl_cache_key(stable_id), _fetch)
+async def _ensembl_parent(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> dict:
+    """The parent a transcript/protein doc names; Ensembl lacking it is inconsistent."""
+    doc = await _ensembl_lookup(stable_id, client, budget)
+    if doc is None:
+        raise _EnsemblUnavailable("inconsistent response")
+    return doc
 
 
 async def _ensembl_lookup_many(
-    stable_ids: List[str], client: httpx.AsyncClient
+    stable_ids: List[str], client: httpx.AsyncClient, budget: _EnsemblBudget
 ) -> Dict[str, Optional[dict] | _EnsemblUnavailable]:
-    """Each ID's lookup doc (None when Ensembl doesn't know it) or the failure.
+    """Each ID's lookup doc, None when Ensembl's lookup lacks it, or the failure.
 
     Uncached IDs go to Ensembl in one batch POST; if Ensembl rejects a
     multi-ID batch with 400/404, each ID is looked up on its own so one bad
     ID can't fail the rest."""
     results: Dict[str, Optional[dict] | _EnsemblUnavailable] = {}
     misses: List[str] = []
-    for stable_id, (hit, doc) in zip(stable_ids, await asyncio.gather(*map(_cached_ensembl_doc, stable_ids))):
+    for stable_id, (hit, doc) in zip(stable_ids, await asyncio.gather(*map(_ensembl_cached_doc, stable_ids))):
         if hit:
             results[stable_id] = doc
         else:
@@ -525,61 +587,86 @@ async def _ensembl_lookup_many(
         return results
 
     try:
-        data = await _ensembl_json(misses, client, ENSEMBL_LOOKUP_URL, body={"ids": misses})
+        data = await _ensembl_json(
+            misses, client, budget, ENSEMBL_LOOKUP_URL, body={"ids": misses}, valid=lambda d: isinstance(d, dict)
+        )
     except _EnsemblUnavailable as exc:
         return {**results, **{stable_id: exc for stable_id in misses}}
-    if isinstance(data, dict) or len(misses) == 1:
-        # A batch answer has an entry (null when unknown) per ID; a 400/404
-        # for a single ID is Ensembl saying it doesn't exist.
+
+    if isinstance(data, dict):
+        # One entry per ID: a doc, or null when the lookup lacks it. A missing
+        # or malformed entry can't be trusted either way.
         for stable_id in misses:
-            doc = data.get(stable_id) if isinstance(data, dict) else None
-            results[stable_id] = doc if isinstance(doc, dict) else None
-            await _cache_ensembl_doc(stable_id, results[stable_id])
+            entry = data.get(stable_id, _CacheMiss)
+            if entry is None or _is_lookup_doc(entry):
+                results[stable_id] = entry  # type: ignore[assignment]
+                if entry is not None:
+                    await _cache_store(_ensembl_lookup_key(stable_id), entry)
+            else:
+                logger.warning("Ensembl batch lookup returned no usable entry for %s", stable_id)
+                results[stable_id] = _EnsemblUnavailable("invalid response")
+        return results
+    if len(misses) == 1:
+        results[misses[0]] = None  # 400/404 for a single ID: the lookup lacks it
         return results
 
     logger.info("Ensembl rejected a batch of %d IDs; looking each up on its own", len(misses))
-    semaphore = asyncio.Semaphore(NORMALIZATION_CONCURRENCY)
 
     async def lookup_one(stable_id: str) -> Optional[dict] | _EnsemblUnavailable:
-        async with semaphore:
-            try:
-                return await _ensembl_lookup(stable_id, client)
-            except _EnsemblUnavailable as exc:
-                return exc
+        try:
+            return await _ensembl_fetch_doc(stable_id, client, budget)
+        except _EnsemblUnavailable as exc:
+            return exc
 
     results.update(zip(misses, await asyncio.gather(*map(lookup_one, misses))))
     return results
 
 
-async def _ensembl_archive(stable_id: str, client: httpx.AsyncClient) -> Optional[dict]:
-    """GET /archive/id/{id}, cached: the ID's release history, or None when
-    Ensembl has never had it. Raises _EnsemblUnavailable (never cached)."""
+async def _ensembl_absence(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> dict:
+    """Why Ensembl's lookup lacks stable_id, per its archive (cached):
+    {"status": "retired", "release", "replacements"} or {"status": "unknown"}.
+    Raises _EnsemblUnavailable (never cached) when the archive can't be had or
+    says the ID is current, contradicting the lookup."""
 
-    async def _fetch() -> Optional[dict]:
-        doc = await _ensembl_json([stable_id], client, f"{ENSEMBL_ARCHIVE_URL}/{stable_id}")
-        return doc if isinstance(doc, dict) else None
-
-    return await cached_call(f"ensembl:archive:{stable_id}", _fetch)
-
-
-async def _ensembl_unknown(symbol: str, stable_id: str, client: httpx.AsyncClient) -> ResolvedGene:
-    """An ID Ensembl's lookup doesn't know: retired (per the archive) or never existed."""
-    try:
-        archive = await _ensembl_archive(stable_id, client)
-    except _EnsemblUnavailable:
-        archive = None  # the lookup already said it's unknown; just without release detail
-    if archive and str(archive.get("is_current") or "") not in ("1", "true", "True"):
-        release = archive.get("release")
-        message = f"Ensembl ID {stable_id} is retired" + (f" (last seen in release {release})." if release else ".")
+    async def _fetch() -> dict:
+        archive = await _ensembl_json(
+            [stable_id],
+            client,
+            budget,
+            f"{ENSEMBL_ARCHIVE_URL}/{stable_id}",
+            valid=lambda d: isinstance(d, dict) and "is_current" in d,
+        )
+        if archive is None:
+            return {"status": "unknown"}
+        if str(archive.get("is_current") or "").lower() in ("1", "true"):  # type: ignore[union-attr]
+            logger.warning("Ensembl lookup lacks %s but its archive says it is current", stable_id)
+            raise _EnsemblUnavailable("inconsistent response")
         replacements = [
             item["stable_id"]
-            for item in archive.get("possible_replacement") or []
+            for item in archive.get("possible_replacement") or []  # type: ignore[union-attr]
             if isinstance(item, dict) and item.get("stable_id")
         ]
-        if replacements:
-            message += f" Ensembl lists {', '.join(replacements)} as a possible replacement."
-        return _unresolvable_gene(symbol, resolution_error=message)
-    return _unresolvable_gene(symbol, resolution_error=f"Ensembl did not find ID {stable_id}.")
+        return {"status": "retired", "release": archive.get("release"), "replacements": replacements}  # type: ignore[union-attr]
+
+    return await cached_call(_ensembl_absent_key(stable_id), _fetch)
+
+
+async def _ensembl_unknown(
+    symbol: str, stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget
+) -> ResolvedGene:
+    """An ID Ensembl's lookup lacks: retired, never existed, or (archive down or
+    contradicting the lookup) a retryable failure."""
+    try:
+        absence = await _ensembl_absence(stable_id, client, budget)
+    except _EnsemblUnavailable as exc:
+        return _ensembl_failed(symbol, exc.reason)
+    if absence.get("status") != "retired":
+        return _unresolvable_gene(symbol, resolution_error=f"Ensembl did not find ID {stable_id}.")
+    release = absence.get("release")
+    message = f"Ensembl ID {stable_id} is retired" + (f" (last seen in release {release})." if release else ".")
+    if absence.get("replacements"):
+        message += f" Ensembl lists {', '.join(absence['replacements'])} as a possible replacement."
+    return _unresolvable_gene(symbol, resolution_error=message)
 
 
 def _is_human(doc: dict) -> bool:
@@ -615,13 +702,14 @@ def _resolved_from_ensembl(symbol: str, doc: Optional[dict]) -> ResolvedGene:
 async def _resolve_ensembl_gene_ids(
     symbols: List[str],
     client: httpx.AsyncClient,
+    budget: _EnsemblBudget,
 ) -> Dict[str, ResolvedGene]:
     """
     Resolve Ensembl gene IDs, uncached ones in one POST call.
 
     Ensembl can be slow, so batching avoids one network round-trip per ENSG ID.
-    Unknown IDs are checked against the archive (retired vs never existed);
-    failed lookups are retryable errors.
+    IDs the lookup lacks are checked against the archive (retired vs never
+    existed); failed lookups are retryable errors.
     """
     if not symbols:
         return {}
@@ -630,34 +718,36 @@ async def _resolve_ensembl_gene_ids(
     for symbol in symbols:
         lookup_to_symbols.setdefault(_ensembl_lookup_id(symbol).upper(), []).append(symbol)
 
-    docs = await _ensembl_lookup_many(list(lookup_to_symbols), client)
+    docs = await _ensembl_lookup_many(list(lookup_to_symbols), client, budget)
 
     async def resolve(lookup_id: str, symbol: str) -> ResolvedGene:
         doc = docs[lookup_id]
         if isinstance(doc, _EnsemblUnavailable):
             return _ensembl_failed(symbol, doc.reason)
         if doc is None:
-            return await _ensembl_unknown(symbol, lookup_id, client)
+            return await _ensembl_unknown(symbol, lookup_id, client, budget)
         return _resolved_from_ensembl(symbol, doc)
 
     pairs = [(lookup_id, symbol) for lookup_id, group in lookup_to_symbols.items() for symbol in group]
     return dict(zip((symbol for _, symbol in pairs), await asyncio.gather(*(resolve(*pair) for pair in pairs))))
 
 
-async def _resolve_ensembl_transcript_id(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
+async def _resolve_ensembl_transcript_id(
+    symbol: str, client: httpx.AsyncClient, budget: _EnsemblBudget
+) -> ResolvedGene:
     """ENST -> parent gene, ENSP -> parent transcript -> parent gene, then the gene's symbol."""
     stable_id = _ensembl_lookup_id(symbol).upper()
     try:
-        doc = await _ensembl_lookup(stable_id, client)
+        doc = await _ensembl_lookup(stable_id, client, budget)
         if doc is None:
-            return await _ensembl_unknown(symbol, stable_id, client)
+            return await _ensembl_unknown(symbol, stable_id, client, budget)
         if stable_id.startswith("ENSP"):
             if doc.get("object_type") != "Translation" or not doc.get("Parent"):
                 return _ensembl_absent(symbol)
-            doc = await _ensembl_lookup(doc["Parent"], client)
-        if not doc or doc.get("object_type") != "Transcript" or not doc.get("Parent") or not _is_human(doc):
+            doc = await _ensembl_parent(doc["Parent"], client, budget)
+        if doc.get("object_type") != "Transcript" or not doc.get("Parent") or not _is_human(doc):
             return _ensembl_absent(symbol)
-        gene_doc = await _ensembl_lookup(doc["Parent"], client)
+        gene_doc = await _ensembl_parent(doc["Parent"], client, budget)
     except _EnsemblUnavailable as exc:
         return _ensembl_failed(symbol, exc.reason)
     resolved = _resolved_from_ensembl(symbol, gene_doc)
@@ -671,20 +761,17 @@ async def _resolve_ensembl_ids(
     symbols: Iterable[str],
     client: httpx.AsyncClient,
 ) -> Dict[str, ResolvedGene]:
-    """Resolve Ensembl gene (one batch POST), transcript and protein IDs to gene symbols."""
+    """Resolve Ensembl gene (one batch POST), transcript and protein IDs to gene
+    symbols, all within one Ensembl budget."""
     symbol_list = list(dict.fromkeys(symbols))
     gene_ids = [symbol for symbol in symbol_list if symbol.upper().startswith("ENSG")]
     other_ids = [symbol for symbol in symbol_list if not symbol.upper().startswith("ENSG")]
-    resolved = await _resolve_ensembl_gene_ids(gene_ids, client)
-
-    semaphore = asyncio.Semaphore(NORMALIZATION_CONCURRENCY)
-
-    async def resolve_one(symbol: str) -> ResolvedGene:
-        async with semaphore:
-            return await _resolve_ensembl_transcript_id(symbol, client)
-
-    resolved.update(zip(other_ids, await asyncio.gather(*(resolve_one(symbol) for symbol in other_ids))))
-    return resolved
+    budget = _EnsemblBudget.start()
+    genes, *others = await asyncio.gather(
+        _resolve_ensembl_gene_ids(gene_ids, client, budget),
+        *(_resolve_ensembl_transcript_id(symbol, client, budget) for symbol in other_ids),
+    )
+    return {**genes, **dict(zip(other_ids, others))}
 
 
 def _refseq_absent(symbol: str) -> ResolvedGene:
