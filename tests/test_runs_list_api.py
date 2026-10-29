@@ -193,3 +193,33 @@ def test_response_excludes_blobs_and_owner(client):
         "run_id", "created_at", "source", "input_summary", "input_count", "genes_annotated", "view_url",
     }
     assert "private" not in response.text
+
+
+def test_run_access_is_owner_or_admin_only(client):
+    http, store = client
+    store.get_run_metadata = AsyncMock(
+        return_value={"owner_email": "owner@mskcc.org", "source": "session"}
+    )
+
+    owner = http.get("/v1/runs/run-1/access", headers=session("owner@mskcc.org"))
+    other = http.get("/v1/runs/run-1/access", headers=session("other@mskcc.org"))
+    admin_token = session_token_for(
+        AuthenticatedUser(email="admin@mskcc.org", name="Admin", domain="mskcc.org", role="admin")
+    )
+    admin = http.get("/v1/runs/run-1/access", headers={"Authorization": f"Bearer {admin_token}"})
+
+    assert owner.status_code == 200
+    assert owner.json() == {"run_id": "run-1", "can_modify": True}
+    assert other.status_code == 200
+    assert other.json() == {"run_id": "run-1", "can_modify": False}
+    assert admin.status_code == 200
+    assert admin.json()["can_modify"] is True
+
+
+def test_run_access_unknown_run_is_404(client):
+    http, store = client
+    store.get_run_metadata = AsyncMock(return_value=None)
+
+    response = http.get("/v1/runs/missing/access", headers=session())
+
+    assert response.status_code == 404

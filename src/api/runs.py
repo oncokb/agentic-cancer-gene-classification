@@ -7,7 +7,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from src.api.run_persistence import run_owner
+from src.api.run_persistence import can_modify_run, run_owner
 from src.auth import AuthenticatedUser, require_auth
 from src.pipeline.run_store import _decode_runs_cursor
 
@@ -31,6 +31,33 @@ class RunListResponse(BaseModel):
 
     runs: List[RunSummaryResponse] = Field(description="Run summaries in descending creation order.")
     next_cursor: Optional[str] = Field(description="Opaque cursor for the next page; null at the end.")
+
+
+class RunAccessResponse(BaseModel):
+    """Whether the caller may modify this saved run (owner or admin)."""
+
+    run_id: str
+    can_modify: bool
+
+
+@router.get("/v1/runs/{run_id}/access", response_model=RunAccessResponse)
+async def get_run_access(
+    run_id: str,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(require_auth),
+) -> RunAccessResponse:
+    """Tell the UI whether to offer owner-only actions (e.g. retrying failed
+    fusion-evidence lookups) without exposing the run's request or result."""
+    store = getattr(request.app.state, "run_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Run storage is unavailable.")
+    metadata = await store.get_run_metadata(run_id)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return RunAccessResponse(
+        run_id=run_id,
+        can_modify=can_modify_run(metadata.get("owner_email"), current_user),
+    )
 
 
 @router.get("/v1/runs", response_model=RunListResponse)
