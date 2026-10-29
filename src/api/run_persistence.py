@@ -17,6 +17,17 @@ GENERIC_FAILURE = "Gene query failed. Please retry; contact the ACGC team if thi
 LOCAL_USER_EMAIL = "local@internal"
 
 
+def can_modify_run(owner_email: Optional[str], current_user: Optional[AuthenticatedUser]) -> bool:
+    """Only a run's owner or an admin may change what a saved run contains."""
+    if current_user is not None and getattr(current_user, "role", None) == "admin":
+        return True
+    if current_user is None:
+        return False
+    email = getattr(current_user, "email", None)
+    normalized = email.strip().lower() if email else None
+    return owner_email is not None and owner_email.strip().lower() == normalized
+
+
 def run_owner(current_user: Optional[AuthenticatedUser]) -> Dict[str, Optional[str]]:
     """The `owner_email`/`source` a run started by `current_user` is saved with.
 

@@ -532,6 +532,18 @@ class RunStore(UserStoreMixin):
             return None
         return json.loads(row[0])
 
+    async def get_run_metadata(self, run_id: str) -> Optional[Dict[str, Optional[str]]]:
+        """Owner attribution for a saved run, or None when it doesn't exist."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT owner_email, source FROM runs WHERE run_id = %s", (run_id,)
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {"owner_email": row[0], "source": row[1]}
+
     async def save_gene_annotation(
         self,
         annotation: GeneAnnotation,

@@ -46,6 +46,10 @@ const state = {
   currentView: "annotate",
   resultsViewMode: "results",
   fusionEvidenceStatus: null,
+  // Whether the signed-in viewer may change the current saved run (owner or
+  // admin). Shared links are readable by peers, but only these users may
+  // retry failed fusion-evidence lookups onto the stored run.
+  canModifyRun: false,
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -465,6 +469,7 @@ function clearResults() {
   state.currentResult = null;
   state.resultsViewMode = "results";
   state.fusionEvidenceStatus = null;
+  state.canModifyRun = false;
   updateExportState();
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
@@ -984,6 +989,8 @@ async function runAnnotation() {
 
     const job = await response.json();
     await pollAnnotationJob(job.status_url);
+    // This page started the run, so the signed-in user owns it.
+    state.canModifyRun = true;
     startFusionEvidenceJob(annotationInputs, state.currentResult?.run_id).catch((error) => {
       state.fusionEvidenceStatus = "failed";
       setMessage(formatRunError(error.message), "error");
@@ -1054,6 +1061,120 @@ function fusionEvidenceInputs(inputs) {
     fusionInputs.push(item);
   });
   return fusionInputs;
+}
+
+function fusionEvidenceKey(item) {
+  const submission = item?.input || item?.fusion || "";
+  const tumorType = String(item?.tumor_type || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return `${submission}||${tumorType}`;
+}
+
+function mergeFusionEvidence(existing, incoming) {
+  const replacements = new Map((incoming || []).map((item) => [fusionEvidenceKey(item), item]));
+  const merged = [];
+  const replaced = new Set();
+  (existing || []).forEach((item) => {
+    const key = fusionEvidenceKey(item);
+    if (replacements.has(key)) {
+      merged.push(replacements.get(key));
+      replaced.add(key);
+    } else {
+      merged.push(item);
+    }
+  });
+  (incoming || []).forEach((item) => {
+    const key = fusionEvidenceKey(item);
+    if (!replaced.has(key)) {
+      merged.push(item);
+      replaced.add(key);
+    }
+  });
+  return merged;
+}
+
+function retryableFusionEvidence(items) {
+  return (items || []).filter((item) => item.retrieval_status === "failed");
+}
+
+async function retryFailedFusionEvidence() {
+  if (!state.currentResult || !state.canModifyRun || state.fusionEvidenceStatus === "running") return;
+  const failed = retryableFusionEvidence(state.currentResult.fusion_evidence);
+  if (!failed.length) return;
+
+  // Re-submit the same submitted fusion spelling (which can differ from the
+  // resolved symbol) and tumor type that failed originally.
+  const fusions = failed.map((item) => ({
+    fusion: item.input || item.fusion,
+    tumor_type: item.tumor_type || undefined,
+  }));
+
+  state.fusionEvidenceStatus = "running";
+  renderAnnotationResult(state.currentResult);
+
+  try {
+    const response = await fetch("/v1/fusion-evidence/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fusions,
+        mode: elements.annotateMode.value || "full",
+        run_id: state.currentResult.run_id || null,
+      }),
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      const text = await response.text();
+      try {
+        const payload = JSON.parse(text);
+        detail = payload.detail || detail;
+      } catch {
+        detail = text || detail;
+      }
+      throw new Error(detail || "Fusion evidence retry failed");
+    }
+
+    const job = await response.json();
+    await pollRetriedFusionEvidenceJob(job.status_url);
+    state.fusionEvidenceStatus = "complete";
+    renderAnnotationResult(state.currentResult);
+    setMessage("Fusion evidence retry complete.", "info");
+  } catch (error) {
+    // Keep whatever was already on the run; only the successful retries (if
+    // any completed before the error) have been merged in.
+    state.fusionEvidenceStatus = "complete";
+    renderAnnotationResult(state.currentResult);
+    setMessage(formatRunError(error.message), "error");
+  }
+}
+
+async function pollRetriedFusionEvidenceJob(statusUrl) {
+  while (true) {
+    const response = await fetch(statusUrl);
+    if (!response.ok) {
+      throw new Error(response.statusText || "Unable to load fusion evidence job status");
+    }
+    const status = await response.json();
+    if (status.status === "failed") {
+      throw new Error(status.error || "Fusion evidence job failed");
+    }
+
+    state.currentResult = {
+      ...state.currentResult,
+      fusion_evidence: mergeFusionEvidence(
+        state.currentResult.fusion_evidence || [],
+        status.fusion_evidence || [],
+      ),
+    };
+    renderAnnotationResult(state.currentResult);
+
+    if (status.status === "complete") {
+      return;
+    }
+
+    const total = status.fusions_total || "?";
+    setMessage(`Retrying fusion evidence: ${status.fusions_completed}/${total} fusions complete.`, "info");
+    await sleep(1500);
+  }
 }
 
 async function startFusionEvidenceJob(inputs, runId) {
@@ -1243,6 +1364,17 @@ async function loadSharedRun() {
       );
     }
     const result = await response.json();
+    // Shared links are readable by peers, but only the run's owner (or an
+    // admin) may retry failed lookups back onto it. Fail closed if this check
+    // can't be read, so other viewers never see an action they can't complete.
+    try {
+      const accessResponse = await fetch(`/v1/runs/${encodeURIComponent(sharedRunId)}/access`);
+      state.canModifyRun = accessResponse.ok
+        ? Boolean((await accessResponse.json()).can_modify)
+        : false;
+    } catch {
+      state.canModifyRun = false;
+    }
     // A run's fusion evidence job runs after the core annotation completes, so
     // it's normally persisted onto the run by the time anyone opens a share
     // link. Mark it complete up front so the tab shows immediately instead of
@@ -1960,6 +2092,19 @@ function renderFusionEvidenceView(fusionEvidence) {
     const heading = appendFusionText(section, "h3", "fusion-section-heading");
     const toggle = appendFusionText(heading, "button", "fusion-section-toggle", `${label} (${items.length})`);
     toggle.type = "button";
+    if (label === "Lookup failed" && state.canModifyRun) {
+      const retry = appendFusionText(
+        heading,
+        "button",
+        "retry-failed-fusions",
+        state.fusionEvidenceStatus === "running" ? "Retrying..." : "Retry failed lookups",
+      );
+      retry.type = "button";
+      retry.disabled = state.fusionEvidenceStatus === "running";
+      retry.addEventListener("click", () => {
+        retryFailedFusionEvidence().catch(() => {});
+      });
+    }
     const cards = document.createElement("div");
     cards.className = "annotation-list fusion-section-cards";
     cards.id = `fusion-section-${list.children.length}`;
