@@ -39,6 +39,12 @@ class ResolvedGene(BaseModel):
     ensembl_transcript_id: Optional[str] = None
     # RefSeq transcript (NM_/NR_/XM_/XR_) an input named; None for NP_/XP_ proteins.
     refseq_transcript_id: Optional[str] = None
+    # "ensembl_id" when Ensembl has the gene but no HGNC symbol or Ensembl name
+    # for it, so canonical_symbol is its stable ID, not a gene symbol.
+    symbol_source: Optional[str] = None
+    # Ensembl's biotype and description (minus its [Source:...] tag) for such genes.
+    biotype: Optional[str] = None
+    description: Optional[str] = None
 
 
 class LiteratureRecord(BaseModel):
@@ -149,6 +155,10 @@ class FusionEvidenceCard(EvidenceCard):
 
 class FusionEvidenceResult(BaseModel):
     fusion: str
+    partial: bool = Field(
+        default=False,
+        description="True when one exact-pair search failed; retained evidence is incomplete.",
+    )
     input: Optional[str] = Field(
         default=None,
         description="The fusion as submitted, when it differs from `fusion` (e.g. Ensembl IDs resolved to symbols).",
@@ -169,8 +179,8 @@ class FusionEvidenceResult(BaseModel):
             "title or abstract MENTIONS the requested tumor type or an alias; it does not mean the "
             "fusion was shown in that tumor type. other_or_unspecified: a tumor type was requested "
             "but no retained paper mentions it. any_tumor: no tumor type was requested and papers "
-            "were found. no_literature: retrieval succeeded and no paper was retained. null when "
-            "retrieval failed, no exact-pair search ran, or the result predates this field."
+            "were found. no_literature: all searches succeeded and no paper was retained. null when "
+            "retrieval failed, a partial result is empty or its tumor-scoped query failed, no exact-pair search ran, or the result predates this field."
         ),
     )
     requested_tumor_pmids: List[str] = Field(

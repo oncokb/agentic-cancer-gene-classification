@@ -53,6 +53,10 @@ const state = {
   // starts; a fusion-evidence poll from an older generation is dropped so it
   // can't write into a newer result (see startFusionEvidenceJob).
   fusionEvidenceGeneration: 0,
+  // Whether the signed-in viewer may change the current saved run (owner or
+  // admin). Shared links are readable by peers, but only these users may
+  // retry failed fusion-evidence lookups onto the stored run.
+  canModifyRun: false,
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -497,6 +501,7 @@ function clearResults() {
   state.currentResult = null;
   state.resultsViewMode = "results";
   state.fusionEvidenceStatus = null;
+  state.canModifyRun = false;
   updateExportState();
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
@@ -1021,6 +1026,8 @@ async function runAnnotation() {
 
     const job = await response.json();
     await pollAnnotationJob(job.status_url);
+    // This page started the run, so the signed-in user owns it.
+    state.canModifyRun = true;
     startFusionEvidenceJob(annotationInputs, state.currentResult?.run_id).catch((error) => {
       state.fusionEvidenceStatus = "failed";
       setMessage(formatRunError(error.message), "error");
@@ -1093,8 +1100,152 @@ function fusionEvidenceInputs(inputs) {
   return fusionInputs;
 }
 
+// Drops every in-flight fusion-evidence job (initial or retry). A tab left
+// "running" by a dropped job is reset, so a new run never shows a stuck
+// "Fusion evidence (0...)".
 function invalidateFusionEvidenceJobs() {
   state.fusionEvidenceGeneration += 1;
+  if (state.fusionEvidenceStatus === "running") state.fusionEvidenceStatus = null;
+}
+
+// Starts a fusion-evidence job's lifetime: older jobs become stale, and this
+// one goes stale as soon as another starts or a different run is shown.
+function claimFusionEvidenceJob(runId) {
+  invalidateFusionEvidenceJobs();
+  return { generation: state.fusionEvidenceGeneration, runId: runId || null };
+}
+
+function fusionEvidenceJobIsStale(token) {
+  return (
+    token.generation !== state.fusionEvidenceGeneration ||
+    (token.runId !== null && state.currentResult?.run_id !== token.runId)
+  );
+}
+
+function fusionEvidenceKey(item) {
+  const submission = item?.input || item?.fusion || "";
+  const tumorType = String(item?.tumor_type || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return `${submission}||${tumorType}`;
+}
+
+function mergeFusionEvidence(existing, incoming) {
+  const replacements = new Map((incoming || []).map((item) => [fusionEvidenceKey(item), item]));
+  const merged = [];
+  const replaced = new Set();
+  (existing || []).forEach((item) => {
+    const key = fusionEvidenceKey(item);
+    if (replacements.has(key)) {
+      merged.push(replacements.get(key));
+      replaced.add(key);
+    } else {
+      merged.push(item);
+    }
+  });
+  replacements.forEach((item, key) => {
+    if (!replaced.has(key)) {
+      merged.push(item);
+      replaced.add(key);
+    }
+  });
+  return merged;
+}
+
+function retryableFusionEvidence(items) {
+  return (items || []).filter((item) => item.retrieval_status === "failed");
+}
+
+async function retryFailedFusionEvidence() {
+  if (!state.currentResult || !state.canModifyRun || state.fusionEvidenceStatus === "running") return;
+  const failed = retryableFusionEvidence(state.currentResult.fusion_evidence);
+  if (!failed.length) return;
+
+  // Re-submit the same submitted fusion spelling (which can differ from the
+  // resolved symbol) and tumor type that failed originally.
+  const fusions = failed.map((item) => ({
+    fusion: item.input || item.fusion,
+    tumor_type: item.tumor_type || undefined,
+  }));
+
+  const token = claimFusionEvidenceJob(state.currentResult.run_id);
+  state.fusionEvidenceStatus = "running";
+  renderAnnotationResult(state.currentResult);
+
+  try {
+    const response = await fetch("/v1/fusion-evidence/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fusions,
+        mode: elements.annotateMode.value || "full",
+        run_id: state.currentResult.run_id || null,
+      }),
+    });
+    if (fusionEvidenceJobIsStale(token)) return;
+    if (!response.ok) {
+      let detail = response.statusText;
+      const text = await response.text();
+      try {
+        const payload = JSON.parse(text);
+        detail = payload.detail || detail;
+      } catch {
+        detail = text || detail;
+      }
+      throw new Error(detail || "Fusion evidence retry failed");
+    }
+
+    const job = await response.json();
+    const retried = await pollRetriedFusionEvidenceJob(job.status_url, token);
+    // Another run is shown (or another evidence job started): drop it.
+    if (retried === null) return;
+    // Apply only the fully completed retry, so a late poll failure can never
+    // leave the viewer looking at a half-updated list.
+    state.currentResult = {
+      ...state.currentResult,
+      fusion_evidence: mergeFusionEvidence(
+        state.currentResult.fusion_evidence || [],
+        retried,
+      ),
+    };
+    state.fusionEvidenceStatus = "complete";
+    renderAnnotationResult(state.currentResult);
+    setMessage("Fusion evidence retry complete.", "info");
+  } catch (error) {
+    if (fusionEvidenceJobIsStale(token)) return;
+    // Keep the original items exactly as they were: retry results are staged
+    // until the job completes.
+    state.fusionEvidenceStatus = "complete";
+    renderAnnotationResult(state.currentResult);
+    setMessage(formatRunError(error.message), "error");
+  }
+}
+
+// Resolves to the retried evidence, or null once `token` is stale.
+async function pollRetriedFusionEvidenceJob(statusUrl, token) {
+  const stale = () => fusionEvidenceJobIsStale(token);
+  let staged = [];
+  while (true) {
+    if (stale()) return null;
+    const response = await fetch(statusUrl);
+    if (stale()) return null;
+    if (!response.ok) {
+      throw new Error(response.statusText || "Unable to load fusion evidence job status");
+    }
+    const status = await response.json();
+    if (stale()) return null;
+    if (status.status === "failed") {
+      throw new Error(status.error || "Fusion evidence job failed");
+    }
+
+    staged = status.fusion_evidence || staged;
+
+    if (status.status === "complete") {
+      return staged;
+    }
+
+    const total = status.fusions_total || "?";
+    setMessage(`Retrying fusion evidence: ${status.fusions_completed}/${total} fusions complete.`, "info");
+    await sleep(1500);
+  }
 }
 
 // Resolves to the job's evidence, or null when the job went stale (another
@@ -1106,17 +1257,16 @@ async function startFusionEvidenceJob(
   const fusions = fusionEvidenceInputs(inputs);
   if (!fusions.length || !state.currentResult) return null;
 
-  invalidateFusionEvidenceJobs();
-  const generation = state.fusionEvidenceGeneration;
+  const token = claimFusionEvidenceJob(runId);
   try {
-    return await runFusionEvidenceJob(fusions, runId, mode, forceRefresh, generation);
+    return await runFusionEvidenceJob(fusions, runId, mode, forceRefresh, token);
   } catch (error) {
-    if (generation !== state.fusionEvidenceGeneration) return null;
+    if (fusionEvidenceJobIsStale(token)) return null;
     throw error;
   }
 }
 
-async function runFusionEvidenceJob(fusions, runId, mode, forceRefresh, generation) {
+async function runFusionEvidenceJob(fusions, runId, mode, forceRefresh, token) {
   state.fusionEvidenceStatus = "running";
   state.currentResult = {
     ...state.currentResult,
@@ -1134,18 +1284,20 @@ async function runFusionEvidenceJob(fusions, runId, mode, forceRefresh, generati
       force_refresh: forceRefresh === true,
     }),
   });
-  if (generation !== state.fusionEvidenceGeneration) return null;
+  if (fusionEvidenceJobIsStale(token)) return null;
   if (!response.ok) {
     const text = await response.text();
     throw new Error(text || response.statusText || "Fusion evidence job failed");
   }
 
   const job = await response.json();
-  return pollFusionEvidenceJob(job.status_url, generation);
+  return pollFusionEvidenceJob(job.status_url, token);
 }
 
-async function pollFusionEvidenceJob(statusUrl, generation = state.fusionEvidenceGeneration) {
-  const stale = () => generation !== state.fusionEvidenceGeneration;
+async function pollFusionEvidenceJob(
+  statusUrl, token = { generation: state.fusionEvidenceGeneration, runId: null },
+) {
+  const stale = () => fusionEvidenceJobIsStale(token);
   while (true) {
     if (stale()) return null;
     const response = await fetch(statusUrl);
@@ -1308,6 +1460,17 @@ async function loadSharedRun() {
       );
     }
     const result = await response.json();
+    // Shared links are readable by peers, but only the run's owner (or an
+    // admin) may retry failed lookups back onto it. Fail closed if this check
+    // can't be read, so other viewers never see an action they can't complete.
+    try {
+      const accessResponse = await fetch(`/v1/runs/${encodeURIComponent(sharedRunId)}/access`);
+      state.canModifyRun = accessResponse.ok
+        ? Boolean((await accessResponse.json()).can_modify)
+        : false;
+    } catch {
+      state.canModifyRun = false;
+    }
     // A run's fusion evidence job runs after the core annotation completes, so
     // it's normally persisted onto the run by the time anyone opens a share
     // link. Mark it complete up front so the tab shows immediately instead of
@@ -1401,10 +1564,9 @@ async function rerunSavedRun(runId, forceRefresh = false) {
     state.currentResult = null;
     const result = await pollAnnotationJob(job.status_url);
     state.openedRunId = result?.run_id || null;
-    // The new run belongs to the caller, so they may modify it. Hook for
-    // `canModifyRun` (PR #152, GET /v1/runs/{run_id}/access): set without
-    // re-checking access, whichever of the two merges first.
-    if ("canModifyRun" in state) state.canModifyRun = true;
+    // The new run belongs to the caller, so (like a fresh submission) they
+    // may retry its failed lookups without a GET /v1/runs/{id}/access check.
+    state.canModifyRun = true;
     if (result?.run_id) {
       history.replaceState(null, "", `${location.pathname}?run=${encodeURIComponent(result.run_id)}`);
     }
@@ -2160,6 +2322,19 @@ function renderFusionEvidenceView(fusionEvidence) {
     const heading = appendFusionText(section, "h3", "fusion-section-heading");
     const toggle = appendFusionText(heading, "button", "fusion-section-toggle", `${label} (${sectionItems.length})`);
     toggle.type = "button";
+    if (label === "Lookup failed" && state.canModifyRun) {
+      const retry = appendFusionText(
+        heading,
+        "button",
+        "retry-failed-fusions",
+        state.fusionEvidenceStatus === "running" ? "Retrying..." : "Retry failed lookups",
+      );
+      retry.type = "button";
+      retry.disabled = state.fusionEvidenceStatus === "running";
+      retry.addEventListener("click", () => {
+        retryFailedFusionEvidence().catch(() => {});
+      });
+    }
     const cards = document.createElement("div");
     cards.className = "annotation-list fusion-section-cards";
     cards.id = `fusion-section-${list.children.length}`;
@@ -2203,7 +2378,7 @@ function fusionEvidenceSections(items) {
     let label;
     let order;
     let key; // stable tracking id; the label can carry the tumor type
-    if (item.retrieval_status === "failed") {
+    if (item.retrieval_status === "failed" || (item.partial && (!item.literature_scope || item.literature_scope === "no_literature"))) {
       label = "Lookup failed";
       order = 4;
       key = "failed";
@@ -2261,6 +2436,7 @@ function renderFusionEvidenceCard(item) {
   const meta = appendFusionText(header, "div", "annotation-card-meta");
   appendFusionText(meta, "span", `review-badge ${item.well_supported ? "high" : "low"}`,
     item.well_supported ? "Well supported" : "Exploratory");
+  if (item.partial) appendFusionText(meta, "span", "status-pill", "Partial lookup");
   const count = fusionEvidencePmidCount(item);
   appendFusionText(meta, "span", "status-pill", `${count} PMID${count === 1 ? "" : "s"}`);
   if (item.literature_scope === "requested_tumor" && item.tumor_type && item.retrieval_status !== "failed") {
@@ -3483,7 +3659,7 @@ function renderFusionPartnerQueryButton(gene, tumorType) {
 
 function renderFusionPartnerPrecedentForFusionEvidence(item) {
   const retrievedCount = item.retrieved_count ?? (item.pmids || []).length;
-  if (retrievedCount > 0 || item.retrieval_status === "failed") return null;
+  if (retrievedCount > 0 || item.retrieval_status === "failed" || item.partial) return null;
 
   const partners = [];
   const seen = new Set();
@@ -3881,6 +4057,7 @@ function renderCacheBadge(annotation) {
   badge.className = "review-badge cache-badge";
   const labelByReason = {
     fresh_final_annotation: "Cached final",
+    retraction_check_failed: "Cached — retraction check unavailable",
     no_new_pubmed_pmids_since_last_check: "Cached after PubMed check",
     force_refresh: "Force refreshed",
     computed_new_annotation: "Freshly computed",

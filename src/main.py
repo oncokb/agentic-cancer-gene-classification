@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
-from src.api.run_persistence import run_owner, save_run_or_raise
+from src.api.run_persistence import can_modify_run, run_owner, save_run_or_raise
 from src.api.runs import router as runs_router
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
@@ -106,7 +106,9 @@ from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.feedback_citations import build_citation_check_section
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
-from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
+from src.pipeline.literature import (
+    pubmed_error_message, retrieve_fusion_evidence, retrieve_fusion_partner_evidence,
+)
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline import openevidence_metrics as oe_metrics
 from src.pipeline.normalization import has_accession_identifier, is_fusion_input, read_gene_input
@@ -829,7 +831,7 @@ async def _retrieve_fusion_evidence_input(
             return FusionEvidenceResult(
                 fusion=item.fusion,
                 tumor_type=item.tumor_type,
-                interpretation=f"Fusion evidence retrieval failed: {exc}",
+                interpretation=pubmed_error_message(exc),
                 retrieval_status="failed",
             )
 
@@ -882,19 +884,57 @@ async def _persist_run_result(
         logger.exception("Failed to persist run %s", result.run_id)
 
 
+def _fusion_evidence_key(item: Dict[str, Any]) -> tuple[str, Optional[str]]:
+    """Identity a fusion evidence item by the submitted input when known (so a
+    resolved Ensembl/RefSeq input still matches its submitted form) plus the
+    normalized tumor type."""
+    submission = item.get("input") or item.get("fusion") or ""
+    tumor_type = " ".join((item.get("tumor_type") or "").strip().lower().split()) or None
+    return str(submission), tumor_type
+
+
+def _merge_fusion_evidence(
+    existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Replace matching items in place, keep every other item, then append
+    incoming items the run didn't already have."""
+    replacements = {_fusion_evidence_key(item): item for item in incoming}
+    merged: List[Dict[str, Any]] = []
+    replaced: set[tuple[str, Optional[str]]] = set()
+    for item in existing:
+        key = _fusion_evidence_key(item)
+        if key in replacements:
+            merged.append(replacements[key])
+            replaced.add(key)
+        else:
+            merged.append(item)
+    for key, item in replacements.items():
+        if key not in replaced:
+            merged.append(item)
+            replaced.add(key)
+    return merged
+
+
 async def _persist_fusion_evidence(
     http_request: Request,
     run_id: str,
     fusion_evidence: List[FusionEvidenceResult],
 ) -> None:
     """Merge a completed fusion-evidence job back onto its run, so opening a
-    shared link later shows it instead of a hidden/empty fusion evidence tab."""
+    shared link later shows it instead of a hidden/empty fusion evidence tab.
+    Only the matching fusion/tumor items are replaced; every other item on the
+    run stays put (a retry of failed lookups must not drop earlier evidence)."""
+    incoming = [item.model_dump() for item in fusion_evidence]
+
+    def merge(stored: Dict[str, Any]) -> Dict[str, Any]:
+        stored["fusion_evidence"] = _merge_fusion_evidence(
+            stored.get("fusion_evidence") or [],
+            incoming,
+        )
+        return stored
+
     try:
-        stored = await http_request.app.state.run_store.get_run(run_id)
-        if stored is None:
-            return
-        stored["fusion_evidence"] = [item.model_dump() for item in fusion_evidence]
-        await http_request.app.state.run_store.update_run_result(run_id, stored)
+        await http_request.app.state.run_store.merge_run_result(run_id, merge)
     except Exception:
         logger.exception("Failed to persist fusion evidence for run %s", run_id)
 
@@ -1881,6 +1921,15 @@ async def create_fusion_evidence_job(
 ) -> FusionEvidenceJobCreateResponse:
     """Run exact fusion-pair PubMed evidence retrieval outside the annotation critical path."""
     _check_annotate_input_limit(request.fusions)
+    if request.run_id:
+        metadata = await http_request.app.state.run_store.get_run_metadata(request.run_id)
+        if metadata is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if not can_modify_run(metadata.get("owner_email"), current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Only this run's owner or an administrator may update it.",
+            )
     fusion_inputs = _fusion_evidence_inputs(request.fusions)
     job_id = str(uuid.uuid4())
     job = FusionEvidenceJobStatusResponse(

@@ -65,6 +65,8 @@ function app({ routes = {}, search = "?run=orig%2F1", storage = memoryStorage() 
 
 const RERUN_ROUTES = {
   "GET /v1/annotate/orig%2F1": ORIGINAL,
+  // #152: whether this viewer may retry failed lookups onto the opened run.
+  "GET /v1/runs/orig%2F1/access": { can_modify: false },
   "POST /v1/runs/orig%2F1/rerun": {
     job_id: "job-1", status_url: "/v1/annotate/jobs/job-1", rerun_of: "orig/1", fusions: INPUTS, mode: "core",
   },
@@ -109,19 +111,21 @@ test("Rerun posts the cached rerun, polls it, updates the URL and starts fusion 
   const keys = calls.map((call) => call.key);
   assert.deepStrictEqual(keys, [
     "GET /v1/annotate/orig%2F1",
+    "GET /v1/runs/orig%2F1/access",
     "POST /v1/runs/orig%2F1/rerun",
     "GET /v1/annotate/jobs/job-1",
     "POST /v1/fusion-evidence/jobs",
     "GET /v1/fusion-evidence/jobs/fe-1",
   ]);
-  assert.deepStrictEqual(calls[1].body, { force_refresh: false });
+  assert.deepStrictEqual(calls[2].body, { force_refresh: false });
   // The follow-up job gets the original fusion inputs, mode and the NEW run.
-  assert.deepStrictEqual(calls[3].body, { fusions: [INPUTS[0]], mode: "core", run_id: "new-run", force_refresh: false });
+  assert.deepStrictEqual(calls[4].body, { fusions: [INPUTS[0]], mode: "core", run_id: "new-run", force_refresh: false });
   assert.deepStrictEqual(replaced, ["/?run=new-run"]);
   assert.strictEqual(sandbox.state.currentResult.run_id, "new-run");
   assert.strictEqual(sandbox.state.openedRunId, "new-run");
   assert.strictEqual(sandbox.state.lastInputsByFusion["EML4::ALK"].five_transcript, "ENST00000318522");
   assert.strictEqual(sandbox.state.isRunning, false);
+  assert.strictEqual(sandbox.state.canModifyRun, true, "the new run belongs to the caller");
 });
 
 test("Rerun with Refresh selected sends force_refresh on the rerun and the fusion-evidence job", async () => {
@@ -184,6 +188,52 @@ test("a previous rerun's late fusion evidence never overwrites a newer rerun's r
   assert.strictEqual(sandbox.state.fusionEvidenceStatus, "complete");
   assert.strictEqual(sandbox.elements.messageBox.textContent, messageAfterB);
   assert.deepStrictEqual(replaced, ["/?run=run-a", "/?run=run-b"]);
+});
+
+test("a new submission or rerun resets a fusion-evidence tab left running by an earlier run", async () => {
+  for (const startNext of ["submit", "rerun"]) {
+    const hanging = deferred();
+    let reruns = 0;
+    const rerun = () => {
+      reruns += 1;
+      // Rerun A has a fusion input (its evidence job hangs); rerun B has none.
+      const fusions = reruns === 1 ? INPUTS : [{ fusion: "TP53", tumor_type: null }];
+      return json({ job_id: `job-${reruns}`, status_url: `/v1/annotate/jobs/job-${reruns}`, rerun_of: "orig/1", fusions, mode: "core" });
+    };
+    const routes = {
+      ...RERUN_ROUTES,
+      "POST /v1/runs/orig%2F1/rerun": rerun,
+      "POST /v1/runs/run-a/rerun": rerun,
+      "POST /v1/annotate/jobs": { job_id: "job-2", status_url: "/v1/annotate/jobs/job-2" },
+      "GET /v1/annotate/jobs/job-1": { job_id: "job-1", status: "complete", fusions_processed: 2, genes_completed: 0, result: { ...NEW_RESULT, run_id: "run-a" } },
+      "GET /v1/annotate/jobs/job-2": { job_id: "job-2", status: "complete", fusions_processed: 1, genes_completed: 0, result: { ...NEW_RESULT, run_id: "run-b" } },
+      "GET /v1/fusion-evidence/jobs/fe-1": () => hanging.promise,
+    };
+    const { sandbox } = app({ routes });
+    await sandbox.loadSharedRun();
+    await click(sandbox.elements.rerunRun);
+    await settle();
+    assert.strictEqual(sandbox.state.fusionEvidenceStatus, "running");
+    assert.strictEqual(sandbox.elements.tabFusionEvidenceView.textContent, "Fusion evidence (0...)");
+
+    if (startNext === "submit") {
+      // A gene-only submission: no fusion-evidence job of its own.
+      sandbox.state.inputMode = "single";
+      sandbox.state.queue = [{ fusion: "TP53" }];
+      await sandbox.runAnnotation();
+    } else {
+      await click(sandbox.elements.rerunRun);
+    }
+    await settle();
+    assert.strictEqual(sandbox.state.currentResult.run_id, "run-b", startNext);
+    assert.strictEqual(sandbox.state.fusionEvidenceStatus, null, `${startNext}: the dropped job's running state is reset`);
+    assert.strictEqual(sandbox.elements.tabFusionEvidenceView.textContent, "Fusion evidence (0)", startNext);
+
+    hanging.resolve(json({ job_id: "fe-1", status: "running", fusions_total: 1, fusions_completed: 0, fusion_evidence: [] }));
+    await settle();
+    assert.strictEqual(sandbox.state.fusionEvidenceStatus, null, startNext);
+    assert.strictEqual(sandbox.elements.tabFusionEvidenceView.textContent, "Fusion evidence (0)", startNext);
+  }
 });
 
 test("a stale fusion-evidence failure is dropped, not reported on the newer result", async () => {
@@ -277,7 +327,7 @@ test("a pending rerun for a different run is discarded, and the URL alone never 
   const { sandbox, calls } = app({ routes: RERUN_ROUTES, storage, search: "?run=orig%2F1&rerun=1" });
   await sandbox.loadSharedRun();
   await settle();
-  assert.deepStrictEqual(calls.map((call) => call.key), ["GET /v1/annotate/orig%2F1"]);
+  assert.deepStrictEqual(calls.map((call) => call.key), ["GET /v1/annotate/orig%2F1", "GET /v1/runs/orig%2F1/access"]);
   assert.strictEqual(storage.items.has("agcg.pendingRerun"), false);
 });
 
@@ -292,7 +342,7 @@ test("stale, undated or corrupt pending reruns are discarded without rerunning",
     const { sandbox, calls } = app({ routes: RERUN_ROUTES, storage });
     await sandbox.loadSharedRun();
     await settle();
-    assert.deepStrictEqual(calls.map((call) => call.key), ["GET /v1/annotate/orig%2F1"], entry);
+    assert.deepStrictEqual(calls.map((call) => call.key), ["GET /v1/annotate/orig%2F1", "GET /v1/runs/orig%2F1/access"], entry);
     assert.strictEqual(storage.items.has("agcg.pendingRerun"), false, entry);
   }
 });

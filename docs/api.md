@@ -191,12 +191,33 @@ Your original input stays in the result: `resolved_inputs` on each annotation
 `submitted_inputs` in gene-query results, and `input` on fusion-evidence
 results. Request-level `warnings` repeat any caveats and errors.
 
+Some current human Ensembl genes (for example novel lncRNAs such as
+`ENSG00000225718`) have neither an HGNC symbol nor an Ensembl name. Such a gene
+is annotated under its unversioned Ensembl gene ID, with a warning like
+"ENSG00000225718 is a current human lncRNA with no HGNC symbol or Ensembl name;
+the Ensembl ID is used as its name." The ID is not an HGNC symbol, so fusion
+evidence searches PubMed for the ID itself (e.g. `PTPRN2::ENSG00000225718`),
+plus the other partner's aliases.
+
 An identifier that can't be used gets its own error row and is not annotated
 as any gene. That covers an unknown, non-human or malformed ID, an Ensembl or
 NCBI lookup that failed (retry), and `GENE(ENST...)` / `GENE(NM_...)` where the
 transcript belongs to a different gene. In the gene query API the last case
 reads "The Ensembl ID belongs to a different gene than the one named." or "The
 RefSeq accession belongs to a different gene than the one named."
+
+For Ensembl IDs Ensembl's lookup doesn't know, the archive tells the two
+permanent cases apart: "Ensembl ID ENSG... is retired (last seen in release
+N)." (naming a replacement only when Ensembl suggests one) or "Ensembl did not
+find ID ENSG...". Timeouts, network errors, HTTP 429, 5xx and unreadable
+responses are retried with backoff (honouring `Retry-After`), up to 3 attempts
+per request, and all Ensembl requests for one submission share a deadline of
+about 15 seconds. Then the error reads "Ensembl lookup temporarily unavailable
+(timeout); retry later." (or `(HTTP 429)`, `(HTTP 503)`, `(invalid response)`,
+...). The same message, with `(inconsistent response)`, is used when Ensembl
+contradicts itself, e.g. its lookup lacks an ID its archive calls current. Only
+these are worth retrying. Successful lookups, and retired or not-found IDs the
+archive has confirmed, are cached per ID; failures are not.
 
 In a fusion, only the bad partner is rejected: the other partner is still
 annotated on its own. For `EML4(ENST00000256078)::ALK` (a KRAS transcript),
@@ -473,9 +494,10 @@ Each `fusion_evidence` entry (the same shape is returned inline by
 | `fusion`, `tumor_type` | The input pair and the tumor type you sent, or `null`. |
 | `pmids`, `retrieved_count` | Every non-retracted PMID whose title or abstract discusses the exact pair, in ranked order. Both a tumor-scoped and a tumor-agnostic search are run when `tumor_type` is set. |
 | `evidence_cards` | Cards for the top 5 `pmids` only. Each card's `requested_tumor_terms` lists the requested tumor type or alias terms found in that paper's title or abstract. |
-| `literature_scope` | Computed over all `pmids`, not just the cards. `requested_tumor`: at least one paper **mentions** the requested tumor type; this does not mean the fusion was shown in that tumor. `other_or_unspecified`: a tumor type was sent but no paper mentions it. `any_tumor`: no tumor type was sent and papers were found. `no_literature`: the search succeeded and found none. `null` when retrieval failed, the input is not a two-partner fusion, or the result predates this field. |
+| `literature_scope` | Computed over all `pmids`, not just the cards. `requested_tumor`: at least one paper **mentions** the requested tumor type; this does not mean the fusion was shown in that tumor. `other_or_unspecified`: a tumor type was sent but no paper mentions it. `any_tumor`: no tumor type was sent and papers were found. `no_literature`: all searches succeeded and no paper was retained. `null` when retrieval failed, a partial result has no retained papers or its tumor-scoped search failed, the input is not a two-partner fusion, or the result predates this field. |
 | `requested_tumor_pmids` | The `pmids` that mention the requested tumor type, in ranked order. These can include papers without a card. |
-| `retrieval_status` | `ok`, or `failed` when retrieval raised an error. A failed entry is empty because the lookup failed, not because no literature exists; retry it. |
+| `partial` | Boolean, default `false`. One exact-pair search failed; evidence from successful searches is retained and the interpretation describes the failure. Partial results are never cached. Scope is unknown (`null`) when no papers were retained or the tumor-scoped query failed; otherwise scope reflects retained papers. The UI labels partial lookups, groups unknown-scope partial results under Lookup failed, and suppresses the no-literature partner prompt. |
+| `retrieval_status` | `ok` when at least one search succeeded (including partial results), or for non-pair inputs where no lookup applies; `failed` when retrieval raised an error. A failed entry is empty because the lookup failed, not because no literature exists; retry it. |
 
 Tumor mentions are matched deterministically on word boundaries against the
 same expanded terms as the tumor-scoped query (for example `LUAD` also matches

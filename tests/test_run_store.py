@@ -244,6 +244,23 @@ async def test_get_run_returns_none_for_missing_id(run_store):
     assert stored is None
 
 
+async def test_get_run_metadata_returns_owner_and_source(run_store):
+    await run_store.save_run(
+        "run-meta",
+        "2026-10-26T12:00:00+00:00",
+        {"fusions": [{"fusion": "EML4::ALK"}]},
+        {"run_id": "run-meta"},
+        owner_email="Owner@MSKCC.org",
+        source="session",
+    )
+
+    assert await run_store.get_run_metadata("run-meta") == {
+        "owner_email": "owner@mskcc.org",
+        "source": "session",
+    }
+    assert await run_store.get_run_metadata("does-not-exist") is None
+
+
 async def test_gene_annotation_cache_round_trip(run_store):
     annotation = GeneAnnotation(
         gene="BRAF",
