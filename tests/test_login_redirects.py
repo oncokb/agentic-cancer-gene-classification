@@ -23,6 +23,9 @@ from src.auth import (
 from src.config import settings
 from tests.auth_helpers import save_profile_for, session_token_for
 
+# Every test runs once per USER_STORE_BACKEND (see conftest.user_store_backend).
+pytestmark = pytest.mark.usefixtures("user_store_backend")
+
 
 TARGET = "/?run=abc&view=details"
 BAD_TARGETS = [

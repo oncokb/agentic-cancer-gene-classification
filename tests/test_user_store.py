@@ -5,6 +5,7 @@ behavior lives in tests/test_user_store_contract.py."""
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -15,6 +16,7 @@ from src.auth import UserStoreUnavailable
 from src.pipeline.run_store import RunStore
 from src.pipeline.user_store import (
     LoginIdentity,
+    UserFilters,
     UserNotFound,
     UserRecord,
     decode_id_cursor,
@@ -22,6 +24,7 @@ from src.pipeline.user_store import (
     encode_id_cursor,
     encode_user_cursor,
     escape_like,
+    search_key,
 )
 from src.pipeline.user_store_fake import FakeUserStore
 
@@ -183,4 +186,80 @@ def test_cursor_round_trips():
 
 
 def test_escape_like():
-    assert escape_like(r"a_b%c\d") == r"a\_b\%c\\d"
+    # '!' escapes; a backslash is an ordinary character under every sql_mode.
+    assert escape_like(r"a_b%c\d!e") == r"a!_b!%c\d!!e"
+
+
+def _like(value: str, pattern: str, escape: str) -> bool:
+    """MySQL LIKE with an explicit ESCAPE character (case-sensitive, as on
+    the binary-collated search columns)."""
+    regex, index = "", 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == escape and index + 1 < len(pattern):
+            index += 1
+            regex += re.escape(pattern[index])
+        elif char == "%":
+            regex += ".*"
+        elif char == "_":
+            regex += "."
+        else:
+            regex += re.escape(char)
+        index += 1
+    return re.fullmatch(regex, value, re.DOTALL) is not None
+
+
+class _CapturingCursor:
+    def __init__(self, sink):
+        self.sink = sink
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, sql, params=None):
+        self.sink.append((sql, params))
+
+    async def fetchall(self):
+        return []
+
+
+class _CapturingPool:
+    def __init__(self):
+        self.statements = []
+
+    @asynccontextmanager
+    async def acquire(self):
+        sink = self.statements
+
+        class _Conn:
+            def cursor(self):
+                return _CapturingCursor(sink)
+
+        yield _Conn()
+
+
+@pytest.mark.parametrize(
+    ("needle", "matching", "not_matching"),
+    [
+        ("a_b", "xa_by", "xaxby"),
+        ("50%", "50% off", "500 off"),
+        ("a\\b", "a\\b", "ab"),
+        ("o'b!", "o'b!", "o'bx"),
+    ],
+)
+async def test_name_search_escapes_without_backslashes(needle, matching, not_matching):
+    store = RunStore(_CapturingPool())
+    await store.list_users(UserFilters(search=needle))
+    sql, params = store._pool.statements[-1]
+    # Every LIKE names its escape character, so the pattern means the same
+    # with or without NO_BACKSLASH_ESCAPES (the parameter itself is quoted
+    # by the driver, which follows the server's mode).
+    assert sql.count("LIKE %s ESCAPE '!'") == 2
+    assert sql.count("LIKE") == 2
+    pattern = params[0]
+    assert "\\" not in pattern.replace(needle, "")
+    assert _like(search_key(matching), pattern, "!")
+    assert not _like(search_key(not_matching), pattern, "!")

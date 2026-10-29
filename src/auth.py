@@ -19,7 +19,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zlib
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import httpx
@@ -37,6 +37,9 @@ from src.api_keys import (
     should_touch_last_used,
 )
 from src.config import settings
+
+if TYPE_CHECKING:  # src.pipeline.user_store imports this module
+    from src.pipeline.user_store import UserRecord, UserStore
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +154,100 @@ class UserStoreUnavailable(RuntimeError):
     """The user profile store could not be read; callers must fail closed."""
 
 
+# ---------------------------------------------------------------------------
+# MySQL user store (USER_STORE_BACKEND=mysql)
+# ---------------------------------------------------------------------------
+
+# New users signing in with the MySQL store; only admin actions and bootstrap
+# grants change a role after that.
+MYSQL_NEW_USER_ROLE = "viewer"
+BOOTSTRAP_ADMIN_REASON = "bootstrap admin grant (BOOTSTRAP_ADMIN_EMAILS)"
+
+_mysql_user_store: Optional["UserStore"] = None
+
+
+def mysql_user_store_enabled() -> bool:
+    return settings.user_store_backend == "mysql"
+
+
+def configure_mysql_user_store(store: Optional["UserStore"]) -> None:
+    """Set the store used when USER_STORE_BACKEND=mysql (the app's RunStore)."""
+    global _mysql_user_store
+    _mysql_user_store = store
+
+
+def _mysql_store() -> "UserStore":
+    if _mysql_user_store is None:
+        raise UserStoreUnavailable("USER_STORE_BACKEND=mysql but no MySQL user store is configured")
+    return _mysql_user_store
+
+
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value is not None else None
+
+
+def _profile_from_record(record: "UserRecord") -> UserProfile:
+    return UserProfile(
+        email=record.email,
+        name=record.name,
+        picture=record.picture,
+        domain=record.domain,
+        role=record.role,
+        status=record.status,
+        provider=record.provider,
+        groups=[str(g) for g in record.groups],
+        claims=dict(record.claims),
+        first_login_at=_iso(record.first_login_at),
+        last_login_at=_iso(record.last_login_at),
+        login_count=record.login_count,
+        annotation_count=record.annotation_count,
+        last_annotation_at=_iso(record.last_annotation_at),
+    )
+
+
+async def _mysql_get_user(email: str) -> Optional["UserRecord"]:
+    """One users-table read. Any failure other than a malformed email (which
+    can't name a user) is UserStoreUnavailable, so callers fail closed."""
+    try:
+        return await _mysql_store().get_user(email)
+    except UserStoreUnavailable:
+        raise
+    except ValueError:
+        return None
+    except Exception as exc:
+        raise UserStoreUnavailable(f"Failed to read user {email}") from exc
+
+
+async def grant_bootstrap_admin_if_listed(email: str) -> Optional[str]:
+    """Grant the admin role once to a BOOTSTRAP_ADMIN_EMAILS user (MySQL store).
+
+    grant_bootstrap_admin logs the grant in role_changes under the same
+    actor as the migration script, and refuses when any earlier grant was
+    logged, so an admin's later demotion is never undone. Returns the store's
+    outcome, or None when the email isn't listed.
+    """
+    clean_email = email.strip().lower()
+    if clean_email not in settings.bootstrap_admin_emails_list:
+        return None
+    outcome = await _mysql_store().grant_bootstrap_admin(clean_email, reason=BOOTSTRAP_ADMIN_REASON)
+    logger.info("Bootstrap admin for %s: %s", clean_email, outcome)
+    return outcome
+
+
+async def bootstrap_admins_at_startup() -> None:
+    """Apply BOOTSTRAP_ADMIN_EMAILS to users already in MySQL. Users who
+    haven't signed in yet get the grant at their first sign-in instead."""
+    from src.pipeline.user_store import UserNotFound
+
+    for email in settings.bootstrap_admin_emails_list:
+        try:
+            await grant_bootstrap_admin_if_listed(email)
+        except UserNotFound:
+            logger.info("Bootstrap admin %s has not signed in yet; granting at first sign-in", email)
+        except Exception:
+            logger.exception("Bootstrap admin grant for %s failed at startup; retried at sign-in", email)
+
+
 async def _profile_store_redis():
     """The Redis client backing authoritative profile reads.
 
@@ -170,12 +267,16 @@ async def _profile_store_redis():
 async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
     """Read a user profile from the authoritative store, failing closed.
 
-    With Redis configured, Redis alone decides: a miss means the profile was
-    deleted (None) and any error raises UserStoreUnavailable. The in-process
+    With USER_STORE_BACKEND=mysql the users table alone decides, the same
+    way. With Redis configured, Redis alone decides: a miss means the profile
+    was deleted (None) and any error raises UserStoreUnavailable. The in-process
     store, which save_user_profile also populates, may hold a stale copy and
     is consulted only when Redis is intentionally unconfigured.
     """
     clean_email = email.strip().lower()
+    if mysql_user_store_enabled():
+        record = await _mysql_get_user(clean_email)
+        return _profile_from_record(record) if record is not None else None
     redis_client = await _profile_store_redis()
     if redis_client is None:
         async with _user_store_lock:
@@ -188,6 +289,8 @@ async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
 
 
 async def get_user_profile(email: str) -> Optional[UserProfile]:
+    if mysql_user_store_enabled():
+        return await load_user_profile_strict(email)
     clean_email = email.strip().lower()
     redis_client = await _get_auth_redis_client()
     if redis_client is not None:
@@ -232,7 +335,28 @@ def _with_activity(profile: UserProfile, activity: Dict[str, Any]) -> UserProfil
     )
 
 
+async def _list_mysql_user_profiles() -> List[UserProfile]:
+    from src.pipeline.user_store import MAX_PAGE_LIMIT, UserFilters
+
+    store = _mysql_store()
+    profiles: List[UserProfile] = []
+    cursor: Optional[str] = None
+    try:
+        while True:
+            page = await store.list_users(UserFilters(), limit=MAX_PAGE_LIMIT, cursor=cursor)
+            profiles.extend(_profile_from_record(record) for record in page.users)
+            cursor = page.next_cursor
+            if cursor is None:
+                return profiles  # already most recent login first
+    except UserStoreUnavailable:
+        raise
+    except Exception as exc:
+        raise UserStoreUnavailable("Failed to list users") from exc
+
+
 async def list_user_profiles() -> List[UserProfile]:
+    if mysql_user_store_enabled():
+        return await _list_mysql_user_profiles()
     redis_client = await _get_auth_redis_client()
     if redis_client is not None:
         try:
@@ -279,6 +403,11 @@ async def provision_or_update_user(
     """
     clean_email = email.strip().lower()
     extracted_domain = domain or clean_email.split("@")[-1]
+    if mysql_user_store_enabled():
+        return await _provision_mysql_user(
+            clean_email, name=name, picture=picture, domain=extracted_domain, provider=provider,
+            groups=groups or [], claims=claims or {}, require_approval=require_approval,
+        )
     now_iso = datetime.now(timezone.utc).isoformat()
     user_groups = groups or []
     user_claims = claims or {}
@@ -333,6 +462,53 @@ async def provision_or_update_user(
     return profile
 
 
+async def _provision_mysql_user(
+    email: str,
+    *,
+    name: str,
+    picture: Optional[str],
+    domain: str,
+    provider: str,
+    groups: List[str],
+    claims: Dict[str, Any],
+    require_approval: Optional[bool],
+) -> UserProfile:
+    """Sign-in against the MySQL users table.
+
+    upsert_login creates a new user as an active viewer (pending when approval
+    is required) and, for an existing user, refreshes identity, groups, claims
+    and login counters but never role or status: IdP groups (Keycloak roles,
+    SAML admin groups) are stored, not mapped to a role. A listed bootstrap
+    admin is then granted admin once. Store errors raise UserStoreUnavailable.
+    """
+    from src.pipeline.user_store import BOOTSTRAP_GRANTED, LoginIdentity
+
+    if require_approval is None:
+        require_approval = settings.jit_require_admin_approval
+    identity = LoginIdentity(
+        email=email, name=name, picture=picture, domain=domain, provider=provider,
+        groups=groups, claims=claims,
+    )
+    store = _mysql_store()
+    try:
+        record = await store.upsert_login(
+            identity,
+            default_role=MYSQL_NEW_USER_ROLE,
+            default_status="pending" if require_approval else "active",
+        )
+        logger.info(
+            "Sign-in for %s (provider=%s, role=%s, status=%s, login_count=%d)",
+            record.email, provider, record.role, record.status, record.login_count,
+        )
+        if record.role != "admin" and await grant_bootstrap_admin_if_listed(record.email) == BOOTSTRAP_GRANTED:
+            record = await store.get_user(record.email) or record
+    except UserStoreUnavailable:
+        raise
+    except Exception as exc:
+        raise UserStoreUnavailable(f"Failed to provision user {email}") from exc
+    return _profile_from_record(record)
+
+
 def _activity_key(email: str) -> str:
     return f"agcg:user_activity:{email}"
 
@@ -345,6 +521,13 @@ async def record_user_annotation_activity(email: str, count: int = 1) -> None:
     the profile (a read-modify-write here could undo a concurrent demotion).
     """
     clean_email = email.strip().lower()
+    if mysql_user_store_enabled():
+        # Same contract as Redis: drop the increment on failure, never buffer it.
+        try:
+            await _mysql_store().incr_activity(clean_email, max(1, count))
+        except Exception as exc:
+            logger.warning("Dropped annotation activity for %s: user store error: %s", clean_email, exc)
+        return
     now_iso = datetime.now(timezone.utc).isoformat()
     if settings.redis_url.strip():
         # Redis is the store: on failure drop the increment rather than buffer
@@ -927,15 +1110,15 @@ async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[Au
         except Exception as exc:
             logger.warning("Failed to update last_used_at for API key %s: %s", record.id, exc)
 
-    # Same authoritative read as sessions: with Redis configured, an owner
-    # missing there was deleted. Without Redis the in-process store is lost on
-    # restart, so a missing owner keeps the default-role behaviour.
+    # Same authoritative read as sessions: with MySQL or Redis as the store,
+    # an owner missing there was deleted. Without either the in-process store
+    # is lost on restart, so a missing owner keeps the default-role behaviour.
     try:
         profile = await load_user_profile_strict(owner_email)
     except UserStoreUnavailable:
         logger.exception("User profile lookup failed for API key %s owner %s", record.id, owner_email)
         return None, "unavailable"
-    if profile is None and settings.redis_url.strip():
+    if profile is None and (mysql_user_store_enabled() or settings.redis_url.strip()):
         logger.warning("API key %s rejected: owner %s has no user profile", record.id, owner_email)
         return None, "invalid"
 

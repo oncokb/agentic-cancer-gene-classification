@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -314,6 +314,15 @@ class Settings(BaseSettings):
     jit_default_role: str = "curator"  # Default role for new users: curator, annotator, viewer
     jit_require_admin_approval: bool = False  # If True, new JIT users start in pending status
 
+    # Where sign-in and per-request permission checks read user records:
+    # "redis" (agcg:user:<email>, the default) or "mysql" (the users table).
+    # With "mysql", new users start as active viewers (pending if
+    # JIT_REQUIRE_ADMIN_APPROVAL) and sign-in never changes an existing role.
+    user_store_backend: Literal["redis", "mysql"] = "redis"
+    # Comma-separated emails made admin once (at startup or sign-in) when
+    # USER_STORE_BACKEND=mysql; never re-granted after an admin removes it.
+    bootstrap_admin_emails: str = ""
+
     # ACGC API keys (scripted access: `Authorization: Bearer acgc_...`)
     api_key_rate_limit_per_minute: int = Field(default=60, ge=1)  # Per-key request budget
     api_key_max_expires_in_days: int = Field(default=365, ge=1)  # Upper bound for expires_in_days
@@ -346,6 +355,12 @@ class Settings(BaseSettings):
         if not self.allowed_emails:
             return []
         return [e.strip().lower() for e in self.allowed_emails.split(",") if e.strip()]
+
+    @property
+    def bootstrap_admin_emails_list(self) -> List[str]:
+        if not self.bootstrap_admin_emails:
+            return []
+        return [e.strip().lower() for e in self.bootstrap_admin_emails.split(",") if e.strip()]
 
     @property
     def saml_allowed_groups_list(self) -> List[str]:

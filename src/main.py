@@ -40,8 +40,10 @@ from src.auth import (
     AuthUserResponse,
     UserProfile,
     UserStoreUnavailable,
+    bootstrap_admins_at_startup,
     build_saml_authn_request,
     clear_session_cookie,
+    configure_mysql_user_store,
     create_oauth_state,
     create_session_token,
     exchange_google_code,
@@ -56,6 +58,7 @@ from src.auth import (
     is_email_allowed,
     is_saml_group_allowed,
     list_user_profiles,
+    mysql_user_store_enabled,
     parse_keycloak_user,
     parse_saml_response,
     provision_or_update_user,
@@ -186,6 +189,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Datadog metrics initialization failed; continuing without metrics", exc_info=True)
     app.state.run_store = await RunStore.create()
+    if mysql_user_store_enabled():
+        # Sign-in and per-request permission checks read the users table;
+        # Redis user records are left untouched (rollback = USER_STORE_BACKEND=redis).
+        configure_mysql_user_store(app.state.run_store)
+        await bootstrap_admins_at_startup()
     logger.info(
         "Application startup: auth_enabled=%s, google_client_id_configured=%s, "
         "google_client_secret_configured=%s (len=%d), auth_secret_key_configured=%s",
@@ -197,6 +205,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     await _cancel_openevidence_sidecar_lookups()
+    configure_mysql_user_store(None)
     await app.state.run_store.close()
     try:
         await asyncio.to_thread(shutdown_statsd)

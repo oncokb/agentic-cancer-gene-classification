@@ -37,9 +37,9 @@ def _validate_identifier(value: str) -> None:
 async def column_exists(cursor: Any, table: str, column: str) -> bool:
     _validate_identifier(table)
     _validate_identifier(column)
-    # SHOW COLUMNS uses LIKE semantics: an underscore in a name is otherwise a wildcard.
-    pattern = column.replace("_", r"\_").replace("%", r"\%")
-    await cursor.execute(f"SHOW COLUMNS FROM {table} LIKE %s", (pattern,))
+    # An exact match, not SHOW COLUMNS ... LIKE: a LIKE pattern needs escaping
+    # for `_`, and backslash escapes mean something else under NO_BACKSLASH_ESCAPES.
+    await cursor.execute(f"SHOW COLUMNS FROM {table} WHERE Field = %s", (column,))
     return await cursor.fetchone() is not None
 
 

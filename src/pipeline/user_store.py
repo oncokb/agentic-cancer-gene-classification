@@ -511,8 +511,19 @@ def decode_id_cursor(cursor: str) -> int:
     return int(raw)
 
 
+# The LIKE escape character, named in every LIKE's ESCAPE clause. Not a
+# backslash: whether '\\' in SQL text is an escape depends on the server's
+# NO_BACKSLASH_ESCAPES mode, while '!' means the same under every sql_mode.
+LIKE_ESCAPE = "!"
+
+
 def escape_like(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    """`value` as a literal inside a LIKE pattern used with ESCAPE '!'."""
+    return (
+        value.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
 
 
 def _loads(value: Any) -> Any:
@@ -893,7 +904,10 @@ class UserStoreMixin:
         if needle:
             # Binary substring match on Python-computed keys, like FakeUserStore.
             pattern = f"%{escape_like(needle)}%"
-            where.append("(email_search LIKE %s OR name_search LIKE %s)")
+            where.append(
+                f"(email_search LIKE %s ESCAPE '{LIKE_ESCAPE}' "
+                f"OR name_search LIKE %s ESCAPE '{LIKE_ESCAPE}')"
+            )
             params.extend([pattern, pattern])
         if cursor is not None:
             after_at, after_email = decode_user_cursor(cursor)
