@@ -417,15 +417,21 @@ def dev_mode_startup_error(config: Settings) -> Optional[str]:
     """Why the app must refuse to start with AGCG_DEV_MODE on, or None.
 
     Dev mode makes every signed-in user an admin, so it's only allowed when
-    PUBLIC_APP_BASE_URL is unset (the default) or names a local host
+    PUBLIC_APP_BASE_URL is absent (not provided at all) or names a local host
     (localhost, 127.0.0.1, ::1, 0.0.0.0; any scheme or port). A base URL
-    whose host can't be parsed is treated as non-local.
+    whose host can't be parsed is treated as non-local, and so is one
+    provided but blank: the app then takes its public URL from each request.
     """
     if not config.agcg_dev_mode or not config._public_app_base_url_configured:
         return None
     url = config.public_app_base_url.strip()
     if not url:
-        return None
+        return (
+            "Refusing to start: AGCG_DEV_MODE is on, which grants every signed-in user admin "
+            "privileges, and PUBLIC_APP_BASE_URL is set but blank, so the public URL would come "
+            "from each request's host. Unset AGCG_DEV_MODE for deployed environments, or set "
+            "PUBLIC_APP_BASE_URL to a localhost URL (or leave it out entirely) for local development."
+        )
     try:
         host = urlsplit(url if "://" in url else f"//{url}").hostname
     except ValueError:

@@ -15,6 +15,7 @@ store's behaviour; "redis" is the real Redis code path against a fake client.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Optional
@@ -706,30 +707,42 @@ async def test_usage_counts_and_admin_list(backend):
     assert listed.last_annotation_at is not None
 
 
-async def test_failed_usage_write(backend):
-    # Redis drops it (today's behaviour); MySQL raises UserStoreUnavailable.
+def _activity_errors(caplog):
+    return [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and r.getMessage().startswith(auth_module.ACTIVITY_WRITE_FAILED_LOG_KEY)
+    ]
+
+
+async def test_failed_usage_write_is_dropped(backend, caplog):
+    # Usage counters aren't an access check: a failed write never raises.
+    # MySQL logs an error under a stable key; Redis keeps today's warning.
     backend.put()
     backend.fail()
-    if backend.name == "redis":
+    with caplog.at_level(logging.WARNING, logger="src.auth"):
         await auth_module.record_user_annotation_activity(EMAIL, count=3)
-    else:
-        with pytest.raises(auth_module.UserStoreUnavailable):
-            await auth_module.record_user_annotation_activity(EMAIL, count=3)
     backend.fail(False)
     [listed] = await auth_module.list_user_profiles()
     assert listed.annotation_count == 0
     assert auth_module._user_activity == {}
+    assert len(_activity_errors(caplog)) == (1 if backend.name == "mysql" else 0)
 
 
-async def test_unexpected_activity_error_is_unavailable_with_mysql(mysql, monkeypatch):
+async def test_activity_error_log_names_no_email(mysql, monkeypatch, caplog):
     mysql.put()
 
     async def broken(*args, **kwargs):
-        raise RuntimeError("pool closed")
+        raise RuntimeError(f"pool closed while updating {EMAIL}")
 
     monkeypatch.setattr(mysql.store, "incr_activity", broken)
-    with pytest.raises(auth_module.UserStoreUnavailable):
-        await auth_module.record_user_annotation_activity(EMAIL)
+    with caplog.at_level(logging.ERROR, logger="src.auth"):
+        await auth_module.record_user_annotation_activity(EMAIL, count=2)
+    [record] = _activity_errors(caplog)
+    assert record.getMessage() == (
+        "user_store.activity_write_failed: dropped an annotation usage count of 2 (RuntimeError)"
+    )
+    assert record.exc_info is None
+    assert "@" not in caplog.text
 
 
 @pytest.fixture
@@ -758,25 +771,32 @@ def _break_activity(monkeypatch, store):
     monkeypatch.setattr(store, "incr_activity", broken)
 
 
-def test_annotation_activity_failure_is_503_with_mysql(mysql, fake_pipeline, monkeypatch):
+@pytest.mark.parametrize("broken", [False, True])
+def test_annotation_succeeds_whether_or_not_usage_is_recorded_with_mysql(
+    mysql, fake_pipeline, monkeypatch, caplog, broken,
+):
     from tests.test_gene_query_api import FakeRunStore
 
     mysql.put()
     app.state.run_store = FakeRunStore()
-    _break_activity(monkeypatch, mysql.store)
-    resp = _session().post("/v1/annotate", json={"fusions": ["EML4::ALK"]})
-    assert resp.status_code == 503
-    assert resp.json()["detail"] == "User records are temporarily unavailable. Please retry shortly."
+    if broken:
+        _break_activity(monkeypatch, mysql.store)
+    with caplog.at_level(logging.ERROR, logger="src.auth"):
+        resp = _session().post("/v1/annotate", json={"fusions": ["EML4::ALK"]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["annotations"][0]["gene"] == "ALK"
+    assert mysql.stored().annotation_count == (0 if broken else 1)
+    assert len(_activity_errors(caplog)) == (1 if broken else 0)
     assert mysql.lookups() == 1  # the request's own check was the only read
 
 
-def test_annotation_activity_recorded_with_mysql(mysql, fake_pipeline):
-    from tests.test_gene_query_api import FakeRunStore
-
+def test_auth_lookup_failure_is_still_503_before_annotating(mysql, fake_pipeline, monkeypatch):
     mysql.put()
-    app.state.run_store = FakeRunStore()
-    assert _session().post("/v1/annotate", json={"fusions": ["EML4::ALK"]}).status_code == 200
-    assert mysql.stored().annotation_count == 1
+    called = []
+    monkeypatch.setattr(main_module, "run_pipeline", lambda *a, **k: called.append(1))
+    mysql.fail()
+    assert _session().post("/v1/annotate", json={"fusions": ["EML4::ALK"]}).status_code == 503
+    assert called == []
 
 
 class _JobStore(CountingFakeUserStore):
@@ -787,35 +807,32 @@ class _JobStore(CountingFakeUserStore):
 
 
 @pytest.mark.parametrize("broken", [False, True])
-def test_annotation_job_activity_with_mysql(fake_pipeline, monkeypatch, broken):
+def test_annotation_job_completes_whether_or_not_usage_is_recorded_with_mysql(
+    fake_pipeline, monkeypatch, caplog, broken,
+):
     import time
 
     store = _JobStore()
-    put_store = Backend("mysql", store=store)
     monkeypatch.setattr(settings, "user_store_backend", "mysql")
     monkeypatch.setattr(auth_module, "_mysql_user_store", store)
-    put_store.put()
+    Backend("mysql", store=store).put()
     if broken:
         _break_activity(monkeypatch, store)
     monkeypatch.setattr(main_module, "RunStore", SimpleNamespace(create=AsyncMock(return_value=store)))
-    seen = []
-    with TestClient(app) as client:
+    body = {}
+    with caplog.at_level(logging.ERROR, logger="src.auth"), TestClient(app) as client:
         client.cookies = _session().cookies
         created = client.post("/v1/annotate/jobs", json={"fusions": ["ALK"], "mode": "core"})
         assert created.status_code == 200, created.text
         for _ in range(100):
             body = client.get(created.json()["status_url"]).json()
-            seen.append(body["status"])
             if body["status"] in ("complete", "failed"):
                 break
             time.sleep(0.01)
-    if broken:
-        # Ends failed, never reported complete first.
-        assert seen[-1] == "failed" and "complete" not in seen
-        assert store._users[EMAIL].annotation_count == 0
-    else:
-        assert seen[-1] == "complete"
-        assert store._users[EMAIL].annotation_count == 1
+    assert body["status"] == "complete", body
+    assert body["result"]["annotations"][0]["gene"] == "ALK"
+    assert store._users[EMAIL].annotation_count == (0 if broken else 1)
+    assert len(_activity_errors(caplog)) == (1 if broken else 0)
 
 
 def test_admin_user_list_endpoint(backend):

@@ -45,11 +45,22 @@ def test_dev_mode_with_a_non_local_base_url_refuses_to_start(base_url):
         "http://127.0.0.1:8000",
         "http://[::1]:8000",
         "http://0.0.0.0",
-        "",
     ],
 )
 def test_dev_mode_with_a_local_base_url_starts(base_url):
     assert dev_mode_startup_error(_settings(agcg_dev_mode=True, public_app_base_url=base_url)) is None
+
+
+@pytest.mark.parametrize("base_url", ["", "   ", "\t\n"])
+def test_dev_mode_with_an_explicitly_blank_base_url_refuses_to_start(base_url):
+    # Blank makes the app take its public URL from each request's host.
+    error = dev_mode_startup_error(_settings(agcg_dev_mode=True, public_app_base_url=base_url))
+    assert error is not None and "set but blank" in error
+
+
+@pytest.mark.parametrize("base_url", ["", "  "])
+def test_blank_base_url_without_dev_mode_starts(base_url):
+    assert dev_mode_startup_error(_settings(public_app_base_url=base_url)) is None
 
 
 def test_dev_mode_with_base_url_unset_starts():
@@ -66,6 +77,11 @@ def test_base_url_from_the_environment_counts_as_set(monkeypatch):
     assert dev_mode_startup_error(Settings(_env_file=None)) is not None
     monkeypatch.setenv("PUBLIC_APP_BASE_URL", "http://localhost:8000")
     assert dev_mode_startup_error(Settings(_env_file=None)) is None
+    for blank in ("", "   "):
+        monkeypatch.setenv("PUBLIC_APP_BASE_URL", blank)
+        assert dev_mode_startup_error(Settings(_env_file=None)) is not None
+    monkeypatch.delenv("PUBLIC_APP_BASE_URL")
+    assert dev_mode_startup_error(Settings(_env_file=None)) is None  # genuinely absent
 
 
 def test_production_settings_start():
@@ -90,8 +106,9 @@ def lifespan_settings(monkeypatch):
     return configure
 
 
-def test_app_refuses_to_start_in_dev_mode_against_a_production_host(lifespan_settings):
-    lifespan_settings(agcg_dev_mode=True, public_app_base_url="https://acgc.oncokb.org")
+@pytest.mark.parametrize("base_url", ["https://acgc.oncokb.org", "", "   "])
+def test_app_refuses_to_start_in_dev_mode_against_a_production_host(lifespan_settings, base_url):
+    lifespan_settings(agcg_dev_mode=True, public_app_base_url=base_url)
     with pytest.raises(RuntimeError, match="AGCG_DEV_MODE"):
         with TestClient(app):
             pass

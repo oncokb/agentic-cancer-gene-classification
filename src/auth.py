@@ -162,6 +162,8 @@ class UserStoreUnavailable(RuntimeError):
 # grants change a role after that.
 MYSQL_NEW_USER_ROLE = "viewer"
 BOOTSTRAP_ADMIN_REASON = "bootstrap admin grant (BOOTSTRAP_ADMIN_EMAILS)"
+# Logged when a usage counter write to the MySQL user store fails.
+ACTIVITY_WRITE_FAILED_LOG_KEY = "user_store.activity_write_failed"
 
 _mysql_user_store: Optional["UserStore"] = None
 
@@ -550,14 +552,17 @@ async def record_user_annotation_activity(email: str, count: int = 1) -> None:
     """
     clean_email = email.strip().lower()
     if mysql_user_store_enabled():
-        # Unlike Redis, a failed write isn't dropped: it raises
-        # UserStoreUnavailable (503). Never buffered in-process either.
+        # Usage counters aren't an access check, and this runs after the work:
+        # on failure the response still succeeds, the count is dropped (never
+        # buffered in-process) and an error is logged under a stable key.
+        # Only the exception type is logged, never the email.
         try:
             await _mysql_store().incr_activity(clean_email, max(1, count))
-        except UserStoreUnavailable:
-            raise
         except Exception as exc:
-            raise UserStoreUnavailable(f"Failed to record annotation activity for {clean_email}") from exc
+            logger.error(
+                "%s: dropped an annotation usage count of %d (%s)",
+                ACTIVITY_WRITE_FAILED_LOG_KEY, max(1, count), type(exc).__name__,
+            )
         return
     now_iso = datetime.now(timezone.utc).isoformat()
     if settings.redis_url.strip():

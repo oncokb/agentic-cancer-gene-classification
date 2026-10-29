@@ -120,10 +120,11 @@ sets no cookie, an existing session is kept); an API key whose owner is
 missing is rejected (401). With `mysql` there is no fallback to Redis or to
 the session's claims, and Redis user data is neither read nor modified.
 
-Also with `mysql`: recording usage after an annotation is not best-effort as
-on Redis. If the write fails the request returns 503, and an annotation job
-ends `failed` (it is never reported complete first). The run is already
-saved and gene annotations are cached by then, so a retry is cheap.
+Usage counters (`annotation_count`, `last_annotation_at`) are not an access
+check and are recorded after the work. If that write fails, the annotation
+response (or job) still succeeds, the count is dropped (never buffered) and
+an error is logged under `user_store.activity_write_failed` (no email in
+the message). Only the per-request user lookup fails closed with 503.
 
 `BOOTSTRAP_ADMIN_EMAILS` (comma-separated) is applied at startup to listed
 users already in MySQL, and at sign-in to the rest. With `mysql`, the app
