@@ -77,7 +77,7 @@
       button.addEventListener("click", () => {
         try {
           win.sessionStorage.setItem(PENDING_RERUN_KEY, JSON.stringify({
-            run_id: run.run_id, force_refresh: mode.value === "refresh",
+            run_id: run.run_id, force_refresh: mode.value === "refresh", created_at: Date.now(),
           }));
         } catch (_) { /* Without storage the run still opens, with its own Rerun button. */ }
         win.location.href = href;

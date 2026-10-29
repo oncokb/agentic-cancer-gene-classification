@@ -49,6 +49,10 @@ const state = {
   // run_id of the saved run opened from a link (or produced by a rerun),
   // which the Rerun controls rerun; null for fresh submissions.
   openedRunId: null,
+  // Bumped whenever the displayed run changes or a new fusion-evidence job
+  // starts; a fusion-evidence poll from an older generation is dropped so it
+  // can't write into a newer result (see startFusionEvidenceJob).
+  fusionEvidenceGeneration: 0,
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -487,6 +491,7 @@ function clearQueue() {
 }
 
 function clearResults() {
+  invalidateFusionEvidenceJobs();
   resetFusionEvidenceSections();
   resetGeneIndexFilters();
   state.currentResult = null;
@@ -972,6 +977,7 @@ async function runAnnotation() {
     return;
   }
 
+  invalidateFusionEvidenceJobs();
   resetFusionEvidenceSections();
   resetGeneIndexFilters();
   state.openedRunId = null;
@@ -1087,10 +1093,30 @@ function fusionEvidenceInputs(inputs) {
   return fusionInputs;
 }
 
-async function startFusionEvidenceJob(inputs, runId, mode = elements.annotateMode.value || "full") {
-  const fusions = fusionEvidenceInputs(inputs);
-  if (!fusions.length || !state.currentResult) return;
+function invalidateFusionEvidenceJobs() {
+  state.fusionEvidenceGeneration += 1;
+}
 
+// Resolves to the job's evidence, or null when the job went stale (another
+// run was shown or another evidence job started) — stale progress and
+// failures are dropped, never written into or reported on the newer result.
+async function startFusionEvidenceJob(
+  inputs, runId, mode = elements.annotateMode.value || "full", forceRefresh = false,
+) {
+  const fusions = fusionEvidenceInputs(inputs);
+  if (!fusions.length || !state.currentResult) return null;
+
+  invalidateFusionEvidenceJobs();
+  const generation = state.fusionEvidenceGeneration;
+  try {
+    return await runFusionEvidenceJob(fusions, runId, mode, forceRefresh, generation);
+  } catch (error) {
+    if (generation !== state.fusionEvidenceGeneration) return null;
+    throw error;
+  }
+}
+
+async function runFusionEvidenceJob(fusions, runId, mode, forceRefresh, generation) {
   state.fusionEvidenceStatus = "running";
   state.currentResult = {
     ...state.currentResult,
@@ -1105,24 +1131,30 @@ async function startFusionEvidenceJob(inputs, runId, mode = elements.annotateMod
       fusions,
       mode,
       run_id: runId || null,
+      force_refresh: forceRefresh === true,
     }),
   });
+  if (generation !== state.fusionEvidenceGeneration) return null;
   if (!response.ok) {
     const text = await response.text();
     throw new Error(text || response.statusText || "Fusion evidence job failed");
   }
 
   const job = await response.json();
-  await pollFusionEvidenceJob(job.status_url);
+  return pollFusionEvidenceJob(job.status_url, generation);
 }
 
-async function pollFusionEvidenceJob(statusUrl) {
+async function pollFusionEvidenceJob(statusUrl, generation = state.fusionEvidenceGeneration) {
+  const stale = () => generation !== state.fusionEvidenceGeneration;
   while (true) {
+    if (stale()) return null;
     const response = await fetch(statusUrl);
+    if (stale()) return null;
     if (!response.ok) {
       throw new Error(response.statusText || "Unable to load fusion evidence job status");
     }
     const status = await response.json();
+    if (stale()) return null;
     if (status.status === "failed") {
       throw new Error(status.error || "Fusion evidence job failed");
     }
@@ -1262,6 +1294,8 @@ async function copyShareLink() {
 // of a clean landing page.
 async function loadSharedRun() {
   const sharedRunId = new URLSearchParams(location.search).get("run");
+  // Consumed before any request, so an interrupted load can't replay it later.
+  const pendingRerun = takePendingRerun(sharedRunId);
   if (!sharedRunId) return;
 
   try {
@@ -1281,6 +1315,7 @@ async function loadSharedRun() {
     if (result.fusion_evidence?.length) {
       state.fusionEvidenceStatus = "complete";
     }
+    invalidateFusionEvidenceJobs();
     resetFusionEvidenceSections();
     resetGeneIndexFilters();
     state.currentResult = result;
@@ -1289,11 +1324,10 @@ async function loadSharedRun() {
     syncRerunControls();
     setMessage("Shared run restored.", "info");
   } catch (error) {
-    takePendingRerun(sharedRunId);
     setMessage(formatRunError(error.message), "error");
     return;
   }
-  await startPendingRerun(sharedRunId);
+  if (pendingRerun) await rerunSavedRun(sharedRunId, pendingRerun.forceRefresh);
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,8 +1335,10 @@ async function loadSharedRun() {
 // ---------------------------------------------------------------------------
 
 // The My runs page hands a Rerun click over in sessionStorage (never the URL,
-// so a crafted link can't start a run), then opens the run here.
+// so a crafted link can't start a run), then opens the run here. Entries
+// older than this are ignored (an interrupted navigation or a duplicated tab).
 const PENDING_RERUN_KEY = "agcg.pendingRerun";
+const PENDING_RERUN_MAX_AGE_MS = 60 * 1000;
 
 function syncRerunControls() {
   const visible = Boolean(state.openedRunId) && state.currentView !== "benchmark";
@@ -1314,18 +1350,17 @@ function syncRerunControls() {
 function takePendingRerun(runId) {
   let pending = null;
   try {
-    pending = JSON.parse(sessionStorage.getItem(PENDING_RERUN_KEY) || "null");
+    const raw = sessionStorage.getItem(PENDING_RERUN_KEY);
+    if (raw === null) return null;
     sessionStorage.removeItem(PENDING_RERUN_KEY);
+    pending = JSON.parse(raw);
   } catch {
     return null;
   }
-  if (!pending || pending.run_id !== runId) return null;
+  if (!pending || !runId || pending.run_id !== runId) return null;
+  const age = Date.now() - Number(pending.created_at);
+  if (!(age >= 0 && age <= PENDING_RERUN_MAX_AGE_MS)) return null;
   return { forceRefresh: pending.force_refresh === true };
-}
-
-async function startPendingRerun(runId) {
-  const pending = takePendingRerun(runId);
-  if (pending) await rerunSavedRun(runId, pending.forceRefresh);
 }
 
 async function rerunSavedRun(runId, forceRefresh = false) {
@@ -1335,6 +1370,7 @@ async function rerunSavedRun(runId, forceRefresh = false) {
   clearMessage();
   setMessage(forceRefresh ? "Rerunning this run with refreshed results..." : "Rerunning this run...", "info");
 
+  let started = false;
   try {
     const response = await fetch(`/v1/runs/${encodeURIComponent(runId)}/rerun`, {
       method: "POST",
@@ -1353,6 +1389,8 @@ async function rerunSavedRun(runId, forceRefresh = false) {
     }
 
     const job = await response.json();
+    started = true;
+    invalidateFusionEvidenceJobs();
     resetFusionEvidenceSections();
     resetGeneIndexFilters();
     const inputs = job.fusions || [];
@@ -1363,6 +1401,10 @@ async function rerunSavedRun(runId, forceRefresh = false) {
     state.currentResult = null;
     const result = await pollAnnotationJob(job.status_url);
     state.openedRunId = result?.run_id || null;
+    // The new run belongs to the caller, so they may modify it. Hook for
+    // `canModifyRun` (PR #152, GET /v1/runs/{run_id}/access): set without
+    // re-checking access, whichever of the two merges first.
+    if ("canModifyRun" in state) state.canModifyRun = true;
     if (result?.run_id) {
       history.replaceState(null, "", `${location.pathname}?run=${encodeURIComponent(result.run_id)}`);
     }
@@ -1371,7 +1413,7 @@ async function rerunSavedRun(runId, forceRefresh = false) {
       state.fusionEvidenceStatus = "complete";
       renderAnnotationResult(result);
     } else {
-      startFusionEvidenceJob(inputs, result?.run_id, job.mode || "full").catch((error) => {
+      startFusionEvidenceJob(inputs, result?.run_id, job.mode || "full", forceRefresh).catch((error) => {
         state.fusionEvidenceStatus = "failed";
         setMessage(formatRunError(error.message), "error");
         if (state.currentResult) renderAnnotationResult(state.currentResult);
@@ -1379,6 +1421,11 @@ async function rerunSavedRun(runId, forceRefresh = false) {
     }
     setMessage("Rerun complete. Review fields before exporting.", "info");
   } catch (error) {
+    if (!started) {
+      // Rejected before a job started: the opened run is still shown intact.
+      updateExportState();
+      elements.shareRun.disabled = !state.currentResult?.run_id;
+    }
     setMessage(formatRunError(error.message), "error");
   } finally {
     setRunning(false);

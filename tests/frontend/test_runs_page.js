@@ -246,8 +246,10 @@ test("each row has a Rerun button that hands the run to the run page, cached by 
   button.fire("click");
   // No request from this page: the run page starts the rerun and polls it.
   assert.strictEqual(e.calls.length, 1);
-  assert.deepStrictEqual(JSON.parse(e.window.sessionStorage.items.get("agcg.pendingRerun")), {
-    run_id: "run/1", force_refresh: false,
+  const handoff = JSON.parse(e.window.sessionStorage.items.get("agcg.pendingRerun"));
+  assert.ok(Math.abs(Date.now() - handoff.created_at) < 5000, "hand-off is timestamped");
+  assert.deepStrictEqual({ ...handoff, created_at: undefined }, {
+    run_id: "run/1", force_refresh: false, created_at: undefined,
   });
   assert.strictEqual(e.window.location.href, "https://acgc.example.org/?run=run%2F1");
 });
@@ -258,9 +260,10 @@ test("Rerun with Refresh selected requests force_refresh", async () => {
   const [mode, button] = e.nodes.tbody.children[1].children[4].children;
   mode.value = "refresh";
   button.fire("click");
-  assert.deepStrictEqual(JSON.parse(e.window.sessionStorage.items.get("agcg.pendingRerun")), {
-    run_id: "two", force_refresh: true,
-  });
+  const handoff = JSON.parse(e.window.sessionStorage.items.get("agcg.pendingRerun"));
+  assert.strictEqual(handoff.run_id, "two");
+  assert.strictEqual(handoff.force_refresh, true);
+  assert.strictEqual(typeof handoff.created_at, "number");
   assert.strictEqual(e.window.location.href, "https://acgc.example.org/?run=two");
 });
 
