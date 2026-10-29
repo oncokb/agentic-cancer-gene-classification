@@ -375,7 +375,7 @@ async def test_run_pipeline_force_refresh_bypasses_cache(monkeypatch):
     assert store.saved[0][0].gene == "BRAF"
 
 
-@pytest.mark.parametrize("age_days", [1, 1000])
+@pytest.mark.parametrize("age_days", [1])
 async def test_retraction_failure_keeps_cached_annotation_without_reannotation(monkeypatch, age_days):
     updated_at = datetime.now(timezone.utc) - timedelta(days=age_days)
     annotation = GeneAnnotation(gene="BRAF", cancer_associated=True, citations=["12345"])
@@ -398,3 +398,37 @@ async def test_retraction_failure_keeps_cached_annotation_without_reannotation(m
     assert result.annotations[0].cache_reason == "retraction_check_failed"
     assert result.annotations[0].citations == ["12345"]
     assert store.saved == []
+
+
+@pytest.mark.parametrize("case", ["fresh", "final", "stale_no_new", "stale_new", "missing_timestamp"])
+async def test_retraction_failure_still_applies_normal_cache_policy(monkeypatch, case):
+    from unittest.mock import AsyncMock
+
+    now = datetime.now(timezone.utc)
+    age = {"fresh": 1, "final": 30, "stale_no_new": 1000, "stale_new": 1000}.get(case)
+    updated_at = now - timedelta(days=age) if age else None
+    annotation = GeneAnnotation(gene="BRAF", cancer_associated=True, citations=["12345"])
+    store = FakeGeneStore({("BRAF", "luad"): {"annotation": annotation.model_dump(), "updated_at": updated_at}})
+    monkeypatch.setattr(orchestrator.settings, "gene_cache_enabled", True)
+    monkeypatch.setattr(orchestrator.settings, "gene_cache_low_support_days", 14)
+    monkeypatch.setattr(orchestrator.settings, "gene_cache_final_annotation_days", 180)
+    monkeypatch.setattr(orchestrator, "find_retracted_annotation_pmids", AsyncMock(side_effect=RuntimeError("unavailable")))
+    recent = AsyncMock(return_value=["99"] if case == "stale_new" else [])
+    monkeypatch.setattr(orchestrator, "search_recent_pubmed_pmids", recent)
+    result = await orchestrator._maybe_reuse_cached_annotation(
+        gene="BRAF", fusions=["TP53::BRAF"], tumor_type="LUAD", now=now,
+        run_store=store,
+    )
+    if case in {"stale_new", "missing_timestamp"}:
+        assert result is None
+    else:
+        assert result.cache_reason == "retraction_check_failed"
+        assert result.citations == ["12345"]
+        flags = [flag for flag in result.quality_flags if flag.code == "retraction_check_unavailable"]
+        assert len(flags) == 1
+        assert flags[0].label == "Retraction check unavailable"
+    assert len(store.checked) == (1 if case == "stale_no_new" else 0)
+    if case.startswith("stale"):
+        recent.assert_awaited_once_with("BRAF", ["TP53::BRAF"], since=updated_at, tumor_type="LUAD")
+    else:
+        recent.assert_not_awaited()

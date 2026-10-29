@@ -564,14 +564,16 @@ def _fusion_query_variants(
         : _MAX_QUERY_ALIASES_PER_PARTNER + 1
     ]
     variants: List[str] = []
-    for five in five_options:
-        for three in three_options:
-            variants.extend([
-                f"{five}::{three}",
-                f"{five}-{three}",
-                f"{five}/{three}",
-                f"{five} {three}",
-            ])
+    pairs = [(five, three) for five in five_options for three in three_options]
+    # Keep all canonical/alias combinations ahead of alias/alias combinations.
+    pairs.sort(key=lambda pair: pair[0] != five_options[0] and pair[1] != three_options[0])
+    for five, three in pairs:
+        variants.extend([
+            f"{five}::{three}",
+            f"{five}-{three}",
+            f"{five}/{three}",
+            f"{five} {three}",
+        ])
     return list(dict.fromkeys(variants))[:_MAX_FUSION_QUERY_PHRASES]
 
 
@@ -958,7 +960,7 @@ def _fusion_evidence_interpretation(
     tumor_type: Optional[str],
     records: List[LiteratureRecord],
     well_supported: bool,
-    literature_scope: str,
+    literature_scope: Optional[str],
     requested_tumor_count: int,
 ) -> str:
     novelty_count = _novelty_record_count(records)
@@ -992,8 +994,8 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             "min_papers": settings.min_papers_for_strong_association,
             "exact_fusion_filter_version": 2,
             "retraction_filter_version": 2,
-            "alias_expansion_version": 2,
-            "partial_search_version": 1,
+            "alias_expansion_version": 3,
+            "partial_search_version": 2,
             # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
             # 2: hyphen-aware word edges; case-independent free-text abbreviations.
             # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
@@ -1004,6 +1006,14 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
         },
         sort_keys=True,
     )
+
+
+class _PartialFusionEvidence(Exception):
+    """Carry a usable result through cached_call without writing it to Redis."""
+
+    def __init__(self, result: FusionEvidenceResult):
+        self.result = result
+        super().__init__("Partial fusion evidence must not be cached")
 
 
 async def retrieve_fusion_evidence(
@@ -1035,15 +1045,20 @@ async def retrieve_fusion_evidence(
             tumor_type=tumor_type,
             max_results=max_results,
         )
+        if result.partial:
+            raise _PartialFusionEvidence(result)
         return result.model_dump()
 
-    payload = await cached_call(
-        cache_key,
-        _compute,
-        ttl_seconds=settings.fusion_evidence_cache_ttl_seconds,
-        force_refresh=force_refresh,
-    )
-    result = FusionEvidenceResult(**payload)
+    try:
+        payload = await cached_call(
+            cache_key,
+            _compute,
+            ttl_seconds=settings.fusion_evidence_cache_ttl_seconds,
+            force_refresh=force_refresh,
+        )
+        result = FusionEvidenceResult(**payload)
+    except _PartialFusionEvidence as exc:
+        result = exc.result
     if fusion != submitted:
         result.input = submitted
     return result
@@ -1066,7 +1081,6 @@ async def _retrieve_fusion_evidence_uncached(
             fusion=fusion,
             tumor_type=tumor_type,
             interpretation="Fusion evidence is only available for two-partner fusion inputs.",
-            retrieval_status="failed",
         )
 
     client = _get_ncbi_client()
@@ -1125,6 +1139,8 @@ async def _retrieve_fusion_evidence_uncached(
     }
     requested_tumor_pmids = [record.pmid for record in records if record.pmid in requested_tumor_terms]
     literature_scope = fusion_literature_scope(tumor_type, len(records), len(requested_tumor_pmids))
+    if failures and (not records or (tumor_type and isinstance(search_results[0], Exception))):
+        literature_scope = None
     return FusionEvidenceResult(
         fusion=fusion,
         tumor_type=tumor_type,
@@ -1445,7 +1461,13 @@ def pubmed_error_message(exc: Exception) -> str:
 
 
 async def _ncbi_post(url: str, params: dict, client: httpx.AsyncClient, timeout: float) -> httpx.Response:
-    """Bound requests, limiter waits and retry sleeps by one overall deadline."""
+    """Bound requests, limiter waits and retry sleeps by one overall deadline.
+
+    Consolidation with normalization._ncbi_get needs explicit policy handling:
+    that helper returns HTTP responses under a 15s deadline and retries only
+    429s; this helper raises terminal errors and retries transport/5xx failures
+    under a 60s deadline. Keep those caller contracts until a shared policy is tested.
+    """
     deadline = monotonic() + NCBI_RETRY_DEADLINE_SECONDS
 
     async def _attempt() -> httpx.Response:

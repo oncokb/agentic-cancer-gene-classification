@@ -156,7 +156,7 @@ async def test_one_search_fails_keeps_other_results_and_scope(monkeypatch, faile
     assert result.pmids == ["42"]
     assert result.partial is True
     assert result.retrieval_status == "ok"
-    assert result.literature_scope == "requested_tumor"
+    assert result.literature_scope == (None if failed_index == 0 else "requested_tumor")
     assert result.requested_tumor_pmids == ["42"]
     assert "One search failed" in result.interpretation
     assert "HTTP 414" in result.interpretation
@@ -230,9 +230,9 @@ async def test_all_searches_fail_has_no_literature_scope(monkeypatch):
     fetch.assert_not_called()
 
 
-async def test_no_search_ran_does_not_claim_success():
+async def test_non_pair_input_is_not_a_retryable_lookup_failure():
     result = await literature._retrieve_fusion_evidence_uncached("BRAF", None, 20)
-    assert result.retrieval_status == "failed"
+    assert result.retrieval_status == "ok"
     assert result.literature_scope is None
 
 
@@ -246,5 +246,73 @@ async def test_sanitizing_partial_results_keeps_failure_note():
     )
     assert await sanitize_fusion_evidence_result(result, {"42"})
     assert result.partial is True
-    assert result.literature_scope == "no_literature"
+    assert result.literature_scope is None
     assert "One search failed" in result.interpretation
+
+
+@pytest.mark.parametrize("force_refresh", [False, True])
+async def test_partial_fusion_result_is_not_cached(monkeypatch, fake_redis, force_refresh):
+    from src.models.schema import FusionEvidenceResult
+    from src.pipeline import cache
+
+    monkeypatch.setattr(literature, "cached_call", cache.cached_call)
+    compute = AsyncMock(side_effect=[
+        FusionEvidenceResult(fusion="EML4::ALK", partial=True),
+        FusionEvidenceResult(fusion="EML4::ALK", literature_scope="no_literature"),
+    ])
+    monkeypatch.setattr(literature, "_retrieve_fusion_evidence_uncached", compute)
+    first = await literature.retrieve_fusion_evidence("EML4::ALK", "LUAD", force_refresh=force_refresh)
+    assert first.partial
+    assert not fake_redis.keys_with_prefix("fusion_evidence:")
+    second = await literature.retrieve_fusion_evidence("EML4::ALK", "LUAD")
+    assert not second.partial
+    assert len(fake_redis.keys_with_prefix("fusion_evidence:")) == 1
+    third = await literature.retrieve_fusion_evidence("EML4::ALK", "LUAD")
+    assert third == second
+    assert compute.await_count == 2
+
+
+@pytest.mark.parametrize("failed_index", [0, 1])
+@pytest.mark.parametrize("paper", [None, "other", "tumor"])
+async def test_partial_scope_is_unknown_if_empty_or_tumor_search_failed(monkeypatch, failed_index, paper):
+    monkeypatch.setattr(literature, "resolve_fusion_partner_aliases", AsyncMock(return_value=([], [])))
+    error = httpx.HTTPStatusError("upstream error", request=httpx.Request("POST", literature.ESEARCH_URL), response=httpx.Response(503))
+    outcomes = [[], []] if paper is None else [["42"], ["42"]]
+    outcomes[failed_index] = error
+    monkeypatch.setattr(literature, "_esearch", AsyncMock(side_effect=outcomes))
+    records = [] if paper is None else [LiteratureRecord(
+        pmid="42", title="EML4-ALK fusion in " + ("lung adenocarcinoma" if paper == "tumor" else "cancer"), abstract="Fusion evidence",
+    )]
+    monkeypatch.setattr(literature, "_efetch", AsyncMock(return_value=records))
+    result = await literature._retrieve_fusion_evidence_uncached("EML4::ALK", "LUAD", 20)
+    assert result.partial
+    assert result.retrieval_status == "ok"
+    expected = None if failed_index == 0 or paper is None else ("requested_tumor" if paper == "tumor" else "other_or_unspecified")
+    assert result.literature_scope == expected
+    assert "One search failed" in result.interpretation
+
+
+async def test_sanitizer_keeps_unknown_partial_scope_and_all_verified_pmids():
+    from src.models.schema import FusionEvidenceResult
+    from src.pipeline.result_sanitizer import sanitize_fusion_evidence_result
+
+    result = FusionEvidenceResult(
+        fusion="EML4::ALK", partial=True, tumor_type="LUAD", pmids=[str(i) for i in range(7)],
+        retrieved_count=7, interpretation="One search failed; results are partial.",
+    )
+    assert await sanitize_fusion_evidence_result(result, {"0"})
+    assert result.pmids == [str(i) for i in range(1, 7)]
+    assert result.literature_scope is None
+    assert "One search failed" in result.interpretation
+
+
+def test_canonical_partner_pairs_survive_phrase_cap():
+    variants = literature._fusion_query_variants(
+        "FMN1::APBA2", [f"F{i}" for i in range(6)], [f"A{i}" for i in range(6)],
+    )
+    assert len(variants) == 120
+    assert "F5-APBA2" in variants
+    assert "FMN1-A5" in variants
+    first_alias_pair = variants.index("F0::A0")
+    assert variants.index("F5-APBA2") < first_alias_pair
+    assert variants.index("FMN1-A5") < first_alias_pair

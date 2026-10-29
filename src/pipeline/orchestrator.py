@@ -179,14 +179,20 @@ async def _maybe_reuse_cached_annotation(
         return None
 
     annotation = GeneAnnotation(**cached["annotation"])
+    annotation.quality_flags = [
+        flag for flag in annotation.quality_flags if flag.code != "retraction_check_unavailable"
+    ]
+    retraction_reason = None
     try:
         retracted_pmids = await find_retracted_annotation_pmids(annotation)
     except Exception:
-        logger.exception("Keeping cached annotation for %s because retraction validation failed", gene)
-        return _cached_annotation_for_request(
-            cached["annotation"], fusions, "retraction_check_failed",
-            cached.get("updated_at"), cached.get("last_pubmed_checked_at"),
-        )
+        logger.exception("Retraction validation unavailable for cached annotation %s", gene)
+        retracted_pmids = set()
+        retraction_reason = "retraction_check_failed"
+        annotation.quality_flags.append(QualityFlag(
+            code="retraction_check_unavailable", label="Retraction check unavailable",
+            severity="warning", detail="PubMed retraction validation failed; normal cache freshness checks still apply.",
+        ))
     if retracted_pmids:
         logger.info(
             "Refreshing cached annotation for %s because referenced PMID(s) are retracted: %s",
@@ -195,6 +201,7 @@ async def _maybe_reuse_cached_annotation(
         )
         return None
 
+    cached = {**cached, "annotation": annotation.model_dump()}
     updated_at = cached.get("updated_at")
     if updated_at is None:
         return None
@@ -206,7 +213,7 @@ async def _maybe_reuse_cached_annotation(
         return _cached_annotation_for_request(
             cached["annotation"],
             fusions,
-            reason,
+            retraction_reason or reason,
             updated_at,
             last_pubmed_checked_at,
         )
@@ -216,7 +223,7 @@ async def _maybe_reuse_cached_annotation(
         return _cached_annotation_for_request(
             cached["annotation"],
             fusions,
-            "fresh_final_annotation",
+            retraction_reason or "fresh_final_annotation",
             updated_at,
             last_pubmed_checked_at,
         )
@@ -239,7 +246,7 @@ async def _maybe_reuse_cached_annotation(
     reused = _cached_annotation_for_request(
         cached["annotation"],
         fusions,
-        "no_new_pubmed_pmids_since_last_check",
+        retraction_reason or "no_new_pubmed_pmids_since_last_check",
         updated_at,
         now,
     )
