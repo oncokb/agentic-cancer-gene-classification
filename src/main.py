@@ -98,6 +98,7 @@ from src.observability import (
     reset_user_context,
     set_user_context,
     shutdown_statsd,
+    stable_user_key,
     tag_current_span,
     tag_user,
 )
@@ -123,6 +124,7 @@ from src.pipeline.openevidence import (
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.result_sanitizer import sanitize_annotation_result
 from src.pipeline.run_store import RunStore
+from src.ui_events import router as ui_events_router
 
 _log_record_factory = logging.getLogRecordFactory()
 
@@ -133,6 +135,10 @@ def _datadog_log_record_factory(*args, **kwargs):
     usr_id = user_ctx.get("user_id") or "-"
     usr_email = user_ctx.get("email") or "-"
     usr_name = user_ctx.get("name") or "-"
+    if record.name == "src.ui_events" and record.levelno == logging.INFO:
+        usr_id = stable_user_key(usr_id) if usr_id != "-" else "-"
+        usr_email = "-"
+        usr_name = "-"
     auth_method = user_ctx.get("auth_method") or "-"
     api_key_id = user_ctx.get("api_key_id") or "-"
     defaults = {
@@ -217,6 +223,7 @@ app.add_middleware(
 )
 app.include_router(api_keys_router)
 app.include_router(runs_router)
+app.include_router(ui_events_router)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 if _STATIC_DIR.exists():
@@ -282,6 +289,7 @@ async def user_context_middleware(request: Request, call_next):
 class DevStatusResponse(BaseModel):
     enabled: bool
     openevidence_enabled: bool
+    ui_events_enabled: bool
 
 
 class AnnotationJobCreateResponse(BaseModel):
@@ -1554,6 +1562,7 @@ async def dev_status() -> DevStatusResponse:
     return DevStatusResponse(
         enabled=settings.acgc_dev_mode,
         openevidence_enabled=settings.openevidence_enabled,
+        ui_events_enabled=settings.ui_events_enabled,
     )
 
 

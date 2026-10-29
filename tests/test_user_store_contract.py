@@ -371,6 +371,90 @@ async def test_concurrent_set_role_audits_each_real_change_once(store, email):
 
 
 # ---------------------------------------------------------------------------
+# Import (one-off migration)
+# ---------------------------------------------------------------------------
+
+
+def _imported(address, **overrides):
+    values = dict(
+        email=address, name="Imported User", picture=None, domain="", provider="keycloak",
+        status="active", role="curator", role_updated_by=None, role_updated_at=None,
+        groups=["g1"], claims={"sub": "abc"}, first_login_at=T0,
+        last_login_at=T0 + timedelta(days=3), login_count=7, annotation_count=12,
+        last_annotation_at=T0 + timedelta(days=2), created_at=T0,
+        updated_at=T0 + timedelta(days=4),
+    )
+    values.update(overrides)
+    return user_store.UserRecord(**values)
+
+
+async def test_import_user_inserts_the_row_as_given(store, email):
+    address = email("imported")
+    assert await store.import_user(_imported(address.upper())) is True
+
+    user = await store.get_user(address)
+    assert user == _imported(address, domain=address.split("@")[1])
+    assert (await store.list_role_changes(email=address)).changes == []
+    found = await store.list_users(UserFilters(search="IMPORTED user"))
+    assert [u.email for u in found.users] == [address]
+
+
+async def test_import_user_never_overwrites_an_existing_user(store, email):
+    address = email("present")
+    await _login(store, address, name="Live Name", role="viewer", at=T0)
+    before = await store.get_user(address)
+
+    assert await store.import_user(_imported(address, role="admin", login_count=99)) is False
+    assert await store.import_user(_imported(email("again"))) is True
+    assert await store.import_user(_imported(email("again"), name="Other")) is False
+
+    assert await store.get_user(address) == before
+    assert (await store.get_user(email("again"))).name == "Imported User"
+
+
+async def test_import_user_validates_before_storage(store, email):
+    for bad in (
+        _imported(email("r"), role="owner"),
+        _imported(email("s"), status="gone"),
+        _imported(email("n"), login_count=-1),
+        _imported(email("j"), claims={"x": float("nan")}),
+        _imported("not-an-email"),
+    ):
+        with pytest.raises(ValueError):
+            await store.import_user(bad)
+    assert (await store.list_users(UserFilters(search=email("")))).users == []
+
+
+async def test_grant_bootstrap_admin_grants_once_and_never_after_a_demotion(store, email):
+    address = email("boot")
+    await _login(store, address, role="curator", at=T0)
+
+    outcomes = await asyncio.gather(
+        *(store.grant_bootstrap_admin(address.upper(), reason="bootstrap") for _ in range(5))
+    )
+
+    assert sorted(outcomes) == [user_store.BOOTSTRAP_ALREADY_ADMIN] * 4 + [user_store.BOOTSTRAP_GRANTED]
+    user = await store.get_user(address)
+    assert (user.role, user.role_updated_by) == ("admin", user_store.BOOTSTRAP_ACTOR)
+    [change] = (await store.list_role_changes(email=address)).changes
+    assert (change.old_value, change.new_value, change.actor, change.reason) == (
+        "curator", "admin", user_store.BOOTSTRAP_ACTOR, "bootstrap",
+    )
+
+    await store.set_role(address, "viewer", actor=email("boss"))
+    outcome = await store.grant_bootstrap_admin(address, reason="another reason")
+    assert outcome == user_store.BOOTSTRAP_PREVIOUSLY_GRANTED
+    assert (await store.get_user(address)).role == "viewer"
+    assert len((await store.list_role_changes(email=address)).changes) == 2
+
+
+async def test_grant_bootstrap_admin_unknown_user(store, email):
+    with pytest.raises(UserNotFound):
+        await store.grant_bootstrap_admin(email("nobody"), reason="bootstrap")
+    assert (await store.list_role_changes(email=email("nobody"))).changes == []
+
+
+# ---------------------------------------------------------------------------
 # Activity
 # ---------------------------------------------------------------------------
 
