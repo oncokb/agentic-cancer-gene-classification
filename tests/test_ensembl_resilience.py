@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote
 
 import httpx
 import pytest
@@ -107,8 +107,12 @@ class FakeEnsembl:
         return httpx.Response(200, json=doc)
 
     def _pubmed(self, request: httpx.Request) -> httpx.Response:
+        # E-utilities params come in the query string (GET) or a form body (POST).
+        params = dict(request.url.params)
+        if request.method == "POST":
+            params.update(parse_qsl(request.content.decode()))
         if request.url.path.endswith("esearch.fcgi"):
-            term = request.url.params["term"]
+            term = params["term"]
             self.pubmed_terms.append(term)
             ids = ["111", "222"] if _LNCRNA in term else []
             return httpx.Response(200, json={"esearchresult": {"idlist": ids}})
@@ -117,7 +121,7 @@ class FakeEnsembl:
             f"<ArticleTitle>{title}</ArticleTitle><Abstract><AbstractText>{title}.</AbstractText></Abstract>"
             "</Article></MedlineCitation></PubmedArticle>"
             for pmid, title in _PUBMED.items()
-            if pmid in request.url.params["id"].split(",")
+            if pmid in params["id"].split(",")
         )
         return httpx.Response(200, text=f"<PubmedArticleSet>{articles}</PubmedArticleSet>")
 
