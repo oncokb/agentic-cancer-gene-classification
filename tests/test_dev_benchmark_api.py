@@ -14,7 +14,7 @@ def test_dev_status_reflects_config(monkeypatch):
     response = client.get("/v1/dev/status")
 
     assert response.status_code == 200
-    assert response.json() == {"enabled": True, "openevidence_enabled": False}
+    assert response.json() == {"enabled": True, "openevidence_enabled": False, "ui_events_enabled": False}
 
 
 def test_dev_status_reflects_openevidence_flag(monkeypatch):
@@ -25,7 +25,7 @@ def test_dev_status_reflects_openevidence_flag(monkeypatch):
     response = client.get("/v1/dev/status")
 
     assert response.status_code == 200
-    assert response.json() == {"enabled": False, "openevidence_enabled": True}
+    assert response.json() == {"enabled": False, "openevidence_enabled": True, "ui_events_enabled": False}
 
 
 def test_benchmark_endpoint_hidden_when_dev_mode_disabled(monkeypatch):

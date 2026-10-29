@@ -33,7 +33,7 @@ import json
 import logging
 import unicodedata
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Tuple
 
@@ -47,6 +47,13 @@ ROLES = ("viewer", "curator", "admin")
 STATUSES = ("pending", "active", "disabled")
 REQUEST_STATUSES = ("pending", "approved", "rejected")
 ROLE_CHANGE_FIELDS = ("role", "status")
+
+# Bootstrap admin grants (grant_bootstrap_admin) are logged under this fixed
+# actor, which is how a later grant attempt recognizes an earlier one.
+BOOTSTRAP_ACTOR = "system:migration"
+BOOTSTRAP_GRANTED = "granted"
+BOOTSTRAP_ALREADY_ADMIN = "already admin"
+BOOTSTRAP_PREVIOUSLY_GRANTED = "previously granted"
 
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 500
@@ -283,6 +290,10 @@ class UserStore(Protocol):
         at: Optional[datetime] = None,
     ) -> UserRecord: ...
 
+    async def import_user(self, user: UserRecord) -> bool: ...
+
+    async def grant_bootstrap_admin(self, email: str, *, reason: str) -> str: ...
+
     async def set_role(
         self, email: str, role: str, *, actor: str, reason: Optional[str] = None,
         request_id: Optional[int] = None,
@@ -407,6 +418,33 @@ def check_status(status: str) -> str:
     if status not in STATUSES:
         raise ValueError(f"Unknown status {status!r}; expected one of {STATUSES}")
     return status
+
+
+def prepare_import(user: UserRecord) -> UserRecord:
+    """A complete user row for import_user, normalized like upsert_login
+    (email, name, groups, claims, UTC times) and validated before any
+    storage access; ValueError for anything the users table would reject."""
+    email = normalize_email(user.email)
+    check_role(user.role)
+    check_status(user.status)
+    if user.login_count < 0 or user.annotation_count < 0:
+        raise ValueError("login_count and annotation_count must not be negative")
+    return replace(
+        user,
+        email=email,
+        name=normalize_name(user.name) or email,
+        picture=user.picture or None,
+        domain=user.domain or email.split("@")[-1],
+        role_updated_by=None if user.role_updated_by is None else normalize_actor(user.role_updated_by),
+        role_updated_at=None if user.role_updated_at is None else to_utc(user.role_updated_at),
+        groups=normalize_groups(user.groups),
+        claims=normalize_claims(user.claims),
+        first_login_at=to_utc(user.first_login_at),
+        last_login_at=to_utc(user.last_login_at),
+        last_annotation_at=None if user.last_annotation_at is None else to_utc(user.last_annotation_at),
+        created_at=to_utc(user.created_at),
+        updated_at=to_utc(user.updated_at),
+    )
 
 
 def check_limit(limit: int) -> int:
@@ -660,6 +698,74 @@ class UserStoreMixin:
         if user is None:
             raise UserStoreUnavailable(f"User {email} missing right after upsert")
         return user
+
+    async def import_user(self, user: UserRecord) -> bool:
+        """Insert a complete user row (counters and timestamps as given) unless
+        the email already exists; True when inserted. An existing row is never
+        modified. For one-off migrations; logins go through upsert_login."""
+        user = prepare_import(user)
+        params = (
+            user.email, user.name, search_key(user.name), search_key(user.email), user.picture,
+            user.domain, user.provider, user.status, user.role, user.role_updated_by,
+            _to_db(user.role_updated_at), to_json(user.groups, "groups"),
+            to_json(user.claims, "claims"), _to_db(user.first_login_at),
+            _to_db(user.last_login_at), user.login_count, user.annotation_count,
+            _to_db(user.last_annotation_at), _to_db(user.created_at), _to_db(user.updated_at),
+        )
+        async with _store_errors("import_user"):
+            try:
+                async with self._pool.acquire() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(
+                            """
+                            INSERT INTO users (
+                                email, name, name_search, email_search, picture, domain,
+                                provider, status, role, role_updated_by, role_updated_at,
+                                groups_json, claims_json, first_login_at, last_login_at,
+                                login_count, annotation_count, last_annotation_at, created_at,
+                                updated_at
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s
+                            )
+                            """,
+                            params,
+                        )
+            except pymysql.err.IntegrityError as exc:
+                if exc.args and exc.args[0] == _ER_DUP_ENTRY:
+                    return False
+                raise
+        return True
+
+    async def grant_bootstrap_admin(self, email: str, *, reason: str) -> str:
+        """Make a user admin unless they already are or a bootstrap grant was
+        ever logged for them (so a later demotion is never undone). The check
+        and the change are one transaction holding the user's row lock, so
+        concurrent callers grant at most once. Returns BOOTSTRAP_GRANTED,
+        BOOTSTRAP_ALREADY_ADMIN or BOOTSTRAP_PREVIOUSLY_GRANTED; raises
+        UserNotFound for an unknown email."""
+        clean = normalize_email(email)
+        now = _to_db(utc_now())
+        async with _store_errors("grant_bootstrap_admin"):
+            async with self._user_transaction() as cursor:
+                user = await self._fetch_user(cursor, clean, for_update=True)
+                if user is None:
+                    raise UserNotFound(clean)
+                if user.role == "admin":
+                    return BOOTSTRAP_ALREADY_ADMIN
+                # A locking read sees the latest committed grant, not a snapshot.
+                await cursor.execute(
+                    "SELECT 1 FROM role_changes WHERE email = %s AND field = 'role' "
+                    "AND new_value = 'admin' AND actor = %s LIMIT 1 FOR SHARE",
+                    (clean, BOOTSTRAP_ACTOR),
+                )
+                if await cursor.fetchone():
+                    return BOOTSTRAP_PREVIOUSLY_GRANTED
+                await self._apply_user_field(
+                    cursor, "role", clean, "admin", actor=BOOTSTRAP_ACTOR, reason=reason,
+                    request_id=None, now=now,
+                )
+                return BOOTSTRAP_GRANTED
 
     async def _set_user_field(
         self,
