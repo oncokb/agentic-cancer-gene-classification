@@ -309,9 +309,95 @@ async function testDisabledWhileRunningAndNoOverlappingJobs() {
   assert.strictEqual(sectionOf(cardFor(sandbox, "FAIL::ED")), "Found in LUAD (3)");
 }
 
+function completedWith(entry) {
+  return () => statusResponse({ status: "complete", fusions_total: 1, fusions_completed: 1, fusion_evidence: [entry] });
+}
+
+async function rerunCard(sandbox, fusion) {
+  rerunButton(cardFor(sandbox, fusion)).click();
+  await settle();
+}
+
+async function testCompletedJobWithBadLookupKeepsGoodCard() {
+  for (const [entry, expected] of [
+    [{ fusion: "KEEP::ONE", tumor_type: "LUAD", retrieval_status: "failed", pmids: [],
+      interpretation: "PubMed search failed (timeout)" }, "Re-run failed: PubMed search failed (timeout)"],
+    [{ fusion: "KEEP::ONE", tumor_type: "LUAD", partial: true, literature_scope: "requested_tumor", pmids: [] },
+      "Re-run failed: PubMed lookup was incomplete (partial result)."],
+  ]) {
+    const sandbox = app(jobFetch([], completedWith(entry)));
+    sandbox.state.canModifyRun = true;
+    render(sandbox);
+    sandbox.setMessage("before", "info");
+    const before = JSON.stringify(sandbox.state.currentResult);
+
+    await rerunCard(sandbox, "KEEP::ONE");
+
+    assert.strictEqual(JSON.stringify(sandbox.state.currentResult), before, "prior evidence is kept");
+    const card = cardFor(sandbox, "KEEP::ONE");
+    assert.strictEqual(sectionOf(card), "Found in LUAD (2)");
+    assert.strictEqual(JSON.stringify(sandbox.state.currentResult.fusion_evidence[0].pmids), JSON.stringify(["1"]));
+    assert.ok(byClass(card, "status-pill").some((pill) => pill.textContent === "1 PMID"), "card still shows prior PMIDs");
+    const errors = byClass(sandbox.elements.resultsWindow, "fusion-rerun-error");
+    assert.strictEqual(errors.length, 1);
+    assert.strictEqual(byClass(card, "fusion-rerun-error")[0], errors[0]);
+    assert.strictEqual(errors[0].textContent, expected);
+    assert.ok(!sandbox.elements.messageBox.textContent.includes("complete"), "no success message");
+    assert.strictEqual(rerunButton(card).disabled, false);
+  }
+}
+
+async function testFailedCardReplacedByPartialOrFailed() {
+  // failed -> partial: the partial result replaces the card, no error.
+  let sandbox = app(jobFetch([], completedWith({
+    fusion: "FAIL::ED", tumor_type: "LUAD", partial: true, literature_scope: "requested_tumor", pmids: ["5"],
+  })));
+  sandbox.state.canModifyRun = true;
+  render(sandbox);
+  await rerunCard(sandbox, "FAIL::ED");
+  let replaced = sandbox.state.currentResult.fusion_evidence[4];
+  assert.strictEqual(replaced.partial, true);
+  assert.strictEqual(JSON.stringify(replaced.pmids), JSON.stringify(["5"]));
+  assert.strictEqual(sectionOf(cardFor(sandbox, "FAIL::ED")), "Found in LUAD (3)");
+  assert.strictEqual(byClass(sandbox.elements.resultsWindow, "fusion-rerun-error").length, 0);
+  assert.ok(sandbox.elements.messageBox.textContent.includes("partial"));
+
+  // failed -> failed: the newer failure replaces the card and is shown inline.
+  sandbox = app(jobFetch([], completedWith({
+    fusion: "FAIL::ED", tumor_type: "LUAD", retrieval_status: "failed", pmids: [],
+    interpretation: "PubMed search failed (HTTP 503)",
+  })));
+  sandbox.state.canModifyRun = true;
+  render(sandbox);
+  await rerunCard(sandbox, "FAIL::ED");
+  replaced = sandbox.state.currentResult.fusion_evidence[4];
+  assert.strictEqual(replaced.interpretation, "PubMed search failed (HTTP 503)", "updated failure stored");
+  const card = cardFor(sandbox, "FAIL::ED");
+  assert.strictEqual(sectionOf(card), "Lookup failed (1)");
+  assert.strictEqual(byClass(card, "fusion-rerun-error")[0].textContent,
+    "Re-run failed: PubMed search failed (HTTP 503)");
+  assert.ok(!sandbox.elements.messageBox.textContent.includes("complete"));
+}
+
+function testMergeNeverReplacesSucceededWithFailedOrPartial() {
+  const sandbox = app();
+  const good = { fusion: "A::B", tumor_type: "LUAD", retrieval_status: "ok", pmids: ["1"] };
+  const failed = { fusion: "C::D", tumor_type: "LUAD", retrieval_status: "failed", pmids: [] };
+  const partial = { fusion: "E::F", tumor_type: "LUAD", partial: true, pmids: ["2"] };
+  const merged = sandbox.mergeFusionEvidence([good, failed, partial], [
+    { ...good, retrieval_status: "failed", pmids: [] },
+    { ...failed, retrieval_status: "ok", pmids: ["3"] },
+    { ...partial, retrieval_status: "failed", partial: false, pmids: [] },
+  ]);
+  assert.strictEqual(JSON.stringify(merged.map((item) => [item.fusion, item.retrieval_status, item.pmids])),
+    JSON.stringify([["A::B", "ok", ["1"]], ["C::D", "ok", ["3"]], ["E::F", "failed", []]]));
+  assert.strictEqual(sandbox.mergeFusionEvidence([good], [{ ...good, partial: true, pmids: [] }])[0], good);
+}
+
 const tests = [testHiddenWithoutPermissionAndOnEveryCardWithIt, testRerunUpdatesOnlyThatCardAndMovesSections,
   testFailureLeavesCardUnchangedWithInlineError, testStaleRerunAfterSwitchingRunsIsDropped,
-  testDisabledWhileRunningAndNoOverlappingJobs];
+  testDisabledWhileRunningAndNoOverlappingJobs, testCompletedJobWithBadLookupKeepsGoodCard,
+  testFailedCardReplacedByPartialOrFailed, testMergeNeverReplacesSucceededWithFailedOrPartial];
 (async () => {
   for (const test of tests) {
     await test();

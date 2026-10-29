@@ -613,3 +613,74 @@ def test_single_fusion_force_refresh_rerun_bypasses_cache_and_merges_only_it(
     refreshed = asyncio.run(fake_redis.get(cache_key))
     assert b"Fresh lookup." in refreshed, "the re-run replaces the cached value"
     main._fusion_evidence_jobs.clear_local()
+
+
+def test_merge_never_replaces_succeeded_item_with_failed_or_partial():
+    good = {"fusion": "A::B", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["1"]}
+    failed = {"fusion": "C::D", "tumor_type": "LUAD", "retrieval_status": "failed", "pmids": []}
+    partial = {"fusion": "E::F", "tumor_type": "LUAD", "retrieval_status": "ok", "partial": True}
+    also_failed = {"fusion": "G::H", "tumor_type": "LUAD", "retrieval_status": "failed", "pmids": []}
+
+    merged = main._merge_fusion_evidence(
+        [good, failed, partial, also_failed],
+        [
+            {**good, "retrieval_status": "failed", "pmids": []},  # good kept
+            {**failed, "partial": True, "retrieval_status": "ok", "pmids": ["2"]},  # failed -> partial
+            {**partial, "retrieval_status": "failed", "partial": False},  # partial -> failed
+            {**also_failed, "interpretation": "PubMed search failed (HTTP 503)"},  # failed -> failed
+        ],
+    )
+
+    assert merged[0] == good
+    assert merged[1]["partial"] is True and merged[1]["pmids"] == ["2"]
+    assert merged[2]["retrieval_status"] == "failed"
+    assert merged[3]["interpretation"] == "PubMed search failed (HTTP 503)"
+    assert main._merge_fusion_evidence([good], [{**good, "partial": True, "pmids": []}]) == [good]
+
+
+@pytest.mark.parametrize("outcome", ["raises", "partial"])
+def test_failed_or_partial_rerun_keeps_runs_good_evidence(monkeypatch, outcome):
+    """A single-fusion force_refresh re-run whose lookup fails completes with a
+    failed (or partial) item, but the saved run keeps its earlier evidence."""
+    main._fusion_evidence_jobs.clear_local()
+
+    async def fake_retrieve_fusion_evidence(fusion, tumor_type=None, force_refresh=False):
+        assert force_refresh is True
+        if outcome == "raises":
+            raise TimeoutError("PubMed timed out")
+        return FusionEvidenceResult(
+            fusion=fusion, tumor_type=tumor_type, partial=True, literature_scope="requested_tumor",
+        )
+
+    good = {
+        "fusion": "EML4::ALK", "tumor_type": "LUAD", "retrieval_status": "ok",
+        "literature_scope": "requested_tumor", "pmids": ["1", "2"],
+    }
+    failed = {"fusion": "KIF5B::RET", "tumor_type": "LUAD", "retrieval_status": "failed", "pmids": []}
+    fake_run_store = _FakeRunStore({"run_id": "run-keep", "annotations": [], "fusion_evidence": [good, failed]})
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_retrieve_fusion_evidence)
+    monkeypatch.setattr(main.settings, "fusion_evidence_concurrency", 1)
+    main.app.state.run_store = fake_run_store
+    client = TestClient(main.app)
+
+    response = client.post("/v1/fusion-evidence/jobs", json={
+        "fusions": [{"fusion": "EML4::ALK", "tumor_type": "LUAD"}],
+        "run_id": "run-keep",
+        "force_refresh": True,
+    })
+    assert response.status_code == 200
+    for _ in range(50):
+        payload = client.get(response.json()["status_url"]).json()
+        if payload["status"] == "complete":
+            break
+        time.sleep(0.01)
+
+    assert payload["status"] == "complete"
+    job_item = payload["fusion_evidence"][0]
+    if outcome == "raises":
+        assert job_item["retrieval_status"] == "failed"
+    else:
+        assert job_item["partial"] is True
+    _, updated = fake_run_store.updated_runs[-1]
+    assert updated["fusion_evidence"] == [good, failed], "the run keeps its earlier evidence"
+    main._fusion_evidence_jobs.clear_local()

@@ -1135,6 +1135,13 @@ function fusionEvidenceKey(item) {
   return `${submission}||${tumorType}`;
 }
 
+// A complete lookup: neither failed nor partial.
+function fusionEvidenceSucceeded(item) {
+  return item.retrieval_status !== "failed" && !item.partial;
+}
+
+// Same rule as the server's _merge_fusion_evidence: a failed or partial
+// lookup never replaces an item that succeeded.
 function mergeFusionEvidence(existing, incoming) {
   const replacements = new Map((incoming || []).map((item) => [fusionEvidenceKey(item), item]));
   const merged = [];
@@ -1142,7 +1149,8 @@ function mergeFusionEvidence(existing, incoming) {
   (existing || []).forEach((item) => {
     const key = fusionEvidenceKey(item);
     if (replacements.has(key)) {
-      merged.push(replacements.get(key));
+      const next = replacements.get(key);
+      merged.push(fusionEvidenceSucceeded(item) && !fusionEvidenceSucceeded(next) ? item : next);
       replaced.add(key);
     } else {
       merged.push(item);
@@ -1199,21 +1207,39 @@ async function rerunFusionEvidence(item) {
     if (fusionEvidenceJobIsStale(token)) return;
     const evidence = await pollRetriedFusionEvidenceJob(job.status_url, token);
     if (evidence === null) return;
+    // A complete job can still carry a failed or partial lookup for this
+    // fusion. The merge keeps a card that had succeeded; a failed/partial
+    // card may be replaced (failed by failed, failed or partial by partial).
+    const rerun = evidence.find((entry) => fusionEvidenceKey(entry) === key);
+    if (!rerun) throw new Error("The re-run returned no evidence for this fusion.");
+    const previous = (state.currentResult.fusion_evidence || []).find((entry) => fusionEvidenceKey(entry) === key);
     state.currentResult = {
       ...state.currentResult,
       fusion_evidence: mergeFusionEvidence(state.currentResult.fusion_evidence || [], evidence),
     };
     state.fusionEvidenceStatus = "complete";
     state.rerunningFusionEvidenceKey = null;
+    const keptPrevious = Boolean(previous) && fusionEvidenceSucceeded(previous) && !fusionEvidenceSucceeded(rerun);
+    if (rerun.retrieval_status === "failed" || keptPrevious) {
+      const reason = rerun.retrieval_status === "failed"
+        ? rerun.interpretation || "PubMed lookup failed."
+        : "PubMed lookup was incomplete (partial result).";
+      state.fusionEvidenceRerunError = { key, runId: token.runId, message: `Re-run failed: ${reason}` };
+      renderAnnotationResult(state.currentResult);
+      clearMessage();
+      return;
+    }
     renderAnnotationResult(state.currentResult);
-    setMessage(`Fusion evidence re-run complete for ${item.fusion}.`, "info");
+    setMessage(rerun.partial
+      ? `Fusion evidence re-run for ${item.fusion} returned a partial lookup.`
+      : `Fusion evidence re-run complete for ${item.fusion}.`, "info");
   } catch (error) {
     if (fusionEvidenceJobIsStale(token)) return;
     // Leave the card exactly as it was; the error is shown inline on it.
     state.fusionEvidenceStatus = "complete";
     state.rerunningFusionEvidenceKey = null;
     state.fusionEvidenceRerunError = {
-      key, runId: token.runId, message: formatRunError(error.message),
+      key, runId: token.runId, message: `Re-run failed: ${formatRunError(error.message)}`,
     };
     renderAnnotationResult(state.currentResult);
     clearMessage();
