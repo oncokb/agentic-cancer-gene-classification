@@ -41,6 +41,7 @@ from src.auth import (
     UserProfile,
     UserStoreUnavailable,
     bootstrap_admins_at_startup,
+    describe_store_error,
     build_saml_authn_request,
     clear_session_cookie,
     configure_mysql_user_store,
@@ -2750,7 +2751,7 @@ app.include_router(gene_query_router)
 async def user_store_unavailable_handler(request: Request, exc: UserStoreUnavailable):
     """Fail closed when the user profile store can't be read (e.g. during login
     provisioning): never provision or authorize from a stale in-process copy."""
-    logger.error("User profile store unavailable for %s: %s", request.url.path, exc)
+    logger.error("User profile store unavailable for %s: %s", request.url.path, describe_store_error(exc))
     detail = "Sign-in is temporarily unavailable. Please retry shortly."
     if request.url.path.startswith("/auth/"):
         return HTMLResponse(

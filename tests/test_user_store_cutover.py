@@ -636,7 +636,7 @@ def test_startup_fails_when_granting_an_existing_bootstrap_admin_fails(monkeypat
         raise auth_module.UserStoreUnavailable("lost connection mid-transaction")
 
     monkeypatch.setattr(store, "grant_bootstrap_admin", broken)
-    with pytest.raises(auth_module.UserStoreStartupError, match="kuangf@mskcc.org"):
+    with pytest.raises(auth_module.UserStoreStartupError, match="BOOTSTRAP_ADMIN_EMAILS entry 1"):
         with _startup_with(store, monkeypatch):
             pass
     assert store._users[BOOTSTRAP_EMAIL].role == "viewer"

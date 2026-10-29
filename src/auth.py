@@ -151,7 +151,28 @@ async def _get_auth_redis_client():
 
 
 class UserStoreUnavailable(RuntimeError):
-    """The user profile store could not be read; callers must fail closed."""
+    """The user profile store could not be read; callers must fail closed.
+
+    Messages never name a user: they're logged and shown to operators."""
+
+
+def describe_store_error(exc: BaseException) -> str:
+    """A log-safe description of a user-store failure: exception classes and
+    MySQL error codes along the cause chain, never a driver's message or args
+    (they can quote row data such as emails). Messages of our own
+    UserStoreUnavailable / UserStoreStartupError are kept: they never name a user."""
+    parts = []
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (UserStoreUnavailable, UserStoreStartupError)):
+            parts.append(f"{type(current).__name__}: {current}")
+        else:
+            code = current.args[0] if current.args and isinstance(current.args[0], int) else None
+            parts.append(type(current).__name__ + (f" (MySQL error {code})" if code is not None else ""))
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +247,7 @@ async def _mysql_get_user(email: str) -> Optional["UserRecord"]:
     except UserStoreUnavailable:
         raise
     except Exception as exc:
-        raise UserStoreUnavailable(f"Failed to read user {clean_email}") from exc
+        raise UserStoreUnavailable("User store get_user failed") from exc
 
 
 async def grant_bootstrap_admin_if_listed(email: str) -> Optional[str]:
@@ -246,7 +267,11 @@ async def grant_bootstrap_admin_if_listed(email: str) -> Optional[str]:
 
 
 class UserStoreStartupError(RuntimeError):
-    """The MySQL user store isn't usable at startup; the app must not serve."""
+    """The MySQL user store isn't usable at startup; the app must not serve.
+
+    Raised without its cause: the server prints a startup failure's whole
+    traceback, and a driver's message there can quote row data (emails). The
+    message carries the redacted cause (describe_store_error) instead."""
 
 
 async def bootstrap_admins_at_startup() -> None:
@@ -263,19 +288,20 @@ async def bootstrap_admins_at_startup() -> None:
         admins = await store.count_admins()
     except Exception as exc:
         raise UserStoreStartupError(
-            "USER_STORE_BACKEND=mysql but the MySQL user store can't be read at startup; refusing to start"
-        ) from exc
+            "USER_STORE_BACKEND=mysql but the MySQL user store can't be read at startup; "
+            f"refusing to start ({describe_store_error(exc)})"
+        ) from None
     logger.info("MySQL user store ready: %d active admin(s)", admins)
-    for email in settings.bootstrap_admin_emails_list:
+    for position, email in enumerate(settings.bootstrap_admin_emails_list, start=1):
         try:
             await grant_bootstrap_admin_if_listed(email)
         except UserNotFound:
             logger.info("Bootstrap admin %s has not signed in yet; granting at first sign-in", email)
         except Exception as exc:
             raise UserStoreStartupError(
-                f"Granting the bootstrap admin role to {email} (BOOTSTRAP_ADMIN_EMAILS) failed; "
-                "refusing to start"
-            ) from exc
+                f"Granting the bootstrap admin role to BOOTSTRAP_ADMIN_EMAILS entry {position} "
+                f"failed; refusing to start ({describe_store_error(exc)})"
+            ) from None
 
 
 async def _profile_store_redis():
@@ -315,7 +341,7 @@ async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
         payload = await redis_client.get(f"agcg:user:{clean_email}")
         return UserProfile.model_validate_json(payload) if payload else None
     except Exception as exc:
-        raise UserStoreUnavailable(f"Failed to read user {clean_email}") from exc
+        raise UserStoreUnavailable("Failed to read a user profile from Redis") from exc
 
 
 async def get_user_profile(email: str) -> Optional[UserProfile]:
@@ -535,7 +561,7 @@ async def _provision_mysql_user(
     except UserStoreUnavailable:
         raise
     except Exception as exc:
-        raise UserStoreUnavailable(f"Failed to provision user {email}") from exc
+        raise UserStoreUnavailable("User store sign-in failed") from exc
     return _profile_from_record(record)
 
 
@@ -1064,8 +1090,9 @@ async def _verify_session(token: str) -> Tuple[Optional[AuthenticatedUser], Opti
     # current profile so demotions take effect on already-issued sessions.
     try:
         profile = await load_user_profile_strict(claims.email)
-    except UserStoreUnavailable:
-        logger.exception("User profile lookup failed for session of %s", claims.email)
+    except UserStoreUnavailable as exc:
+        # No traceback or email: a cause's message can quote stored data.
+        logger.error("User profile lookup failed for a session: %s", describe_store_error(exc))
         return None, "unavailable"
 
     if profile is None:
@@ -1151,8 +1178,10 @@ async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[Au
     # is lost on restart, so a missing owner keeps the default-role behaviour.
     try:
         profile = await load_user_profile_strict(owner_email)
-    except UserStoreUnavailable:
-        logger.exception("User profile lookup failed for API key %s owner %s", record.id, owner_email)
+    except UserStoreUnavailable as exc:
+        logger.error(
+            "User profile lookup failed for API key %s owner: %s", record.id, describe_store_error(exc)
+        )
         return None, "unavailable"
     if profile is None and (mysql_user_store_enabled() or settings.redis_url.strip()):
         logger.warning("API key %s rejected: owner %s has no user profile", record.id, owner_email)

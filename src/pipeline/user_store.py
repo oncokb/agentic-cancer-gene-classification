@@ -39,7 +39,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Tuple
 
 import pymysql
 
-from src.auth import UserStoreUnavailable
+from src.auth import UserStoreUnavailable, describe_store_error
 
 logger = logging.getLogger(__name__)
 
@@ -596,7 +596,9 @@ async def _store_errors(what: str) -> AsyncIterator[None]:
     try:
         yield
     except _STORE_ERRORS as exc:
-        logger.warning("User store %s failed: %s", what, exc)
+        # Class and MySQL error code only: a driver message can quote row
+        # data (e.g. an email). The cause stays chained for callers.
+        logger.warning("User store %s failed: %s", what, describe_store_error(exc))
         raise UserStoreUnavailable(f"User store {what} failed") from exc
 
 
@@ -634,7 +636,10 @@ class UserStoreMixin:
                 try:
                     await conn.rollback()
                 except BaseException as rollback_exc:
-                    logger.warning("User store rollback failed; discarding connection: %r", rollback_exc)
+                    logger.warning(
+                        "User store rollback failed; discarding connection: %s",
+                        describe_store_error(rollback_exc),
+                    )
                     conn.close()
                     if not isinstance(rollback_exc, Exception):
                         raise
@@ -707,7 +712,7 @@ class UserStoreMixin:
                 )
                 user = await self._fetch_user(cursor, email)
         if user is None:
-            raise UserStoreUnavailable(f"User {email} missing right after upsert")
+            raise UserStoreUnavailable("User store upsert_login: user missing right after upsert")
         return user
 
     async def import_user(self, user: UserRecord) -> bool:
