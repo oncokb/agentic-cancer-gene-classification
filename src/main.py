@@ -71,7 +71,7 @@ from src.auth import (
     validate_redirect_to,
     verify_oauth_state,
 )
-from src.config import settings
+from src.config import dev_mode_startup_error, settings
 from src.job_store import JobStore, can_read_job, job_owner
 from src.logging_utils import install_secret_redaction_filter
 from src.models.schema import (
@@ -181,6 +181,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    dev_mode_error = dev_mode_startup_error(settings)
+    if dev_mode_error:
+        logger.critical(dev_mode_error)
+        raise RuntimeError(dev_mode_error)
     # Build the DogStatsD client (file/DNS I/O) off the event loop, once,
     # before any request can emit a metric. Metrics are optional: nothing
     # about them may stop the app from starting.
@@ -1731,6 +1735,11 @@ async def _launch_annotation_job(
                 await _save_run_result(http_request, request_payload, result, current_user, run_source)
             else:
                 await _persist_run_result(http_request, request_payload, result, current_user, run_source)
+            # Before the job is marked complete: with the MySQL user store a
+            # failed usage write raises, and the job then ends as failed
+            # rather than flipping from complete to failed under a poller.
+            if current_user and current_user.email:
+                await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
             current.phase = "complete"
@@ -1740,8 +1749,6 @@ async def _launch_annotation_job(
             current.genes_total = result.genes_annotated
             current.timings_ms = result.timings_ms
             await _store_annotation_job(current)
-            if current_user and current_user.email:
-                await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
             record_user_action(
                 user_id=current_user.email if current_user else _request_user_id(http_request),
                 action=complete_action,
@@ -2747,13 +2754,16 @@ async def user_store_unavailable_handler(request: Request, exc: UserStoreUnavail
     """Fail closed when the user profile store can't be read (e.g. during login
     provisioning): never provision or authorize from a stale in-process copy."""
     logger.error("User profile store unavailable for %s: %s", request.url.path, exc)
-    detail = "Sign-in is temporarily unavailable. Please retry shortly."
     if request.url.path.startswith("/auth/"):
         return HTMLResponse(
-            render_access_denied_html(email="", reason=detail),
+            render_access_denied_html(email="", reason="Sign-in is temporarily unavailable. Please retry shortly."),
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
-    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": detail})
+    # Elsewhere (e.g. recording usage after an annotation on the MySQL store).
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "User records are temporarily unavailable. Please retry shortly."},
+    )
 
 
 @app.exception_handler(Exception)

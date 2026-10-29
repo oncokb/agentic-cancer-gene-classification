@@ -330,6 +330,25 @@ def test_mysql_store_not_configured_is_503(mysql, monkeypatch):
     assert _session().get(PROTECTED).status_code == 503
 
 
+def test_mysql_store_value_error_on_a_valid_session_is_503(mysql, monkeypatch):
+    # E.g. a stored row that fails to decode: a store fault, not a missing user.
+    mysql.put()
+
+    async def undecodable(email):
+        raise ValueError("Invalid isoformat string")
+
+    monkeypatch.setattr(mysql.store, "get_user", undecodable)
+    resp = _session().get(PROTECTED)
+    assert resp.status_code == 503
+    assert "set-cookie" not in resp.headers
+
+
+async def test_mysql_malformed_email_is_no_user_without_a_store_call(mysql):
+    assert await auth_module.load_user_profile_strict("not-an-email") is None
+    assert await auth_module.load_user_profile_strict("  ") is None
+    assert mysql.lookups() == 0
+
+
 def test_mysql_unexpected_store_exception_is_503(mysql, monkeypatch):
     mysql.put()
 
@@ -586,15 +605,91 @@ def test_startup_with_redis_does_not_wire_mysql(monkeypatch):
         assert auth_module._mysql_user_store is None
 
 
-async def test_startup_bootstrap_survives_store_errors(mysql, monkeypatch):
+def _startup_with(store, monkeypatch, *, backend="mysql", emails=BOOTSTRAP_EMAIL):
+    monkeypatch.setattr(settings, "user_store_backend", backend)
+    monkeypatch.setattr(settings, "bootstrap_admin_emails", emails)
+    monkeypatch.setattr(main_module, "RunStore", SimpleNamespace(create=AsyncMock(return_value=store)))
+    monkeypatch.setattr(auth_module, "_mysql_user_store", None)
+    return TestClient(app)
+
+
+def _existing(store, email=BOOTSTRAP_EMAIL):
+    asyncio.run(store.upsert_login(
+        LoginIdentity(email=email, name="K"), default_role="viewer", default_status="active",
+    ))
+
+
+def test_startup_fails_when_the_store_is_unreachable(monkeypatch):
+    store = CountingFakeUserStore()
+    store.unavailable = True
+    with pytest.raises(auth_module.UserStoreStartupError, match="can't be read at startup"):
+        with _startup_with(store, monkeypatch, emails=""):
+            pass
+
+
+def test_startup_fails_when_granting_an_existing_bootstrap_admin_fails(monkeypatch):
+    store = CountingFakeUserStore()
+    _existing(store)
+
+    async def broken(email, *, reason):
+        raise auth_module.UserStoreUnavailable("lost connection mid-transaction")
+
+    monkeypatch.setattr(store, "grant_bootstrap_admin", broken)
+    with pytest.raises(auth_module.UserStoreStartupError, match="kuangf@mskcc.org"):
+        with _startup_with(store, monkeypatch):
+            pass
+    assert store._users[BOOTSTRAP_EMAIL].role == "viewer"
+
+
+def test_startup_skips_listed_users_who_have_not_signed_in(monkeypatch):
+    store = CountingFakeUserStore()
+    with _startup_with(store, monkeypatch, emails=f"{BOOTSTRAP_EMAIL},other@mskcc.org"):
+        assert auth_module._mysql_user_store is store
+    assert store._users == {} and store._role_changes == []
+
+
+def test_startup_with_redis_ignores_an_unreachable_mysql_user_store(monkeypatch):
+    store = CountingFakeUserStore()
+    _existing(store)
+    store.unavailable = True
+    with _startup_with(store, monkeypatch, backend="redis"):
+        assert auth_module._mysql_user_store is None
+
+
+async def test_concurrent_bootstrap_callers_record_one_grant(mysql, monkeypatch):
+    # Two instances starting while the bootstrap admin signs in: one grant.
+    # (FakeUserStore serializes like MySQL's row lock; real-MySQL parity is
+    # tests/test_user_store_contract.py.)
     monkeypatch.setattr(settings, "bootstrap_admin_emails", BOOTSTRAP_EMAIL)
     mysql.put(BOOTSTRAP_EMAIL, role="viewer")
-    mysql.fail()
-    await auth_module.bootstrap_admins_at_startup()  # logged, not raised
-    mysql.fail(False)
-    assert mysql.stored(BOOTSTRAP_EMAIL).role == "viewer"
+    await asyncio.gather(
+        auth_module.bootstrap_admins_at_startup(),
+        auth_module.bootstrap_admins_at_startup(),
+        auth_module.provision_or_update_user(email=BOOTSTRAP_EMAIL, name="K", provider="google"),
+    )
+    changes = await _role_changes(mysql.store, BOOTSTRAP_EMAIL)
+    assert [(c.new_value, c.actor) for c in changes] == [("admin", BOOTSTRAP_ACTOR)]
+    assert mysql.stored(BOOTSTRAP_EMAIL).role == "admin"
+
+
+async def test_grant_outcomes(mysql, monkeypatch):
+    monkeypatch.setattr(settings, "bootstrap_admin_emails", BOOTSTRAP_EMAIL)
+    mysql.put(BOOTSTRAP_EMAIL, role="viewer")
+    assert await auth_module.grant_bootstrap_admin_if_listed(EMAIL) is None
     assert await auth_module.grant_bootstrap_admin_if_listed(BOOTSTRAP_EMAIL) == BOOTSTRAP_GRANTED
     assert await auth_module.grant_bootstrap_admin_if_listed(BOOTSTRAP_EMAIL) == BOOTSTRAP_ALREADY_ADMIN
+
+
+def test_bootstrap_grant_failure_at_sign_in_is_503_without_cookie(mysql, google_login, monkeypatch):
+    monkeypatch.setattr(settings, "bootstrap_admin_emails", BOOTSTRAP_EMAIL)
+
+    async def broken(email, *, reason):
+        raise auth_module.UserStoreUnavailable("down")
+
+    monkeypatch.setattr(mysql.store, "grant_bootstrap_admin", broken)
+    _, resp = google_login(BOOTSTRAP_EMAIL)
+    assert resp.status_code == 503
+    assert "set-cookie" not in resp.headers
 
 
 # ---------------------------------------------------------------------------
@@ -611,14 +706,116 @@ async def test_usage_counts_and_admin_list(backend):
     assert listed.last_annotation_at is not None
 
 
-async def test_failed_usage_write_is_dropped(backend):
+async def test_failed_usage_write(backend):
+    # Redis drops it (today's behaviour); MySQL raises UserStoreUnavailable.
     backend.put()
     backend.fail()
-    await auth_module.record_user_annotation_activity(EMAIL, count=3)  # never raises
+    if backend.name == "redis":
+        await auth_module.record_user_annotation_activity(EMAIL, count=3)
+    else:
+        with pytest.raises(auth_module.UserStoreUnavailable):
+            await auth_module.record_user_annotation_activity(EMAIL, count=3)
     backend.fail(False)
     [listed] = await auth_module.list_user_profiles()
     assert listed.annotation_count == 0
     assert auth_module._user_activity == {}
+
+
+async def test_unexpected_activity_error_is_unavailable_with_mysql(mysql, monkeypatch):
+    mysql.put()
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("pool closed")
+
+    monkeypatch.setattr(mysql.store, "incr_activity", broken)
+    with pytest.raises(auth_module.UserStoreUnavailable):
+        await auth_module.record_user_annotation_activity(EMAIL)
+
+
+@pytest.fixture
+def fake_pipeline(monkeypatch):
+    from src.models.schema import AnnotationResult, GeneAnnotation
+
+    async def run(fusions, on_annotation=None, on_total_known=None, **kwargs):
+        annotations = [GeneAnnotation(gene="ALK", evidence_support_score=0.8)]
+        if on_total_known:
+            await on_total_known(1)
+        for annotation in annotations:
+            if on_annotation:
+                await on_annotation(annotation)
+        return AnnotationResult(
+            run_id="cutover-run", timestamp="2026-10-29T00:00:00+00:00", fusions_processed=len(fusions),
+            genes_annotated=1, annotations=annotations,
+        )
+
+    monkeypatch.setattr(main_module, "run_pipeline", run)
+
+
+def _break_activity(monkeypatch, store):
+    async def broken(*args, **kwargs):
+        raise auth_module.UserStoreUnavailable("down")
+
+    monkeypatch.setattr(store, "incr_activity", broken)
+
+
+def test_annotation_activity_failure_is_503_with_mysql(mysql, fake_pipeline, monkeypatch):
+    from tests.test_gene_query_api import FakeRunStore
+
+    mysql.put()
+    app.state.run_store = FakeRunStore()
+    _break_activity(monkeypatch, mysql.store)
+    resp = _session().post("/v1/annotate", json={"fusions": ["EML4::ALK"]})
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "User records are temporarily unavailable. Please retry shortly."
+    assert mysql.lookups() == 1  # the request's own check was the only read
+
+
+def test_annotation_activity_recorded_with_mysql(mysql, fake_pipeline):
+    from tests.test_gene_query_api import FakeRunStore
+
+    mysql.put()
+    app.state.run_store = FakeRunStore()
+    assert _session().post("/v1/annotate", json={"fusions": ["EML4::ALK"]}).status_code == 200
+    assert mysql.stored().annotation_count == 1
+
+
+class _JobStore(CountingFakeUserStore):
+    """The app's RunStore for a lifespan-managed client: user store + no-op run saves."""
+
+    async def save_run(self, *args, **kwargs):
+        pass
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_annotation_job_activity_with_mysql(fake_pipeline, monkeypatch, broken):
+    import time
+
+    store = _JobStore()
+    put_store = Backend("mysql", store=store)
+    monkeypatch.setattr(settings, "user_store_backend", "mysql")
+    monkeypatch.setattr(auth_module, "_mysql_user_store", store)
+    put_store.put()
+    if broken:
+        _break_activity(monkeypatch, store)
+    monkeypatch.setattr(main_module, "RunStore", SimpleNamespace(create=AsyncMock(return_value=store)))
+    seen = []
+    with TestClient(app) as client:
+        client.cookies = _session().cookies
+        created = client.post("/v1/annotate/jobs", json={"fusions": ["ALK"], "mode": "core"})
+        assert created.status_code == 200, created.text
+        for _ in range(100):
+            body = client.get(created.json()["status_url"]).json()
+            seen.append(body["status"])
+            if body["status"] in ("complete", "failed"):
+                break
+            time.sleep(0.01)
+    if broken:
+        # Ends failed, never reported complete first.
+        assert seen[-1] == "failed" and "complete" not in seen
+        assert store._users[EMAIL].annotation_count == 0
+    else:
+        assert seen[-1] == "complete"
+        assert store._users[EMAIL].annotation_count == 1
 
 
 def test_admin_user_list_endpoint(backend):

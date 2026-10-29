@@ -120,8 +120,15 @@ sets no cookie, an existing session is kept); an API key whose owner is
 missing is rejected (401). With `mysql` there is no fallback to Redis or to
 the session's claims, and Redis user data is neither read nor modified.
 
+Also with `mysql`: recording usage after an annotation is not best-effort as
+on Redis. If the write fails the request returns 503, and an annotation job
+ends `failed` (it is never reported complete first). The run is already
+saved and gene annotations are cached by then, so a retry is cheap.
+
 `BOOTSTRAP_ADMIN_EMAILS` (comma-separated) is applied at startup to listed
-users already in MySQL, and at sign-in to the rest. Each listed user is made
+users already in MySQL, and at sign-in to the rest. With `mysql`, the app
+**refuses to start** when the user store can't be read or granting a listed
+existing user fails, rather than serving without the configured admin. Each listed user is made
 admin once, logged in `role_changes` with the actor `system:migration`, the
 same actor as the script's `--bootstrap-admin`. Any earlier grant by either
 one counts: if an admin later removes the role, neither a restart nor a
@@ -145,8 +152,10 @@ sign-in grants it again.
    since the last apply; while sign-in still uses Redis, new sign-ups land
    only there.
 5. **Restart** the app (`kubectl -n <namespace> rollout restart
-   deployment/<app>`). Startup logs `Bootstrap admin for kuangf@mskcc.org:
-   already admin` (or `granted`).
+   deployment/<app>`). Startup logs `MySQL user store ready: N active
+   admin(s)` and `Bootstrap admin for kuangf@mskcc.org: already admin` (or
+   `granted`). If pods crash-loop with `UserStoreStartupError`, MySQL isn't
+   readable or the grant failed: fix it, or roll back (below).
 6. **Check**: sign in as the bootstrap admin, open `GET /auth/users` (all
    migrated users listed with roles), and sign in as a non-admin to confirm
    their role is unchanged.

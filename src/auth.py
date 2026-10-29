@@ -206,16 +206,25 @@ def _profile_from_record(record: "UserRecord") -> UserProfile:
 
 
 async def _mysql_get_user(email: str) -> Optional["UserRecord"]:
-    """One users-table read. Any failure other than a malformed email (which
-    can't name a user) is UserStoreUnavailable, so callers fail closed."""
+    """One users-table read, failing closed.
+
+    The email is validated first: a malformed one can't name a user (None,
+    so 401). After that, any exception from the store, including a
+    ValueError from decoding a stored row, is UserStoreUnavailable (503).
+    """
+    from src.pipeline.user_store import normalize_email
+
     try:
-        return await _mysql_store().get_user(email)
-    except UserStoreUnavailable:
-        raise
+        clean_email = normalize_email(email)
     except ValueError:
         return None
+    store = _mysql_store()
+    try:
+        return await store.get_user(clean_email)
+    except UserStoreUnavailable:
+        raise
     except Exception as exc:
-        raise UserStoreUnavailable(f"Failed to read user {email}") from exc
+        raise UserStoreUnavailable(f"Failed to read user {clean_email}") from exc
 
 
 async def grant_bootstrap_admin_if_listed(email: str) -> Optional[str]:
@@ -234,18 +243,37 @@ async def grant_bootstrap_admin_if_listed(email: str) -> Optional[str]:
     return outcome
 
 
+class UserStoreStartupError(RuntimeError):
+    """The MySQL user store isn't usable at startup; the app must not serve."""
+
+
 async def bootstrap_admins_at_startup() -> None:
-    """Apply BOOTSTRAP_ADMIN_EMAILS to users already in MySQL. Users who
-    haven't signed in yet get the grant at their first sign-in instead."""
+    """Check the MySQL user store and apply BOOTSTRAP_ADMIN_EMAILS to listed
+    users already in it. Raises UserStoreStartupError, so startup fails, when
+    the store can't be read or a grant fails: serving would leave the operator
+    without the admins they configured. Listed users who haven't signed in
+    yet are skipped and granted at their first sign-in.
+    """
     from src.pipeline.user_store import UserNotFound
 
+    store = _mysql_store()
+    try:
+        admins = await store.count_admins()
+    except Exception as exc:
+        raise UserStoreStartupError(
+            "USER_STORE_BACKEND=mysql but the MySQL user store can't be read at startup; refusing to start"
+        ) from exc
+    logger.info("MySQL user store ready: %d active admin(s)", admins)
     for email in settings.bootstrap_admin_emails_list:
         try:
             await grant_bootstrap_admin_if_listed(email)
         except UserNotFound:
             logger.info("Bootstrap admin %s has not signed in yet; granting at first sign-in", email)
-        except Exception:
-            logger.exception("Bootstrap admin grant for %s failed at startup; retried at sign-in", email)
+        except Exception as exc:
+            raise UserStoreStartupError(
+                f"Granting the bootstrap admin role to {email} (BOOTSTRAP_ADMIN_EMAILS) failed; "
+                "refusing to start"
+            ) from exc
 
 
 async def _profile_store_redis():
@@ -522,11 +550,14 @@ async def record_user_annotation_activity(email: str, count: int = 1) -> None:
     """
     clean_email = email.strip().lower()
     if mysql_user_store_enabled():
-        # Same contract as Redis: drop the increment on failure, never buffer it.
+        # Unlike Redis, a failed write isn't dropped: it raises
+        # UserStoreUnavailable (503). Never buffered in-process either.
         try:
             await _mysql_store().incr_activity(clean_email, max(1, count))
+        except UserStoreUnavailable:
+            raise
         except Exception as exc:
-            logger.warning("Dropped annotation activity for %s: user store error: %s", clean_email, exc)
+            raise UserStoreUnavailable(f"Failed to record annotation activity for {clean_email}") from exc
         return
     now_iso = datetime.now(timezone.utc).isoformat()
     if settings.redis_url.strip():
