@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import time
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
 from fastapi.testclient import TestClient
 
-from src import auth, main
+from src import api_keys, auth, main
+from src.api_keys import ApiKeyRecord, InMemoryRateLimiter, generate_api_key, hash_api_key
 from src.auth import AuthenticatedUser
 from src.config import settings
 from src.models.schema import FusionEvidenceResult
@@ -69,10 +75,15 @@ def test_fusion_evidence_job_runs_in_background_and_ignores_gene_inputs(monkeypa
 
 
 class _FakeRunStore:
+    """In-memory run store whose merge primitive serializes per run, matching
+    the row lock the MySQL store uses."""
+
     def __init__(self, stored_run, owner_email="local@internal"):
         self._stored_run = stored_run
         self._owner_email = owner_email
         self.updated_runs = []
+        self._merge_lock = asyncio.Lock()
+        self.keys: dict[str, ApiKeyRecord] = {}
 
     async def get_run(self, run_id):
         return self._stored_run if run_id == self._stored_run.get("run_id") else None
@@ -85,6 +96,42 @@ class _FakeRunStore:
     async def update_run_result(self, run_id, result_payload):
         self.updated_runs.append((run_id, result_payload))
         self._stored_run = result_payload
+
+    async def merge_run_result(self, run_id, mutate):
+        async with self._merge_lock:
+            if run_id != self._stored_run.get("run_id"):
+                return None
+            updated = mutate(copy.deepcopy(self._stored_run))
+            if updated is None:
+                updated = self._stored_run
+            self._stored_run = updated
+            self.updated_runs.append((run_id, updated))
+            return updated
+
+    async def get_api_key_by_hash(self, key_hash: str) -> Optional[ApiKeyRecord]:
+        return next((key for key in self.keys.values() if key.key_hash == key_hash), None)
+
+    async def touch_api_key(self, key_id: str, used_at: datetime) -> None:
+        pass
+
+
+class _InterleavingRunStore(_FakeRunStore):
+    """A read-modify-write store with a barrier on reads: the pre-atomic
+    get_run/update_run_result path lets both jobs read the same snapshot, so
+    the last update loses the other job's attach."""
+
+    def __init__(self, stored_run, **kwargs):
+        super().__init__(stored_run, **kwargs)
+        self._reads = 0
+        self._both_read = asyncio.Event()
+
+    async def get_run(self, run_id):
+        snapshot = copy.deepcopy(self._stored_run)
+        self._reads += 1
+        if self._reads >= 2:
+            self._both_read.set()
+        await self._both_read.wait()
+        return snapshot
 
 
 def test_fusion_evidence_job_persists_result_onto_run_when_run_id_given(monkeypatch):
@@ -264,4 +311,228 @@ def test_merge_matches_submitted_input_when_resolved_symbol_differs():
          "retrieval_status": "ok", "pmids": ["3"]},
         {"fusion": "EML4::ALK", "tumor_type": "COAD", "retrieval_status": "ok"},
         {"fusion": "KEEP::ONE", "tumor_type": "LUAD", "retrieval_status": "ok"},
+    ]
+
+
+def _auth_settings(monkeypatch):
+    monkeypatch.setattr(settings, "auth_enabled", True)
+    monkeypatch.setattr(settings, "auth_secret_key", "fusion-evidence-owner-test-secret")
+    monkeypatch.setattr(settings, "allowed_email_domains", "mskcc.org")
+    monkeypatch.setattr(settings, "allowed_emails", "")
+    monkeypatch.setattr(settings, "redis_url", "")
+    monkeypatch.setattr(settings, "api_key_rate_limit_per_minute", 1000)
+    monkeypatch.setattr(auth, "_redis_client", None)
+    monkeypatch.setattr(api_keys, "_memory_limiter", InMemoryRateLimiter())
+
+
+def _session_headers(email: str, role: str = "curator") -> dict:
+    token = session_token_for(
+        AuthenticatedUser(email=email, name="User", domain="mskcc.org", role=role)
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _submit_and_poll(client, fusions, run_id, headers):
+    response = client.post(
+        "/v1/fusion-evidence/jobs",
+        json={"fusions": fusions, "run_id": run_id},
+        headers=headers,
+    )
+    if response.status_code != 200:
+        return response, None
+    for _ in range(50):
+        payload = client.get(response.json()["status_url"], headers=headers).json()
+        if payload["status"] in ("complete", "failed"):
+            return response, payload
+        time.sleep(0.01)
+    return response, payload
+
+
+def _ok_retrieve(monkeypatch):
+    async def retrieve(fusion, tumor_type=None, force_refresh=False):
+        return FusionEvidenceResult(
+            fusion=fusion, tumor_type=tumor_type, retrieval_status="ok", pmids=["1"],
+        )
+
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", retrieve)
+    monkeypatch.setattr(main.settings, "fusion_evidence_concurrency", 1)
+
+
+def test_authenticated_owner_can_attach_fusion_evidence(monkeypatch):
+    main._fusion_evidence_jobs.clear_local()
+    _auth_settings(monkeypatch)
+    _ok_retrieve(monkeypatch)
+    store = _FakeRunStore(
+        {"run_id": "run-owner", "annotations": [], "fusion_evidence": []},
+        owner_email="owner@mskcc.org",
+    )
+    main.app.state.run_store = store
+    client = TestClient(main.app)
+
+    response, payload = _submit_and_poll(
+        client, [{"fusion": "EML4::ALK"}], "run-owner", _session_headers("Owner@MSKCC.org")
+    )
+
+    assert response.status_code == 200
+    assert payload["status"] == "complete"
+    assert store.updated_runs[-1][1]["fusion_evidence"][0]["fusion"] == "EML4::ALK"
+
+
+def test_authenticated_non_owner_and_missing_run_cannot_attach(monkeypatch):
+    main._fusion_evidence_jobs.clear_local()
+    _auth_settings(monkeypatch)
+    _ok_retrieve(monkeypatch)
+    store = _FakeRunStore(
+        {"run_id": "run-owner", "annotations": [], "fusion_evidence": []},
+        owner_email="owner@mskcc.org",
+    )
+    main.app.state.run_store = store
+    client = TestClient(main.app)
+    headers = _session_headers("other@mskcc.org")
+
+    denied = client.post(
+        "/v1/fusion-evidence/jobs",
+        json={"fusions": [{"fusion": "EML4::ALK"}], "run_id": "run-owner"},
+        headers=headers,
+    )
+    missing = client.post(
+        "/v1/fusion-evidence/jobs",
+        json={"fusions": [{"fusion": "EML4::ALK"}], "run_id": "not-a-run"},
+        headers=headers,
+    )
+
+    assert denied.status_code == 403
+    assert missing.status_code == 404
+    assert store.updated_runs == []
+
+
+def test_authenticated_admin_can_attach_to_another_users_run(monkeypatch):
+    main._fusion_evidence_jobs.clear_local()
+    _auth_settings(monkeypatch)
+    _ok_retrieve(monkeypatch)
+    store = _FakeRunStore(
+        {"run_id": "run-owner", "annotations": [], "fusion_evidence": []},
+        owner_email="owner@mskcc.org",
+    )
+    main.app.state.run_store = store
+    client = TestClient(main.app)
+
+    response, payload = _submit_and_poll(
+        client,
+        [{"fusion": "EML4::ALK"}],
+        "run-owner",
+        _session_headers("admin@mskcc.org", role="admin"),
+    )
+
+    assert response.status_code == 200
+    assert payload["status"] == "complete"
+    assert store.updated_runs
+
+
+def test_owner_api_key_can_attach(monkeypatch):
+    main._fusion_evidence_jobs.clear_local()
+    _auth_settings(monkeypatch)
+    _ok_retrieve(monkeypatch)
+    store = _FakeRunStore(
+        {"run_id": "run-owner", "annotations": [], "fusion_evidence": []},
+        owner_email="owner@mskcc.org",
+    )
+    key = generate_api_key()
+    store.keys["key-1"] = ApiKeyRecord(
+        id="key-1",
+        key_hash=hash_api_key(key),
+        owner_email="Owner@MSKCC.org",
+        name="script",
+        created_at=datetime.now(timezone.utc),
+    )
+    main.app.state.run_store = store
+    client = TestClient(main.app)
+
+    response, payload = _submit_and_poll(
+        client,
+        [{"fusion": "EML4::ALK"}],
+        "run-owner",
+        {"Authorization": f"Bearer {key}"},
+    )
+
+    assert response.status_code == 200
+    assert payload["status"] == "complete"
+    assert store.updated_runs
+
+
+def test_ownerless_legacy_run_is_admin_only(monkeypatch):
+    main._fusion_evidence_jobs.clear_local()
+    _auth_settings(monkeypatch)
+    _ok_retrieve(monkeypatch)
+    store = _FakeRunStore(
+        {"run_id": "run-legacy", "annotations": [], "fusion_evidence": []},
+        owner_email=None,
+    )
+    main.app.state.run_store = store
+    client = TestClient(main.app)
+
+    denied = client.post(
+        "/v1/fusion-evidence/jobs",
+        json={"fusions": [{"fusion": "EML4::ALK"}], "run_id": "run-legacy"},
+        headers=_session_headers("curator@mskcc.org"),
+    )
+    allowed, payload = _submit_and_poll(
+        client,
+        [{"fusion": "EML4::ALK"}],
+        "run-legacy",
+        _session_headers("admin@mskcc.org", role="admin"),
+    )
+
+    assert denied.status_code == 403
+    assert allowed.status_code == 200
+    assert payload["status"] == "complete"
+    assert store.updated_runs
+
+
+def test_concurrent_fusion_evidence_merges_do_not_lose_updates(monkeypatch):
+    async def scenario():
+        store = _InterleavingRunStore({
+            "run_id": "run-concurrent",
+            "annotations": [],
+            "fusion_evidence": [
+                {"fusion": "A::B", "tumor_type": "LUAD", "retrieval_status": "failed"},
+                {"fusion": "C::D", "tumor_type": "LUAD", "retrieval_status": "failed"},
+            ],
+        })
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(run_store=store))
+        )
+        retry_a = [FusionEvidenceResult(fusion="A::B", tumor_type="LUAD", pmids=["1"])]
+        retry_b = [FusionEvidenceResult(fusion="C::D", tumor_type="LUAD", pmids=["2"])]
+
+        await asyncio.gather(
+            main._persist_fusion_evidence(request, "run-concurrent", retry_a),
+            main._persist_fusion_evidence(request, "run-concurrent", retry_b),
+        )
+        return store._stored_run["fusion_evidence"]
+
+    merged = asyncio.run(scenario())
+
+    assert [item["retrieval_status"] for item in merged] == ["ok", "ok"]
+    assert [item["pmids"] for item in merged] == [["1"], ["2"]]
+
+
+def test_merge_resolves_duplicate_keys_to_one_item():
+    existing = [
+        {"fusion": "A::B", "tumor_type": "LUAD", "retrieval_status": "failed"},
+        {"fusion": "KEEP::ONE", "tumor_type": "LUAD", "retrieval_status": "ok"},
+    ]
+    incoming = [
+        {"fusion": "A::B", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["1"]},
+        {"fusion": "A::B", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["2"]},
+        {"fusion": "NEW::ONE", "tumor_type": "LUAD", "retrieval_status": "ok"},
+        {"fusion": "NEW::ONE", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["3"]},
+    ]
+
+    merged = main._merge_fusion_evidence(existing, incoming)
+
+    assert merged == [
+        {"fusion": "A::B", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["2"]},
+        {"fusion": "KEEP::ONE", "tumor_type": "LUAD", "retrieval_status": "ok"},
+        {"fusion": "NEW::ONE", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["3"]},
     ]

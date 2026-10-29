@@ -1082,8 +1082,7 @@ function mergeFusionEvidence(existing, incoming) {
       merged.push(item);
     }
   });
-  (incoming || []).forEach((item) => {
-    const key = fusionEvidenceKey(item);
+  replacements.forEach((item, key) => {
     if (!replaced.has(key)) {
       merged.push(item);
       replaced.add(key);
@@ -1134,13 +1133,22 @@ async function retryFailedFusionEvidence() {
     }
 
     const job = await response.json();
-    await pollRetriedFusionEvidenceJob(job.status_url);
+    const retried = await pollRetriedFusionEvidenceJob(job.status_url);
+    // Apply only the fully completed retry, so a late poll failure can never
+    // leave the viewer looking at a half-updated list.
+    state.currentResult = {
+      ...state.currentResult,
+      fusion_evidence: mergeFusionEvidence(
+        state.currentResult.fusion_evidence || [],
+        retried,
+      ),
+    };
     state.fusionEvidenceStatus = "complete";
     renderAnnotationResult(state.currentResult);
     setMessage("Fusion evidence retry complete.", "info");
   } catch (error) {
-    // Keep whatever was already on the run; only the successful retries (if
-    // any completed before the error) have been merged in.
+    // Keep the original items exactly as they were: retry results are staged
+    // until the job completes.
     state.fusionEvidenceStatus = "complete";
     renderAnnotationResult(state.currentResult);
     setMessage(formatRunError(error.message), "error");
@@ -1148,6 +1156,7 @@ async function retryFailedFusionEvidence() {
 }
 
 async function pollRetriedFusionEvidenceJob(statusUrl) {
+  let staged = [];
   while (true) {
     const response = await fetch(statusUrl);
     if (!response.ok) {
@@ -1158,17 +1167,10 @@ async function pollRetriedFusionEvidenceJob(statusUrl) {
       throw new Error(status.error || "Fusion evidence job failed");
     }
 
-    state.currentResult = {
-      ...state.currentResult,
-      fusion_evidence: mergeFusionEvidence(
-        state.currentResult.fusion_evidence || [],
-        status.fusion_evidence || [],
-      ),
-    };
-    renderAnnotationResult(state.currentResult);
+    staged = status.fusion_evidence || staged;
 
     if (status.status === "complete") {
-      return;
+      return staged;
     }
 
     const total = status.fusions_total || "?";

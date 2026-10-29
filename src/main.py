@@ -879,8 +879,7 @@ def _merge_fusion_evidence(
             replaced.add(key)
         else:
             merged.append(item)
-    for item in incoming:
-        key = _fusion_evidence_key(item)
+    for key, item in replacements.items():
         if key not in replaced:
             merged.append(item)
             replaced.add(key)
@@ -896,15 +895,17 @@ async def _persist_fusion_evidence(
     shared link later shows it instead of a hidden/empty fusion evidence tab.
     Only the matching fusion/tumor items are replaced; every other item on the
     run stays put (a retry of failed lookups must not drop earlier evidence)."""
-    try:
-        stored = await http_request.app.state.run_store.get_run(run_id)
-        if stored is None:
-            return
+    incoming = [item.model_dump() for item in fusion_evidence]
+
+    def merge(stored: Dict[str, Any]) -> Dict[str, Any]:
         stored["fusion_evidence"] = _merge_fusion_evidence(
             stored.get("fusion_evidence") or [],
-            [item.model_dump() for item in fusion_evidence],
+            incoming,
         )
-        await http_request.app.state.run_store.update_run_result(run_id, stored)
+        return stored
+
+    try:
+        await http_request.app.state.run_store.merge_run_result(run_id, merge)
     except Exception:
         logger.exception("Failed to persist fusion evidence for run %s", run_id)
 
