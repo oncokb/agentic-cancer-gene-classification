@@ -2051,7 +2051,7 @@ function fusionEvidenceSections(items) {
     let label;
     let order;
     let key; // stable tracking id; the label can carry the tumor type
-    if (item.retrieval_status === "failed") {
+    if (item.retrieval_status === "failed" || (item.partial && (!item.literature_scope || item.literature_scope === "no_literature"))) {
       label = "Lookup failed";
       order = 4;
       key = "failed";
@@ -2109,6 +2109,7 @@ function renderFusionEvidenceCard(item) {
   const meta = appendFusionText(header, "div", "annotation-card-meta");
   appendFusionText(meta, "span", `review-badge ${item.well_supported ? "high" : "low"}`,
     item.well_supported ? "Well supported" : "Exploratory");
+  if (item.partial) appendFusionText(meta, "span", "status-pill", "Partial lookup");
   const count = fusionEvidencePmidCount(item);
   appendFusionText(meta, "span", "status-pill", `${count} PMID${count === 1 ? "" : "s"}`);
   if (item.literature_scope === "requested_tumor" && item.tumor_type && item.retrieval_status !== "failed") {
@@ -3331,7 +3332,7 @@ function renderFusionPartnerQueryButton(gene, tumorType) {
 
 function renderFusionPartnerPrecedentForFusionEvidence(item) {
   const retrievedCount = item.retrieved_count ?? (item.pmids || []).length;
-  if (retrievedCount > 0 || item.retrieval_status === "failed") return null;
+  if (retrievedCount > 0 || item.retrieval_status === "failed" || item.partial) return null;
 
   const partners = [];
   const seen = new Set();
@@ -3729,6 +3730,7 @@ function renderCacheBadge(annotation) {
   badge.className = "review-badge cache-badge";
   const labelByReason = {
     fresh_final_annotation: "Cached final",
+    retraction_check_failed: "Cached — retraction check unavailable",
     no_new_pubmed_pmids_since_last_check: "Cached after PubMed check",
     force_refresh: "Force refreshed",
     computed_new_annotation: "Freshly computed",
