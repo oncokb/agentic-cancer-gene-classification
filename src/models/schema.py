@@ -39,6 +39,12 @@ class ResolvedGene(BaseModel):
     ensembl_transcript_id: Optional[str] = None
     # RefSeq transcript (NM_/NR_/XM_/XR_) an input named; None for NP_/XP_ proteins.
     refseq_transcript_id: Optional[str] = None
+    # "ensembl_id" when Ensembl has the gene but no HGNC symbol or Ensembl name
+    # for it, so canonical_symbol is its stable ID, not a gene symbol.
+    symbol_source: Optional[str] = None
+    # Ensembl's biotype and description (minus its [Source:...] tag) for such genes.
+    biotype: Optional[str] = None
+    description: Optional[str] = None
 
 
 class LiteratureRecord(BaseModel):

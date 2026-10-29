@@ -118,6 +118,11 @@ def fake_http(monkeypatch):
 
     monkeypatch.setattr("src.pipeline.normalization.httpx.AsyncClient", client_factory)
 
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(normalization, "_sleep", no_sleep)  # Ensembl retry backoff
+
     def configure(**kwargs):
         state["handler"] = _handler(**kwargs)
         return state["handler"]
@@ -304,14 +309,14 @@ async def test_unknown_transcript_is_a_clear_error_not_a_fuzzy_match(fake_http):
     for key in (_UNKNOWN_TX, f"EML4({_UNKNOWN_TX})"):
         resolved = gene_map[key][0]
         assert resolved.unresolvable and not resolved.lookup_failed
-        assert resolved.resolution_error == f"Ensembl has no human gene, transcript or protein {_UNKNOWN_TX}."
+        assert resolved.resolution_error == f"Ensembl did not find ID {_UNKNOWN_TX}."
     assert gene_map[f"{_UNKNOWN_TX}.2"][0].resolution_error.startswith(
-        f"3′ partner of 'ALK::{_UNKNOWN_TX}.2' rejected — Ensembl has no human"
+        f"3′ partner of 'ALK::{_UNKNOWN_TX}.2' rejected — Ensembl did not find ID"
     )
     assert _hgnc_requests(handler) == ["rest.genenames.org/fetch/symbol/ALK"]  # only the plain symbol
 
 
-_UNKNOWN_MESSAGE = f"Ensembl has no human gene, transcript or protein {_UNKNOWN_TX}."
+_UNKNOWN_MESSAGE = f"Ensembl did not find ID {_UNKNOWN_TX}."
 _UNKNOWN_FUSION = f"{_UNKNOWN_TX}::ALK"
 _UNKNOWN_PARTNER_MESSAGE = f"5′ partner of '{_UNKNOWN_FUSION}' rejected — {_UNKNOWN_MESSAGE}"
 
@@ -371,7 +376,7 @@ async def test_ensembl_outage_is_a_retryable_per_input_error(fake_http):
 
     tx = gene_map[_TP53_TX][0]
     assert tx.unresolvable and tx.lookup_failed
-    assert tx.resolution_error == f"The Ensembl lookup for {_TP53_TX} failed; please retry."
+    assert tx.resolution_error == "Ensembl lookup temporarily unavailable (network error); retry later."
     assert gene_map[f"EML4({_EML4_TX})"][0].lookup_failed
     assert gene_map["KRAS"][0].resolved and gene_map["ALK"][0].resolved
     assert gene_map.inputs[f"EML4({_EML4_TX})::ALK"].lookup_failed
@@ -525,7 +530,7 @@ def test_annotate_reports_mismatch_and_unknown_ids_per_input(client):
         f"'EML4({_KRAS_TX})': Ensembl {_KRAS_TX} belongs to KRAS, not EML4. Correct the gene or the Ensembl ID."
     )
     assert by_gene[_UNKNOWN_TX]["error"] == (
-        f"Unresolvable gene symbol — Ensembl has no human gene, transcript or protein {_UNKNOWN_TX}."
+        f"Unresolvable gene symbol — Ensembl did not find ID {_UNKNOWN_TX}."
     )
     assert len(result["warnings"]) == 2
 
