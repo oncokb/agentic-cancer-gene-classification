@@ -132,7 +132,7 @@ def default_off_app(monkeypatch):
     monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
 
     run_store = _RecordingRunStore()
-    monkeypatch.setattr(main.app.state, "run_store", run_store, raising=False)
+    monkeypatch.setitem(main.app.state._state, "run_store", run_store)
     return TestClient(main.app), run_store, seen
 
 
