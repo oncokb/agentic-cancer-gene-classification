@@ -18,9 +18,8 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
-import anyio
 import httpx
 
 from src.config import settings
@@ -32,8 +31,6 @@ logger = logging.getLogger(__name__)
 HGNC_FETCH_URL = "https://rest.genenames.org/fetch/symbol/{symbol}"
 HGNC_SEARCH_URL = "https://rest.genenames.org/search/symbol/{symbol}"
 ENSEMBL_LOOKUP_URL = "https://rest.ensembl.org/lookup/id"
-# Release history of a stable ID, current or retired.
-ENSEMBL_ARCHIVE_URL = "https://rest.ensembl.org/archive/id"
 # NCBI Datasets gene report for an RNA or protein accession (one call, any version).
 NCBI_GENE_BY_ACCESSION_URL = "https://api.ncbi.nlm.nih.gov/datasets/v2/gene/accession/{accession}"
 _ENSEMBL_ID = r"ENS[GTP]\d{11}(?:\.\d+)?"
@@ -64,13 +61,6 @@ HGNC_ID_PATTERN = re.compile(r"Acc:(HGNC:\d+)")
 HGNC_TIMEOUT_SECONDS = 5.0
 ENSEMBL_TIMEOUT_SECONDS = 8.0
 NCBI_TIMEOUT_SECONDS = 8.0
-# Ensembl has outages (timeouts, 5xx, HTML maintenance pages) and rate limits
-# (429): make up to ENSEMBL_ATTEMPTS requests, waiting as long as Retry-After
-# says (else exponential backoff) between them. All of one resolution's
-# Ensembl requests share one deadline.
-ENSEMBL_ATTEMPTS = 3
-ENSEMBL_RETRY_BACKOFF_SECONDS = 0.5
-ENSEMBL_RETRY_DEADLINE_SECONDS = 15.0
 # NCBI answers 429 when a burst outruns its per-second budget, even under the
 # shared limiter (it bursts its full allowance); retry a few times, waiting as
 # long as Retry-After says (else exponential backoff). Everything, limiter
@@ -395,311 +385,10 @@ def _ensembl_absent(symbol: str) -> ResolvedGene:
     return _unresolvable_gene(symbol, resolution_error=f"Ensembl has no human gene, transcript or protein {symbol}.")
 
 
-def _ensembl_failed(symbol: str, reason: str) -> ResolvedGene:
+def _ensembl_failed(symbol: str) -> ResolvedGene:
     return _unresolvable_gene(
-        symbol,
-        lookup_failed=True,
-        resolution_error=f"Ensembl lookup temporarily unavailable ({reason}); retry later.",
+        symbol, lookup_failed=True, resolution_error=f"The Ensembl lookup for {symbol} failed; please retry."
     )
-
-
-class _EnsemblUnavailable(Exception):
-    """An Ensembl answer couldn't be had or trusted (timeout, network, 429, 5xx,
-    unreadable or inconsistent body): retryable, never cached."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason  # 'timeout', 'HTTP 503', ... for the user-facing message
-
-
-@dataclass
-class _EnsemblBudget:
-    """One resolution's Ensembl budget: every request it makes (batch, per-ID
-    fallback, transcript chain, archive) shares one deadline and one bound on
-    concurrent requests."""
-
-    deadline: float
-    semaphore: asyncio.Semaphore
-
-    @classmethod
-    def start(cls) -> "_EnsemblBudget":
-        return cls(_monotonic() + ENSEMBL_RETRY_DEADLINE_SECONDS, asyncio.Semaphore(NORMALIZATION_CONCURRENCY))
-
-    def remaining(self) -> float:
-        return self.deadline - _monotonic()
-
-
-def _is_lookup_doc(data: object) -> bool:
-    return isinstance(data, dict) and bool(data.get("object_type"))
-
-
-def _parse_lookup_doc(data: object) -> dict:
-    if not _is_lookup_doc(data):
-        raise ValueError(f"unexpected lookup JSON {type(data).__name__}")
-    return data  # type: ignore[return-value]
-
-
-# The archive's is_current flag on the wire (ensembl-rest t/archive.t): "1"
-# for current, "" for not current. Any other form is untrusted, never classified.
-_ARCHIVE_CURRENT = "1"
-_ARCHIVE_NOT_CURRENT = ""
-
-
-def _parse_archive(data: object) -> dict:
-    """An archive answer for an ID the lookup lacks, as a cacheable absence:
-    {"status": "retired", "release", "replacements"}. Raises ValueError for
-    any shape not exactly as Ensembl documents it, and _EnsemblUnavailable
-    when the archive calls the ID current, contradicting the lookup."""
-    if not isinstance(data, dict):
-        raise ValueError(f"unexpected archive JSON {type(data).__name__}")
-    flag = data.get("is_current")
-    if not isinstance(flag, str) or flag not in (_ARCHIVE_CURRENT, _ARCHIVE_NOT_CURRENT):
-        raise ValueError(f"unexpected archive is_current {flag!r}")
-    if flag == _ARCHIVE_CURRENT:
-        raise _EnsemblUnavailable("inconsistent response")
-    release = data.get("release")
-    if release is not None and (isinstance(release, bool) or not isinstance(release, (str, int))):
-        raise ValueError(f"unexpected archive release {release!r}")
-    candidates = data.get("possible_replacement", [])
-    if not isinstance(candidates, list) or not all(
-        isinstance(item, dict) and isinstance(item.get("stable_id"), str) and ENSEMBL_PATTERN.match(item["stable_id"])
-        for item in candidates
-    ):
-        raise ValueError(f"unexpected archive possible_replacement {candidates!r}")
-    return {
-        "status": "retired",
-        "release": str(release) if release not in (None, "") else None,
-        "replacements": [item["stable_id"] for item in candidates],
-    }
-
-
-async def _ensembl_json(
-    stable_ids: List[str],
-    client: httpx.AsyncClient,
-    budget: _EnsemblBudget,
-    url: str,
-    *,
-    parse: Callable[[object], object],
-    body: Optional[dict] = None,
-) -> Optional[object]:
-    """GET `url` (or POST `body` to it) and return parse(JSON); None when
-    Ensembl answers 400/404 (it doesn't know the ID). `parse` raises
-    ValueError for a body of the wrong shape, or _EnsemblUnavailable for one
-    that can't be trusted yet. Those, timeouts, network errors, 429, 5xx and
-    non-JSON bodies are retried, up to ENSEMBL_ATTEMPTS in all and within the
-    budget's deadline, then raise _EnsemblUnavailable."""
-    headers = {"Accept": "application/json"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    for attempt in range(ENSEMBL_ATTEMPTS):
-        retry_after = None
-        try:
-            remaining = budget.remaining()
-            if remaining <= 0:
-                raise TimeoutError
-            # Bounds the wait for a request slot and the whole request, body included.
-            with anyio.fail_after(remaining):
-                async with budget.semaphore:
-                    if body is None:
-                        resp = await client.get(url, headers=headers, timeout=ENSEMBL_TIMEOUT_SECONDS)
-                    else:
-                        resp = await client.post(url, headers=headers, json=body, timeout=ENSEMBL_TIMEOUT_SECONDS)
-            if resp.status_code in (400, 404):
-                return None
-            if resp.status_code == 429 or resp.status_code >= 500:
-                retry_after = _retry_after_seconds(resp)
-                raise _EnsemblUnavailable(f"HTTP {resp.status_code}")
-            resp.raise_for_status()
-            return parse(resp.json())
-        except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as exc:
-            error, failure = exc, _EnsemblUnavailable("timeout")
-        except httpx.HTTPStatusError as exc:
-            error, failure = exc, _EnsemblUnavailable(f"HTTP {exc.response.status_code}")
-        except httpx.HTTPError as exc:
-            error, failure = exc, _EnsemblUnavailable("network error")
-        except ValueError as exc:  # 200 with an HTML maintenance page, or JSON of the wrong shape
-            error, failure = exc, _EnsemblUnavailable("invalid response")
-        except _EnsemblUnavailable as exc:
-            error, failure = exc, exc
-        logger.warning(
-            "Ensembl request for %s failed (attempt %d of %d): %s %s",
-            ", ".join(stable_ids), attempt + 1, ENSEMBL_ATTEMPTS, type(error).__name__, error,
-        )
-        if attempt == ENSEMBL_ATTEMPTS - 1 or (failure.reason.startswith("HTTP 4") and failure.reason != "HTTP 429"):
-            raise failure
-        delay = retry_after if retry_after is not None else ENSEMBL_RETRY_BACKOFF_SECONDS * 2**attempt
-        if delay >= budget.remaining():
-            raise failure  # Ensembl asks for longer than we have left: fail fast, retryable
-        await _sleep(delay)
-    raise AssertionError("unreachable")
-
-
-# Only answers Ensembl gives deterministically are cached: a lookup doc, and an
-# archive-confirmed retired or never-existing ID. A lookup that merely came
-# back empty is not (an outage can do that), nor is any failure.
-def _ensembl_lookup_key(stable_id: str) -> str:
-    return f"ensembl:lookup:{stable_id}"
-
-
-def _ensembl_absent_key(stable_id: str) -> str:
-    return f"ensembl:absent:{stable_id}"
-
-
-class _CacheMiss(Exception):
-    pass
-
-
-async def _cache_probe(key: str) -> Optional[object]:
-    """The cached value for key, or None on a miss. Never computes anything."""
-
-    async def _miss() -> None:
-        raise _CacheMiss
-
-    try:
-        return await cached_call(key, _miss)
-    except _CacheMiss:
-        return None
-
-
-async def _cache_store(key: str, value: object) -> None:
-    """Store value under key, replacing whatever is there (e.g. a lookup null
-    an earlier version cached, which _cache_probe's callers ignore)."""
-
-    async def _value() -> object:
-        return value
-
-    await cached_call(key, _value, force_refresh=True)
-
-
-async def _ensembl_cached_doc(stable_id: str) -> Tuple[bool, Optional[dict]]:
-    """(True, doc) for a cached lookup, (True, None) for a cached confirmed
-    absence, (False, None) when Ensembl must be asked."""
-    doc = await _cache_probe(_ensembl_lookup_key(stable_id))
-    if _is_lookup_doc(doc):
-        return True, doc  # type: ignore[return-value]
-    if await _cache_probe(_ensembl_absent_key(stable_id)) is not None:
-        return True, None
-    return False, None
-
-
-async def _ensembl_fetch_doc(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> Optional[dict]:
-    """GET /lookup/id/{id}: its doc (then cached), or None when the lookup lacks it."""
-    doc = await _ensembl_json([stable_id], client, budget, f"{ENSEMBL_LOOKUP_URL}/{stable_id}", parse=_parse_lookup_doc)
-    if doc is not None:
-        await _cache_store(_ensembl_lookup_key(stable_id), doc)
-    return doc  # type: ignore[return-value]
-
-
-async def _ensembl_lookup(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> Optional[dict]:
-    """stable_id's lookup doc, or None when Ensembl's lookup lacks it (see
-    _ensembl_unknown for why). Raises _EnsemblUnavailable."""
-    hit, doc = await _ensembl_cached_doc(stable_id)
-    if hit:
-        return doc
-    return await _ensembl_fetch_doc(stable_id, client, budget)
-
-
-async def _ensembl_parent(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> dict:
-    """The parent a transcript/protein doc names; Ensembl lacking it is inconsistent."""
-    doc = await _ensembl_lookup(stable_id, client, budget)
-    if doc is None:
-        raise _EnsemblUnavailable("inconsistent response")
-    return doc
-
-
-async def _ensembl_lookup_many(
-    stable_ids: List[str], client: httpx.AsyncClient, budget: _EnsemblBudget
-) -> Dict[str, Optional[dict] | _EnsemblUnavailable]:
-    """Each ID's lookup doc, None when Ensembl's lookup lacks it, or the failure.
-
-    Uncached IDs go to Ensembl in one batch POST. A batch answer missing an
-    entry for an ID, or with a malformed one, is retried like any transient
-    failure. If Ensembl rejects a multi-ID batch with 400/404, or keeps
-    answering it incompletely, each ID is looked up on its own so one bad ID
-    can't fail the rest."""
-    results: Dict[str, Optional[dict] | _EnsemblUnavailable] = {}
-    misses: List[str] = []
-    for stable_id, (hit, doc) in zip(stable_ids, await asyncio.gather(*map(_ensembl_cached_doc, stable_ids))):
-        if hit:
-            results[stable_id] = doc
-        else:
-            misses.append(stable_id)
-    if not misses:
-        return results
-
-    def parse_batch(data: object) -> dict:
-        # One entry per ID: a doc, or null when the lookup lacks it. A missing
-        # or malformed entry can't be trusted either way.
-        if not isinstance(data, dict):
-            raise ValueError(f"unexpected batch JSON {type(data).__name__}")
-        bad = [i for i in misses if i not in data or not (data[i] is None or _is_lookup_doc(data[i]))]
-        if bad:
-            raise _EnsemblUnavailable(f"incomplete response for {', '.join(bad)}")
-        return data
-
-    try:
-        data = await _ensembl_json(misses, client, budget, ENSEMBL_LOOKUP_URL, body={"ids": misses}, parse=parse_batch)
-    except _EnsemblUnavailable as exc:
-        if not (exc.reason.startswith("incomplete response") and len(misses) > 1):
-            reason = "incomplete response" if exc.reason.startswith("incomplete response") else exc.reason
-            return {**results, **{stable_id: _EnsemblUnavailable(reason) for stable_id in misses}}
-        data = None  # still incomplete: fall back to per-ID lookups below
-
-    if isinstance(data, dict):
-        for stable_id in misses:
-            entry = data[stable_id]
-            results[stable_id] = entry
-            if entry is not None:
-                await _cache_store(_ensembl_lookup_key(stable_id), entry)
-        return results
-    if len(misses) == 1:
-        results[misses[0]] = None  # 400/404 for a single ID: the lookup lacks it
-        return results
-
-    logger.info("Ensembl rejected or garbled a batch of %d IDs; looking each up on its own", len(misses))
-
-    async def lookup_one(stable_id: str) -> Optional[dict] | _EnsemblUnavailable:
-        try:
-            return await _ensembl_fetch_doc(stable_id, client, budget)
-        except _EnsemblUnavailable as exc:
-            return exc
-
-    results.update(zip(misses, await asyncio.gather(*map(lookup_one, misses))))
-    return results
-
-
-async def _ensembl_absence(stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget) -> dict:
-    """Why Ensembl's lookup lacks stable_id, per its archive (cached):
-    {"status": "retired", "release", "replacements"} or {"status": "unknown"}.
-    Raises _EnsemblUnavailable (never cached) when the archive can't be had,
-    answers in an unexpected shape, or keeps calling the ID current,
-    contradicting the lookup; all of those are retried first."""
-
-    async def _fetch() -> dict:
-        absence = await _ensembl_json(
-            [stable_id], client, budget, f"{ENSEMBL_ARCHIVE_URL}/{stable_id}", parse=_parse_archive
-        )
-        return {"status": "unknown"} if absence is None else absence  # type: ignore[return-value]
-
-    return await cached_call(_ensembl_absent_key(stable_id), _fetch)
-
-
-async def _ensembl_unknown(
-    symbol: str, stable_id: str, client: httpx.AsyncClient, budget: _EnsemblBudget
-) -> ResolvedGene:
-    """An ID Ensembl's lookup lacks: retired, never existed, or (archive down or
-    contradicting the lookup) a retryable failure."""
-    try:
-        absence = await _ensembl_absence(stable_id, client, budget)
-    except _EnsemblUnavailable as exc:
-        return _ensembl_failed(symbol, exc.reason)
-    if absence.get("status") != "retired":
-        return _unresolvable_gene(symbol, resolution_error=f"Ensembl did not find ID {stable_id}.")
-    release = absence.get("release")
-    message = f"Ensembl ID {stable_id} is retired" + (f" (last seen in release {release})." if release else ".")
-    if absence.get("replacements"):
-        message += f" Ensembl lists {', '.join(absence['replacements'])} as a possible replacement."
-    return _unresolvable_gene(symbol, resolution_error=message)
 
 
 def _is_human(doc: dict) -> bool:
@@ -707,23 +396,11 @@ def _is_human(doc: dict) -> bool:
 
 
 def _resolved_from_ensembl(symbol: str, doc: Optional[dict]) -> ResolvedGene:
-    if not doc or doc.get("object_type") != "Gene" or not _is_human(doc):
+    if not doc or doc.get("object_type") != "Gene" or not doc.get("display_name") or not _is_human(doc):
         return _ensembl_absent(symbol)
 
     description = doc.get("description") or ""
     hgnc_match = HGNC_ID_PATTERN.search(description)
-    if not doc.get("display_name"):
-        # A current human gene with neither an HGNC symbol nor an Ensembl name
-        # (e.g. a novel lncRNA): its stable ID is the only name it has.
-        return ResolvedGene(
-            input_symbol=symbol,
-            canonical_symbol=_ensembl_lookup_id(doc.get("id") or symbol).upper(),
-            hgnc_id=hgnc_match.group(1) if hgnc_match else None,
-            resolved=True,
-            symbol_source="ensembl_id",
-            biotype=doc.get("biotype"),
-            description=re.sub(r"\s*\[Source:[^\]]*\]$", "", description) or None,
-        )
     return ResolvedGene(
         input_symbol=symbol,
         canonical_symbol=doc["display_name"],
@@ -735,54 +412,85 @@ def _resolved_from_ensembl(symbol: str, doc: Optional[dict]) -> ResolvedGene:
 async def _resolve_ensembl_gene_ids(
     symbols: List[str],
     client: httpx.AsyncClient,
-    budget: _EnsemblBudget,
 ) -> Dict[str, ResolvedGene]:
     """
-    Resolve Ensembl gene IDs, uncached ones in one POST call.
+    Resolve Ensembl gene IDs in one POST call.
 
-    Ensembl can be slow, so batching avoids one network round-trip per ENSG ID.
-    IDs the lookup lacks are checked against the archive (retired vs never
-    existed); failed lookups are retryable errors.
+    Ensembl can be slow, so batching avoids one network round-trip per ENSG ID
+    and keeps a bounded timeout. Unresolved IDs fall back to insufficient evidence.
     """
     if not symbols:
         return {}
 
     lookup_to_symbols: Dict[str, list[str]] = {}
     for symbol in symbols:
-        lookup_to_symbols.setdefault(_ensembl_lookup_id(symbol).upper(), []).append(symbol)
+        lookup_to_symbols.setdefault(_ensembl_lookup_id(symbol), []).append(symbol)
 
-    docs = await _ensembl_lookup_many(list(lookup_to_symbols), client, budget)
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    try:
+        resp = await client.post(
+            ENSEMBL_LOOKUP_URL,
+            headers=headers,
+            json={"ids": list(lookup_to_symbols)},
+            timeout=ENSEMBL_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as exc:
+        # A 400/404 for a single ID is Ensembl saying it doesn't exist; anything
+        # else (timeouts, 5xx, a 4xx for a whole batch) is a failed lookup.
+        confirmed_absent = (
+            isinstance(exc, httpx.HTTPStatusError)
+            and exc.response.status_code in (400, 404)
+            and len(lookup_to_symbols) == 1
+        )
+        if not confirmed_absent:
+            logger.warning("Ensembl lookup failed for %d IDs: %s", len(lookup_to_symbols), exc)
+        return {
+            symbol: _ensembl_absent(symbol) if confirmed_absent else _ensembl_failed(symbol)
+            for symbol in symbols
+        }
 
-    async def resolve(lookup_id: str, symbol: str) -> ResolvedGene:
-        doc = docs[lookup_id]
-        if isinstance(doc, _EnsemblUnavailable):
-            return _ensembl_failed(symbol, doc.reason)
-        if doc is None:
-            return await _ensembl_unknown(symbol, lookup_id, client, budget)
-        return _resolved_from_ensembl(symbol, doc)
-
-    pairs = [(lookup_id, symbol) for lookup_id, group in lookup_to_symbols.items() for symbol in group]
-    return dict(zip((symbol for _, symbol in pairs), await asyncio.gather(*(resolve(*pair) for pair in pairs))))
+    resolved: Dict[str, ResolvedGene] = {}
+    for lookup_id, original_symbols in lookup_to_symbols.items():
+        for symbol in original_symbols:
+            resolved[symbol] = _resolved_from_ensembl(symbol, data.get(lookup_id))
+    return resolved
 
 
-async def _resolve_ensembl_transcript_id(
-    symbol: str, client: httpx.AsyncClient, budget: _EnsemblBudget
-) -> ResolvedGene:
+async def _ensembl_lookup(stable_id: str, client: httpx.AsyncClient) -> Optional[dict]:
+    """GET /lookup/id/{id}, cached. None when Ensembl says the ID doesn't exist;
+    raises httpx.HTTPError / ValueError when the lookup itself failed."""
+
+    async def _fetch() -> Optional[dict]:
+        resp = await client.get(
+            f"{ENSEMBL_LOOKUP_URL}/{stable_id}",
+            headers={"Accept": "application/json"},
+            timeout=ENSEMBL_TIMEOUT_SECONDS,
+        )
+        if resp.status_code in (400, 404):
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+    return await cached_call(f"ensembl:lookup:{stable_id}", _fetch)
+
+
+async def _resolve_ensembl_transcript_id(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
     """ENST -> parent gene, ENSP -> parent transcript -> parent gene, then the gene's symbol."""
     stable_id = _ensembl_lookup_id(symbol).upper()
     try:
-        doc = await _ensembl_lookup(stable_id, client, budget)
-        if doc is None:
-            return await _ensembl_unknown(symbol, stable_id, client, budget)
+        doc = await _ensembl_lookup(stable_id, client)
         if stable_id.startswith("ENSP"):
-            if doc.get("object_type") != "Translation" or not doc.get("Parent"):
+            if not doc or doc.get("object_type") != "Translation" or not doc.get("Parent"):
                 return _ensembl_absent(symbol)
-            doc = await _ensembl_parent(doc["Parent"], client, budget)
-        if doc.get("object_type") != "Transcript" or not doc.get("Parent") or not _is_human(doc):
+            doc = await _ensembl_lookup(doc["Parent"], client)
+        if not doc or doc.get("object_type") != "Transcript" or not doc.get("Parent") or not _is_human(doc):
             return _ensembl_absent(symbol)
-        gene_doc = await _ensembl_parent(doc["Parent"], client, budget)
-    except _EnsemblUnavailable as exc:
-        return _ensembl_failed(symbol, exc.reason)
+        gene_doc = await _ensembl_lookup(doc["Parent"], client)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Ensembl lookup failed for %s: %s", symbol, exc)
+        return _ensembl_failed(symbol)
     resolved = _resolved_from_ensembl(symbol, gene_doc)
     if resolved.unresolvable:
         return resolved
@@ -794,17 +502,20 @@ async def _resolve_ensembl_ids(
     symbols: Iterable[str],
     client: httpx.AsyncClient,
 ) -> Dict[str, ResolvedGene]:
-    """Resolve Ensembl gene (one batch POST), transcript and protein IDs to gene
-    symbols, all within one Ensembl budget."""
+    """Resolve Ensembl gene (one batch POST), transcript and protein IDs to gene symbols."""
     symbol_list = list(dict.fromkeys(symbols))
     gene_ids = [symbol for symbol in symbol_list if symbol.upper().startswith("ENSG")]
     other_ids = [symbol for symbol in symbol_list if not symbol.upper().startswith("ENSG")]
-    budget = _EnsemblBudget.start()
-    genes, *others = await asyncio.gather(
-        _resolve_ensembl_gene_ids(gene_ids, client, budget),
-        *(_resolve_ensembl_transcript_id(symbol, client, budget) for symbol in other_ids),
-    )
-    return {**genes, **dict(zip(other_ids, others))}
+    resolved = await _resolve_ensembl_gene_ids(gene_ids, client)
+
+    semaphore = asyncio.Semaphore(NORMALIZATION_CONCURRENCY)
+
+    async def resolve_one(symbol: str) -> ResolvedGene:
+        async with semaphore:
+            return await _resolve_ensembl_transcript_id(symbol, client)
+
+    resolved.update(zip(other_ids, await asyncio.gather(*(resolve_one(symbol) for symbol in other_ids))))
+    return resolved
 
 
 def _refseq_absent(symbol: str) -> ResolvedGene:
@@ -1054,22 +765,6 @@ class GeneMap(Dict[str, Tuple[ResolvedGene, List[str]]]):
         self.submitted: Dict[str, List[str]] = {}
 
 
-def _unnamed_gene_warning(accession: str, gene: ResolvedGene) -> str:
-    """Say that a gene Ensembl has no name for is called by its stable ID."""
-    gene_id = gene.canonical_symbol or ""
-    biotype = (gene.biotype or "").replace("_", " ")
-    kind = biotype if biotype.endswith(("RNA", "gene")) else f"{biotype} gene".strip()
-    if _ensembl_lookup_id(accession) == gene_id:
-        return (
-            f"{gene_id} is a current human {kind} with no HGNC symbol or Ensembl name; "
-            "the Ensembl ID is used as its name."
-        )
-    return (
-        f"{accession} belongs to {gene_id}, a current human {kind} with no HGNC symbol or Ensembl name; "
-        "the Ensembl gene ID is used as its name."
-    )
-
-
 def _read_accession_token(
     token: _AccessionToken,
     by_accession: Dict[str, ResolvedGene],
@@ -1125,15 +820,12 @@ def _read_accession_token(
                 ),
             ), None, None
 
-    warnings = []
-    if by_id.symbol_source == "ensembl_id":
-        warnings.append(_unnamed_gene_warning(token.accession, by_id))
+    warning = None
     if token.variant:
-        warnings.append(
+        warning = (
             f"'{token.raw}' was annotated as gene {ensembl_symbol} (from {token.accession}); "
             f"variant-level interpretation of {token.variant} is not supported."
         )
-    warning = " ".join(warnings) or None
     if named and not token.variant:
         # GENE(ENST...) matching its transcript: annotate GENE as written.
         return named, by_id.model_copy(update={"input_symbol": named}), transcript, warning

@@ -260,12 +260,6 @@ def _format_gene_identity(resolved_gene: ResolvedGene) -> Optional[str]:
         return None
 
     parts = []
-    if resolved_gene.symbol_source == "ensembl_id":
-        parts.append(f"Ensembl gene ID (no HGNC symbol or Ensembl name): {resolved_gene.canonical_symbol}")
-        if resolved_gene.biotype:
-            parts.append(f"Ensembl biotype: {resolved_gene.biotype}")
-        if resolved_gene.description:
-            parts.append(f"Ensembl description: {resolved_gene.description}")
     if resolved_gene.name:
         parts.append(f"HGNC name: {resolved_gene.name}")
     if resolved_gene.hgnc_id:

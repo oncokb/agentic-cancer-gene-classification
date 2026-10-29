@@ -377,26 +377,8 @@ class FakeEnsemblClient:
             raise httpx.ReadTimeout("timed out", request=request)
         if isinstance(self.mode, int):
             return httpx.Response(self.mode, request=request, json={"error": "nope"})
-        if self.mode == "batch400":
-            return httpx.Response(400, request=request, json={"error": "bad batch"})
         known = {"ENSG00000141510": _ENSEMBL_TP53_DOC}
         return httpx.Response(200, request=request, json={i: known.get(i) for i in json["ids"]})
-
-    async def get(self, url, headers=None, timeout=None):
-        # Per-ID /lookup/id/{id} and /archive/id/{id}; Ensembl answers 400 for unknown IDs.
-        request = httpx.Request("GET", url)
-        if self.mode == "timeout":
-            raise httpx.ReadTimeout("timed out", request=request)
-        if isinstance(self.mode, int):
-            return httpx.Response(self.mode, request=request, json={"error": "nope"})
-        stable_id = url.rsplit("/", 1)[-1]
-        if "/lookup/id/" in url and stable_id == "ENSG00000141510":
-            return httpx.Response(200, request=request, json=_ENSEMBL_TP53_DOC)
-        return httpx.Response(400, request=request, json={"error": f"ID '{stable_id}' not found"})
-
-
-async def _no_sleep(_seconds):
-    pass
 
 
 @pytest.fixture
@@ -435,7 +417,6 @@ def real_pipeline(client, monkeypatch):
 
     monkeypatch.setattr(main, "run_pipeline", orchestrator.run_pipeline)
     monkeypatch.setattr(normalization, "_resolve_ensembl_ids", fake_resolve_ensembl)
-    monkeypatch.setattr(normalization, "_sleep", _no_sleep)  # Ensembl retry backoff
     monkeypatch.setattr(normalization, "_resolve_hgnc_symbols_concurrently", fake_resolve_hgnc)
     monkeypatch.setattr(orchestrator, "find_retracted_annotation_pmids", no_retractions)
     monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
@@ -618,14 +599,11 @@ def test_batch_reports_absence_and_lookup_failure_per_gene(client, real_pipeline
     assert errors == {symbol: expected_error, "ALK": None}
 
 
-def test_ensembl_batch_rejection_falls_back_to_per_id_lookups():
-    # A 400 for a multi-ID batch can't confirm any one ID is absent: each ID is looked up on its own.
-    resolved = asyncio.run(_REAL_RESOLVE_ENSEMBL([_TP53_ENSEMBL, _ABSENT_ENSEMBL], FakeEnsemblClient("batch400")))
+def test_ensembl_batch_rejection_is_a_lookup_failure_not_absence():
+    # A 400 for a multi-ID batch can't confirm any one ID is absent.
+    resolved = asyncio.run(_REAL_RESOLVE_ENSEMBL([_TP53_ENSEMBL, _ABSENT_ENSEMBL], FakeEnsemblClient(400)))
 
-    assert resolved[_TP53_ENSEMBL].resolved and resolved[_TP53_ENSEMBL].canonical_symbol == "TP53"
-    absent = resolved[_ABSENT_ENSEMBL]
-    assert absent.unresolvable and not absent.lookup_failed
-    assert absent.resolution_error == f"Ensembl did not find ID {_ABSENT_ENSEMBL}."
+    assert all(gene.unresolvable and gene.lookup_failed for gene in resolved.values())
 
 
 @pytest.fixture

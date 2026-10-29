@@ -115,8 +115,8 @@ def fake_cache(monkeypatch):
     """In-memory stand-in for the Redis-backed cached_call (same compute-on-miss contract)."""
     store: dict = {}
 
-    async def cached_call(key, compute, ttl_seconds=None, force_refresh=False):
-        if force_refresh or key not in store:
+    async def cached_call(key, compute, ttl_seconds=None):
+        if key not in store:
             store[key] = await compute()
         return store[key]
 
