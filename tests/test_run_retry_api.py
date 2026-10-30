@@ -844,3 +844,68 @@ def test_unresolved_row_takes_its_first_resolution():
 
     assert merged["annotations"][0]["gene"] == "BRAF"
     assert outcomes == []
+
+
+# ---------------------------------------------------------------------------
+# A result with no gene
+# ---------------------------------------------------------------------------
+
+_UNRESOLVED_ENSG_ROW = {
+    "gene": "ENSG00000157764", "insufficient_evidence": True,
+    "error": "Unresolvable gene symbol — Ensembl lookup temporarily unavailable (503); retry later.",
+}
+
+
+@pytest.mark.parametrize("blank", ["", "  "])
+@pytest.mark.parametrize("echoes_spelling", [True, False])
+def test_blank_result_gene_is_never_written(monkeypatch, fresh_jobs, blank, echoes_spelling):
+    stored = _stored_run(annotations=[
+        dict(_UNRESOLVED_ENSG_ROW),
+        {"gene": "TP53", "insufficient_evidence": False},
+    ])
+    resolved = (
+        [{"input": "ENSG00000157764", "resolved": blank}] if echoes_spelling else []
+    )
+    _ok_pipeline(monkeypatch, annotations=[
+        _annotation(blank, gene_summary="Blank", resolved_inputs=resolved),
+    ])
+    store = _FakeRunStore(stored)
+    _use_store(monkeypatch, store)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/runs/run-1/retry", json={"kind": "errors", "inputs": ["ENSG00000157764"]},
+    )
+
+    body = _poll(client, response.json()["status_url"])
+    assert body["status"] == "complete"
+    assert store.stored["annotations"] == stored["annotations"]
+    assert body["retry_outcomes"] == [{
+        "input": "ENSG00000157764",
+        "row_gene": "ENSG00000157764",
+        "resolved_gene": "",
+        "message": "ENSG00000157764 did not resolve to a gene; not updated",
+    }]
+
+
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_blank_result_gene_never_replaces_a_row_with_a_gene(blank):
+    stored = _stored_run(annotations=[{
+        "gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout",
+        "resolved_inputs": [{"input": "CD246", "resolved": "ALK"}],
+    }])
+    outcomes = []
+
+    merged = main._merge_retried_annotations(
+        copy.deepcopy(stored),
+        _dump([_annotation(blank, resolved_inputs=[{"input": "CD246", "resolved": blank}])]),
+        [],
+        {"CD246": "ALK"},
+        "errors",
+        outcomes,
+    )
+
+    assert merged["annotations"] == stored["annotations"]
+    assert [outcome.message for outcome in outcomes] == [
+        "CD246 did not resolve to a gene; not updated",
+    ]

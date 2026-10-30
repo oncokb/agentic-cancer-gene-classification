@@ -1162,6 +1162,20 @@ def _row_has_gene_identity(row: Dict[str, Any]) -> bool:
     return not str(row.get("error") or "").lower().startswith("unresolvable gene symbol")
 
 
+def _retry_spelling(
+    item: Dict[str, Any], keys: set[str], targets: Dict[str, str], destination: str,
+) -> str:
+    """The submitted spelling that routed `item` to the `destination` row."""
+    spellings = [
+        resolution.get("input")
+        for resolution in item.get("resolved_inputs") or []
+        if targets.get(_normalized_retry_token(resolution.get("input"))) == destination
+    ] or [key for key in sorted(keys) if targets.get(key) == destination]
+    if not spellings:
+        spellings = [key for key in sorted(targets) if targets[key] == destination]
+    return str(spellings[0]) if spellings else destination
+
+
 def _merge_retried_annotations(
     stored: Dict[str, Any],
     incoming: List[Dict[str, Any]],
@@ -1176,8 +1190,10 @@ def _merge_retried_annotations(
     the row it was validated against. An incoming annotation is routed to a
     target row by that map (via its gene or the spellings it was resolved
     from) and written there only when its gene is the row's gene (an input
-    that now resolves to a different gene leaves the row unchanged and adds a
-    RunRetryOutcome to `outcomes`), while the row is still eligible for a
+    that now resolves to a different gene, or to no gene at all, leaves the
+    row unchanged and adds a RunRetryOutcome to `outcomes`; a result with a
+    blank gene is never written, not even as an unresolved row's first
+    resolution), while the row is still eligible for a
     `kind` retry, and only with a result at least as good (a retry that fails
     again never overwrites a no-result row with an error). Every other row,
     including a target that got a good result meanwhile, is left exactly as
@@ -1192,6 +1208,9 @@ def _merge_retried_annotations(
         keys = _annotation_match_keys(item)
         item_gene = _normalized_retry_token(item.get("gene"))
         destinations = {targets[key] for key in keys if key in targets} | (keys & row_keys)
+        if not item_gene and not destinations and len(row_keys) == 1:
+            # A blank result that names no spelling: a one-gene retry's.
+            destinations = set(row_keys)
         for destination in destinations:
             index = next(
                 (
@@ -1203,15 +1222,21 @@ def _merge_retried_annotations(
             )
             if index is None:
                 continue
+            if not item_gene:
+                # Never written anywhere, not even as a first resolution.
+                if outcomes is not None:
+                    spelling = _retry_spelling(item, keys, targets, destination)
+                    outcomes.append(RunRetryOutcome(
+                        input=spelling,
+                        row_gene=str(rows[index].get("gene")),
+                        resolved_gene="",
+                        message=f"{spelling} did not resolve to a gene; not updated",
+                    ))
+                continue
             if item_gene != destination and _row_has_gene_identity(rows[index]):
                 if outcomes is not None:
                     row_gene = str(rows[index].get("gene"))
-                    spellings = [
-                        resolution.get("input")
-                        for resolution in item.get("resolved_inputs") or []
-                        if targets.get(_normalized_retry_token(resolution.get("input"))) == destination
-                    ] or [key for key in sorted(keys) if targets.get(key) == destination]
-                    spelling = str(spellings[0]) if spellings else destination
+                    spelling = _retry_spelling(item, keys, targets, destination)
                     outcomes.append(RunRetryOutcome(
                         input=spelling,
                         row_gene=row_gene,

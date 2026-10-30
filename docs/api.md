@@ -910,7 +910,10 @@ job's `retry_outcomes`:
 
 A row whose input never resolved to a gene (its `gene` is the raw input,
 because the symbol lookup failed) has no gene yet, so its first successful
-resolution is written.
+resolution to a non-empty gene is written. A result with an empty or blank
+`gene` is never written to any row; its input is listed in `retry_outcomes`
+with `resolved_gene: ""` and a message such as
+`"ENSG00000157764 did not resolve to a gene; not updated"`.
 
 Results are written to the stored run only when the whole job completes, in the
 same locked transaction other run updates (such as fusion-evidence retries)

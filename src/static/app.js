@@ -1393,11 +1393,14 @@ function rowHasGeneIdentity(row) {
 }
 
 // `mismatches` collects { rowGene, message } for rows left unchanged because
-// the retried input now resolves to a different gene.
+// the retried input now resolves to a different gene, or to none.
 function mergeRetriedAnnotations(existing, incoming, targets, kind, mismatches = []) {
   const merged = [...(existing || [])];
   (incoming || []).forEach((annotation) => {
-    const keys = new Set([...annotationMatchKeys(annotation)].filter((key) => targets.has(key)));
+    const blank = !normalizedRetryToken(annotation.gene);
+    let keys = new Set([...annotationMatchKeys(annotation)].filter((key) => targets.has(key)));
+    // A blank result that names no spelling: a one-gene retry's.
+    if (blank && !keys.size && targets.size === 1) keys = new Set(targets);
     const matches = [];
     merged.forEach((row, index) => {
       if (keys.has(normalizedRetryToken(row.gene)) && isRetryEligible(row, kind)) matches.push(index);
@@ -1405,6 +1408,14 @@ function mergeRetriedAnnotations(existing, incoming, targets, kind, mismatches =
     if (!matches.length) return;
     const [first, ...rest] = matches;
     const rowGene = merged[first].gene;
+    if (blank) {
+      // Never written anywhere, not even as an unresolved row's first resolution.
+      const spelling = (annotation.resolved_inputs || [])
+        .map((resolution) => resolution.input)
+        .find((input) => targets.has(normalizedRetryToken(input))) || rowGene;
+      mismatches.push({ rowGene, message: `${spelling} did not resolve to a gene; not updated` });
+      return;
+    }
     if (
       normalizedRetryToken(annotation.gene) !== normalizedRetryToken(rowGene) &&
       rowHasGeneIdentity(merged[first])

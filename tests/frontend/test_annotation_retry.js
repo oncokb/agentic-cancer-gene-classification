@@ -303,6 +303,41 @@ async function testRetryResolvingToAnotherGeneLeavesTheRowAndShowsWhy() {
   assert.ok(sandbox.elements.messageBox.textContent.includes("1 gene was not updated"));
 }
 
+// A result with an empty or blank gene is never written, even into a row
+// whose lookup failed (which otherwise takes its first resolution).
+async function testBlankResultGeneIsNeverWritten() {
+  for (const blank of ["", "  "]) {
+    for (const echoesSpelling of [true, false]) {
+      const ensg = {
+        gene: "ENSG00000157764", insufficient_evidence: true,
+        error: "Unresolvable gene symbol — Ensembl lookup temporarily unavailable (503); retry later.",
+      };
+      const sandbox = app(retryFetch([{
+        status: "complete",
+        result: {
+          annotations: [{
+            gene: blank, insufficient_evidence: false, gene_summary: "Blank",
+            resolved_inputs: echoesSpelling ? [{ input: "ENSG00000157764", resolved: blank }] : [],
+          }],
+        },
+      }]));
+      renderNoResult(sandbox, [ensg]);
+
+      await sandbox.retryFailedAnnotations("errors");
+
+      const label = `gene=${JSON.stringify(blank)}, echoes spelling=${echoesSpelling}`;
+      assert.deepStrictEqual(
+        JSON.parse(JSON.stringify(sandbox.state.currentResult.annotations)), [ensg], label,
+      );
+      const notes = byClass(sandbox.elements.resultsWindow, "annotation-retry-note");
+      assert.strictEqual(notes.length, 1, label);
+      assert.ok(
+        notes[0].innerHTML.includes("ENSG00000157764 did not resolve to a gene; not updated"), label,
+      );
+    }
+  }
+}
+
 async function testTumorTypeIsTheFirstSubmittedForTheGene() {
   const calls = [];
   const sandbox = app(retryFetch([{ status: "complete", result: { annotations: [] } }], calls));
@@ -489,6 +524,7 @@ const tests = [
   testTumorTypeIsTheFirstSubmittedForTheGene,
   testRetryKeepsTheRowsSubmittedSpellings,
   testRetryResolvingToAnotherGeneLeavesTheRowAndShowsWhy,
+  testBlankResultGeneIsNeverWritten,
   testRetryErrorKeepsOldRows,
   testFailedJobLeavesPageUnchanged,
   testWorseResultNeverReplacesExisting,
