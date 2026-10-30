@@ -338,6 +338,35 @@ async function testBlankResultGeneIsNeverWritten() {
   }
 }
 
+// A multi-gene retry whose job returns a blank result naming no spelling: it
+// can't be tied to ALK or BRAF, so each row is left unchanged and says why.
+async function testMultiGeneRetryExplainsRowsWithoutAUsableResult() {
+  for (const blank of ["", "  "]) {
+    const rows = [
+      { gene: "ALK", insufficient_evidence: true, error: "Synthesis error: timeout" },
+      { gene: "BRAF", insufficient_evidence: true, error: "Synthesis error: timeout" },
+    ];
+    const sandbox = app(retryFetch([{
+      status: "complete",
+      result: { annotations: [{ gene: blank, insufficient_evidence: false, gene_summary: "Blank" }] },
+      retry_outcomes: [],
+    }]));
+    renderNoResult(sandbox, rows);
+
+    await sandbox.retryFailedAnnotations("errors");
+
+    const label = `gene=${JSON.stringify(blank)}`;
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(sandbox.state.currentResult.annotations)), rows, label,
+    );
+    const notes = byClass(sandbox.elements.resultsWindow, "annotation-retry-note");
+    assert.deepStrictEqual(notes.map((note) => note._parent.id), ["gene-ALK", "gene-BRAF"], label);
+    assert.ok(notes[0].innerHTML.includes("ALK: no usable result was returned; not updated"), label);
+    assert.ok(notes[1].innerHTML.includes("BRAF: no usable result was returned; not updated"), label);
+    assert.ok(sandbox.elements.messageBox.textContent.includes("2 genes were not updated"), label);
+  }
+}
+
 async function testTumorTypeIsTheFirstSubmittedForTheGene() {
   const calls = [];
   const sandbox = app(retryFetch([{ status: "complete", result: { annotations: [] } }], calls));
@@ -525,6 +554,7 @@ const tests = [
   testRetryKeepsTheRowsSubmittedSpellings,
   testRetryResolvingToAnotherGeneLeavesTheRowAndShowsWhy,
   testBlankResultGeneIsNeverWritten,
+  testMultiGeneRetryExplainsRowsWithoutAUsableResult,
   testRetryErrorKeepsOldRows,
   testFailedJobLeavesPageUnchanged,
   testWorseResultNeverReplacesExisting,

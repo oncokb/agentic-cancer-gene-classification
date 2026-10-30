@@ -317,7 +317,13 @@ class RunRetryOutcome(BaseModel):
 
     input: str = Field(..., description="The spelling that was retried, e.g. `CD246`.")
     row_gene: str = Field(..., description="The gene of the saved row the input targeted.")
-    resolved_gene: str = Field(..., description="The gene the input resolved to on retry.")
+    resolved_gene: Optional[str] = Field(
+        ...,
+        description=(
+            "The gene the input resolved to on retry: empty when it resolved to no gene, "
+            "null when no usable result was returned for it."
+        ),
+    )
     message: str
 
 
@@ -1193,7 +1199,8 @@ def _merge_retried_annotations(
     that now resolves to a different gene, or to no gene at all, leaves the
     row unchanged and adds a RunRetryOutcome to `outcomes`; a result with a
     blank gene is never written, not even as an unresolved row's first
-    resolution), while the row is still eligible for a
+    resolution; any other target row left waiting gets a "no usable result"
+    outcome), while the row is still eligible for a
     `kind` retry, and only with a result at least as good (a retry that fails
     again never overwrites a no-result row with an error). Every other row,
     including a target that got a good result meanwhile, is left exactly as
@@ -1204,6 +1211,7 @@ def _merge_retried_annotations(
     rows = list(stored.get("annotations") or [])
     row_keys = set(targets.values())
     updated_keys: set[str] = set()
+    updated_rows: set[str] = set()
     for item in incoming:
         keys = _annotation_match_keys(item)
         item_gene = _normalized_retry_token(item.get("gene"))
@@ -1255,6 +1263,28 @@ def _merge_retried_annotations(
                 row["resolved_inputs"] = resolved_inputs
             rows[index] = row
             updated_keys |= keys | {destination}
+            updated_rows.add(destination)
+    if outcomes is not None:
+        # Every target row still waiting for a result says why it wasn't
+        # updated, whatever the pipeline returned (or didn't) for it.
+        reported = {_normalized_retry_token(outcome.row_gene) for outcome in outcomes}
+        for row in rows:
+            row_key = _normalized_retry_token(row.get("gene"))
+            if (
+                row_key not in row_keys
+                or row_key in updated_rows
+                or row_key in reported
+                or not _is_retry_eligible(row, kind)
+            ):
+                continue
+            spelling = next(key for key, target in targets.items() if target == row_key)
+            outcomes.append(RunRetryOutcome(
+                input=spelling,
+                row_gene=str(row.get("gene")),
+                resolved_gene=None,
+                message=f"{spelling}: no usable result was returned; not updated",
+            ))
+            reported.add(row_key)
     existing_warnings = list(stored.get("warnings") or [])
     for warning in warnings:
         if warning not in existing_warnings and _warning_mentions_any(warning, updated_keys):

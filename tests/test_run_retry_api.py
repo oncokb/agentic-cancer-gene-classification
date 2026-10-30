@@ -909,3 +909,64 @@ def test_blank_result_gene_never_replaces_a_row_with_a_gene(blank):
     assert [outcome.message for outcome in outcomes] == [
         "CD246 did not resolve to a gene; not updated",
     ]
+
+
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_multi_gene_retry_reports_every_row_left_without_a_usable_result(
+    monkeypatch, fresh_jobs, blank,
+):
+    # The blank result names no spelling, so it can't be tied to ALK or BRAF.
+    stored = _stored_run(annotations=[
+        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+        {"gene": "BRAF", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+        {"gene": "TP53", "insufficient_evidence": False},
+    ])
+    _ok_pipeline(monkeypatch, annotations=[_annotation(blank, gene_summary="Blank")])
+    store = _FakeRunStore(stored)
+    _use_store(monkeypatch, store)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/runs/run-1/retry", json={"kind": "errors", "inputs": ["ALK", "BRAF"]},
+    )
+
+    body = _poll(client, response.json()["status_url"])
+    assert body["status"] == "complete"
+    assert store.stored["annotations"] == stored["annotations"]
+    assert body["retry_outcomes"] == [
+        {
+            "input": "ALK", "row_gene": "ALK", "resolved_gene": None,
+            "message": "ALK: no usable result was returned; not updated",
+        },
+        {
+            "input": "BRAF", "row_gene": "BRAF", "resolved_gene": None,
+            "message": "BRAF: no usable result was returned; not updated",
+        },
+    ]
+
+
+def test_fallback_outcome_only_for_rows_left_waiting():
+    stored = _stored_run(annotations=[
+        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+        {"gene": "BRAF", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+        {"gene": "KRAS", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+    ])
+    outcomes = []
+
+    merged = main._merge_retried_annotations(
+        copy.deepcopy(stored),
+        _dump([
+            _annotation("ALK", gene_summary="Retried"),
+            _annotation("LTK", resolved_inputs=[{"input": "KRAS", "resolved": "LTK"}]),
+        ]),
+        [],
+        {"ALK": "ALK", "BRAF": "BRAF", "KRAS": "KRAS"},
+        "errors",
+        outcomes,
+    )
+
+    assert merged["annotations"][0]["gene_summary"] == "Retried"
+    assert [outcome.message for outcome in outcomes] == [
+        "KRAS now resolves to LTK, not KRAS; KRAS was not updated",
+        "BRAF: no usable result was returned; not updated",
+    ]

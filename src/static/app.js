@@ -1392,10 +1392,12 @@ function rowHasGeneIdentity(row) {
   return !String(row?.error || "").toLowerCase().startsWith("unresolvable gene symbol");
 }
 
-// `mismatches` collects { rowGene, message } for rows left unchanged because
-// the retried input now resolves to a different gene, or to none.
+// `mismatches` collects { rowGene, message } for target rows left unchanged:
+// the retried input now resolves to a different gene, to none, or no usable
+// result came back for it.
 function mergeRetriedAnnotations(existing, incoming, targets, kind, mismatches = []) {
   const merged = [...(existing || [])];
+  const updated = new Set();
   (incoming || []).forEach((annotation) => {
     const blank = !normalizedRetryToken(annotation.gene);
     let keys = new Set([...annotationMatchKeys(annotation)].filter((key) => targets.has(key)));
@@ -1431,9 +1433,22 @@ function mergeRetriedAnnotations(existing, incoming, targets, kind, mismatches =
     merged[first] = resolvedInputs.length
       ? { ...annotation, resolved_inputs: resolvedInputs }
       : annotation;
+    updated.add(normalizedRetryToken(rowGene));
     rest.reverse().forEach((index) => {
       if (annotationRank(merged[index]) <= annotationRank(annotation)) merged.splice(index, 1);
     });
+  });
+  // Every target row still waiting for a result says why it wasn't updated,
+  // whatever the job returned (or didn't) for it — as the server reports.
+  const reported = new Set(mismatches.map(({ rowGene }) => normalizedRetryToken(rowGene)));
+  merged.forEach((row) => {
+    const key = normalizedRetryToken(row.gene);
+    if (!targets.has(key) || updated.has(key) || reported.has(key) || !isRetryEligible(row, kind)) return;
+    mismatches.push({
+      rowGene: row.gene,
+      message: `${row.gene}: no usable result was returned; not updated`,
+    });
+    reported.add(key);
   });
   return merged;
 }

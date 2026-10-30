@@ -915,6 +915,13 @@ resolution to a non-empty gene is written. A result with an empty or blank
 with `resolved_gene: ""` and a message such as
 `"ENSG00000157764 did not resolve to a gene; not updated"`.
 
+Every other submitted row that is still waiting after the merge (for example
+because no result could be tied to it, or the result was worse than the saved
+row) is also listed, with `resolved_gene: null` and a message such as
+`"BRAF: no usable result was returned; not updated"`. A row that another
+update fixed in the meantime is not listed. So every submitted gene is either
+updated or explained.
+
 Results are written to the stored run only when the whole job completes, in the
 same locked transaction other run updates (such as fusion-evidence retries)
 use, so concurrent updates don't overwrite each other; a `failed` job leaves the
