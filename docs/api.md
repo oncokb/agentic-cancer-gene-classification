@@ -746,3 +746,70 @@ Unauthenticated requests return `401`. Run storage that isn't configured returns
 `503`; a database outage returns `500`, like `GET /v1/annotate/{run_id}`.
 `created_at` is an ISO-8601 UTC timestamp and may include microseconds.
 The `run_id` in `view_url` is URL-encoded.
+
+## GET /v1/runs/{run_id}/inputs
+
+Return the fusion inputs a saved run was submitted with, so a client can retry
+individual genes without reconstructing tumor types or breakpoints from the
+annotations. Requires a signed-in session or API key; only the run's owner or an
+administrator may read them.
+
+```json
+{
+  "run_id": "example-run-id",
+  "inputs": [
+    {
+      "fusion": "EML4::ALK",
+      "tumor_type": "LUAD",
+      "five_exon": null,
+      "three_exon": null,
+      "five_genomic": null,
+      "three_genomic": null,
+      "five_transcript": "ENST00000318522",
+      "three_transcript": null
+    }
+  ]
+}
+```
+
+Unknown runs return `404`, non-owners return `403`, unauthenticated requests
+return `401`, and run storage that isn't configured returns `503`.
+
+## POST /v1/runs/{run_id}/retry
+
+Re-annotate failed or no-result genes on an existing saved run and merge the
+results into that run in place. Only the run's owner or an administrator may
+retry. The run's other annotations, original inputs, attribution, and fusion
+evidence are left untouched.
+
+```bash
+curl -s -X POST https://acgc.oncokb.org/v1/runs/example-run-id/retry \
+  -H "Authorization: Bearer $ACGC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": [{"fusion": "ALK", "tumor_type": "LUAD"}],
+    "force_refresh": false
+  }'
+```
+
+```json
+{
+  "job_id": "c1a4e8f2-3b6d-4c8e-9a0f-5d7b1e2c9a44",
+  "status_url": "/v1/annotate/jobs/c1a4e8f2-3b6d-4c8e-9a0f-5d7b1e2c9a44"
+}
+```
+
+`inputs` accepts the same entries as `POST /v1/annotate/jobs` and is capped by
+`ANNOTATE_MAX_INPUTS`. `force_refresh` defaults to `false`; set it to `true` when
+re-checking no-result genes so a cached low-evidence result isn't reused. The
+job runs in the background and is polled through the returned `status_url` with
+`GET /v1/annotate/jobs/{job_id}`. When the job is `complete`, `result.run_id` is
+the original run id; its `annotations` contain only the retried genes, already
+merged into the stored run.
+
+Inputs whose stored error is deterministic (for example a malformed accession
+or a transcript that belongs to a different gene) are ignored because a retry
+would fail the same way. If every supplied input is deterministic, the endpoint
+returns `422` and starts no job. Unknown runs return `404`, non-owners return
+`403`, unauthenticated requests return `401`, and run storage that isn't
+configured returns `503`.

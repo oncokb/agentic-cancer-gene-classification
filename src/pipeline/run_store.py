@@ -511,21 +511,46 @@ class RunStore(UserStoreMixin):
             next_cursor = _encode_runs_cursor(last.created_at, last.run_id)
         return RunSummaryPage(runs=runs, next_cursor=next_cursor)
 
-    async def update_run_result(self, run_id: str, result_payload: Dict[str, Any]) -> None:
+    async def update_run_result(
+        self,
+        run_id: str,
+        result_payload: Dict[str, Any],
+        *,
+        genes_annotated: Optional[int] = None,
+    ) -> None:
         """Overwrite a saved run's result (e.g. once a background job, like fusion
-        evidence retrieval, completes after the initial save)."""
+        evidence retrieval, completes after the initial save).
+
+        `genes_annotated` updates the listing column too when the result changes
+        how many genes the run contains (retrying failed annotations). Leaving it
+        unset keeps the existing listing value, as before."""
+        if genes_annotated is None:
+            sql = "UPDATE runs SET result_json = %s WHERE run_id = %s"
+            params: tuple = (json.dumps(result_payload), run_id)
+        else:
+            sql = "UPDATE runs SET result_json = %s, genes_annotated = %s WHERE run_id = %s"
+            params = (json.dumps(result_payload), genes_annotated, run_id)
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute(
-                    "UPDATE runs SET result_json = %s WHERE run_id = %s",
-                    (json.dumps(result_payload), run_id),
-                )
+                await cursor.execute(sql, params)
 
     async def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
                     "SELECT result_json FROM runs WHERE run_id = %s", (run_id,)
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+    async def get_run_request(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """The request payload a run was saved with, or None when it doesn't exist."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT request_json FROM runs WHERE run_id = %s", (run_id,)
                 )
                 row = await cursor.fetchone()
         if row is None:

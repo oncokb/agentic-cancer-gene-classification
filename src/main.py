@@ -108,7 +108,12 @@ from src.pipeline.fusion_context import annotate_fusion_position_contexts, parse
 from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline import openevidence_metrics as oe_metrics
-from src.pipeline.normalization import has_accession_identifier, is_fusion_input, read_gene_input
+from src.pipeline.normalization import (
+    has_accession_identifier,
+    is_fusion_input,
+    read_gene_input,
+    split_fusion,
+)
 from src.pipeline.openevidence import (
     OpenEvidenceClient,
     claim_lookup,
@@ -397,6 +402,27 @@ class FusionEvidenceJobStatusResponse(BaseModel):
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
     owner: Optional[str] = Field(default=None, exclude=True)
+
+
+class RunRetryRequest(BaseModel):
+    """Inputs to re-annotate and merge back into an existing saved run."""
+
+    inputs: List[FusionInput] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "The original submitted inputs to retry, including tumor type and breakpoint "
+            "fields. Inputs rejected for a deterministic reason (bad accession, mismatched "
+            "transcript) are ignored."
+        ),
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description=(
+            "Bypass stored gene annotations. The UI sets this for the 'No result' tab, "
+            "where a cached annotation would just repeat the same result."
+        ),
+    )
 
 
 class BenchmarkRequest(BaseModel):
@@ -907,6 +933,170 @@ async def _persist_fusion_evidence(
         await http_request.app.state.run_store.update_run_result(run_id, stored)
     except Exception:
         logger.exception("Failed to persist fusion evidence for run %s", run_id)
+
+
+_TRANSIENT_ANNOTATION_ERROR_MARKERS = (
+    "please retry",
+    "try again",
+    "synthesis error",
+    "timed out",
+    "timeout",
+    "temporarily",
+    "rate limit",
+    "connection",
+    "service unavailable",
+    "lookup failed",
+)
+_DETERMINISTIC_ANNOTATION_ERROR_MARKERS = (
+    "not a valid",
+    "belongs to",
+    "has no human",
+    "is not a gene symbol",
+    "unresolvable gene symbol",
+    "correct the gene",
+    "unannotated locus",
+    "not supported",
+)
+
+
+def _is_transient_annotation_error(message: Optional[str]) -> bool:
+    """Whether an annotation error is worth retrying.
+
+    Deterministic rejections (bad accession form, an accession that belongs to
+    another gene, a symbol HGNC/Ensembl confirmed does not exist) will fail the
+    same way again. Unknown errors default to retryable so a new transient
+    failure mode is not silently hidden."""
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _TRANSIENT_ANNOTATION_ERROR_MARKERS):
+        return True
+    return not any(marker in text for marker in _DETERMINISTIC_ANNOTATION_ERROR_MARKERS)
+
+
+def _normalized_retry_token(value: Any) -> str:
+    return " ".join(str(value or "").strip().upper().split())
+
+
+def _retry_tokens_for_text(value: Any) -> set[str]:
+    """Every spelling a submitted input can be matched by: the whole string and
+    its fusion partners."""
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    tokens = {_normalized_retry_token(text)}
+    for part in split_fusion(text):
+        if part:
+            tokens.add(_normalized_retry_token(part))
+    return tokens
+
+
+def _annotation_retry_tokens(annotation: Dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for value in [annotation.get("gene"), *(annotation.get("fusions") or [])]:
+        tokens |= _retry_tokens_for_text(value)
+    for resolution in annotation.get("resolved_inputs") or []:
+        tokens |= _retry_tokens_for_text(resolution.get("input"))
+        tokens |= _retry_tokens_for_text(resolution.get("resolved"))
+    return tokens
+
+
+def _filter_retryable_inputs(
+    stored_result: Dict[str, Any], inputs: List[FusionInput]
+) -> List[FusionInput]:
+    """Drop inputs that only touch annotations rejected deterministically.
+
+    An input is kept when it also touches a retryable annotation (a transient
+    error or a no-result gene), so one deterministic partner in a fusion does
+    not block re-checking the other partner."""
+    deterministic_tokens: set[str] = set()
+    retryable_tokens: set[str] = set()
+    for annotation in stored_result.get("annotations") or []:
+        tokens = _annotation_retry_tokens(annotation)
+        error = annotation.get("error")
+        if error and not _is_transient_annotation_error(error):
+            deterministic_tokens |= tokens
+        else:
+            retryable_tokens |= tokens
+    if not deterministic_tokens:
+        return list(inputs)
+    kept: List[FusionInput] = []
+    for item in inputs:
+        tokens = _retry_tokens_for_text(item.fusion)
+        if tokens & deterministic_tokens and not (tokens & retryable_tokens):
+            continue
+        kept.append(item)
+    return kept
+
+
+def _annotation_gene_key(item: Dict[str, Any]) -> str:
+    return _normalized_retry_token(item.get("gene"))
+
+
+def _merge_annotations_by_gene(
+    existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Replace matching gene rows in place, keep every other row, then append
+    incoming rows the run didn't already have."""
+    replacements = {_annotation_gene_key(item): item for item in incoming}
+    merged: List[Dict[str, Any]] = []
+    replaced: set[str] = set()
+    for item in existing:
+        key = _annotation_gene_key(item)
+        if key in replacements:
+            merged.append(replacements[key])
+            replaced.add(key)
+        else:
+            merged.append(item)
+    for item in incoming:
+        key = _annotation_gene_key(item)
+        if key not in replaced:
+            merged.append(item)
+            replaced.add(key)
+    return merged
+
+
+def _warning_mentions_any(warning: str, tokens: set[str]) -> bool:
+    for token in tokens:
+        if not token:
+            continue
+        pattern = r"(?<![A-Za-z0-9_])" + re.escape(token) + r"(?![A-Za-z0-9_])"
+        if re.search(pattern, warning, re.IGNORECASE):
+            return True
+    return False
+
+
+def _merge_run_warnings(
+    existing: List[str], incoming: List[str], targeted_tokens: set[str]
+) -> List[str]:
+    merged = [warning for warning in existing if not _warning_mentions_any(warning, targeted_tokens)]
+    for warning in incoming:
+        if warning not in merged:
+            merged.append(warning)
+    return merged
+
+
+def _merge_retried_annotations(
+    stored: Dict[str, Any], retried: AnnotationResult
+) -> Dict[str, Any]:
+    """Merge a retried subset of annotations into a stored run.
+
+    Only annotations/warnings for the retried inputs change; the run's owner,
+    original inputs, fusion evidence and other annotations stay as they were.
+    Run-level counts derived from the annotation list are recomputed."""
+    incoming = [item.model_dump() for item in retried.annotations]
+    existing = stored.get("annotations") or []
+    merged_annotations = _merge_annotations_by_gene(existing, incoming)
+    targeted_tokens: set[str] = set()
+    for item in incoming:
+        targeted_tokens |= _annotation_retry_tokens(item)
+    updated = dict(stored)
+    updated["annotations"] = merged_annotations
+    updated["warnings"] = _merge_run_warnings(
+        stored.get("warnings") or [], retried.warnings, targeted_tokens,
+    )
+    updated["genes_annotated"] = len(merged_annotations)
+    return updated
 
 
 def _public_app_base_url(request: Request) -> str:
@@ -1745,6 +1935,150 @@ async def get_annotation_job(
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> AnnotationJobStatusResponse:
     return await _get_annotation_job(job_id, viewer=current_user)
+
+
+async def _launch_run_retry_job(
+    run_id: str,
+    retry_inputs: List[FusionInput],
+    request: RunRetryRequest,
+    stored_request: Dict[str, Any],
+    http_request: Request,
+    current_user: Optional[AuthenticatedUser],
+) -> str:
+    """Re-annotate only `retry_inputs` in the background, then merge the
+    completed annotations into the existing run."""
+    job_id = str(uuid.uuid4())
+    job = AnnotationJobStatusResponse(
+        job_id=job_id,
+        status="queued",
+        fusions_processed=len(retry_inputs),
+        kind="run_retry",
+        owner=job_owner(current_user),
+    )
+    await _store_annotation_job(job)
+
+    async def on_annotation(annotation: GeneAnnotation) -> None:
+        current = await _get_annotation_job(job_id)
+        current.annotations.append(annotation)
+        current.annotations.sort(key=lambda item: item.gene)
+        current.genes_completed = len(current.annotations)
+        await _store_annotation_job(current)
+
+    async def on_total_known(total: int) -> None:
+        current = await _get_annotation_job(job_id)
+        current.genes_total = total
+        await _store_annotation_job(current)
+
+    async def run_job() -> None:
+        current = await _get_annotation_job(job_id)
+        current.status = "running"
+        current.phase = "annotation"
+        await _store_annotation_job(current)
+        try:
+            result = await run_pipeline(
+                retry_inputs,
+                local_backend=stored_request.get("local_backend"),
+                run_store=http_request.app.state.run_store,
+                force_refresh=request.force_refresh,
+                skip_literature_for_oncokb=bool(
+                    stored_request.get("skip_literature_for_oncokb")
+                ),
+                mode=stored_request.get("mode") or "full",
+                on_annotation=on_annotation,
+                on_total_known=on_total_known,
+            )
+            result.run_id = run_id
+            stored = await http_request.app.state.run_store.get_run(run_id)
+            if stored is None:
+                raise RuntimeError("Run not found")
+            merged = _merge_retried_annotations(stored, result)
+            await http_request.app.state.run_store.update_run_result(
+                run_id, merged, genes_annotated=merged.get("genes_annotated"),
+            )
+            current = await _get_annotation_job(job_id)
+            current.status = "complete"
+            current.phase = "complete"
+            current.result = result
+            current.annotations = result.annotations
+            current.genes_completed = result.genes_annotated
+            current.genes_total = result.genes_annotated
+            current.timings_ms = result.timings_ms
+            await _store_annotation_job(current)
+            record_user_action(
+                user_id=current_user.email if current_user else _request_user_id(http_request),
+                action="run_retry_complete",
+                details={
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "genes_completed": result.genes_annotated,
+                    "force_refresh": request.force_refresh,
+                },
+            )
+        except Exception as exc:
+            logger.exception("Run retry job %s failed", job_id)
+            record_user_action(
+                user_id=current_user.email if current_user else _request_user_id(http_request),
+                action="run_retry_error",
+                details={"job_id": job_id, "run_id": run_id, "error": str(exc)},
+            )
+            current = await _get_annotation_job(job_id)
+            current.status = "failed"
+            current.phase = "failed"
+            current.error = str(exc)
+            await _store_annotation_job(current)
+
+    _track_background_task(run_job())
+    return job_id
+
+
+@app.post("/v1/runs/{run_id}/retry", response_model=AnnotationJobCreateResponse)
+async def retry_run_annotations(
+    run_id: str,
+    request: RunRetryRequest,
+    http_request: Request,
+    current_user: AuthenticatedUser = Depends(require_auth),
+) -> AnnotationJobCreateResponse:
+    """Retry failed or no-result gene annotations on an existing saved run.
+
+    Only the supplied inputs are re-annotated, and their results are merged
+    into the stored run in place; the run's other annotations, original
+    inputs, attribution and fusion evidence are left untouched. Inputs whose
+    stored error is deterministic are ignored (a retry cannot change them)."""
+    store = getattr(http_request.app.state, "run_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Run storage is unavailable.")
+    metadata = await store.get_run_metadata(run_id)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not can_modify_run(metadata.get("owner_email"), current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only this run's owner or an administrator may retry its annotations.",
+        )
+    _check_annotate_input_limit(request.inputs)
+    stored = await store.get_run(run_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    retry_inputs = _filter_retryable_inputs(stored, request.inputs)
+    if not retry_inputs:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No retryable inputs: these inputs were rejected for a deterministic "
+                "reason and would fail the same way again."
+            ),
+        )
+    stored_request: Dict[str, Any] = {}
+    get_run_request = getattr(store, "get_run_request", None)
+    if get_run_request is not None:
+        stored_request = await get_run_request(run_id) or {}
+    job_id = await _launch_run_retry_job(
+        run_id, retry_inputs, request, stored_request, http_request, current_user,
+    )
+    return AnnotationJobCreateResponse(
+        job_id=job_id,
+        status_url=f"/v1/annotate/jobs/{job_id}",
+    )
 
 
 @app.post("/v1/annotate/enrichment/jobs", response_model=EnrichmentJobCreateResponse)

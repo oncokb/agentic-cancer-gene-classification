@@ -612,6 +612,12 @@ textarea {
   padding: 14px;
 }
 
+.annotation-retry-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .annotation-card {
   border: 1px solid var(--line);
   border-radius: 8px;
