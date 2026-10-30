@@ -22,6 +22,9 @@ from src.auth import AuthenticatedUser
 from src.config import settings
 from tests.auth_helpers import session_token_for
 
+# Every test runs once per USER_STORE_BACKEND (see conftest.user_store_backend).
+pytestmark = pytest.mark.usefixtures("user_store_backend")
+
 _FRONTEND_DIR = Path(__file__).parent / "frontend"
 _STATIC_DIR = Path(__file__).parent.parent / "src" / "static"
 

@@ -29,6 +29,9 @@ from src.config import settings
 from src.main import app
 from tests.auth_helpers import session_token_for
 
+# Every test runs once per USER_STORE_BACKEND (see conftest.user_store_backend).
+pytestmark = pytest.mark.usefixtures("user_store_backend")
+
 
 def test_is_email_allowed_domains(monkeypatch):
     monkeypatch.setattr(settings, "allowed_email_domains", "mskcc.org,openevidence.com")
@@ -451,6 +454,9 @@ def test_saml_login_redirect(monkeypatch):
     assert "RelayState=%2Fjobs%2F123" in resp.headers["location"]
 
 
+# Redis semantics: IdP groups map to the admin role. With MySQL they never
+# change a role (tests/test_user_store_cutover.py).
+@pytest.mark.redis_user_store_only
 @pytest.mark.asyncio
 async def test_saml_acs_success_and_jit_role_mapping(monkeypatch):
     monkeypatch.setattr(settings, "auth_enabled", True)
@@ -533,6 +539,9 @@ def test_saml_acs_rejections(monkeypatch):
     assert "MSK-OncoKB-Curators" in resp_group.text
 
 
+# Redis semantics: IdP groups map to the admin role. With MySQL they never
+# change a role (tests/test_user_store_cutover.py).
+@pytest.mark.redis_user_store_only
 @pytest.mark.asyncio
 async def test_jit_provisioning_and_user_store(monkeypatch):
     monkeypatch.setattr(settings, "jit_default_role", "curator")
@@ -833,6 +842,9 @@ def test_keycloak_login_endpoint(monkeypatch):
     assert resp_unconfigured.status_code == 501
 
 
+# Redis semantics: IdP groups map to the admin role. With MySQL they never
+# change a role (tests/test_user_store_cutover.py).
+@pytest.mark.redis_user_store_only
 @pytest.mark.asyncio
 async def test_keycloak_callback_flow(monkeypatch):
     monkeypatch.setattr(settings, "auth_enabled", True)

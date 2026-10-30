@@ -1,6 +1,7 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
+from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -77,8 +78,18 @@ class Settings(BaseSettings):
     aws_default_region: str = ""
     aws_profile: str = ""
     acgc_dev_mode: bool = False
+    # Grants every signed-in user admin and enables dev login: local use only
+    # (see dev_mode_startup_error).
     agcg_dev_mode: bool = False
     public_app_base_url: str = "https://acgc.oncokb.org"
+    # Whether PUBLIC_APP_BASE_URL came from the environment / .env rather than
+    # the default above; captured once at construction.
+    _public_app_base_url_configured: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="after")
+    def record_configured_base_url(self) -> "Settings":
+        self._public_app_base_url_configured = "public_app_base_url" in self.model_fields_set
+        return self
     pubmed_max_results: int = 50
     # Shared per-gene budget for partner queries in retrieval and freshness probes.
     pubmed_max_partner_queries: int = Field(default=8, ge=1)
@@ -314,6 +325,15 @@ class Settings(BaseSettings):
     jit_default_role: str = "curator"  # Default role for new users: curator, annotator, viewer
     jit_require_admin_approval: bool = False  # If True, new JIT users start in pending status
 
+    # Where sign-in and per-request permission checks read user records:
+    # "redis" (agcg:user:<email>, the default) or "mysql" (the users table).
+    # With "mysql", new users start as active viewers (pending if
+    # JIT_REQUIRE_ADMIN_APPROVAL) and sign-in never changes an existing role.
+    user_store_backend: Literal["redis", "mysql"] = "redis"
+    # Comma-separated emails made admin once (at startup or sign-in) when
+    # USER_STORE_BACKEND=mysql; never re-granted after an admin removes it.
+    bootstrap_admin_emails: str = ""
+
     # ACGC API keys (scripted access: `Authorization: Bearer acgc_...`)
     api_key_rate_limit_per_minute: int = Field(default=60, ge=1)  # Per-key request budget
     api_key_max_expires_in_days: int = Field(default=365, ge=1)  # Upper bound for expires_in_days
@@ -348,6 +368,12 @@ class Settings(BaseSettings):
         return [e.strip().lower() for e in self.allowed_emails.split(",") if e.strip()]
 
     @property
+    def bootstrap_admin_emails_list(self) -> List[str]:
+        if not self.bootstrap_admin_emails:
+            return []
+        return [e.strip().lower() for e in self.bootstrap_admin_emails.split(",") if e.strip()]
+
+    @property
     def saml_allowed_groups_list(self) -> List[str]:
         if not self.saml_allowed_groups:
             return []
@@ -380,6 +406,43 @@ class Settings(BaseSettings):
     datadog_gene_latency_watchlist: str = (
         "ALK,ROS1,RET,NTRK1,NTRK2,NTRK3,BRAF,EGFR,MET,FGFR1,FGFR2,FGFR3,"
         "ABL1,KMT2A,ETV6,EWSR1,TMPRSS2,ERG,PAX3,PAX7,FOXO1,DDIT3,NUTM1,BCR"
+    )
+
+
+# PUBLIC_APP_BASE_URL hosts that count as a local deployment.
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def dev_mode_startup_error(config: Settings) -> Optional[str]:
+    """Why the app must refuse to start with AGCG_DEV_MODE on, or None.
+
+    Dev mode makes every signed-in user an admin, so it's only allowed when
+    PUBLIC_APP_BASE_URL is absent (not provided at all) or names a local host
+    (localhost, 127.0.0.1, ::1, 0.0.0.0; any scheme or port). A base URL
+    whose host can't be parsed is treated as non-local, and so is one
+    provided but blank: the app then takes its public URL from each request.
+    """
+    if not config.agcg_dev_mode or not config._public_app_base_url_configured:
+        return None
+    url = config.public_app_base_url.strip()
+    if not url:
+        return (
+            "Refusing to start: AGCG_DEV_MODE is on, which grants every signed-in user admin "
+            "privileges, and PUBLIC_APP_BASE_URL is set but blank, so the public URL would come "
+            "from each request's host. Unset AGCG_DEV_MODE for deployed environments, or set "
+            "PUBLIC_APP_BASE_URL to a localhost URL (or leave it out entirely) for local development."
+        )
+    try:
+        host = urlsplit(url if "://" in url else f"//{url}").hostname
+    except ValueError:
+        host = None
+    if host in _LOCAL_HOSTS:
+        return None
+    return (
+        f"Refusing to start: AGCG_DEV_MODE is on, which grants every signed-in user admin "
+        f"privileges, but PUBLIC_APP_BASE_URL points at a non-local host ({host or url!r}). "
+        "Unset AGCG_DEV_MODE for deployed environments, or point PUBLIC_APP_BASE_URL at "
+        "localhost for local development."
     )
 
 

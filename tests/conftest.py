@@ -58,6 +58,10 @@ def _guard_real_backends(monkeypatch):
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
+        "redis_user_store_only: skip under the user_store_backend fixture's mysql run",
+    )
+    config.addinivalue_line(
+        "markers",
         "no_real_redis: never build a client for the configured Redis (or flush it); "
         "the cache client is an in-memory FakeRedis instead",
     )
@@ -172,6 +176,33 @@ def _auth_profiles_in_memory(monkeypatch):
     monkeypatch.setattr(auth, "_user_store", {})
     monkeypatch.setattr(auth, "_user_activity", {})
     yield originals
+
+
+@pytest.fixture(params=["redis", "mysql"])
+def user_store_backend(request, monkeypatch, _auth_profiles_in_memory):
+    """Run a test once per USER_STORE_BACKEND.
+
+    "redis" is today's path (the in-process store unless the test installs a
+    fake Redis); "mysql" points src.auth at a FakeUserStore, the in-memory
+    stand-in with the MySQL store's behaviour, and yields it. Tests marked
+    `redis_user_store_only` exercise Redis specifics and skip under "mysql".
+    tests/auth_helpers.py stores and removes profiles in whichever is active.
+    """
+    from src import auth
+    from src.config import settings
+
+    if request.param == "redis":
+        monkeypatch.setattr(settings, "user_store_backend", "redis")
+        yield None
+        return
+    if request.node.get_closest_marker("redis_user_store_only") is not None:
+        pytest.skip("exercises the Redis user-record code path")
+    from src.pipeline.user_store_fake import FakeUserStore
+
+    store = FakeUserStore()
+    monkeypatch.setattr(settings, "user_store_backend", "mysql")
+    monkeypatch.setattr(auth, "_mysql_user_store", store)
+    yield store
 
 
 @pytest.fixture(autouse=True)

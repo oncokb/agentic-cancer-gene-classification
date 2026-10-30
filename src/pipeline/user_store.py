@@ -39,7 +39,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Tuple
 
 import pymysql
 
-from src.auth import UserStoreUnavailable
+from src.auth import UserStoreUnavailable, describe_store_error
 
 logger = logging.getLogger(__name__)
 
@@ -511,8 +511,19 @@ def decode_id_cursor(cursor: str) -> int:
     return int(raw)
 
 
+# The LIKE escape character, named in every LIKE's ESCAPE clause. Not a
+# backslash: whether '\\' in SQL text is an escape depends on the server's
+# NO_BACKSLASH_ESCAPES mode, while '!' means the same under every sql_mode.
+LIKE_ESCAPE = "!"
+
+
 def escape_like(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    """`value` as a literal inside a LIKE pattern used with ESCAPE '!'."""
+    return (
+        value.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
 
 
 def _loads(value: Any) -> Any:
@@ -585,7 +596,9 @@ async def _store_errors(what: str) -> AsyncIterator[None]:
     try:
         yield
     except _STORE_ERRORS as exc:
-        logger.warning("User store %s failed: %s", what, exc)
+        # Class and MySQL error code only: a driver message can quote row
+        # data (e.g. an email). The cause stays chained for callers.
+        logger.warning("User store %s failed: %s", what, describe_store_error(exc))
         raise UserStoreUnavailable(f"User store {what} failed") from exc
 
 
@@ -623,7 +636,10 @@ class UserStoreMixin:
                 try:
                     await conn.rollback()
                 except BaseException as rollback_exc:
-                    logger.warning("User store rollback failed; discarding connection: %r", rollback_exc)
+                    logger.warning(
+                        "User store rollback failed; discarding connection: %s",
+                        describe_store_error(rollback_exc),
+                    )
                     conn.close()
                     if not isinstance(rollback_exc, Exception):
                         raise
@@ -696,7 +712,7 @@ class UserStoreMixin:
                 )
                 user = await self._fetch_user(cursor, email)
         if user is None:
-            raise UserStoreUnavailable(f"User {email} missing right after upsert")
+            raise UserStoreUnavailable("User store upsert_login: user missing right after upsert")
         return user
 
     async def import_user(self, user: UserRecord) -> bool:
@@ -893,7 +909,10 @@ class UserStoreMixin:
         if needle:
             # Binary substring match on Python-computed keys, like FakeUserStore.
             pattern = f"%{escape_like(needle)}%"
-            where.append("(email_search LIKE %s OR name_search LIKE %s)")
+            where.append(
+                f"(email_search LIKE %s ESCAPE '{LIKE_ESCAPE}' "
+                f"OR name_search LIKE %s ESCAPE '{LIKE_ESCAPE}')"
+            )
             params.extend([pattern, pattern])
         if cursor is not None:
             after_at, after_email = decode_user_cursor(cursor)

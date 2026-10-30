@@ -32,8 +32,12 @@ from src.auth import (
 from src.config import settings
 from src.main import app
 from src.models.schema import AnnotationResult
+from tests.auth_helpers import delete_profile, put_profile, stored_profile
 from tests.test_api_keys import FakeStore
 from tests.test_gene_query_api import FakeRunStore, pipeline_calls  # noqa: F401 (fixture)
+
+# Every test runs once per USER_STORE_BACKEND (see conftest.user_store_backend).
+pytestmark = pytest.mark.usefixtures("user_store_backend")
 
 PROTECTED = "/v1/annotate/does-not-exist"  # require_auth; 404 once authenticated
 ADMIN_ONLY = "/auth/users"  # require_admin
@@ -126,8 +130,13 @@ class _FakePipeline:
 
 
 @pytest.fixture
-def redis_store(monkeypatch):
-    """Run the real Redis-backed profile store code against a FakeAuthRedis."""
+def redis_store(monkeypatch, user_store_backend):
+    """Run the real Redis-backed profile store code against a FakeAuthRedis.
+
+    Redis specifics only: under USER_STORE_BACKEND=mysql these tests skip;
+    tests/test_user_store_cutover.py covers the same guarantees there."""
+    if user_store_backend is not None:
+        pytest.skip("exercises the Redis user-record code path")
     fake = FakeAuthRedis()
 
     async def get_client():
@@ -141,7 +150,8 @@ def redis_store(monkeypatch):
 
 
 def _set_profile(email: str = EMAIL, redis: FakeAuthRedis | None = None, **overrides) -> UserProfile:
-    """Store a profile the way save_user_profile does: Redis (if any) and in-process."""
+    """Store a profile the way save_user_profile does: Redis (if any) and in-process
+    (or in the MySQL stand-in under USER_STORE_BACKEND=mysql)."""
     now_iso = datetime.now(timezone.utc).isoformat()
     data = dict(
         email=email,
@@ -157,7 +167,7 @@ def _set_profile(email: str = EMAIL, redis: FakeAuthRedis | None = None, **overr
     if redis is not None:
         redis.data[f"agcg:user:{email}"] = profile.model_dump_json()
         redis.sets.setdefault("agcg:users", set()).add(email)
-    auth_module._user_store[email] = profile
+    put_profile(profile)
     return profile
 
 
@@ -249,7 +259,8 @@ def test_decoder_only_checks_signature_expiry_and_allowlist():
 
 def test_deleted_profile_invalidates_session():
     client = _login()
-    del auth_module._user_store[EMAIL]
+    assert client.get(PROTECTED).status_code == 404
+    delete_profile(EMAIL)
 
     assert client.get(PROTECTED).status_code == 401
     page = client.get("/runs", follow_redirects=False)
@@ -304,6 +315,7 @@ def test_redis_get_error_fails_closed_with_503_and_keeps_cookie(redis_store):
     assert client.get(PROTECTED).status_code == 404
 
 
+@pytest.mark.redis_user_store_only
 def test_redis_client_init_failure_fails_closed_with_503(monkeypatch):
     import redis.asyncio as redis_asyncio
 
@@ -420,6 +432,9 @@ def keycloak_login(monkeypatch):
     return login
 
 
+# Redis semantics: a Keycloak admin role maps to the admin role. With MySQL a
+# new user is a viewer (tests/test_user_store_cutover.py).
+@pytest.mark.redis_user_store_only
 def test_keycloak_login_without_jit_stores_profile(keycloak_login):
     browser, resp = keycloak_login(role="admin")
     assert resp.status_code == 303
@@ -438,7 +453,7 @@ def test_keycloak_login_without_jit_keeps_stored_status(keycloak_login):
     _, resp = keycloak_login()
     assert resp.status_code == 403
     assert "pending administrator approval" in resp.text
-    assert auth_module._user_store[EMAIL].status == "pending"
+    assert stored_profile(EMAIL).status == "pending"
 
 
 @pytest.fixture
@@ -481,6 +496,9 @@ def test_saml_login_token_provider_comes_from_login_path(monkeypatch):
     assert decode_session_token(resp.cookies.get(settings.auth_cookie_name)).provider == "saml"
 
 
+# Redis merge rules (admin stickiness, merged groups); MySQL's are in
+# tests/test_user_store_cutover.py.
+@pytest.mark.redis_user_store_only
 def test_jit_off_and_jit_on_returning_user_merges_agree(keycloak_login, monkeypatch):
     # Returning-user merge rules are shared: admin stickiness, merged groups,
     # stored status preserved. Only new-user admission differs between them.
@@ -535,6 +553,7 @@ def test_login_fails_closed_with_503_on_profile_store_error(redis_store, google_
     assert "set-cookie" not in resp.headers
 
 
+@pytest.mark.redis_user_store_only
 def test_login_fails_closed_with_503_on_redis_init_failure(google_login, monkeypatch):
     import redis.asyncio as redis_asyncio
 
@@ -607,6 +626,9 @@ async def test_failed_activity_write_is_not_buffered_in_memory(redis_store):
 # ---------------------------------------------------------------------------
 
 
+# Without Redis or MySQL a key owner without a profile keeps the default role;
+# with MySQL that owner is rejected (tests/test_user_store_cutover.py).
+@pytest.mark.redis_user_store_only
 def test_api_key_path_does_not_use_session_profile_check(auth_env, monkeypatch):
     headers = _add_api_key(auth_env)
 

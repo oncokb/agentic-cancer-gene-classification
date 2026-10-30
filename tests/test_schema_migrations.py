@@ -12,10 +12,17 @@ from src.pipeline import schema_migrations
 
 
 class FakeCursor:
-    """Records SQL; `columns` is the live schema and `errors` simulates ALTER races."""
+    """Records SQL; `columns` is the live schema and `errors` simulates ALTER races.
 
-    def __init__(self, columns: Dict[str, set], errors: Optional[List[Any]] = None) -> None:
+    `no_backslash_escapes` models that sql_mode: LIKE then has no default
+    escape character, so a backslash in a pattern is a literal backslash."""
+
+    def __init__(
+        self, columns: Dict[str, set], errors: Optional[List[Any]] = None,
+        *, no_backslash_escapes: bool = False,
+    ) -> None:
         self.columns = columns
+        self.no_backslash_escapes = no_backslash_escapes
         self.errors = list(errors or [])  # popped per ALTER: an errno, or None for success
         self.sql: List[str] = []
         self.params: List[Any] = []
@@ -26,10 +33,12 @@ class FakeCursor:
         self.params.append(params)
         if sql.startswith("SHOW COLUMNS"):
             table = sql.split()[3]
-            self._result = next(
-                ((name,) for name in self.columns.get(table, set()) if _like_matches(name, params[0])),
-                None,
-            )
+            if sql.endswith("WHERE Field = %s"):
+                matches = lambda name: name == params[0]  # noqa: E731
+            else:
+                escape = None if self.no_backslash_escapes else "\\"
+                matches = lambda name: _like_matches(name, params[0], escape)  # noqa: E731
+            self._result = next(((name,) for name in self.columns.get(table, set()) if matches(name)), None)
         elif sql.startswith("ALTER TABLE"):
             outcome = self.errors.pop(0) if self.errors else None
             table = sql.split()[2]
@@ -45,12 +54,12 @@ class FakeCursor:
         return self._result
 
 
-def _like_matches(value: str, pattern: str) -> bool:
+def _like_matches(value: str, pattern: str, escape: Optional[str] = "\\") -> bool:
     regex = ""
     index = 0
     while index < len(pattern):
         character = pattern[index]
-        if character == "\\" and index + 1 < len(pattern):
+        if escape is not None and character == escape and index + 1 < len(pattern):
             index += 1
             regex += re.escape(pattern[index])
         elif character == "_":
@@ -121,11 +130,29 @@ async def test_invalid_identifier_is_rejected_before_sql(table, column):
     assert cursor.sql == []
 
 
-async def test_show_columns_escapes_underscore_in_column_name():
-    cursor = FakeCursor({"runs": {"ownerXemail"}})
+@pytest.mark.parametrize("no_backslash_escapes", [False, True])
+async def test_column_check_is_an_exact_match_under_any_sql_mode(no_backslash_escapes):
+    # An underscore is not a wildcard: ownerXemail doesn't count as owner_email.
+    cursor = FakeCursor({"runs": {"ownerXemail"}}, no_backslash_escapes=no_backslash_escapes)
     await schema_migrations.add_column_if_missing(cursor, "runs", "owner_email", "VARCHAR(255)")
-    assert cursor.params[0] == (r"owner\_email",)
+    assert cursor.sql[0] == "SHOW COLUMNS FROM runs WHERE Field = %s"
+    assert cursor.params[0] == ("owner_email",)
     assert "owner_email" in cursor.columns["runs"]
+
+
+@pytest.mark.parametrize("no_backslash_escapes", [False, True])
+async def test_existing_column_with_underscore_is_found_under_any_sql_mode(no_backslash_escapes):
+    # A backslash-escaped LIKE pattern misses the column under NO_BACKSLASH_ESCAPES.
+    cursor = FakeCursor({"runs": {"owner_email"}}, no_backslash_escapes=no_backslash_escapes)
+    await schema_migrations.add_column_if_missing(cursor, "runs", "owner_email", "VARCHAR(255)")
+    assert not any(sql.startswith("ALTER") for sql in cursor.sql)
+    assert not any("LIKE" in sql or "\\" in sql for sql in cursor.sql)
+
+
+def test_backslash_like_pattern_misses_under_no_backslash_escapes():
+    # Documents the fixed bug, using the fake's LIKE model.
+    assert _like_matches("owner_email", r"owner\_email")
+    assert not _like_matches("owner_email", r"owner\_email", escape=None)
 
 
 @pytest.mark.parametrize("duplicate_errno", [1060, 1061, 1068])

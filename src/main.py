@@ -40,8 +40,11 @@ from src.auth import (
     AuthUserResponse,
     UserProfile,
     UserStoreUnavailable,
+    bootstrap_admins_at_startup,
+    describe_store_error,
     build_saml_authn_request,
     clear_session_cookie,
+    configure_mysql_user_store,
     create_oauth_state,
     create_session_token,
     exchange_google_code,
@@ -56,6 +59,7 @@ from src.auth import (
     is_email_allowed,
     is_saml_group_allowed,
     list_user_profiles,
+    mysql_user_store_enabled,
     parse_keycloak_user,
     parse_saml_response,
     provision_or_update_user,
@@ -68,7 +72,7 @@ from src.auth import (
     validate_redirect_to,
     verify_oauth_state,
 )
-from src.config import settings
+from src.config import dev_mode_startup_error, settings
 from src.job_store import JobStore, can_read_job, job_owner
 from src.logging_utils import install_secret_redaction_filter
 from src.models.schema import (
@@ -178,6 +182,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    dev_mode_error = dev_mode_startup_error(settings)
+    if dev_mode_error:
+        logger.critical(dev_mode_error)
+        raise RuntimeError(dev_mode_error)
     # Build the DogStatsD client (file/DNS I/O) off the event loop, once,
     # before any request can emit a metric. Metrics are optional: nothing
     # about them may stop the app from starting.
@@ -186,6 +194,11 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Datadog metrics initialization failed; continuing without metrics", exc_info=True)
     app.state.run_store = await RunStore.create()
+    if mysql_user_store_enabled():
+        # Sign-in and per-request permission checks read the users table;
+        # Redis user records are left untouched (rollback = USER_STORE_BACKEND=redis).
+        configure_mysql_user_store(app.state.run_store)
+        await bootstrap_admins_at_startup()
     logger.info(
         "Application startup: auth_enabled=%s, google_client_id_configured=%s, "
         "google_client_secret_configured=%s (len=%d), auth_secret_key_configured=%s",
@@ -197,6 +210,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     await _cancel_openevidence_sidecar_lookups()
+    configure_mysql_user_store(None)
     await app.state.run_store.close()
     try:
         await asyncio.to_thread(shutdown_statsd)
@@ -2737,7 +2751,7 @@ app.include_router(gene_query_router)
 async def user_store_unavailable_handler(request: Request, exc: UserStoreUnavailable):
     """Fail closed when the user profile store can't be read (e.g. during login
     provisioning): never provision or authorize from a stale in-process copy."""
-    logger.error("User profile store unavailable for %s: %s", request.url.path, exc)
+    logger.error("User profile store unavailable for %s: %s", request.url.path, describe_store_error(exc))
     detail = "Sign-in is temporarily unavailable. Please retry shortly."
     if request.url.path.startswith("/auth/"):
         return HTMLResponse(

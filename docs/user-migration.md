@@ -1,8 +1,16 @@
-# Runbook: copy users from Redis to MySQL
+# Runbook: move users from Redis to MySQL
+
+Two parts: copy the users (`python -m src.scripts.migrate_users_to_mysql`),
+then switch sign-in and permission checks over with `USER_STORE_BACKEND=mysql`
+([Cutover](#cutover-switch-sign-in-to-mysql) below). The switch ships off
+(`USER_STORE_BACKEND=redis` is the default), so deploying it changes nothing
+until the setting is flipped.
+
+## Copy users
 
 `python -m src.scripts.migrate_users_to_mysql` copies the user profiles that
 sign-in keeps in Redis into the MySQL `users` table. Run it in production
-**before** deploying the change that switches sign-in to MySQL.
+**before** setting `USER_STORE_BACKEND=mysql`.
 
 What it does:
 
@@ -35,7 +43,7 @@ or Redis can't be reached, the Redis URL is malformed, or a required table is
 missing (nothing written). The check is per email. MySQL users that aren't in
 Redis are counted but don't fail it.
 
-## Steps
+### Steps
 
 1. **Open a shell where the app's environment is set.** The simplest way is
    the running app pod, which already has `REDIS_URL` and the MySQL settings:
@@ -90,3 +98,74 @@ The script can be re-run any number of times. Run it once more just before
 the switch-over deploy to copy users who signed up in the meantime. It does
 not copy logins or annotations made after the first apply by users who are
 already in MySQL. A re-run lists those users as differing.
+
+## Cutover: switch sign-in to MySQL
+
+`USER_STORE_BACKEND` decides where sign-in (Google, Keycloak, SAML, dev
+login), the per-request permission check, the API-key owner check, the admin
+user list (`GET /auth/users`) and usage counts read and write user records.
+
+| | `redis` (default) | `mysql` |
+|---|---|---|
+| User records | `agcg:user:<email>` in Redis | `users` table |
+| New user | `JIT_DEFAULT_ROLE`, active | **viewer**, active |
+| `JIT_REQUIRE_ADMIN_APPROVAL=true` | new user pending | new user pending |
+| Returning user's role/status | kept, except IdP admin groups (Keycloak `KEYCLOAK_ADMIN_ROLES`, `SAML_ADMIN_GROUPS`) make them admin | **never changed by sign-in**; IdP groups are stored but don't set a role |
+| `BOOTSTRAP_ADMIN_EMAILS` | ignored | made admin once (see below) |
+
+Unchanged with either backend: every request re-reads the user's current
+role and status with exactly one lookup and no cache; a user missing from
+the store must sign in again (401); an unreachable store is a 503 (sign-in
+sets no cookie, an existing session is kept); an API key whose owner is
+missing is rejected (401). With `mysql` there is no fallback to Redis or to
+the session's claims, and Redis user data is neither read nor modified.
+
+Usage counters (`annotation_count`, `last_annotation_at`) are not an access
+check and are recorded after the work. If that write fails, the annotation
+response (or job) still succeeds, the count is dropped (never buffered) and
+an error is logged under `user_store.activity_write_failed` (no email in
+the message). Only the per-request user lookup fails closed with 503.
+
+`BOOTSTRAP_ADMIN_EMAILS` (comma-separated) is applied at startup to listed
+users already in MySQL, and at sign-in to the rest. With `mysql`, the app
+**refuses to start** when the user store can't be read or granting a listed
+existing user fails, rather than serving without the configured admin. Each listed user is made
+admin once, logged in `role_changes` with the actor `system:migration`, the
+same actor as the script's `--bootstrap-admin`. Any earlier grant by either
+one counts: if an admin later removes the role, neither a restart nor a
+sign-in grants it again.
+
+### Steps
+
+1. **Dry run** the copy (step 2 above) and check the counts.
+2. **Apply** it (step 3 above): expect `Result: OK` and exit code 0.
+3. **Verify the counts**: re-run the dry run (step 4 above). Expect
+   `Users that would be created: 0` and `Redis users missing from MySQL: 0`
+   (from the apply).
+4. **Set** in the deployment's environment (ConfigMap / secret):
+
+   ```sh
+   USER_STORE_BACKEND=mysql
+   BOOTSTRAP_ADMIN_EMAILS=kuangf@mskcc.org
+   ```
+
+   Re-run the copy (`--apply`) right before this step if anyone signed up
+   since the last apply; while sign-in still uses Redis, new sign-ups land
+   only there.
+5. **Restart** the app (`kubectl -n <namespace> rollout restart
+   deployment/<app>`). Startup logs `MySQL user store ready: N active
+   admin(s)` and `Bootstrap admin for kuangf@mskcc.org: already admin` (or
+   `granted`). If pods crash-loop with `UserStoreStartupError`, MySQL isn't
+   readable or the grant failed: fix it, or roll back (below).
+6. **Check**: sign in as the bootstrap admin, open `GET /auth/users` (all
+   migrated users listed with roles), and sign in as a non-admin to confirm
+   their role is unchanged.
+
+### Rollback
+
+Set `USER_STORE_BACKEND=redis` (`BOOTSTRAP_ADMIN_EMAILS` is then ignored) and
+restart. Sign-in goes back to the Redis records, which the MySQL backend
+never touched. **Users created and role/status changes made while on `mysql`
+are not in Redis**: those users get a fresh Redis record (`JIT_DEFAULT_ROLE`)
+at their next sign-in, and role changes have to be redone. Their MySQL rows
+stay, so switching back to `mysql` later picks them up again.

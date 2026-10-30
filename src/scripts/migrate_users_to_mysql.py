@@ -43,7 +43,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from pydantic import ValidationError
 
-from src.auth import UserProfile, UserStoreUnavailable, _activity_key, _with_activity
+from src.auth import UserProfile, UserStoreUnavailable, _activity_key, _with_activity, describe_store_error
 from src.pipeline.user_store import (
     BOOTSTRAP_ACTOR,
     BOOTSTRAP_ALREADY_ADMIN,
@@ -544,7 +544,7 @@ async def _run(args: argparse.Namespace) -> int:
             show_emails=args.show_emails,
         )
     except UserStoreUnavailable as exc:
-        print(f"MySQL error: {exc}", file=sys.stderr)
+        print(f"MySQL error: {describe_store_error(exc)}", file=sys.stderr)
         return 2
     except redis_asyncio.RedisError as exc:
         print(f"Redis error: {type(exc).__name__}", file=sys.stderr)

@@ -39,6 +39,9 @@ from src.config import settings
 from src.main import app
 from tests.auth_helpers import session_token_for
 
+# Every test runs once per USER_STORE_BACKEND (see conftest.user_store_backend).
+pytestmark = pytest.mark.usefixtures("user_store_backend")
+
 # ---------------------------------------------------------------------------
 # Pure logic
 # ---------------------------------------------------------------------------
