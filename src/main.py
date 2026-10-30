@@ -1062,45 +1062,62 @@ def _annotation_match_keys(annotation: Dict[str, Any]) -> set[str]:
 
 def _validate_retry_inputs(
     stored_result: Dict[str, Any], inputs: List[FusionInput], kind: RunRetryKind,
-) -> List[FusionInput]:
-    """The retry's inputs, deduplicated by gene, or a 422 for the whole request.
+) -> Tuple[List[FusionInput], Dict[str, str]]:
+    """The retry's inputs and the row each one targets, or a 422 for the
+    whole request.
 
     A retry works on genes, not submissions: every input must be a plain gene
-    (no fusion, no breakpoint fields) whose row on this run is currently
-    eligible for a `kind` retry. A fusion would re-annotate its other partner
-    too, and a permanently rejected gene would just fail the same way again,
-    so either one rejects the request instead of being processed in part."""
+    (no fusion, no breakpoint fields) naming exactly one row that is currently
+    eligible for a `kind` retry, by its gene or by a spelling it was resolved
+    from (an alias, Ensembl or RefSeq ID). A fusion would re-annotate its
+    other partner too, and a permanently rejected gene would just fail the
+    same way again, so either one rejects the request instead of being
+    processed in part.
+
+    Returns the inputs (one per target row) and a map from each submitted
+    spelling (normalized) to its row's key, the row's normalized `gene`. The
+    merge writes by that key, never by whatever spelling comes back."""
     rows = stored_result.get("annotations") or []
-    eligible: set[str] = set()
+    eligible_rows: Dict[str, set[str]] = {}
     permanent: set[str] = set()
     for row in rows:
+        row_key = _normalized_retry_token(row.get("gene"))
         if _is_retry_eligible(row, kind):
-            eligible |= _annotation_match_keys(row)
+            for key in _annotation_match_keys(row):
+                eligible_rows.setdefault(key, set()).add(row_key)
         elif _is_permanent_rejection(row):
             permanent |= _annotation_match_keys(row)
     label = "failed" if kind == "errors" else "no-result"
     problems: List[str] = []
     accepted: List[FusionInput] = []
-    seen: set[str] = set()
+    targets: Dict[str, str] = {}
     for item in inputs:
         token = _normalized_retry_token(item.fusion)
+        matched = eligible_rows.get(token, set())
         if is_fusion_input(item.fusion):
             problems.append(f"{item.fusion!r} is a fusion; retry its genes individually")
         elif any(getattr(item, field) is not None for field in _BREAKPOINT_FIELDS):
             problems.append(f"{item.fusion!r} has breakpoint fields, which only apply to fusions")
         elif token in permanent:
             problems.append(f"{item.fusion!r} was rejected permanently and would fail the same way")
-        elif token not in eligible:
+        elif not matched:
             problems.append(f"{item.fusion!r} is not a {label} gene on this run")
-        elif token not in seen:
-            seen.add(token)
-            accepted.append(item)
+        elif len(matched) > 1:
+            problems.append(
+                f"{item.fusion!r} matches more than one {label} row "
+                f"({', '.join(sorted(matched))}); retry each by its gene"
+            )
+        else:
+            row_key = next(iter(matched))
+            if row_key not in targets.values():
+                accepted.append(item)
+            targets.setdefault(token, row_key)
     if problems:
         raise HTTPException(
             status_code=422,
             detail="Not retryable: " + "; ".join(problems) + ".",
         )
-    return accepted
+    return accepted, targets
 
 
 def _annotation_rank(annotation: Dict[str, Any]) -> int:
@@ -1112,39 +1129,59 @@ def _annotation_rank(annotation: Dict[str, Any]) -> int:
     return 2
 
 
+def _merged_resolved_inputs(
+    stored_row: Dict[str, Any], incoming: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """The stored row's submitted spellings plus the retry's, one per input."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for resolution in [*(stored_row.get("resolved_inputs") or []), *(incoming.get("resolved_inputs") or [])]:
+        merged[_normalized_retry_token(resolution.get("input"))] = resolution
+    return list(merged.values())
+
+
 def _merge_retried_annotations(
     stored: Dict[str, Any],
     incoming: List[Dict[str, Any]],
     warnings: List[str],
-    targets: set[str],
+    targets: Dict[str, str],
     kind: RunRetryKind,
 ) -> Dict[str, Any]:
     """Merge a gene retry into a stored run, in place.
 
-    Only rows for the retried genes (`targets`, normalized) that are still
-    eligible for a `kind` retry are written; every other row, including a
-    target that got a good result meanwhile, is left exactly as it was. A
-    target row is only replaced by a result at least as good (a retry that
-    fails again never overwrites a no-result row with an error). Incoming rows
-    for genes the retry wasn't asked for are dropped, never appended. Existing
-    warnings are kept; new warnings about an updated gene are added.
-    genes_annotated is recomputed."""
+    `targets` maps each submitted spelling to the key (normalized `gene`) of
+    the row it was validated against. An incoming annotation is routed to a
+    target row by that map (via its gene or the spellings it was resolved
+    from) and written there only while the row is still eligible for a `kind`
+    retry, and only with a result at least as good (a retry that fails again
+    never overwrites a no-result row with an error). Every other row,
+    including a target that got a good result meanwhile, is left exactly as
+    it was; incoming rows for genes the retry wasn't asked for are dropped,
+    never appended. The written row keeps the stored row's resolved_inputs
+    alongside the retry's. Existing warnings are kept; new warnings about an
+    updated gene are added. genes_annotated is recomputed."""
     rows = list(stored.get("annotations") or [])
+    row_keys = set(targets.values())
     updated_keys: set[str] = set()
     for item in incoming:
-        keys = _annotation_match_keys(item) & targets
-        matches = [
-            index for index, row in enumerate(rows)
-            if _normalized_retry_token(row.get("gene")) in keys and _is_retry_eligible(row, kind)
-        ]
-        if not matches or _annotation_rank(item) < _annotation_rank(rows[matches[0]]):
-            continue
-        rows[matches[0]] = item
-        # Another submitted spelling of the same gene (its raw input) is now covered.
-        for index in reversed(matches[1:]):
-            if _annotation_rank(rows[index]) <= _annotation_rank(item):
-                del rows[index]
-        updated_keys |= keys | {_normalized_retry_token(item.get("gene"))}
+        keys = _annotation_match_keys(item)
+        destinations = {targets[key] for key in keys if key in targets} | (keys & row_keys)
+        for destination in destinations:
+            index = next(
+                (
+                    i for i, row in enumerate(rows)
+                    if _normalized_retry_token(row.get("gene")) == destination
+                    and _is_retry_eligible(row, kind)
+                ),
+                None,
+            )
+            if index is None or _annotation_rank(item) < _annotation_rank(rows[index]):
+                continue
+            row = dict(item)
+            resolved_inputs = _merged_resolved_inputs(rows[index], item)
+            if resolved_inputs:
+                row["resolved_inputs"] = resolved_inputs
+            rows[index] = row
+            updated_keys |= keys | {destination}
     existing_warnings = list(stored.get("warnings") or [])
     for warning in warnings:
         if warning not in existing_warnings and _warning_mentions_any(warning, updated_keys):
@@ -2077,7 +2114,7 @@ async def _persist_retried_annotations(
     http_request: Request,
     run_id: str,
     result: AnnotationResult,
-    targets: set[str],
+    targets: Dict[str, str],
     kind: RunRetryKind,
 ) -> None:
     """Merge a completed retry onto its run under the run's row lock, so it
@@ -2119,6 +2156,7 @@ async def _launch_run_retry_job(
     run_id: str,
     request: AnnotateRequest,
     kind: RunRetryKind,
+    targets: Dict[str, str],
     http_request: Request,
     current_user: Optional[AuthenticatedUser],
 ) -> str:
@@ -2165,7 +2203,6 @@ async def _launch_run_retry_job(
                 on_total_known=on_total_known,
             )
             result.run_id = run_id
-            targets = {_normalized_retry_token(item.fusion) for item in request.fusions}
             await _persist_retried_annotations(http_request, run_id, result, targets, kind)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
@@ -2233,7 +2270,7 @@ async def retry_run_annotations(
     stored = await store.get_run(run_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="Run not found")
-    retry_inputs = _validate_retry_inputs(stored, request.inputs, request.kind)
+    retry_inputs, targets = _validate_retry_inputs(stored, request.inputs, request.kind)
     force_refresh = (
         request.force_refresh if request.force_refresh is not None
         else request.kind == "no_result"
@@ -2242,7 +2279,7 @@ async def retry_run_annotations(
     annotate_request = _run_retry_request(stored_request, retry_inputs, force_refresh)
     _record_annotation_request_metrics(annotate_request, http_request, current_user)
     job_id = await _launch_run_retry_job(
-        run_id, annotate_request, request.kind, http_request, current_user,
+        run_id, annotate_request, request.kind, targets, http_request, current_user,
     )
     return AnnotationJobCreateResponse(
         job_id=job_id,

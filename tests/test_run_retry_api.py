@@ -160,8 +160,12 @@ def _ok_pipeline(monkeypatch, seen=None, annotations=None):
 
 
 def _merge(stored, incoming, targets, kind="errors", warnings=()):
+    """`targets` is a {submitted spelling: row key} map, or a set of row genes
+    each submitted under its own name."""
+    if not isinstance(targets, dict):
+        targets = {target: target for target in targets}
     return main._merge_retried_annotations(
-        copy.deepcopy(stored), _dump(incoming), list(warnings), set(targets), kind,
+        copy.deepcopy(stored), _dump(incoming), list(warnings), targets, kind,
     )
 
 
@@ -256,6 +260,7 @@ def test_merge_replaces_row_stored_under_its_raw_input():
     )
 
     merged = _merge(stored, [retried], {"ENSG00000157764"})
+    assert merged["annotations"][0]["resolved_inputs"][0]["input"] == "ENSG00000157764"
 
     assert [item["gene"] for item in merged["annotations"]] == ["BRAF", "TP53"]
     assert merged["genes_annotated"] == 2
@@ -476,7 +481,9 @@ def test_concurrent_retry_and_fusion_evidence_attach_do_not_clobber(monkeypatch)
         evidence = [FusionEvidenceResult(fusion="EML4::ALK", tumor_type="LUAD", pmids=["1"])]
 
         await asyncio.gather(
-            main._persist_retried_annotations(request, "run-1", retried, {"ALK"}, "errors"),
+            main._persist_retried_annotations(
+                request, "run-1", retried, {"ALK": "ALK"}, "errors",
+            ),
             main._persist_fusion_evidence(request, "run-1", evidence),
         )
         return store.stored
@@ -626,3 +633,125 @@ def test_run_inputs_endpoint_reads_single_gene_requests(monkeypatch):
     assert response.status_code == 200
     assert response.json()["inputs"][0]["fusion"] == "BRAF"
     assert response.json()["inputs"][0]["tumor_type"] == "Melanoma"
+
+
+# ---------------------------------------------------------------------------
+# Retrying a row by a spelling it was resolved from
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["CD246", "cd246", "ENSG00000171094", "ENST00000389048", "NM_004304.5"],
+)
+def test_retry_by_a_resolved_spelling_updates_the_saved_row(monkeypatch, fresh_jobs, spelling):
+    # The run saved the failed ALK row under its canonical gene; the user had
+    # submitted an alias, an Ensembl ID or a RefSeq accession.
+    stored_resolution = {"input": spelling.upper(), "resolved": "ALK"}
+    stored = _stored_run(annotations=[
+        {
+            "gene": "ALK",
+            "insufficient_evidence": True,
+            "error": "Synthesis error: timeout",
+            "resolved_inputs": [stored_resolution],
+        },
+        {"gene": "TP53", "insufficient_evidence": False, "cancer_associated": True},
+    ])
+    seen = []
+    _ok_pipeline(monkeypatch, seen, annotations=[_annotation(
+        "ALK",
+        gene_summary="Retried",
+        resolved_inputs=[{"input": spelling, "resolved": "ALK"}],
+    )])
+    store = _FakeRunStore(stored)
+    _use_store(monkeypatch, store)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/runs/run-1/retry", json={"kind": "errors", "inputs": [spelling]},
+    )
+
+    assert response.status_code == 200
+    assert _poll(client, response.json()["status_url"])["status"] == "complete"
+    assert [item["fusions"] for item in seen] == [[{"fusion": spelling}]]
+    alk = store.stored["annotations"][0]
+    assert alk["gene"] == "ALK"
+    assert alk["gene_summary"] == "Retried"
+    assert alk["error"] is None
+    assert spelling.upper() in {item["input"].upper() for item in alk["resolved_inputs"]}
+    assert store.stored["annotations"][1] == stored["annotations"][1]
+    assert store.stored["genes_annotated"] == 2
+
+
+def test_retry_by_spelling_keeps_the_rows_other_resolved_inputs(monkeypatch, fresh_jobs):
+    stored = _stored_run(annotations=[{
+        "gene": "ALK",
+        "insufficient_evidence": True,
+        "error": "Synthesis error: timeout",
+        "resolved_inputs": [
+            {"input": "CD246", "resolved": "ALK"},
+            {"input": "ENSG00000171094", "resolved": "ALK"},
+        ],
+    }])
+    _ok_pipeline(monkeypatch, annotations=[_annotation(
+        "ALK", gene_summary="Retried", resolved_inputs=[{"input": "CD246", "resolved": "ALK"}],
+    )])
+    store = _FakeRunStore(stored)
+    _use_store(monkeypatch, store)
+    client = TestClient(main.app)
+
+    response = client.post("/v1/runs/run-1/retry", json={"kind": "errors", "inputs": ["CD246"]})
+
+    assert _poll(client, response.json()["status_url"])["status"] == "complete"
+    alk = store.stored["annotations"][0]
+    assert alk["gene_summary"] == "Retried"
+    assert [item["input"] for item in alk["resolved_inputs"]] == ["CD246", "ENSG00000171094"]
+
+
+def test_spelling_matching_more_than_one_eligible_row_is_rejected(monkeypatch, fresh_jobs):
+    stored = _stored_run(annotations=[
+        {
+            "gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout",
+            "resolved_inputs": [{"input": "SHARED1", "resolved": "ALK"}],
+        },
+        {
+            "gene": "LTK", "insufficient_evidence": True, "error": "Synthesis error: timeout",
+            "resolved_inputs": [{"input": "SHARED1", "resolved": "LTK"}],
+        },
+    ])
+
+    response = _rejected(monkeypatch, stored, {"kind": "errors", "inputs": ["ALK", "SHARED1"]})
+
+    assert response.status_code == 422
+    assert "'SHARED1' matches more than one failed row (ALK, LTK)" in response.json()["detail"]
+
+
+def test_unmappable_spelling_is_rejected(monkeypatch, fresh_jobs):
+    stored = _stored_run(annotations=[{
+        "gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout",
+        "resolved_inputs": [{"input": "CD246", "resolved": "ALK"}],
+    }])
+
+    response = _rejected(monkeypatch, stored, {"kind": "errors", "inputs": ["CD246", "ENSG00000000001"]})
+
+    assert response.status_code == 422
+    assert "'ENSG00000000001' is not a failed gene" in response.json()["detail"]
+
+
+def test_retry_by_spelling_routes_by_row_key_without_resolved_inputs(monkeypatch, fresh_jobs):
+    # Even if the retried annotation doesn't echo the submitted spelling, it is
+    # written to the row the spelling was validated against.
+    stored = _stored_run(annotations=[{
+        "gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout",
+        "resolved_inputs": [{"input": "CD246", "resolved": "ALK"}],
+    }])
+    _ok_pipeline(monkeypatch, annotations=[_annotation("ALK", gene_summary="Retried")])
+    store = _FakeRunStore(stored)
+    _use_store(monkeypatch, store)
+    client = TestClient(main.app)
+
+    response = client.post("/v1/runs/run-1/retry", json={"kind": "errors", "inputs": ["CD246"]})
+
+    assert _poll(client, response.json()["status_url"])["status"] == "complete"
+    assert store.stored["annotations"][0]["gene_summary"] == "Retried"
+    assert store.stored["annotations"][0]["resolved_inputs"] == [{"input": "CD246", "resolved": "ALK"}]

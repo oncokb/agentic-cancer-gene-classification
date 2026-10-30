@@ -235,6 +235,34 @@ async function testFusionWithGoodPartnerSendsOnlyTheGene() {
   assert.deepStrictEqual(rows[1], goodTp53, "the good partner row is untouched");
 }
 
+async function testRetryKeepsTheRowsSubmittedSpellings() {
+  const sandbox = app(retryFetch([{
+    status: "complete",
+    result: {
+      annotations: [{
+        gene: "ALK", insufficient_evidence: false, gene_summary: "Retried",
+        resolved_inputs: [{ input: "CD246", resolved: "ALK" }],
+      }],
+    },
+  }]));
+  renderNoResult(sandbox, [{
+    gene: "ALK", insufficient_evidence: true, error: "Synthesis error: timeout",
+    resolved_inputs: [
+      { input: "CD246", resolved: "ALK" },
+      { input: "ENSG00000171094", resolved: "ALK" },
+    ],
+  }]);
+
+  await sandbox.retryFailedAnnotations("errors");
+
+  const alk = sandbox.state.currentResult.annotations[0];
+  assert.strictEqual(alk.gene_summary, "Retried");
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(alk.resolved_inputs.map((item) => item.input))),
+    ["CD246", "ENSG00000171094"],
+  );
+}
+
 async function testTumorTypeIsTheFirstSubmittedForTheGene() {
   const calls = [];
   const sandbox = app(retryFetch([{ status: "complete", result: { annotations: [] } }], calls));
@@ -419,6 +447,7 @@ const tests = [
   testFusionWithPermanentlyRejectedPartnerSendsOnlyTheGene,
   testFusionWithGoodPartnerSendsOnlyTheGene,
   testTumorTypeIsTheFirstSubmittedForTheGene,
+  testRetryKeepsTheRowsSubmittedSpellings,
   testRetryErrorKeepsOldRows,
   testFailedJobLeavesPageUnchanged,
   testWorseResultNeverReplacesExisting,

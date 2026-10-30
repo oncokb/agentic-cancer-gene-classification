@@ -872,14 +872,17 @@ curl -s -X POST https://acgc.oncokb.org/v1/runs/example-run-id/retry \
 | Field | Description |
 |---|---|
 | `kind` | Required. `errors` retries genes whose annotation failed for a transient reason; `no_result` re-checks genes on the No result tab that have no error. |
-| `inputs` | Required, 1 to `ANNOTATE_MAX_INPUTS` entries. Plain genes (structured inputs or strings, as in `POST /v1/annotate/jobs`), each named as its row's `gene`, with the tumor type it was annotated under. |
+| `inputs` | Required, 1 to `ANNOTATE_MAX_INPUTS` entries. Plain genes (structured inputs or strings, as in `POST /v1/annotate/jobs`), each naming one row by its `gene` or by a spelling it was resolved from (an alias, Ensembl ID or RefSeq accession in its `resolved_inputs`), with the tumor type it was annotated under. |
 | `force_refresh` | Optional. Defaults to `true` for `no_result` (a cached result would just repeat) and `false` for `errors`. |
 
 Every input must be a plain gene whose row on this run is currently eligible
 for `kind`. If any input is a fusion, carries breakpoint fields, was rejected
 permanently (an invalid accession, an unresolvable symbol, or a transcript that
-belongs to a different gene), or isn't an eligible gene on this run, the whole
-request returns `422` naming each problem, and nothing is processed. Inputs are
+belongs to a different gene), matches no eligible row, or matches more than one
+eligible row, the whole request returns `422` naming each problem, and nothing
+is processed. Each accepted input is tied to the row it matched before the job
+starts, and the result is written to that row whatever spelling it comes back
+under. Inputs are
 otherwise validated like a fresh annotate request, and the retry reuses the
 saved run's `mode`, `local_backend`, and `skip_literature_for_oncokb`.
 
@@ -894,7 +897,8 @@ use, so concurrent updates don't overwrite each other; a `failed` job leaves the
 run unchanged. Only the rows of the submitted genes that are still eligible are
 written, and only with a result at least as good (an error < no result < a
 grounded annotation); no other gene's row is ever changed, and results for genes
-that weren't submitted are discarded. Existing warnings are kept and new
+that weren't submitted are discarded. An updated row keeps its earlier
+`resolved_inputs` alongside the retry's. Existing warnings are kept and new
 warnings about the updated genes are added. `genes_annotated` is recomputed.
 
 Unknown runs return `404`, non-owners return `403`, unauthenticated requests

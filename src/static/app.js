@@ -1393,12 +1393,25 @@ function mergeRetriedAnnotations(existing, incoming, targets, kind) {
     if (!matches.length) return;
     const [first, ...rest] = matches;
     if (annotationRank(annotation) < annotationRank(merged[first])) return;
-    merged[first] = annotation;
+    const resolvedInputs = mergedResolvedInputs(merged[first], annotation);
+    merged[first] = resolvedInputs.length
+      ? { ...annotation, resolved_inputs: resolvedInputs }
+      : annotation;
     rest.reverse().forEach((index) => {
       if (annotationRank(merged[index]) <= annotationRank(annotation)) merged.splice(index, 1);
     });
   });
   return merged;
+}
+
+// The stored row's submitted spellings plus the retry's, one per input (as
+// the server's _merged_resolved_inputs keeps them).
+function mergedResolvedInputs(storedRow, incoming) {
+  const byInput = new Map();
+  [...(storedRow?.resolved_inputs || []), ...(incoming?.resolved_inputs || [])].forEach((resolution) => {
+    byInput.set(normalizedRetryToken(resolution.input), resolution);
+  });
+  return [...byInput.values()];
 }
 
 // Drops in-flight annotation retries when the displayed run changes; like
