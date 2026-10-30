@@ -838,15 +838,18 @@ administrator may read them.
 }
 ```
 
-Unknown runs return `404`, non-owners return `403`, unauthenticated requests
-return `401`, and run storage that isn't configured returns `503`.
+Inputs come back as submitted; a run saved by `POST /v1/annotate/gene` returns
+its gene as a single input. Unknown runs return `404`, non-owners return `403`,
+unauthenticated requests return `401`, and run storage that isn't configured
+returns `503`.
 
 ## POST /v1/runs/{run_id}/retry
 
 Re-annotate failed or no-result genes on an existing saved run and merge the
 results into that run in place. Only the run's owner or an administrator may
-retry. The run's other annotations, original inputs, attribution, and fusion
-evidence are left untouched.
+retry (an API key acts as its owner; a run with no recorded owner is
+admin-only). The run's other annotations, original inputs, attribution, and
+fusion evidence are left untouched.
 
 ```bash
 curl -s -X POST https://acgc.oncokb.org/v1/runs/example-run-id/retry \
@@ -865,17 +868,28 @@ curl -s -X POST https://acgc.oncokb.org/v1/runs/example-run-id/retry \
 }
 ```
 
-`inputs` accepts the same entries as `POST /v1/annotate/jobs` and is capped by
-`ANNOTATE_MAX_INPUTS`. `force_refresh` defaults to `false`; set it to `true` when
-re-checking no-result genes so a cached low-evidence result isn't reused. The
-job runs in the background and is polled through the returned `status_url` with
-`GET /v1/annotate/jobs/{job_id}`. When the job is `complete`, `result.run_id` is
-the original run id; its `annotations` contain only the retried genes, already
-merged into the stored run.
+`inputs` accepts the same entries as `POST /v1/annotate/jobs` (structured
+inputs or plain strings), is validated the same way, and is capped by
+`ANNOTATE_MAX_INPUTS`. The retry reuses the saved run's `mode`, `local_backend`,
+and `skip_literature_for_oncokb`. `force_refresh` defaults to `false`; set it to
+`true` when re-checking no-result genes so a cached low-evidence result isn't
+reused. The job runs in the background and is polled through the returned
+`status_url` with `GET /v1/annotate/jobs/{job_id}`. When the job is `complete`,
+`result.run_id` is the original run id and its `annotations` contain only the
+retried genes.
 
-Inputs whose stored error is deterministic (for example a malformed accession
-or a transcript that belongs to a different gene) are ignored because a retry
-would fail the same way. If every supplied input is deterministic, the endpoint
-returns `422` and starts no job. Unknown runs return `404`, non-owners return
-`403`, unauthenticated requests return `401`, and run storage that isn't
-configured returns `503`.
+Results are written to the stored run only when the whole job completes, in the
+same locked transaction other run updates (such as fusion-evidence retries)
+use, so concurrent updates don't overwrite each other; a `failed` job leaves the
+run unchanged. A stored annotation is only replaced by one at least as good
+(an error < no result < a grounded annotation), so a retry that fails again
+never overwrites an existing result. `genes_annotated` is recomputed.
+
+Only inputs that match a failed or no-result annotation on the run are retried.
+Inputs whose stored error is permanent (an invalid accession, an unresolvable
+symbol, or a transcript that belongs to a different gene) are ignored because a
+retry would fail the same way, as are inputs that match nothing retryable on
+the run. If no supplied input remains, the endpoint returns `422` and starts no
+job; more than `ANNOTATE_MAX_INPUTS` inputs or invalid entries also return
+`422`. Unknown runs return `404`, non-owners return `403`, unauthenticated
+requests return `401`, and run storage that isn't configured returns `503`.
