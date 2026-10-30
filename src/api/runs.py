@@ -5,7 +5,7 @@ from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from src.api.run_persistence import can_modify_run, run_owner
 from src.auth import AuthenticatedUser, require_auth
@@ -71,12 +71,23 @@ async def get_run_inputs(
             status_code=403,
             detail="Only this run's owner or an administrator may retry its annotations.",
         )
-    request_payload = await store.get_run_request(run_id)
-    raw_inputs = (request_payload or {}).get("fusions") or []
-    return RunInputsResponse(
-        run_id=run_id,
-        inputs=[FusionInput.model_validate(item) for item in raw_inputs],
-    )
+    request_payload = await store.get_run_request(run_id) or {}
+    raw_inputs = request_payload.get("fusions")
+    if raw_inputs is None and isinstance(request_payload.get("gene"), str):
+        # Saved by POST /v1/annotate/gene.
+        raw_inputs = [
+            {"fusion": request_payload["gene"], "tumor_type": request_payload.get("tumor_type")}
+        ]
+    inputs: List[FusionInput] = []
+    for item in raw_inputs if isinstance(raw_inputs, list) else []:
+        try:
+            inputs.append(
+                FusionInput.model_validate({"fusion": item} if isinstance(item, str) else item)
+            )
+        except ValidationError:
+            # An older or malformed saved input: the UI falls back to the gene.
+            continue
+    return RunInputsResponse(run_id=run_id, inputs=inputs)
 
 
 @router.get("/v1/runs/{run_id}/access", response_model=RunAccessResponse)
