@@ -628,6 +628,10 @@ textarea {
   gap: 8px;
 }
 
+.annotation-retry-note .field-row-value {
+  color: #7c5a00;
+}
+
 .annotation-card {
   border: 1px solid var(--line);
   border-radius: 8px;

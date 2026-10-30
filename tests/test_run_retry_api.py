@@ -755,3 +755,92 @@ def test_retry_by_spelling_routes_by_row_key_without_resolved_inputs(monkeypatch
     assert _poll(client, response.json()["status_url"])["status"] == "complete"
     assert store.stored["annotations"][0]["gene_summary"] == "Retried"
     assert store.stored["annotations"][0]["resolved_inputs"] == [{"input": "CD246", "resolved": "ALK"}]
+
+
+# ---------------------------------------------------------------------------
+# A spelling that resolves to a different gene on retry
+# ---------------------------------------------------------------------------
+
+
+def test_spelling_that_now_resolves_to_another_gene_leaves_the_row_unchanged(
+    monkeypatch, fresh_jobs,
+):
+    # The saved ALK row was submitted as CD246; on retry CD246 resolves to LTK.
+    alk = {
+        "gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout",
+        "resolved_inputs": [{"input": "CD246", "resolved": "ALK"}],
+    }
+    stored = _stored_run(annotations=[
+        alk,
+        {"gene": "BRAF", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+        {"gene": "TP53", "insufficient_evidence": False},
+    ])
+    _ok_pipeline(monkeypatch, annotations=[
+        _annotation("LTK", gene_summary="Wrong gene",
+                    resolved_inputs=[{"input": "CD246", "resolved": "LTK"}]),
+        _annotation("BRAF", gene_summary="Retried"),
+    ])
+    store = _FakeRunStore(stored)
+    _use_store(monkeypatch, store)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/runs/run-1/retry", json={"kind": "errors", "inputs": ["CD246", "BRAF"]},
+    )
+
+    body = _poll(client, response.json()["status_url"])
+    assert body["status"] == "complete"
+    assert body["retry_outcomes"] == [{
+        "input": "CD246",
+        "row_gene": "ALK",
+        "resolved_gene": "LTK",
+        "message": "CD246 now resolves to LTK, not ALK; ALK was not updated",
+    }]
+    rows = store.stored["annotations"]
+    assert rows[0] == alk, "the ALK row is left exactly as it was"
+    assert rows[1]["gene_summary"] == "Retried", "other genes' results still apply"
+    assert [row["gene"] for row in rows] == ["ALK", "BRAF", "TP53"], "no LTK row is created"
+    assert store.stored["genes_annotated"] == 3
+
+
+def test_merge_checks_gene_identity_for_a_row_retried_by_its_own_gene():
+    stored = _stored_run(annotations=[
+        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+    ])
+    outcomes = []
+
+    merged = main._merge_retried_annotations(
+        copy.deepcopy(stored),
+        _dump([_annotation("LTK", resolved_inputs=[{"input": "ALK", "resolved": "LTK"}])]),
+        [],
+        {"ALK": "ALK"},
+        "errors",
+        outcomes,
+    )
+
+    assert merged["annotations"] == stored["annotations"]
+    assert [outcome.message for outcome in outcomes] == [
+        "ALK now resolves to LTK, not ALK; ALK was not updated",
+    ]
+
+
+def test_unresolved_row_takes_its_first_resolution():
+    # A row stored under its raw input (its lookup failed) has no gene yet:
+    # resolving it on retry is not a change of gene.
+    stored = _stored_run(annotations=[{
+        "gene": "ENSG00000157764", "insufficient_evidence": True,
+        "error": "Unresolvable gene symbol — Ensembl lookup temporarily unavailable (503); retry later.",
+    }])
+    outcomes = []
+
+    merged = main._merge_retried_annotations(
+        copy.deepcopy(stored),
+        _dump([_annotation("BRAF", resolved_inputs=[{"input": "ENSG00000157764", "resolved": "BRAF"}])]),
+        [],
+        {"ENSG00000157764": "ENSG00000157764"},
+        "errors",
+        outcomes,
+    )
+
+    assert merged["annotations"][0]["gene"] == "BRAF"
+    assert outcomes == []

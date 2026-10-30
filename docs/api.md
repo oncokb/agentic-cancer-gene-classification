@@ -889,7 +889,28 @@ saved run's `mode`, `local_backend`, and `skip_literature_for_oncokb`.
 The job runs in the background and is polled through the returned `status_url`
 with `GET /v1/annotate/jobs/{job_id}`. When the job is `complete`,
 `result.run_id` is the original run id and its `annotations` contain the
-retried genes.
+retried genes as the pipeline returned them.
+
+A result is written to a row only when its gene is the row's gene. If an input
+now resolves to a different gene (for example an alias that has since moved),
+the row is left unchanged, no row is added for the other gene, and the job
+still completes with the other genes applied. Each such input is listed in the
+job's `retry_outcomes`:
+
+```json
+"retry_outcomes": [
+  {
+    "input": "CD246",
+    "row_gene": "ALK",
+    "resolved_gene": "LTK",
+    "message": "CD246 now resolves to LTK, not ALK; ALK was not updated"
+  }
+]
+```
+
+A row whose input never resolved to a gene (its `gene` is the raw input,
+because the symbol lookup failed) has no gene yet, so its first successful
+resolution is written.
 
 Results are written to the stored run only when the whole job completes, in the
 same locked transaction other run updates (such as fusion-evidence retries)

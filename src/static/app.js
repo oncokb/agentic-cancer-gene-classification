@@ -62,6 +62,9 @@ const state = {
   // Like fusionEvidenceGeneration, for annotation retries: bumped when the
   // displayed run changes so a late retry status is dropped.
   annotationRetryGeneration: 0,
+  // Row gene (normalized) -> why the last retry left that row unchanged,
+  // e.g. "CD246 now resolves to LTK, not ALK; ALK was not updated".
+  annotationRetryNotes: new Map(),
   annotationRetryKind: null,
   // The inputs this run was submitted with, so retries preserve tumor type
   // and breakpoint fields instead of guessing them from annotations.
@@ -1382,7 +1385,16 @@ function isRetryEligible(annotation, kind) {
 // genes (`targets`) that are still eligible are written, and only by a result
 // at least as good. Rows for any other gene are never touched, and results
 // for genes the retry wasn't asked for are dropped, never appended.
-function mergeRetriedAnnotations(existing, incoming, targets, kind) {
+// A row whose input never resolved to a gene (its `gene` is the raw
+// submission) takes its first resolution; see the server's
+// _row_has_gene_identity.
+function rowHasGeneIdentity(row) {
+  return !String(row?.error || "").toLowerCase().startsWith("unresolvable gene symbol");
+}
+
+// `mismatches` collects { rowGene, message } for rows left unchanged because
+// the retried input now resolves to a different gene.
+function mergeRetriedAnnotations(existing, incoming, targets, kind, mismatches = []) {
   const merged = [...(existing || [])];
   (incoming || []).forEach((annotation) => {
     const keys = new Set([...annotationMatchKeys(annotation)].filter((key) => targets.has(key)));
@@ -1392,6 +1404,17 @@ function mergeRetriedAnnotations(existing, incoming, targets, kind) {
     });
     if (!matches.length) return;
     const [first, ...rest] = matches;
+    const rowGene = merged[first].gene;
+    if (
+      normalizedRetryToken(annotation.gene) !== normalizedRetryToken(rowGene) &&
+      rowHasGeneIdentity(merged[first])
+    ) {
+      mismatches.push({
+        rowGene,
+        message: `${rowGene} now resolves to ${annotation.gene}, not ${rowGene}; ${rowGene} was not updated`,
+      });
+      return;
+    }
     if (annotationRank(annotation) < annotationRank(merged[first])) return;
     const resolvedInputs = mergedResolvedInputs(merged[first], annotation);
     merged[first] = resolvedInputs.length
@@ -1418,6 +1441,7 @@ function mergedResolvedInputs(storedRow, incoming) {
 // invalidateFusionEvidenceJobs, a late status for the old run is ignored.
 function invalidateAnnotationRetryJobs() {
   state.annotationRetryGeneration += 1;
+  state.annotationRetryNotes = new Map();
   state.annotationRetryStatus = null;
   state.annotationRetryKind = null;
 }
@@ -1475,12 +1499,24 @@ async function retryFailedAnnotations(kind) {
     // Another run is shown (or another retry started): drop it.
     if (retried === null) return;
     // Apply only the fully completed retry, matching what the server saved.
+    const mismatches = [];
     const merged = mergeRetriedAnnotations(
       state.currentResult.annotations || [],
-      retried,
+      retried.annotations,
       new Set(inputs.map((item) => normalizedRetryToken(item.fusion))),
       kind,
+      mismatches,
     );
+    // The server's per-input outcome wins; a mismatch only the page saw
+    // still explains why its row didn't change.
+    const notes = new Map();
+    mismatches.forEach(({ rowGene, message }) => notes.set(normalizedRetryToken(rowGene), message));
+    retried.outcomes.forEach((outcome) => {
+      if (outcome?.row_gene && outcome.message) {
+        notes.set(normalizedRetryToken(outcome.row_gene), outcome.message);
+      }
+    });
+    state.annotationRetryNotes = notes;
     state.currentResult = {
       ...state.currentResult,
       annotations: merged,
@@ -1489,8 +1525,11 @@ async function retryFailedAnnotations(kind) {
     state.annotationRetryStatus = null;
     state.annotationRetryKind = null;
     renderAnnotationResult(state.currentResult);
+    const done = kind === "noresult" ? "No-result genes re-checked." : "Failed annotations retried.";
     setMessage(
-      kind === "noresult" ? "No-result genes re-checked." : "Failed annotations retried.",
+      notes.size
+        ? `${done} ${notes.size} gene${notes.size === 1 ? " was" : "s were"} not updated; see the No result tab.`
+        : done,
       "info",
     );
   } catch (error) {
@@ -1503,7 +1542,8 @@ async function retryFailedAnnotations(kind) {
   }
 }
 
-// Resolves to the retried annotations, or null once `token` is stale.
+// Resolves to { annotations, outcomes } for the completed retry, or null once
+// `token` is stale.
 async function pollRetriedAnnotationsJob(statusUrl, token) {
   const stale = () => annotationRetryJobIsStale(token);
   while (true) {
@@ -1519,7 +1559,10 @@ async function pollRetriedAnnotationsJob(statusUrl, token) {
       throw new Error(status.error || "Annotation retry failed");
     }
     if (status.status === "complete") {
-      return status.result?.annotations || status.annotations || [];
+      return {
+        annotations: status.result?.annotations || status.annotations || [],
+        outcomes: status.retry_outcomes || [],
+      };
     }
 
     const total = status.genes_total || "?";
@@ -2546,6 +2589,16 @@ function renderNoResultView(hiddenAnnotations) {
         <div class="field-row-value">${escapeHtml(reason)}</div>
       </div>
     `;
+    const retryNote = state.annotationRetryNotes.get(normalizedRetryToken(annotation.gene));
+    if (retryNote) {
+      const noteRow = document.createElement("div");
+      noteRow.className = "field-row annotation-retry-note";
+      noteRow.innerHTML = `
+        <span class="field-row-label">Retry</span>
+        <div class="field-row-value">${escapeHtml(retryNote)}</div>
+      `;
+      card.appendChild(noteRow);
+    }
     uiTrack().surfaced(card, { ...geneTrackContext(annotation, "no_result", index), section: "gene_card" });
     const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
     if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);

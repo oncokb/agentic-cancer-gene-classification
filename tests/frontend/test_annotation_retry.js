@@ -263,6 +263,46 @@ async function testRetryKeepsTheRowsSubmittedSpellings() {
   );
 }
 
+// Codex review case: the ALK row was submitted as CD246, and on retry the
+// input resolves to LTK. The ALK row stays exactly as it was, no LTK row is
+// added, other genes still update, and the server's outcome is shown on the row.
+async function testRetryResolvingToAnotherGeneLeavesTheRowAndShowsWhy() {
+  const alk = {
+    gene: "ALK", insufficient_evidence: true, error: "Synthesis error: timeout",
+    resolved_inputs: [{ input: "CD246", resolved: "ALK" }],
+  };
+  const message = "CD246 now resolves to LTK, not ALK; ALK was not updated";
+  const sandbox = app(retryFetch([{
+    status: "complete",
+    result: {
+      annotations: [
+        {
+          gene: "LTK", insufficient_evidence: false, gene_summary: "Wrong gene",
+          resolved_inputs: [{ input: "ALK", resolved: "LTK" }],
+        },
+        { gene: "BRAF", insufficient_evidence: false, gene_summary: "Retried" },
+      ],
+    },
+    retry_outcomes: [{ input: "CD246", row_gene: "ALK", resolved_gene: "LTK", message }],
+  }]));
+  renderNoResult(sandbox, [
+    alk,
+    { gene: "BRAF", insufficient_evidence: true, error: "Synthesis error: timeout" },
+  ]);
+
+  await sandbox.retryFailedAnnotations("errors");
+
+  const rows = JSON.parse(JSON.stringify(sandbox.state.currentResult.annotations));
+  assert.deepStrictEqual(rows[0], alk, "the ALK row is left exactly as it was");
+  assert.strictEqual(rows[1].gene_summary, "Retried", "other genes still update");
+  assert.deepStrictEqual(rows.map((row) => row.gene), ["ALK", "BRAF"], "no LTK row is added");
+  const notes = byClass(sandbox.elements.resultsWindow, "annotation-retry-note");
+  assert.strictEqual(notes.length, 1);
+  assert.ok(notes[0].innerHTML.includes(message), "the outcome is shown on the ALK row");
+  assert.strictEqual(notes[0]._parent.id, "gene-ALK");
+  assert.ok(sandbox.elements.messageBox.textContent.includes("1 gene was not updated"));
+}
+
 async function testTumorTypeIsTheFirstSubmittedForTheGene() {
   const calls = [];
   const sandbox = app(retryFetch([{ status: "complete", result: { annotations: [] } }], calls));
@@ -448,6 +488,7 @@ const tests = [
   testFusionWithGoodPartnerSendsOnlyTheGene,
   testTumorTypeIsTheFirstSubmittedForTheGene,
   testRetryKeepsTheRowsSubmittedSpellings,
+  testRetryResolvingToAnotherGeneLeavesTheRowAndShowsWhy,
   testRetryErrorKeepsOldRows,
   testFailedJobLeavesPageUnchanged,
   testWorseResultNeverReplacesExisting,
