@@ -172,8 +172,152 @@ async function testRetryErrorKeepsOldItems() {
   assert.ok(sandbox.elements.messageBox.textContent.includes("Not allowed"));
 }
 
+async function testRetryPollingErrorKeepsOriginalItems() {
+  let polls = 0;
+  const sandbox = app(async (url, options = {}) => {
+    if (url === "/v1/fusion-evidence/jobs" && options.method === "POST") {
+      return {
+        ok: true, status: 200,
+        json: async () => ({ job_id: "job-2", status_url: "/v1/fusion-evidence/jobs/job-2" }),
+        text: async () => "",
+      };
+    }
+    if (url === "/v1/fusion-evidence/jobs/job-2") {
+      polls += 1;
+      if (polls === 1) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            status: "running", fusions_total: 1, fusions_completed: 1,
+            fusion_evidence: [{
+              fusion: "EML4::ALK", input: "ENST00000318522::ENST00000389048",
+              tumor_type: "LUAD", retrieval_status: "ok", pmids: ["3"],
+            }],
+          }),
+          text: async () => "",
+        };
+      }
+      return { ok: false, status: 503, statusText: "Service Unavailable", text: async () => "" };
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  sandbox.sleep = async () => {};
+  sandbox.state.canModifyRun = true;
+  renderForRetry(sandbox);
+
+  await sandbox.retryFailedFusionEvidence();
+
+  const items = sandbox.state.currentResult.fusion_evidence;
+  assert.strictEqual(items.length, 3);
+  assert.strictEqual(items[1].retrieval_status, "failed", "staged poll results must not be applied");
+  assert.strictEqual(JSON.stringify(items[1].pmids), JSON.stringify([]));
+  assert.ok(sandbox.elements.messageBox.textContent.includes("Service Unavailable"));
+}
+
+function testDuplicateIncomingKeysMergeOnce() {
+  const sandbox = app();
+  const merged = sandbox.mergeFusionEvidence(
+    [{ fusion: "A::B", tumor_type: "LUAD", retrieval_status: "failed" }],
+    [
+      { fusion: "A::B", tumor_type: "LUAD", retrieval_status: "ok", pmids: ["1"] },
+      { fusion: "A::B", tumor_type: "LUAD", retrieval_status: "ok", pmids: ["2"] },
+      { fusion: "NEW::ONE", tumor_type: "LUAD", retrieval_status: "ok", pmids: ["3"] },
+      { fusion: "NEW::ONE", tumor_type: "LUAD", retrieval_status: "ok", pmids: ["4"] },
+    ],
+  );
+  assert.strictEqual(JSON.stringify(merged.map((item) => [item.fusion, item.pmids])),
+    JSON.stringify([["A::B", ["2"]], ["NEW::ONE", ["4"]]]));
+}
+
+function testSidebarFilterSurvivesItemMovingSections() {
+  const sandbox = app();
+  sandbox.bindGeneIndexFilter();
+  const items = () => sandbox.elements.geneIndex.children.filter((node) =>
+    hasClass(node, "gene-index-item") && !node.hidden).map((node) => node.title);
+  const headings = () => sandbox.elements.geneIndex.children
+    .filter((node) => hasClass(node, "fusion-index-section"))
+    .map((node) => node.textContent);
+  sandbox.state.canModifyRun = true;
+  renderForRetry(sandbox, [{
+    fusion: "EML4::ALK", input: "ENST00000318522::ENST00000389048",
+    tumor_type: "LUAD", retrieval_status: "failed", pmids: [],
+  }]);
+  sandbox.elements.geneIndexFilter.value = "eml4";
+  sandbox.setGeneIndexFilter("eml4");
+  sandbox.applyGeneIndexFilter();
+  assert.strictEqual(JSON.stringify(items()), JSON.stringify(["EML4::ALK"]));
+  assert.strictEqual(sandbox.elements.geneIndexFilter.value, "eml4");
+
+  const retried = sandbox.mergeFusionEvidence(sandbox.state.currentResult.fusion_evidence, [{
+    fusion: "EML4::ALK", input: "ENST00000318522::ENST00000389048",
+    tumor_type: "LUAD", retrieval_status: "ok", literature_scope: "requested_tumor",
+    pmids: ["3"],
+  }]);
+  sandbox.state.currentResult = { ...sandbox.state.currentResult, fusion_evidence: retried };
+  sandbox.renderAnnotationResult(sandbox.state.currentResult);
+
+  assert.strictEqual(sandbox.elements.geneIndexFilter.value, "eml4", "filter text persists");
+  assert.strictEqual(JSON.stringify(items()), JSON.stringify(["EML4::ALK"]));
+  assert.deepStrictEqual(headings(), ["Found in LUAD"], "item now sits under its new section");
+}
+
+
+async function testLateRetryResponseNeverWritesIntoAnotherRun() {
+  // A retry whose run is replaced before the job answers — by another result
+  // (different run id) or by clearing results — must not touch the new state.
+  for (const switchRun of [
+    (sandbox) => {
+      sandbox.state.currentResult = {
+        run_id: "run-2", annotations: [{ gene: "BRAF" }],
+        fusion_evidence: [{ fusion: "KIAA1549::BRAF", tumor_type: "LGG", pmids: ["9"] }],
+      };
+      sandbox.state.fusionEvidenceStatus = "complete";
+      sandbox.setMessage("Shared run restored.", "info");
+    },
+    (sandbox) => sandbox.clearResults(),
+  ]) {
+    for (const lateStatus of [
+      { status: "complete", fusions_total: 1, fusions_completed: 1, fusion_evidence: [{
+        fusion: "EML4::ALK", input: "ENST00000318522::ENST00000389048",
+        tumor_type: "LUAD", retrieval_status: "ok", pmids: ["3"],
+      }] },
+      { status: "failed", error: "upstream timeout" },
+    ]) {
+      let release;
+      const late = new Promise((resolve) => { release = resolve; });
+      const sandbox = app(async (url, options = {}) => {
+        if (url === "/v1/fusion-evidence/jobs" && options.method === "POST") {
+          return {
+            ok: true, status: 200,
+            json: async () => ({ job_id: "job-3", status_url: "/v1/fusion-evidence/jobs/job-3" }),
+            text: async () => "",
+          };
+        }
+        if (url === "/v1/fusion-evidence/jobs/job-3") return late;
+        throw new Error(`unexpected fetch ${url}`);
+      });
+      sandbox.state.canModifyRun = true;
+      renderForRetry(sandbox);
+
+      const retry = sandbox.retryFailedFusionEvidence();
+      for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+      switchRun(sandbox);
+      const before = JSON.stringify(sandbox.state.currentResult);
+      const statusBefore = sandbox.state.fusionEvidenceStatus;
+      const messageBefore = sandbox.elements.messageBox.textContent;
+      release({ ok: true, status: 200, json: async () => lateStatus, text: async () => "" });
+      await retry;
+
+      assert.strictEqual(JSON.stringify(sandbox.state.currentResult), before, "late retry left the new run alone");
+      assert.strictEqual(sandbox.state.fusionEvidenceStatus, statusBefore);
+      assert.strictEqual(sandbox.elements.messageBox.textContent, messageBefore);
+    }
+  }
+}
+
 const tests = [testButtonOnlyWithFailedItemsAndPermission, testRetrySendsOnlyFailedFusionsAndMergesInPlace,
-  testRetryErrorKeepsOldItems];
+  testRetryErrorKeepsOldItems, testRetryPollingErrorKeepsOriginalItems, testDuplicateIncomingKeysMergeOnce,
+  testSidebarFilterSurvivesItemMovingSections, testLateRetryResponseNeverWritesIntoAnotherRun];
 (async () => {
   for (const test of tests) {
     await test();

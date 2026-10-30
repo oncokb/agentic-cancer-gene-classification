@@ -295,7 +295,37 @@ function testSectionedCardShowsSubmittedInputNote() {
   assert.ok(!walk(plain).some((node) => hasClass(node, "submitted-input-note")));
 }
 
-const tests = [testSectioningAndOrder, testSectionedCardShowsSubmittedInputNote, testEmptySectionsOmitted,
+function testPartialLookupSectionsAndPrompt() {
+  const sandbox = app();
+  const note = 'One search failed <img src=x onerror="bad()">';
+  for (const pmids of [[], ["42"]]) {
+    sandbox.renderFusionEvidenceView([{
+      fusion: "EML4::ALK", tumor_type: "LUAD", partial: true,
+      literature_scope: null, retrieval_status: "ok", pmids, interpretation: note,
+    }]);
+    const root = sandbox.elements.resultsWindow;
+    assert.ok(allText(root).includes("Lookup failed (1)"));
+    assert.ok(allText(root).includes("Partial lookup"));
+    assert.ok(allText(root).includes(note));
+    assert.ok(!allText(root).includes("No literature found"));
+    assert.ok(!allText(root).includes("No exact fusion-pair literature was found"));
+    assert.strictEqual(root.querySelectorAll(".fusion-partner-query-button").length, 0);
+    assert.ok(walk(root).every((node) => node.innerHTML === ""));
+  }
+  // Even a previously saved, misclassified partial result must not offer the prompt.
+  assert.strictEqual(sandbox.renderFusionPartnerPrecedentForFusionEvidence({
+    fusion: "EML4::ALK", partial: true, literature_scope: "no_literature",
+  }), null);
+}
+
+function testRetractionUnavailableCacheBadge() {
+  const sandbox = app();
+  const badge = sandbox.renderCacheBadge({ cache_status: "reused", cache_reason: "retraction_check_failed" });
+  assert.strictEqual(badge.textContent, "Cached — retraction check unavailable");
+  assert.strictEqual(badge.innerHTML, "");
+}
+
+const tests = [testPartialLookupSectionsAndPrompt, testRetractionUnavailableCacheBadge, testSectioningAndOrder, testSectionedCardShowsSubmittedInputNote, testEmptySectionsOmitted,
   testSidebarNavigationAndActiveTracking, testActiveTrackingAcrossObserverBatches,
   testHighlightsAndSafeCardContent, testSharedPmidCountAndFutureScopes,
   testExpansionPersistsAndResetsForNewResults, testResultsAndNoResultSidebarUnchanged];

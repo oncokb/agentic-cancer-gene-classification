@@ -241,6 +241,16 @@
             <button id="open-feedback" type="button" class="feedback-button">Send feedback</button>
             <button id="clear-results" type="button" disabled>Clear results</button>
             <button id="share-run" type="button" disabled title="Copy a link to this run — only works for peers who can reach the same Backend URL">Copy share link</button>
+            <span id="rerun-controls" class="rerun-controls hidden">
+              <label class="export-control" for="rerun-mode">
+                <span>Rerun with</span>
+                <select id="rerun-mode">
+                  <option value="cached" selected>Use cached results</option>
+                  <option value="refresh">Refresh (force_refresh)</option>
+                </select>
+              </label>
+              <button id="rerun-run" type="button" title="Start a new run with this run's inputs; this run is left unchanged">Rerun</button>
+            </span>
             <label class="export-control" for="export-format">
               <span>Format</span>
               <select id="export-format">
@@ -342,6 +352,7 @@
       </section>
     </div>
 
+    <script src="/static/tracking.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

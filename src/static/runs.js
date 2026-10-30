@@ -26,6 +26,9 @@
     return run.run_id ? `/?run=${encodeURIComponent(run.run_id)}` : null;
   }
 
+  // Read by app.js on the run page it opens (see takePendingRerun there).
+  const PENDING_RERUN_KEY = "agcg.pendingRerun";
+
   function friendlyError(error) {
     const { status, network } = error;
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
@@ -37,7 +40,10 @@
     return "Couldn't load your runs. Try again.";
   }
 
-  function createRunsPage({ document: doc, window: win, fetch: fetchFn }) {
+  const NOOP_TRACKER = { surfaced() {}, event() {} };
+
+  function createRunsPage({ document: doc, window: win, fetch: fetchFn, tracker }) {
+    const track = tracker || NOOP_TRACKER; // tracking.js; see docs/ui-events.md
     const el = {};
     for (const name of ["error", "empty", "loading", "table", "tbody", "load-more", "retry"]) {
       el[name] = doc.getElementById(`runs-${name}`);
@@ -48,6 +54,36 @@
     function cell(value) {
       const td = doc.createElement("td");
       td.textContent = value == null ? "" : String(value);
+      return td;
+    }
+
+    function rerunCell(run, href) {
+      const td = doc.createElement("td");
+      if (!href || !run.run_id) return td;
+      const mode = doc.createElement("select");
+      mode.setAttribute("aria-label", "Rerun with");
+      for (const [value, label] of [["cached", "Use cached results"], ["refresh", "Refresh (force_refresh)"]]) {
+        const option = doc.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        mode.appendChild(option);
+      }
+      mode.value = "cached";
+      const button = doc.createElement("button");
+      button.type = "button";
+      button.className = "runs-rerun";
+      button.textContent = "Rerun";
+      button.title = "Start a new run with this run's inputs; this run is left unchanged";
+      button.addEventListener("click", () => {
+        try {
+          win.sessionStorage.setItem(PENDING_RERUN_KEY, JSON.stringify({
+            run_id: run.run_id, force_refresh: mode.value === "refresh", created_at: Date.now(),
+          }));
+        } catch (_) { /* Without storage the run still opens, with its own Rerun button. */ }
+        win.location.href = href;
+      });
+      td.appendChild(mode);
+      td.appendChild(button);
       return td;
     }
 
@@ -63,8 +99,9 @@
       show(el["load-more"], Boolean(state.nextCursor) && !state.error);
       el["load-more"].disabled = state.loading;
       el.tbody.replaceChildren();
-      for (const run of state.runs) {
+      state.runs.forEach((run, index) => {
         const row = doc.createElement("tr");
+        track.surfaced(row, { surface: "runs", section: "runs_row", subject_kind: "run", subject_id: run.run_id, position: index });
         const dateCell = cell("");
         const href = viewHref(run, win.location.origin);
         if (href) {
@@ -80,8 +117,9 @@
         row.appendChild(cell(run.input_count == null ? summary : `${summary ? summary + " " : ""}(${run.input_count})`));
         row.appendChild(cell(run.genes_annotated));
         row.appendChild(cell(run.source));
+        row.appendChild(rerunCell(run, href));
         el.tbody.appendChild(row);
-      }
+      });
     }
 
     async function load() {
@@ -116,11 +154,22 @@
       }
     }
 
+    // Delegated so the anchors stay listener-free; the row supplies the run.
+    const opened = (event) => {
+      if (event.type === "auxclick" && event.button !== 1) return;
+      const link = event.target && event.target.closest ? event.target.closest("a[href]") : null;
+      if (link) track.event(link, { type: "action", state: "opened_run" });
+    };
+    el.tbody.addEventListener("click", opened);
+    el.tbody.addEventListener("auxclick", opened);
     el["load-more"].addEventListener("click", () => {
-      if (state.nextCursor) return load();
+      if (!state.nextCursor) return;
+      track.event({ type: "action", state: "load_more", surface: "runs", section: "runs_pagination" });
+      return load();
     });
     el.retry.addEventListener("click", () => {
       if (state.loading || !state.error || [401, 403].includes(state.error.status)) return;
+      track.event({ type: "action", state: "retry", surface: "runs", section: "runs_page" });
       if (state.error.status === 422) {
         state.nextCursor = null;
         state.runs = [];
@@ -128,12 +177,16 @@
       }
       return load();
     });
+    const page = doc.getElementById("runs-page");
+    if (page) track.surfaced(page, { surface: "runs", section: "runs_page", subject_kind: "none" });
     return { init: load };
   }
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = { createRunsPage, formatDateTime };
   } else {
-    createRunsPage({ document: root.document, window: root, fetch: root.fetch.bind(root) }).init();
+    const tracker = root.ACGCTracking;
+    if (tracker) tracker.loadStatus();
+    createRunsPage({ document: root.document, window: root, fetch: root.fetch.bind(root), tracker }).init();
   }
 })(typeof window !== "undefined" ? window : globalThis);

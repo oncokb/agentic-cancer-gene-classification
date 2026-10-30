@@ -235,7 +235,7 @@ def test_enrichment_job_endpoint_streams_enriched_annotations(monkeypatch):
 @pytest.mark.parametrize("force_refresh", [False, True])
 def test_inline_fusion_evidence_is_opt_in_and_persisted(monkeypatch, path, include, force_refresh):
     store = FakeRunStore()
-    monkeypatch.setattr(main.app.state, "run_store", store, raising=False)
+    monkeypatch.setitem(main.app.state._state, "run_store", store)
     async def create_store():
         return store
 
@@ -436,7 +436,7 @@ def test_fusion_evidence_request_hides_inline_flag():
 
 def test_annotation_api_returns_tumor_conflict_warning(monkeypatch):
     monkeypatch.setattr(main.settings, "gene_cache_enabled", False)
-    monkeypatch.setattr(main.app.state, "run_store", FakeRunStore(), raising=False)
+    monkeypatch.setitem(main.app.state._state, "run_store", FakeRunStore())
 
     async def normalize(inputs):
         return {"ALK": (ResolvedGene(input_symbol="ALK", canonical_symbol="ALK", resolved=True), inputs)}

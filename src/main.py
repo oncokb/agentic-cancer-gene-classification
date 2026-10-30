@@ -24,11 +24,11 @@ from urllib.parse import parse_qs, quote
 
 import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
 from src.api.run_persistence import can_modify_run, run_owner, save_run_or_raise
@@ -98,6 +98,7 @@ from src.observability import (
     reset_user_context,
     set_user_context,
     shutdown_statsd,
+    stable_user_key,
     tag_current_span,
     tag_user,
 )
@@ -105,7 +106,9 @@ from src.pipeline.cache import cached_call
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.feedback_citations import build_citation_check_section
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
-from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
+from src.pipeline.literature import (
+    pubmed_error_message, retrieve_fusion_evidence, retrieve_fusion_partner_evidence,
+)
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline import openevidence_metrics as oe_metrics
 from src.pipeline.normalization import (
@@ -128,6 +131,7 @@ from src.pipeline.openevidence import (
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.result_sanitizer import sanitize_annotation_result
 from src.pipeline.run_store import RunStore
+from src.ui_events import router as ui_events_router
 
 _log_record_factory = logging.getLogRecordFactory()
 
@@ -138,6 +142,10 @@ def _datadog_log_record_factory(*args, **kwargs):
     usr_id = user_ctx.get("user_id") or "-"
     usr_email = user_ctx.get("email") or "-"
     usr_name = user_ctx.get("name") or "-"
+    if record.name == "src.ui_events" and record.levelno == logging.INFO:
+        usr_id = stable_user_key(usr_id) if usr_id != "-" else "-"
+        usr_email = "-"
+        usr_name = "-"
     auth_method = user_ctx.get("auth_method") or "-"
     api_key_id = user_ctx.get("api_key_id") or "-"
     defaults = {
@@ -222,6 +230,7 @@ app.add_middleware(
 )
 app.include_router(api_keys_router)
 app.include_router(runs_router)
+app.include_router(ui_events_router)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 if _STATIC_DIR.exists():
@@ -287,11 +296,25 @@ async def user_context_middleware(request: Request, call_next):
 class DevStatusResponse(BaseModel):
     enabled: bool
     openevidence_enabled: bool
+    ui_events_enabled: bool
 
 
 class AnnotationJobCreateResponse(BaseModel):
     job_id: str
     status_url: str
+
+
+class RerunRequest(BaseModel):
+    force_refresh: bool = Field(
+        default=False,
+        description="Bypass stored gene annotations and fusion evidence instead of reusing cached results.",
+    )
+
+
+class RerunJobCreateResponse(AnnotationJobCreateResponse):
+    rerun_of: str = Field(description="The saved run whose inputs were rerun; it is never modified.")
+    fusions: List[FusionInput] = Field(description="The inputs the new run was started with.")
+    mode: AnnotationMode = Field(description="The annotation mode the new run was started with.")
 
 
 class AnnotationJobStatusResponse(BaseModel):
@@ -834,7 +857,7 @@ async def _retrieve_fusion_evidence_input(
             return FusionEvidenceResult(
                 fusion=item.fusion,
                 tumor_type=item.tumor_type,
-                interpretation=f"Fusion evidence retrieval failed: {exc}",
+                interpretation=pubmed_error_message(exc),
                 retrieval_status="failed",
             )
 
@@ -859,11 +882,16 @@ async def _save_run_result(
     request_payload: dict,
     result: AnnotationResult,
     current_user: Optional[AuthenticatedUser],
+    run_source: Optional[str] = None,
 ) -> None:
     """Save a run, raising on failure. For callers that hand out a link to the
-    run and so must not report success unless it was actually saved."""
+    run and so must not report success unless it was actually saved.
+    `run_source` overrides the recorded source (e.g. "rerun")."""
+    owner = run_owner(current_user)
+    if run_source is not None:
+        owner["source"] = run_source
     await http_request.app.state.run_store.save_run(
-        result.run_id, result.timestamp, request_payload, result.model_dump(), **run_owner(current_user)
+        result.run_id, result.timestamp, request_payload, result.model_dump(), **owner
     )
 
 
@@ -872,9 +900,10 @@ async def _persist_run_result(
     request_payload: dict,
     result: AnnotationResult,
     current_user: Optional[AuthenticatedUser],
+    run_source: Optional[str] = None,
 ) -> None:
     try:
-        await _save_run_result(http_request, request_payload, result, current_user)
+        await _save_run_result(http_request, request_payload, result, current_user, run_source)
     except Exception:
         # A run's own result always returns even if it can't be persisted for
         # later sharing — the run store isn't on the critical path for the caller.
@@ -905,8 +934,7 @@ def _merge_fusion_evidence(
             replaced.add(key)
         else:
             merged.append(item)
-    for item in incoming:
-        key = _fusion_evidence_key(item)
+    for key, item in replacements.items():
         if key not in replaced:
             merged.append(item)
             replaced.add(key)
@@ -922,15 +950,17 @@ async def _persist_fusion_evidence(
     shared link later shows it instead of a hidden/empty fusion evidence tab.
     Only the matching fusion/tumor items are replaced; every other item on the
     run stays put (a retry of failed lookups must not drop earlier evidence)."""
-    try:
-        stored = await http_request.app.state.run_store.get_run(run_id)
-        if stored is None:
-            return
+    incoming = [item.model_dump() for item in fusion_evidence]
+
+    def merge(stored: Dict[str, Any]) -> Dict[str, Any]:
         stored["fusion_evidence"] = _merge_fusion_evidence(
             stored.get("fusion_evidence") or [],
-            [item.model_dump() for item in fusion_evidence],
+            incoming,
         )
-        await http_request.app.state.run_store.update_run_result(run_id, stored)
+        return stored
+
+    try:
+        await http_request.app.state.run_store.merge_run_result(run_id, merge)
     except Exception:
         logger.exception("Failed to persist fusion evidence for run %s", run_id)
 
@@ -1762,6 +1792,7 @@ async def dev_status() -> DevStatusResponse:
     return DevStatusResponse(
         enabled=settings.acgc_dev_mode,
         openevidence_enabled=settings.openevidence_enabled,
+        ui_events_enabled=settings.ui_events_enabled,
     )
 
 
@@ -1822,12 +1853,16 @@ async def _launch_annotation_job(
     complete_action: str = "job_complete",
     error_action: str = "job_error",
     extra_details: Optional[Dict[str, Any]] = None,
+    run_source: Optional[str] = None,
+    saved_request_extras: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Queue a background annotation run in the job store and
-    return its job ID. Shared by /v1/annotate/jobs and the gene query API.
+    return its job ID. Shared by /v1/annotate/jobs, run reruns and the gene
+    query API.
 
     With require_persistence, a failure to save the run fails the job instead
-    of being logged and ignored."""
+    of being logged and ignored. `run_source` overrides the saved run's
+    source; `saved_request_extras` are stored alongside the request."""
     job_id = str(uuid.uuid4())
     job = AnnotationJobStatusResponse(
         job_id=job_id,
@@ -1872,10 +1907,11 @@ async def _launch_annotation_job(
                 current.phase = "fusion_evidence"
                 await _store_annotation_job(current)
             await _include_inline_fusion_evidence(request, result)
+            request_payload = {**request.model_dump(), **(saved_request_extras or {})}
             if require_persistence:
-                await _save_run_result(http_request, request.model_dump(), result, current_user)
+                await _save_run_result(http_request, request_payload, result, current_user, run_source)
             else:
-                await _persist_run_result(http_request, request.model_dump(), result, current_user)
+                await _persist_run_result(http_request, request_payload, result, current_user, run_source)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
             current.phase = "complete"
@@ -1926,6 +1962,70 @@ async def create_annotation_job(
     return AnnotationJobCreateResponse(
         job_id=job_id,
         status_url=f"/v1/annotate/jobs/{job_id}",
+    )
+
+
+_NO_RERUN_REQUEST_DETAIL = (
+    "This run can't be rerun: its original request wasn't saved in a rerunnable form. "
+    "Start a new annotation with its inputs instead."
+)
+
+
+def _rerun_request(stored: Dict[str, Any], force_refresh: bool) -> AnnotateRequest:
+    """The AnnotateRequest to rerun a saved run's stored request with.
+
+    Handles annotate payloads (`fusions`) and single-gene payloads saved by
+    POST /v1/annotate/gene (`gene`, `tumor_type`). Raises 422 for anything
+    else (older or malformed requests)."""
+    payload = {key: value for key, value in stored.items() if key != "rerun_of"}
+    if "fusions" not in payload and isinstance(payload.get("gene"), str) and payload["gene"].strip():
+        gene = {"fusion": payload.pop("gene"), "tumor_type": payload.pop("tumor_type", None)}
+        payload["fusions"] = [gene]
+    if not payload.get("fusions"):
+        raise HTTPException(status_code=422, detail=_NO_RERUN_REQUEST_DETAIL)
+    try:
+        request = AnnotateRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=_NO_RERUN_REQUEST_DETAIL) from exc
+    request.force_refresh = force_refresh
+    return request
+
+
+@app.post("/v1/runs/{run_id}/rerun", response_model=RerunJobCreateResponse)
+async def rerun_saved_run(
+    run_id: str,
+    http_request: Request,
+    body: Optional[RerunRequest] = Body(default=None),
+    current_user: AuthenticatedUser = Depends(require_auth),
+) -> RerunJobCreateResponse:
+    """Start a new annotation job with a saved run's original request.
+
+    Any signed-in user who can open the run may rerun it; the new run is
+    theirs (source "rerun", with `rerun_of` stored on its request). The
+    original run is never modified, so links to it keep working."""
+    store = getattr(http_request.app.state, "run_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Run storage is unavailable.")
+    stored = await store.get_run_request(run_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    request = _rerun_request(stored, force_refresh=bool(body and body.force_refresh))
+    _check_annotate_input_limit(request.fusions)
+    _record_annotation_request_metrics(request, http_request, current_user)
+    job_id = await _launch_annotation_job(
+        request,
+        http_request,
+        current_user,
+        run_source="rerun",
+        saved_request_extras={"rerun_of": run_id},
+        extra_details={"rerun_of": run_id},
+    )
+    return RerunJobCreateResponse(
+        job_id=job_id,
+        status_url=f"/v1/annotate/jobs/{job_id}",
+        rerun_of=run_id,
+        fusions=request.fusions,
+        mode=request.mode,
     )
 
 

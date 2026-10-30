@@ -15,7 +15,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import aiomysql
 import pymysql
@@ -511,28 +511,71 @@ class RunStore(UserStoreMixin):
             next_cursor = _encode_runs_cursor(last.created_at, last.run_id)
         return RunSummaryPage(runs=runs, next_cursor=next_cursor)
 
-    async def update_run_result(
-        self,
-        run_id: str,
-        result_payload: Dict[str, Any],
-        *,
-        genes_annotated: Optional[int] = None,
-    ) -> None:
+    async def update_run_result(self, run_id: str, result_payload: Dict[str, Any]) -> None:
         """Overwrite a saved run's result (e.g. once a background job, like fusion
         evidence retrieval, completes after the initial save).
 
-        `genes_annotated` updates the listing column too when the result changes
-        how many genes the run contains (retrying failed annotations). Leaving it
-        unset keeps the existing listing value, as before."""
-        if genes_annotated is None:
-            sql = "UPDATE runs SET result_json = %s WHERE run_id = %s"
-            params: tuple = (json.dumps(result_payload), run_id)
-        else:
-            sql = "UPDATE runs SET result_json = %s, genes_annotated = %s WHERE run_id = %s"
-            params = (json.dumps(result_payload), genes_annotated, run_id)
+        Prefer merge_run_result for read-modify-write updates: this overwrites
+        the whole result and can lose a concurrent attach."""
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute(sql, params)
+                await cursor.execute(
+                    "UPDATE runs SET result_json = %s WHERE run_id = %s",
+                    (json.dumps(result_payload), run_id),
+                )
+
+    async def merge_run_result(
+        self,
+        run_id: str,
+        mutate: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]],
+        *,
+        sync_genes_annotated: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically read, mutate, and write a run's result.
+
+        Locks the run row with SELECT ... FOR UPDATE so two background jobs
+        attaching to the same run serialize instead of restoring each other's
+        stale snapshot. `mutate` receives the freshly-read result and may
+        modify it in place; returning None keeps the in-place changes. Returns
+        the stored result, or None when the run does not exist. Only
+        result_json is written, so owner/source/input summary stay untouched;
+        `sync_genes_annotated` also copies the result's genes_annotated into
+        the listing column (for updates that can change the gene count, like
+        retrying failed annotations).
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await conn.begin()
+                try:
+                    await cursor.execute(
+                        "SELECT result_json FROM runs WHERE run_id = %s FOR UPDATE",
+                        (run_id,),
+                    )
+                    row = await cursor.fetchone()
+                    if row is None:
+                        await conn.rollback()
+                        return None
+                    stored = json.loads(row[0])
+                    updated = mutate(stored)
+                    if updated is None:
+                        updated = stored
+                    genes_annotated = updated.get("genes_annotated")
+                    if sync_genes_annotated and isinstance(genes_annotated, int):
+                        await cursor.execute(
+                            "UPDATE runs SET result_json = %s, genes_annotated = %s "
+                            "WHERE run_id = %s",
+                            (json.dumps(updated), genes_annotated, run_id),
+                        )
+                    else:
+                        await cursor.execute(
+                            "UPDATE runs SET result_json = %s WHERE run_id = %s",
+                            (json.dumps(updated), run_id),
+                        )
+                    await conn.commit()
+                    return updated
+                except BaseException:
+                    await conn.rollback()
+                    raise
 
     async def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         async with self._pool.acquire() as conn:
@@ -546,7 +589,8 @@ class RunStore(UserStoreMixin):
         return json.loads(row[0])
 
     async def get_run_request(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """The request payload a run was saved with, or None when it doesn't exist."""
+        """The request a run was saved with, or None for an unknown run. A
+        stored request that isn't a JSON object comes back as {}."""
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
@@ -555,7 +599,8 @@ class RunStore(UserStoreMixin):
                 row = await cursor.fetchone()
         if row is None:
             return None
-        return json.loads(row[0])
+        payload = json.loads(row[0]) if row[0] is not None else None
+        return payload if isinstance(payload, dict) else {}
 
     async def get_run_metadata(self, run_id: str) -> Optional[Dict[str, Optional[str]]]:
         """Owner attribution for a saved run, or None when it doesn't exist."""

@@ -168,9 +168,9 @@ async def sanitize_fusion_evidence_result(
 
     kept_pmids = {card.pmid for card in kept_cards}
     result.evidence_cards = kept_cards
-    if result.literature_scope is not None:
-        # Results that carry a literature_scope were produced by the current
-        # exact-pair filter (the cache key was bumped with the field), so
+    if result.literature_scope is not None or result.partial:
+        # Scoped and partial results were produced by the current exact-pair
+        # filter (partial results may have unknown tumor scope), so
         # PMIDs beyond the evidence cards were verified at retrieval time.
         # Keep them, so a reopened run classifies like the live result; drop
         # only retracted PMIDs and PMIDs whose own card failed re-verification.
@@ -192,7 +192,9 @@ async def sanitize_fusion_evidence_result(
     result.requested_tumor_pmids = [
         pmid for pmid in result.requested_tumor_pmids if pmid in retained_pmids
     ]
-    if result.literature_scope is not None:
+    if result.partial and (not result.pmids or original_scope is None):
+        result.literature_scope = None
+    elif result.literature_scope is not None:
         result.literature_scope = fusion_literature_scope(
             result.tumor_type, len(result.pmids), len(result.requested_tumor_pmids)
         )
@@ -218,6 +220,8 @@ async def sanitize_fusion_evidence_result(
             retained_count=result.retrieved_count,
             requested_tumor_count=len(result.requested_tumor_pmids),
         )
+    if result.partial and result.pmids != original_pmids:
+        result.interpretation += " One search failed; results are partial."
     return (
         result.pmids != original_pmids
         or len(result.evidence_cards) != original_card_count
