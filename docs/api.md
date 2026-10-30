@@ -934,3 +934,117 @@ warnings about the updated genes are added. `genes_annotated` is recomputed.
 
 Unknown runs return `404`, non-owners return `403`, unauthenticated requests
 return `401`, and run storage that isn't configured returns `503`.
+
+## Admin user management (`/v1/admin`)
+
+Admins only: any other caller gets `403`, signed-out callers `401`. An API key
+acts with its owner's current role, so only an admin's key works, and stops
+working as soon as the owner is demoted or disabled. `AGCG_DEV_MODE` doesn't
+open these endpoints. Changes and the change log need
+`USER_STORE_BACKEND=mysql`; with `redis`, `GET /v1/admin/users` still lists
+users (`"writable": false`) and the other endpoints return `409`. A user
+store that can't be read returns `503`; nothing falls back to a cached copy.
+See [admin.md](admin.md) for the `/admin/users` page.
+
+### GET /v1/admin/users
+
+Users by most recent login first. Query parameters (all optional):
+`search` (case-insensitive substring of email or name; accents and case
+folding as in the user store, e.g. `strasse` finds `Straße`), `role`
+(`viewer`, `curator`, `admin`), `status` (`pending`, `active`, `disabled`),
+`limit` (default `50`, `1`–`500`) and `cursor` (the previous page's
+`next_cursor`, unchanged).
+
+```json
+{
+  "users": [
+    {
+      "email": "jane@mskcc.org",
+      "name": "Jane Doe",
+      "domain": "mskcc.org",
+      "provider": "google",
+      "role": "curator",
+      "status": "active",
+      "role_updated_by": "admin@mskcc.org",
+      "role_updated_at": "2026-10-20T09:00:00Z",
+      "first_login_at": "2026-09-01T12:00:00Z",
+      "last_login_at": "2026-10-29T08:30:00Z",
+      "login_count": 42,
+      "annotation_count": 310,
+      "last_annotation_at": "2026-10-29T08:41:00Z"
+    }
+  ],
+  "next_cursor": null,
+  "backend": "mysql",
+  "writable": true
+}
+```
+
+An unknown `role`/`status`, an out-of-range `limit` or a malformed `cursor`
+returns `422`.
+
+### POST /v1/admin/users/{email}/changes
+
+Change a user's role and/or status. URL-encode the email (`@` as `%40`).
+
+```json
+{ "role": "curator", "status": "active", "reason": "Approved by the curation lead" }
+```
+
+- `role`: `viewer`, `curator` or `admin`.
+- `status`: `active` (approve a pending user, re-enable a disabled one) or
+  `disabled`. Users can't be moved back to `pending`.
+- `reason` (optional, at most 1000 characters) is recorded with the change.
+
+Give `role`, `status` or both; both are applied in one transaction. Each field
+that actually changes writes one change-log entry with you as `actor`; fields
+that already have the requested value write nothing, so repeating a request
+is a no-op (`"changes": []`). The change applies to the user's next request
+(sessions and API keys alike).
+
+```json
+{
+  "user": { "email": "jane@mskcc.org", "role": "curator", "status": "active", "...": "..." },
+  "changes": [
+    {
+      "id": 18, "email": "jane@mskcc.org", "field": "status", "old_value": "pending",
+      "new_value": "active", "actor": "admin@mskcc.org",
+      "reason": "Approved by the curation lead", "request_id": null,
+      "created_at": "2026-10-30T10:00:00Z"
+    }
+  ]
+}
+```
+
+| Status | When |
+|---|---|
+| `404` | No such user (or not an email address). |
+| `409` | The change would leave no **active** admin (the last active admin can't be demoted or disabled; promote or re-enable another admin first). Checked in the same transaction as the change, so two admins can't remove each other at once. |
+| `409` | You tried to disable your own account (demoting yourself is allowed while another active admin remains). |
+| `409` | `USER_STORE_BACKEND` is `redis`. |
+| `422` | Neither `role` nor `status`, an unknown value, `status: "pending"`, or a reason over 1000 characters. Nothing is written. |
+| `503` | The user store is unavailable. Nothing is written. |
+
+### GET /v1/admin/role-changes
+
+Every role and status change, newest first: admin changes, curator-request
+approvals (`request_id` set) and bootstrap grants (`actor`
+`system:migration`). Query parameters: `limit` (default `50`, `1`–`500`) and
+`cursor`.
+
+```json
+{
+  "changes": [
+    {
+      "id": 18, "email": "jane@mskcc.org", "field": "status", "old_value": "pending",
+      "new_value": "active", "actor": "admin@mskcc.org", "reason": null,
+      "request_id": null, "created_at": "2026-10-30T10:00:00Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+### GET /v1/admin/users/{email}/changes
+
+The same, for one user. Unknown users return `404`.

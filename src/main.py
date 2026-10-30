@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
 from src.api.run_persistence import can_modify_run, run_owner, save_run_or_raise
 from src.api.runs import router as runs_router
+from src.admin_users_routes import router as admin_users_router
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
     AuthenticatedUser,
@@ -237,6 +238,7 @@ app.add_middleware(
     # frontend's preflight would fail and the card would silently vanish.
     allow_headers=["Content-Type", "Authorization", "X-OpenEvidence-Poll"],
 )
+app.include_router(admin_users_router)
 app.include_router(api_keys_router)
 app.include_router(runs_router)
 app.include_router(ui_events_router)
@@ -254,7 +256,7 @@ async def no_cache_static(request: Request, call_next):
     # app.js/styles.css after a deploy on a plain reload, not just a hard
     # refresh — force revalidation on every request for both.
     response = await call_next(request)
-    if request.url.path in ("/", "/login", "/api-keys", "/runs") or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/login", "/api-keys", "/runs", "/admin/users") or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -1463,6 +1465,26 @@ async def runs_page(request: Request) -> Response:
     if redirect:
         return redirect
     return FileResponse(_STATIC_DIR / "runs.html")
+
+
+_ADMIN_ONLY_PAGE_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><title>Admins only</title>
+<link rel="stylesheet" href="/static/styles.css" /></head>
+<body class="api-keys-body"><main class="api-keys-page">
+<h1>Admins only</h1><p>User management is available to administrators.</p>
+<p><a href="/">&larr; Back to annotations</a></p></main></body></html>
+"""
+
+
+@app.get("/admin/users")
+async def admin_users_page(request: Request) -> Response:
+    redirect = await _login_redirect(request)
+    if redirect:
+        return redirect
+    user = await get_request_user(request)
+    if settings.auth_enabled and (user is None or user.role != "admin"):
+        return HTMLResponse(_ADMIN_ONLY_PAGE_HTML, status_code=403)
+    return FileResponse(_STATIC_DIR / "admin-users.html")
 
 
 @app.get("/login")
