@@ -25,6 +25,7 @@ from src.pipeline.user_store import (
     CuratorRequestAlreadyDecided,
     CuratorRequestNotFound,
     DuplicatePendingCuratorRequest,
+    LastActiveAdmin,
     LoginIdentity,
     UserFilters,
     UserNotFound,
@@ -368,6 +369,128 @@ async def test_concurrent_set_role_audits_each_real_change_once(store, email):
     )
     assert sum(r is not None for r in results) == 1
     assert len((await store.list_role_changes(email=address)).changes) == 1
+
+
+# ---------------------------------------------------------------------------
+# Admin access changes (change_user_access)
+# ---------------------------------------------------------------------------
+
+
+async def _admins(store, email, *names):
+    for name in names:
+        await _login(store, email(name))
+        await store.set_role(email(name), "admin", actor="bootstrap@ops.example")
+
+
+async def _require_no_other_admins(store, backend):
+    """Last-admin rules are global; on a shared MySQL another active admin
+    (outside this test's domain) would legitimately allow the change."""
+    if await store.count_admins() and backend[0] == "mysql":
+        pytest.skip("the shared database has other active admins")
+
+
+async def test_change_user_access_sets_both_fields_with_one_audit_row_each(store, email):
+    address = email("pending")
+    await _login(store, address, status="pending")
+
+    changes = await store.change_user_access(
+        address, role="curator", status="active", actor=email("admin"), reason="approved",
+    )
+
+    assert [(c.field, c.old_value, c.new_value) for c in changes] == [
+        ("role", "viewer", "curator"), ("status", "pending", "active"),
+    ]
+    assert {(c.actor, c.reason, c.request_id) for c in changes} == {(email("admin"), "approved", None)}
+    user = await store.get_user(address)
+    assert (user.role, user.status, user.role_updated_by) == ("curator", "active", email("admin"))
+    assert sorted((await store.list_role_changes(email=address)).changes, key=lambda c: c.id) == changes
+
+
+async def test_change_user_access_no_op_writes_nothing(store, email):
+    address = email("same")
+    before = await _login(store, address)
+    assert await store.change_user_access(address, role="viewer", status="active", actor=email("a")) == []
+    assert await store.get_user(address) == before
+    assert (await store.list_role_changes(email=address)).changes == []
+    # Only the field that changes is audited.
+    changes = await store.change_user_access(address, role="viewer", status="disabled", actor=email("a"))
+    assert [(c.field, c.new_value) for c in changes] == [("status", "disabled")]
+
+
+async def test_change_user_access_unknown_user_or_value(store, email):
+    with pytest.raises(UserNotFound):
+        await store.change_user_access(email("ghost"), role="curator", actor=email("a"))
+    await _login(store, email("real"))
+    for kwargs in ({"role": "owner"}, {"status": "frozen"}, {}):
+        with pytest.raises(ValueError):
+            await store.change_user_access(email("real"), actor=email("a"), **kwargs)
+    assert (await store.list_role_changes(email=email("real"))).changes == []
+
+
+@pytest.mark.parametrize(
+    "change", [{"role": "curator"}, {"status": "disabled"}, {"role": "viewer", "status": "disabled"}],
+)
+async def test_last_active_admin_cannot_be_demoted_or_disabled(store, email, backend, change):
+    await _require_no_other_admins(store, backend)
+    await _admins(store, email, "only")
+    before = await store.get_user(email("only"))
+    audit_before = (await store.list_role_changes(email=email("only"))).changes
+
+    with pytest.raises(LastActiveAdmin):
+        await store.change_user_access(email("only"), actor=email("only"), **change)
+
+    assert await store.get_user(email("only")) == before
+    assert (await store.list_role_changes(email=email("only"))).changes == audit_before
+
+
+async def test_disabled_admins_do_not_count_as_another_admin(store, email, backend):
+    await _require_no_other_admins(store, backend)
+    await _admins(store, email, "live", "off")
+    await store.change_user_access(email("off"), status="disabled", actor=email("live"))
+    with pytest.raises(LastActiveAdmin):
+        await store.change_user_access(email("live"), role="viewer", actor=email("live"))
+    # Re-enabling the other admin makes the demotion possible again.
+    await store.change_user_access(email("off"), status="active", actor=email("live"))
+    assert len(await store.change_user_access(email("live"), role="viewer", actor=email("off"))) == 1
+
+
+async def test_admin_changes_allowed_while_another_admin_stays_active(store, email):
+    await _admins(store, email, "a1", "a2")
+    changes = await store.change_user_access(email("a2"), status="disabled", actor=email("a1"))
+    assert [(c.field, c.new_value) for c in changes] == [("status", "disabled")]
+    # A non-admin target never trips the check, whatever the admin count.
+    await _login(store, email("viewer"))
+    assert len(await store.change_user_access(email("viewer"), status="disabled", actor=email("a1"))) == 1
+
+
+async def test_two_admins_removing_each_other_leaves_one_active_admin(store, email, backend):
+    await _require_no_other_admins(store, backend)
+    await _admins(store, email, "x", "y")
+
+    results = await asyncio.gather(
+        store.change_user_access(email("y"), role="viewer", actor=email("x")),
+        store.change_user_access(email("x"), status="disabled", actor=email("y")),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(r, LastActiveAdmin) for r in results) == 1
+    assert sum(isinstance(r, list) and len(r) == 1 for r in results) == 1
+    assert await store.count_admins() == 1
+    audit = (await store.list_role_changes(email=email("x"))).changes + (
+        await store.list_role_changes(email=email("y"))
+    ).changes
+    assert len([c for c in audit if c.actor != "bootstrap@ops.example"]) == 1
+
+
+@pytest.mark.parametrize("value", ["viewer"])
+async def test_failed_audit_insert_rolls_back_both_fields(store, email, break_audit_insert, value):
+    address = email("atomic2")
+    before = await _login(store, address, status="pending")
+    break_audit_insert()
+    with pytest.raises(Exception):
+        await store.change_user_access(address, role="curator", status="active", actor=email("a"))
+    assert await store.get_user(address) == before
+    assert (await store.list_role_changes(email=address)).changes == []
 
 
 # ---------------------------------------------------------------------------
