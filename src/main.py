@@ -907,18 +907,27 @@ def _fusion_evidence_key(item: Dict[str, Any]) -> tuple[str, Optional[str]]:
     return str(submission), tumor_type
 
 
+def _fusion_evidence_succeeded(item: Dict[str, Any]) -> bool:
+    """A complete lookup: neither failed nor partial."""
+    return item.get("retrieval_status") != "failed" and not item.get("partial")
+
+
 def _merge_fusion_evidence(
     existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """Replace matching items in place, keep every other item, then append
-    incoming items the run didn't already have."""
+    incoming items the run didn't already have. A failed or partial lookup
+    never replaces an item that succeeded, so a re-run whose lookup fails
+    keeps the run's earlier evidence."""
     replacements = {_fusion_evidence_key(item): item for item in incoming}
     merged: List[Dict[str, Any]] = []
     replaced: set[tuple[str, Optional[str]]] = set()
     for item in existing:
         key = _fusion_evidence_key(item)
         if key in replacements:
-            merged.append(replacements[key])
+            incoming_item = replacements[key]
+            keep_existing = _fusion_evidence_succeeded(item) and not _fusion_evidence_succeeded(incoming_item)
+            merged.append(item if keep_existing else incoming_item)
             replaced.add(key)
         else:
             merged.append(item)

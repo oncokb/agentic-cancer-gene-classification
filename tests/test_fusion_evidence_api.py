@@ -536,3 +536,151 @@ def test_merge_resolves_duplicate_keys_to_one_item():
         {"fusion": "KEEP::ONE", "tumor_type": "LUAD", "retrieval_status": "ok"},
         {"fusion": "NEW::ONE", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["3"]},
     ]
+
+
+def test_single_fusion_force_refresh_rerun_bypasses_cache_and_merges_only_it(
+    monkeypatch, fake_redis,
+):
+    """The UI's per-card Re-run: one fusion + run_id + force_refresh skips the
+    cached evidence, replaces that one item in place and refreshes the cache."""
+    from src.pipeline import literature
+
+    main._fusion_evidence_jobs.clear_local()
+    # Job snapshots stay in-process; fake_redis is the evidence cache alone.
+    monkeypatch.setattr(main._fusion_evidence_jobs, "_redis_client_factory", lambda: None)
+    stale = FusionEvidenceResult(
+        fusion="EML4::ALK", tumor_type="LUAD", retrieval_status="ok",
+        literature_scope="no_literature", interpretation="Cached before the re-run.",
+    )
+    cache_key = literature._fusion_evidence_cache_key(
+        "EML4::ALK", "LUAD", settings.fusion_evidence_max_results,
+    )
+    asyncio.run(fake_redis.set(cache_key, stale.model_dump_json()))
+
+    live_calls = []
+
+    async def fake_uncached(fusion, tumor_type=None, max_results=None):
+        live_calls.append((fusion, tumor_type))
+        return FusionEvidenceResult(
+            fusion=fusion, tumor_type=tumor_type, retrieval_status="ok",
+            literature_scope="requested_tumor", retrieved_count=2, pmids=["7", "8"],
+            interpretation="Fresh lookup.",
+        )
+
+    monkeypatch.setattr(literature, "_retrieve_fusion_evidence_uncached", fake_uncached)
+    monkeypatch.setattr(main.settings, "fusion_evidence_concurrency", 1)
+    others = [
+        {"fusion": "KEEP::ONE", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["1"]},
+        {"fusion": "EML4::ALK", "tumor_type": "COAD", "retrieval_status": "failed", "pmids": []},
+    ]
+    fake_run_store = _FakeRunStore({
+        "run_id": "run-rerun", "annotations": [],
+        "fusion_evidence": [others[0], stale.model_dump(), others[1]],
+    })
+    main.app.state.run_store = fake_run_store
+    client = TestClient(main.app)
+
+    def run_job(force_refresh):
+        response = client.post("/v1/fusion-evidence/jobs", json={
+            "fusions": [{"fusion": "EML4::ALK", "tumor_type": "LUAD"}],
+            "run_id": "run-rerun",
+            "force_refresh": force_refresh,
+        })
+        assert response.status_code == 200
+        for _ in range(50):
+            payload = client.get(response.json()["status_url"]).json()
+            if payload["status"] == "complete":
+                return payload
+            time.sleep(0.01)
+        raise AssertionError(f"job did not complete: {payload}")
+
+    # Without force_refresh the cached evidence is reused (sanity check).
+    cached = run_job(force_refresh=False)
+    assert live_calls == []
+    assert cached["fusion_evidence"][0]["interpretation"] == "Cached before the re-run."
+
+    rerun = run_job(force_refresh=True)
+    assert live_calls == [("EML4::ALK", "LUAD")], "force_refresh must bypass the cache"
+    assert [item["fusion"] for item in rerun["fusion_evidence"]] == ["EML4::ALK"]
+    assert rerun["fusion_evidence"][0]["pmids"] == ["7", "8"]
+
+    _, updated = fake_run_store.updated_runs[-1]
+    assert updated["fusion_evidence"][0] == others[0]
+    assert updated["fusion_evidence"][1]["pmids"] == ["7", "8"]
+    assert updated["fusion_evidence"][1]["interpretation"] == "Fresh lookup."
+    assert updated["fusion_evidence"][2] == others[1], "same fusion, other tumor type untouched"
+    assert len(updated["fusion_evidence"]) == 3
+    refreshed = asyncio.run(fake_redis.get(cache_key))
+    assert b"Fresh lookup." in refreshed, "the re-run replaces the cached value"
+    main._fusion_evidence_jobs.clear_local()
+
+
+def test_merge_never_replaces_succeeded_item_with_failed_or_partial():
+    good = {"fusion": "A::B", "tumor_type": "LUAD", "retrieval_status": "ok", "pmids": ["1"]}
+    failed = {"fusion": "C::D", "tumor_type": "LUAD", "retrieval_status": "failed", "pmids": []}
+    partial = {"fusion": "E::F", "tumor_type": "LUAD", "retrieval_status": "ok", "partial": True}
+    also_failed = {"fusion": "G::H", "tumor_type": "LUAD", "retrieval_status": "failed", "pmids": []}
+
+    merged = main._merge_fusion_evidence(
+        [good, failed, partial, also_failed],
+        [
+            {**good, "retrieval_status": "failed", "pmids": []},  # good kept
+            {**failed, "partial": True, "retrieval_status": "ok", "pmids": ["2"]},  # failed -> partial
+            {**partial, "retrieval_status": "failed", "partial": False},  # partial -> failed
+            {**also_failed, "interpretation": "PubMed search failed (HTTP 503)"},  # failed -> failed
+        ],
+    )
+
+    assert merged[0] == good
+    assert merged[1]["partial"] is True and merged[1]["pmids"] == ["2"]
+    assert merged[2]["retrieval_status"] == "failed"
+    assert merged[3]["interpretation"] == "PubMed search failed (HTTP 503)"
+    assert main._merge_fusion_evidence([good], [{**good, "partial": True, "pmids": []}]) == [good]
+
+
+@pytest.mark.parametrize("outcome", ["raises", "partial"])
+def test_failed_or_partial_rerun_keeps_runs_good_evidence(monkeypatch, outcome):
+    """A single-fusion force_refresh re-run whose lookup fails completes with a
+    failed (or partial) item, but the saved run keeps its earlier evidence."""
+    main._fusion_evidence_jobs.clear_local()
+
+    async def fake_retrieve_fusion_evidence(fusion, tumor_type=None, force_refresh=False):
+        assert force_refresh is True
+        if outcome == "raises":
+            raise TimeoutError("PubMed timed out")
+        return FusionEvidenceResult(
+            fusion=fusion, tumor_type=tumor_type, partial=True, literature_scope="requested_tumor",
+        )
+
+    good = {
+        "fusion": "EML4::ALK", "tumor_type": "LUAD", "retrieval_status": "ok",
+        "literature_scope": "requested_tumor", "pmids": ["1", "2"],
+    }
+    failed = {"fusion": "KIF5B::RET", "tumor_type": "LUAD", "retrieval_status": "failed", "pmids": []}
+    fake_run_store = _FakeRunStore({"run_id": "run-keep", "annotations": [], "fusion_evidence": [good, failed]})
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_retrieve_fusion_evidence)
+    monkeypatch.setattr(main.settings, "fusion_evidence_concurrency", 1)
+    main.app.state.run_store = fake_run_store
+    client = TestClient(main.app)
+
+    response = client.post("/v1/fusion-evidence/jobs", json={
+        "fusions": [{"fusion": "EML4::ALK", "tumor_type": "LUAD"}],
+        "run_id": "run-keep",
+        "force_refresh": True,
+    })
+    assert response.status_code == 200
+    for _ in range(50):
+        payload = client.get(response.json()["status_url"]).json()
+        if payload["status"] == "complete":
+            break
+        time.sleep(0.01)
+
+    assert payload["status"] == "complete"
+    job_item = payload["fusion_evidence"][0]
+    if outcome == "raises":
+        assert job_item["retrieval_status"] == "failed"
+    else:
+        assert job_item["partial"] is True
+    _, updated = fake_run_store.updated_runs[-1]
+    assert updated["fusion_evidence"] == [good, failed], "the run keeps its earlier evidence"
+    main._fusion_evidence_jobs.clear_local()
