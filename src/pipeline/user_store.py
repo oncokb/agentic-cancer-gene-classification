@@ -757,7 +757,9 @@ class UserStoreMixin:
         """Make a user admin unless they already are or a bootstrap grant was
         ever logged for them (so a later demotion is never undone). The check
         and the change are one transaction holding the user's row lock, so
-        concurrent callers grant at most once. Returns BOOTSTRAP_GRANTED,
+        concurrent callers grant at most once. An existing admin also gets a
+        grant row if none exists, without changing their user record.
+        Returns BOOTSTRAP_GRANTED,
         BOOTSTRAP_ALREADY_ADMIN or BOOTSTRAP_PREVIOUSLY_GRANTED; raises
         UserNotFound for an unknown email."""
         clean = normalize_email(email)
@@ -767,15 +769,23 @@ class UserStoreMixin:
                 user = await self._fetch_user(cursor, clean, for_update=True)
                 if user is None:
                     raise UserNotFound(clean)
-                if user.role == "admin":
-                    return BOOTSTRAP_ALREADY_ADMIN
                 # A locking read sees the latest committed grant, not a snapshot.
                 await cursor.execute(
                     "SELECT 1 FROM role_changes WHERE email = %s AND field = 'role' "
                     "AND new_value = 'admin' AND actor = %s LIMIT 1 FOR SHARE",
                     (clean, BOOTSTRAP_ACTOR),
                 )
-                if await cursor.fetchone():
+                previously_granted = await cursor.fetchone()
+                if user.role == "admin":
+                    if not previously_granted:
+                        # Imported admins must also consume their one-time grant.
+                        # Keep the user row (including role metadata) unchanged.
+                        await cursor.execute(
+                            _INSERT_ROLE_CHANGE_SQL,
+                            (clean, "role", "admin", "admin", BOOTSTRAP_ACTOR, reason, None, now),
+                        )
+                    return BOOTSTRAP_ALREADY_ADMIN
+                if previously_granted:
                     return BOOTSTRAP_PREVIOUSLY_GRANTED
                 await self._apply_user_field(
                     cursor, "role", clean, "admin", actor=BOOTSTRAP_ACTOR, reason=reason,

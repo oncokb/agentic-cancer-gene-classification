@@ -155,13 +155,26 @@ class FakeUserStore:
             user = self._users.get(clean)
             if user is None:
                 raise UserNotFound(clean)
-            if user.role == "admin":
-                return BOOTSTRAP_ALREADY_ADMIN
-            if any(
+            previously_granted = any(
                 c.email == clean and c.field == "role" and c.new_value == "admin"
                 and c.actor == BOOTSTRAP_ACTOR
                 for c in self._role_changes
-            ):
+            )
+            if user.role == "admin":
+                if not previously_granted:
+                    self._append_role_change(RoleChange(
+                        id=self._next_change_id,
+                        email=clean,
+                        field="role",
+                        old_value="admin",
+                        new_value="admin",
+                        actor=BOOTSTRAP_ACTOR,
+                        reason=reason,
+                        request_id=None,
+                        created_at=_db_time(),
+                    ))
+                return BOOTSTRAP_ALREADY_ADMIN
+            if previously_granted:
                 return BOOTSTRAP_PREVIOUSLY_GRANTED
             self._apply_user_field(
                 "role", clean, "admin", actor=BOOTSTRAP_ACTOR, reason=reason, request_id=None,

@@ -550,6 +550,30 @@ def test_bootstrap_admin_not_regranted_after_demotion(mysql, google_login, monke
     assert mysql.stored(BOOTSTRAP_EMAIL).role == "curator"
 
 
+@pytest.mark.parametrize("first_grant", ["startup", "sign-in"])
+def test_imported_admin_not_regranted_after_demotion(
+    mysql, google_login, monkeypatch, first_grant,
+):
+    monkeypatch.setattr(settings, "bootstrap_admin_emails", BOOTSTRAP_EMAIL)
+    mysql.put(BOOTSTRAP_EMAIL, role="admin")
+    if first_grant == "startup":
+        asyncio.run(auth_module.bootstrap_admins_at_startup())
+    else:
+        _, resp = google_login(BOOTSTRAP_EMAIL)
+        assert resp.status_code == 303
+    [change] = asyncio.run(_role_changes(mysql.store, BOOTSTRAP_EMAIL))
+    assert (change.old_value, change.new_value, change.actor) == ("admin", "admin", BOOTSTRAP_ACTOR)
+
+    asyncio.run(mysql.store.set_role(BOOTSTRAP_EMAIL, "curator", actor="other-admin@mskcc.org"))
+    asyncio.run(auth_module.bootstrap_admins_at_startup())
+    assert mysql.stored(BOOTSTRAP_EMAIL).role == "curator"
+    browser, resp = google_login(BOOTSTRAP_EMAIL)
+    assert resp.status_code == 303
+    assert mysql.stored(BOOTSTRAP_EMAIL).role == "curator"
+    assert browser.get(ADMIN_ONLY).status_code == 403
+    assert len(asyncio.run(_role_changes(mysql.store, BOOTSTRAP_EMAIL))) == 2
+
+
 def test_bootstrap_respects_an_earlier_migration_grant(mysql, monkeypatch):
     # The migration script's --bootstrap-admin grant counts: same actor.
     monkeypatch.setattr(settings, "bootstrap_admin_emails", BOOTSTRAP_EMAIL)
