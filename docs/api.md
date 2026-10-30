@@ -846,18 +846,19 @@ returns `503`.
 ## POST /v1/runs/{run_id}/retry
 
 Re-annotate failed or no-result genes on an existing saved run and merge the
-results into that run in place. Only the run's owner or an administrator may
-retry (an API key acts as its owner; a run with no recorded owner is
-admin-only). The run's other annotations, original inputs, attribution, and
-fusion evidence are left untouched.
+results into that run in place. A retry works on genes, not on the original
+submissions: a fusion's partners are retried one gene at a time, and fusion
+evidence has its own retry (`POST /v1/fusion-evidence/jobs` with `run_id`).
+Only the run's owner or an administrator may retry (an API key acts as its
+owner; a run with no recorded owner is admin-only).
 
 ```bash
 curl -s -X POST https://acgc.oncokb.org/v1/runs/example-run-id/retry \
   -H "Authorization: Bearer $ACGC_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "inputs": [{"fusion": "ALK", "tumor_type": "LUAD"}],
-    "force_refresh": false
+    "kind": "errors",
+    "inputs": [{"fusion": "ALK", "tumor_type": "LUAD"}]
   }'
 ```
 
@@ -868,28 +869,33 @@ curl -s -X POST https://acgc.oncokb.org/v1/runs/example-run-id/retry \
 }
 ```
 
-`inputs` accepts the same entries as `POST /v1/annotate/jobs` (structured
-inputs or plain strings), is validated the same way, and is capped by
-`ANNOTATE_MAX_INPUTS`. The retry reuses the saved run's `mode`, `local_backend`,
-and `skip_literature_for_oncokb`. `force_refresh` defaults to `false`; set it to
-`true` when re-checking no-result genes so a cached low-evidence result isn't
-reused. The job runs in the background and is polled through the returned
-`status_url` with `GET /v1/annotate/jobs/{job_id}`. When the job is `complete`,
-`result.run_id` is the original run id and its `annotations` contain only the
+| Field | Description |
+|---|---|
+| `kind` | Required. `errors` retries genes whose annotation failed for a transient reason; `no_result` re-checks genes on the No result tab that have no error. |
+| `inputs` | Required, 1 to `ANNOTATE_MAX_INPUTS` entries. Plain genes (structured inputs or strings, as in `POST /v1/annotate/jobs`), each named as its row's `gene`, with the tumor type it was annotated under. |
+| `force_refresh` | Optional. Defaults to `true` for `no_result` (a cached result would just repeat) and `false` for `errors`. |
+
+Every input must be a plain gene whose row on this run is currently eligible
+for `kind`. If any input is a fusion, carries breakpoint fields, was rejected
+permanently (an invalid accession, an unresolvable symbol, or a transcript that
+belongs to a different gene), or isn't an eligible gene on this run, the whole
+request returns `422` naming each problem, and nothing is processed. Inputs are
+otherwise validated like a fresh annotate request, and the retry reuses the
+saved run's `mode`, `local_backend`, and `skip_literature_for_oncokb`.
+
+The job runs in the background and is polled through the returned `status_url`
+with `GET /v1/annotate/jobs/{job_id}`. When the job is `complete`,
+`result.run_id` is the original run id and its `annotations` contain the
 retried genes.
 
 Results are written to the stored run only when the whole job completes, in the
 same locked transaction other run updates (such as fusion-evidence retries)
 use, so concurrent updates don't overwrite each other; a `failed` job leaves the
-run unchanged. A stored annotation is only replaced by one at least as good
-(an error < no result < a grounded annotation), so a retry that fails again
-never overwrites an existing result. `genes_annotated` is recomputed.
+run unchanged. Only the rows of the submitted genes that are still eligible are
+written, and only with a result at least as good (an error < no result < a
+grounded annotation); no other gene's row is ever changed, and results for genes
+that weren't submitted are discarded. Existing warnings are kept and new
+warnings about the updated genes are added. `genes_annotated` is recomputed.
 
-Only inputs that match a failed or no-result annotation on the run are retried.
-Inputs whose stored error is permanent (an invalid accession, an unresolvable
-symbol, or a transcript that belongs to a different gene) are ignored because a
-retry would fail the same way, as are inputs that match nothing retryable on
-the run. If no supplied input remains, the endpoint returns `422` and starts no
-job; more than `ANNOTATE_MAX_INPUTS` inputs or invalid entries also return
-`422`. Unknown runs return `404`, non-owners return `403`, unauthenticated
-requests return `401`, and run storage that isn't configured returns `503`.
+Unknown runs return `404`, non-owners return `403`, unauthenticated requests
+return `401`, and run storage that isn't configured returns `503`.

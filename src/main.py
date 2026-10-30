@@ -111,12 +111,7 @@ from src.pipeline.literature import (
 )
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline import openevidence_metrics as oe_metrics
-from src.pipeline.normalization import (
-    has_accession_identifier,
-    is_fusion_input,
-    read_gene_input,
-    split_fusion,
-)
+from src.pipeline.normalization import has_accession_identifier, is_fusion_input, read_gene_input
 from src.pipeline.openevidence import (
     OpenEvidenceClient,
     claim_lookup,
@@ -428,22 +423,30 @@ class FusionEvidenceJobStatusResponse(BaseModel):
 
 
 class RunRetryRequest(BaseModel):
-    """Inputs to re-annotate and merge back into an existing saved run."""
+    """Genes to re-annotate and merge back into an existing saved run."""
 
+    kind: Literal["errors", "no_result"] = Field(
+        ...,
+        description=(
+            "'errors' retries genes whose annotation failed transiently; 'no_result' "
+            "re-checks genes on the No result tab that have no error."
+        ),
+    )
     inputs: List[FusionInput] = Field(
         ...,
         min_length=1,
         description=(
-            "The original submitted inputs to retry, including tumor type and breakpoint "
-            "fields. Inputs rejected for a deterministic reason (bad accession, mismatched "
-            "transcript) are ignored."
+            "Plain genes to retry, each with the tumor type it was annotated under. Every "
+            "gene must currently be eligible for `kind` on this run; a fusion, a "
+            "breakpoint field, a permanently rejected gene or any other gene rejects "
+            "the whole request with 422."
         ),
     )
-    force_refresh: bool = Field(
-        default=False,
+    force_refresh: Optional[bool] = Field(
+        default=None,
         description=(
-            "Bypass stored gene annotations. The UI sets this for the 'No result' tab, "
-            "where a cached annotation would just repeat the same result."
+            "Bypass stored gene annotations. Defaults to true for 'no_result' (a cached "
+            "annotation would just repeat the same result) and false for 'errors'."
         ),
     )
 
@@ -1019,69 +1022,31 @@ def _is_transient_annotation_error(message: Optional[str]) -> bool:
     return not any(marker in text for marker in _DETERMINISTIC_ANNOTATION_ERROR_MARKERS)
 
 
-def _is_retryable_annotation(annotation: Dict[str, Any]) -> bool:
-    """A transiently failed annotation, or a no-result gene without an error."""
+RunRetryKind = Literal["errors", "no_result"]
+
+# FusionInput fields that only describe a fusion breakpoint; a gene retry has none.
+_BREAKPOINT_FIELDS = (
+    "five_exon", "three_exon", "five_genomic", "three_genomic",
+    "five_transcript", "three_transcript",
+)
+
+
+def _is_permanent_rejection(annotation: Dict[str, Any]) -> bool:
     error = annotation.get("error")
-    if error:
-        return _is_transient_annotation_error(error)
-    return bool(annotation.get("insufficient_evidence"))
+    return bool(error) and not _is_transient_annotation_error(error)
+
+
+def _is_retry_eligible(annotation: Dict[str, Any], kind: RunRetryKind) -> bool:
+    """Whether a row may be retried by a `kind` retry: a transiently failed
+    annotation for "errors", a no-result gene without an error for "no_result"."""
+    error = annotation.get("error")
+    if kind == "errors":
+        return bool(error) and _is_transient_annotation_error(error)
+    return not error and bool(annotation.get("insufficient_evidence"))
 
 
 def _normalized_retry_token(value: Any) -> str:
     return " ".join(str(value or "").strip().upper().split())
-
-
-def _retry_tokens_for_text(value: Any) -> set[str]:
-    """Every spelling a submitted input can be matched by: the whole string and
-    its fusion partners."""
-    text = str(value or "").strip()
-    if not text:
-        return set()
-    tokens = {_normalized_retry_token(text)}
-    for part in split_fusion(text):
-        if part:
-            tokens.add(_normalized_retry_token(part))
-    return tokens
-
-
-def _annotation_retry_tokens(annotation: Dict[str, Any]) -> set[str]:
-    tokens: set[str] = set()
-    for value in [annotation.get("gene"), *(annotation.get("fusions") or [])]:
-        tokens |= _retry_tokens_for_text(value)
-    for resolution in annotation.get("resolved_inputs") or []:
-        tokens |= _retry_tokens_for_text(resolution.get("input"))
-        tokens |= _retry_tokens_for_text(resolution.get("resolved"))
-    return tokens
-
-
-def _filter_retryable_inputs(
-    stored_result: Dict[str, Any], inputs: List[FusionInput]
-) -> List[FusionInput]:
-    """Keep only inputs that touch a retryable annotation on the run.
-
-    Inputs that only touch annotations rejected for a permanent reason (bad
-    accession, unresolvable symbol, mismatched transcript), or that match
-    nothing retryable on the run, are dropped: a retry cannot change the
-    former, and the latter would add genes the run never had. A fusion with
-    one permanently rejected partner is kept when its other partner is
-    retryable."""
-    retryable_tokens: set[str] = set()
-    for annotation in stored_result.get("annotations") or []:
-        if _is_retryable_annotation(annotation):
-            retryable_tokens |= _annotation_retry_tokens(annotation)
-    return [
-        item for item in inputs
-        if _retry_tokens_for_text(item.fusion) & retryable_tokens
-    ]
-
-
-def _annotation_rank(annotation: Dict[str, Any]) -> int:
-    """How good an annotation is: an error < no result < a grounded result."""
-    if annotation.get("error"):
-        return 0
-    if annotation.get("insufficient_evidence"):
-        return 1
-    return 2
 
 
 def _annotation_match_keys(annotation: Dict[str, Any]) -> set[str]:
@@ -1095,34 +1060,99 @@ def _annotation_match_keys(annotation: Dict[str, Any]) -> set[str]:
     return keys
 
 
-def _merge_annotations_by_gene(
-    existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Replace matching rows in place, keep every other row, then append
-    incoming rows the run didn't already have.
+def _validate_retry_inputs(
+    stored_result: Dict[str, Any], inputs: List[FusionInput], kind: RunRetryKind,
+) -> List[FusionInput]:
+    """The retry's inputs, deduplicated by gene, or a 422 for the whole request.
 
-    A row is only replaced by one at least as good (_annotation_rank): a retry
-    that fails again never overwrites an existing result with an error, and a
-    no-result re-check never replaces a grounded result."""
-    merged = list(existing)
+    A retry works on genes, not submissions: every input must be a plain gene
+    (no fusion, no breakpoint fields) whose row on this run is currently
+    eligible for a `kind` retry. A fusion would re-annotate its other partner
+    too, and a permanently rejected gene would just fail the same way again,
+    so either one rejects the request instead of being processed in part."""
+    rows = stored_result.get("annotations") or []
+    eligible: set[str] = set()
+    permanent: set[str] = set()
+    for row in rows:
+        if _is_retry_eligible(row, kind):
+            eligible |= _annotation_match_keys(row)
+        elif _is_permanent_rejection(row):
+            permanent |= _annotation_match_keys(row)
+    label = "failed" if kind == "errors" else "no-result"
+    problems: List[str] = []
+    accepted: List[FusionInput] = []
+    seen: set[str] = set()
+    for item in inputs:
+        token = _normalized_retry_token(item.fusion)
+        if is_fusion_input(item.fusion):
+            problems.append(f"{item.fusion!r} is a fusion; retry its genes individually")
+        elif any(getattr(item, field) is not None for field in _BREAKPOINT_FIELDS):
+            problems.append(f"{item.fusion!r} has breakpoint fields, which only apply to fusions")
+        elif token in permanent:
+            problems.append(f"{item.fusion!r} was rejected permanently and would fail the same way")
+        elif token not in eligible:
+            problems.append(f"{item.fusion!r} is not a {label} gene on this run")
+        elif token not in seen:
+            seen.add(token)
+            accepted.append(item)
+    if problems:
+        raise HTTPException(
+            status_code=422,
+            detail="Not retryable: " + "; ".join(problems) + ".",
+        )
+    return accepted
+
+
+def _annotation_rank(annotation: Dict[str, Any]) -> int:
+    """How good an annotation is: an error < no result < a grounded result."""
+    if annotation.get("error"):
+        return 0
+    if annotation.get("insufficient_evidence"):
+        return 1
+    return 2
+
+
+def _merge_retried_annotations(
+    stored: Dict[str, Any],
+    incoming: List[Dict[str, Any]],
+    warnings: List[str],
+    targets: set[str],
+    kind: RunRetryKind,
+) -> Dict[str, Any]:
+    """Merge a gene retry into a stored run, in place.
+
+    Only rows for the retried genes (`targets`, normalized) that are still
+    eligible for a `kind` retry are written; every other row, including a
+    target that got a good result meanwhile, is left exactly as it was. A
+    target row is only replaced by a result at least as good (a retry that
+    fails again never overwrites a no-result row with an error). Incoming rows
+    for genes the retry wasn't asked for are dropped, never appended. Existing
+    warnings are kept; new warnings about an updated gene are added.
+    genes_annotated is recomputed."""
+    rows = list(stored.get("annotations") or [])
+    updated_keys: set[str] = set()
     for item in incoming:
-        keys = _annotation_match_keys(item)
+        keys = _annotation_match_keys(item) & targets
         matches = [
-            index for index, row in enumerate(merged)
-            if _normalized_retry_token(row.get("gene")) in keys
+            index for index, row in enumerate(rows)
+            if _normalized_retry_token(row.get("gene")) in keys and _is_retry_eligible(row, kind)
         ]
-        if not matches:
-            merged.append(item)
+        if not matches or _annotation_rank(item) < _annotation_rank(rows[matches[0]]):
             continue
-        first = matches[0]
-        if _annotation_rank(item) < _annotation_rank(merged[first]):
-            continue
-        merged[first] = item
-        # An older row stored under a raw input this result now covers.
+        rows[matches[0]] = item
+        # Another submitted spelling of the same gene (its raw input) is now covered.
         for index in reversed(matches[1:]):
-            if _annotation_rank(merged[index]) <= _annotation_rank(item):
-                del merged[index]
-    return merged
+            if _annotation_rank(rows[index]) <= _annotation_rank(item):
+                del rows[index]
+        updated_keys |= keys | {_normalized_retry_token(item.get("gene"))}
+    existing_warnings = list(stored.get("warnings") or [])
+    for warning in warnings:
+        if warning not in existing_warnings and _warning_mentions_any(warning, updated_keys):
+            existing_warnings.append(warning)
+    stored["annotations"] = rows
+    stored["warnings"] = existing_warnings
+    stored["genes_annotated"] = len(rows)
+    return stored
 
 
 def _warning_mentions_any(warning: str, tokens: set[str]) -> bool:
@@ -1133,38 +1163,6 @@ def _warning_mentions_any(warning: str, tokens: set[str]) -> bool:
         if re.search(pattern, warning, re.IGNORECASE):
             return True
     return False
-
-
-def _merge_run_warnings(
-    existing: List[str], incoming: List[str], targeted_tokens: set[str]
-) -> List[str]:
-    merged = [warning for warning in existing if not _warning_mentions_any(warning, targeted_tokens)]
-    for warning in incoming:
-        if warning not in merged:
-            merged.append(warning)
-    return merged
-
-
-def _merge_retried_annotations(
-    stored: Dict[str, Any], incoming: List[Dict[str, Any]], warnings: List[str]
-) -> Dict[str, Any]:
-    """Merge a retried subset of annotations into a stored run, in place.
-
-    Only annotations/warnings for the retried genes that improved change; the
-    run's owner, original inputs, fusion evidence and other annotations stay
-    as they were. genes_annotated is recomputed from the merged list."""
-    existing = stored.get("annotations") or []
-    merged_annotations = _merge_annotations_by_gene(existing, incoming)
-    applied = [item for item in incoming if any(item is row for row in merged_annotations)]
-    targeted_tokens: set[str] = set()
-    for item in applied:
-        targeted_tokens |= _annotation_retry_tokens(item)
-    stored["annotations"] = merged_annotations
-    stored["warnings"] = _merge_run_warnings(
-        stored.get("warnings") or [], warnings if applied else [], targeted_tokens,
-    )
-    stored["genes_annotated"] = len(merged_annotations)
-    return stored
 
 
 def _public_app_base_url(request: Request) -> str:
@@ -2076,14 +2074,19 @@ async def get_annotation_job(
 
 
 async def _persist_retried_annotations(
-    http_request: Request, run_id: str, result: AnnotationResult,
+    http_request: Request,
+    run_id: str,
+    result: AnnotationResult,
+    targets: set[str],
+    kind: RunRetryKind,
 ) -> None:
     """Merge a completed retry onto its run under the run's row lock, so it
-    can't clobber (or be clobbered by) a concurrent fusion-evidence attach."""
+    can't clobber (or be clobbered by) a concurrent fusion-evidence attach.
+    Eligibility is re-checked against the freshly locked run."""
     incoming = [item.model_dump() for item in result.annotations]
 
     def merge(stored: Dict[str, Any]) -> Dict[str, Any]:
-        return _merge_retried_annotations(stored, incoming, result.warnings)
+        return _merge_retried_annotations(stored, incoming, result.warnings, targets, kind)
 
     merged = await http_request.app.state.run_store.merge_run_result(
         run_id, merge, sync_genes_annotated=True,
@@ -2115,6 +2118,7 @@ def _run_retry_request(
 async def _launch_run_retry_job(
     run_id: str,
     request: AnnotateRequest,
+    kind: RunRetryKind,
     http_request: Request,
     current_user: Optional[AuthenticatedUser],
 ) -> str:
@@ -2161,7 +2165,8 @@ async def _launch_run_retry_job(
                 on_total_known=on_total_known,
             )
             result.run_id = run_id
-            await _persist_retried_annotations(http_request, run_id, result)
+            targets = {_normalized_retry_token(item.fusion) for item in request.fusions}
+            await _persist_retried_annotations(http_request, run_id, result, targets, kind)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
             current.phase = "complete"
@@ -2207,12 +2212,12 @@ async def retry_run_annotations(
 ) -> AnnotationJobCreateResponse:
     """Retry failed or no-result gene annotations on an existing saved run.
 
-    Only the supplied inputs are re-annotated, and their results are merged
-    into the stored run in place once the whole job succeeds; the run's other
-    annotations, original inputs, attribution and fusion evidence are left
-    untouched, and an existing annotation is only replaced by one at least as
-    good. Inputs whose stored error is permanent are ignored (a retry cannot
-    change them)."""
+    A retry works on genes: every input must be a plain gene whose row is
+    eligible for `kind` (see _validate_retry_inputs), or the whole request is
+    rejected with 422. Results are merged into the stored run in place once
+    the whole job succeeds, writing only the submitted genes' rows; the run's
+    other annotations, original inputs, attribution and fusion evidence are
+    left untouched, and a row is only replaced by one at least as good."""
     store = getattr(http_request.app.state, "run_store", None)
     if store is None:
         raise HTTPException(status_code=503, detail="Run storage is unavailable.")
@@ -2228,19 +2233,17 @@ async def retry_run_annotations(
     stored = await store.get_run(run_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="Run not found")
-    retry_inputs = _filter_retryable_inputs(stored, request.inputs)
-    if not retry_inputs:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "No retryable inputs: none of these inputs match a failed or no-result "
-                "annotation on this run that a retry could change."
-            ),
-        )
+    retry_inputs = _validate_retry_inputs(stored, request.inputs, request.kind)
+    force_refresh = (
+        request.force_refresh if request.force_refresh is not None
+        else request.kind == "no_result"
+    )
     stored_request = await store.get_run_request(run_id) or {}
-    annotate_request = _run_retry_request(stored_request, retry_inputs, request.force_refresh)
+    annotate_request = _run_retry_request(stored_request, retry_inputs, force_refresh)
     _record_annotation_request_metrics(annotate_request, http_request, current_user)
-    job_id = await _launch_run_retry_job(run_id, annotate_request, http_request, current_user)
+    job_id = await _launch_run_retry_job(
+        run_id, annotate_request, request.kind, http_request, current_user,
+    )
     return AnnotationJobCreateResponse(
         job_id=job_id,
         status_url=f"/v1/annotate/jobs/{job_id}",

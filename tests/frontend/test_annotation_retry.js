@@ -79,7 +79,7 @@ function testButtonsGateOnPermissionAndKind() {
   assert.strictEqual(retryErrorsButton(sandbox).textContent, "Retrying...");
 }
 
-async function testRetryErrorsPostsOriginalInputsAndMergesInPlace() {
+async function testRetryErrorsPostsGenesAndMergesInPlace() {
   const calls = [];
   const sandbox = app(async (url, options = {}) => {
     calls.push({ url, options });
@@ -117,9 +117,10 @@ async function testRetryErrorsPostsOriginalInputsAndMergesInPlace() {
   assert.strictEqual(posts.length, 1);
   assert.strictEqual(posts[0].url, "/v1/runs/run-1/retry");
   assert.deepStrictEqual(JSON.parse(posts[0].options.body), {
-    inputs: [{ fusion: "EML4::ALK", tumor_type: "LUAD" }],
+    kind: "errors",
+    inputs: [{ fusion: "ALK", tumor_type: "LUAD" }],
     force_refresh: false,
-  });
+  }, "the gene is sent alone, with the tumor type its fusion was submitted with");
   assert.ok(calls.some((call) => call.url === "/v1/annotate/jobs/job-1"));
 
   const annotations = sandbox.state.currentResult.annotations;
@@ -162,6 +163,7 @@ async function testRecheckNoResultForcesRefreshAndFallsBackToGeneInput() {
 
   const post = calls.find((call) => call.options.method === "POST");
   assert.deepStrictEqual(JSON.parse(post.options.body), {
+    kind: "no_result",
     inputs: [{ fusion: "BRAF" }],
     force_refresh: true,
   });
@@ -169,36 +171,97 @@ async function testRecheckNoResultForcesRefreshAndFallsBackToGeneInput() {
   assert.strictEqual(sandbox.elements.messageBox.textContent, "No-result genes re-checked.");
 }
 
-async function testRetryAvoidsDeterministicallyRejectedPartner() {
+// Codex review case 1: ALK failed transiently, its fusion partner BAD was
+// rejected permanently. Only ALK is sent, and BAD's row is never rewritten
+// even if the job returns a row for it.
+async function testFusionWithPermanentlyRejectedPartnerSendsOnlyTheGene() {
   const calls = [];
-  const sandbox = app(async (url, options = {}) => {
-    calls.push({ url, options });
-    if (url === "/v1/runs/run-1/retry" && options.method === "POST") {
-      return {
-        ok: true, status: 200,
-        json: async () => ({ job_id: "job-3", status_url: "/v1/annotate/jobs/job-3" }),
-        text: async () => "",
-      };
-    }
-    return {
-      ok: true, status: 200,
-      json: async () => ({ status: "complete", annotations: [{ gene: "ALK" }] }),
-      text: async () => "",
-    };
-  });
-  sandbox.state.canModifyRun = true;
-  sandbox.state.currentRunInputs = [{ fusion: "EML4::ALK", tumor_type: "LUAD" }];
+  const badRow = {
+    gene: "BAD", fusions: ["ALK::BAD"], insufficient_evidence: true,
+    error: "'BAD' is not a valid human Ensembl ID.",
+  };
+  const sandbox = app(retryFetch([{
+    status: "complete",
+    result: {
+      annotations: [
+        { gene: "ALK", insufficient_evidence: false, gene_summary: "Retried" },
+        { gene: "BAD", insufficient_evidence: true, error: "Synthesis error: something else" },
+      ],
+    },
+  }], calls));
+  sandbox.state.currentRunInputs = [{ fusion: "ALK::BAD", tumor_type: "LUAD" }];
   renderNoResult(sandbox, [
-    { gene: "EML4", insufficient_evidence: true, error: "'EML4': NM_1 belongs to EML4, not ALK." },
+    { gene: "ALK", fusions: ["ALK::BAD"], insufficient_evidence: true, error: "Synthesis error: timeout" },
+    badRow,
+  ]);
+
+  await sandbox.retryFailedAnnotations("errors");
+
+  const post = calls.find((call) => call.options.method === "POST");
+  assert.deepStrictEqual(JSON.parse(post.options.body).inputs, [{ fusion: "ALK", tumor_type: "LUAD" }]);
+  const rows = JSON.parse(JSON.stringify(sandbox.state.currentResult.annotations));
+  assert.strictEqual(rows[0].gene_summary, "Retried");
+  assert.deepStrictEqual(rows[1], badRow, "the permanently rejected row is untouched");
+}
+
+// Codex review case 2: ALK failed, its fusion partner TP53 already has a good
+// result. Only ALK is sent, and a recomputed TP53 never replaces the good row.
+async function testFusionWithGoodPartnerSendsOnlyTheGene() {
+  const calls = [];
+  const goodTp53 = {
+    gene: "TP53", fusions: ["ALK::TP53"], insufficient_evidence: false, gene_summary: "Good",
+  };
+  const sandbox = app(retryFetch([{
+    status: "complete",
+    result: {
+      annotations: [
+        { gene: "ALK", insufficient_evidence: false, gene_summary: "Retried" },
+        { gene: "TP53", insufficient_evidence: false, gene_summary: "Recomputed" },
+      ],
+    },
+  }], calls));
+  sandbox.state.currentRunInputs = [{ fusion: "ALK::TP53", tumor_type: "LUAD" }];
+  renderNoResult(sandbox, [
+    { gene: "ALK", fusions: ["ALK::TP53"], insufficient_evidence: true, error: "Synthesis error: timeout" },
+    goodTp53,
+  ]);
+
+  await sandbox.retryFailedAnnotations("errors");
+
+  const post = calls.find((call) => call.options.method === "POST");
+  assert.deepStrictEqual(JSON.parse(post.options.body).inputs, [{ fusion: "ALK", tumor_type: "LUAD" }]);
+  const rows = JSON.parse(JSON.stringify(sandbox.state.currentResult.annotations));
+  assert.strictEqual(rows[0].gene_summary, "Retried");
+  assert.deepStrictEqual(rows[1], goodTp53, "the good partner row is untouched");
+}
+
+async function testTumorTypeIsTheFirstSubmittedForTheGene() {
+  const calls = [];
+  const sandbox = app(retryFetch([{ status: "complete", result: { annotations: [] } }], calls));
+  sandbox.state.currentRunInputs = [
+    { fusion: "KRAS" },
+    { fusion: "EML4::ALK" },
+    { fusion: "ENSG00000157764", tumor_type: "Melanoma" },
+    { fusion: "ALK", tumor_type: "NSCLC" },
+    { fusion: "EML4::ALK", tumor_type: "LUAD" },
+  ];
+  renderNoResult(sandbox, [
     { gene: "ALK", insufficient_evidence: true, error: "Synthesis error: timeout" },
+    {
+      gene: "BRAF", insufficient_evidence: true, error: "Synthesis error: timeout",
+      resolved_inputs: [{ input: "ENSG00000157764", resolved: "BRAF" }],
+    },
+    { gene: "KRAS", insufficient_evidence: true, error: "Synthesis error: timeout" },
   ]);
 
   await sandbox.retryFailedAnnotations("errors");
 
   const post = calls.find((call) => call.options.method === "POST");
   assert.deepStrictEqual(JSON.parse(post.options.body).inputs, [
-    { fusion: "ALK", tumor_type: "LUAD" },
-  ], "only the retryable gene is sent, keeping the tumor context");
+    { fusion: "ALK", tumor_type: "NSCLC" },
+    { fusion: "BRAF", tumor_type: "Melanoma" },
+    { fusion: "KRAS" },
+  ]);
 }
 
 async function testRetryErrorKeepsOldRows() {
@@ -351,9 +414,11 @@ async function testCountsAndSidebarFilterUpdate() {
 
 const tests = [
   testButtonsGateOnPermissionAndKind,
-  testRetryErrorsPostsOriginalInputsAndMergesInPlace,
+  testRetryErrorsPostsGenesAndMergesInPlace,
   testRecheckNoResultForcesRefreshAndFallsBackToGeneInput,
-  testRetryAvoidsDeterministicallyRejectedPartner,
+  testFusionWithPermanentlyRejectedPartnerSendsOnlyTheGene,
+  testFusionWithGoodPartnerSendsOnlyTheGene,
+  testTumorTypeIsTheFirstSubmittedForTheGene,
   testRetryErrorKeepsOldRows,
   testFailedJobLeavesPageUnchanged,
   testWorseResultNeverReplacesExisting,

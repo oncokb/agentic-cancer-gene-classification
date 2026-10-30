@@ -1318,112 +1318,9 @@ function recheckNoResultAnnotations(annotations) {
   );
 }
 
+// Same normalization as the server's _normalized_retry_token.
 function normalizedRetryToken(value) {
-  return String(value || "").trim().toUpperCase();
-}
-
-function retrySearchTerms(value) {
-  const terms = new Set();
-  const add = (term) => {
-    const normalized = normalizedRetryToken(term);
-    if (normalized) terms.add(normalized);
-  };
-  add(value);
-  splitFusionGenes(String(value || "")).forEach(add);
-  return terms;
-}
-
-function annotationRetryTerms(annotation) {
-  const terms = new Set();
-  const add = (term) => {
-    const normalized = normalizedRetryToken(term);
-    if (normalized) terms.add(normalized);
-  };
-  add(annotation?.gene);
-  (annotation?.fusions || []).forEach((fusion) => {
-    add(fusion);
-    splitFusionGenes(fusion).forEach(add);
-  });
-  (annotation?.resolved_inputs || []).forEach((resolution) => {
-    add(resolution.input);
-    add(resolution.resolved);
-  });
-  return terms;
-}
-
-function inputMatchesAnnotation(item, annotation) {
-  const inputTerms = retrySearchTerms(item?.fusion);
-  const annotationTerms = annotationRetryTerms(annotation);
-  for (const term of inputTerms) {
-    if (annotationTerms.has(term)) return true;
-  }
-  return false;
-}
-
-function inputTouchesDeterministicRejection(item, annotations) {
-  const inputTerms = retrySearchTerms(item?.fusion);
-  return (annotations || []).some((annotation) => {
-    if (!annotation.error || isTransientAnnotationError(annotation.error)) return false;
-    const annotationTerms = annotationRetryTerms(annotation);
-    for (const term of inputTerms) {
-      if (annotationTerms.has(term)) return true;
-    }
-    return false;
-  });
-}
-
-function retryInputKey(item) {
-  return [
-    item?.fusion,
-    item?.tumor_type,
-    item?.five_exon,
-    item?.three_exon,
-    item?.five_genomic,
-    item?.three_genomic,
-    item?.five_transcript,
-    item?.three_transcript,
-  ].map((value) => String(value || "")).join("|");
-}
-
-function retryInputsForAnnotations(annotations, runInputs) {
-  const candidates = Array.isArray(runInputs) ? runInputs : [];
-  const allAnnotations = state.currentResult?.annotations || [];
-  const inputs = [];
-  const seen = new Set();
-  const add = (item) => {
-    const key = retryInputKey(item);
-    if (!item?.fusion || seen.has(key)) return;
-    seen.add(key);
-    inputs.push(item);
-  };
-
-  (annotations || []).forEach((annotation) => {
-    const matched = candidates.filter((item) => inputMatchesAnnotation(item, annotation));
-    if (!matched.length) {
-      add({ fusion: annotation.gene });
-      return;
-    }
-    matched.forEach((item) => {
-      if (inputTouchesDeterministicRejection(item, allAnnotations)) {
-        // Keep the tumor context but retry only this gene, so a partner the
-        // server already rejected deterministically is not re-run.
-        add({
-          fusion: annotation.gene,
-          ...(item.tumor_type ? { tumor_type: item.tumor_type } : {}),
-        });
-      } else {
-        add({ ...item });
-      }
-    });
-  });
-  return inputs;
-}
-
-// How good an annotation is: an error < no result < a grounded result.
-function annotationRank(annotation) {
-  if (annotation?.error) return 0;
-  if (annotation?.insufficient_evidence) return 1;
-  return 2;
+  return String(value || "").trim().toUpperCase().split(/\s+/).filter(Boolean).join(" ");
 }
 
 // The gene plus the submitted spellings it was resolved from, so a row stored
@@ -1438,21 +1335,62 @@ function annotationMatchKeys(annotation) {
   return keys;
 }
 
-// Mirrors the server's merge (_merge_annotations_by_gene): rows are replaced
-// in place only by a row at least as good, so a retry that fails again never
-// overwrites an existing result; rows the run didn't have are appended.
-function mergeRetriedAnnotations(existing, incoming) {
+// The tumor type a gene was annotated under: like the pipeline, the first
+// non-empty tumor type, in submission order, among inputs naming the gene
+// (as a gene, as a fusion partner, or by the spelling it was resolved from).
+function retryTumorTypeFor(annotation, runInputs) {
+  const keys = annotationMatchKeys(annotation);
+  for (const item of runInputs || []) {
+    const tumorType = String(item?.tumor_type || "").trim();
+    if (!tumorType) continue;
+    const spellings = [item.fusion, ...splitFusionGenes(String(item.fusion || ""))];
+    if (spellings.some((spelling) => keys.has(normalizedRetryToken(spelling)))) return tumorType;
+  }
+  return null;
+}
+
+// A retry works on genes, never submissions: each selected row is sent as its
+// own plain gene input, so a fusion's other partner (already good, or
+// rejected permanently) is never re-annotated.
+function retryInputsForAnnotations(annotations, runInputs) {
+  const inputs = [];
+  const seen = new Set();
+  (annotations || []).forEach((annotation) => {
+    const key = normalizedRetryToken(annotation.gene);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    const tumorType = retryTumorTypeFor(annotation, runInputs);
+    inputs.push(tumorType ? { fusion: annotation.gene, tumor_type: tumorType } : { fusion: annotation.gene });
+  });
+  return inputs;
+}
+
+// How good an annotation is: an error < no result < a grounded result.
+function annotationRank(annotation) {
+  if (annotation?.error) return 0;
+  if (annotation?.insufficient_evidence) return 1;
+  return 2;
+}
+
+function isRetryEligible(annotation, kind) {
+  return kind === "noresult"
+    ? Boolean(annotation.insufficient_evidence && !annotation.error)
+    : Boolean(annotation.error && isTransientAnnotationError(annotation.error));
+}
+
+// Mirrors the server's _merge_retried_annotations: only rows for the retried
+// genes (`targets`) that are still eligible are written, and only by a result
+// at least as good. Rows for any other gene are never touched, and results
+// for genes the retry wasn't asked for are dropped, never appended.
+function mergeRetriedAnnotations(existing, incoming, targets, kind) {
   const merged = [...(existing || [])];
   (incoming || []).forEach((annotation) => {
-    const keys = annotationMatchKeys(annotation);
+    const keys = new Set([...annotationMatchKeys(annotation)].filter((key) => targets.has(key)));
     const matches = [];
     merged.forEach((row, index) => {
-      if (keys.has(normalizedRetryToken(row.gene))) matches.push(index);
+      if (keys.has(normalizedRetryToken(row.gene)) && isRetryEligible(row, kind)) matches.push(index);
     });
-    if (!matches.length) {
-      merged.push(annotation);
-      return;
-    }
+    if (!matches.length) return;
     const [first, ...rest] = matches;
     if (annotationRank(annotation) < annotationRank(merged[first])) return;
     merged[first] = annotation;
@@ -1500,7 +1438,11 @@ async function retryFailedAnnotations(kind) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // A cached no-result annotation would just repeat itself.
-      body: JSON.stringify({ inputs, force_refresh: kind === "noresult" }),
+      body: JSON.stringify({
+        kind: kind === "noresult" ? "no_result" : "errors",
+        inputs,
+        force_refresh: kind === "noresult",
+      }),
     });
     if (annotationRetryJobIsStale(token)) return;
     if (!response.ok) {
@@ -1520,7 +1462,12 @@ async function retryFailedAnnotations(kind) {
     // Another run is shown (or another retry started): drop it.
     if (retried === null) return;
     // Apply only the fully completed retry, matching what the server saved.
-    const merged = mergeRetriedAnnotations(state.currentResult.annotations || [], retried);
+    const merged = mergeRetriedAnnotations(
+      state.currentResult.annotations || [],
+      retried,
+      new Set(inputs.map((item) => normalizedRetryToken(item.fusion))),
+      kind,
+    );
     state.currentResult = {
       ...state.currentResult,
       annotations: merged,

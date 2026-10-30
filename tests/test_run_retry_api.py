@@ -159,47 +159,86 @@ def _ok_pipeline(monkeypatch, seen=None, annotations=None):
 # ---------------------------------------------------------------------------
 
 
+def _merge(stored, incoming, targets, kind="errors", warnings=()):
+    return main._merge_retried_annotations(
+        copy.deepcopy(stored), _dump(incoming), list(warnings), set(targets), kind,
+    )
+
+
 def test_merge_replaces_only_targeted_annotations_and_keeps_fusion_evidence():
     stored = _stored_run()
 
-    merged = main._merge_retried_annotations(
-        copy.deepcopy(stored),
-        _dump([_annotation("ALK", cancer_associated=True, gene_summary="Retried")]),
-        ["ALK: using tumor type 'LUAD'."],
+    merged = _merge(
+        stored,
+        [_annotation("ALK", cancer_associated=True, gene_summary="Retried")],
+        {"ALK"},
+        warnings=["ALK: new note.", "KRAS: unrelated note."],
     )
 
     assert [item["gene"] for item in merged["annotations"]] == ["ALK", "TP53"]
     assert merged["annotations"][0]["gene_summary"] == "Retried"
     assert merged["annotations"][1] == stored["annotations"][1]
-    assert merged["warnings"] == ["ALK: using tumor type 'LUAD'."]
+    assert merged["warnings"] == stored["warnings"] + ["ALK: new note."]
     assert merged["fusion_evidence"] == stored["fusion_evidence"]
     assert merged["genes_annotated"] == 2
     assert merged["run_id"] == "run-1"
     assert merged["fusions_processed"] == 2
 
 
-def test_merge_never_replaces_a_better_annotation_with_a_worse_one():
+def test_merge_never_writes_rows_for_genes_that_were_not_submitted():
+    good_tp53 = {"gene": "TP53", "insufficient_evidence": False, "cancer_associated": True}
     stored = _stored_run(annotations=[
-        {"gene": "TP53", "insufficient_evidence": False, "cancer_associated": True},
-        {"gene": "BRAF", "insufficient_evidence": True},
         {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
-    ], warnings=["TP53: kept warning."])
+        good_tp53,
+    ])
 
-    merged = main._merge_retried_annotations(
-        copy.deepcopy(stored),
-        _dump([
-            _annotation("TP53", insufficient_evidence=True, error="Synthesis error: again"),
-            _annotation("BRAF", insufficient_evidence=True, error="Synthesis error: again"),
-            _annotation("ALK", insufficient_evidence=True, error="Synthesis error: rate limit"),
-        ]),
-        ["TP53: new warning from a failed retry."],
+    # The pipeline also returned TP53 (equally ranked) and KRAS (new).
+    merged = _merge(
+        stored,
+        [
+            _annotation("ALK", gene_summary="Retried"),
+            _annotation("TP53", gene_summary="Recomputed"),
+            _annotation("KRAS"),
+        ],
+        {"ALK"},
     )
 
-    assert merged["annotations"][0] == stored["annotations"][0]
-    assert merged["annotations"][1] == stored["annotations"][1]
+    assert [item["gene"] for item in merged["annotations"]] == ["ALK", "TP53"]
+    assert merged["annotations"][1] == good_tp53
+    assert merged["genes_annotated"] == 2
+
+
+def test_merge_skips_a_target_that_is_no_longer_eligible():
+    # Another retry fixed ALK while this one was running.
+    fixed = {"gene": "ALK", "insufficient_evidence": False, "gene_summary": "Fixed"}
+    stored = _stored_run(annotations=[fixed])
+
+    merged = _merge(stored, [_annotation("ALK", gene_summary="Mine")], {"ALK"})
+
+    assert merged["annotations"] == [fixed]
+
+
+def test_merge_never_replaces_a_target_with_a_worse_result():
+    stored = _stored_run(annotations=[
+        {"gene": "BRAF", "insufficient_evidence": True},
+        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+    ])
+
+    no_result = _merge(
+        stored,
+        [_annotation("BRAF", insufficient_evidence=True, error="Synthesis error: again")],
+        {"BRAF"},
+        kind="no_result",
+    )
+    errors = _merge(
+        stored,
+        [_annotation("ALK", insufficient_evidence=True, error="Synthesis error: rate limit")],
+        {"ALK"},
+    )
+
+    assert no_result["annotations"] == stored["annotations"]
     # An error replaced by a newer error is fine: it is no worse.
-    assert merged["annotations"][2]["error"] == "Synthesis error: rate limit"
-    assert "TP53: kept warning." in merged["warnings"]
+    assert errors["annotations"][1]["error"] == "Synthesis error: rate limit"
 
 
 def test_merge_replaces_row_stored_under_its_raw_input():
@@ -216,7 +255,7 @@ def test_merge_replaces_row_stored_under_its_raw_input():
         resolved_inputs=[{"input": "ENSG00000157764", "resolved": "BRAF"}],
     )
 
-    merged = main._merge_retried_annotations(copy.deepcopy(stored), _dump([retried]), [])
+    merged = _merge(stored, [retried], {"ENSG00000157764"})
 
     assert [item["gene"] for item in merged["annotations"]] == ["BRAF", "TP53"]
     assert merged["genes_annotated"] == 2
@@ -249,7 +288,7 @@ def test_retry_job_merges_into_run_under_the_lock(monkeypatch, fresh_jobs):
     store = _FakeRunStore(
         _stored_run(),
         request_payload={
-            "fusions": [{"fusion": "ALK", "tumor_type": "LUAD"}],
+            "fusions": [{"fusion": "EML4::ALK", "tumor_type": "LUAD"}],
             "mode": "core",
             "local_backend": "codex",
         },
@@ -259,7 +298,7 @@ def test_retry_job_merges_into_run_under_the_lock(monkeypatch, fresh_jobs):
 
     response = client.post(
         "/v1/runs/run-1/retry",
-        json={"inputs": [{"fusion": "ALK", "tumor_type": "LUAD"}], "force_refresh": True},
+        json={"kind": "errors", "inputs": [{"fusion": "ALK", "tumor_type": "LUAD"}]},
     )
 
     assert response.status_code == 200
@@ -268,7 +307,7 @@ def test_retry_job_merges_into_run_under_the_lock(monkeypatch, fresh_jobs):
     assert body["result"]["run_id"] == "run-1"
     assert seen == [{
         "fusions": [{"fusion": "ALK", "tumor_type": "LUAD"}],
-        "force_refresh": True,
+        "force_refresh": False,
         "local_backend": "codex",
         "mode": "core",
     }]
@@ -278,6 +317,24 @@ def test_retry_job_merges_into_run_under_the_lock(monkeypatch, fresh_jobs):
     assert updated["annotations"][0]["gene_summary"] == "Retried"
     assert updated["annotations"][1]["gene"] == "TP53"
     assert updated["fusion_evidence"] == _stored_run()["fusion_evidence"]
+
+
+@pytest.mark.parametrize("override,expected", [(None, True), (False, False)])
+def test_no_result_retry_defaults_to_force_refresh(monkeypatch, fresh_jobs, override, expected):
+    seen = []
+    _ok_pipeline(monkeypatch, seen, annotations=[_annotation("BRAF")])
+    _use_store(monkeypatch, _FakeRunStore(_stored_run(annotations=[
+        {"gene": "BRAF", "insufficient_evidence": True},
+    ])))
+    client = TestClient(main.app)
+    body = {"kind": "no_result", "inputs": ["BRAF"]}
+    if override is not None:
+        body["force_refresh"] = override
+
+    response = client.post("/v1/runs/run-1/retry", json=body)
+
+    assert _poll(client, response.json()["status_url"])["status"] == "complete"
+    assert seen[0]["force_refresh"] is expected
 
 
 def test_failed_retry_job_leaves_the_run_unchanged(monkeypatch, fresh_jobs):
@@ -290,7 +347,7 @@ def test_failed_retry_job_leaves_the_run_unchanged(monkeypatch, fresh_jobs):
     _use_store(monkeypatch, store)
     client = TestClient(main.app)
 
-    response = client.post("/v1/runs/run-1/retry", json={"inputs": [{"fusion": "ALK"}]})
+    response = client.post("/v1/runs/run-1/retry", json={"kind": "errors", "inputs": ["ALK"]})
 
     body = _poll(client, response.json()["status_url"])
     assert body["status"] == "failed"
@@ -298,103 +355,113 @@ def test_failed_retry_job_leaves_the_run_unchanged(monkeypatch, fresh_jobs):
     assert store.stored == _stored_run()
 
 
-def test_retry_that_fails_again_does_not_overwrite_a_good_annotation(monkeypatch, fresh_jobs):
-    _ok_pipeline(monkeypatch, annotations=[
-        _annotation("BRAF", insufficient_evidence=True, error="Synthesis error: timeout"),
-    ])
-    good_braf = {"gene": "BRAF", "insufficient_evidence": False, "gene_summary": "Good"}
-    stored = _stored_run(annotations=[
-        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
-        good_braf,
-    ])
-    store = _FakeRunStore(stored)
-    _use_store(monkeypatch, store)
-    client = TestClient(main.app)
-
-    # ALK::BRAF touches the retryable ALK row; BRAF's good row must survive.
-    response = client.post("/v1/runs/run-1/retry", json={"inputs": ["ALK::BRAF"]})
-
-    assert _poll(client, response.json()["status_url"])["status"] == "complete"
-    assert store.stored["annotations"][1] == good_braf
-
-
-def test_permanent_rejections_and_unrelated_inputs_are_not_retried(monkeypatch, fresh_jobs):
-    seen = []
-    _ok_pipeline(monkeypatch, seen)
-    stored = _stored_run(annotations=[
-        {"gene": "BAD", "insufficient_evidence": True, "error": "'BAD' is not a valid human Ensembl ID."},
-        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
-        {"gene": "TP53", "insufficient_evidence": False},
-    ])
-    _use_store(monkeypatch, _FakeRunStore(stored))
-    client = TestClient(main.app)
-
-    response = client.post(
-        "/v1/runs/run-1/retry",
-        json={"inputs": [{"fusion": "BAD"}, {"fusion": "ALK"}, {"fusion": "TP53"}, {"fusion": "KRAS"}]},
-    )
-
-    assert response.status_code == 200
-    _poll(client, response.json()["status_url"])
-    assert [item["fusions"] for item in seen] == [[{"fusion": "ALK"}]]
-
-
-def test_only_permanent_rejections_return_422_without_starting_a_job(monkeypatch, fresh_jobs):
+def _rejected(monkeypatch, stored, body):
     called = []
 
     async def fake_run_pipeline(*args, **kwargs):
         called.append(args)
 
-    stored = _stored_run(annotations=[
-        {"gene": "BAD", "insufficient_evidence": True, "error": "'BAD' is not a valid human Ensembl ID."},
-    ])
     monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
     store = _FakeRunStore(stored)
     _use_store(monkeypatch, store)
-    client = TestClient(main.app)
+    response = TestClient(main.app).post("/v1/runs/run-1/retry", json=body)
+    assert called == [], "no part of a rejected request is processed"
+    assert store.updated_runs == []
+    assert store.stored == stored
+    return response
 
-    response = client.post("/v1/runs/run-1/retry", json={"inputs": [{"fusion": "BAD"}]})
+
+def test_fusion_with_a_permanently_rejected_partner_is_rejected(monkeypatch, fresh_jobs):
+    # Codex review case 1: ALK failed transiently, BAD was rejected permanently.
+    stored = _stored_run(annotations=[
+        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+        {"gene": "BAD", "insufficient_evidence": True, "error": "'BAD' is not a valid human Ensembl ID."},
+    ])
+
+    response = _rejected(monkeypatch, stored, {"kind": "errors", "inputs": ["ALK::BAD"]})
 
     assert response.status_code == 422
-    assert "No retryable inputs" in response.json()["detail"]
-    assert called == []
-    assert store.updated_runs == []
+    assert "'ALK::BAD' is a fusion" in response.json()["detail"]
+
+
+def test_fusion_with_an_already_good_partner_is_rejected(monkeypatch, fresh_jobs):
+    # Codex review case 2: ALK failed, TP53 already has a good result.
+    response = _rejected(
+        monkeypatch, _stored_run(), {"kind": "errors", "inputs": [{"fusion": "ALK::TP53"}]},
+    )
+
+    assert response.status_code == 422
+    assert "'ALK::TP53' is a fusion" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "inputs,fragment",
+    [
+        (["ALK", "TP53"], "'TP53' is not a failed gene"),
+        (["ALK", "KRAS"], "'KRAS' is not a failed gene"),
+        (["ALK", "BAD"], "'BAD' was rejected permanently"),
+        ([{"fusion": "ALK", "five_exon": 20}], "has breakpoint fields"),
+    ],
+)
+def test_any_ineligible_input_rejects_the_whole_request(monkeypatch, fresh_jobs, inputs, fragment):
+    stored = _stored_run(annotations=[
+        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+        {"gene": "BAD", "insufficient_evidence": True, "error": "'BAD' is not a valid human Ensembl ID."},
+        {"gene": "TP53", "insufficient_evidence": False},
+    ])
+
+    response = _rejected(monkeypatch, stored, {"kind": "errors", "inputs": inputs})
+
+    assert response.status_code == 422
+    assert fragment in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "kind,gene,fragment",
+    [("errors", "BRAF", "'BRAF' is not a failed gene"), ("no_result", "ALK", "'ALK' is not a no-result gene")],
+)
+def test_kind_selects_which_rows_are_eligible(monkeypatch, fresh_jobs, kind, gene, fragment):
+    stored = _stored_run(annotations=[
+        {"gene": "ALK", "insufficient_evidence": True, "error": "Synthesis error: timeout"},
+        {"gene": "BRAF", "insufficient_evidence": True},
+    ])
+
+    response = _rejected(monkeypatch, stored, {"kind": kind, "inputs": [gene]})
+
+    assert response.status_code == 422
+    assert fragment in response.json()["detail"]
 
 
 def test_retry_applies_the_annotate_input_cap(monkeypatch, fresh_jobs):
-    called = []
-
-    async def fake_run_pipeline(*args, **kwargs):
-        called.append(args)
-
-    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
-    _use_store(monkeypatch, _FakeRunStore(_stored_run()))
-    client = TestClient(main.app)
-
-    response = client.post(
-        "/v1/runs/run-1/retry",
-        json={"inputs": ["ALK"] * (settings.annotate_max_inputs + 1)},
+    response = _rejected(
+        monkeypatch,
+        _stored_run(),
+        {"kind": "errors", "inputs": ["ALK"] * (settings.annotate_max_inputs + 1)},
     )
 
     assert response.status_code == 422
     assert f"At most {settings.annotate_max_inputs} inputs" in response.json()["detail"]
-    assert called == []
 
 
-@pytest.mark.parametrize("body", [{"inputs": []}, {"inputs": [{"tumor_type": "LUAD"}]}, {}])
-def test_retry_validates_inputs_like_a_fresh_request(monkeypatch, fresh_jobs, body):
-    _use_store(monkeypatch, _FakeRunStore(_stored_run()))
-    client = TestClient(main.app)
-
-    assert client.post("/v1/runs/run-1/retry", json=body).status_code == 422
-    assert client.post("/v1/annotate/jobs", json={"fusions": body.get("inputs", None)}).status_code == 422
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"kind": "errors", "inputs": []},
+        {"kind": "errors", "inputs": [{"tumor_type": "LUAD"}]},
+        {"kind": "errors"},
+        {"inputs": ["ALK"]},
+        {"kind": "everything", "inputs": ["ALK"]},
+    ],
+)
+def test_retry_validates_the_request(monkeypatch, fresh_jobs, body):
+    assert _rejected(monkeypatch, _stored_run(), body).status_code == 422
 
 
 def test_retry_unknown_run_is_404(monkeypatch, fresh_jobs):
     _use_store(monkeypatch, _FakeRunStore(_stored_run()))
     client = TestClient(main.app)
 
-    response = client.post("/v1/runs/missing/retry", json={"inputs": [{"fusion": "ALK"}]})
+    response = client.post("/v1/runs/missing/retry", json={"kind": "errors", "inputs": ["ALK"]})
 
     assert response.status_code == 404
 
@@ -409,7 +476,7 @@ def test_concurrent_retry_and_fusion_evidence_attach_do_not_clobber(monkeypatch)
         evidence = [FusionEvidenceResult(fusion="EML4::ALK", tumor_type="LUAD", pmids=["1"])]
 
         await asyncio.gather(
-            main._persist_retried_annotations(request, "run-1", retried),
+            main._persist_retried_annotations(request, "run-1", retried, {"ALK"}, "errors"),
             main._persist_fusion_evidence(request, "run-1", evidence),
         )
         return store.stored
@@ -446,7 +513,9 @@ def _session_headers(email: str, role: str = "curator") -> dict:
 
 def _retry(client, headers, run_id="run-1"):
     response = client.post(
-        f"/v1/runs/{run_id}/retry", json={"inputs": [{"fusion": "ALK"}]}, headers=headers,
+        f"/v1/runs/{run_id}/retry",
+        json={"kind": "errors", "inputs": [{"fusion": "ALK"}]},
+        headers=headers,
     )
     if response.status_code != 200:
         return response, None
