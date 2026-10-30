@@ -528,6 +528,8 @@ class RunStore(UserStoreMixin):
         self,
         run_id: str,
         mutate: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]],
+        *,
+        sync_genes_annotated: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Atomically read, mutate, and write a run's result.
 
@@ -536,7 +538,10 @@ class RunStore(UserStoreMixin):
         stale snapshot. `mutate` receives the freshly-read result and may
         modify it in place; returning None keeps the in-place changes. Returns
         the stored result, or None when the run does not exist. Only
-        result_json is written, so owner/source/input summary stay untouched.
+        result_json is written, so owner/source/input summary stay untouched;
+        `sync_genes_annotated` also copies the result's genes_annotated into
+        the listing column (for updates that can change the gene count, like
+        retrying failed annotations).
         """
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
@@ -554,10 +559,18 @@ class RunStore(UserStoreMixin):
                     updated = mutate(stored)
                     if updated is None:
                         updated = stored
-                    await cursor.execute(
-                        "UPDATE runs SET result_json = %s WHERE run_id = %s",
-                        (json.dumps(updated), run_id),
-                    )
+                    genes_annotated = updated.get("genes_annotated")
+                    if sync_genes_annotated and isinstance(genes_annotated, int):
+                        await cursor.execute(
+                            "UPDATE runs SET result_json = %s, genes_annotated = %s "
+                            "WHERE run_id = %s",
+                            (json.dumps(updated), genes_annotated, run_id),
+                        )
+                    else:
+                        await cursor.execute(
+                            "UPDATE runs SET result_json = %s WHERE run_id = %s",
+                            (json.dumps(updated), run_id),
+                        )
                     await conn.commit()
                     return updated
                 except BaseException:

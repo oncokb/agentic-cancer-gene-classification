@@ -5,10 +5,11 @@ from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from src.api.run_persistence import can_modify_run, run_owner
 from src.auth import AuthenticatedUser, require_auth
+from src.models.schema import FusionInput
 from src.pipeline.run_store import _decode_runs_cursor
 
 router = APIRouter()
@@ -38,6 +39,55 @@ class RunAccessResponse(BaseModel):
 
     run_id: str
     can_modify: bool
+
+
+class RunInputsResponse(BaseModel):
+    """The original inputs a run was submitted with, for a retry request."""
+
+    run_id: str
+    inputs: List[FusionInput] = Field(
+        default_factory=list,
+        description="Inputs exactly as submitted (including tumor type and breakpoint fields).",
+    )
+
+
+@router.get("/v1/runs/{run_id}/inputs", response_model=RunInputsResponse)
+async def get_run_inputs(
+    run_id: str,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(require_auth),
+) -> RunInputsResponse:
+    """Return a run's original submitted inputs to its owner or an admin, so a
+    retry can preserve tumor type and breakpoint context instead of guessing it
+    from the stored annotations."""
+    store = getattr(request.app.state, "run_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Run storage is unavailable.")
+    metadata = await store.get_run_metadata(run_id)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not can_modify_run(metadata.get("owner_email"), current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only this run's owner or an administrator may retry its annotations.",
+        )
+    request_payload = await store.get_run_request(run_id) or {}
+    raw_inputs = request_payload.get("fusions")
+    if raw_inputs is None and isinstance(request_payload.get("gene"), str):
+        # Saved by POST /v1/annotate/gene.
+        raw_inputs = [
+            {"fusion": request_payload["gene"], "tumor_type": request_payload.get("tumor_type")}
+        ]
+    inputs: List[FusionInput] = []
+    for item in raw_inputs if isinstance(raw_inputs, list) else []:
+        try:
+            inputs.append(
+                FusionInput.model_validate({"fusion": item} if isinstance(item, str) else item)
+            )
+        except ValidationError:
+            # An older or malformed saved input: the UI falls back to the gene.
+            continue
+    return RunInputsResponse(run_id=run_id, inputs=inputs)
 
 
 @router.get("/v1/runs/{run_id}/access", response_model=RunAccessResponse)

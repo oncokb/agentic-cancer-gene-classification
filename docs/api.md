@@ -812,3 +812,125 @@ Unauthenticated requests return `401`. Run storage that isn't configured returns
 `503`; a database outage returns `500`, like `GET /v1/annotate/{run_id}`.
 `created_at` is an ISO-8601 UTC timestamp and may include microseconds.
 The `run_id` in `view_url` is URL-encoded.
+
+## GET /v1/runs/{run_id}/inputs
+
+Return the fusion inputs a saved run was submitted with, so a client can retry
+individual genes without reconstructing tumor types or breakpoints from the
+annotations. Requires a signed-in session or API key; only the run's owner or an
+administrator may read them.
+
+```json
+{
+  "run_id": "example-run-id",
+  "inputs": [
+    {
+      "fusion": "EML4::ALK",
+      "tumor_type": "LUAD",
+      "five_exon": null,
+      "three_exon": null,
+      "five_genomic": null,
+      "three_genomic": null,
+      "five_transcript": "ENST00000318522",
+      "three_transcript": null
+    }
+  ]
+}
+```
+
+Inputs come back as submitted; a run saved by `POST /v1/annotate/gene` returns
+its gene as a single input. Unknown runs return `404`, non-owners return `403`,
+unauthenticated requests return `401`, and run storage that isn't configured
+returns `503`.
+
+## POST /v1/runs/{run_id}/retry
+
+Re-annotate failed or no-result genes on an existing saved run and merge the
+results into that run in place. A retry works on genes, not on the original
+submissions: a fusion's partners are retried one gene at a time, and fusion
+evidence has its own retry (`POST /v1/fusion-evidence/jobs` with `run_id`).
+Only the run's owner or an administrator may retry (an API key acts as its
+owner; a run with no recorded owner is admin-only).
+
+```bash
+curl -s -X POST https://acgc.oncokb.org/v1/runs/example-run-id/retry \
+  -H "Authorization: Bearer $ACGC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "kind": "errors",
+    "inputs": [{"fusion": "ALK", "tumor_type": "LUAD"}]
+  }'
+```
+
+```json
+{
+  "job_id": "c1a4e8f2-3b6d-4c8e-9a0f-5d7b1e2c9a44",
+  "status_url": "/v1/annotate/jobs/c1a4e8f2-3b6d-4c8e-9a0f-5d7b1e2c9a44"
+}
+```
+
+| Field | Description |
+|---|---|
+| `kind` | Required. `errors` retries genes whose annotation failed for a transient reason; `no_result` re-checks genes on the No result tab that have no error. |
+| `inputs` | Required, 1 to `ANNOTATE_MAX_INPUTS` entries. Plain genes (structured inputs or strings, as in `POST /v1/annotate/jobs`), each naming one row by its `gene` or by a spelling it was resolved from (an alias, Ensembl ID or RefSeq accession in its `resolved_inputs`), with the tumor type it was annotated under. |
+| `force_refresh` | Optional. Defaults to `true` for `no_result` (a cached result would just repeat) and `false` for `errors`. |
+
+Every input must be a plain gene whose row on this run is currently eligible
+for `kind`. If any input is a fusion, carries breakpoint fields, was rejected
+permanently (an invalid accession, an unresolvable symbol, or a transcript that
+belongs to a different gene), matches no eligible row, or matches more than one
+eligible row, the whole request returns `422` naming each problem, and nothing
+is processed. Each accepted input is tied to the row it matched before the job
+starts, and the result is written to that row whatever spelling it comes back
+under. Inputs are
+otherwise validated like a fresh annotate request, and the retry reuses the
+saved run's `mode`, `local_backend`, and `skip_literature_for_oncokb`.
+
+The job runs in the background and is polled through the returned `status_url`
+with `GET /v1/annotate/jobs/{job_id}`. When the job is `complete`,
+`result.run_id` is the original run id and its `annotations` contain the
+retried genes as the pipeline returned them.
+
+A result is written to a row only when its gene is the row's gene. If an input
+now resolves to a different gene (for example an alias that has since moved),
+the row is left unchanged, no row is added for the other gene, and the job
+still completes with the other genes applied. Each such input is listed in the
+job's `retry_outcomes`:
+
+```json
+"retry_outcomes": [
+  {
+    "input": "CD246",
+    "row_gene": "ALK",
+    "resolved_gene": "LTK",
+    "message": "CD246 now resolves to LTK, not ALK; ALK was not updated"
+  }
+]
+```
+
+A row whose input never resolved to a gene (its `gene` is the raw input,
+because the symbol lookup failed) has no gene yet, so its first successful
+resolution to a non-empty gene is written. A result with an empty or blank
+`gene` is never written to any row; its input is listed in `retry_outcomes`
+with `resolved_gene: ""` and a message such as
+`"ENSG00000157764 did not resolve to a gene; not updated"`.
+
+Every other submitted row that is still waiting after the merge (for example
+because no result could be tied to it, or the result was worse than the saved
+row) is also listed, with `resolved_gene: null` and a message such as
+`"BRAF: no usable result was returned; not updated"`. A row that another
+update fixed in the meantime is not listed. So every submitted gene is either
+updated or explained.
+
+Results are written to the stored run only when the whole job completes, in the
+same locked transaction other run updates (such as fusion-evidence retries)
+use, so concurrent updates don't overwrite each other; a `failed` job leaves the
+run unchanged. Only the rows of the submitted genes that are still eligible are
+written, and only with a result at least as good (an error < no result < a
+grounded annotation); no other gene's row is ever changed, and results for genes
+that weren't submitted are discarded. An updated row keeps its earlier
+`resolved_inputs` alongside the retry's. Existing warnings are kept and new
+warnings about the updated genes are added. `genes_annotated` is recomputed.
+
+Unknown runs return `404`, non-owners return `403`, unauthenticated requests
+return `401`, and run storage that isn't configured returns `503`.

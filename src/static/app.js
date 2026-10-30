@@ -60,8 +60,20 @@ const state = {
   fusionEvidenceRerunError: null,
   // Whether the signed-in viewer may change the current saved run (owner or
   // admin). Shared links are readable by peers, but only these users may
-  // retry failed fusion-evidence lookups onto the stored run.
+  // retry failed lookups onto the stored run.
   canModifyRun: false,
+  // "running" while a failed-annotation or no-result retry job is in flight.
+  annotationRetryStatus: null,
+  // Like fusionEvidenceGeneration, for annotation retries: bumped when the
+  // displayed run changes so a late retry status is dropped.
+  annotationRetryGeneration: 0,
+  // Row gene (normalized) -> why the last retry left that row unchanged,
+  // e.g. "CD246 now resolves to LTK, not ALK; ALK was not updated".
+  annotationRetryNotes: new Map(),
+  annotationRetryKind: null,
+  // The inputs this run was submitted with, so retries preserve tumor type
+  // and breakpoint fields instead of guessing them from annotations.
+  currentRunInputs: [],
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -501,12 +513,14 @@ function clearQueue() {
 
 function clearResults() {
   invalidateFusionEvidenceJobs();
+  invalidateAnnotationRetryJobs();
   resetFusionEvidenceSections();
   resetGeneIndexFilters();
   state.currentResult = null;
   state.resultsViewMode = "results";
   state.fusionEvidenceStatus = null;
   state.canModifyRun = false;
+  state.currentRunInputs = [];
   updateExportState();
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
@@ -988,8 +1002,10 @@ async function runAnnotation() {
   }
 
   invalidateFusionEvidenceJobs();
+  invalidateAnnotationRetryJobs();
   resetFusionEvidenceSections();
   resetGeneIndexFilters();
+  state.currentRunInputs = annotationInputs.map((item) => ({ ...item }));
   state.openedRunId = null;
 
   // Collapse the expanded batch sidebar so results have room
@@ -1122,11 +1138,17 @@ function claimFusionEvidenceJob(runId) {
   return { generation: state.fusionEvidenceGeneration, runId: runId || null };
 }
 
-function fusionEvidenceJobIsStale(token) {
+// A background job for one run is stale once a newer job of its kind started
+// (`generation` moved on) or a different run is shown.
+function runJobIsStale(token, generation) {
   return (
-    token.generation !== state.fusionEvidenceGeneration ||
+    token.generation !== generation ||
     (token.runId !== null && state.currentResult?.run_id !== token.runId)
   );
+}
+
+function fusionEvidenceJobIsStale(token) {
+  return runJobIsStale(token, state.fusionEvidenceGeneration);
 }
 
 function fusionEvidenceKey(item) {
@@ -1336,6 +1358,336 @@ async function pollRetriedFusionEvidenceJob(statusUrl, token) {
 
     const total = status.fusions_total || "?";
     setMessage(`Retrying fusion evidence: ${status.fusions_completed}/${total} fusions complete.`, "info");
+    await sleep(1500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Failed-annotation / no-result retries
+// ---------------------------------------------------------------------------
+
+const TRANSIENT_ANNOTATION_ERROR_MARKERS = [
+  "please retry",
+  "try again",
+  "synthesis error",
+  "timed out",
+  "timeout",
+  "temporarily",
+  "rate limit",
+  "connection",
+  "service unavailable",
+  "lookup failed",
+];
+const DETERMINISTIC_ANNOTATION_ERROR_MARKERS = [
+  "not a valid",
+  "belongs to",
+  "has no human",
+  "is not a gene symbol",
+  "unresolvable gene symbol",
+  "correct the gene",
+  "unannotated locus",
+  "not supported",
+];
+
+function isTransientAnnotationError(message) {
+  const text = String(message || "").trim().toLowerCase();
+  if (!text) return false;
+  if (TRANSIENT_ANNOTATION_ERROR_MARKERS.some((marker) => text.includes(marker))) return true;
+  return !DETERMINISTIC_ANNOTATION_ERROR_MARKERS.some((marker) => text.includes(marker));
+}
+
+// Error rows the server can plausibly fix on a retry. Deterministic rejections
+// (bad accession, mismatched transcript) are deliberately excluded.
+function retryableErrorAnnotations(annotations) {
+  return (annotations || []).filter(
+    (annotation) => annotation.error && isTransientAnnotationError(annotation.error),
+  );
+}
+
+// "No result" rows without an error are genes the pipeline could not ground.
+// Re-check them with force_refresh, since a cached low-evidence result would
+// just repeat itself.
+function recheckNoResultAnnotations(annotations) {
+  return (annotations || []).filter(
+    (annotation) => annotation.insufficient_evidence && !annotation.error,
+  );
+}
+
+// Same normalization as the server's _normalized_retry_token.
+function normalizedRetryToken(value) {
+  return String(value || "").trim().toUpperCase().split(/\s+/).filter(Boolean).join(" ");
+}
+
+// The gene plus the submitted spellings it was resolved from, so a row stored
+// under its raw input (an Ensembl ID whose lookup failed) is matched by the
+// retried row for the symbol it resolves to.
+function annotationMatchKeys(annotation) {
+  const keys = new Set([normalizedRetryToken(annotation?.gene)]);
+  (annotation?.resolved_inputs || []).forEach((resolution) => {
+    keys.add(normalizedRetryToken(resolution.input));
+  });
+  keys.delete("");
+  return keys;
+}
+
+// The tumor type a gene was annotated under: like the pipeline, the first
+// non-empty tumor type, in submission order, among inputs naming the gene
+// (as a gene, as a fusion partner, or by the spelling it was resolved from).
+function retryTumorTypeFor(annotation, runInputs) {
+  const keys = annotationMatchKeys(annotation);
+  for (const item of runInputs || []) {
+    const tumorType = String(item?.tumor_type || "").trim();
+    if (!tumorType) continue;
+    const spellings = [item.fusion, ...splitFusionGenes(String(item.fusion || ""))];
+    if (spellings.some((spelling) => keys.has(normalizedRetryToken(spelling)))) return tumorType;
+  }
+  return null;
+}
+
+// A retry works on genes, never submissions: each selected row is sent as its
+// own plain gene input, so a fusion's other partner (already good, or
+// rejected permanently) is never re-annotated.
+function retryInputsForAnnotations(annotations, runInputs) {
+  const inputs = [];
+  const seen = new Set();
+  (annotations || []).forEach((annotation) => {
+    const key = normalizedRetryToken(annotation.gene);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    const tumorType = retryTumorTypeFor(annotation, runInputs);
+    inputs.push(tumorType ? { fusion: annotation.gene, tumor_type: tumorType } : { fusion: annotation.gene });
+  });
+  return inputs;
+}
+
+// How good an annotation is: an error < no result < a grounded result.
+function annotationRank(annotation) {
+  if (annotation?.error) return 0;
+  if (annotation?.insufficient_evidence) return 1;
+  return 2;
+}
+
+function isRetryEligible(annotation, kind) {
+  return kind === "noresult"
+    ? Boolean(annotation.insufficient_evidence && !annotation.error)
+    : Boolean(annotation.error && isTransientAnnotationError(annotation.error));
+}
+
+// Mirrors the server's _merge_retried_annotations: only rows for the retried
+// genes (`targets`) that are still eligible are written, and only by a result
+// at least as good. Rows for any other gene are never touched, and results
+// for genes the retry wasn't asked for are dropped, never appended.
+// A row whose input never resolved to a gene (its `gene` is the raw
+// submission) takes its first resolution; see the server's
+// _row_has_gene_identity.
+function rowHasGeneIdentity(row) {
+  return !String(row?.error || "").toLowerCase().startsWith("unresolvable gene symbol");
+}
+
+// `mismatches` collects { rowGene, message } for target rows left unchanged:
+// the retried input now resolves to a different gene, to none, or no usable
+// result came back for it.
+function mergeRetriedAnnotations(existing, incoming, targets, kind, mismatches = []) {
+  const merged = [...(existing || [])];
+  const updated = new Set();
+  (incoming || []).forEach((annotation) => {
+    const blank = !normalizedRetryToken(annotation.gene);
+    let keys = new Set([...annotationMatchKeys(annotation)].filter((key) => targets.has(key)));
+    // A blank result that names no spelling: a one-gene retry's.
+    if (blank && !keys.size && targets.size === 1) keys = new Set(targets);
+    const matches = [];
+    merged.forEach((row, index) => {
+      if (keys.has(normalizedRetryToken(row.gene)) && isRetryEligible(row, kind)) matches.push(index);
+    });
+    if (!matches.length) return;
+    const [first, ...rest] = matches;
+    const rowGene = merged[first].gene;
+    if (blank) {
+      // Never written anywhere, not even as an unresolved row's first resolution.
+      const spelling = (annotation.resolved_inputs || [])
+        .map((resolution) => resolution.input)
+        .find((input) => targets.has(normalizedRetryToken(input))) || rowGene;
+      mismatches.push({ rowGene, message: `${spelling} did not resolve to a gene; not updated` });
+      return;
+    }
+    if (
+      normalizedRetryToken(annotation.gene) !== normalizedRetryToken(rowGene) &&
+      rowHasGeneIdentity(merged[first])
+    ) {
+      mismatches.push({
+        rowGene,
+        message: `${rowGene} now resolves to ${annotation.gene}, not ${rowGene}; ${rowGene} was not updated`,
+      });
+      return;
+    }
+    if (annotationRank(annotation) < annotationRank(merged[first])) return;
+    const resolvedInputs = mergedResolvedInputs(merged[first], annotation);
+    merged[first] = resolvedInputs.length
+      ? { ...annotation, resolved_inputs: resolvedInputs }
+      : annotation;
+    updated.add(normalizedRetryToken(rowGene));
+    rest.reverse().forEach((index) => {
+      if (annotationRank(merged[index]) <= annotationRank(annotation)) merged.splice(index, 1);
+    });
+  });
+  // Every target row still waiting for a result says why it wasn't updated,
+  // whatever the job returned (or didn't) for it — as the server reports.
+  const reported = new Set(mismatches.map(({ rowGene }) => normalizedRetryToken(rowGene)));
+  merged.forEach((row) => {
+    const key = normalizedRetryToken(row.gene);
+    if (!targets.has(key) || updated.has(key) || reported.has(key) || !isRetryEligible(row, kind)) return;
+    mismatches.push({
+      rowGene: row.gene,
+      message: `${row.gene}: no usable result was returned; not updated`,
+    });
+    reported.add(key);
+  });
+  return merged;
+}
+
+// The stored row's submitted spellings plus the retry's, one per input (as
+// the server's _merged_resolved_inputs keeps them).
+function mergedResolvedInputs(storedRow, incoming) {
+  const byInput = new Map();
+  [...(storedRow?.resolved_inputs || []), ...(incoming?.resolved_inputs || [])].forEach((resolution) => {
+    byInput.set(normalizedRetryToken(resolution.input), resolution);
+  });
+  return [...byInput.values()];
+}
+
+// Drops in-flight annotation retries when the displayed run changes; like
+// invalidateFusionEvidenceJobs, a late status for the old run is ignored.
+function invalidateAnnotationRetryJobs() {
+  state.annotationRetryGeneration += 1;
+  state.annotationRetryNotes = new Map();
+  state.annotationRetryStatus = null;
+  state.annotationRetryKind = null;
+}
+
+function claimAnnotationRetryJob(runId) {
+  invalidateAnnotationRetryJobs();
+  return { generation: state.annotationRetryGeneration, runId: runId || null };
+}
+
+function annotationRetryJobIsStale(token) {
+  return runJobIsStale(token, state.annotationRetryGeneration);
+}
+
+async function retryFailedAnnotations(kind) {
+  if (!state.currentResult || !state.canModifyRun || state.annotationRetryStatus === "running") return;
+  const annotations = state.currentResult.annotations || [];
+  const targets = kind === "noresult"
+    ? recheckNoResultAnnotations(annotations)
+    : retryableErrorAnnotations(annotations);
+  const inputs = retryInputsForAnnotations(targets, state.currentRunInputs);
+  const runId = state.currentResult.run_id;
+  if (!inputs.length || !runId) return;
+
+  const token = claimAnnotationRetryJob(runId);
+  state.annotationRetryStatus = "running";
+  state.annotationRetryKind = kind;
+  renderAnnotationResult(state.currentResult);
+
+  try {
+    const response = await fetch(`/v1/runs/${encodeURIComponent(runId)}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // A cached no-result annotation would just repeat itself.
+      body: JSON.stringify({
+        kind: kind === "noresult" ? "no_result" : "errors",
+        inputs,
+        force_refresh: kind === "noresult",
+      }),
+    });
+    if (annotationRetryJobIsStale(token)) return;
+    if (!response.ok) {
+      let detail = response.statusText;
+      const text = await response.text();
+      try {
+        const payload = JSON.parse(text);
+        detail = payload.detail || detail;
+      } catch {
+        detail = text || detail;
+      }
+      throw new Error(detail || "Annotation retry failed");
+    }
+
+    const job = await response.json();
+    const retried = await pollRetriedAnnotationsJob(job.status_url, token);
+    // Another run is shown (or another retry started): drop it.
+    if (retried === null) return;
+    // Apply only the fully completed retry, matching what the server saved.
+    const mismatches = [];
+    const merged = mergeRetriedAnnotations(
+      state.currentResult.annotations || [],
+      retried.annotations,
+      new Set(inputs.map((item) => normalizedRetryToken(item.fusion))),
+      kind,
+      mismatches,
+    );
+    // The server's per-input outcome wins; a mismatch only the page saw
+    // still explains why its row didn't change.
+    const notes = new Map();
+    mismatches.forEach(({ rowGene, message }) => notes.set(normalizedRetryToken(rowGene), message));
+    retried.outcomes.forEach((outcome) => {
+      if (outcome?.row_gene && outcome.message) {
+        notes.set(normalizedRetryToken(outcome.row_gene), outcome.message);
+      }
+    });
+    state.annotationRetryNotes = notes;
+    state.currentResult = {
+      ...state.currentResult,
+      annotations: merged,
+      genes_annotated: merged.length,
+    };
+    state.annotationRetryStatus = null;
+    state.annotationRetryKind = null;
+    renderAnnotationResult(state.currentResult);
+    const done = kind === "noresult" ? "No-result genes re-checked." : "Failed annotations retried.";
+    setMessage(
+      notes.size
+        ? `${done} ${notes.size} gene${notes.size === 1 ? " was" : "s were"} not updated; see the No result tab.`
+        : done,
+      "info",
+    );
+  } catch (error) {
+    if (annotationRetryJobIsStale(token)) return;
+    // Nothing is merged until the job completes, so the old rows stay put.
+    state.annotationRetryStatus = null;
+    state.annotationRetryKind = null;
+    renderAnnotationResult(state.currentResult);
+    setMessage(formatRunError(error.message), "error");
+  }
+}
+
+// Resolves to { annotations, outcomes } for the completed retry, or null once
+// `token` is stale.
+async function pollRetriedAnnotationsJob(statusUrl, token) {
+  const stale = () => annotationRetryJobIsStale(token);
+  while (true) {
+    if (stale()) return null;
+    const response = await fetch(statusUrl);
+    if (stale()) return null;
+    if (!response.ok) {
+      throw new Error(response.statusText || "Unable to load annotation retry status");
+    }
+    const status = await response.json();
+    if (stale()) return null;
+    if (status.status === "failed") {
+      throw new Error(status.error || "Annotation retry failed");
+    }
+    if (status.status === "complete") {
+      return {
+        annotations: status.result?.annotations || status.annotations || [],
+        outcomes: status.retry_outcomes || [],
+      };
+    }
+
+    const total = status.genes_total || "?";
+    setMessage(
+      `Retrying annotations: ${status.genes_completed}/${total} genes complete.`,
+      "info",
+    );
     await sleep(1500);
   }
 }
@@ -1555,13 +1907,23 @@ async function loadSharedRun() {
     // Shared links are readable by peers, but only the run's owner (or an
     // admin) may retry failed lookups back onto it. Fail closed if this check
     // can't be read, so other viewers never see an action they can't complete.
+    state.currentRunInputs = [];
     try {
       const accessResponse = await fetch(`/v1/runs/${encodeURIComponent(sharedRunId)}/access`);
       state.canModifyRun = accessResponse.ok
         ? Boolean((await accessResponse.json()).can_modify)
         : false;
+      if (state.canModifyRun) {
+        const inputsResponse = await fetch(
+          `/v1/runs/${encodeURIComponent(sharedRunId)}/inputs`,
+        );
+        state.currentRunInputs = inputsResponse.ok
+          ? ((await inputsResponse.json()).inputs || [])
+          : [];
+      }
     } catch {
       state.canModifyRun = false;
+      state.currentRunInputs = [];
     }
     // A run's fusion evidence job runs after the core annotation completes, so
     // it's normally persisted onto the run by the time anyone opens a share
@@ -1571,6 +1933,7 @@ async function loadSharedRun() {
       state.fusionEvidenceStatus = "complete";
     }
     invalidateFusionEvidenceJobs();
+    invalidateAnnotationRetryJobs();
     resetFusionEvidenceSections();
     resetGeneIndexFilters();
     state.currentResult = result;
@@ -1646,12 +2009,14 @@ async function rerunSavedRun(runId, forceRefresh = false) {
     const job = await response.json();
     started = true;
     invalidateFusionEvidenceJobs();
+    invalidateAnnotationRetryJobs();
     resetFusionEvidenceSections();
     resetGeneIndexFilters();
     const inputs = job.fusions || [];
     inputs.forEach((item) => {
       if (item.fusion) state.lastInputsByFusion[item.fusion] = item;
     });
+    state.currentRunInputs = inputs.map((item) => ({ ...item }));
     state.fusionEvidenceStatus = null;
     state.currentResult = null;
     const result = await pollAnnotationJob(job.status_url);
@@ -2277,6 +2642,44 @@ function renderNoResultView(hiddenAnnotations) {
   const list = document.createElement("div");
   list.className = "annotation-list";
 
+  const retryableErrors = retryableErrorAnnotations(hiddenAnnotations);
+  const noResultGenes = recheckNoResultAnnotations(hiddenAnnotations);
+  if (state.canModifyRun && (retryableErrors.length || noResultGenes.length)) {
+    const actions = document.createElement("div");
+    actions.className = "annotation-retry-actions";
+    const running = state.annotationRetryStatus === "running";
+
+    if (retryableErrors.length) {
+      const retryErrors = document.createElement("button");
+      retryErrors.type = "button";
+      retryErrors.className = "retry-failed-annotations";
+      retryErrors.textContent = running && state.annotationRetryKind === "errors"
+        ? "Retrying..."
+        : "Retry failed annotations";
+      retryErrors.disabled = running;
+      retryErrors.addEventListener("click", () => {
+        retryFailedAnnotations("errors").catch(() => {});
+      });
+      actions.appendChild(retryErrors);
+    }
+
+    if (noResultGenes.length) {
+      const recheck = document.createElement("button");
+      recheck.type = "button";
+      recheck.className = "recheck-no-result-genes";
+      recheck.textContent = running && state.annotationRetryKind === "noresult"
+        ? "Re-checking..."
+        : "Re-check no-result genes";
+      recheck.disabled = running;
+      recheck.addEventListener("click", () => {
+        retryFailedAnnotations("noresult").catch(() => {});
+      });
+      actions.appendChild(recheck);
+    }
+
+    list.appendChild(actions);
+  }
+
   hiddenAnnotations.forEach((annotation, index) => {
     const isError = Boolean(annotation.error);
     const reason =
@@ -2304,6 +2707,16 @@ function renderNoResultView(hiddenAnnotations) {
         <div class="field-row-value">${escapeHtml(reason)}</div>
       </div>
     `;
+    const retryNote = state.annotationRetryNotes.get(normalizedRetryToken(annotation.gene));
+    if (retryNote) {
+      const noteRow = document.createElement("div");
+      noteRow.className = "field-row annotation-retry-note";
+      noteRow.innerHTML = `
+        <span class="field-row-label">Retry</span>
+        <div class="field-row-value">${escapeHtml(retryNote)}</div>
+      `;
+      card.appendChild(noteRow);
+    }
     uiTrack().surfaced(card, { ...geneTrackContext(annotation, "no_result", index), section: "gene_card" });
     const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
     if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);
