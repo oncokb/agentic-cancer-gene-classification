@@ -235,6 +235,30 @@ async def test_bootstrap_grant_is_not_repeated_after_a_human_changes_the_role():
     assert code == 1  # verification flags the bootstrap admin without the role
 
 
+async def test_imported_admin_records_bootstrap_grant_and_respects_demotion():
+    redis = UserRedis()
+    _put(redis, _profile(ADMIN, role="admin"))
+    store = FakeUserStore()
+
+    code, out = await _run(redis, store, apply=True)
+
+    assert code == 0, out
+    assert (await store.get_user(ADMIN)).role == "admin"
+    [change] = (await store.list_role_changes(email=ADMIN)).changes
+    assert (change.old_value, change.new_value, change.actor, change.reason) == (
+        "admin", "admin", "system:migration", migration.BOOTSTRAP_REASON,
+    )
+    assert "already admin" in out
+
+    await store.set_role(ADMIN, "curator", actor="someone@mskcc.org")
+    code, out = await _run(redis, store, apply=True)
+
+    assert code == 1
+    assert (await store.get_user(ADMIN)).role == "curator"
+    assert len((await store.list_role_changes(email=ADMIN)).changes) == 2
+    assert "previously granted; role since changed to curator, left as is" in out
+
+
 async def test_bootstrap_admin_missing_everywhere_fails_verification():
     redis, _ = _production_like()
     store = FakeUserStore()

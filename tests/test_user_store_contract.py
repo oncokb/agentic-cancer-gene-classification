@@ -448,6 +448,31 @@ async def test_grant_bootstrap_admin_grants_once_and_never_after_a_demotion(stor
     assert len((await store.list_role_changes(email=address)).changes) == 2
 
 
+async def test_bootstrap_already_admin_records_grant_and_respects_demotion(store, email):
+    address = email("imported-admin")
+    await _login(store, address, role="admin", at=T0)
+    before = await store.get_user(address)
+
+    outcomes = await asyncio.gather(
+        *(store.grant_bootstrap_admin(address.upper(), reason="bootstrap") for _ in range(5))
+    )
+
+    assert outcomes == [user_store.BOOTSTRAP_ALREADY_ADMIN] * 5
+    assert await store.get_user(address) == before
+    [change] = (await store.list_role_changes(email=address)).changes
+    assert (change.field, change.old_value, change.new_value, change.actor, change.reason) == (
+        "role", "admin", "admin", user_store.BOOTSTRAP_ACTOR, "bootstrap",
+    )
+    assert change.request_id is None
+
+    await store.set_role(address, "curator", actor=email("boss"))
+    assert await store.grant_bootstrap_admin(address, reason="restart") == (
+        user_store.BOOTSTRAP_PREVIOUSLY_GRANTED
+    )
+    assert (await store.get_user(address)).role == "curator"
+    assert len((await store.list_role_changes(email=address)).changes) == 2
+
+
 async def test_grant_bootstrap_admin_unknown_user(store, email):
     with pytest.raises(UserNotFound):
         await store.grant_bootstrap_admin(email("nobody"), reason="bootstrap")

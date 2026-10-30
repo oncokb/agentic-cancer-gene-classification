@@ -556,7 +556,7 @@ async def _provision_mysql_user(
             "Sign-in for %s (provider=%s, role=%s, status=%s, login_count=%d)",
             record.email, provider, record.role, record.status, record.login_count,
         )
-        if record.role != "admin" and await grant_bootstrap_admin_if_listed(record.email) == BOOTSTRAP_GRANTED:
+        if await grant_bootstrap_admin_if_listed(record.email) == BOOTSTRAP_GRANTED:
             record = await store.get_user(record.email) or record
     except UserStoreUnavailable:
         raise
