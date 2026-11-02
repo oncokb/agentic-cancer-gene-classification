@@ -242,7 +242,6 @@ async function test_invalid_pmids_render_inline() {
 async function test_job_post_errors_are_explained() {
   for (const [status, detail, expected] of [
     [429, { detail: "Too many in-flight re-evaluation jobs" }, /maximum number of re-evaluations running/],
-    [403, { detail: "Curator privileges required for this action." }, /curator privileges/],
     [422, { detail: [{ msg: "List should have at most 50 items" }] }, /rejected: List should have at most 50 items/],
   ]) {
     const app = loadCurationApp({ routes: async (method) => (method === "POST" ? [status, detail] : undefined) });
@@ -253,6 +252,7 @@ async function test_job_post_errors_are_explained() {
     assert.match(oneByData(app.root("curation-status"), "curation", "message").textContent, expected);
     assert.strictEqual(app.curationState.sessions.get("gene|ALK|luad").job, null);
   }
+  // 403 means curator access is gone: see test_submit_and_revert_403_flip_to_read_only.
 }
 
 async function test_save_put_body_rerenders_in_place_and_toasts() {
@@ -1247,7 +1247,208 @@ async function test_curated_and_draft_text_never_render_as_markup() {
   assert.strictEqual(oneByData(body(app), "curation", "rationale").value, `Rationale ${evil}`, "draft rationale is a field value");
 }
 
+// ---------------------------------------------------------------------------
+// Losing curator access mid-session, and pending writes
+// ---------------------------------------------------------------------------
+
+const ACCESS_LOST = "You no longer have curator access";
+
+function meRoute(getMe, routes) {
+  return async (method, url, reqBody) => (url === "/auth/me" ? [200, getMe()] : routes(method, url, reqBody));
+}
+
+function typeInto(node, value, event = "input") {
+  node.value = value;
+  node.fire(event);
+}
+
+function noticeText(app) {
+  return `${app.root("toast-region").allText} ${app.root("curation-notifications").allText}`;
+}
+
+async function test_demotion_on_auth_refresh_removes_controls_and_blocks_writes() {
+  const curator = { auth_enabled: true, authenticated: true, email: "cur@x", role: "curator", can_curate: true };
+  let me = curator;
+  const app = loadCurationApp({ auth: { can_curate: undefined }, routes: meRoute(() => me, jobRoutes()) });
+  await app.checkAuth();
+  const result = curatedEverywhereResult();
+  render(app, result);
+  assert.ok(editControls(app.root("results-window")).length > 0, "curator starts with edit controls");
+  await toDraft(app);
+  typeInto(oneByData(body(app), "curation", "rationale"), "Typed by the curator.");
+  typeInto(oneByData(body(app), "curation", "note"), "Typed note.");
+  const id = "gene|ALK|luad";
+  const session = app.curationState.sessions.get(id);
+
+  me = { ...curator, role: "viewer", can_curate: false };
+  await app.checkAuth();
+
+  assert.ok(app.root("curation-modal").classList.contains("hidden"), "the open editor closes");
+  assert.deepStrictEqual(editControls(app.root("results-window")).map((c) => c.dataset.curation || c.tagName), [],
+    "no gene-card edit controls remain");
+  app.state.resultsViewMode = "fusion";
+  app.state.fusionEvidenceStatus = "complete";
+  app.renderAnnotationResult(app.state.currentResult);
+  assert.deepStrictEqual(editControls(app.root("results-window")).map((c) => c.dataset.curation || c.tagName), [],
+    "no fusion-card edit controls remain");
+  for (const action of ["notification-review", "notification-open"]) {
+    assert.strictEqual(byData(app.root("curation-notifications"), "curation", action).length, 0, `no ${action}`);
+  }
+  assert.ok(noticeText(app).includes(ACCESS_LOST), "a short notice explains why");
+  assert.strictEqual(app.curationState.sessions.get(id), session, "the draft stays in memory");
+  assert.strictEqual(session.draft.rationale, "Typed by the curator.");
+  assert.strictEqual(session.note, "Typed note.");
+
+  // No handler sends anything without permission.
+  const before = app.requests.length;
+  const subject = app.geneCurationSubject(result.annotations[0]);
+  await app.saveCurationDraft(session);
+  await app.submitCurationReevaluation(session);
+  await app.reloadAfterCurationConflict(session);
+  await app.revertCuration(subject, 2, app.document.createElement("p"), app.document.createElement("button"));
+  app.confirmCurationRevert(subject);
+  app.openCurationDialog(subject, { step: "review" });
+  assert.deepStrictEqual(app.requests.slice(before).map((r) => `${r.method} ${r.url}`), [], "no request was sent");
+  assert.ok(app.root("curation-aux-modal").classList.contains("hidden"), "revert confirmation never opens");
+  assert.ok(app.root("curation-modal").classList.contains("hidden"), "editor never opens");
+
+  // Re-promotion brings the controls and the kept draft back.
+  me = curator;
+  await app.checkAuth();
+  assert.ok(editControls(app.root("results-window")).length > 0, "controls return on re-promotion");
+  app.openCurationDialog(subject, { step: "review" });
+  assert.strictEqual(oneByData(body(app), "curation", "rationale").value, "Typed by the curator.");
+  assert.strictEqual(oneByData(body(app), "curation", "note").value, "Typed note.");
+}
+
+async function test_save_403_flips_to_read_only_and_keeps_the_draft() {
+  const puts = [];
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      extra: async (method, url, reqBody) => {
+        if (method !== "PUT") return undefined;
+        puts.push(reqBody);
+        return [403, { detail: "Curator privileges required" }];
+      },
+    }),
+  });
+  render(app, geneResult({ curated: true, curated_by: "cur@x", curated_at: "2026-10-02", curation_version: 0 }));
+  await toDraft(app);
+  typeInto(oneByData(body(app), "curation", "rationale"), "Typed before the 403.");
+  footerButton(app, "save").click();
+  await waitFor(() => app.root("curation-modal").classList.contains("hidden"), "editor closes on 403");
+  assert.strictEqual(puts.length, 1);
+  assert.strictEqual(app.state.auth.can_curate, false, "the UI is read-only now");
+  assert.deepStrictEqual(editControls(app.root("results-window")).map((c) => c.dataset.curation || c.tagName), []);
+  assert.ok(noticeText(app).includes(ACCESS_LOST));
+  const session = app.curationState.sessions.get("gene|ALK|luad");
+  assert.ok(session && session.draft, "draft kept");
+  assert.strictEqual(session.draft.rationale, "Typed before the 403.");
+  await app.saveCurationDraft(session);
+  assert.strictEqual(puts.length, 1, "no retry is sent without permission");
+}
+
+async function test_submit_and_revert_403_flip_to_read_only() {
+  const app = loadCurationApp({
+    routes: async (method) => (method === "POST" || method === "DELETE" ? [403, { detail: "Curator privileges required" }] : undefined),
+  });
+  render(app, geneResult({ curated: true, curated_by: "cur@x", curated_at: "2026-10-02", curation_version: 2 }));
+  oneByData(app.root("results-window"), "curation", "revert").click();
+  oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").click();
+  await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "revert dialog closes on 403");
+  assert.strictEqual(app.state.auth.can_curate, false);
+  assert.ok(noticeText(app).includes(ACCESS_LOST));
+  assert.deepStrictEqual(editControls(app.root("results-window")).map((c) => c.dataset.curation || c.tagName), []);
+
+  const app2 = loadCurationApp({
+    routes: async (method) => (method === "POST" ? [403, { detail: "Curator privileges required" }] : undefined),
+  });
+  render(app2, geneResult());
+  app2.openCurationDialog(geneSubject(app2));
+  addPmid(app2, "evidence", "333");
+  footerButton(app2, "submit").click();
+  await waitFor(() => app2.root("curation-modal").classList.contains("hidden"), "editor closes on 403");
+  assert.strictEqual(app2.state.auth.can_curate, false);
+  assert.deepStrictEqual([...app2.curationState.sessions.get("gene|ALK|luad").lists.evidence], ["111", "222", "333"],
+    "PMID edits kept");
+}
+
+async function test_editor_is_read_only_while_a_save_is_pending() {
+  const gates = [];
+  const puts = [];
+  const app = loadCurationApp({
+    routes: jobRoutes({
+      extra: async (method, url, reqBody) => {
+        if (method !== "PUT") return undefined;
+        puts.push(reqBody);
+        await new Promise((resolve) => gates.push(resolve));
+        if (puts.length === 1) return [500, { detail: "boom" }];
+        return [200, { version: 1, override: { curator_email: "cur@x", updated_at: "2026-10-12T00:00:00Z", payload: reqBody.payload } }];
+      },
+    }),
+  });
+  render(app, geneResult());
+  await toDraft(app);
+  typeInto(oneByData(body(app), "curation", "rationale"), "Final text.");
+  typeInto(oneByData(body(app), "curation", "note"), "My note.");
+  const fields = () => body(app).querySelectorAll("input, textarea, select, button");
+
+  footerButton(app, "save").click();
+  await waitFor(() => gates.length === 1, "PUT pending");
+  assert.ok(fields().length > 0);
+  assert.deepStrictEqual(fields().filter((node) => !node.disabled).map((n) => n.dataset.curation || n.tagName), [],
+    "every review field is read-only while the PUT is in flight");
+  assert.ok(footerButton(app, "save").disabled, "save disabled");
+  assert.ok(footerButton(app, "discard").disabled && footerButton(app, "back").disabled);
+  gates[0]();
+  await waitFor(() => !app.curationState.busy, "first save failed");
+  assert.ok(!app.root("curation-modal").classList.contains("hidden"), "editor stays open on failure");
+  assert.strictEqual(oneByData(body(app), "curation", "rationale").disabled, false, "editable again");
+  assert.strictEqual(oneByData(body(app), "curation", "rationale").value, "Final text.", "input intact");
+  assert.strictEqual(oneByData(body(app), "curation", "note").value, "My note.");
+  assert.ok(!footerButton(app, "save").disabled);
+
+  footerButton(app, "save").click();
+  await waitFor(() => gates.length === 2, "second PUT pending");
+  assert.deepStrictEqual(fields().filter((node) => !node.disabled).map((n) => n.dataset.curation || n.tagName), []);
+  gates[1]();
+  await waitFor(() => app.root("curation-modal").classList.contains("hidden"), "saved");
+  assert.strictEqual(puts[1].payload.cancer_association_rationale, "Final text.", "what was saved is what was typed");
+  assert.strictEqual(puts[1].note, "My note.");
+}
+
+async function test_revert_dialog_is_locked_while_delete_is_pending() {
+  let release;
+  const app = loadCurationApp({
+    routes: async (method, url) => {
+      if (method === "DELETE") {
+        await new Promise((resolve) => { release = resolve; });
+        return [500, { detail: "boom" }];
+      }
+      return undefined;
+    },
+  });
+  render(app, geneResult({ curated: true, curated_by: "cur@x", curated_at: "2026-10-02", curation_version: 2 }));
+  oneByData(app.root("results-window"), "curation", "revert").click();
+  oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").click();
+  await waitFor(() => release, "DELETE pending");
+  assert.ok(oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").disabled);
+  assert.ok(oneByData(app.root("curation-aux-footer"), "curation", "cancel-revert").disabled, "cancel locked while pending");
+  app.pressKey("Escape");
+  assert.ok(!app.root("curation-aux-modal").classList.contains("hidden"), "Escape can't close mid-revert");
+  release();
+  await waitFor(() => !app.curationState.busy, "revert failed");
+  assert.ok(!oneByData(app.root("curation-aux-footer"), "curation", "cancel-revert").disabled, "cancel re-enabled");
+  assert.ok(!oneByData(app.root("curation-aux-footer"), "curation", "confirm-revert").disabled);
+  assert.ok(app.root("curation-aux-body").allText.includes("boom"), "error shown");
+}
+
 runTests("curation UI", [
+  test_demotion_on_auth_refresh_removes_controls_and_blocks_writes,
+  test_save_403_flips_to_read_only_and_keeps_the_draft,
+  test_submit_and_revert_403_flip_to_read_only,
+  test_editor_is_read_only_while_a_save_is_pending,
+  test_revert_dialog_is_locked_while_delete_is_pending,
   test_viewer_from_auth_me_sees_no_edit_controls_anywhere,
   test_curator_from_auth_me_sees_edit_controls_everywhere,
   test_curated_and_draft_text_never_render_as_markup,

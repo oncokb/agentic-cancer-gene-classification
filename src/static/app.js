@@ -318,9 +318,11 @@ async function checkAuth() {
     const response = await fetch("/auth/me");
     if (!response.ok) return;
     const payload = await response.json();
+    const couldCurate = canCurate();
     state.auth = payload;
-    // can_curate gates the curator edit controls on already-rendered results.
-    if (payload.can_curate && state.currentResult) renderAnnotationResult(state.currentResult);
+    // can_curate gates the curator edit controls: re-render on any change,
+    // and on losing it close the editors (drafts are kept in memory).
+    applyCurationPermissionChange(couldCurate);
 
     if (!payload.auth_enabled) {
       if (elements.userAuthBar) elements.userAuthBar.classList.add("hidden");
