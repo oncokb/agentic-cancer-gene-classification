@@ -31,6 +31,7 @@ from src.observability import record_user_action
 from src.pipeline import literature
 from src.pipeline.curation import (
     FUSION,
+    FUSION_PARTNER,
     GENE,
     CurationPayload,
     fusion_evidence_pmids,
@@ -80,6 +81,15 @@ class CurationSaveRequest(BaseModel):
         ),
     )
     note: Optional[str] = Field(default=None, max_length=2000, description="Optional note kept in history.")
+    removed_pmids: List[str] = Field(
+        default_factory=list,
+        max_length=500,
+        description=(
+            "fusion_partner only: PMIDs the curator deliberately removed. A save that drops a PMID the "
+            "stored override (at expected_version) references is rejected (422) unless the PMID is listed "
+            "here, so a save built from a filtered follow-up view can't silently lose saved evidence."
+        ),
+    )
 
 
 class CurationResponse(BaseModel):
@@ -240,6 +250,42 @@ async def get_curation(
     )
 
 
+async def _reject_unacknowledged_removals(
+    store: Any, key: str, tumor_type: str, request: CurationSaveRequest, pmids: List[str]
+) -> None:
+    """422 when a fusion_partner save drops a PMID the stored override references
+    without listing it in removed_pmids.
+
+    Follow-up partner lookups hide previously shown PMIDs, so a payload built from
+    that view would otherwise replace the complete stored list with a filtered one.
+    Checked against the override at expected_version: if another save landed in the
+    meantime the save 409s anyway (the store compares versions), so the content
+    checked here is exactly the content being replaced."""
+    current = await _store_call(store.get_curated_override(FUSION_PARTNER, key, tumor_type))
+    if current is None or current.version != request.expected_version:
+        return
+    try:
+        stored = payload_pmids(parse_payload(FUSION_PARTNER, current.payload))
+    except ValidationError:
+        logger.warning("Stored fusion_partner override for %s is unreadable", key, exc_info=True)
+        return
+    acknowledged = set(request.removed_pmids)
+    kept = set(pmids)
+    missing = [pmid for pmid in stored if pmid not in kept and pmid not in acknowledged]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "This save would remove saved partner-precedent PMIDs that were not explicitly removed "
+                    "(was it built from a filtered follow-up view?). Reload the full precedent list, or list "
+                    "them in removed_pmids to remove them."
+                ),
+                "unacknowledged_removed_pmids": missing,
+            },
+        )
+
+
 @router.put("/{subject_type}/{subject_key}", response_model=CurationResponse)
 async def save_curation(
     request: CurationSaveRequest,
@@ -266,6 +312,8 @@ async def save_curation(
         )
 
     pmids = payload_pmids(payload)
+    if subject_type == FUSION_PARTNER:
+        await _reject_unacknowledged_removals(store, key, tt, request, pmids)
     records = await _fetch_pubmed(pmids) if pmids else {}
     invalid = _invalid_pmids(pmids, records)
     if invalid:

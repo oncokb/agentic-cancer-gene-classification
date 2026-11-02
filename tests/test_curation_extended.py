@@ -343,6 +343,52 @@ def test_partner_route_serves_live_override_per_search_scope(client, store, monk
     assert unavailable["curated"] is False and CURATION_UNAVAILABLE_FLAG in _codes(unavailable)
 
 
+def test_partner_save_from_follow_up_view_cannot_drop_saved_pmids(client, store, monkeypatch):
+    """Repro (#120 review): an all-tumor-types override [111, 222], edited from a
+    follow-up lookup that hid 111, must not be replaced by [222] by accident."""
+
+    async def fake_partner(gene, tumor_type=None, agnostic=False, exclude_pmids=None, **_kwargs):
+        pmids = [p for p in ("111", "222") if p not in (exclude_pmids or set())]
+        return _partner(tuple(pmids), tumor_type=tumor_type, scope="all_tumor_types")
+
+    monkeypatch.setattr(main, "retrieve_fusion_partner_evidence", fake_partner)
+    monkeypatch.setattr(curation_routes.literature, "retrieve_fusion_partner_evidence", fake_partner)
+    url = "/v1/curation/fusion_partner/ALK"
+    saved = client.put(url, json={"payload": {"pmids": ["111", "222"], "interpretation": "Both."}})
+    assert saved.status_code == 200, saved.text
+    # The follow-up view excludes 111, so it shows only 222.
+    follow_up = client.post("/v1/fusion-partner-evidence",
+                            json={"gene": "ALK", "tumor_type": "NSCLC", "agnostic": True, "exclude_pmids": ["111"]})
+    assert follow_up.json()["pmids"] == ["222"]
+
+    filtered = {"expected_version": 1, "payload": {"pmids": follow_up.json()["pmids"], "interpretation": "Edited."}}
+    rejected = client.put(url, json=filtered)
+    assert rejected.status_code == 422, rejected.text
+    assert rejected.json()["detail"]["unacknowledged_removed_pmids"] == ["111"]
+    current = client.get(url).json()
+    assert current["version"] == 1 and current["override"]["payload"]["pmids"] == ["111", "222"]
+
+    # Cards count too: dropping a stored card's PMID needs the same acknowledgement.
+    with_card = client.put(url, json={"expected_version": 1, "payload": {
+        "pmids": ["111", "222"], "evidence_cards": [{"pmid": "222", "quote": "q"}]}})
+    assert with_card.status_code == 200
+    no_card = client.put(url, json={"expected_version": 2, "payload": {"pmids": ["111"]}})
+    assert no_card.json()["detail"]["unacknowledged_removed_pmids"] == ["222"]
+
+    # A deliberate removal is listed explicitly and goes through.
+    removed = client.put(url, json={**filtered, "expected_version": 2, "removed_pmids": ["111"]})
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["override"]["payload"]["pmids"] == ["222"]
+    # A stale expected_version is still a 409, never a 422 against older content.
+    assert client.put(url, json=filtered).status_code == 409
+
+
+def test_removal_acknowledgement_only_applies_to_partner_subjects(client, store):
+    gene = "/v1/curation/gene/ALK?tumor_type=LUAD"
+    assert client.put(gene, json={"payload": {"citations": ["111", "222"]}}).status_code == 200
+    assert client.put(gene, json={"expected_version": 1, "payload": {"citations": ["222"]}}).status_code == 200
+
+
 async def test_partner_override_retraction_checked_live(monkeypatch):
     store = FakeCurationStore()
     store.overrides[("fusion_partner", "ALK", "nsclc")] = _partner_override({"pmids": ["333", "666"]})

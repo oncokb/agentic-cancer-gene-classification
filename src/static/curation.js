@@ -65,6 +65,9 @@ const curationState = {
   // record }) }. Partner lookups are on-demand, not part of the run result, so
   // each rendered lookup registers here for the editor to find and refresh.
   partnerViews: new Map(),
+  // subjectId -> { call, note, baseVersion }: an unsaved cancer-associated
+  // call edit, kept (like edit sessions) when the editor closes or access is lost.
+  callDrafts: new Map(),
   openSubjectId: null,
   returnFocus: null,
   busy: false,
@@ -472,6 +475,9 @@ function createCurationSession(subject, record, focus) {
     include: { evidence: focus !== "precedent", precedent: isGene && focus === "precedent" },
     info: curationPmidInfo(record),
     invalid: new Map(),
+    // PMIDs the curator removed here: sent as removed_pmids (fusion_partner) so
+    // the server accepts dropping them from the stored override.
+    removed: new Set(),
     inputErrors: { evidence: "", precedent: "" },
     job: null,
     // Frozen copy of the lists/inclusion as submitted; the draft and the
@@ -558,6 +564,7 @@ function addCurationPmids(session, listName, rawValue) {
     return { added: [], error: `At most ${CURATION_MAX_PMIDS} unique PMIDs across evidence and precedent.` };
   }
   list.push(...added);
+  added.forEach((pmid) => session.removed.delete(pmid));
   session.include[listName] = true;
   curationListsChanged(session);
   return { added, error: "" };
@@ -566,6 +573,7 @@ function addCurationPmids(session, listName, rawValue) {
 function removeCurationPmid(session, listName, pmid) {
   if (curationLocked(session)) return;
   session.lists[listName] = session.lists[listName].filter((value) => value !== pmid);
+  session.removed.add(pmid);
   session.include[listName] = true;
   session.invalid.delete(pmid);
   curationListsChanged(session);
@@ -1072,6 +1080,8 @@ async function saveCurationDraft(session) {
       return;
     }
     const body = { expected_version: expected, payload: buildCurationPayload(session, current.override?.payload) };
+    const removed = curationRemovedPmids(session, body.payload);
+    if (removed.length) body.removed_pmids = removed;
     const note = session.note.trim();
     if (note) body.note = note;
     // Sent only if access still holds now, after the preflight await.
@@ -1113,6 +1123,14 @@ async function saveCurationDraft(session) {
   }
 }
 
+// fusion_partner saves list the PMIDs the curator deliberately removed; the
+// server rejects any other PMID dropped from the stored override.
+function curationRemovedPmids(session, payload) {
+  if (session.subject.type !== "fusion_partner") return [];
+  const kept = new Set([...(payload.pmids || []), ...(payload.evidence_cards || []).map((card) => card.pmid)]);
+  return [...session.removed].filter((pmid) => !kept.has(pmid));
+}
+
 function handleCurationSaveError(session, status, detail) {
   if (status === 409) {
     const current = detail && detail.current_version;
@@ -1130,6 +1148,14 @@ function handleCurationSaveError(session, status, detail) {
       type: "error",
       text: `${detail.message || "Some PMIDs cannot be used as curated evidence."} ` +
         Array.from(session.invalid, ([pmid, reason]) => `PMID ${pmid}: ${reason}`).join("; "),
+    };
+    return;
+  }
+  if (status === 422 && detail && Array.isArray(detail.unacknowledged_removed_pmids)) {
+    session.message = {
+      type: "error",
+      text: `Nothing was saved: this would remove saved PMID(s) ${detail.unacknowledged_removed_pmids.join(", ")} ` +
+        "that you didn't remove. Discard this draft and reopen the editor to load the full list.",
     };
     return;
   }
@@ -1201,6 +1227,57 @@ async function reloadPartnerCurationViews(subject) {
   return fresh;
 }
 
+// A partner lookup on screen may be a follow-up that hides PMIDs shown earlier,
+// so a new partner editor starts from the COMPLETE stored override (or, with no
+// stored PMIDs, the unfiltered lookup): a PMID leaves the saved list only when
+// the curator removes it.
+async function openPartnerCurationEditor(subject, options) {
+  if (curationState.busy) return;
+  curationState.busy = true;
+  let base = null;
+  try {
+    base = await loadPartnerEditorBase(subject);
+  } catch (error) {
+    if (canCurate()) {
+      showCurationToast(`Couldn't load the saved precedent list for ${subject.label}, so the editor didn't open; please retry.`, "error");
+    }
+  } finally {
+    curationState.busy = false;
+  }
+  if (!base || !canCurate()) return;
+  const id = curationSubjectId(subject);
+  if (!curationState.sessions.has(id)) {
+    const session = createCurationSession(subject, base.record, options.focus);
+    session.baseVersion = base.version;
+    curationState.sessions.set(id, session);
+  }
+  openCurationDialog(subject, options);
+}
+
+async function loadPartnerEditorBase(subject) {
+  const current = await fetchCurrentCurationOverride(subject);
+  const payload = current.override?.payload || {};
+  const cards = payload.evidence_cards || [];
+  let complete = null;
+  if (!Array.isArray(payload.pmids)) {
+    const view = curationState.partnerViews.get(curationSubjectId(subject));
+    const unfiltered = view && [...view.entries.values()].find((entry) => !(entry.request?.excludePmids || []).length);
+    complete = unfiltered?.record ||
+      await fetchFusionPartnerEvidence(subject.key, subject.tumorType ? { tumorType: subject.tumorType } : { agnostic: true });
+  }
+  const pmids = [...new Set([...(Array.isArray(payload.pmids) ? payload.pmids : complete.pmids || []), ...cards.map((card) => card.pmid)])];
+  const record = findCurationRecord(subject) || complete || {};
+  return {
+    version: current.version,
+    record: {
+      ...record,
+      pmids,
+      evidence_cards: [...cards, ...(complete?.evidence_cards || [])],
+      curation_version: current.version,
+    },
+  };
+}
+
 // Called by app.js for each rendered partner-precedent lookup: registers it
 // and returns the curation panel and edit control (null when there's none).
 function renderPartnerCurationControls(container, data, request) {
@@ -1253,12 +1330,15 @@ function openCurationCallEditor(subject) {
   const record = findCurationRecord(subject);
   if (!record || curationTumorContextUnresolved(subject, record)) return;
   const initial = curatedCall(record);
-  const edit = { call: initial, baseVersion: record.curation_version || 0, note: "" };
+  const id = curationSubjectId(subject);
+  const restored = curationState.callDrafts.get(id);
+  const edit = restored || { call: initial, baseVersion: record.curation_version || 0, note: "" };
+  curationState.callDrafts.set(id, edit);
   const shown = typeof initial === "boolean"
     ? `${curationCallText(initial)} (curator-set)`
     : `${record.cancer_associated === true ? "Yes" : record.cancer_associated === false ? "No" : "undetermined"} (pipeline)`;
-  const select = curationCallSelect(initial, (call) => { edit.call = call; });
-  const note = curationTextarea("", (value) => { edit.note = value; }, { rows: 2, dataset: { curation: "call-note" } });
+  const select = curationCallSelect(edit.call, (call) => { edit.call = call; });
+  const note = curationTextarea(edit.note, (value) => { edit.note = value; }, { rows: 2, dataset: { curation: "call-note" } });
   const body = curationEl("div", { className: "curation-call-editor" }, [
     curationEl("p", {
       text: `Currently: ${shown}. Only the call changes; other curated sections are kept as they are.`,
@@ -1268,9 +1348,15 @@ function openCurationCallEditor(subject) {
     curationField("Note for history (optional)", note, { id: "curation-call-note" }),
   ]);
   const error = curationEl("p", { className: "curation-error", attrs: { role: "alert" }, dataset: { curation: "call-error" } });
+  if (restored) error.textContent = "Restored your unsaved call edit.";
   body.appendChild(error);
   const save = curationButton("Save call", null, { className: "primary-action", action: "save-call" });
-  const cancel = curationButton("Cancel", () => closeCurationAuxModal(), { action: "cancel-call" });
+  // Cancel discards the call draft; closing any other way keeps it.
+  const cancel = curationButton("Cancel", () => {
+    if (curationState.busy) return;
+    curationState.callDrafts.delete(id);
+    closeCurationAuxModal();
+  }, { action: "cancel-call" });
   // Every control is read-only while the write is in flight.
   const controls = [select, note, save, cancel];
   save.addEventListener("click", () => saveCurationCall(subject, edit, error, controls));
@@ -1311,6 +1397,7 @@ async function saveCurationCall(subject, edit, errorNode, controls) {
     const payload = applyCurationCall(currentPayload, edit.call);
     if (JSON.stringify(payload) === JSON.stringify(currentPayload)) {
       curationState.busy = false;
+      curationState.callDrafts.delete(curationSubjectId(subject));
       closeCurationAuxModal();
       showCurationToast("The call is unchanged; nothing was saved.");
       return;
@@ -1362,6 +1449,7 @@ async function saveCurationCall(subject, edit, errorNode, controls) {
       if (!fresh) applySavedCurationFallback(subject, saved);
     }
     curationState.busy = false;
+    curationState.callDrafts.delete(id);
     refreshCurationView(subject);
     closeCurationAuxModal();
     showCurationToast(`${subject.label}: cancer-associated call saved`, "success");
@@ -1689,6 +1777,10 @@ function renderCurationUnavailableBanner(result) {
 
 function openCurationDialog(subject, { focus = "evidence", step } = {}) {
   if (!canCurate() || curationTumorContextUnresolved(subject, findCurationRecord(subject))) return;
+  if (subject.type === "fusion_partner" && !curationState.sessions.has(curationSubjectId(subject))) {
+    openPartnerCurationEditor(subject, { focus, step });
+    return;
+  }
   const session = getCurationSession(subject, focus);
   if (step === "review" && session.draft) session.step = "review";
   if (!curationState.openSubjectId) curationState.returnFocus = document.activeElement || null;

@@ -36,6 +36,8 @@ function render(app, annotationOverrides = {}) {
 }
 
 const body = (app) => app.root("curation-body");
+// A partner editor opens after loading the stored override.
+const editorOpen = (app) => waitFor(() => !app.root("curation-modal").classList.contains("hidden"), "editor open");
 const footerButton = (app, action) => oneByData(app.root("curation-footer"), "curation", action);
 
 // Answers the curation GET, the re-evaluation job (one poll), and the PUT.
@@ -488,6 +490,7 @@ async function test_partner_precedent_edit_flow() {
   const edit = oneByData(outer, "curation", "edit-evidence");
   assert.strictEqual(edit.textContent, "Edit partner precedent");
   edit.click();
+  await editorOpen(app);
 
   assert.strictEqual(byData(body(app), "list", "precedent").length, 0, "no therapeutic precedent list");
   assert.ok(body(app).allText.includes("Partner-precedent PMIDs"));
@@ -680,6 +683,7 @@ async function test_call_save_403_turns_read_only_and_keeps_drafts() {
   const { outer } = renderGeneAndPartner(app);
   // A partner draft in progress elsewhere.
   oneByData(outer, "curation", "edit-evidence").click();
+  await editorOpen(app);
   const partnerId = "fusion_partner|ALK|nsclc";
   app.curationState.sessions.get(partnerId).note = "Partner note kept.";
   app.closeCurationDialog();
@@ -708,6 +712,7 @@ async function test_partner_save_403_turns_read_only_and_keeps_draft() {
     : forbidden(url, options));
   const outer = renderPartner(app, PARTNER, { tumorType: "NSCLC", agnostic: false });
   oneByData(outer, "curation", "edit-evidence").click();
+  await editorOpen(app);
   footerButton(app, "submit").click();
   await waitFor(() => app.curationState.sessions.get("fusion_partner|ALK|nsclc")?.draft, "draft");
   footerButton(app, "review").click();
@@ -753,6 +758,135 @@ async function test_call_editor_read_only_while_write_pending() {
   await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "closed after the write");
 }
 
+// ---------------------------------------------------------------------------
+// #120 review: follow-up views and call drafts
+// ---------------------------------------------------------------------------
+
+// The all-tumor-types follow-up hides PMIDs shown earlier (here 111).
+const FOLLOW_UP = {
+  ...PARTNER, scope: "all_tumor_types", pmids: ["222"], retrieved_count: 1,
+  evidence_cards: [{ pmid: "222", title: "Second paper", abstract: "Second sentence.", selected_reason: "s2", quote: "Second sentence.", evidence_type: "other" }],
+  curated: true, curated_by: "cur@x", curated_at: "2026-10-12", curation_version: 1, curated_fields: ["interpretation", "pmids"],
+};
+const STORED_PARTNER = { version: 1, override: { ...OVERRIDE_META, payload: { pmids: ["111", "222"], interpretation: "Both." } } };
+
+function partnerDraft(pmids) {
+  return {
+    gene: "ALK", tumor_type: null, scope: "all_tumor_types", has_precedent: true, pmids, interpretation: "Suggested.",
+    evidence_cards: pmids.map((pmid) => ({ pmid, title: `T${pmid}`, abstract: `A${pmid}.`, selected_reason: "s", quote: `A${pmid}.`, evidence_type: "other" })),
+  };
+}
+
+async function savePartnerFromFollowUp({ remove } = {}) {
+  let put;
+  let submittedPmids;
+  const app = loadCurationApp({
+    routes: async (method, url, reqBody) => {
+      if (method === "GET" && url === "/v1/curation/fusion_partner/ALK") return [200, STORED_PARTNER];
+      if (method === "POST" && url === "/v1/curation/reevaluate/jobs") {
+        submittedPmids = reqBody.evidence_pmids;
+        return [200, { job_id: "job-1", status_url: "/v1/curation/reevaluate/jobs/job-1" }];
+      }
+      if (method === "GET" && url === "/v1/curation/reevaluate/jobs/job-1") {
+        return [200, { status: "succeeded", error: null, invalid_pmids: null, draft: partnerDraft(submittedPmids) }];
+      }
+      if (method === "PUT") {
+        put = { url, body: reqBody };
+        return [200, { version: 2, override: { ...OVERRIDE_META, payload: reqBody.payload } }];
+      }
+      if (method === "POST" && url === "/v1/fusion-partner-evidence") return [200, FOLLOW_UP];
+      return undefined;
+    },
+  });
+  const outer = renderPartner(app, FOLLOW_UP, { tumorType: "NSCLC", agnostic: true, excludePmids: ["111"] });
+  oneByData(outer, "curation", "edit-evidence").click();
+  await editorOpen(app);
+  const session = app.curationState.sessions.get("fusion_partner|ALK|");
+  assert.deepStrictEqual([...session.lists.evidence], ["111", "222"], "the editor lists the complete stored override");
+  assert.strictEqual(session.baseVersion, 1);
+  if (remove) {
+    const button = byData(body(app), "curation", "remove-pmid").find((b) => b.getAttribute("aria-label") === `Remove PMID ${remove}`);
+    button.click();
+  }
+  footerButton(app, "submit").click();
+  await waitFor(() => session.draft, "draft");
+  footerButton(app, "review").click();
+  footerButton(app, "save").click();
+  await waitFor(() => put, "PUT");
+  return put;
+}
+
+async function test_partner_edit_from_follow_up_keeps_saved_pmids() {
+  const put = await savePartnerFromFollowUp();
+  assert.strictEqual(put.url, "/v1/curation/fusion_partner/ALK");
+  assert.strictEqual(put.body.expected_version, 1);
+  assert.deepStrictEqual(put.body.payload.pmids, ["111", "222"], "111, hidden by the follow-up, is still saved");
+  assert.ok(!("removed_pmids" in put.body), "nothing was removed");
+}
+
+async function test_partner_explicit_removal_is_sent_as_removed_pmids() {
+  const put = await savePartnerFromFollowUp({ remove: "111" });
+  assert.deepStrictEqual(put.body.payload.pmids, ["222"]);
+  assert.deepStrictEqual(put.body.removed_pmids, ["111"], "the curator's removal is acknowledged explicitly");
+}
+
+async function test_partner_unacknowledged_removal_422_explains_and_keeps_draft() {
+  const base = routes({ draft: PARTNER_DRAFT, onPut: () => {} });
+  const app = loadCurationApp({
+    routes: async (method, url, reqBody) => (method === "PUT"
+      ? [422, { detail: { message: "x", unacknowledged_removed_pmids: ["999"] } }]
+      : base(method, url, reqBody)),
+  });
+  const outer = renderPartner(app, PARTNER, { tumorType: "NSCLC", agnostic: false });
+  oneByData(outer, "curation", "edit-evidence").click();
+  await editorOpen(app);
+  footerButton(app, "submit").click();
+  await waitFor(() => app.curationState.sessions.get("fusion_partner|ALK|nsclc")?.draft, "draft");
+  footerButton(app, "review").click();
+  footerButton(app, "save").click();
+  await waitFor(() => !app.curationState.busy && app.curationState.sessions.get("fusion_partner|ALK|nsclc").message?.type === "error", "error");
+  assert.match(app.curationState.sessions.get("fusion_partner|ALK|nsclc").message.text, /999/);
+  assert.strictEqual(app.state.auth.can_curate, true);
+}
+
+async function test_call_draft_survives_403_and_repromotion() {
+  let forbid = true;
+  const app = loadCurationApp({
+    routes: async (method, url) => {
+      if (method === "GET" && url.startsWith("/v1/curation/gene/ALK")) return [200, { version: 0, override: null }];
+      if (method === "PUT") return forbid ? [403, { detail: "Curator privileges required for this action." }] : undefined;
+      return undefined;
+    },
+  });
+  render(app);
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const aux = app.root("curation-aux-body");
+  const select = oneByData(aux, "curation", "cancer-associated");
+  select.value = "false";
+  select.fire("change");
+  const note = oneByData(aux, "curation", "call-note");
+  note.value = "Germline only";
+  note.fire("input");
+  oneByData(app.root("curation-aux-footer"), "curation", "save-call").click();
+  await waitFor(() => app.state.auth.can_curate === false, "access lost on 403");
+  await waitFor(() => !app.curationState.busy, "save finished");
+  assert.ok(app.root("curation-aux-modal").classList.contains("hidden"));
+
+  forbid = false;
+  app.state.auth.can_curate = true;
+  app.applyCurationPermissionChange(false);
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const reopened = app.root("curation-aux-body");
+  assert.strictEqual(oneByData(reopened, "curation", "cancer-associated").value, "false", "selection restored");
+  assert.strictEqual(oneByData(reopened, "curation", "call-note").value, "Germline only", "note restored");
+
+  // Cancel discards the draft; the next open starts from the current call.
+  oneByData(app.root("curation-aux-footer"), "curation", "cancel-call").click();
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  assert.strictEqual(oneByData(app.root("curation-aux-body"), "curation", "cancer-associated").value, "");
+  assert.strictEqual(oneByData(app.root("curation-aux-body"), "curation", "call-note").value, "");
+}
+
 runTests("curation extended UI", [
   test_suggested_call_offered_applied_flipped_and_sent_in_put,
   test_untouched_call_in_evidence_edit_is_not_written,
@@ -776,4 +910,8 @@ runTests("curation extended UI", [
   test_call_save_403_turns_read_only_and_keeps_drafts,
   test_partner_save_403_turns_read_only_and_keeps_draft,
   test_call_editor_read_only_while_write_pending,
+  test_partner_edit_from_follow_up_keeps_saved_pmids,
+  test_partner_explicit_removal_is_sent_as_removed_pmids,
+  test_partner_unacknowledged_removal_422_explains_and_keeps_draft,
+  test_call_draft_survives_403_and_repromotion,
 ]);
