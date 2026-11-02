@@ -41,7 +41,7 @@ class JobStatus(BaseModel):
     error: Optional[str] = None
     invalid_pmids: Optional[dict[str, list[str]]] = None
     draft: Optional[dict[str, Any]] = None
-    owner_email: str = Field(default="", exclude=True)
+    owner_email: Optional[str] = Field(default=None, exclude=True)
     finished_at: Optional[float] = Field(default=None, exclude=True)
 
 
@@ -65,9 +65,8 @@ async def _run_job(job_id: str, request: ReevaluateRequest, run_store):
         job_id=job_id, status="failed", error="Re-evaluation failed; please retry.", owner_email=owner
     )
     try:
-        async with _jobs_lock:
-            job.status = "running"
-            await _jobs.put(job)
+        job.status = "running"
+        await _jobs.put(job)
         _audit(owner, "curation_reevaluate_start", {"job_id": job_id})
         draft = await reevaluate(request, run_store=run_store)
         result = JobStatus(job_id=job_id, status="succeeded", draft=draft, owner_email=owner)
@@ -84,8 +83,7 @@ async def _run_job(job_id: str, request: ReevaluateRequest, run_store):
         logger.exception("Curator re-evaluation job %s failed", job_id)
     finally:
         result.finished_at = time.monotonic()
-        async with _jobs_lock:
-            await _jobs.put(result)
+        await _jobs.put(result)
         _audit(
             owner,
             "curation_reevaluate_success"
@@ -121,8 +119,7 @@ async def create_job(
 
 @router.get("/jobs/{job_id}", response_model=JobStatus)
 async def get_job(job_id: str, current_user=Depends(_curator_dependency)):
-    async with _jobs_lock:
-        job = await _jobs.get(job_id)
-        if job is None or not can_read_job(job.owner_email, current_user):
-            raise HTTPException(status_code=404, detail="Job not found")
-        return job
+    job = await _jobs.get(job_id)
+    if job is None or not can_read_job(job.owner_email, current_user):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job

@@ -31,7 +31,7 @@ unique PMID count must fit this cap, or POST returns **422** (standard FastAPI
 validation detail). Both copies of an ID shared across arrays count once toward
 the combined limit. Per-list and combined limits read the live settings on
 each validation; they are not frozen when the module is imported.
-`CURATION_REEVALUATE_MAX_INFLIGHT_JOBS` defaults to **2**:
+`CURATION_REEVALUATE_MAX_INFLIGHT_JOBS` defaults to **2 per user per pod**:
 queued/running jobs count toward the normalized owner email's limit, or POST
 returns **429**:
 
@@ -85,8 +85,11 @@ esearch. If that check confirms they do not exist, the job returns
 `invalid_pmids.unknown`, including when every supplied ID is unknown. If efetch
 returned no records but esearch finds supplied IDs, the job instead fails with
 `invalid_pmids: null` and `error: "NCBI returned no verifiable PMIDs; please retry."`.
-This avoids classifying a cached empty fetch after an XML parse error as invalid
-literature. Network exceptions remain generic job failures.
+Curator validation bypasses both efetch and existence-search caches, so a cached
+empty fetch from an earlier XML parse error cannot invalidate real PMIDs.
+Malformed XML and existence responses with `ERROR` or missing `esearchresult`
+fail with the same retryable NCBI error, never `invalid_pmids.unknown`.
+Network exceptions remain generic job failures.
 
 An actual unresolved subject returns
 `"Could not resolve subject: <input>. Check the gene symbol and retry."`
