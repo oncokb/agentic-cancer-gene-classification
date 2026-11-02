@@ -161,6 +161,9 @@ sign-in grants it again.
    migrated users listed with roles), and sign in as a non-admin to confirm
    their role is unchanged.
 
+After the cutover, admins approve, disable and re-enable users and change
+roles on the `/admin/users` page; see [admin.md](admin.md).
+
 ### Rollback
 
 Set `USER_STORE_BACKEND=redis` (`BOOTSTRAP_ADMIN_EMAILS` is then ignored) and

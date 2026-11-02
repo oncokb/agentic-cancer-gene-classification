@@ -2851,3 +2851,32 @@ body.api-keys-body {
   color: var(--danger);
   font-size: 13px;
 }
+
+/* ---------------------------------------------------------------------------
+   Admin user management page (/admin/users)
+   --------------------------------------------------------------------------- */
+
+.admin-users-page {
+  max-width: 1100px;
+}
+
+.admin-users-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.admin-users-filters input[type="search"] {
+  flex: 1 1 220px;
+}
+
+.admin-users-page .api-keys-table td button + button {
+  margin-left: 6px;
+}
+
+#admin-confirm textarea {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+}

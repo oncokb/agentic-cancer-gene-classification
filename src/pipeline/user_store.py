@@ -59,6 +59,9 @@ DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 500
 
 _ER_DUP_ENTRY = 1062
+_ER_LOCK_DEADLOCK = 1213
+# change_user_access retries a transaction InnoDB chose as a deadlock victim.
+_DEADLOCK_ATTEMPTS = 3
 
 _CREATE_USERS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -171,6 +174,10 @@ class CuratorRequestAlreadyDecided(Exception):
 
 class DuplicatePendingCuratorRequest(Exception):
     """The email already has a pending curator request."""
+
+
+class LastActiveAdmin(Exception):
+    """The change would leave no active admin."""
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +310,11 @@ class UserStore(Protocol):
         self, email: str, status: str, *, actor: str, reason: Optional[str] = None,
         request_id: Optional[int] = None,
     ) -> Optional[RoleChange]: ...
+
+    async def change_user_access(
+        self, email: str, *, role: Optional[str] = None, status: Optional[str] = None,
+        actor: str, reason: Optional[str] = None,
+    ) -> List[RoleChange]: ...
 
     async def incr_activity(self, email: str, n: int = 1, at: Optional[datetime] = None) -> bool: ...
 
@@ -445,6 +457,20 @@ def prepare_import(user: UserRecord) -> UserRecord:
         created_at=to_utc(user.created_at),
         updated_at=to_utc(user.updated_at),
     )
+
+
+def check_access_change(role: Optional[str], status: Optional[str]) -> None:
+    """Validate change_user_access arguments before any storage access."""
+    if role is None and status is None:
+        raise ValueError("Give a role, a status, or both")
+    if role is not None:
+        check_role(role)
+    if status is not None:
+        check_status(status)
+
+
+def is_active_admin(role: str, status: str) -> bool:
+    return role == "admin" and status == "active"
 
 
 def check_limit(limit: int) -> int:
@@ -880,6 +906,75 @@ class UserStoreMixin:
             "status", email, check_status(status), actor=actor, reason=reason,
             request_id=request_id,
         )
+
+    async def change_user_access(
+        self, email: str, *, role: Optional[str] = None, status: Optional[str] = None,
+        actor: str, reason: Optional[str] = None,
+    ) -> List[RoleChange]:
+        """Set a user's role and/or status in one transaction, one role_changes
+        row per field that actually changes ([] and nothing written when
+        neither does). Raises LastActiveAdmin, writing nothing, when the
+        change would leave no active admin.
+
+        Every active admin's row is locked (in index order, so concurrent
+        callers queue rather than deadlock) before the check, so two admins
+        removing each other can't both succeed: the second re-reads the
+        committed state after the first commits. Raises UserNotFound for an
+        unknown email and ValueError for an unknown role/status."""
+        check_access_change(role, status)
+        clean = normalize_email(email)
+        actor = normalize_actor(actor)
+        for attempt in range(1, _DEADLOCK_ATTEMPTS + 1):
+            now = _to_db(utc_now())
+            try:
+                async with _store_errors("change_user_access"):
+                    async with self._user_transaction() as cursor:
+                        return await self._apply_access_change(
+                            cursor, clean, role=role, status=status, actor=actor,
+                            reason=reason, now=now,
+                        )
+            except UserStoreUnavailable as exc:
+                cause = exc.__cause__
+                deadlock = (
+                    isinstance(cause, pymysql.err.OperationalError)
+                    and bool(cause.args) and cause.args[0] == _ER_LOCK_DEADLOCK
+                )
+                if not deadlock or attempt == _DEADLOCK_ATTEMPTS:
+                    raise
+        raise AssertionError("unreachable")
+
+    async def _apply_access_change(
+        self, cursor, email: str, *, role: Optional[str], status: Optional[str], actor: str,
+        reason: Optional[str], now: datetime,
+    ) -> List[RoleChange]:
+        # A locking read: the latest committed admins, not a snapshot.
+        await cursor.execute(
+            "SELECT email FROM users WHERE role = 'admin' AND status = 'active' "
+            "ORDER BY email FOR UPDATE"
+        )
+        active_admins = {row[0] for row in await cursor.fetchall()}
+        user = await self._fetch_user(cursor, email, for_update=True)
+        if user is None:
+            raise UserNotFound(email)
+        new_role = user.role if role is None else role
+        new_status = user.status if status is None else status
+        if (
+            is_active_admin(user.role, user.status)
+            and not is_active_admin(new_role, new_status)
+            and not active_admins - {email}
+        ):
+            raise LastActiveAdmin(email)
+        changes = []
+        for field_name, value in (("role", role), ("status", status)):
+            if value is None:
+                continue
+            change = await self._apply_user_field(
+                cursor, field_name, email, value, actor=actor, reason=reason,
+                request_id=None, now=now,
+            )
+            if change is not None:
+                changes.append(change)
+        return changes
 
     async def incr_activity(self, email: str, n: int = 1, at: Optional[datetime] = None) -> bool:
         """Add n (>= 1) annotations to a user's counter in one UPDATE; False

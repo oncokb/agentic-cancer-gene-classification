@@ -30,6 +30,7 @@ from src.pipeline.user_store import (
     CuratorRequestNotFound,
     CuratorRequestPage,
     DuplicatePendingCuratorRequest,
+    LastActiveAdmin,
     LoginIdentity,
     RoleChange,
     RoleChangePage,
@@ -37,6 +38,7 @@ from src.pipeline.user_store import (
     UserNotFound,
     UserPage,
     UserRecord,
+    check_access_change,
     check_limit,
     check_role,
     check_status,
@@ -44,6 +46,7 @@ from src.pipeline.user_store import (
     decode_user_cursor,
     encode_id_cursor,
     encode_user_cursor,
+    is_active_admin,
     normalize_actor,
     normalize_claims,
     normalize_email,
@@ -251,6 +254,52 @@ class FakeUserStore:
                 "status", clean, status, actor=actor, reason=reason, request_id=request_id,
                 now=_db_time(),
             )
+
+    async def change_user_access(
+        self, email: str, *, role: Optional[str] = None, status: Optional[str] = None,
+        actor: str, reason: Optional[str] = None,
+    ) -> List[RoleChange]:
+        check_access_change(role, status)
+        clean = normalize_email(email)
+        actor = normalize_actor(actor)
+        self._check_available("change_user_access")
+        now = _db_time()
+        async with self._lock:
+            user = self._users.get(clean)
+            if user is None:
+                raise UserNotFound(clean)
+            new_role = user.role if role is None else role
+            new_status = user.status if status is None else status
+            others_active = any(
+                is_active_admin(u.role, u.status) for e, u in self._users.items() if e != clean
+            )
+            if (
+                is_active_admin(user.role, user.status)
+                and not is_active_admin(new_role, new_status)
+                and not others_active
+            ):
+                raise LastActiveAdmin(clean)
+            # Both fields or neither: snapshot so a failed audit write undoes the first.
+            users_before = dict(self._users)
+            changes_before = list(self._role_changes)
+            next_id_before = self._next_change_id
+            changes = []
+            try:
+                for field_name, value in (("role", role), ("status", status)):
+                    if value is None:
+                        continue
+                    change = self._apply_user_field(
+                        field_name, clean, value, actor=actor, reason=reason, request_id=None,
+                        now=now,
+                    )
+                    if change is not None:
+                        changes.append(change)
+            except BaseException:
+                self._users = users_before
+                self._role_changes = changes_before
+                self._next_change_id = next_id_before
+                raise
+            return changes
 
     async def incr_activity(self, email: str, n: int = 1, at: Optional[datetime] = None) -> bool:
         clean = normalize_email(email)
