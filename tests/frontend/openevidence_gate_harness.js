@@ -34,7 +34,10 @@ function loadedSource() {
   // loading the script wires up `state`/`elements`/every function without
   // also firing bindEvents()/renderGrid()/loadDevStatus()/loadSharedRun()
   // against our fake DOM.
-  const declarations = source.slice(0, idx);
+  // curation.js loads before app.js in index.html; app.js's renderers call
+  // its (viewer-safe) helpers, so its declarations are prepended here too.
+  const curation = fs.readFileSync(path.join(path.dirname(APP_JS_PATH), "curation.js"), "utf8");
+  const declarations = `${curation}\n${source.slice(0, idx)}`;
   // Top-level `const`/`let` bindings in a vm script live in the script's
   // lexical scope, not as properties of the sandbox/global object (unlike
   // `function` declarations, which do attach) — so `state` isn't reachable

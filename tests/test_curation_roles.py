@@ -339,3 +339,24 @@ def test_new_keycloak_user_is_a_viewer_whatever_their_groups(keycloak_login):
     browser = keycloak_login(["acgc-curator", "MSK-Curators"], email="new.kc@mskcc.org")
     assert stored_profile("new.kc@mskcc.org").role == "viewer"
     assert browser.put(GENE_URL, json=GENE_BODY).status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# (e) re-evaluation jobs the curator UI (#118) starts and polls
+# ---------------------------------------------------------------------------
+
+REEVALUATE_JOBS = "/v1/curation/reevaluate/jobs"
+
+
+def test_reevaluate_jobs_require_curator(auth_on):
+    """POST/GET re-evaluation jobs (#116), which the curator UI calls, are
+    curator-only. A missing route would 404 here, not 403."""
+    curator_email = "curator.reevaluate@mskcc.org"
+    _put_user(EMAIL, "viewer")
+    _put_user(curator_email, "curator")
+    viewer = _session(EMAIL)  # stale admin token: the stored viewer role decides
+    body = {"subject_type": "gene", "subject_key": "ALK", "tumor_type": "LUAD", "evidence_pmids": ["1"]}
+    post = viewer.post(REEVALUATE_JOBS, json=body)
+    assert post.status_code == 403
+    assert viewer.get(f"{REEVALUATE_JOBS}/missing").status_code == 403
+    assert _session(curator_email).get(f"{REEVALUATE_JOBS}/missing").status_code == 404  # past auth
