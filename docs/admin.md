@@ -12,14 +12,19 @@ can call with an admin's API key.
   list is newest sign-in first; **Load more** fetches the next page.
 - **Approve** a pending account (pending → active), **Disable** an active
   one, **Re-enable** a disabled one.
-- **Change a role** with the role menu: viewer, curator or admin.
+- **Change a role** with the role menu: viewer, curator or admin. Curators
+  (and admins) may save and revert curated overrides (`/v1/curation`);
+  viewers can only read them. This page is the only way to grant curator:
+  sign-in never sets curator or lowers a role from Keycloak roles or SAML
+  groups. With `USER_STORE_BACKEND=redis` (legacy), members of `KEYCLOAK_ADMIN_ROLES` / `SAML_ADMIN_GROUPS` are promoted to admin at sign-in; with `mysql`, groups never change a role.
 - **History** shows one user's changes; **Show all changes** returns to the
   full change log.
 
 Every change opens a confirmation with an optional reason, which is stored
 in the change log. Demotions and disabling are marked as such. A change
 applies on the user's next request: a disabled user loses access (sessions are refused) and their
-API keys stop working; a demoted admin loses admin pages and endpoints.
+API keys stop working; a demoted admin loses admin pages and endpoints; a
+demoted curator can no longer save or revert curated overrides.
 
 ## Safety rules
 

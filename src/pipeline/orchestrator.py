@@ -26,6 +26,7 @@ from src.models.schema import (
     ResolvedInput,
 )
 from src.observability import distribution, gene_latency_tag, increment, trace
+from src.pipeline.curation import apply_current_gene_overrides, has_curation_unavailable
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import (
     rank_literature_for_synthesis,
@@ -33,7 +34,13 @@ from src.pipeline.literature import (
     search_recent_pubmed_pmids,
 )
 from src.pipeline.llm_client import resolve_local_backend
-from src.pipeline.normalization import is_fusion_input, normalize_fusions, unparsed_fusion_warnings
+from src.pipeline.normalization import (
+    gene_tumor_types,
+    is_fusion_input,
+    normalize_fusions,
+    split_input_tumor_types,
+    unparsed_fusion_warnings,
+)
 from src.pipeline.pmid_distillation import distill_and_save_pmid_evidence
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
 from src.pipeline.selection import select_papers_for_synthesis
@@ -558,18 +565,7 @@ def _normalize_fusion_inputs(
     Accept either plain strings or FusionInput objects.
     Returns (input_strings, ordered input/tumor-type pairs).
     """
-    input_strings: List[str] = []
-    tumor_contexts: List[tuple[str, str]] = []
-
-    for item in fusions:
-        if isinstance(item, str):
-            input_strings.append(item)
-        else:
-            input_strings.append(item.fusion)
-            if item.tumor_type:
-                tumor_contexts.append((item.fusion, item.tumor_type))
-
-    return input_strings, tumor_contexts
+    return split_input_tumor_types(fusions)
 
 
 async def run_pipeline(
@@ -632,7 +628,6 @@ async def run_pipeline(
     # gene_map lists canonical input strings (Ensembl IDs replaced by symbols);
     # tumor contexts are matched against the inputs as submitted.
     input_readings = getattr(gene_map, "inputs", {})
-    submitted_by_gene = getattr(gene_map, "submitted", {})
     resolved_inputs_by_canonical: Dict[str, List[ResolvedInput]] = {}
     for reading in input_readings.values():
         if reading.canonical != reading.submitted or reading.warnings:
@@ -648,26 +643,7 @@ async def run_pipeline(
 
     # Preserve normalized input precedence, keeping the first non-null context
     # for repeated input strings, and disclose conflicting contexts.
-    gene_tumor_type: Dict[str, Optional[str]] = {}
-    warnings: List[str] = []
-    for canonical, (_, gene_inputs) in gene_map.items():
-        tumor_types_by_key: Dict[str, str] = {}
-        # Request order across every input that resolved to this gene, whatever
-        # its spelling (symbol, alias, ENSG/ENST/ENSP, GENE(ENST...)).
-        gene_submitted = set(submitted_by_gene.get(canonical, gene_inputs))
-        for submitted, tt in tumor_contexts:
-            if submitted in gene_submitted:
-                key = " ".join(tt.strip().lower().split())
-                if key:
-                    tumor_types_by_key.setdefault(key, tt)
-        tumor_types = list(tumor_types_by_key.values())
-        if tumor_types:
-            gene_tumor_type[canonical] = tumor_types[0]
-        if len(tumor_types) > 1:
-            warnings.append(
-                f"{canonical}: using tumor type {tumor_types[0]!r}; "
-                f"ignored tumor types: {', '.join(repr(tt) for tt in tumor_types[1:])}."
-            )
+    gene_tumor_type, warnings = gene_tumor_types(gene_map, tumor_contexts)
     # Shared with the tumor-type notes above: append, never replace.
     warnings.extend(await unparsed_fusion_warnings(input_strings, gene_map))
     for reading in input_readings.values():
@@ -793,6 +769,11 @@ async def run_pipeline(
     timings["annotation"] = _elapsed_ms(annotation_start)
 
     annotations.sort(key=lambda a: a.gene)
+    # Progress callbacks and gene_annotations only ever see pipeline output;
+    # curator overrides are overlaid once here, in one batched lookup (callers
+    # that store results keep the pipeline originals, see curation.py).
+    annotation_tumor_types = {a.gene: a.analysis_tumor_type for a in annotations}
+    annotations = await apply_current_gene_overrides(annotations, run_store)
     timings["total"] = _elapsed_ms(total_start)
     distribution("pipeline.duration_ms", timings["total"], tags=metric_tags)
 
@@ -804,4 +785,6 @@ async def run_pipeline(
         annotations=annotations,
         warnings=warnings,
         timings_ms=timings,
+        annotation_tumor_types=annotation_tumor_types,
+        curation_unavailable=has_curation_unavailable(annotations),
     )

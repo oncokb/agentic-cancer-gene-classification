@@ -613,6 +613,7 @@ async def test_status_response_shape_unchanged(job_backends):
         "fusion_evidence",
         "error",
         "timings_ms",
+        "curation_unavailable",  # set per poll by the curator-override overlay
     }
 
 

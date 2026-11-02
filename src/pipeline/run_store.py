@@ -23,6 +23,7 @@ import pymysql
 from src.api_keys import ApiKeyRecord
 from src.config import settings
 from src.models.schema import GeneAnnotation, PMIDEvidenceRecord
+from src.pipeline.curation_store import CurationStoreMixin
 from src.pipeline.user_store import UserStoreMixin
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,7 @@ class RunsSchemaUpgradeError(RuntimeError):
     """Startup couldn't add the run owner columns to `runs`."""
 
 
-class RunStore(UserStoreMixin):
+class RunStore(CurationStoreMixin, UserStoreMixin):
     """Save/fetch runs and reusable gene annotations. Calling code never issues raw SQL."""
 
     def __init__(self, pool: aiomysql.Pool):
@@ -327,6 +328,7 @@ class RunStore(UserStoreMixin):
                     await cursor.execute(_CREATE_PMID_EVIDENCE_TABLE_SQL)
                 await cursor.execute(_CREATE_FEEDBACK_TABLE_SQL)
                 await cursor.execute(_CREATE_API_KEYS_TABLE_SQL)
+                await self._ensure_curation_schema(cursor)
                 await self._ensure_user_schema(cursor)
 
     async def _ensure_runs_schema(self, cursor) -> None:
@@ -520,7 +522,7 @@ class RunStore(UserStoreMixin):
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
-                    "UPDATE runs SET result_json = %s WHERE run_id = %s",
+                    "UPDATE runs SET result_json = %s, revision = revision + 1 WHERE run_id = %s",
                     (json.dumps(result_payload), run_id),
                 )
 
@@ -562,13 +564,13 @@ class RunStore(UserStoreMixin):
                     genes_annotated = updated.get("genes_annotated")
                     if sync_genes_annotated and isinstance(genes_annotated, int):
                         await cursor.execute(
-                            "UPDATE runs SET result_json = %s, genes_annotated = %s "
-                            "WHERE run_id = %s",
+                            "UPDATE runs SET result_json = %s, genes_annotated = %s, "
+                            "revision = revision + 1 WHERE run_id = %s",
                             (json.dumps(updated), genes_annotated, run_id),
                         )
                     else:
                         await cursor.execute(
-                            "UPDATE runs SET result_json = %s WHERE run_id = %s",
+                            "UPDATE runs SET result_json = %s, revision = revision + 1 WHERE run_id = %s",
                             (json.dumps(updated), run_id),
                         )
                     await conn.commit()

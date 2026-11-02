@@ -63,7 +63,7 @@ class AuthenticatedUser(BaseModel):
     name: str
     picture: Optional[str] = None
     domain: str
-    role: str = "curator"
+    role: str = "viewer"
     status: str = "active"
     provider: str = "google"
     groups: List[str] = Field(default_factory=list)
@@ -77,7 +77,7 @@ class UserProfile(BaseModel):
     name: str
     picture: Optional[str] = None
     domain: str
-    role: str = "curator"
+    role: str = "viewer"
     status: str = "active"
     provider: str = "google"
     groups: List[str] = Field(default_factory=list)
@@ -94,7 +94,7 @@ class AuthUserResponse(BaseModel):
     name: str
     picture: Optional[str] = None
     domain: str
-    role: str = "curator"
+    role: str = "viewer"
     status: str = "active"
     provider: str = "google"
     groups: List[str] = Field(default_factory=list)
@@ -114,6 +114,8 @@ class AuthMeResponse(BaseModel):
     jit_provisioning_enabled: bool = True
     dev_login_enabled: bool = False
     keycloak_enabled: bool = False
+    # Whether the current user may edit curated overrides (see require_curator).
+    can_curate: bool = False
 
 
 class SAMLAssertionData(BaseModel):
@@ -123,6 +125,27 @@ class SAMLAssertionData(BaseModel):
     display_name: str = ""
     issuer: str = ""
     session_index: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+
+# Roles allowed to edit curated overrides. Admins are included so the
+# curation flow can be exercised without a separate curator account. Roles are
+# granted on /admin/users (recorded in role_changes); sign-in never derives a
+# role from IdP groups.
+CURATION_ROLES = frozenset({"curator", "admin"})
+
+
+def can_curate(user: Optional["AuthenticatedUser"]) -> bool:
+    """True when `user` may edit curated overrides (always, with auth disabled).
+
+    `user` must carry the CURRENT role and status, as require_auth returns
+    them (re-read from the user store on every request)."""
+    if not settings.auth_enabled:
+        return True
+    return bool(user) and user.status == "active" and user.role in CURATION_ROLES
 
 
 # ---------------------------------------------------------------------------
@@ -1311,6 +1334,22 @@ async def require_admin(request: Request) -> AuthenticatedUser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Administrator privileges required for this action.",
+        )
+    return user
+
+
+async def require_curator(request: Request) -> AuthenticatedUser:
+    """Allow curators and admins to edit curated overrides.
+
+    require_auth re-reads the user's current role and status from the user
+    store on every request (sessions and API keys alike), so a promotion or
+    demotion on /admin/users applies to the very next request.
+    """
+    user = await require_auth(request)
+    if not can_curate(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Curator privileges required for this action.",
         )
     return user
 
