@@ -7,8 +7,10 @@ M0 annotation engine for candidate cancer genes and gene fusions. The pipeline a
 
 ## Setup
 
+Requires Python 3.12 or newer.
+
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "agentic-cancer-gene-classification"
 version = "0.1.0"
 description = "Agentic LLM annotation engine for cancer genes and gene fusions (M0)"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "anthropic[bedrock]>=0.40.0",
     "ddtrace>=3.0.0",
