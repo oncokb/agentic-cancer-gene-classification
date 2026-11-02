@@ -27,6 +27,7 @@ from src.pipeline.user_store import (
     REQUEST_STATUSES,
     CuratorRequest,
     CuratorRequestAlreadyDecided,
+    CuratorRequestIneligible,
     CuratorRequestNotFound,
     CuratorRequestPage,
     DuplicatePendingCuratorRequest,
@@ -426,11 +427,12 @@ class FakeUserStore:
                 user = self._users.get(request.email)
                 if user is None:
                     raise UserNotFound(request.email)
-                if user.role == "viewer":
-                    self._apply_user_field(
-                        "role", request.email, "curator", actor=reviewer, reason=note,
-                        request_id=request_id, now=now,
-                    )
+                if user.role != "viewer" or user.status != "active":
+                    raise CuratorRequestIneligible(request.email)
+                self._apply_user_field(
+                    "role", request.email, "curator", actor=reviewer, reason=note,
+                    request_id=request_id, now=now,
+                )
             decided = replace(
                 request,
                 status="approved" if approve else "rejected",

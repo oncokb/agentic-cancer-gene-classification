@@ -49,3 +49,28 @@ Changes need the MySQL user store (`USER_STORE_BACKEND=mysql`, see
 read-only notice, the role and status controls are disabled, and the change
 log is unavailable. If the user store can't be reached, the page shows an
 error and nothing is changed.
+
+## Curator access requests
+
+Active viewers can choose **Request curator access** in the user menu, submit
+reason, affiliation, expertise and an optional ORCID, and return there to see
+status. Only one request may be pending per user. Rejection displays the reviewer
+note and allows another application. There are no email or other notifications.
+
+On `/admin/users`, the **Curator requests** section starts with the pending
+queue, newest first. Use the status selector to see approved or rejected requests
+and **Load more** to paginate. Read the application, choose **Approve** or
+**Reject**, optionally enter a reviewer note (up to 1000 characters), then confirm.
+The page refreshes after review so the users table and change log reflect the
+result. Application fields and notes are rendered as text.
+
+Approval atomically grants curator access, records the acting admin and request
+ID in the role change log, and closes the request. It fails without changing
+anything if another reviewer has already decided it or the applicant is no
+longer an active viewer (for example, disabled or already promoted). A stale
+request can still be rejected. Rejection records the reviewer and note without
+changing access. Current roles apply on the user's next request.
+
+This feature requires `USER_STORE_BACKEND=mysql`; Redis shows an explicit
+unavailable-feature message. The API endpoints and limits are documented in
+[api.md](api.md#curator-access-requests).
