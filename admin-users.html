@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="same-origin" />
+    <title>Users — Cancer Gene Classification</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/favicon-180.png" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="api-keys-body">
+    <main class="api-keys-page admin-users-page" id="admin-page">
+      <header class="api-keys-header">
+        <a class="api-keys-back" href="/">&larr; Back to annotations</a>
+        <div class="brand-title">
+          <img class="brand-icon" src="/static/favicon.svg" alt="" width="28" height="28" />
+          <h1>Users</h1>
+        </div>
+        <p class="api-keys-lead">
+          Approve, disable and re-enable accounts and change roles. Changes take effect on the
+          user's next request and are recorded in the change log.
+        </p>
+      </header>
+
+      <p class="api-keys-warning hidden" id="admin-readonly" role="status">
+        Read-only: user management needs the MySQL user store (USER_STORE_BACKEND=mysql). Roles
+        and statuses can't be changed and there is no change log.
+      </p>
+      <div class="api-keys-alert hidden" id="admin-error" role="alert"></div>
+
+      <section class="api-keys-card" aria-labelledby="admin-users-heading">
+        <div class="api-keys-list-heading">
+          <h2 id="admin-users-heading">Users</h2>
+        </div>
+        <form class="admin-users-filters" id="admin-filters">
+          <input id="admin-search" type="search" placeholder="Search email or name" aria-label="Search email or name" maxlength="255" />
+          <select id="admin-role-filter" aria-label="Filter by role">
+            <option value="">All roles</option>
+            <option value="viewer">Viewer</option>
+            <option value="curator">Curator</option>
+            <option value="admin">Admin</option>
+          </select>
+          <select id="admin-status-filter" aria-label="Filter by status">
+            <option value="">All statuses</option>
+            <option value="pending">Pending</option>
+            <option value="active">Active</option>
+            <option value="disabled">Disabled</option>
+          </select>
+          <button class="primary-action" type="submit">Search</button>
+        </form>
+        <p class="api-keys-empty hidden" id="admin-empty">No users match.</p>
+        <p class="api-keys-empty" id="admin-loading">Loading…</p>
+        <div class="api-keys-table-wrap">
+          <table class="api-keys-table hidden" id="admin-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Last login</th>
+                <th>Annotations</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="admin-tbody"></tbody>
+          </table>
+        </div>
+        <button class="primary-action hidden" id="admin-load-more" type="button">Load more</button>
+      </section>
+
+      <section class="api-keys-card hidden" id="admin-log" aria-labelledby="admin-log-heading">
+        <div class="api-keys-list-heading">
+          <h2 id="admin-log-heading">Change log</h2>
+          <button class="hidden" id="admin-log-all" type="button">Show all changes</button>
+        </div>
+        <p class="api-keys-empty hidden" id="admin-log-empty">No changes recorded.</p>
+        <div class="api-keys-table-wrap">
+          <table class="api-keys-table hidden" id="admin-log-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>User</th>
+                <th>Field</th>
+                <th>Change</th>
+                <th>By</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="admin-log-tbody"></tbody>
+          </table>
+        </div>
+        <button class="primary-action hidden" id="admin-log-more" type="button">Load more</button>
+      </section>
+    </main>
+
+    <div class="modal-backdrop hidden" id="admin-confirm" role="dialog" aria-modal="true" aria-labelledby="admin-confirm-title">
+      <div class="feedback-modal">
+        <div class="modal-header">
+          <h2 id="admin-confirm-title">Confirm change</h2>
+        </div>
+        <p id="admin-confirm-message"></p>
+        <p class="api-keys-warning hidden" id="admin-confirm-warning"></p>
+        <label for="admin-confirm-reason">Reason (optional, recorded in the change log)</label>
+        <textarea id="admin-confirm-reason" rows="2" maxlength="1000"></textarea>
+        <p class="api-keys-form-error hidden" id="admin-confirm-error" role="alert"></p>
+        <div class="modal-footer api-keys-modal-actions">
+          <button type="button" id="admin-confirm-cancel">Cancel</button>
+          <button class="primary-action" type="button" id="admin-confirm-ok">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/admin-users.js"></script>
+  </body>
+</html>
