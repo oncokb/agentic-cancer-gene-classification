@@ -10,8 +10,15 @@
         credentials: "same-origin",
         ...(payload === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }),
       });
-      const body = await response.json();
-      if (!response.ok) throw new Error(typeof body.detail === "string" ? body.detail : "Please check the fields and retry.");
+      const fallback = response.ok
+        ? "Unexpected server response. Please retry shortly."
+        : `Request failed (HTTP ${response.status}). Please retry shortly.`;
+      const contentType = (response.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
+      if (contentType !== "application/json") throw new Error(fallback);
+      let body;
+      try { body = await response.json(); }
+      catch (_) { throw new Error(fallback); }
+      if (!response.ok) throw new Error(body && typeof body.detail === "string" ? body.detail : fallback);
       return body;
     }
     function error(err) { el("message").textContent = err.message || "Unable to load requests. Please retry."; }
@@ -24,9 +31,12 @@
     async function loadStatus() {
       show(el("form"), false);
       try {
-        const data = await api("/v1/curator-requests/me");
+        const [data, auth] = await Promise.all([
+          api("/v1/curator-requests/me"), api("/auth/me"),
+        ]);
         el("message").textContent = `Request status: ${data.status}${data.status === "rejected" && data.request.review_note ? `. Reviewer note: ${data.request.review_note}` : ""}`;
-        show(el("form"), data.status === "none" || data.status === "rejected");
+        const eligible = auth.authenticated && auth.user && auth.user.role === "viewer" && auth.user.status === "active";
+        show(el("form"), Boolean(eligible) && data.status !== "pending");
       } catch (err) { error(err); }
     }
     async function submit(event) {

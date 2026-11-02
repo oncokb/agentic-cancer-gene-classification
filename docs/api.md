@@ -1095,7 +1095,11 @@ return **503**. No notifications are sent.
 - `GET /v1/curator-requests/me`: returns `{status, request}` with the latest
   request for the authenticated user. Status is `none`, `pending`, `approved`, or
   `rejected`; `request` is null for `none`. Rejection notes are in
-  `request.review_note`. Rejected applicants may submit again.
+  `request.review_note`. The applicant-visible request contains only the submitted
+  fields (`reason`, `affiliation`, `expertise`, `orcid`), `created_at`, `decided_at`,
+  and `review_note`; it never includes `reviewer_email` or other administrator
+  identity fields. Active viewers may submit again whenever they have no pending
+  request, including after approval followed by demotion to viewer.
 - `GET /v1/admin/curator-requests`: administrators only (**403** otherwise).
   Optional `status=pending|approved|rejected`, `limit=1..200` (default 50), and
   opaque `cursor`. Returns `{requests, next_cursor}`, newest first; null cursor
@@ -1108,9 +1112,11 @@ return **503**. No notifications are sent.
   `role_changes` audit entry, and closes the request in one transaction. Rejection
   records the note without changing the role. Concurrent decisions succeed once.
 
-Request objects include `id`, `email`, the application fields, `status`,
-`created_at`, `reviewer_email`, `decided_at`, and `review_note`. Users can read
-only their own application; administrators can review all applications.
+Admin request objects include `id`, `email`, the application fields, `status`,
+`created_at`, `reviewer_email`, `decided_at`, and `review_note`. The application
+creation response uses this shape with null review fields. `/me` uses the
+restricted applicant-visible shape above. Users can read only their own
+application; administrators can review all applications.
 
 All cookie/session-authenticated mutations above require same-origin evidence
 and `Content-Type: application/json`, using the same checks as admin user changes

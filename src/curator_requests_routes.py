@@ -59,9 +59,17 @@ class RequestPage(BaseModel):
     next_cursor: str | None
 
 
+class MyRequestInfo(Application):
+    """Applicant-visible fields: deliberately excludes administrator identities."""
+
+    created_at: datetime
+    decided_at: datetime | None
+    review_note: str | None
+
+
 class MyRequest(BaseModel):
     status: Literal["none", "pending", "approved", "rejected"]
-    request: RequestInfo | None = None
+    request: MyRequestInfo | None = None
 
 
 def mysql_store():

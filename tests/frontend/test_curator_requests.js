@@ -15,13 +15,14 @@ class Element {
   addEventListener(event, fn) { this.listeners[event] = fn; }
   fire(event) { return this.listeners[event]({ preventDefault() {} }); }
 }
-const response = (body, status = 200) => ({ ok: status < 400, json: async () => body });
+const response = (body, status = 200) => ({ ok: status < 400, status, headers: { get: () => "application/json" }, json: async () => body });
 const record = { id: 7, email: "<img src=x>", status: "pending", reason: "<script>bad</script>", affiliation: "MSK", expertise: "Genes" };
-function env(queue, admin = false) {
+function env(queue, admin = false, currentUser = { role: "viewer", status: "active" }) {
   const nodes = {}, calls = [];
   const doc = { getElementById: id => nodes[id] || (nodes[id] = new Element()), createElement: () => new Element() };
   const page = createCuratorRequests({ document: doc, admin, fetch: async (url, init) => {
     calls.push({ url, init });
+    if (url === "/auth/me") return response({ authenticated: Boolean(currentUser), user: currentUser });
     assert.ok(queue.length, `Unexpected request ${url}`);
     const next = queue.shift();
     if (next instanceof Error) throw next;
@@ -49,12 +50,19 @@ test("opening loads latest status; none shows form", async () => {
   e.el("close").fire("click");
   assert.equal(e.el("dialog").classList.contains("hidden"), true);
 });
-test("pending and approved hide form", async () => {
-  for (const status of ["pending", "approved"]) {
+test("active viewers can reapply after approval but pending requests hide the form", async () => {
+  for (const status of ["none", "rejected", "approved", "pending"]) {
     const e = env([response({ status, request: record })]);
     await e.page.loadStatus();
-    assert.equal(e.el("form").classList.contains("hidden"), true);
+    assert.equal(e.el("form").classList.contains("hidden"), status === "pending");
     assert.ok(e.el("message").textContent.includes(status));
+  }
+});
+test("only currently active viewers see the form after approval", async () => {
+  for (const currentUser of [{ role: "curator", status: "active" }, { role: "admin", status: "active" }, { role: "viewer", status: "disabled" }, { role: "viewer", status: "pending" }, null]) {
+    const e = env([response({ status: "approved", request: record })], false, currentUser);
+    await e.page.loadStatus();
+    assert.equal(e.el("form").classList.contains("hidden"), true);
   }
 });
 test("rejected shows note as text and permits another request", async () => {
@@ -77,6 +85,18 @@ test("API conflicts and unavailable backends show useful text", async () => {
   const e = env([response({ detail: "Requires MySQL" }, 409)]);
   await e.page.loadStatus();
   assert.equal(e.el("message").textContent, "Requires MySQL");
+});
+test("non-JSON proxy errors show a readable HTTP error without parsing HTML", async () => {
+  const e = env([{ ok: false, status: 502, headers: { get: () => "text/html" }, json: async () => { throw Error("HTML must not be parsed as JSON"); } }]);
+  await e.page.loadStatus();
+  assert.equal(e.el("message").textContent, "Request failed (HTTP 502). Please retry shortly.");
+});
+test("unexpected successful content and malformed JSON show readable errors", async () => {
+  for (const contentType of [null, "text/html", "application/json"]) {
+    const e = env([{ ok: true, status: 200, headers: { get: () => contentType }, json: async () => { throw SyntaxError("Unexpected token <"); } }]);
+    await e.page.loadStatus();
+    assert.equal(e.el("message").textContent, "Unexpected server response. Please retry shortly.");
+  }
 });
 test("queue renders user content as text and paginates", async () => {
   const e = env([response({ requests: [record], next_cursor: "abc" }), response({ requests: [{ ...record, id: 6 }], next_cursor: null })], true);

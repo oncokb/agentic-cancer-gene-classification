@@ -52,6 +52,36 @@ def test_apply_status_duplicate_and_rejection(store):
     assert apply().status_code == 201
 
 
+@pytest.mark.parametrize("decision", [None, "approve", "reject"])
+def test_my_request_omits_admin_identity(store, decision):
+    seed()
+    request_id = apply().json()["id"]
+    if decision:
+        assert (
+            session()
+            .post(f"{QUEUE}/{request_id}/{decision}", json={"note": "Review note"})
+            .status_code
+            == 200
+        )
+    mine = session(VIEWER).get(URL + "/me").json()
+    assert set(mine) == {"status", "request"}
+    assert set(mine["request"]) == {
+        "reason",
+        "affiliation",
+        "expertise",
+        "orcid",
+        "created_at",
+        "decided_at",
+        "review_note",
+    }
+    assert ADMIN not in str(mine)
+    assert mine["request"]["created_at"]
+    assert mine["request"]["review_note"] == ("Review note" if decision else None)
+    admin_request = session().get(QUEUE).json()["requests"][0]
+    assert admin_request["reviewer_email"] == (ADMIN if decision else None)
+    assert mine["request"]["decided_at"] == admin_request["decided_at"]
+
+
 @pytest.mark.parametrize(
     "role,status,code",
     [
