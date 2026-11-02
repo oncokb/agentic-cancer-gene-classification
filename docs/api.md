@@ -988,12 +988,13 @@ returns `422`.
 Change a user's role and/or status. URL-encode the email (`@` as `%40`, `/`
 as `%2F`).
 
-Send the body as `Content-Type: application/json` (otherwise `415`). With an
-API key that's all. From a browser session (cookie), the request must also
-come from ACGC's own pages: `Sec-Fetch-Site: same-origin`, or, from a browser
+Send the body as JSON with `Content-Type: application/json`. From a browser
+session (cookie), a missing or different `Content-Type` is rejected with `415`,
+and the request must also come from ACGC's own pages: `Sec-Fetch-Site: same-origin`, or, from a browser
 that doesn't send `Sec-Fetch-Site`, an `Origin` (or `Referer`) exactly
 matching `PUBLIC_APP_BASE_URL`'s scheme, host and port; anything else is
-`403`, so a page on a sibling subdomain can't use an admin's cookie.
+`403`, so a page on a sibling subdomain can't use an admin's cookie. With an
+API key, neither check applies; a body that isn't valid JSON returns `422`.
 
 ```json
 { "role": "curator", "status": "active", "reason": "Approved by the curation lead" }
