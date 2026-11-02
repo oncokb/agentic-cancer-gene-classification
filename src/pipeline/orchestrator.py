@@ -23,6 +23,7 @@ from src.models.schema import (
     PMIDEvidenceRecord,
     QualityFlag,
     ResolvedGene,
+    ResolvedInput,
 )
 from src.observability import distribution, gene_latency_tag, increment, trace
 from src.pipeline.curation import apply_current_gene_overrides, has_curation_unavailable
@@ -38,6 +39,7 @@ from src.pipeline.normalization import (
     is_fusion_input,
     normalize_fusions,
     split_input_tumor_types,
+    unparsed_fusion_warnings,
 )
 from src.pipeline.pmid_distillation import distill_and_save_pmid_evidence
 from src.pipeline.result_sanitizer import find_retracted_annotation_pmids
@@ -184,11 +186,20 @@ async def _maybe_reuse_cached_annotation(
         return None
 
     annotation = GeneAnnotation(**cached["annotation"])
+    annotation.quality_flags = [
+        flag for flag in annotation.quality_flags if flag.code != "retraction_check_unavailable"
+    ]
+    retraction_reason = None
     try:
         retracted_pmids = await find_retracted_annotation_pmids(annotation)
     except Exception:
-        logger.exception("Refreshing cached annotation for %s because retraction validation failed", gene)
-        return None
+        logger.exception("Retraction validation unavailable for cached annotation %s", gene)
+        retracted_pmids = set()
+        retraction_reason = "retraction_check_failed"
+        annotation.quality_flags.append(QualityFlag(
+            code="retraction_check_unavailable", label="Retraction check unavailable",
+            severity="warning", detail="PubMed retraction validation failed; normal cache freshness checks still apply.",
+        ))
     if retracted_pmids:
         logger.info(
             "Refreshing cached annotation for %s because referenced PMID(s) are retracted: %s",
@@ -197,6 +208,7 @@ async def _maybe_reuse_cached_annotation(
         )
         return None
 
+    cached = {**cached, "annotation": annotation.model_dump()}
     updated_at = cached.get("updated_at")
     if updated_at is None:
         return None
@@ -208,7 +220,7 @@ async def _maybe_reuse_cached_annotation(
         return _cached_annotation_for_request(
             cached["annotation"],
             fusions,
-            reason,
+            retraction_reason or reason,
             updated_at,
             last_pubmed_checked_at,
         )
@@ -218,7 +230,7 @@ async def _maybe_reuse_cached_annotation(
         return _cached_annotation_for_request(
             cached["annotation"],
             fusions,
-            "fresh_final_annotation",
+            retraction_reason or "fresh_final_annotation",
             updated_at,
             last_pubmed_checked_at,
         )
@@ -241,7 +253,7 @@ async def _maybe_reuse_cached_annotation(
     reused = _cached_annotation_for_request(
         cached["annotation"],
         fusions,
-        "no_new_pubmed_pmids_since_last_check",
+        retraction_reason or "no_new_pubmed_pmids_since_last_check",
         updated_at,
         now,
     )
@@ -255,6 +267,12 @@ def _format_gene_identity(resolved_gene: ResolvedGene) -> Optional[str]:
         return None
 
     parts = []
+    if resolved_gene.symbol_source == "ensembl_id":
+        parts.append(f"Ensembl gene ID (no HGNC symbol or Ensembl name): {resolved_gene.canonical_symbol}")
+        if resolved_gene.biotype:
+            parts.append(f"Ensembl biotype: {resolved_gene.biotype}")
+        if resolved_gene.description:
+            parts.append(f"Ensembl description: {resolved_gene.description}")
     if resolved_gene.name:
         parts.append(f"HGNC name: {resolved_gene.name}")
     if resolved_gene.hgnc_id:
@@ -366,7 +384,11 @@ async def _annotate_gene(
             ),
             cache_status="bypassed",
             cache_reason="unresolvable_gene",
-            error="Unresolvable gene symbol — bare Ensembl ID or unannotated locus",
+            error=(
+                f"Unresolvable gene symbol — {resolved_gene.resolution_error}"
+                if resolved_gene.resolution_error
+                else "Unresolvable gene symbol — bare Ensembl ID or unannotated locus"
+            ),
         )
         annotation.timings_ms["total"] = _elapsed_ms(total_start)
         _record_annotation_duration(annotation, gene, fusions, metric_tags)
@@ -538,10 +560,10 @@ async def _annotate_gene(
 
 def _normalize_fusion_inputs(
     fusions: Union[List[str], List[FusionInput]],
-) -> tuple[List[str], Dict[str, str]]:
+) -> tuple[List[str], List[tuple[str, str]]]:
     """
     Accept either plain strings or FusionInput objects.
-    Returns (input_strings, tumor_type_by_input_string).
+    Returns (input_strings, ordered input/tumor-type pairs).
     """
     return split_input_tumor_types(fusions)
 
@@ -570,7 +592,7 @@ async def run_pipeline(
     local_backend = resolve_local_backend(local_mode=local_mode, local_backend=local_backend)
     local_mode = local_backend is not None
 
-    input_strings, tumor_type_by_input = _normalize_fusion_inputs(fusions)
+    input_strings, tumor_contexts = _normalize_fusion_inputs(fusions)
     metric_tags = [
         f"mode:{mode}",
         f"local_backend:{local_backend or 'sdk'}",
@@ -603,8 +625,30 @@ async def run_pipeline(
     logger.info("Resolved %d unique genes from %d inputs", len(gene_map), len(input_strings))
     await _maybe_call_total(on_total_known, len(gene_map))
 
-    # Build per-gene tumor_type: first non-null tumor_type from the gene's submitted inputs.
-    gene_tumor_type = gene_tumor_types(gene_map, tumor_type_by_input)
+    # gene_map lists canonical input strings (Ensembl IDs replaced by symbols);
+    # tumor contexts are matched against the inputs as submitted.
+    input_readings = getattr(gene_map, "inputs", {})
+    resolved_inputs_by_canonical: Dict[str, List[ResolvedInput]] = {}
+    for reading in input_readings.values():
+        if reading.canonical != reading.submitted or reading.warnings:
+            resolved_inputs_by_canonical.setdefault(reading.canonical, []).append(
+                ResolvedInput(
+                    input=reading.submitted,
+                    resolved=reading.canonical,
+                    five_transcript=reading.five_transcript,
+                    three_transcript=reading.three_transcript,
+                    warnings=reading.warnings,
+                )
+            )
+
+    # Preserve normalized input precedence, keeping the first non-null context
+    # for repeated input strings, and disclose conflicting contexts.
+    gene_tumor_type, warnings = gene_tumor_types(gene_map, tumor_contexts)
+    # Shared with the tumor-type notes above: append, never replace.
+    warnings.extend(await unparsed_fusion_warnings(input_strings, gene_map))
+    for reading in input_readings.values():
+        warnings.extend(reading.warnings)
+        warnings.extend(reading.errors)
 
     # Annotate genes with bounded fan-out. PubMed, Redis, and LLM paths still
     # enforce their own lower-level limits/caches.
@@ -691,6 +735,12 @@ async def run_pipeline(
             distribution("gene.queue_wait_ms", queue_wait_ms, tags=gene_tags)
         annotation.analysis_tumor_type = tumor_type
         annotation.symbol_lookup_failed = resolved_gene.lookup_failed
+        # Per run, never from a cached annotation: which submitted inputs became this gene.
+        annotation.resolved_inputs = [
+            resolution
+            for value in dict.fromkeys(gene_inputs)
+            for resolution in resolved_inputs_by_canonical.get(value, [])
+        ]
         return annotation
 
     tasks = [
@@ -733,11 +783,8 @@ async def run_pipeline(
         fusions_processed=len(input_strings),
         genes_annotated=len(annotations),
         annotations=annotations,
+        warnings=warnings,
         timings_ms=timings,
         annotation_tumor_types=annotation_tumor_types,
         curation_unavailable=has_curation_unavailable(annotations),
     )
-
-
-# Public helpers shared by draft re-evaluation; private names remain compatible.
-format_gene_identity = _format_gene_identity

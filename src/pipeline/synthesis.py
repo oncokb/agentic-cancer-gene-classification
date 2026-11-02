@@ -309,7 +309,6 @@ def _verify_citations(
     records: List[LiteratureRecord],
     max_citations: int,
     gene_identity: Optional[str] = None,
-    pinned: bool = False,
 ) -> List[str]:
     """
     Remove ambiguous or unretrieved PMIDs from the LLM's citation list, then rank.
@@ -323,7 +322,6 @@ def _verify_citations(
         max_citations=max_citations,
         gene_identity=gene_identity,
         min_score=-99,
-        pinned=pinned,
     )
     rejected = set(citations) - retrieved_pmids
     if rejected:
@@ -347,7 +345,6 @@ def _postprocess_synthesis_output(
     tool_input: Dict,
     records: List[LiteratureRecord],
     gene_identity: Optional[str],
-    pinned: bool = False,
 ) -> Dict:
     """Apply deterministic citation verification to a raw synthesis tool response."""
     records = _filter_retracted_records(records)
@@ -358,7 +355,6 @@ def _postprocess_synthesis_output(
             records,
             settings.max_citations_per_annotation,
             gene_identity,
-            pinned=pinned,
         )
     return tool_input
 
@@ -646,7 +642,6 @@ async def synthesize_gene_annotation(
     local_backend: Optional[str] = None,
     mode: AnnotationMode = "full",
     pmid_evidence: Optional[Dict[str, PMIDEvidenceRecord]] = None,
-    pinned: bool = False,
 ) -> Dict:
     """
     Call Claude to produce a structured annotation. Returns raw tool-use input dict.
@@ -700,7 +695,6 @@ async def synthesize_gene_annotation(
         tool_input=tool_input,
         records=prompt_records,
         gene_identity=gene_identity,
-        pinned=pinned,
     )
     tool_input["_synthesis_escalated"] = False
     tool_input["_synthesis_escalation_reason"] = None
@@ -734,7 +728,6 @@ async def synthesize_gene_annotation(
                 tool_input=deep_input,
                 records=prompt_records,
                 gene_identity=gene_identity,
-                pinned=pinned,
             )
             tool_input["_synthesis_escalated"] = True
             tool_input["_synthesis_escalation_reason"] = reason
@@ -823,7 +816,3 @@ def build_gene_annotation(
         cache_status="refreshed",
         cache_reason="computed_new_annotation",
     )
-
-
-# Public helpers shared by draft re-evaluation; private names remain compatible.
-evidence_type = _evidence_type

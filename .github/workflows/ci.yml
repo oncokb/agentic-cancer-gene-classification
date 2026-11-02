@@ -37,7 +37,7 @@ jobs:
       mysql:
         image: mysql:8
         env:
-          MYSQL_DATABASE: acgc
+          MYSQL_DATABASE: acgc_test
           MYSQL_USER: acgc
           MYSQL_PASSWORD: acgc
           MYSQL_ROOT_PASSWORD: acgc
@@ -64,8 +64,12 @@ jobs:
       MYSQL_PORT: 3306
       MYSQL_USER: acgc
       MYSQL_PASSWORD: acgc
-      MYSQL_DATABASE: acgc
+      MYSQL_DATABASE: acgc_test
       REDIS_URL: redis://localhost:6379/0
+      # Throwaway service containers: let tests flush Redis and drop/truncate
+      # MySQL tables (tests/conftest.py refuses without this, or if the
+      # database name lacks "test").
+      ACGC_ALLOW_DESTRUCTIVE_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v4

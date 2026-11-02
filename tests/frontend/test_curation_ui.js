@@ -1078,7 +1078,179 @@ async function test_revert_with_failed_reload_shows_pending_refresh() {
   assert.strictEqual(byData(app.root("results-window"), "flag", "pending_refresh").length, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Visibility: every curator edit control renders only when /auth/me says
+// can_curate. Viewers get curated content read-only on every surface.
+// ---------------------------------------------------------------------------
+
+// data-curation actions that change or start changing curated content.
+const EDIT_ACTIONS = [
+  "edit-evidence", "edit-precedent", "revert", "confirm-revert", "submit", "review", "save", "retry-refresh",
+];
+
+function curatedEverywhereResult() {
+  const newer = {
+    code: "newer_pipeline_evidence", label: "Newer pipeline evidence since curation", severity: "warning",
+    detail: "The pipeline now cites PMID(s) that were not in its evidence when this was curated: 555.",
+  };
+  return geneResult({
+    curated: true, curated_by: "cur@x", curated_at: "2026-10-02T09:00:00Z", curation_version: 2,
+    quality_flags: [newer],
+    clinical_actionability: {
+      curated: true, confidence_score: 0.9, summary: "Curated precedent.", confidence_explanation: "e",
+      pmids: ["789"],
+      evidence: [{ pmid: "789", title: "Precedent paper", abstract: "Precedent abstract.", quote: "q", therapies: ["crizotinib"] }],
+    },
+  }, {
+    fusion_evidence: [{
+      fusion: "EML4::ALK", tumor_type: "LUAD", well_supported: true, retrieved_count: 1, pmids: ["111"],
+      literature_scope: "requested_tumor", requested_tumor_pmids: ["111"],
+      interpretation: "Curated fusion.", curated: true, curated_by: "cur@x", curated_at: "2026-10-02T09:00:00Z",
+      curation_version: 1, quality_flags: [newer],
+      evidence_cards: [{ pmid: "111", title: "F1", abstract: "Fusion one.", selected_reason: "s1", quote: "Fusion one.", evidence_type: "clinical" }],
+    }],
+  });
+}
+
+function editControls(win) {
+  return [...new Set([
+    ...EDIT_ACTIONS.flatMap((action) => byData(win, "curation", action)),
+    ...win.querySelectorAll(".curation-edit-button"),
+    ...win.querySelectorAll(".curation-panel, .supporting-evidence, .clinical-actionability, .fusion-evidence-card")
+      .flatMap((section) => section.querySelectorAll("input, textarea, select")),
+  ])];
+}
+
+function renderBothViews(app) {
+  const result = curatedEverywhereResult();
+  app.state.resultsViewMode = "gene";
+  const geneWin = render(app, result);
+  const gene = {
+    controls: editControls(geneWin),
+    precedent: geneWin.querySelectorAll(".clinical-actionability"),
+    text: geneWin.allText,
+  };
+  app.state.resultsViewMode = "fusion";
+  app.state.fusionEvidenceStatus = "complete";
+  const fusionWin = render(app, result);
+  const fusion = {
+    controls: editControls(fusionWin),
+    cards: fusionWin.querySelectorAll(".fusion-evidence-card"),
+    text: fusionWin.allText,
+  };
+  return { gene, fusion, result };
+}
+
+async function test_viewer_from_auth_me_sees_no_edit_controls_anywhere() {
+  const app = loadCurationApp({
+    auth: { can_curate: undefined },
+    routes: async (method, url) => (url === "/auth/me"
+      ? [200, { auth_enabled: true, authenticated: true, email: "view@x", role: "viewer", can_curate: false }]
+      : undefined),
+  });
+  await app.checkAuth();
+  assert.strictEqual(app.state.auth.can_curate, false, "role comes from /auth/me");
+
+  const { gene, fusion, result } = renderBothViews(app);
+  // Curated content is still shown, read-only.
+  assert.ok(gene.text.includes("Curated by cur@x"), "viewers see the curated badge on genes");
+  assert.ok(gene.text.includes("Curated precedent."), "viewers see the curated precedent");
+  assert.ok(gene.text.includes("789"), "viewers see precedent PMIDs");
+  assert.strictEqual(gene.precedent.length, 1);
+  assert.ok(fusion.cards.length === 1 && fusion.text.includes("Curated fusion."), "viewers see the curated fusion");
+  assert.ok(fusion.text.includes("Curated by cur@x"), "viewers see the curated badge on fusions");
+  assert.deepStrictEqual(gene.controls.map((c) => c.dataset.curation || c.tagName), [], "no gene-card edit controls");
+  assert.deepStrictEqual(fusion.controls.map((c) => c.dataset.curation || c.tagName), [], "no fusion-card edit controls");
+
+  // Nothing opens the editor or starts a re-evaluation for a viewer.
+  const geneSubject = app.geneCurationSubject(result.annotations[0]);
+  const fusionSubject = app.fusionCurationSubject(result.fusion_evidence[0]);
+  for (const subject of [geneSubject, fusionSubject]) {
+    for (const focus of ["evidence", "precedent"]) {
+      app.openCurationDialog(subject, { focus });
+      app.openCurationDialog(subject, { focus, step: "review" });
+    }
+  }
+  assert.ok(app.root("curation-modal").classList.contains("hidden"), "the editor never opens");
+  assert.strictEqual(app.root("curation-body").children.length, 0, "no PMID inputs were built");
+  assert.strictEqual(app.curationState.sessions.size, 0, "no edit/re-evaluate session");
+  assert.strictEqual(app.root("curation-notifications").children.length, 0, "no re-evaluate notifications");
+  assert.ok(
+    !app.requests.some((r) => r.method !== "GET" || r.url.startsWith("/v1/curation/reevaluate")),
+    "no curation write or re-evaluate request",
+  );
+}
+
+async function test_curator_from_auth_me_sees_edit_controls_everywhere() {
+  const app = loadCurationApp({
+    auth: { can_curate: undefined },
+    routes: async (method, url) => (url === "/auth/me"
+      ? [200, { auth_enabled: false, authenticated: true, email: "cur@x", role: "curator", can_curate: true }]
+      : undefined),
+  });
+  await app.checkAuth();
+  assert.strictEqual(app.state.auth.can_curate, true);
+  const { gene, fusion, result } = renderBothViews(app);
+  const actions = (controls) => controls.map((c) => c.dataset.curation).filter(Boolean).sort();
+  // Edit evidence twice (heading + newer-evidence shortcut), Edit precedent, Revert.
+  assert.deepStrictEqual(actions(gene.controls), ["edit-evidence", "edit-evidence", "edit-precedent", "revert"]);
+  assert.ok(gene.precedent[0].querySelectorAll(".curation-edit-button").length === 1, "Edit precedent sits in the precedent section");
+  assert.deepStrictEqual(actions(fusion.controls), ["edit-evidence", "edit-evidence", "revert"]);
+
+  // The precedent PMID editor and the re-evaluate submit are reachable.
+  app.openCurationDialog(app.geneCurationSubject(result.annotations[0]), { focus: "precedent" });
+  assert.ok(!app.root("curation-modal").classList.contains("hidden"));
+  assert.ok(byData(body(app), "curation", "precedent-input").length === 1, "precedent PMID input");
+  assert.ok(byData(body(app), "curation", "evidence-input").length === 1, "evidence PMID input");
+  assert.ok(byData(app.root("curation-footer"), "curation", "submit").length === 1, "re-evaluate submit");
+}
+
+// Curated text, LLM draft text and abstracts are never parsed as markup.
+async function test_curated_and_draft_text_never_render_as_markup() {
+  const evil = '<img src=x onerror="alert(1)">';
+  const htmlOf = (el) => [el._html, ...el.children.flatMap(htmlOf)];
+  const assertNoMarkup = (app, label) => {
+    ["results-window", "curation-body", "curation-footer", "curation-aux-body", "curation-notifications", "toast-region"]
+      .forEach((id) => {
+        const raw = htmlOf(app.root(id)).filter((html) => html.includes("<img"));
+        assert.deepStrictEqual(raw, [], `${label}: unescaped markup in #${id}`);
+      });
+  };
+  const draft = {
+    gene: "ALK",
+    cancer_association_rationale: `Rationale ${evil}`,
+    evidence_cards: [{
+      pmid: "111", title: `Title ${evil}`, journal: `Journal ${evil}`, abstract: `Abstract ${evil}`,
+      selected_reason: `Reason ${evil}`, quote: `Quote ${evil}`, evidence_type: "clinical",
+    }],
+    supporting_quotes: [{ pmid: "111", quote: `Quote ${evil}` }],
+    clinical_actionability: {
+      summary: `Precedent ${evil}`, pmids: ["789"],
+      evidence: [{ pmid: "789", title: `PTitle ${evil}`, abstract: `PAbstract ${evil}`, quote: `PQuote ${evil}`, therapies: [`drug ${evil}`] }],
+    },
+  };
+  const app = loadCurationApp({ routes: jobRoutes({ draft }) });
+  render(app, geneResult({
+    curated: true, curated_by: `cur${evil}@x`, curated_at: "2026-10-02T09:00:00Z", curation_version: 1,
+    cancer_association_rationale: `Curated ${evil}`,
+    evidence_cards: [{ pmid: "111", title: `Curated title ${evil}`, journal: "J", abstract: `Curated abstract ${evil}`, selected_reason: `Curated reason ${evil}`, quote: `Curated quote ${evil}`, evidence_type: "clinical" }],
+    quality_flags: [{ code: "curated_retracted_pmids_removed", label: `Flag ${evil}`, severity: "critical", detail: `Detail ${evil}` }],
+  }));
+  assertNoMarkup(app, "curated card");
+  assert.ok(app.root("results-window").textContent.includes(`Detail ${evil}`), "flag detail shown as text");
+
+  await toDraft(app);
+  assertNoMarkup(app, "draft review");
+  const reviewText = body(app).textContent;
+  assert.ok(reviewText.includes(`Abstract ${evil}`), "draft abstract shown as text");
+  assert.ok(reviewText.includes(`Title ${evil}`), "draft title shown as text");
+  assert.strictEqual(oneByData(body(app), "curation", "rationale").value, `Rationale ${evil}`, "draft rationale is a field value");
+}
+
 runTests("curation UI", [
+  test_viewer_from_auth_me_sees_no_edit_controls_anywhere,
+  test_curator_from_auth_me_sees_edit_controls_everywhere,
+  test_curated_and_draft_text_never_render_as_markup,
   test_viewer_sees_no_edit_controls,
   test_curator_sees_controls_even_when_sections_empty,
   test_pmid_add_remove_reorder_validation_and_cap,

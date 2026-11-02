@@ -1,238 +1,364 @@
-"""Curator role derivation (Keycloak roles / SAML groups) and require_curator."""
+"""Who may edit curated overrides.
+
+Roles live in the user store (USER_STORE_BACKEND redis or mysql) and are
+re-read on every request; admins grant `curator` on /admin/users. Sign-in
+never derives a role from Keycloak roles or SAML groups: they are stored on
+the user record only. require_curator (curator or admin, CURRENT role)
+guards every curation write; reads stay open to viewers.
+"""
 
 from __future__ import annotations
 
 import base64
 import json
 from datetime import datetime, timezone
+from typing import Dict, List, Optional
+from unittest.mock import AsyncMock
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
 
+from src import api_keys as api_keys_module
 from src import auth as auth_module
-from src.auth import (
-    AuthenticatedUser,
-    UserProfile,
-    create_session_token,
-    decode_session_token,
-    derive_role,
-    get_auth_secret_key,
-    parse_keycloak_user,
-    provision_or_update_user,
-)
-from src.config import settings
+from src import main as main_module
+from src.api_keys import ApiKeyRecord, InMemoryRateLimiter, generate_api_key, hash_api_key
+from src.auth import AuthenticatedUser, UserProfile, create_oauth_state, create_session_token
+from src.api import curation_routes
+from src.config import Settings, settings
 from src.main import app
-from tests.test_api_keys import FakeStore, _bearer, _create_key, _session_client
+from src.models.schema import FusionEvidenceResult
+from tests.auth_helpers import put_profile, stored_profile
+from tests.test_curation import FakeCurationStore, store  # noqa: F401  (fixture)
 
-CURATION_URL = "/v1/curation/gene/ALK"
+pytestmark = pytest.mark.usefixtures("user_store_backend")
+
+EMAIL = "someone@mskcc.org"
+ADMIN = "boss@mskcc.org"
+GENE_URL = "/v1/curation/gene/ALK?tumor_type=LUAD"
+FUSION_URL = "/v1/curation/fusion/EML4::ALK?tumor_type=LUAD"
+GENE_BODY = {"payload": {"citations": ["111"]}}
+FUSION_BODY = {"payload": {"interpretation": "Curated."}}
+
+# Every curation write endpoint: (method, url, json body).
+WRITES = [
+    ("put", GENE_URL, GENE_BODY),
+    ("delete", GENE_URL, None),
+    ("put", FUSION_URL, FUSION_BODY),
+    ("delete", FUSION_URL, None),
+]
+READS = [GENE_URL, FUSION_URL, "/v1/curation/gene/ALK/history?tumor_type=LUAD"]
+
+
+class CurationAndKeyStore(FakeCurationStore):
+    """FakeCurationStore that also holds API keys (one RunStore in the app)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.keys: Dict[str, ApiKeyRecord] = {}
+
+    async def get_api_key_by_hash(self, key_hash: str) -> Optional[ApiKeyRecord]:
+        return next((k for k in self.keys.values() if k.key_hash == key_hash), None)
+
+    async def touch_api_key(self, key_id: str, used_at: datetime) -> None:
+        pass
 
 
 @pytest.fixture
-def role_settings(monkeypatch):
-    monkeypatch.setattr(settings, "keycloak_admin_roles", "acgc-admin")
-    monkeypatch.setattr(settings, "keycloak_curator_roles", "acgc-curator")
-    monkeypatch.setattr(settings, "saml_admin_groups", "MSK-Admins")
-    monkeypatch.setattr(settings, "saml_curator_groups", "MSK-Curators")
-    monkeypatch.setattr(settings, "jit_default_role", "viewer")
-    monkeypatch.setattr(settings, "redis_url", "")
-    monkeypatch.setattr(auth_module, "_redis_client", None)
-
-
-@pytest.fixture
-def auth_on(monkeypatch, role_settings):
+def auth_on(monkeypatch, store):  # noqa: F811
     monkeypatch.setattr(settings, "auth_enabled", True)
     monkeypatch.setattr(settings, "agcg_dev_mode", False)
     monkeypatch.setattr(settings, "auth_secret_key", "curation-role-secret-123456")
-    monkeypatch.setattr(settings, "allowed_email_domains", "mskcc.org,openevidence.com")
+    monkeypatch.setattr(settings, "allowed_email_domains", "mskcc.org")
     monkeypatch.setattr(settings, "allowed_emails", "")
+    monkeypatch.setattr(settings, "jit_provisioning_enabled", True)
+    monkeypatch.setattr(settings, "jit_require_admin_approval", False)
+    monkeypatch.setattr(settings, "bootstrap_admin_emails", "")
+    monkeypatch.setattr(main_module, "record_user_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(api_keys_module, "_memory_limiter", InMemoryRateLimiter())
+
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None, **_kwargs):
+        return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, pmids=["111"])
+
+    monkeypatch.setattr(curation_routes.literature, "retrieve_fusion_evidence", fake_fusion_evidence)
+    keyed = CurationAndKeyStore()
+    app.state.run_store = keyed  # the `store` fixture restores the previous one
+    return keyed
 
 
-def test_default_jit_role_is_viewer():
-    assert type(settings).model_fields["jit_default_role"].default == "viewer"
-
-
-@pytest.mark.parametrize(
-    ("groups", "expected"),
-    [
-        (["acgc-admin", "acgc-curator"], "admin"),
-        (["MSK-Admins"], "admin"),
-        (["acgc-curator"], "curator"),
-        (["MSK-Curators", "other"], "curator"),
-        (["other"], "viewer"),
-        ([], "viewer"),
-    ],
-)
-def test_derive_role(role_settings, groups, expected):
-    assert derive_role(groups) == expected
-
-
-def test_settings_lists_parse_comma_separated(monkeypatch):
-    monkeypatch.setattr(settings, "keycloak_curator_roles", " a , b ,")
-    monkeypatch.setattr(settings, "saml_curator_groups", "G1,,G2 ")
-    assert settings.keycloak_curator_roles_list == ["a", "b"]
-    assert settings.saml_curator_groups_list == ["G1", "G2"]
-
-
-def test_parse_keycloak_user_maps_curator_role(role_settings, monkeypatch):
-    monkeypatch.setattr(settings, "keycloak_client_id", "acgc")
-    claims = {"realm_access": {"roles": ["acgc-curator"]}}
-    jwt_payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-    user = parse_keycloak_user(
-        {"access_token": f"header.{jwt_payload}.sig"}, {"email": "kc.curator@mskcc.org", "name": "KC"}
-    )
-    assert user.role == "curator"
-    assert parse_keycloak_user({}, {"email": "kc.viewer@mskcc.org", "name": "V"}).role == "viewer"
-
-
-async def test_role_is_rederived_on_every_login(role_settings):
-    email = "rederive.user@mskcc.org"
+def _put_user(email: str, role: str, groups: Optional[List[str]] = None) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    # A profile stored before roles were derived: everyone was "curator".
-    await auth_module.save_user_profile(
-        UserProfile(email=email, name="Legacy", domain="mskcc.org", role="curator",
-                    first_login_at=now, last_login_at=now)
+    put_profile(UserProfile(
+        email=email, name="User", domain="mskcc.org", role=role, status="active",
+        groups=groups or [], first_login_at=now, last_login_at=now,
+    ))
+
+
+def _session(email: str = EMAIL, token_role: str = "admin") -> TestClient:
+    """A signed-in browser. The token's role is a stale login-time snapshot:
+    it defaults to admin to prove authorization uses the stored role."""
+    client = TestClient(app, headers={"Sec-Fetch-Site": "same-origin"})
+    client.cookies.set(
+        settings.auth_cookie_name,
+        create_session_token(AuthenticatedUser(email=email, name="User", domain="mskcc.org", role=token_role)),
     )
-
-    profile = await provision_or_update_user(email=email, name="Legacy", provider="keycloak", groups=["other"])
-    assert profile.role == "viewer"
-    assert profile.role_version == auth_module.ROLE_DERIVATION_VERSION
-
-    profile = await provision_or_update_user(email=email, name="Legacy", provider="keycloak", groups=["acgc-curator"])
-    assert profile.role == "curator"
-
-    profile = await provision_or_update_user(email=email, name="Legacy", provider="keycloak", groups=["acgc-admin"])
-    assert profile.role == "admin"
-
-    # Admin is not sticky either: the IdP is the source of truth.
-    profile = await provision_or_update_user(email=email, name="Legacy", provider="keycloak", groups=[])
-    assert profile.role == "viewer"
+    return client
 
 
-def test_legacy_session_token_curator_role_is_downgraded(auth_on):
-    import hashlib
-    import hmac
+def _api_key(keyed: CurationAndKeyStore, owner: str = EMAIL) -> Dict[str, str]:
+    key = generate_api_key()
+    keyed.keys["key-1"] = ApiKeyRecord(
+        id="key-1", key_hash=hash_api_key(key), owner_email=owner, name="script",
+        created_at=datetime.now(timezone.utc),
+    )
+    return {"Authorization": f"Bearer {key}"}
 
-    def legacy_token(role: str) -> str:
-        now = int(datetime.now(timezone.utc).timestamp())
-        payload = {"email": "old@mskcc.org", "name": "Old", "domain": "mskcc.org", "role": role,
-                   "status": "active", "provider": "google", "groups": [], "iat": now, "exp": now + 60}
-        body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-        sig = hmac.new(get_auth_secret_key().encode(), body.encode(), hashlib.sha256).digest()
-        return f"{body}.{base64.urlsafe_b64encode(sig).decode().rstrip('=')}"
 
-    assert decode_session_token(legacy_token("curator")).role == "viewer"
-    assert decode_session_token(legacy_token("admin")).role == "admin"
-    fresh = create_session_token(AuthenticatedUser(email="new@mskcc.org", name="N", domain="mskcc.org", role="curator"))
-    assert decode_session_token(fresh).role == "curator"
+def _write(client: TestClient, method: str, url: str, body, headers=None):
+    kwargs = {"headers": headers} if headers else {}
+    if body is not None:
+        kwargs["json"] = body
+    return getattr(client, method)(url, **kwargs)
+
+
+def _seed_overrides(client: TestClient) -> None:
+    """Give each DELETE something to revert (so success is 200, not 404)."""
+    for method, url, body in WRITES:
+        if method == "put":
+            assert _write(client, method, url, body).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Defaults and removed configuration
+# ---------------------------------------------------------------------------
+
+
+def test_viewer_is_the_default_role():
+    assert Settings.model_fields["jit_default_role"].default == "viewer"
+    assert AuthenticatedUser(email="a@mskcc.org", name="A", domain="mskcc.org").role == "viewer"
+    assert auth_module.MYSQL_NEW_USER_ROLE == "viewer"
+
+
+def test_no_group_to_role_configuration_or_role_versioning():
+    for name in ("keycloak_curator_roles", "saml_curator_groups"):
+        assert name not in Settings.model_fields
+    for name in ("derive_role", "ROLE_DERIVATION_VERSION"):
+        assert not hasattr(auth_module, name)
+    assert "role_version" not in UserProfile.model_fields
+
+
+# ---------------------------------------------------------------------------
+# (a) viewers: 403 on every write, reads allowed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("method", "url", "body"), WRITES)
+def test_viewer_gets_403_on_every_curation_write(auth_on, method, url, body):
+    _put_user(EMAIL, "viewer")
+    resp = _write(_session(), method, url, body)
+    assert resp.status_code == 403
+    assert "Curator privileges required" in resp.json()["detail"]
+    assert auth_on.overrides == {} and auth_on.history == []
+
+
+@pytest.mark.parametrize(("method", "url", "body"), WRITES)
+def test_viewer_api_key_gets_403_on_every_curation_write(auth_on, method, url, body):
+    _put_user(EMAIL, "viewer")
+    resp = _write(TestClient(app), method, url, body, headers=_api_key(auth_on))
+    assert resp.status_code == 403
+    assert auth_on.overrides == {}
+
+
+@pytest.mark.parametrize("url", READS)
+def test_viewer_can_read_curation(auth_on, url):
+    _put_user(EMAIL, "viewer")
+    assert _session().get(url).status_code == 200
+
+
+def test_signed_out_writes_are_401(auth_on):
+    for method, url, body in WRITES:
+        assert _write(TestClient(app), method, url, body).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# (b) curators and admins succeed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", ["curator", "admin"])
+def test_curator_and_admin_succeed_on_every_curation_write(auth_on, role):
+    _put_user(EMAIL, role)
+    client = _session(token_role="viewer")  # stale token role is ignored
+    for method, url, body in WRITES:
+        resp = _write(client, method, url, body)
+        assert resp.status_code == 200, (method, url, resp.text)
+    assert [e.action for e in auth_on.history] == ["save", "revert", "save", "revert"]
+    assert {e.curator_email for e in auth_on.history} == {EMAIL}
+
+
+@pytest.mark.parametrize("role", ["curator", "admin"])
+def test_curator_and_admin_api_keys_succeed(auth_on, role):
+    _put_user(EMAIL, role)
+    headers = _api_key(auth_on)
+    client = TestClient(app)
+    for method, url, body in WRITES:
+        assert _write(client, method, url, body, headers=headers).status_code == 200
 
 
 @pytest.mark.parametrize(("role", "can"), [("viewer", False), ("curator", True), ("admin", True)])
-def test_auth_me_exposes_can_curate(auth_on, role, can):
-    client = _session_client(f"{role}.me@mskcc.org", role=role)
-    body = client.get("/auth/me").json()
+def test_auth_me_reports_can_curate_from_the_stored_role(auth_on, role, can):
+    _put_user(EMAIL, role)
+    body = _session(token_role="admin" if role != "admin" else "viewer").get("/auth/me").json()
     assert body["user"]["role"] == role
     assert body["can_curate"] is can
 
 
-def test_auth_me_can_curate_when_auth_disabled(monkeypatch):
+def test_auth_disabled_allows_curation(monkeypatch, store):  # noqa: F811
     monkeypatch.setattr(settings, "auth_enabled", False)
-    assert TestClient(app).get("/auth/me").json()["can_curate"] is True
-
-
-def test_require_curator_rejects_viewer_on_writes_but_allows_reads(auth_on):
-    viewer = _session_client("viewer.writes@mskcc.org", role="viewer")
-    previous = getattr(app.state, "run_store", None)
-    app.state.run_store = FakeStore()  # no curation methods: reads 503 past auth
-    try:
-        put = viewer.put(CURATION_URL, json={"payload": {"citations": ["1"]}})
-        assert put.status_code == 403
-        assert "Curator privileges required" in put.json()["detail"]
-        assert viewer.delete(CURATION_URL).status_code == 403
-        assert viewer.get(CURATION_URL).status_code == 503
-
-        curator = _session_client("curator.writes@mskcc.org", role="curator")
-        assert curator.put(CURATION_URL, json={"payload": {"citations": ["1"]}}).status_code == 503
-    finally:
-        app.state.run_store = previous
-
-
-def test_api_key_curation_follows_owner_live_profile_role(auth_on, monkeypatch):
-    from src import api_keys as api_keys_module
-    from src.api_keys import InMemoryRateLimiter
-
-    monkeypatch.setattr(api_keys_module, "_memory_limiter", InMemoryRateLimiter())
-    store = FakeStore()
-    previous = getattr(app.state, "run_store", None)
-    app.state.run_store = store
-    email = "key.owner@mskcc.org"
-    now = datetime.now(timezone.utc).isoformat()
-
-    def set_profile(role: str, role_version: int = auth_module.ROLE_DERIVATION_VERSION) -> None:
-        monkeypatch.setitem(
-            auth_module._user_store,
-            email,
-            UserProfile(email=email, name="Owner", domain="mskcc.org", role=role,
-                        first_login_at=now, last_login_at=now, role_version=role_version),
-        )
-
-    try:
-        key = _create_key(_session_client(email, role="curator"))["key"]
-        client = TestClient(app)
-        body = {"payload": {"citations": ["1"]}}
-
-        set_profile("viewer")
-        assert client.put(CURATION_URL, json=body, headers=_bearer(key)).status_code == 403
-        # Legacy profile stored as "curator" before roles were derived.
-        set_profile("curator", role_version=1)
-        assert client.put(CURATION_URL, json=body, headers=_bearer(key)).status_code == 403
-        set_profile("curator")
-        assert client.put(CURATION_URL, json=body, headers=_bearer(key)).status_code == 503  # past auth
-    finally:
-        app.state.run_store = previous
-
-
-def test_dev_login_role_param(auth_on, monkeypatch):
-    monkeypatch.setattr(settings, "dev_login_enabled", True)
     client = TestClient(app)
-
-    resp = client.get("/auth/dev/login?email=dev.curator@mskcc.org&role=curator", follow_redirects=False)
-    assert decode_session_token(resp.cookies.get(settings.auth_cookie_name)).role == "curator"
-
-    resp = client.get("/auth/dev/login?email=dev.viewer@mskcc.org", follow_redirects=False)
-    assert decode_session_token(resp.cookies.get(settings.auth_cookie_name)).role == "viewer"
-
-    resp = client.get("/auth/dev/login?email=dev.admin@mskcc.org&role=admin", follow_redirects=False)
-    assert decode_session_token(resp.cookies.get(settings.auth_cookie_name)).role == "admin"
+    assert client.get("/auth/me").json()["can_curate"] is True
+    assert client.put(GENE_URL, json=GENE_BODY).status_code == 200
 
 
-@pytest.mark.parametrize("jit_default", ["curator", "admin"])
-def test_api_key_without_live_profile_cannot_curate_even_with_privileged_jit_default(auth_on, monkeypatch, jit_default):
-    from src import api_keys as api_keys_module
-    from src.api_keys import InMemoryRateLimiter
+# ---------------------------------------------------------------------------
+# (c) role changes take effect on the next request
+# ---------------------------------------------------------------------------
 
-    monkeypatch.setattr(api_keys_module, "_memory_limiter", InMemoryRateLimiter())
-    previous = getattr(app.state, "run_store", None)
-    app.state.run_store = FakeStore()
-    email = f"no.profile.{jit_default}@mskcc.org"
-    try:
-        key = _create_key(_session_client(email, role="curator"))["key"]
-        monkeypatch.setattr(settings, "jit_default_role", jit_default)
-        monkeypatch.delitem(auth_module._user_store, email, raising=False)
-        client = TestClient(app)
-        resp = client.put(CURATION_URL, json={"payload": {"citations": ["1"]}}, headers=_bearer(key))
-        assert resp.status_code == 403
-        assert client.get("/v1/api-keys?all=true", headers=_bearer(key)).status_code == 403  # not admin either
-    finally:
-        app.state.run_store = previous
+
+def test_admin_demoting_a_curator_takes_effect_on_the_next_request(auth_on, user_store_backend):
+    if user_store_backend is None:
+        pytest.skip("/admin/users changes roles on the MySQL user store only")
+    _put_user(ADMIN, "admin")
+    _put_user(EMAIL, "curator")
+    curator, curator_key = _session(), _api_key(auth_on)
+    assert curator.put(GENE_URL, json=GENE_BODY).status_code == 200
+
+    demoted = _session(ADMIN).post(
+        f"/v1/admin/users/{quote(EMAIL, safe='')}/changes", json={"role": "viewer", "reason": "rotation"},
+    )
+    assert demoted.status_code == 200, demoted.text
+    assert [(c.field, c.old_value, c.new_value) for c in user_store_backend._role_changes] == [
+        ("role", "curator", "viewer")
+    ]
+
+    # Same session and same API key, very next request: no re-login needed.
+    second = {"expected_version": 1, "payload": {"citations": ["222"]}}
+    assert curator.put(GENE_URL, json=second).status_code == 403
+    assert curator.delete(GENE_URL).status_code == 403
+    assert TestClient(app).put(GENE_URL, json=second, headers=curator_key).status_code == 403
+    assert curator.get(GENE_URL).json()["version"] == 1  # still readable, unchanged
+
+    promoted = _session(ADMIN).post(
+        f"/v1/admin/users/{quote(EMAIL, safe='')}/changes", json={"role": "curator"},
+    )
+    assert promoted.status_code == 200
+    assert curator.put(GENE_URL, json=second).status_code == 200
+
+
+def test_stored_role_change_takes_effect_on_the_next_request(auth_on):
+    """Both stores: whatever the store holds now decides, not the session."""
+    _put_user(EMAIL, "curator")
+    client = _session(token_role="curator")
+    assert client.put(GENE_URL, json=GENE_BODY).status_code == 200
+    _put_user(EMAIL, "viewer")
+    assert client.delete(GENE_URL).status_code == 403
+    _put_user(EMAIL, "curator")
+    assert client.delete(GENE_URL).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# (d) sign-in never changes an existing role
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def keycloak_login(monkeypatch, auth_on):
+    """Sign in through the real Keycloak callback and parse_keycloak_user,
+    with the IdP's realm roles in the access token."""
+    monkeypatch.setattr(settings, "keycloak_url", "https://idp.example")
+    monkeypatch.setattr(settings, "keycloak_client_id", "acgc")
+    monkeypatch.setattr(settings, "keycloak_allowed_roles", "")
+    monkeypatch.setattr(settings, "keycloak_admin_roles", "")
+
+    def login(groups: List[str], email: str = EMAIL):
+        claims = {"realm_access": {"roles": list(groups)}}
+        jwt_body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        monkeypatch.setattr(
+            main_module, "exchange_keycloak_code",
+            AsyncMock(return_value={"access_token": f"header.{jwt_body}.sig"}),
+        )
+        monkeypatch.setattr(
+            main_module, "get_keycloak_user_info",
+            AsyncMock(return_value={"email": email, "email_verified": True, "name": "KC User"}),
+        )
+        browser = TestClient(app)
+        resp = browser.get(
+            "/auth/callback/keycloak", params={"code": "c", "state": create_oauth_state("/")},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303, resp.text
+        return browser
+
+    return login
+
+
+# Groups an IdP might send, including ones #117 used to map to curator/admin.
+GROUP_SETS = [[], ["acgc-curator"], ["MSK-Curators", "acgc-admin-like"], ["unrelated"]]
+
+
+@pytest.mark.parametrize("role", ["viewer", "curator", "admin"])
+@pytest.mark.parametrize("groups", GROUP_SETS)
+def test_keycloak_sign_in_never_changes_an_existing_role(keycloak_login, role, groups):
+    _put_user(EMAIL, role, groups=["old-group"])
+    browser = keycloak_login(groups)
+    stored = stored_profile(EMAIL)
+    assert stored.role == role
+    assert set(groups) <= set(stored.groups)  # groups are stored, nothing more
+    can_write = role in ("curator", "admin")
+    assert browser.put(GENE_URL, json=GENE_BODY).status_code == (200 if can_write else 403)
+
+
+def test_keycloak_admin_role_never_changes_role_on_mysql(keycloak_login, user_store_backend, monkeypatch):
+    if user_store_backend is None:
+        pytest.skip("Redis keeps main's KEYCLOAK_ADMIN_ROLES promotion (never a demotion)")
+    monkeypatch.setattr(settings, "keycloak_admin_roles", "acgc-admin")
+    for role in ("viewer", "curator"):
+        _put_user(EMAIL, role)
+        keycloak_login(["acgc-admin"])
+        assert stored_profile(EMAIL).role == role
+
+
+def test_keycloak_sign_in_never_lowers_an_admin(keycloak_login, monkeypatch):
+    monkeypatch.setattr(settings, "keycloak_admin_roles", "acgc-admin")
+    _put_user(EMAIL, "admin", groups=["acgc-admin"])
+    keycloak_login([])  # admin role removed in Keycloak
+    assert stored_profile(EMAIL).role == "admin"
+
+
+def test_new_keycloak_user_is_a_viewer_whatever_their_groups(keycloak_login):
+    browser = keycloak_login(["acgc-curator", "MSK-Curators"], email="new.kc@mskcc.org")
+    assert stored_profile("new.kc@mskcc.org").role == "viewer"
+    assert browser.put(GENE_URL, json=GENE_BODY).status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# (e) re-evaluation jobs the curator UI (#118) starts and polls
+# ---------------------------------------------------------------------------
+
+REEVALUATE_JOBS = "/v1/curation/reevaluate/jobs"
 
 
 def test_reevaluate_jobs_require_curator(auth_on):
-    viewer = _session_client("viewer.reevaluate@mskcc.org", role="viewer")
-    body = {"subject_type": "gene", "subject_key": "ALK", "evidence_pmids": ["1"]}
-    post = viewer.post("/v1/curation/reevaluate/jobs", json=body)
+    """POST/GET re-evaluation jobs are curator-only. They ship in #116
+    (feat/curator-reevaluate); until it merges there is nothing to guard."""
+    if not any(getattr(route, "path", "").startswith(REEVALUATE_JOBS) for route in app.routes):
+        pytest.skip("re-evaluation job routes ship in #116 (feat/curator-reevaluate)")
+    curator_email = "curator.reevaluate@mskcc.org"
+    _put_user(EMAIL, "viewer")
+    _put_user(curator_email, "curator")
+    viewer = _session(EMAIL)  # stale admin token: the stored viewer role decides
+    body = {"subject_type": "gene", "subject_key": "ALK", "tumor_type": "LUAD", "evidence_pmids": ["1"]}
+    post = viewer.post(REEVALUATE_JOBS, json=body)
     assert post.status_code == 403
-    assert "Curator privileges required" in post.json()["detail"]
-    assert viewer.get("/v1/curation/reevaluate/jobs/missing").status_code == 403
-
-    curator = _session_client("curator.reevaluate@mskcc.org", role="curator")
-    assert curator.get("/v1/curation/reevaluate/jobs/missing").status_code == 404  # past auth
+    assert viewer.get(f"{REEVALUATE_JOBS}/missing").status_code == 403
+    assert _session(curator_email).get(f"{REEVALUATE_JOBS}/missing").status_code == 404  # past auth

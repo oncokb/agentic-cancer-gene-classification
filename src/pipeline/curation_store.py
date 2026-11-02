@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tup
 import pymysql
 
 from src.models.schema import CuratedOverride, CurationHistoryEntry
+from src.pipeline.schema_migrations import add_column_if_missing
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +135,8 @@ class CurationStoreMixin:
         await cursor.execute(_CREATE_CURATION_HISTORY_TABLE_SQL)
         # runs.revision: bumped by every result_json write, so whole-result
         # rewrites can compare-and-swap instead of clobbering concurrent ones.
-        await cursor.execute("SHOW COLUMNS FROM runs LIKE 'revision'")
-        if await cursor.fetchone() is None:
-            await cursor.execute("ALTER TABLE runs ADD COLUMN revision INT NOT NULL DEFAULT 0")
+        # Concurrency-safe and ALGORITHM=INSTANT where supported (no table copy).
+        await add_column_if_missing(cursor, "runs", "revision", "INT NOT NULL DEFAULT 0")
 
     async def get_curated_override(
         self, subject_type: str, subject_key: str, tumor_type: str
@@ -463,8 +463,10 @@ class CurationStoreMixin:
                 return cursor.rowcount == 1
 
     async def set_run_annotation_tumor_types(self, run_id: str, entries: Dict[str, Optional[str]]) -> None:
-        """Atomically merge confirmed gene -> tumor type entries into the run's
-        annotation_tumor_types, touching no other part of result_json."""
+        """Atomically add reconstructed gene -> tumor type entries to the run's
+        annotation_tumor_types, touching no other part of result_json. Only
+        missing entries are added (JSON_INSERT): an entry written meanwhile,
+        e.g. by a gene retry, is never overwritten by a reconstruction."""
         if not entries:
             return
         assignments = ", ".join(["%s, %s"] * len(entries))
@@ -476,7 +478,7 @@ class CurationStoreMixin:
                 await cursor.execute(
                     f"""
                     UPDATE runs SET
-                        result_json = JSON_SET(
+                        result_json = JSON_INSERT(
                             JSON_SET(
                                 result_json, '$.annotation_tumor_types',
                                 COALESCE(JSON_EXTRACT(result_json, '$.annotation_tumor_types'), JSON_OBJECT())
@@ -487,16 +489,6 @@ class CurationStoreMixin:
                     WHERE run_id = %s
                     """,
                     (*params, run_id),
-                )
-
-    async def set_run_fusion_evidence(self, run_id: str, fusion_evidence: List[Dict[str, Any]]) -> None:
-        """Atomically replace only the run's fusion_evidence."""
-        async with self._pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute(
-                    "UPDATE runs SET result_json = JSON_SET(result_json, '$.fusion_evidence', CAST(%s AS JSON)), "
-                    "revision = revision + 1 WHERE run_id = %s",
-                    (json.dumps(fusion_evidence), run_id),
                 )
 
     async def get_run_request(self, run_id: str) -> Optional[Dict[str, Any]]:

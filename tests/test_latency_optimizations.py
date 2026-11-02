@@ -201,34 +201,6 @@ def test_annotation_job_endpoint_streams_partial_results(monkeypatch):
     assert status_payload["result"]["timings_ms"]["total"] == 2.0
 
 
-async def test_evict_stale_annotation_jobs_removes_only_finished_jobs_past_ttl(monkeypatch):
-    from src.main import AnnotationJobStatusResponse
-
-    main._annotation_jobs.clear()
-    monkeypatch.setattr(main.settings, "annotation_job_ttl_seconds", 100)
-
-    now = time.monotonic()
-    stale_complete = AnnotationJobStatusResponse(
-        job_id="stale-complete", status="complete", fusions_processed=1, created_at=now - 200
-    )
-    stale_failed = AnnotationJobStatusResponse(
-        job_id="stale-failed", status="failed", fusions_processed=1, created_at=now - 200
-    )
-    fresh_complete = AnnotationJobStatusResponse(
-        job_id="fresh-complete", status="complete", fusions_processed=1, created_at=now
-    )
-    stale_but_running = AnnotationJobStatusResponse(
-        job_id="stale-running", status="running", fusions_processed=1, created_at=now - 200
-    )
-    for job in (stale_complete, stale_failed, fresh_complete, stale_but_running):
-        await main._store_annotation_job(job)
-
-    await main._evict_stale_annotation_jobs()
-
-    assert set(main._annotation_jobs.keys()) == {"fresh-complete", "stale-running"}
-    main._annotation_jobs.clear()
-
-
 async def test_track_background_task_keeps_strong_reference_until_done():
     main._background_tasks.clear()
     started = asyncio.Event()

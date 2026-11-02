@@ -1,0 +1,570 @@
+{
+  "definition": {
+    "title": "OpenEvidence sidecar",
+    "type": "group",
+    "layout_type": "ordered",
+    "show_title": true,
+    "background_color": "vivid_blue",
+    "widgets": [
+      {
+        "definition": {
+          "title": "Cache hit rate (hits / (hits + paid lookups started))",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "query_value",
+          "autoscale": false,
+          "precision": 1,
+          "custom_unit": "%",
+          "requests": [
+            {
+              "response_format": "scalar",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "hits",
+                  "query": "sum:acgc.openevidence.endpoint.requests{service:agentic-cancer-gene-classification,outcome:cache_hit}.as_count()",
+                  "aggregator": "sum"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "started",
+                  "query": "sum:acgc.openevidence.lookups.started{service:agentic-cancer-gene-classification}.as_count()",
+                  "aggregator": "sum"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "100 * hits / (hits + started)"
+                }
+              ]
+            }
+          ]
+        },
+        "layout": {
+          "x": 0,
+          "y": 0,
+          "width": 3,
+          "height": 2
+        }
+      },
+      {
+        "definition": {
+          "title": "Paid upstream calls (total)",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "query_value",
+          "autoscale": true,
+          "precision": 0,
+          "requests": [
+            {
+              "response_format": "scalar",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "calls",
+                  "query": "sum:acgc.openevidence.upstream.calls{service:agentic-cancer-gene-classification}.as_count()",
+                  "aggregator": "sum"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "calls"
+                }
+              ]
+            }
+          ]
+        },
+        "layout": {
+          "x": 0,
+          "y": 2,
+          "width": 3,
+          "height": 2
+        }
+      },
+      {
+        "definition": {
+          "title": "Endpoint requests by outcome",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "timeseries",
+          "show_legend": true,
+          "legend_layout": "auto",
+          "legend_columns": [
+            "avg",
+            "max",
+            "value",
+            "sum"
+          ],
+          "requests": [
+            {
+              "response_format": "timeseries",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "q1",
+                  "query": "sum:acgc.openevidence.endpoint.requests{service:agentic-cancer-gene-classification} by {outcome}.as_count()"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "q1"
+                }
+              ],
+              "display_type": "bars",
+              "style": {
+                "palette": "dog_classic",
+                "line_type": "solid",
+                "line_width": "normal"
+              }
+            }
+          ]
+        },
+        "layout": {
+          "x": 3,
+          "y": 0,
+          "width": 9,
+          "height": 4
+        }
+      },
+      {
+        "definition": {
+          "title": "Cache hit rate % over time",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "timeseries",
+          "show_legend": true,
+          "legend_layout": "auto",
+          "legend_columns": [
+            "avg",
+            "max",
+            "value",
+            "sum"
+          ],
+          "requests": [
+            {
+              "response_format": "timeseries",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "hits",
+                  "query": "sum:acgc.openevidence.endpoint.requests{service:agentic-cancer-gene-classification,outcome:cache_hit}.as_count()"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "started",
+                  "query": "sum:acgc.openevidence.lookups.started{service:agentic-cancer-gene-classification}.as_count()"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "peek_hit",
+                  "query": "sum:acgc.openevidence.cache.lookups{service:agentic-cancer-gene-classification,result:hit}.as_count()"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "peek_all",
+                  "query": "sum:acgc.openevidence.cache.lookups{service:agentic-cancer-gene-classification}.as_count()"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "100 * hits / (hits + started)",
+                  "alias": "demand hit rate %"
+                },
+                {
+                  "formula": "100 * peek_hit / peek_all",
+                  "alias": "raw cache peek hit rate % (incl. polls)"
+                }
+              ],
+              "display_type": "line",
+              "style": {
+                "palette": "dog_classic",
+                "line_type": "solid",
+                "line_width": "normal"
+              }
+            }
+          ]
+        },
+        "layout": {
+          "x": 0,
+          "y": 4,
+          "width": 6,
+          "height": 4
+        }
+      },
+      {
+        "definition": {
+          "title": "Paid upstream calls by model and status",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "timeseries",
+          "show_legend": true,
+          "legend_layout": "auto",
+          "legend_columns": [
+            "avg",
+            "max",
+            "value",
+            "sum"
+          ],
+          "requests": [
+            {
+              "response_format": "timeseries",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "q1",
+                  "query": "sum:acgc.openevidence.upstream.calls{service:agentic-cancer-gene-classification} by {model,status,source}.as_count()"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "q1"
+                }
+              ],
+              "display_type": "bars",
+              "style": {
+                "palette": "dog_classic",
+                "line_type": "solid",
+                "line_width": "normal"
+              }
+            }
+          ]
+        },
+        "layout": {
+          "x": 6,
+          "y": 4,
+          "width": 6,
+          "height": 4
+        }
+      },
+      {
+        "definition": {
+          "title": "Upstream call latency p50 / p90 / p99 by model (successful calls)",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "timeseries",
+          "show_legend": true,
+          "legend_layout": "auto",
+          "legend_columns": [
+            "avg",
+            "max",
+            "value",
+            "sum"
+          ],
+          "requests": [
+            {
+              "response_format": "timeseries",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "p50",
+                  "query": "p50:acgc.openevidence.upstream.duration_ms{service:agentic-cancer-gene-classification,status:success} by {model}"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "p90",
+                  "query": "p90:acgc.openevidence.upstream.duration_ms{service:agentic-cancer-gene-classification,status:success} by {model}"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "p99",
+                  "query": "p99:acgc.openevidence.upstream.duration_ms{service:agentic-cancer-gene-classification,status:success} by {model}"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "p50",
+                  "alias": "p50"
+                },
+                {
+                  "formula": "p90",
+                  "alias": "p90"
+                },
+                {
+                  "formula": "p99",
+                  "alias": "p99"
+                }
+              ],
+              "display_type": "line",
+              "style": {
+                "palette": "dog_classic",
+                "line_type": "solid",
+                "line_width": "normal"
+              }
+            }
+          ]
+        },
+        "layout": {
+          "x": 0,
+          "y": 8,
+          "width": 6,
+          "height": 4
+        }
+      },
+      {
+        "definition": {
+          "title": "Endpoint response time p50 / p95",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "timeseries",
+          "show_legend": true,
+          "legend_layout": "auto",
+          "legend_columns": [
+            "avg",
+            "max",
+            "value",
+            "sum"
+          ],
+          "requests": [
+            {
+              "response_format": "timeseries",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "p50",
+                  "query": "p50:acgc.openevidence.endpoint.duration_ms{service:agentic-cancer-gene-classification}"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "p95",
+                  "query": "p95:acgc.openevidence.endpoint.duration_ms{service:agentic-cancer-gene-classification}"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "p50",
+                  "alias": "p50"
+                },
+                {
+                  "formula": "p95",
+                  "alias": "p95"
+                }
+              ],
+              "display_type": "line",
+              "style": {
+                "palette": "dog_classic",
+                "line_type": "solid",
+                "line_width": "normal"
+              }
+            }
+          ]
+        },
+        "layout": {
+          "x": 6,
+          "y": 8,
+          "width": 6,
+          "height": 4
+        }
+      },
+      {
+        "definition": {
+          "title": "Retries, upstream failures/timeouts, failed answers",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "timeseries",
+          "show_legend": true,
+          "legend_layout": "auto",
+          "legend_columns": [
+            "avg",
+            "max",
+            "value",
+            "sum"
+          ],
+          "requests": [
+            {
+              "response_format": "timeseries",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "retries",
+                  "query": "sum:acgc.openevidence.retries{service:agentic-cancer-gene-classification} by {reason}.as_count()"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "upstream_bad",
+                  "query": "sum:acgc.openevidence.upstream.calls{service:agentic-cancer-gene-classification,!status:success} by {status}.as_count()"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "failed",
+                  "query": "sum:acgc.openevidence.endpoint.requests{service:agentic-cancer-gene-classification,outcome:failed}.as_count()"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "retries",
+                  "alias": "retries"
+                },
+                {
+                  "formula": "upstream_bad",
+                  "alias": "upstream non-success"
+                },
+                {
+                  "formula": "failed",
+                  "alias": "endpoint failed answers"
+                }
+              ],
+              "display_type": "bars",
+              "style": {
+                "palette": "dog_classic",
+                "line_type": "solid",
+                "line_width": "normal"
+              }
+            }
+          ]
+        },
+        "layout": {
+          "x": 0,
+          "y": 12,
+          "width": 6,
+          "height": 4
+        }
+      },
+      {
+        "definition": {
+          "title": "Semaphore / queue wait p90 and time to ready",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "timeseries",
+          "show_legend": true,
+          "legend_layout": "auto",
+          "legend_columns": [
+            "avg",
+            "max",
+            "value",
+            "sum"
+          ],
+          "requests": [
+            {
+              "response_format": "timeseries",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "wait",
+                  "query": "p90:acgc.openevidence.semaphore_wait_ms{service:agentic-cancer-gene-classification} by {model}"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "ready50",
+                  "query": "p50:acgc.openevidence.lookups.time_to_ready_ms{service:agentic-cancer-gene-classification} by {model}"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "ready90",
+                  "query": "p90:acgc.openevidence.lookups.time_to_ready_ms{service:agentic-cancer-gene-classification} by {model}"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "ttfc",
+                  "query": "p50:acgc.openevidence.upstream.time_to_first_chunk_ms{service:agentic-cancer-gene-classification} by {model}"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "wait",
+                  "alias": "semaphore wait p90"
+                },
+                {
+                  "formula": "ready50",
+                  "alias": "time to ready p50"
+                },
+                {
+                  "formula": "ready90",
+                  "alias": "time to ready p90"
+                },
+                {
+                  "formula": "ttfc",
+                  "alias": "time to first chunk p50"
+                }
+              ],
+              "display_type": "line",
+              "style": {
+                "palette": "dog_classic",
+                "line_type": "solid",
+                "line_width": "normal"
+              }
+            }
+          ]
+        },
+        "layout": {
+          "x": 6,
+          "y": 12,
+          "width": 6,
+          "height": 4
+        }
+      },
+      {
+        "definition": {
+          "title": "Async lifecycle: lookups started / deduped / completed / lease fallbacks",
+          "title_size": "16",
+          "title_align": "left",
+          "type": "timeseries",
+          "show_legend": true,
+          "legend_layout": "auto",
+          "legend_columns": [
+            "avg",
+            "max",
+            "value",
+            "sum"
+          ],
+          "requests": [
+            {
+              "response_format": "timeseries",
+              "queries": [
+                {
+                  "data_source": "metrics",
+                  "name": "started",
+                  "query": "sum:acgc.openevidence.lookups.started{service:agentic-cancer-gene-classification}.as_count()"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "deduped",
+                  "query": "sum:acgc.openevidence.lookups.deduped{service:agentic-cancer-gene-classification} by {scope}.as_count()"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "completed",
+                  "query": "sum:acgc.openevidence.lookups.completed{service:agentic-cancer-gene-classification} by {result}.as_count()"
+                },
+                {
+                  "data_source": "metrics",
+                  "name": "lease",
+                  "query": "sum:acgc.openevidence.lease.unavailable{service:agentic-cancer-gene-classification} by {op}.as_count()"
+                }
+              ],
+              "formulas": [
+                {
+                  "formula": "started",
+                  "alias": "started"
+                },
+                {
+                  "formula": "deduped",
+                  "alias": "deduped"
+                },
+                {
+                  "formula": "completed",
+                  "alias": "completed"
+                },
+                {
+                  "formula": "lease",
+                  "alias": "lease unavailable"
+                }
+              ],
+              "display_type": "bars",
+              "style": {
+                "palette": "dog_classic",
+                "line_type": "solid",
+                "line_width": "normal"
+              }
+            }
+          ]
+        },
+        "layout": {
+          "x": 0,
+          "y": 16,
+          "width": 12,
+          "height": 4
+        }
+      }
+    ]
+  }
+}

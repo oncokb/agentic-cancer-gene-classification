@@ -559,14 +559,14 @@ async def ensure_annotation_tumor_types(
         request = await getter(run_id)
         if not request:
             return unresolved("saved request not found")
-        input_strings, tumor_type_by_input = split_input_tumor_types(_request_fusion_inputs(request))
+        _, tumor_contexts = split_input_tumor_types(_request_fusion_inputs(request))
     except Exception:
         logger.warning("Failed to load request for run %s", run_id, exc_info=True)
         return unresolved("saved request unavailable")
 
     tumor_types: Dict[str, Optional[str]] = {}
-    if tumor_type_by_input:
-        typed_inputs = list(dict.fromkeys(v for v in input_strings if v in tumor_type_by_input))
+    if tumor_contexts:
+        typed_inputs = list(dict.fromkeys(value for value, _ in tumor_contexts))
         try:
             gene_map = await normalize_fusions(typed_inputs)
         except Exception:
@@ -574,7 +574,7 @@ async def ensure_annotation_tumor_types(
             return unresolved("alias resolution failed")
         if any(resolved.lookup_failed for resolved, _ in gene_map.values()):
             return unresolved("gene symbol lookup unavailable")
-        tumor_types = gene_tumor_types(gene_map, tumor_type_by_input)
+        tumor_types, _ = gene_tumor_types(gene_map, tumor_contexts)
     # A gene no tumor-typed input resolves to is confirmed to have none.
     confirmed = {gene: tumor_types.get(gene) for gene in missing}
     result.annotation_tumor_types.update(confirmed)
