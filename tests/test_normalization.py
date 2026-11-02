@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from src.pipeline import cache as cache_module
+from src.pipeline import normalization
 from src.pipeline.normalization import (
     ENSEMBL_LOOKUP_URL,
     HGNC_FETCH_URL,
@@ -81,7 +82,12 @@ async def test_resolve_ensembl_ids_batches_lookup_and_maps_hgnc_metadata():
 
 
 @pytest.mark.asyncio
-async def test_resolve_ensembl_ids_falls_back_when_ensembl_fails():
+async def test_resolve_ensembl_ids_falls_back_when_ensembl_fails(monkeypatch):
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(normalization, "_sleep", no_sleep)
+
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow Ensembl response", request=request)
 
@@ -91,6 +97,7 @@ async def test_resolve_ensembl_ids_falls_back_when_ensembl_fails():
     assert resolved["ENSG00000253796"].canonical_symbol == "ENSG00000253796"
     assert resolved["ENSG00000253796"].resolved is False
     assert resolved["ENSG00000253796"].unresolvable is True
+    assert resolved["ENSG00000253796"].lookup_failed is True
 
 
 @pytest.mark.asyncio

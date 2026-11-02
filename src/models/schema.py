@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, constr, model_validator
 
 LocalBackend = Literal["claude-code", "codex", "antigravity"]
 AnnotationMode = Literal["full", "core"]
@@ -32,6 +32,19 @@ class ResolvedGene(BaseModel):
     # True when unresolvable only because the lookup service failed (timeout,
     # 5xx, ...), as opposed to the service confirming the symbol doesn't exist.
     lookup_failed: bool = False
+    # Why an Ensembl/RefSeq-form input (ENST..., GENE(NM_...), NM_...:c....)
+    # could not be used, e.g. an unknown ID or a transcript of a different gene.
+    resolution_error: Optional[str] = None
+    # Transcript an ENST/ENSP input resolved through (ENSP -> its parent ENST).
+    ensembl_transcript_id: Optional[str] = None
+    # RefSeq transcript (NM_/NR_/XM_/XR_) an input named; None for NP_/XP_ proteins.
+    refseq_transcript_id: Optional[str] = None
+    # "ensembl_id" when Ensembl has the gene but no HGNC symbol or Ensembl name
+    # for it, so canonical_symbol is its stable ID, not a gene symbol.
+    symbol_source: Optional[str] = None
+    # Ensembl's biotype and description (minus its [Source:...] tag) for such genes.
+    biotype: Optional[str] = None
+    description: Optional[str] = None
 
 
 class LiteratureRecord(BaseModel):
@@ -130,16 +143,60 @@ class FusionEvidenceCard(EvidenceCard):
     # literal match, which behaves exactly as before this field existed.
     matched_via_alias: bool = False
     alias_matches: List[AliasMatch] = Field(default_factory=list)
+    requested_tumor_terms: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Requested-tumor terms (the tumor type and its known aliases) found in this paper's "
+            "title or abstract. Empty when no tumor type was requested or none is mentioned. A "
+            "mention only; it does not mean the paper shows the fusion in that tumor type."
+        ),
+    )
 
 
 class FusionEvidenceResult(BaseModel):
     fusion: str
+    partial: bool = Field(
+        default=False,
+        description="True when one exact-pair search failed; retained evidence is incomplete.",
+    )
+    input: Optional[str] = Field(
+        default=None,
+        description="The fusion as submitted, when it differs from `fusion` (e.g. Ensembl IDs resolved to symbols).",
+    )
     tumor_type: Optional[str] = None
     well_supported: bool = False
     retrieved_count: int = 0
     pmids: List[str] = Field(default_factory=list)
     interpretation: str = ""
     evidence_cards: List[FusionEvidenceCard] = Field(default_factory=list)
+    literature_scope: Optional[
+        Literal["requested_tumor", "other_or_unspecified", "any_tumor", "no_literature"]
+    ] = Field(
+        default=None,
+        description=(
+            "How the exact-pair literature relates to the requested tumor type, computed over every "
+            "retained PMID (not just the evidence cards). requested_tumor: at least one paper's "
+            "title or abstract MENTIONS the requested tumor type or an alias; it does not mean the "
+            "fusion was shown in that tumor type. other_or_unspecified: a tumor type was requested "
+            "but no retained paper mentions it. any_tumor: no tumor type was requested and papers "
+            "were found. no_literature: all searches succeeded and no paper was retained. null when "
+            "retrieval failed, a partial result is empty or its tumor-scoped query failed, no exact-pair search ran, or the result predates this field."
+        ),
+    )
+    requested_tumor_pmids: List[str] = Field(
+        default_factory=list,
+        description=(
+            "PMIDs, in ranked order, whose title or abstract mentions the requested tumor type. "
+            "A subset of pmids; may include papers without an evidence card."
+        ),
+    )
+    retrieval_status: Literal["ok", "failed"] = Field(
+        default="ok",
+        description=(
+            "failed when exact-pair retrieval raised an error. An empty failed result is not "
+            "evidence of missing literature, and its literature_scope is null."
+        ),
+    )
 
 
 class FusionPartnerEvidenceRequest(BaseModel):
@@ -335,11 +392,30 @@ class DistilledOpenEvidence(BaseModel):
     redundant_citation_count: int = 0
 
 
+class ResolvedInput(BaseModel):
+    """A submitted input that was rewritten before annotation, e.g. an Ensembl
+    transcript ID resolved to its gene symbol."""
+
+    input: str = Field(..., description="The input as submitted, e.g. `ENST00000269305`.")
+    resolved: str = Field(..., description="The gene or fusion string that was annotated, e.g. `TP53`.")
+    five_transcript: Optional[str] = Field(default=None, description="5' partner transcript taken from the input.")
+    three_transcript: Optional[str] = Field(default=None, description="3' partner transcript taken from the input.")
+    warnings: List[str] = Field(default_factory=list, description="Caveats about how the input was read.")
+
+
 class GeneAnnotation(BaseModel):
     """One row in Nicole's spreadsheet, keyed by gene."""
 
     gene: str
     fusions: List[str] = Field(default_factory=list)
+    resolved_inputs: List[ResolvedInput] = Field(
+        default_factory=list,
+        description=(
+            "Submitted inputs for this gene that were rewritten before annotation (Ensembl IDs, RefSeq "
+            "accessions, GENE(ENST...)/GENE(NM_...) and ENST...:c..../NM_...:c.... forms), with what each "
+            "resolved to."
+        ),
+    )
     in_oncokb: Optional[bool] = None  # None when OncoKB token not configured
 
     cancer_associated: Optional[bool] = None
@@ -421,6 +497,13 @@ class GeneAnnotationWithRun(GeneAnnotation):
         default=None,
         description="Absolute link that opens the full run in the ACGC UI (requires login).",
     )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Request-level warnings for the saved run, such as conflicting tumor types "
+            "or fusion-like notation. Same list as AnnotationResult.warnings."
+        ),
+    )
 
 
 class FusionInput(BaseModel):
@@ -440,8 +523,29 @@ class FusionInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def coerce_gene_input_aliases(cls, data: Any) -> Any:
-        """Allow structured rows to name the required value as gene/input/query."""
-        if isinstance(data, dict) and "fusion" not in data:
+        """Allow structured rows to name the required value as gene/input/query,
+        or to give fusion partners separately as gene1/gene2."""
+        if not isinstance(data, dict):
+            return data
+        if "gene1" in data or "gene2" in data:
+            gene1 = str(data.get("gene1") or "").strip()
+            gene2 = str(data.get("gene2") or "").strip()
+            if not (gene1 and gene2):
+                raise ValueError("gene1 and gene2 must both be given to describe a fusion")
+            fusion = f"{gene1}::{gene2}"
+            given = data.get("fusion")
+            # Deferred: normalization imports this module.
+            from src.pipeline.normalization import split_fusion
+
+            if given is not None and tuple(
+                (part or "").upper() for part in split_fusion(str(given))
+            ) != (gene1.upper(), gene2.upper()):
+                raise ValueError(
+                    f"fusion '{given}' conflicts with gene1/gene2 ('{fusion}'); give one or the other"
+                )
+            data = {key: value for key, value in data.items() if key not in ("gene1", "gene2")}
+            return {**data, "fusion": fusion if given is None else given}
+        if "fusion" not in data:
             for alias in ("gene", "input", "query"):
                 if alias in data:
                     return {**data, "fusion": data[alias]}
@@ -449,6 +553,10 @@ class FusionInput(BaseModel):
 
 
 class AnnotateRequest(BaseModel):
+    include_fusion_evidence: bool = Field(
+        default=False,
+        description="Retrieve exact-pair fusion evidence inline before returning and saving the annotation run.",
+    )
     fusions: List[FusionInput] = Field(
         ...,
         description="Gene or fusion inputs with optional tumor type and breakpoint context",
@@ -462,7 +570,7 @@ class AnnotateRequest(BaseModel):
     )
     force_refresh: bool = Field(
         default=False,
-        description="Bypass stored gene annotations and recompute results.",
+        description="Bypass stored gene annotations and fusion evidence and recompute results.",
     )
     skip_literature_for_oncokb: bool = Field(
         default=False,
@@ -483,7 +591,7 @@ class AnnotateRequest(BaseModel):
     @classmethod
     def coerce_string_fusions(cls, data: Any) -> Any:
         """Accept plain gene/fusion strings alongside structured FusionInput dicts."""
-        if isinstance(data, dict) and "fusions" in data:
+        if isinstance(data, dict) and isinstance(data.get("fusions"), list):
             coerced = []
             for item in data["fusions"]:
                 if isinstance(item, str):
@@ -529,7 +637,18 @@ class AnnotationResult(BaseModel):
     fusions_processed: int
     genes_annotated: int
     annotations: List[GeneAnnotation]
-    fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
+    fusion_evidence: List[FusionEvidenceResult] = Field(
+        default_factory=list,
+        description=(
+            "Exact fusion-pair evidence, empty by default. Set include_fusion_evidence=true "
+            "on the annotation request to populate it inline; otherwise run "
+            "POST /v1/fusion-evidence/jobs (optionally with run_id) to populate it."
+        ),
+    )
+    warnings: List[str] = Field(
+        default_factory=list,
+        description="Request-level warnings, including the tumor type used and ignored conflicting types per gene.",
+    )
     timings_ms: Dict[str, float] = Field(default_factory=dict)
 
 
@@ -548,6 +667,14 @@ class FeedbackRequest(BaseModel):
     )
     page_url: Optional[str] = Field(
         default=None, max_length=2048, description="URL of the page feedback was submitted from"
+    )
+    pmids: Optional[List[constr(max_length=64)]] = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Optional structured list of PMIDs cited by the feedback. Values are "
+            "parsed leniently; unparseable entries are reported in the citation check."
+        ),
     )
 
 

@@ -200,10 +200,13 @@ partner precedent is kept separate from the exact-fusion evidence array.
 
 ## Operations and timing
 
-Jobs use the same process-local memory/asyncio pattern as annotation jobs.
-The in-flight limit and ownership store are process-local. Completed jobs are evicted on subsequent POSTs after
-`settings.annotation_job_ttl_seconds`. Polling must reach the same worker;
-restarting the worker loses its jobs. No database persistence is involved.
+Jobs use the shared Redis-backed job store with a process-local fallback when
+Redis is unavailable. Any worker can serve status snapshots; owner checks apply
+to local and Redis reads. Snapshots expire according to `JOB_TTL_SECONDS` (or the
+deprecated `ANNOTATION_JOB_TTL_SECONDS`), defaulting to 24 hours after the last
+update. The task and in-flight admission limit remain local to the submitting
+worker, like the other background jobs. Restarting that worker interrupts its
+tasks; Redis retains their last snapshots until expiry.
 
 Plan for roughly **10–60 seconds** for a typical small PMID set on the Haiku
 fast path, with longer times for Opus escalation, upstream retries, or large

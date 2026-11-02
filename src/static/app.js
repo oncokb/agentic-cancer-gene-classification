@@ -46,6 +46,34 @@ const state = {
   currentView: "annotate",
   resultsViewMode: "results",
   fusionEvidenceStatus: null,
+  // run_id of the saved run opened from a link (or produced by a rerun),
+  // which the Rerun controls rerun; null for fresh submissions.
+  openedRunId: null,
+  // Bumped whenever the displayed run changes or a new fusion-evidence job
+  // starts; a fusion-evidence poll from an older generation is dropped so it
+  // can't write into a newer result (see startFusionEvidenceJob).
+  fusionEvidenceGeneration: 0,
+  // fusionEvidenceKey of the card whose single-fusion re-run is in flight, and
+  // the last re-run failure ({ key, runId, message }) shown inline on its card.
+  // Both are dropped with the job when the run changes or another job starts.
+  rerunningFusionEvidenceKey: null,
+  fusionEvidenceRerunError: null,
+  // Whether the signed-in viewer may change the current saved run (owner or
+  // admin). Shared links are readable by peers, but only these users may
+  // retry failed lookups onto the stored run.
+  canModifyRun: false,
+  // "running" while a failed-annotation or no-result retry job is in flight.
+  annotationRetryStatus: null,
+  // Like fusionEvidenceGeneration, for annotation retries: bumped when the
+  // displayed run changes so a late retry status is dropped.
+  annotationRetryGeneration: 0,
+  // Row gene (normalized) -> why the last retry left that row unchanged,
+  // e.g. "CD246 now resolves to LTK, not ALK; ALK was not updated".
+  annotationRetryNotes: new Map(),
+  annotationRetryKind: null,
+  // The inputs this run was submitted with, so retries preserve tumor type
+  // and breakpoint fields instead of guessing them from annotations.
+  currentRunInputs: [],
   inputMode: "single",
   queue: [],
   batchRows: Array.from({ length: 5 }, emptyRow),
@@ -91,8 +119,17 @@ const elements = {
   exportButton: document.querySelector("#export-button"),
   exportFormat: document.querySelector("#export-format"),
   shareRun: document.querySelector("#share-run"),
+  rerunControls: document.querySelector("#rerun-controls"),
+  rerunMode: document.querySelector("#rerun-mode"),
+  rerunRun: document.querySelector("#rerun-run"),
   appShell: document.querySelector(".app-shell"),
   geneIndex: document.querySelector("#gene-index"),
+  geneIndexPanel: document.querySelector("#gene-index-panel"),
+  geneIndexFilter: document.querySelector("#gene-index-filter"),
+  geneIndexFilterLabel: document.querySelector("#gene-index-filter-label"),
+  geneIndexFilterClear: document.querySelector("#gene-index-filter-clear"),
+  geneIndexFilterCount: document.querySelector("#gene-index-filter-count"),
+  geneIndexNoMatches: document.querySelector("#gene-index-no-matches"),
   openFeedback: document.querySelector("#open-feedback"),
   closeFeedback: document.querySelector("#close-feedback"),
   feedbackModal: document.querySelector("#feedback-modal"),
@@ -124,6 +161,7 @@ const elements = {
   userName: document.querySelector("#user-name"),
   userRole: document.querySelector("#user-role"),
   userEmail: document.querySelector("#user-email"),
+  adminUsersLink: document.querySelector("#admin-users-link"),
   signoutBtn: document.querySelector("#signout-btn"),
   userSignin: document.querySelector("#user-signin"),
   headerSigninBtn: document.querySelector("#header-signin-btn"),
@@ -181,6 +219,22 @@ const editableFields = [
   ["signaling_pathways", "Signaling pathways", "long"],
   ["error", "Error", "text"],
 ];
+
+// UI engagement tracker (tracking.js, docs/ui-events.md); a no-op when absent.
+const UI_TRACK_NOOP = new Proxy({}, { get: () => () => {} });
+function uiTrack() {
+  return (typeof window !== "undefined" && window.ACGCTracking) || UI_TRACK_NOOP;
+}
+
+// Shared context for one annotation's card and everything inside it.
+function geneTrackContext(annotation, surface, displayPosition) {
+  const position = (state.currentResult?.annotations || []).indexOf(annotation);
+  return {
+    surface, subject_kind: "gene", subject_id: annotation.gene, tab: state.resultsViewMode,
+    position: position < 0 ? null : position, display_position: displayPosition,
+    tumor_type_given: Boolean(tumorTypeForAnnotation(annotation)),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Sidebar resizing
@@ -290,6 +344,7 @@ async function checkAuth() {
         elements.userRole.className = `user-role-badge role-${role.toLowerCase()}`;
       }
       if (elements.userEmail) elements.userEmail.textContent = payload.user.email;
+      if (elements.adminUsersLink) elements.adminUsersLink.classList.toggle("hidden", payload.user.role !== "admin");
 
       if (elements.userAvatar) {
         if (payload.user.picture) {
@@ -325,12 +380,14 @@ async function loadDevStatus() {
       elements.navBenchmark.classList.add("hidden");
       elements.annotateBackendField.classList.add("hidden");
       state.openevidenceEnabled = false;
+      uiTrack().setEnabled(false);
       if (state.currentView === "benchmark") switchView("annotate");
       return;
     }
     const payload = await response.json();
     elements.navBenchmark.classList.toggle("hidden", !payload.enabled);
     elements.annotateBackendField.classList.toggle("hidden", !payload.enabled);
+    uiTrack().setEnabled(payload.ui_events_enabled === true);
     const openevidenceEnabled = Boolean(payload.openevidence_enabled);
     state.openevidenceEnabled = openevidenceEnabled;
     // Startup fires loadDevStatus() and loadSharedRun() concurrently (see
@@ -349,6 +406,7 @@ async function loadDevStatus() {
     elements.navBenchmark.classList.add("hidden");
     elements.annotateBackendField.classList.add("hidden");
     state.openevidenceEnabled = false;
+    uiTrack().setEnabled(false);
     if (state.currentView === "benchmark") switchView("annotate");
   }
 }
@@ -366,10 +424,12 @@ function switchView(view) {
   elements.shareRun.classList.toggle("hidden", isBenchmark);
   elements.clearResults.disabled = isBenchmark || !state.currentResult;
   elements.shareRun.disabled = isBenchmark || !state.currentResult?.run_id;
+  syncRerunControls();
   updateExportState();
   // The results panel is only hidden, so its cards stay connected — stop
   // their OpenEvidence polling explicitly. Coming back re-renders them.
   if (isBenchmark) cancelOpenEvidenceCardLoads();
+  uiTrack().setActiveTab(isBenchmark ? "benchmark" : state.resultsViewMode);
 
   if (isBenchmark) {
     renderBenchmarkResult(state.currentBenchmark);
@@ -454,12 +514,20 @@ function clearQueue() {
 }
 
 function clearResults() {
+  invalidateFusionEvidenceJobs();
+  invalidateAnnotationRetryJobs();
+  resetFusionEvidenceSections();
+  resetGeneIndexFilters();
   state.currentResult = null;
   state.resultsViewMode = "results";
   state.fusionEvidenceStatus = null;
+  state.canModifyRun = false;
+  state.currentRunInputs = [];
   updateExportState();
   elements.clearResults.disabled = true;
   elements.shareRun.disabled = true;
+  state.openedRunId = null;
+  syncRerunControls();
   elements.resultsViewTabs.classList.add("hidden");
   elements.tabFusionEvidenceView.classList.add("hidden");
   rebuildGeneIndex([]);
@@ -873,6 +941,7 @@ function setRunning(isRunning) {
   state.isRunning = isRunning;
   elements.runButton.textContent = isRunning ? "Running..." : "Run";
   elements.runButton.disabled = isRunning;
+  syncRerunControls();
 }
 
 function sleep(ms) {
@@ -934,6 +1003,13 @@ async function runAnnotation() {
     return;
   }
 
+  invalidateFusionEvidenceJobs();
+  invalidateAnnotationRetryJobs();
+  resetFusionEvidenceSections();
+  resetGeneIndexFilters();
+  state.currentRunInputs = annotationInputs.map((item) => ({ ...item }));
+  state.openedRunId = null;
+
   // Collapse the expanded batch sidebar so results have room
   document.body.classList.remove("batch-active");
 
@@ -973,6 +1049,8 @@ async function runAnnotation() {
 
     const job = await response.json();
     await pollAnnotationJob(job.status_url);
+    // This page started the run, so the signed-in user owns it.
+    state.canModifyRun = true;
     startFusionEvidenceJob(annotationInputs, state.currentResult?.run_id).catch((error) => {
       state.fusionEvidenceStatus = "failed";
       setMessage(formatRunError(error.message), "error");
@@ -1045,10 +1123,596 @@ function fusionEvidenceInputs(inputs) {
   return fusionInputs;
 }
 
-async function startFusionEvidenceJob(inputs, runId) {
-  const fusions = fusionEvidenceInputs(inputs);
-  if (!fusions.length || !state.currentResult) return;
+// Drops every in-flight fusion-evidence job (initial or retry). A tab left
+// "running" by a dropped job is reset, so a new run never shows a stuck
+// "Fusion evidence (0...)".
+function invalidateFusionEvidenceJobs() {
+  state.fusionEvidenceGeneration += 1;
+  state.rerunningFusionEvidenceKey = null;
+  state.fusionEvidenceRerunError = null;
+  if (state.fusionEvidenceStatus === "running") state.fusionEvidenceStatus = null;
+}
 
+// Starts a fusion-evidence job's lifetime: older jobs become stale, and this
+// one goes stale as soon as another starts or a different run is shown.
+function claimFusionEvidenceJob(runId) {
+  invalidateFusionEvidenceJobs();
+  return { generation: state.fusionEvidenceGeneration, runId: runId || null };
+}
+
+// A background job for one run is stale once a newer job of its kind started
+// (`generation` moved on) or a different run is shown.
+function runJobIsStale(token, generation) {
+  return (
+    token.generation !== generation ||
+    (token.runId !== null && state.currentResult?.run_id !== token.runId)
+  );
+}
+
+function fusionEvidenceJobIsStale(token) {
+  return runJobIsStale(token, state.fusionEvidenceGeneration);
+}
+
+function fusionEvidenceKey(item) {
+  const submission = item?.input || item?.fusion || "";
+  const tumorType = String(item?.tumor_type || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return `${submission}||${tumorType}`;
+}
+
+// A complete lookup: neither failed nor partial.
+function fusionEvidenceSucceeded(item) {
+  return item.retrieval_status !== "failed" && !item.partial;
+}
+
+// Same rule as the server's _merge_fusion_evidence: a failed or partial
+// lookup never replaces an item that succeeded.
+function mergeFusionEvidence(existing, incoming) {
+  const replacements = new Map((incoming || []).map((item) => [fusionEvidenceKey(item), item]));
+  const merged = [];
+  const replaced = new Set();
+  (existing || []).forEach((item) => {
+    const key = fusionEvidenceKey(item);
+    if (replacements.has(key)) {
+      const next = replacements.get(key);
+      merged.push(fusionEvidenceSucceeded(item) && !fusionEvidenceSucceeded(next) ? item : next);
+      replaced.add(key);
+    } else {
+      merged.push(item);
+    }
+  });
+  replacements.forEach((item, key) => {
+    if (!replaced.has(key)) {
+      merged.push(item);
+      replaced.add(key);
+    }
+  });
+  return merged;
+}
+
+function retryableFusionEvidence(items) {
+  return (items || []).filter((item) => item.retrieval_status === "failed");
+}
+
+// Re-runs one card's fusion with force_refresh through the same job + merge
+// path as retryFailedFusionEvidence. Only one fusion-evidence job runs at a
+// time (every retry/re-run control is disabled while one is running), so a
+// section retry and a single re-run can never overwrite each other.
+async function rerunFusionEvidence(item) {
+  if (!state.currentResult || !state.canModifyRun || state.fusionEvidenceStatus === "running") return;
+  const key = fusionEvidenceKey(item);
+  const token = claimFusionEvidenceJob(state.currentResult.run_id);
+  state.rerunningFusionEvidenceKey = key;
+  state.fusionEvidenceStatus = "running";
+  uiTrack().event({
+    type: "action", state: "retry", surface: "fusion_evidence", section: "fusion_card",
+    subject_kind: "fusion", subject_id: item.fusion, tumor_type_given: Boolean(item.tumor_type),
+  });
+  renderAnnotationResult(state.currentResult);
+
+  try {
+    const response = await fetch("/v1/fusion-evidence/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fusions: [{ fusion: item.input || item.fusion, tumor_type: item.tumor_type || undefined }],
+        mode: elements.annotateMode.value || "full",
+        run_id: state.currentResult.run_id || null,
+        force_refresh: true,
+      }),
+    });
+    if (fusionEvidenceJobIsStale(token)) return;
+    if (!response.ok) {
+      const body = await response.text();
+      let detail = body || response.statusText;
+      try { detail = JSON.parse(body).detail || detail; } catch { /* Plain-text error. */ }
+      throw new Error(detail || "Fusion evidence re-run failed");
+    }
+    const job = await response.json();
+    if (fusionEvidenceJobIsStale(token)) return;
+    const evidence = await pollRetriedFusionEvidenceJob(job.status_url, token);
+    if (evidence === null) return;
+    // A complete job can still carry a failed or partial lookup for this
+    // fusion. The merge keeps a card that had succeeded; a failed/partial
+    // card may be replaced (failed by failed, failed or partial by partial).
+    const rerun = evidence.find((entry) => fusionEvidenceKey(entry) === key);
+    if (!rerun) throw new Error("The re-run returned no evidence for this fusion.");
+    const previous = (state.currentResult.fusion_evidence || []).find((entry) => fusionEvidenceKey(entry) === key);
+    state.currentResult = {
+      ...state.currentResult,
+      fusion_evidence: mergeFusionEvidence(state.currentResult.fusion_evidence || [], evidence),
+    };
+    state.fusionEvidenceStatus = "complete";
+    state.rerunningFusionEvidenceKey = null;
+    const keptPrevious = Boolean(previous) && fusionEvidenceSucceeded(previous) && !fusionEvidenceSucceeded(rerun);
+    if (rerun.retrieval_status === "failed" || keptPrevious) {
+      const reason = rerun.retrieval_status === "failed"
+        ? rerun.interpretation || "PubMed lookup failed."
+        : "PubMed lookup was incomplete (partial result).";
+      state.fusionEvidenceRerunError = { key, runId: token.runId, message: `Re-run failed: ${reason}` };
+      renderAnnotationResult(state.currentResult);
+      clearMessage();
+      return;
+    }
+    renderAnnotationResult(state.currentResult);
+    setMessage(rerun.partial
+      ? `Fusion evidence re-run for ${item.fusion} returned a partial lookup.`
+      : `Fusion evidence re-run complete for ${item.fusion}.`, "info");
+  } catch (error) {
+    if (fusionEvidenceJobIsStale(token)) return;
+    // Leave the card exactly as it was; the error is shown inline on it.
+    state.fusionEvidenceStatus = "complete";
+    state.rerunningFusionEvidenceKey = null;
+    state.fusionEvidenceRerunError = {
+      key, runId: token.runId, message: `Re-run failed: ${formatRunError(error.message)}`,
+    };
+    renderAnnotationResult(state.currentResult);
+    clearMessage();
+  }
+}
+
+async function retryFailedFusionEvidence() {
+  if (!state.currentResult || !state.canModifyRun || state.fusionEvidenceStatus === "running") return;
+  const failed = retryableFusionEvidence(state.currentResult.fusion_evidence);
+  if (!failed.length) return;
+
+  // Re-submit the same submitted fusion spelling (which can differ from the
+  // resolved symbol) and tumor type that failed originally.
+  const fusions = failed.map((item) => ({
+    fusion: item.input || item.fusion,
+    tumor_type: item.tumor_type || undefined,
+  }));
+
+  const token = claimFusionEvidenceJob(state.currentResult.run_id);
+  state.fusionEvidenceStatus = "running";
+  renderAnnotationResult(state.currentResult);
+
+  try {
+    const response = await fetch("/v1/fusion-evidence/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fusions,
+        mode: elements.annotateMode.value || "full",
+        run_id: state.currentResult.run_id || null,
+      }),
+    });
+    if (fusionEvidenceJobIsStale(token)) return;
+    if (!response.ok) {
+      let detail = response.statusText;
+      const text = await response.text();
+      try {
+        const payload = JSON.parse(text);
+        detail = payload.detail || detail;
+      } catch {
+        detail = text || detail;
+      }
+      throw new Error(detail || "Fusion evidence retry failed");
+    }
+
+    const job = await response.json();
+    const retried = await pollRetriedFusionEvidenceJob(job.status_url, token);
+    // Another run is shown (or another evidence job started): drop it.
+    if (retried === null) return;
+    // Apply only the fully completed retry, so a late poll failure can never
+    // leave the viewer looking at a half-updated list.
+    state.currentResult = {
+      ...state.currentResult,
+      fusion_evidence: mergeFusionEvidence(
+        state.currentResult.fusion_evidence || [],
+        retried,
+      ),
+    };
+    state.fusionEvidenceStatus = "complete";
+    renderAnnotationResult(state.currentResult);
+    setMessage("Fusion evidence retry complete.", "info");
+  } catch (error) {
+    if (fusionEvidenceJobIsStale(token)) return;
+    // Keep the original items exactly as they were: retry results are staged
+    // until the job completes.
+    state.fusionEvidenceStatus = "complete";
+    renderAnnotationResult(state.currentResult);
+    setMessage(formatRunError(error.message), "error");
+  }
+}
+
+// Resolves to the retried evidence, or null once `token` is stale.
+async function pollRetriedFusionEvidenceJob(statusUrl, token) {
+  const stale = () => fusionEvidenceJobIsStale(token);
+  let staged = [];
+  while (true) {
+    if (stale()) return null;
+    const response = await fetch(statusUrl);
+    if (stale()) return null;
+    if (!response.ok) {
+      throw new Error(response.statusText || "Unable to load fusion evidence job status");
+    }
+    const status = await response.json();
+    if (stale()) return null;
+    if (status.status === "failed") {
+      throw new Error(status.error || "Fusion evidence job failed");
+    }
+
+    staged = status.fusion_evidence || staged;
+
+    if (status.status === "complete") {
+      return staged;
+    }
+
+    const total = status.fusions_total || "?";
+    setMessage(`Retrying fusion evidence: ${status.fusions_completed}/${total} fusions complete.`, "info");
+    await sleep(1500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Failed-annotation / no-result retries
+// ---------------------------------------------------------------------------
+
+const TRANSIENT_ANNOTATION_ERROR_MARKERS = [
+  "please retry",
+  "try again",
+  "synthesis error",
+  "timed out",
+  "timeout",
+  "temporarily",
+  "rate limit",
+  "connection",
+  "service unavailable",
+  "lookup failed",
+];
+const DETERMINISTIC_ANNOTATION_ERROR_MARKERS = [
+  "not a valid",
+  "belongs to",
+  "has no human",
+  "is not a gene symbol",
+  "unresolvable gene symbol",
+  "correct the gene",
+  "unannotated locus",
+  "not supported",
+];
+
+function isTransientAnnotationError(message) {
+  const text = String(message || "").trim().toLowerCase();
+  if (!text) return false;
+  if (TRANSIENT_ANNOTATION_ERROR_MARKERS.some((marker) => text.includes(marker))) return true;
+  return !DETERMINISTIC_ANNOTATION_ERROR_MARKERS.some((marker) => text.includes(marker));
+}
+
+// Error rows the server can plausibly fix on a retry. Deterministic rejections
+// (bad accession, mismatched transcript) are deliberately excluded.
+function retryableErrorAnnotations(annotations) {
+  return (annotations || []).filter(
+    (annotation) => annotation.error && isTransientAnnotationError(annotation.error),
+  );
+}
+
+// "No result" rows without an error are genes the pipeline could not ground.
+// Re-check them with force_refresh, since a cached low-evidence result would
+// just repeat itself.
+function recheckNoResultAnnotations(annotations) {
+  return (annotations || []).filter(
+    (annotation) => annotation.insufficient_evidence && !annotation.error,
+  );
+}
+
+// Same normalization as the server's _normalized_retry_token.
+function normalizedRetryToken(value) {
+  return String(value || "").trim().toUpperCase().split(/\s+/).filter(Boolean).join(" ");
+}
+
+// The gene plus the submitted spellings it was resolved from, so a row stored
+// under its raw input (an Ensembl ID whose lookup failed) is matched by the
+// retried row for the symbol it resolves to.
+function annotationMatchKeys(annotation) {
+  const keys = new Set([normalizedRetryToken(annotation?.gene)]);
+  (annotation?.resolved_inputs || []).forEach((resolution) => {
+    keys.add(normalizedRetryToken(resolution.input));
+  });
+  keys.delete("");
+  return keys;
+}
+
+// The tumor type a gene was annotated under: like the pipeline, the first
+// non-empty tumor type, in submission order, among inputs naming the gene
+// (as a gene, as a fusion partner, or by the spelling it was resolved from).
+function retryTumorTypeFor(annotation, runInputs) {
+  const keys = annotationMatchKeys(annotation);
+  for (const item of runInputs || []) {
+    const tumorType = String(item?.tumor_type || "").trim();
+    if (!tumorType) continue;
+    const spellings = [item.fusion, ...splitFusionGenes(String(item.fusion || ""))];
+    if (spellings.some((spelling) => keys.has(normalizedRetryToken(spelling)))) return tumorType;
+  }
+  return null;
+}
+
+// A retry works on genes, never submissions: each selected row is sent as its
+// own plain gene input, so a fusion's other partner (already good, or
+// rejected permanently) is never re-annotated.
+function retryInputsForAnnotations(annotations, runInputs) {
+  const inputs = [];
+  const seen = new Set();
+  (annotations || []).forEach((annotation) => {
+    const key = normalizedRetryToken(annotation.gene);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    const tumorType = retryTumorTypeFor(annotation, runInputs);
+    inputs.push(tumorType ? { fusion: annotation.gene, tumor_type: tumorType } : { fusion: annotation.gene });
+  });
+  return inputs;
+}
+
+// How good an annotation is: an error < no result < a grounded result.
+function annotationRank(annotation) {
+  if (annotation?.error) return 0;
+  if (annotation?.insufficient_evidence) return 1;
+  return 2;
+}
+
+function isRetryEligible(annotation, kind) {
+  return kind === "noresult"
+    ? Boolean(annotation.insufficient_evidence && !annotation.error)
+    : Boolean(annotation.error && isTransientAnnotationError(annotation.error));
+}
+
+// Mirrors the server's _merge_retried_annotations: only rows for the retried
+// genes (`targets`) that are still eligible are written, and only by a result
+// at least as good. Rows for any other gene are never touched, and results
+// for genes the retry wasn't asked for are dropped, never appended.
+// A row whose input never resolved to a gene (its `gene` is the raw
+// submission) takes its first resolution; see the server's
+// _row_has_gene_identity.
+function rowHasGeneIdentity(row) {
+  return !String(row?.error || "").toLowerCase().startsWith("unresolvable gene symbol");
+}
+
+// `mismatches` collects { rowGene, message } for target rows left unchanged:
+// the retried input now resolves to a different gene, to none, or no usable
+// result came back for it.
+function mergeRetriedAnnotations(existing, incoming, targets, kind, mismatches = []) {
+  const merged = [...(existing || [])];
+  const updated = new Set();
+  (incoming || []).forEach((annotation) => {
+    const blank = !normalizedRetryToken(annotation.gene);
+    let keys = new Set([...annotationMatchKeys(annotation)].filter((key) => targets.has(key)));
+    // A blank result that names no spelling: a one-gene retry's.
+    if (blank && !keys.size && targets.size === 1) keys = new Set(targets);
+    const matches = [];
+    merged.forEach((row, index) => {
+      if (keys.has(normalizedRetryToken(row.gene)) && isRetryEligible(row, kind)) matches.push(index);
+    });
+    if (!matches.length) return;
+    const [first, ...rest] = matches;
+    const rowGene = merged[first].gene;
+    if (blank) {
+      // Never written anywhere, not even as an unresolved row's first resolution.
+      const spelling = (annotation.resolved_inputs || [])
+        .map((resolution) => resolution.input)
+        .find((input) => targets.has(normalizedRetryToken(input))) || rowGene;
+      mismatches.push({ rowGene, message: `${spelling} did not resolve to a gene; not updated` });
+      return;
+    }
+    if (
+      normalizedRetryToken(annotation.gene) !== normalizedRetryToken(rowGene) &&
+      rowHasGeneIdentity(merged[first])
+    ) {
+      mismatches.push({
+        rowGene,
+        message: `${rowGene} now resolves to ${annotation.gene}, not ${rowGene}; ${rowGene} was not updated`,
+      });
+      return;
+    }
+    if (annotationRank(annotation) < annotationRank(merged[first])) return;
+    const resolvedInputs = mergedResolvedInputs(merged[first], annotation);
+    merged[first] = resolvedInputs.length
+      ? { ...annotation, resolved_inputs: resolvedInputs }
+      : annotation;
+    updated.add(normalizedRetryToken(rowGene));
+    rest.reverse().forEach((index) => {
+      if (annotationRank(merged[index]) <= annotationRank(annotation)) merged.splice(index, 1);
+    });
+  });
+  // Every target row still waiting for a result says why it wasn't updated,
+  // whatever the job returned (or didn't) for it — as the server reports.
+  const reported = new Set(mismatches.map(({ rowGene }) => normalizedRetryToken(rowGene)));
+  merged.forEach((row) => {
+    const key = normalizedRetryToken(row.gene);
+    if (!targets.has(key) || updated.has(key) || reported.has(key) || !isRetryEligible(row, kind)) return;
+    mismatches.push({
+      rowGene: row.gene,
+      message: `${row.gene}: no usable result was returned; not updated`,
+    });
+    reported.add(key);
+  });
+  return merged;
+}
+
+// The stored row's submitted spellings plus the retry's, one per input (as
+// the server's _merged_resolved_inputs keeps them).
+function mergedResolvedInputs(storedRow, incoming) {
+  const byInput = new Map();
+  [...(storedRow?.resolved_inputs || []), ...(incoming?.resolved_inputs || [])].forEach((resolution) => {
+    byInput.set(normalizedRetryToken(resolution.input), resolution);
+  });
+  return [...byInput.values()];
+}
+
+// Drops in-flight annotation retries when the displayed run changes; like
+// invalidateFusionEvidenceJobs, a late status for the old run is ignored.
+function invalidateAnnotationRetryJobs() {
+  state.annotationRetryGeneration += 1;
+  state.annotationRetryNotes = new Map();
+  state.annotationRetryStatus = null;
+  state.annotationRetryKind = null;
+}
+
+function claimAnnotationRetryJob(runId) {
+  invalidateAnnotationRetryJobs();
+  return { generation: state.annotationRetryGeneration, runId: runId || null };
+}
+
+function annotationRetryJobIsStale(token) {
+  return runJobIsStale(token, state.annotationRetryGeneration);
+}
+
+async function retryFailedAnnotations(kind) {
+  if (!state.currentResult || !state.canModifyRun || state.annotationRetryStatus === "running") return;
+  const annotations = state.currentResult.annotations || [];
+  const targets = kind === "noresult"
+    ? recheckNoResultAnnotations(annotations)
+    : retryableErrorAnnotations(annotations);
+  const inputs = retryInputsForAnnotations(targets, state.currentRunInputs);
+  const runId = state.currentResult.run_id;
+  if (!inputs.length || !runId) return;
+
+  const token = claimAnnotationRetryJob(runId);
+  state.annotationRetryStatus = "running";
+  state.annotationRetryKind = kind;
+  renderAnnotationResult(state.currentResult);
+
+  try {
+    const response = await fetch(`/v1/runs/${encodeURIComponent(runId)}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // A cached no-result annotation would just repeat itself.
+      body: JSON.stringify({
+        kind: kind === "noresult" ? "no_result" : "errors",
+        inputs,
+        force_refresh: kind === "noresult",
+      }),
+    });
+    if (annotationRetryJobIsStale(token)) return;
+    if (!response.ok) {
+      let detail = response.statusText;
+      const text = await response.text();
+      try {
+        const payload = JSON.parse(text);
+        detail = payload.detail || detail;
+      } catch {
+        detail = text || detail;
+      }
+      throw new Error(detail || "Annotation retry failed");
+    }
+
+    const job = await response.json();
+    const retried = await pollRetriedAnnotationsJob(job.status_url, token);
+    // Another run is shown (or another retry started): drop it.
+    if (retried === null) return;
+    // Apply only the fully completed retry, matching what the server saved.
+    const mismatches = [];
+    const merged = mergeRetriedAnnotations(
+      state.currentResult.annotations || [],
+      retried.annotations,
+      new Set(inputs.map((item) => normalizedRetryToken(item.fusion))),
+      kind,
+      mismatches,
+    );
+    // The server's per-input outcome wins; a mismatch only the page saw
+    // still explains why its row didn't change.
+    const notes = new Map();
+    mismatches.forEach(({ rowGene, message }) => notes.set(normalizedRetryToken(rowGene), message));
+    retried.outcomes.forEach((outcome) => {
+      if (outcome?.row_gene && outcome.message) {
+        notes.set(normalizedRetryToken(outcome.row_gene), outcome.message);
+      }
+    });
+    state.annotationRetryNotes = notes;
+    state.currentResult = {
+      ...state.currentResult,
+      annotations: merged,
+      genes_annotated: merged.length,
+    };
+    state.annotationRetryStatus = null;
+    state.annotationRetryKind = null;
+    renderAnnotationResult(state.currentResult);
+    const done = kind === "noresult" ? "No-result genes re-checked." : "Failed annotations retried.";
+    setMessage(
+      notes.size
+        ? `${done} ${notes.size} gene${notes.size === 1 ? " was" : "s were"} not updated; see the No result tab.`
+        : done,
+      "info",
+    );
+  } catch (error) {
+    if (annotationRetryJobIsStale(token)) return;
+    // Nothing is merged until the job completes, so the old rows stay put.
+    state.annotationRetryStatus = null;
+    state.annotationRetryKind = null;
+    renderAnnotationResult(state.currentResult);
+    setMessage(formatRunError(error.message), "error");
+  }
+}
+
+// Resolves to { annotations, outcomes } for the completed retry, or null once
+// `token` is stale.
+async function pollRetriedAnnotationsJob(statusUrl, token) {
+  const stale = () => annotationRetryJobIsStale(token);
+  while (true) {
+    if (stale()) return null;
+    const response = await fetch(statusUrl);
+    if (stale()) return null;
+    if (!response.ok) {
+      throw new Error(response.statusText || "Unable to load annotation retry status");
+    }
+    const status = await response.json();
+    if (stale()) return null;
+    if (status.status === "failed") {
+      throw new Error(status.error || "Annotation retry failed");
+    }
+    if (status.status === "complete") {
+      return {
+        annotations: status.result?.annotations || status.annotations || [],
+        outcomes: status.retry_outcomes || [],
+      };
+    }
+
+    const total = status.genes_total || "?";
+    setMessage(
+      `Retrying annotations: ${status.genes_completed}/${total} genes complete.`,
+      "info",
+    );
+    await sleep(1500);
+  }
+}
+
+// Resolves to the job's evidence, or null when the job went stale (another
+// run was shown or another evidence job started) — stale progress and
+// failures are dropped, never written into or reported on the newer result.
+async function startFusionEvidenceJob(
+  inputs, runId, mode = elements.annotateMode.value || "full", forceRefresh = false,
+) {
+  const fusions = fusionEvidenceInputs(inputs);
+  if (!fusions.length || !state.currentResult) return null;
+
+  const token = claimFusionEvidenceJob(runId);
+  try {
+    return await runFusionEvidenceJob(fusions, runId, mode, forceRefresh, token);
+  } catch (error) {
+    if (fusionEvidenceJobIsStale(token)) return null;
+    throw error;
+  }
+}
+
+async function runFusionEvidenceJob(fusions, runId, mode, forceRefresh, token) {
   state.fusionEvidenceStatus = "running";
   state.currentResult = {
     ...state.currentResult,
@@ -1061,26 +1725,34 @@ async function startFusionEvidenceJob(inputs, runId) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       fusions,
-      mode: elements.annotateMode.value || "full",
+      mode,
       run_id: runId || null,
+      force_refresh: forceRefresh === true,
     }),
   });
+  if (fusionEvidenceJobIsStale(token)) return null;
   if (!response.ok) {
     const text = await response.text();
     throw new Error(text || response.statusText || "Fusion evidence job failed");
   }
 
   const job = await response.json();
-  await pollFusionEvidenceJob(job.status_url);
+  return pollFusionEvidenceJob(job.status_url, token);
 }
 
-async function pollFusionEvidenceJob(statusUrl) {
+async function pollFusionEvidenceJob(
+  statusUrl, token = { generation: state.fusionEvidenceGeneration, runId: null },
+) {
+  const stale = () => fusionEvidenceJobIsStale(token);
   while (true) {
+    if (stale()) return null;
     const response = await fetch(statusUrl);
+    if (stale()) return null;
     if (!response.ok) {
       throw new Error(response.statusText || "Unable to load fusion evidence job status");
     }
     const status = await response.json();
+    if (stale()) return null;
     if (status.status === "failed") {
       throw new Error(status.error || "Fusion evidence job failed");
     }
@@ -1220,6 +1892,8 @@ async function copyShareLink() {
 // of a clean landing page.
 async function loadSharedRun() {
   const sharedRunId = new URLSearchParams(location.search).get("run");
+  // Consumed before any request, so an interrupted load can't replay it later.
+  const pendingRerun = takePendingRerun(sharedRunId);
   if (!sharedRunId) return;
 
   try {
@@ -1232,6 +1906,27 @@ async function loadSharedRun() {
       );
     }
     const result = await response.json();
+    // Shared links are readable by peers, but only the run's owner (or an
+    // admin) may retry failed lookups back onto it. Fail closed if this check
+    // can't be read, so other viewers never see an action they can't complete.
+    state.currentRunInputs = [];
+    try {
+      const accessResponse = await fetch(`/v1/runs/${encodeURIComponent(sharedRunId)}/access`);
+      state.canModifyRun = accessResponse.ok
+        ? Boolean((await accessResponse.json()).can_modify)
+        : false;
+      if (state.canModifyRun) {
+        const inputsResponse = await fetch(
+          `/v1/runs/${encodeURIComponent(sharedRunId)}/inputs`,
+        );
+        state.currentRunInputs = inputsResponse.ok
+          ? ((await inputsResponse.json()).inputs || [])
+          : [];
+      }
+    } catch {
+      state.canModifyRun = false;
+      state.currentRunInputs = [];
+    }
     // A run's fusion evidence job runs after the core annotation completes, so
     // it's normally persisted onto the run by the time anyone opens a share
     // link. Mark it complete up front so the tab shows immediately instead of
@@ -1239,11 +1934,122 @@ async function loadSharedRun() {
     if (result.fusion_evidence?.length) {
       state.fusionEvidenceStatus = "complete";
     }
+    invalidateFusionEvidenceJobs();
+    invalidateAnnotationRetryJobs();
+    resetFusionEvidenceSections();
+    resetGeneIndexFilters();
     state.currentResult = result;
+    state.openedRunId = result.run_id || sharedRunId;
     renderAnnotationResult(result);
+    syncRerunControls();
     setMessage("Shared run restored.", "info");
   } catch (error) {
     setMessage(formatRunError(error.message), "error");
+    return;
+  }
+  if (pendingRerun) await rerunSavedRun(sharedRunId, pendingRerun.forceRefresh);
+}
+
+// ---------------------------------------------------------------------------
+// Rerunning a saved run
+// ---------------------------------------------------------------------------
+
+// The My runs page hands a Rerun click over in sessionStorage (never the URL,
+// so a crafted link can't start a run), then opens the run here. Entries
+// older than this are ignored (an interrupted navigation or a duplicated tab).
+const PENDING_RERUN_KEY = "agcg.pendingRerun";
+const PENDING_RERUN_MAX_AGE_MS = 60 * 1000;
+
+function syncRerunControls() {
+  const visible = Boolean(state.openedRunId) && state.currentView !== "benchmark";
+  elements.rerunControls.classList.toggle("hidden", !visible);
+  elements.rerunRun.disabled = !visible || state.isRunning;
+  elements.rerunMode.disabled = !visible || state.isRunning;
+}
+
+function takePendingRerun(runId) {
+  let pending = null;
+  try {
+    const raw = sessionStorage.getItem(PENDING_RERUN_KEY);
+    if (raw === null) return null;
+    sessionStorage.removeItem(PENDING_RERUN_KEY);
+    pending = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!pending || !runId || pending.run_id !== runId) return null;
+  const age = Date.now() - Number(pending.created_at);
+  if (!(age >= 0 && age <= PENDING_RERUN_MAX_AGE_MS)) return null;
+  return { forceRefresh: pending.force_refresh === true };
+}
+
+async function rerunSavedRun(runId, forceRefresh = false) {
+  if (!runId || state.isRunning) return;
+  setRunning(true);
+  updateExportState({ annotationExportDisabled: true });
+  clearMessage();
+  setMessage(forceRefresh ? "Rerunning this run with refreshed results..." : "Rerunning this run...", "info");
+
+  let started = false;
+  try {
+    const response = await fetch(`/v1/runs/${encodeURIComponent(runId)}/rerun`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force_refresh: forceRefresh }),
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      const text = await response.text();
+      try {
+        detail = JSON.parse(text).detail || detail;
+      } catch {
+        detail = text || detail;
+      }
+      throw new Error(typeof detail === "string" && detail ? detail : "Rerun failed");
+    }
+
+    const job = await response.json();
+    started = true;
+    invalidateFusionEvidenceJobs();
+    invalidateAnnotationRetryJobs();
+    resetFusionEvidenceSections();
+    resetGeneIndexFilters();
+    const inputs = job.fusions || [];
+    inputs.forEach((item) => {
+      if (item.fusion) state.lastInputsByFusion[item.fusion] = item;
+    });
+    state.currentRunInputs = inputs.map((item) => ({ ...item }));
+    state.fusionEvidenceStatus = null;
+    state.currentResult = null;
+    const result = await pollAnnotationJob(job.status_url);
+    state.openedRunId = result?.run_id || null;
+    // The new run belongs to the caller, so (like a fresh submission) they
+    // may retry its failed lookups without a GET /v1/runs/{id}/access check.
+    state.canModifyRun = true;
+    if (result?.run_id) {
+      history.replaceState(null, "", `${location.pathname}?run=${encodeURIComponent(result.run_id)}`);
+    }
+    if (result?.fusion_evidence?.length) {
+      // Run with include_fusion_evidence: evidence is already on the result.
+      state.fusionEvidenceStatus = "complete";
+      renderAnnotationResult(result);
+    } else {
+      startFusionEvidenceJob(inputs, result?.run_id, job.mode || "full", forceRefresh).catch((error) => {
+        state.fusionEvidenceStatus = "failed";
+        setMessage(formatRunError(error.message), "error");
+        if (state.currentResult) renderAnnotationResult(state.currentResult);
+      });
+    }
+    setMessage("Rerun complete. Review fields before exporting.", "info");
+  } catch (error) {
+    if (!started) {
+      // Rejected before a job started: the opened run is still shown intact.
+      updateExportState();
+      elements.shareRun.disabled = !state.currentResult?.run_id;
+    }
+    setMessage(formatRunError(error.message), "error");
+  } finally {
+    setRunning(false);
   }
 }
 
@@ -1299,24 +2105,224 @@ async function runBenchmark() {
 // ---------------------------------------------------------------------------
 
 let _geneObserver = null;
+// Cards currently intersecting the viewport, as reported by _geneObserver.
+let _geneVisibleCards = new Set();
+// The rendered sidebar entries ({ btn, heading, haystack, label }) the
+// filter box toggles; filtering never touches the result cards themselves.
+let _geneIndexEntries = [];
+let _geneIndexFilterTimer = null;
+// Filter text per results tab. Survives redraws (polling re-renders the
+// cards and sidebar every few seconds); reset only when a new run loads,
+// results are cleared, or a shared run is opened — see resetGeneIndexFilters.
+const _geneIndexFilters = { results: "", noresult: "", fusion: "" };
+const GENE_INDEX_FILTER_DEBOUNCE_MS = 80;
 
-function rebuildGeneIndex(annotations) {
+function resetGeneIndexFilters() {
+  Object.keys(_geneIndexFilters).forEach((mode) => { _geneIndexFilters[mode] = ""; });
+  clearTimeout(_geneIndexFilterTimer);
+  _geneIndexFilterTimer = null;
+  syncGeneIndexFilterInput();
+}
+
+function geneIndexFilterMode() {
+  return state.resultsViewMode in _geneIndexFilters ? state.resultsViewMode : "results";
+}
+
+// Lowercase and fold fusion separators ("::", "-", "/", whitespace) to one
+// space, so "eml4 alk", "EML4-ALK" and "EML4::ALK" compare equal. Matching
+// is plain substring search on the result — the query never becomes a regex.
+function normalizeGeneIndexText(value) {
+  return String(value ?? "").toLowerCase().replace(/[\s:/-]+/g, " ").trim();
+}
+
+function syncGeneIndexFilterInput() {
+  const mode = geneIndexFilterMode();
+  const value = _geneIndexFilters[mode];
+  const label = mode === "fusion" ? "Filter fusions" : "Filter genes";
+  // Only write when it differs so a redraw mid-typing keeps the caret.
+  if (elements.geneIndexFilter.value !== value) elements.geneIndexFilter.value = value;
+  elements.geneIndexFilter.placeholder = label;
+  elements.geneIndexFilterLabel.textContent = label;
+  elements.geneIndexFilterClear.hidden = !value;
+}
+
+function rebuildGeneIndex(entries) {
+  if (_geneObserver) _geneObserver.disconnect();
+  _geneObserver = null;
+  _geneVisibleCards = new Set();
+  _geneIndexEntries = [];
   elements.geneIndex.replaceChildren();
-  if (!annotations || !annotations.length) return;
+  elements.geneIndexPanel.classList.toggle("hidden", !entries || !entries.length);
+  syncGeneIndexFilterInput();
+  if (!entries || !entries.length) {
+    applyGeneIndexFilter();
+    return;
+  }
 
-  annotations.forEach((annotation) => {
+  let previousSection;
+  let heading = null;
+  entries.forEach(({ targetId, label, count, section, searchTerms }) => {
+    if (section && section !== previousSection) {
+      heading = document.createElement("div");
+      heading.className = "fusion-index-section";
+      heading.textContent = section;
+      elements.geneIndex.appendChild(heading);
+    } else if (!section) {
+      heading = null;
+    }
+    previousSection = section;
     const btn = document.createElement("button");
     btn.className = "gene-index-item";
-    btn.textContent = annotation.gene;
+    btn.title = label;
     btn.type = "button";
+    btn.dataset.targetId = targetId;
+    if (count === undefined) {
+      btn.textContent = label;
+    } else {
+      btn.classList.add("fusion-index-item");
+      const name = document.createElement("span");
+      name.className = "fusion-index-name";
+      name.textContent = label;
+      const badge = document.createElement("span");
+      badge.className = "fusion-index-count";
+      badge.textContent = String(count);
+      btn.appendChild(name);
+      btn.appendChild(badge);
+      btn.setAttribute("aria-label", `${label}, ${count} PMIDs`);
+    }
     btn.addEventListener("click", () => {
-      const card = document.getElementById(`gene-${annotation.gene}`);
-      if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
+      const card = document.getElementById(targetId);
+      if (!card) return;
+      uiTrack().event({
+        type: "action", state: "jump", surface: "sidebar", section: "sidebar_entry",
+        subject_kind: count === undefined ? "gene" : "fusion", subject_id: label,
+      });
+      const sectionContainer = card.closest(".fusion-evidence-section");
+      const toggle = sectionContainer?.querySelector(".fusion-section-toggle");
+      if (toggle?.getAttribute("aria-expanded") === "false") toggle.click();
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
+      // Land keyboard and screen-reader users on the card they jumped to;
+      // the smooth scroll above does the scrolling.
+      if (card.getAttribute("tabindex") === null) card.setAttribute("tabindex", "-1");
+      card.focus({ preventScroll: true });
     });
     elements.geneIndex.appendChild(btn);
+    // One string per term, joined by a character the normalizer never emits,
+    // so a query cannot match across two terms.
+    const haystack = [label, ...(searchTerms || [])].map(normalizeGeneIndexText).join("\n");
+    _geneIndexEntries.push({ btn, heading, haystack, label: normalizeGeneIndexText(label) });
   });
 
+  applyGeneIndexFilter();
   observeGeneCards();
+}
+
+// Show only the sidebar entries matching the current tab's filter, hide
+// section headings left without entries, and update the count / No matches.
+function applyGeneIndexFilter() {
+  const query = normalizeGeneIndexText(_geneIndexFilters[geneIndexFilterMode()]);
+  const visibleHeadings = new Set();
+  let shown = 0;
+  _geneIndexEntries.forEach((entry) => {
+    const match = !query || entry.haystack.includes(query);
+    entry.btn.hidden = !match;
+    if (match) {
+      shown += 1;
+      if (entry.heading) visibleHeadings.add(entry.heading);
+    }
+  });
+  _geneIndexEntries.forEach(({ heading }) => {
+    if (heading) heading.hidden = !visibleHeadings.has(heading);
+  });
+  updateGeneIndexActive();
+  const filtering = Boolean(query) && _geneIndexEntries.length > 0;
+  elements.geneIndexFilterCount.textContent = filtering ? `${shown} of ${_geneIndexEntries.length}` : "";
+  elements.geneIndexNoMatches.hidden = !filtering || shown > 0;
+  return shown;
+}
+
+function setGeneIndexFilter(value) {
+  if (Boolean(_geneIndexFilters[geneIndexFilterMode()]) !== Boolean(value)) {
+    // Only that the filter was used or cleared — never the query text.
+    uiTrack().event({
+      type: "action", state: value ? "filter_used" : "filter_cleared", surface: "sidebar",
+      section: "sidebar_filter", item_id: geneIndexFilterMode(),
+    });
+  }
+  _geneIndexFilters[geneIndexFilterMode()] = value;
+  elements.geneIndexFilterClear.hidden = !value;
+  clearTimeout(_geneIndexFilterTimer);
+  _geneIndexFilterTimer = null;
+}
+
+function onGeneIndexFilterInput() {
+  setGeneIndexFilter(elements.geneIndexFilter.value);
+  _geneIndexFilterTimer = setTimeout(() => {
+    _geneIndexFilterTimer = null;
+    applyGeneIndexFilter();
+  }, GENE_INDEX_FILTER_DEBOUNCE_MS);
+}
+
+function clearGeneIndexFilter() {
+  elements.geneIndexFilter.value = "";
+  setGeneIndexFilter("");
+  applyGeneIndexFilter();
+}
+
+// Enter: jump to the first match — preferring an exact name, then a name
+// containing the query, over a hit on a related term (e.g. "eml" finds EML4
+// before ALK via EML4::ALK) — through the entry's own click handler, which
+// also opens a collapsed fusion section. Escape: clear the filter.
+function onGeneIndexFilterKeydown(event) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    clearGeneIndexFilter();
+    return;
+  }
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  setGeneIndexFilter(elements.geneIndexFilter.value);
+  applyGeneIndexFilter();
+  const query = normalizeGeneIndexText(elements.geneIndexFilter.value);
+  const matches = _geneIndexEntries.filter((entry) => !entry.btn.hidden);
+  const target = matches.find((entry) => entry.label === query)
+    || matches.find((entry) => entry.label.includes(query))
+    || matches[0];
+  if (!target) return;
+  target.btn.click();
+  _geneIndexEntries.forEach(({ btn }) => btn.classList.toggle("active", btn === target.btn));
+}
+
+function bindGeneIndexFilter() {
+  elements.geneIndexFilter.addEventListener("input", onGeneIndexFilterInput);
+  elements.geneIndexFilter.addEventListener("keydown", onGeneIndexFilterKeydown);
+  elements.geneIndexFilterClear.addEventListener("click", () => {
+    clearGeneIndexFilter();
+    elements.geneIndexFilter.focus();
+  });
+}
+
+// Mark the sidebar entry of the topmost on-screen card active. While the
+// filter hides entries, only cards whose entry is shown are candidates, so a
+// hidden entry never holds the highlight; if none of the on-screen cards
+// match, nothing is active.
+function updateGeneIndexActive() {
+  if (!_geneVisibleCards.size) {
+    // Nothing on screen yet: keep the current highlight unless it was just
+    // filtered out.
+    _geneIndexEntries.forEach(({ btn }) => {
+      if (btn.hidden) btn.classList.remove("active");
+    });
+    return;
+  }
+  const shownIds = new Set(_geneIndexEntries.filter(({ btn }) => !btn.hidden).map(({ btn }) => btn.dataset.targetId));
+  const candidates = [..._geneVisibleCards].filter((card) => shownIds.has(card.id));
+  const topCard = candidates.length
+    ? candidates.reduce((a, b) => (a.getBoundingClientRect().top < b.getBoundingClientRect().top ? a : b))
+    : null;
+  _geneIndexEntries.forEach(({ btn }) => {
+    btn.classList.toggle("active", Boolean(topCard) && btn.dataset.targetId === topCard.id);
+  });
 }
 
 function observeGeneCards() {
@@ -1324,19 +2330,24 @@ function observeGeneCards() {
   const cards = elements.resultsWindow.querySelectorAll(".annotation-card[id]");
   if (!cards.length) return;
 
+  const visibleCards = new Set();
+  _geneVisibleCards = visibleCards;
   _geneObserver = new IntersectionObserver(
     (entries) => {
-      const visible = entries.filter((e) => e.isIntersecting);
-      if (!visible.length) return;
-      const topEntry = visible.reduce((a, b) =>
-        a.boundingClientRect.top < b.boundingClientRect.top ? a : b,
-      );
-      const gene = topEntry.target.id.replace("gene-", "");
-      elements.geneIndex.querySelectorAll(".gene-index-item").forEach((btn) => {
-        btn.classList.toggle("active", btn.textContent === gene);
+      // Observer batches contain only changed intersections. Keep the other
+      // visible cards so a lower card entering cannot steal the active item.
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) visibleCards.add(entry.target);
+        else visibleCards.delete(entry.target);
       });
+      updateGeneIndexActive();
     },
-    { root: elements.resultsWindow, threshold: 0.15 },
+    {
+      // Viewport intersections are also clipped by scrolling ancestors, so
+      // this works across pane/page scrolling without re-picking on resize.
+      root: null,
+      threshold: 0.15,
+    },
   );
 
   cards.forEach((card) => _geneObserver.observe(card));
@@ -1402,10 +2413,12 @@ function showFeedbackModal() {
   }
 
   elements.feedbackModal.classList.remove("hidden");
+  uiTrack().event({ type: "open", surface: "feedback", section: "feedback_modal" });
 }
 
 function hideFeedbackModal() {
   elements.feedbackModal.classList.add("hidden");
+  uiTrack().event({ type: "close", surface: "feedback", section: "feedback_modal" });
 }
 
 function githubIssueUrl(title, body) {
@@ -1441,6 +2454,7 @@ async function submitFeedbackForm() {
       throw new Error(text || "Failed to submit feedback");
     }
     const payload = await response.json();
+    uiTrack().event({ type: "action", state: "submit", surface: "feedback", section: "feedback_modal" });
     if (payload.issue_url) {
       setInstallOutput("Thanks!", `Your feedback was filed as a GitHub issue: ${payload.issue_url}`);
     } else if (payload.issue_title && payload.issue_body) {
@@ -1452,6 +2466,7 @@ async function submitFeedbackForm() {
     elements.feedbackMessage.value = "";
     elements.feedbackEmail.value = "";
   } catch (error) {
+    uiTrack().event({ type: "action", state: "submit_failed", surface: "feedback", section: "feedback_modal" });
     setInstallOutput("Couldn't submit feedback", error.message, "error");
   } finally {
     elements.submitFeedback.disabled = false;
@@ -1461,6 +2476,8 @@ async function submitFeedbackForm() {
 function switchResultsView(mode) {
   if (state.resultsViewMode === mode || !state.currentResult) return;
   state.resultsViewMode = mode;
+  uiTrack().event({ type: "open", surface: "global", section: "tab", item_id: mode });
+  uiTrack().setActiveTab(mode);
   elements.tabResultsView.classList.toggle("active", mode === "results");
   elements.tabFusionEvidenceView.classList.toggle("active", mode === "fusion");
   elements.tabNoResultView.classList.toggle("active", mode === "noresult");
@@ -1473,6 +2490,7 @@ function switchResultsView(mode) {
 
 function renderAnnotationResult(result) {
   syncOpenEvidenceRun(result.run_id);
+  uiTrack().setRunScope(result.run_id);
   const allAnnotations = result.annotations || [];
   const visibleAnnotations = allAnnotations.filter((a) => !a.insufficient_evidence);
   const hiddenAnnotations = allAnnotations.filter((a) => a.insufficient_evidence);
@@ -1505,6 +2523,7 @@ function renderAnnotationResult(result) {
       ? "results"
       : (showFusionTab ? "fusion" : "noresult");
   }
+  uiTrack().setActiveTab(state.currentView === "annotate" ? state.resultsViewMode : state.currentView);
   elements.tabResultsView.classList.toggle("active", state.resultsViewMode === "results");
   elements.tabFusionEvidenceView.classList.toggle("active", state.resultsViewMode === "fusion");
   elements.tabNoResultView.classList.toggle("active", state.resultsViewMode === "noresult");
@@ -1543,10 +2562,11 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
   const list = document.createElement("div");
   list.className = "annotation-list";
 
-  visibleAnnotations.forEach((annotation) => {
+  visibleAnnotations.forEach((annotation, index) => {
     const card = document.createElement("article");
     card.className = "annotation-card";
     card.id = `gene-${annotation.gene}`;
+    uiTrack().surfaced(card, { ...geneTrackContext(annotation, "results", index), section: "gene_card" });
     card.innerHTML = `
       <header>
         <div class="annotation-heading">
@@ -1562,6 +2582,8 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
       <div class="annotation-fields"></div>
     `;
 
+    const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
+    if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);
     const cacheBadge = renderCacheBadge(annotation);
     if (cacheBadge) card.querySelector(".cache-badge-slot").appendChild(cacheBadge);
     card.querySelector(".status-line-slot").appendChild(renderStatusLine(annotation));
@@ -1574,6 +2596,9 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
         continue;
       }
       const row = renderField(annotation, field, label, type);
+      if (field === "cancer_association_rationale" || field === "gene_summary") {
+        uiTrack().observe(row, { section: field === "gene_summary" ? "gene_summary" : "rationale" });
+      }
       if (field === "cancer_association_rationale") {
         row.classList.add("field-row-highlight");
         fields.appendChild(row);
@@ -1599,12 +2624,12 @@ function applyResultsViewMode(visibleAnnotations, hiddenAnnotations, fusionEvide
     // above. Omitted entirely (not shown broken/empty) when OpenEvidence is
     // disabled, gated out client-side (see renderOpenEvidenceCard), or the
     // lookup fails.
-    const openEvidenceCard = renderOpenEvidenceCard(annotation);
+    const openEvidenceCard = renderOpenEvidenceCard(annotation, index);
     if (openEvidenceCard) list.appendChild(openEvidenceCard);
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex(visibleAnnotations);
+  rebuildGeneIndex(visibleAnnotations.map(geneIndexEntryForAnnotation));
 }
 
 function renderNoResultView(hiddenAnnotations) {
@@ -1619,7 +2644,45 @@ function renderNoResultView(hiddenAnnotations) {
   const list = document.createElement("div");
   list.className = "annotation-list";
 
-  hiddenAnnotations.forEach((annotation) => {
+  const retryableErrors = retryableErrorAnnotations(hiddenAnnotations);
+  const noResultGenes = recheckNoResultAnnotations(hiddenAnnotations);
+  if (state.canModifyRun && (retryableErrors.length || noResultGenes.length)) {
+    const actions = document.createElement("div");
+    actions.className = "annotation-retry-actions";
+    const running = state.annotationRetryStatus === "running";
+
+    if (retryableErrors.length) {
+      const retryErrors = document.createElement("button");
+      retryErrors.type = "button";
+      retryErrors.className = "retry-failed-annotations";
+      retryErrors.textContent = running && state.annotationRetryKind === "errors"
+        ? "Retrying..."
+        : "Retry failed annotations";
+      retryErrors.disabled = running;
+      retryErrors.addEventListener("click", () => {
+        retryFailedAnnotations("errors").catch(() => {});
+      });
+      actions.appendChild(retryErrors);
+    }
+
+    if (noResultGenes.length) {
+      const recheck = document.createElement("button");
+      recheck.type = "button";
+      recheck.className = "recheck-no-result-genes";
+      recheck.textContent = running && state.annotationRetryKind === "noresult"
+        ? "Re-checking..."
+        : "Re-check no-result genes";
+      recheck.disabled = running;
+      recheck.addEventListener("click", () => {
+        retryFailedAnnotations("noresult").catch(() => {});
+      });
+      actions.appendChild(recheck);
+    }
+
+    list.appendChild(actions);
+  }
+
+  hiddenAnnotations.forEach((annotation, index) => {
     const isError = Boolean(annotation.error);
     const reason =
       annotation.error ||
@@ -1646,6 +2709,19 @@ function renderNoResultView(hiddenAnnotations) {
         <div class="field-row-value">${escapeHtml(reason)}</div>
       </div>
     `;
+    const retryNote = state.annotationRetryNotes.get(normalizedRetryToken(annotation.gene));
+    if (retryNote) {
+      const noteRow = document.createElement("div");
+      noteRow.className = "field-row annotation-retry-note";
+      noteRow.innerHTML = `
+        <span class="field-row-label">Retry</span>
+        <div class="field-row-value">${escapeHtml(retryNote)}</div>
+      `;
+      card.appendChild(noteRow);
+    }
+    uiTrack().surfaced(card, { ...geneTrackContext(annotation, "no_result", index), section: "gene_card" });
+    const submittedNote = renderSubmittedInputNote(annotation.resolved_inputs);
+    if (submittedNote) card.querySelector(".annotation-heading").appendChild(submittedNote);
     const summary = String(annotation.gene_summary || "").trim();
     if (summary) {
       const summaryRow = document.createElement("div");
@@ -1654,6 +2730,7 @@ function renderNoResultView(hiddenAnnotations) {
         <span class="field-row-label">Interpreted gene summary</span>
         <div class="field-row-value">${escapeHtml(summary)}</div>
       `;
+      uiTrack().observe(summaryRow, { section: "gene_summary" });
       card.appendChild(summaryRow);
     }
     const evidence = renderSupportingEvidence(annotation);
@@ -1666,10 +2743,68 @@ function renderNoResultView(hiddenAnnotations) {
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex(hiddenAnnotations);
+  rebuildGeneIndex(hiddenAnnotations.map(geneIndexEntryForAnnotation));
+}
+
+// Besides the symbol, a gene's sidebar entry is findable by the fusions it
+// came from and by any submitted input the server rewrote to it (the
+// "— from ENST…/NM_…" note on its card).
+function geneIndexEntryForAnnotation(annotation) {
+  const submitted = (annotation.resolved_inputs || [])
+    .filter((entry) => entry && entry.input && entry.input !== entry.resolved)
+    .map((entry) => entry.input);
+  return {
+    targetId: `gene-${annotation.gene}`,
+    label: annotation.gene,
+    searchTerms: [...(annotation.fusions || []), ...submitted],
+  };
+}
+
+let _fusionSectionResultKey = null;
+const _fusionSectionOpen = new Map();
+
+function resetFusionEvidenceSections(resultKey = null) {
+  _fusionSectionResultKey = resultKey;
+  _fusionSectionOpen.clear();
+}
+
+function fusionEvidencePmidCount(item) {
+  return item.retrieved_count || (item.pmids || []).length;
+}
+
+// "TP53 — from ENST00000269305" for each input the server rewrote (Ensembl
+// IDs resolved to symbols), plus that input's warnings. Text only: these
+// strings echo user input, so never go through innerHTML.
+function renderSubmittedInputNote(resolutions) {
+  const rows = (resolutions || []).filter(
+    (entry) => entry && entry.input && (entry.input !== entry.resolved || (entry.warnings || []).length),
+  );
+  if (!rows.length) return null;
+  const note = document.createElement("div");
+  note.className = "subtle submitted-input-note";
+  rows.forEach((entry) => {
+    if (entry.input !== entry.resolved) {
+      const line = document.createElement("div");
+      line.textContent = `${entry.resolved} — from ${entry.input}`;
+      note.appendChild(line);
+    }
+    (entry.warnings || []).forEach((warning) => {
+      const line = document.createElement("div");
+      line.className = "submitted-input-warning";
+      line.textContent = warning;
+      note.appendChild(line);
+    });
+  });
+  return note;
+}
+
+function fusionEvidenceInputNote(item) {
+  return renderSubmittedInputNote(item.input ? [{ input: item.input, resolved: item.fusion, warnings: [] }] : []);
 }
 
 function renderFusionEvidenceView(fusionEvidence) {
+  const resultKey = state.currentResult?.run_id || state.currentResult;
+  if (_fusionSectionResultKey !== resultKey) resetFusionEvidenceSections(resultKey);
   const items = fusionEvidence || [];
   if (!items.length) {
     renderEmptyState(
@@ -1684,75 +2819,207 @@ function renderFusionEvidenceView(fusionEvidence) {
   const list = document.createElement("div");
   list.className = "annotation-list fusion-evidence-list";
 
-  items.forEach((item) => {
-    const card = document.createElement("article");
-    card.className = "annotation-card fusion-evidence-card";
-    card.id = `fusion-${cssSafeId(item.fusion)}`;
-    const pmids = item.pmids || [];
-    const cards = item.evidence_cards || [];
-    card.innerHTML = `
-      <header>
-        <div class="annotation-heading">
-          <h3>${escapeHtml(item.fusion)}</h3>
-          <div class="subtle">${escapeHtml(item.tumor_type || "Any tumor type")}</div>
-        </div>
-        <div class="annotation-card-meta">
-          <span class="review-badge ${item.well_supported ? "high" : "low"}">
-            ${item.well_supported ? "Well supported" : "Exploratory"}
-          </span>
-          <span class="status-pill">
-            ${item.retrieved_count || pmids.length} PMID${(item.retrieved_count || pmids.length) === 1 ? "" : "s"}
-          </span>
-        </div>
-      </header>
-      <div class="field-row field-row-highlight">
-        <span class="field-row-label">Fusion interpretation</span>
-        <div class="field-row-value">${escapeHtml(item.interpretation || "No interpretation available.")}</div>
-      </div>
-      <div class="supporting-evidence fusion-supporting-evidence"></div>
-    `;
-
-    const evidence = card.querySelector(".fusion-supporting-evidence");
-    if (pmids.length) {
-      const links = document.createElement("div");
-      links.className = "citation-links";
-      links.innerHTML = '<span class="field-label">Retrieved PMIDs</span>';
-      const linkRow = document.createElement("div");
-      linkRow.className = "citation-link-list";
-      pmids.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
-      links.appendChild(linkRow);
-      evidence.appendChild(links);
-    }
-
-    if (cards.length) {
-      const cardList = document.createElement("div");
-      cardList.className = "evidence-card-list";
-      cards.forEach((evidenceCard) => {
-        const itemCard = document.createElement("article");
-        itemCard.className = "evidence-card";
-        const evidenceType = String(evidenceCard.evidence_type || "fusion").replace(/_/g, " ");
-        itemCard.innerHTML = `
-          ${evidenceCardTopline(evidenceCard.pmid, evidenceType, evidenceCard.abstract)}
-          <h5>${escapeHtml(evidenceCard.title || "Untitled PubMed record")}</h5>
-          <p class="evidence-card-meta">${escapeHtml(evidenceCard.journal || "Journal unavailable")}</p>
-          ${preprintBadgeHtml(evidenceCard)}
-          ${aliasMatchNoticeHtml(evidenceCard)}
-          ${evidenceCard.selected_reason ? `<p>${escapeHtml(evidenceCard.selected_reason)}</p>` : ""}
-          ${evidenceCard.quote ? `<blockquote>${escapeHtml(evidenceCard.quote)}</blockquote>` : ""}
-        `;
-        cardList.appendChild(itemCard);
+  const indexEntries = [];
+  fusionEvidenceSections(items).forEach(({ label, key, items: sectionItems, collapsed }) => {
+    const section = document.createElement("section");
+    section.className = "fusion-evidence-section";
+    uiTrack().surfaced(section, {
+      surface: "fusion_evidence", subject_kind: "none", tab: "fusion", section: "fusion_section", item_id: key,
+    });
+    const heading = appendFusionText(section, "h3", "fusion-section-heading");
+    const toggle = appendFusionText(heading, "button", "fusion-section-toggle", `${label} (${sectionItems.length})`);
+    toggle.type = "button";
+    if (label === "Lookup failed" && state.canModifyRun) {
+      const retry = appendFusionText(
+        heading,
+        "button",
+        "retry-failed-fusions",
+        state.fusionEvidenceStatus === "running" && !state.rerunningFusionEvidenceKey
+          ? "Retrying..." : "Retry failed lookups",
+      );
+      retry.type = "button";
+      retry.disabled = state.fusionEvidenceStatus === "running";
+      retry.addEventListener("click", () => {
+        retryFailedFusionEvidence().catch(() => {});
       });
-      evidence.appendChild(cardList);
     }
-
-    const partnerPrecedent = renderFusionPartnerPrecedentForFusionEvidence(item);
-    if (partnerPrecedent) evidence.appendChild(partnerPrecedent);
-
-    list.appendChild(card);
+    const cards = document.createElement("div");
+    cards.className = "annotation-list fusion-section-cards";
+    cards.id = `fusion-section-${list.children.length}`;
+    toggle.setAttribute("aria-controls", cards.id);
+    const setOpen = (open) => {
+      toggle.setAttribute("aria-expanded", String(open));
+      cards.hidden = !open;
+      _fusionSectionOpen.set(label, open);
+    };
+    setOpen(_fusionSectionOpen.get(label) ?? !collapsed);
+    toggle.addEventListener("click", (event) => {
+      setOpen(cards.hidden);
+      uiTrack().toggled(section, !cards.hidden, event);
+    });
+    sectionItems.forEach((item) => {
+      const card = renderFusionEvidenceCard(item);
+      uiTrack().surfaced(card, {
+        surface: "fusion_evidence", subject_kind: "fusion", subject_id: item.fusion, tab: "fusion",
+        section: "fusion_card", position: items.indexOf(item), display_position: indexEntries.length,
+        tumor_type_given: Boolean(item.tumor_type),
+      });
+      // Include an ordinal so distinct fusion spellings cannot collide after sanitizing.
+      card.id = `fusion-${cssSafeId(item.fusion)}-${indexEntries.length}`;
+      cards.appendChild(card);
+      indexEntries.push({
+        targetId: card.id, label: item.fusion, count: fusionEvidencePmidCount(item), section: label,
+        searchTerms: item.input ? [item.input] : [],
+      });
+    });
+    section.appendChild(cards);
+    list.appendChild(section);
   });
 
   elements.resultsWindow.replaceChildren(list);
-  rebuildGeneIndex([]);
+  rebuildGeneIndex(indexEntries);
+}
+
+function fusionEvidenceSections(items) {
+  const sections = new Map();
+  items.forEach((item) => {
+    let label;
+    let order;
+    let key; // stable tracking id; the label can carry the tumor type
+    if (item.retrieval_status === "failed" || (item.partial && (!item.literature_scope || item.literature_scope === "no_literature"))) {
+      label = "Lookup failed";
+      order = 4;
+      key = "failed";
+    } else if (item.literature_scope === "no_literature") {
+      label = "No literature found";
+      order = 3;
+      key = "no_literature";
+    } else if (item.literature_scope === "requested_tumor" && item.tumor_type) {
+      label = `Found in ${item.tumor_type}`;
+      order = 0;
+      key = "requested_tumor";
+    } else if (item.literature_scope === "other_or_unspecified" && item.tumor_type) {
+      label = "Found in other tumor types";
+      order = 1;
+      key = "other_tumor";
+    } else if (item.literature_scope === "any_tumor") {
+      label = "Literature found";
+      order = 0;
+      key = "any_tumor";
+    } else if (item.literature_scope || (item.pmids || []).length || item.retrieved_count > 0) {
+      label = "Literature found — not classified by tumor type";
+      order = 2;
+      key = "unclassified";
+    } else {
+      label = "No literature found";
+      order = 3;
+      key = "no_literature";
+    }
+    if (!sections.has(label)) {
+      sections.set(label, { label, key, order, collapsed: label === "No literature found", items: [] });
+    }
+    sections.get(label).items.push(item);
+  });
+  return [...sections.values()].sort((a, b) => a.order - b.order);
+}
+
+function appendFusionText(parent, tag, className, text) {
+  const node = document.createElement(tag);
+  node.className = className;
+  if (text !== undefined) node.textContent = text;
+  parent.appendChild(node);
+  return node;
+}
+
+function renderFusionEvidenceCard(item) {
+  const card = document.createElement("article");
+  card.className = "annotation-card fusion-evidence-card";
+  const pmids = item.pmids || [];
+  const header = appendFusionText(card, "header", "fusion-section-card-header");
+  const heading = appendFusionText(header, "div", "annotation-heading");
+  appendFusionText(heading, "h4", "fusion-section-card-name", item.fusion);
+  appendFusionText(heading, "div", "subtle", item.tumor_type || "Any tumor type");
+  const inputNote = fusionEvidenceInputNote(item);
+  if (inputNote) heading.appendChild(inputNote);
+  const meta = appendFusionText(header, "div", "annotation-card-meta");
+  const key = fusionEvidenceKey(item);
+  if (state.canModifyRun) {
+    const rerunning = state.fusionEvidenceStatus === "running" && state.rerunningFusionEvidenceKey === key;
+    const rerun = appendFusionText(meta, "button", "rerun-fusion-evidence", rerunning ? "Re-running..." : "Re-run");
+    rerun.type = "button";
+    rerun.title = "Re-run this fusion's evidence lookup, bypassing cached results";
+    rerun.disabled = state.fusionEvidenceStatus === "running";
+    if (rerunning) card.setAttribute("aria-busy", "true");
+    rerun.addEventListener("click", () => { rerunFusionEvidence(item).catch(() => {}); });
+  }
+  const rerunError = state.fusionEvidenceRerunError;
+  if (rerunError?.key === key && rerunError.runId === (state.currentResult?.run_id || null)) {
+    const error = appendFusionText(card, "p", "fusion-rerun-error", rerunError.message);
+    error.setAttribute("role", "alert");
+  }
+  appendFusionText(meta, "span", `review-badge ${item.well_supported ? "high" : "low"}`,
+    item.well_supported ? "Well supported" : "Exploratory");
+  if (item.partial) appendFusionText(meta, "span", "status-pill", "Partial lookup");
+  const count = fusionEvidencePmidCount(item);
+  appendFusionText(meta, "span", "status-pill", `${count} PMID${count === 1 ? "" : "s"}`);
+  if (item.literature_scope === "requested_tumor" && item.tumor_type && item.retrieval_status !== "failed") {
+    appendFusionText(card, "p", "fusion-tumor-match",
+      `Mentions ${item.tumor_type} in ${(item.requested_tumor_pmids || []).length} of ${pmids.length} papers`);
+  }
+  const interpretation = appendFusionText(card, "div", "field-row field-row-highlight");
+  appendFusionText(interpretation, "span", "field-row-label", "Fusion interpretation");
+  appendFusionText(interpretation, "div", "field-row-value", item.interpretation || "No interpretation available.");
+  const evidence = appendFusionText(card, "div", "supporting-evidence fusion-supporting-evidence");
+  if (pmids.length) {
+    const links = appendFusionText(evidence, "div", "citation-links");
+    appendFusionText(links, "span", "field-label", "Retrieved PMIDs");
+    const linkRow = appendFusionText(links, "div", "citation-link-list");
+    pmids.forEach((pmid) => linkRow.appendChild(makePubMedLink(pmid)));
+    uiTrack().observe(links, { section: "retrieved_pmids" });
+  }
+  if (item.evidence_cards?.length) {
+    const cardList = appendFusionText(evidence, "div", "evidence-card-list");
+    item.evidence_cards.forEach((paper) => {
+      const paperCard = appendFusionText(cardList, "article", "evidence-card");
+      uiTrack().observe(paperCard, { section: "fusion_paper", item_id: paper.pmid });
+      const topline = appendFusionText(paperCard, "div", "evidence-card-topline");
+      const pill = appendFusionText(topline, "span", "pmid-pill");
+      const link = makePubMedLink(paper.pmid);
+      // Topline links retain the existing plain-link appearance, unlike the
+      // rounded pills in the separate Retrieved PMIDs list.
+      link.className = "";
+      link.textContent = `PMID ${paper.pmid}`;
+      pill.appendChild(link);
+      if (paper.abstract) {
+        const tooltip = appendFusionText(pill, "span", "pmid-abstract-tooltip");
+        tooltip.setAttribute("role", "tooltip");
+        appendFusionText(tooltip, "span", "pmid-abstract-tooltip-label", "Abstract");
+        appendFusionText(tooltip, "span", "", paper.abstract);
+      }
+      appendFusionText(topline, "span", "review-badge context",
+        String(paper.evidence_type || "fusion").replace(/_/g, " "));
+      appendFusionText(paperCard, "h5", "", paper.title || "Untitled PubMed record");
+      appendFusionText(paperCard, "p", "evidence-card-meta", paper.journal || "Journal unavailable");
+      if (paper.is_preprint) {
+        const notice = appendFusionText(paperCard, "p", "evidence-preprint-notice");
+        appendFusionText(notice, "span", "review-badge preprint", "Preprint – not peer-reviewed");
+      }
+      if (paper.matched_via_alias && paper.alias_matches?.length) {
+        const notice = appendFusionText(paperCard, "p", "evidence-alias-notice");
+        appendFusionText(notice, "span", "review-badge alias-match", "Found via alias");
+        appendFusionText(notice, "span", "evidence-alias-notice-detail",
+          paper.alias_matches.map((match) => `${match.alias} (${match.gene})`).join(", "));
+      }
+      if (paper.requested_tumor_terms?.length) {
+        appendFusionText(paperCard, "p", "fusion-tumor-match", `Matched tumor terms: ${paper.requested_tumor_terms.join(", ")}`);
+      }
+      if (paper.selected_reason) appendFusionText(paperCard, "p", "", paper.selected_reason);
+      if (paper.quote) appendFusionText(paperCard, "blockquote", "", paper.quote);
+    });
+  }
+  const partnerPrecedent = renderFusionPartnerPrecedentForFusionEvidence(item);
+  if (partnerPrecedent) evidence.appendChild(partnerPrecedent);
+  return card;
 }
 
 function cssSafeId(value) {
@@ -1858,6 +3125,7 @@ function renderSupportingEvidence(annotation) {
   if (count > 0) {
     const details = document.createElement("details");
     details.className = "retrieval-details";
+    uiTrack().details(details, { section: "retrieved_pmids" });
     const summary = document.createElement("summary");
     summary.className = "retrieval-summary";
     summary.innerHTML = `
@@ -1898,6 +3166,7 @@ function renderSupportingEvidence(annotation) {
 
   const cardDetails = document.createElement("details");
   cardDetails.className = "evidence-card-details";
+  uiTrack().details(cardDetails, { section: "evidence_cards" });
   const cardSummary = document.createElement("summary");
   cardSummary.className = "retrieval-summary";
   cardSummary.innerHTML = `
@@ -1915,6 +3184,7 @@ function renderSupportingEvidence(annotation) {
     evidenceCards.forEach((card) => {
       const item = document.createElement("article");
       item.className = "evidence-card";
+      uiTrack().observe(item, { section: "evidence_card", item_id: card.pmid });
       const evidenceType = String(card.evidence_type || "other").replace(/_/g, " ");
       item.innerHTML = `
         ${evidenceCardTopline(card.pmid, evidenceType, card.abstract)}
@@ -1954,6 +3224,7 @@ function renderSupportingEvidence(annotation) {
   if (quotes.length) {
     const quoteDetails = document.createElement("details");
     quoteDetails.className = "quote-details";
+    uiTrack().details(quoteDetails, { section: "supporting_quotes" });
     const quoteSummary = document.createElement("summary");
     quoteSummary.className = "quote-summary retrieval-summary";
     quoteSummary.innerHTML = `
@@ -1965,9 +3236,10 @@ function renderSupportingEvidence(annotation) {
 
     const quoteList = document.createElement("div");
     quoteList.className = "quote-list";
-    quotes.forEach((q) => {
+    quotes.forEach((q, index) => {
       const blockquote = document.createElement("blockquote");
       blockquote.className = "supporting-quote";
+      uiTrack().observe(blockquote, { section: "supporting_quote", item_id: `${q.pmid}:${index}` });
       const p = document.createElement("p");
       p.textContent = q.quote;
       const cite = document.createElement("cite");
@@ -1996,11 +3268,20 @@ function renderSupportingEvidence(annotation) {
 // from the fusion-annotation service response, never through the LLM. This
 // keeps latency and clutter off the default card: nothing here fetches until
 // a curator explicitly expands the section for a given fusion.
-function fetchFusionContext(fusionKey) {
+// Submitted input row for an annotated fusion string. The server rewrites
+// Ensembl-form inputs (ENST...::ENST..., GENE(ENST...)::...) to symbols, so
+// fall back to the submitted form it reports in resolved_inputs.
+function lastInputForFusion(annotation, fusion) {
+  if (state.lastInputsByFusion[fusion]) return state.lastInputsByFusion[fusion];
+  const resolution = (annotation.resolved_inputs || []).find((entry) => entry.resolved === fusion);
+  return resolution ? state.lastInputsByFusion[resolution.input] || { fusion: resolution.input } : undefined;
+}
+
+function fetchFusionContext(fusionKey, annotation) {
   if (state.fusionContextByFusion[fusionKey]) {
     return state.fusionContextByFusion[fusionKey];
   }
-  const requestBody = { fusion: fusionKey, ...(state.lastInputsByFusion[fusionKey] || {}) };
+  const requestBody = { fusion: fusionKey, ...(lastInputForFusion(annotation, fusionKey) || {}) };
   const promise = fetch("/v1/fusion-context", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2125,6 +3406,7 @@ function renderDomainsAndTreatments(annotation) {
 
   const details = document.createElement("details");
   details.className = "retrieval-details";
+  uiTrack().details(details, { section: "domains_treatments" });
   const summary = document.createElement("summary");
   summary.className = "retrieval-summary";
   summary.innerHTML = `<span class="retrieval-count-label">Domains &amp; treatments</span>`;
@@ -2139,7 +3421,7 @@ function renderDomainsAndTreatments(annotation) {
   details.addEventListener("toggle", () => {
     if (!details.open || loaded) return;
     loaded = true;
-    fetchFusionContext(fusionKey)
+    fetchFusionContext(fusionKey, annotation)
       .then((response) => renderFusionContextResult(body, response))
       .catch(() => {
         body.textContent = "Domain and treatment data not available for this fusion.";
@@ -2227,6 +3509,7 @@ const OPENEVIDENCE_MESSAGES = {
 
 // Replaces the card body with a one-line status note (failed/timed out).
 function renderOpenEvidenceCardNotice(body, message, kind) {
+  uiTrack().state(body, kind);
   const note = document.createElement("div");
   note.className = `subtle openevidence-card-notice openevidence-card-${kind}`;
   note.setAttribute("role", "status");
@@ -2281,6 +3564,7 @@ function syncOpenEvidenceRun(runId) {
 // only if the current run really is that job's.
 function adoptOpenEvidenceRunId(jobId, runId) {
   if (openEvidenceTerminal.runId === jobId) openEvidenceTerminal.runId = runId;
+  uiTrack().aliasRunScope(jobId, runId);
 }
 
 function openEvidenceKey(gene, tumorType, fusion) {
@@ -2360,6 +3644,8 @@ function createOpenEvidenceLifecycle(key, request) {
       return;
     }
     if (response?.status !== "pending") {
+      const outcome = !response?.available || !response.distilled ? "unavailable" : lifecycle.pending ? "ready" : "cached";
+      lifecycle.subscribers.forEach((subscriber) => uiTrack().state(subscriber.card, outcome));
       finish((subscriber) => renderOpenEvidenceCardBody(subscriber.card, subscriber.body, response));
       return;
     }
@@ -2396,7 +3682,9 @@ function createOpenEvidenceLifecycle(key, request) {
     });
     inflight = request(controller ? controller.signal : undefined);
     const settled = inflight.then(handle, () => {
-      if (!lifecycle.finished) finish((subscriber) => subscriber.card.remove());
+      if (lifecycle.finished) return;
+      lifecycle.subscribers.forEach((subscriber) => uiTrack().state(subscriber.card, "failed"));
+      finish((subscriber) => subscriber.card.remove());
     });
     return Promise.race([settled, slotReleased]).finally(() => {
       releaseSlot = null;
@@ -2414,6 +3702,7 @@ function createOpenEvidenceLifecycle(key, request) {
 }
 
 function showOpenEvidencePending(subscriber) {
+  uiTrack().state(subscriber.card, "pending");
   subscriber.body.replaceChildren(renderLoadingState(OPENEVIDENCE_MESSAGES.pending));
 }
 
@@ -2529,10 +3818,11 @@ function renderOpenEvidenceGuidelines(distilled) {
 
   const list = document.createElement("ul");
   list.className = "openevidence-guideline-list";
-  distilled.guidelines.forEach((guideline) => {
+  distilled.guidelines.forEach((guideline, index) => {
     const item = document.createElement("li");
     const link = document.createElement("a");
     link.href = guideline.url;
+    Object.assign(link.dataset, { trackSection: "openevidence_guideline_link", trackItem: String(index) });
     link.target = "_blank";
     link.rel = "noopener noreferrer";
     link.textContent = guideline.title || guideline.url;
@@ -2601,6 +3891,7 @@ function renderOpenEvidenceCardBody(card, body, response) {
     body.appendChild(note);
   }
 
+  uiTrack().surfaced(body, { section: "openevidence_content" });
   const footnote = document.createElement("div");
   footnote.className = "subtle openevidence-footnote";
   footnote.textContent =
@@ -2608,7 +3899,7 @@ function renderOpenEvidenceCardBody(card, body, response) {
   body.appendChild(footnote);
 }
 
-function renderOpenEvidenceCard(annotation) {
+function renderOpenEvidenceCard(annotation, displayPosition = null) {
   // Feature-flag gate: settings.openevidence_enabled, learned from GET
   // /v1/dev/status on page load (see loadDevStatus). When off, render no
   // card at all and never call fetchGeneOpenEvidence, so the client issues
@@ -2645,6 +3936,8 @@ function renderOpenEvidenceCard(annotation) {
   `;
   const body = card.querySelector(".openevidence-card-body");
   body.appendChild(renderLoadingState("Checking OpenEvidence…"));
+  uiTrack().surfaced(card, { ...geneTrackContext(annotation, "results", displayPosition), section: "openevidence" });
+  uiTrack().state(card, "loading");
 
   const tumorType = tumorTypeForAnnotation(annotation);
   const fusion = annotation.fusions?.[0];
@@ -2697,7 +3990,7 @@ function fusionPartnerGenes(annotation) {
 
 function tumorTypeForAnnotation(annotation) {
   for (const fusion of annotation.fusions || []) {
-    const match = state.lastInputsByFusion[fusion];
+    const match = lastInputForFusion(annotation, fusion);
     if (match && match.tumor_type) return match.tumor_type;
   }
   return null;
@@ -2810,6 +4103,7 @@ function appendFusionPartnerAgnosticFollowUp(body, gene, tumorType, seenPmids) {
 function renderFusionPartnerCheck(gene, tumorType) {
   const details = document.createElement("details");
   details.className = "field-row lazy-field-row";
+  uiTrack().details(details, { section: "fusion_partner_check", item_id: gene });
 
   const summary = document.createElement("summary");
   summary.className = "lazy-field-summary";
@@ -2862,6 +4156,7 @@ function renderFusionPartnerQueryButton(gene, tumorType) {
   resultBox.className = "fusion-partner-query-result hidden";
 
   button.addEventListener("click", () => {
+    uiTrack().event(container, { type: "open", section: "fusion_partner_check", item_id: gene });
     button.disabled = true;
     resultBox.classList.remove("hidden");
     resultBox.replaceChildren(renderLoadingState(`Searching PubMed for ${gene} fusion precedent`));
@@ -2887,7 +4182,7 @@ function renderFusionPartnerQueryButton(gene, tumorType) {
 
 function renderFusionPartnerPrecedentForFusionEvidence(item) {
   const retrievedCount = item.retrieved_count ?? (item.pmids || []).length;
-  if (retrievedCount > 0) return null;
+  if (retrievedCount > 0 || item.retrieval_status === "failed" || item.partial) return null;
 
   const partners = [];
   const seen = new Set();
@@ -3081,6 +4376,7 @@ function hasFieldValue(annotation, field) {
 function renderLazyField(annotation, field, label, type) {
   const details = document.createElement("details");
   details.className = "field-row lazy-field-row";
+  uiTrack().details(details, { section: "lazy_field", item_id: field });
 
   const summary = document.createElement("summary");
   summary.className = "lazy-field-summary";
@@ -3141,6 +4437,7 @@ function renderClinicalActionability(annotation) {
 
   const section = document.createElement("div");
   section.className = "clinical-actionability";
+  uiTrack().observe(section, { section: "clinical_actionability" });
 
   const header = document.createElement("div");
   header.className = "clinical-actionability-header";
@@ -3195,6 +4492,7 @@ function renderClinicalActionabilityBreakdown(actionability, abstractByPmid) {
 
   const details = document.createElement("details");
   details.className = "clinical-actionability-breakdown";
+  uiTrack().details(details, { section: "score_breakdown" });
 
   const summary = document.createElement("summary");
   summary.className = "clinical-actionability-breakdown-summary";
@@ -3282,6 +4580,7 @@ function renderCacheBadge(annotation) {
   badge.className = "review-badge cache-badge";
   const labelByReason = {
     fresh_final_annotation: "Cached final",
+    retraction_check_failed: "Cached — retraction check unavailable",
     no_new_pubmed_pmids_since_last_check: "Cached after PubMed check",
     force_refresh: "Force refreshed",
     computed_new_annotation: "Freshly computed",
@@ -3653,6 +4952,7 @@ function escapeAttr(value) {
 
 function bindEvents() {
   elements.runButton.addEventListener("click", runAnnotation);
+  bindGeneIndexFilter();
   elements.runBenchmarkButton.addEventListener("click", runBenchmark);
   elements.navAnnotate.addEventListener("click", () => switchView("annotate"));
   elements.navBenchmark.addEventListener("click", () => switchView("benchmark"));
@@ -3701,6 +5001,9 @@ function bindEvents() {
   elements.batchUploadInput.addEventListener("change", handleBatchFileUpload);
 
   elements.shareRun.addEventListener("click", copyShareLink);
+  elements.rerunRun.addEventListener("click", () => {
+    rerunSavedRun(state.openedRunId, elements.rerunMode.value === "refresh");
+  });
   elements.clearResults.addEventListener("click", clearResults);
   elements.exportButton.addEventListener("click", async () => {
     try {

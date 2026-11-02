@@ -1,24 +1,94 @@
 """Shared test fixtures."""
 
+import functools
+import os
 import sys
+import threading
 from typing import Dict, List, Optional, Tuple
 
+import aiomysql
 import pytest
 
 from src.pipeline import cache as cache_module
 from src.pipeline import literature as literature_module
 
+# Tests FLUSHDB the configured Redis and drop/truncate MySQL tables, so they
+# only touch real backends when explicitly opted in (CI sets this against its
+# throwaway service containers) — never a developer's local Redis/MySQL.
+DESTRUCTIVE_TESTS_ENV = "ACGC_ALLOW_DESTRUCTIVE_TESTS"
+
+
+def destructive_tests_allowed() -> bool:
+    return os.environ.get(DESTRUCTIVE_TESTS_ENV) == "1"
+
+
+# Port 1 refuses connections immediately: Redis-backed tests skip or fail open.
+_UNREACHABLE_REDIS_URL = "redis://127.0.0.1:1/0"
+
 
 @pytest.fixture(autouse=True)
-async def _reset_cache_client():
+def _guard_real_backends(monkeypatch):
+    """Without the opt-in, point the configured Redis at nothing. Refuse real
+    MySQL connections unless opted in AND the database name contains "test".
+    The refusal is a connection error, so MySQL-backed tests skip as if no
+    MySQL were reachable. Tests that fake redis/aiomysql patch over this."""
+    from src.config import settings
+
+    if not destructive_tests_allowed():
+        monkeypatch.setattr(settings, "redis_url", _UNREACHABLE_REDIS_URL)
+        monkeypatch.setattr(settings, "redis_sentinel_enabled", False)
+
+    def guarded(real):
+        @functools.wraps(real)
+        def connect(*args, **kwargs):
+            db = kwargs.get("db") or ""
+            if not destructive_tests_allowed() or "test" not in db:
+                raise ConnectionRefusedError(
+                    f"tests refuse real MySQL database {db!r}: set {DESTRUCTIVE_TESTS_ENV}=1 "
+                    "and point MYSQL_DATABASE at a disposable database whose name contains 'test'"
+                )
+            return real(*args, **kwargs)
+
+        return connect
+
+    monkeypatch.setattr(aiomysql, "create_pool", guarded(aiomysql.create_pool))
+    monkeypatch.setattr(aiomysql, "connect", guarded(aiomysql.connect))
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "redis_user_store_only: skip under the user_store_backend fixture's mysql run",
+    )
+    config.addinivalue_line(
+        "markers",
+        "no_real_redis: never build a client for the configured Redis (or flush it); "
+        "the cache client is an in-memory FakeRedis instead",
+    )
+
+
+@pytest.fixture(autouse=True)
+async def _reset_cache_client(request, _guard_real_backends):
     """Reset the cache module's Redis client singleton before each test.
 
     redis.asyncio.Redis binds its connection pool to the event loop active
     at creation time. pytest-asyncio creates a fresh event loop per test
     function by default, so a client cached from an earlier test becomes
     unusable in a later test's loop — reset it so each test gets its own.
+
+    Tests marked `no_real_redis`, or using the `fake_redis` fixture, never
+    construct (let alone flush) a client for the configured Redis.
     """
     cache_module._client = None
+    if request.node.get_closest_marker("no_real_redis") is not None:
+        cache_module._client = FakeRedis()
+        yield
+        cache_module._client = None
+        return
+    if "fake_redis" in request.fixturenames:
+        yield
+        cache_module._client = None
+        return
     client = cache_module._get_client()
     try:
         await client.flushdb()
@@ -57,10 +127,84 @@ def _reset_ncbi_rate_limiter():
 
 
 @pytest.fixture(autouse=True)
+def _job_stores_use_fake_redis(monkeypatch):
+    """Point src.main's job stores at a per-test FakeRedis with empty local
+    state, so job snapshots never reach a real Redis and no job leaks
+    between tests. Only touches src.main if a test already imported it."""
+    main = sys.modules.get("src.main")
+    if main is None:
+        yield
+        return
+    redis = FakeRedis()
+    from src.api.curation_reevaluate_routes import _jobs as curation_jobs
+
+    stores = (main._annotation_jobs, main._enrichment_jobs, main._fusion_evidence_jobs, curation_jobs)
+    for store in stores:
+        store.clear_local()
+        monkeypatch.setattr(store, "_redis_client_factory", lambda: redis)
+    yield
+    for store in stores:
+        store.clear_local()
+
+
+@pytest.fixture(autouse=True)
 def _default_auth_disabled(monkeypatch):
     """Ensure tests run with auth_enabled=False by default (individual auth tests monkeypatch it to True)."""
     from src.config import settings
     monkeypatch.setattr(settings, "auth_enabled", False)
+
+
+@pytest.fixture(autouse=True)
+def _auth_profiles_in_memory(monkeypatch):
+    """Keep JIT user profiles in src.auth's in-process store, empty per test.
+
+    Session auth reads the live profile on every request and fails closed
+    (503) when the configured Redis errors or can't be reached, so the auth
+    module never talks to the configured Redis in tests. Yields the real
+    store hooks so tests can exercise the Redis code path with a fake client.
+    """
+    from src import auth
+
+    originals = {
+        "_get_auth_redis_client": auth._get_auth_redis_client,
+        "_profile_store_redis": auth._profile_store_redis,
+    }
+
+    async def _no_redis():
+        return None
+
+    monkeypatch.setattr(auth, "_get_auth_redis_client", _no_redis)
+    monkeypatch.setattr(auth, "_profile_store_redis", _no_redis)
+    monkeypatch.setattr(auth, "_user_store", {})
+    monkeypatch.setattr(auth, "_user_activity", {})
+    yield originals
+
+
+@pytest.fixture(params=["redis", "mysql"])
+def user_store_backend(request, monkeypatch, _auth_profiles_in_memory):
+    """Run a test once per USER_STORE_BACKEND.
+
+    "redis" is today's path (the in-process store unless the test installs a
+    fake Redis); "mysql" points src.auth at a FakeUserStore, the in-memory
+    stand-in with the MySQL store's behaviour, and yields it. Tests marked
+    `redis_user_store_only` exercise Redis specifics and skip under "mysql".
+    tests/auth_helpers.py stores and removes profiles in whichever is active.
+    """
+    from src import auth
+    from src.config import settings
+
+    if request.param == "redis":
+        monkeypatch.setattr(settings, "user_store_backend", "redis")
+        yield None
+        return
+    if request.node.get_closest_marker("redis_user_store_only") is not None:
+        pytest.skip("exercises the Redis user-record code path")
+    from src.pipeline.user_store_fake import FakeUserStore
+
+    store = FakeUserStore()
+    monkeypatch.setattr(settings, "user_store_backend", "mysql")
+    monkeypatch.setattr(auth, "_mysql_user_store", store)
+    yield store
 
 
 @pytest.fixture(autouse=True)
@@ -179,3 +323,15 @@ def fake_redis(monkeypatch):
     redis = FakeRedis()
     monkeypatch.setattr(cache_module, "_client", redis)
     return redis
+
+
+@pytest.fixture(autouse=True)
+def _reset_statsd_lifecycle(monkeypatch):
+    """Each test starts with a fresh (uninitialized, unpublished) shared
+    DogStatsd client lifecycle — a test that ran the app's lifespan leaves it
+    `closed`, which would otherwise turn later tests' metrics into no-ops."""
+    from src import observability
+
+    monkeypatch.setattr(observability, "_statsd_state", observability._UNINITIALIZED)
+    monkeypatch.setattr(observability, "_statsd_client", None)
+    monkeypatch.setattr(observability, "_statsd_shutdown", threading.Event())
