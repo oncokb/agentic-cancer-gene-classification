@@ -279,6 +279,63 @@ test("page scripts never use innerHTML or tracking", () => {
   assert.ok(!source.includes("ACGCTracking"));
 });
 
+const deferred = () => {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+};
+const flush = () => new Promise((done) => setImmediate(done));
+
+test("switching history scope while the global log loads shows only the user's rows", async () => {
+  const globalLog = deferred();
+  const USER_CHANGE = { ...CHANGE, id: 9, email: PENDING.email, field: "status", old_value: "pending", new_value: "active" };
+  const OTHER = { ...CHANGE, id: 8, email: "someone@mskcc.org" };
+  const e = env([
+    ME_RESPONSE, usersPage([ADMIN, CURATOR, PENDING]), globalLog.promise,
+    logPage([USER_CHANGE], { next_cursor: null }),
+  ]);
+  const init = e.page.init();
+  await flush();
+  assert.strictEqual(e.calls[2].url, "/v1/admin/role-changes?limit=50"); // in flight
+  // The user's History starts its own load at once, not after the global one.
+  const history = buttons(rowFor(e, PENDING.email)).find((b) => b.textContent === "History");
+  await history.fire("click");
+  assert.strictEqual(e.calls[3].url, `/v1/admin/users/${encodeURIComponent(PENDING.email)}/changes?limit=50`);
+  // The global log answers late, with other users' rows and a cursor.
+  globalLog.resolve(logPage([CHANGE, OTHER], { next_cursor: "global-cursor" }));
+  await init;
+  await flush();
+  assert.strictEqual(e.nodes["admin-log-heading"].textContent, `Change history for ${PENDING.email}`);
+  const logRows = e.nodes["admin-log-tbody"].children;
+  assert.deepStrictEqual(logRows.map((row) => row.children[1].textContent), [PENDING.email]);
+  assert.strictEqual(e.page.state.log.nextCursor, null);
+  assert.ok(e.nodes["admin-log-more"].hidden);
+  assert.ok(!e.nodes["admin-log-more"].disabled);
+  assert.strictEqual(e.page.state.log.loading, false);
+  assert.ok(e.nodes["admin-error"].hidden);
+});
+
+test("a late failure from a superseded log request shows no error", async () => {
+  const userLog = deferred();
+  const e = env([ME_RESPONSE, usersPage([ADMIN, CURATOR]), logPage([CHANGE]), userLog.promise, logPage([CHANGE])]);
+  await e.page.init();
+  const pending = e.page.showHistory(CURATOR.email);
+  await e.nodes["admin-log-all"].fire("click"); // back to all changes before the user's log returns
+  userLog.resolve(response({ detail: "boom" }, 503));
+  await pending;
+  assert.ok(e.nodes["admin-error"].hidden);
+  assert.strictEqual(e.nodes["admin-log-heading"].textContent, "Change log");
+  assert.strictEqual(e.nodes["admin-log-tbody"].children.length, 1);
+});
+
+test("history URLs encode emails containing '/'", async () => {
+  const slashed = user("a/b@mskcc.org", "viewer", "active");
+  const e = env([ME_RESPONSE, usersPage([ADMIN, slashed]), logPage([]), logPage([])]);
+  await e.page.init();
+  await e.page.showHistory(slashed.email);
+  assert.strictEqual(e.calls[3].url, "/v1/admin/users/a%2Fb%40mskcc.org/changes?limit=50");
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of tests) {

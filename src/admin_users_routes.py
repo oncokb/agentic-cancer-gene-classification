@@ -16,7 +16,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from src import auth
@@ -29,6 +29,7 @@ from src.auth import (
     mysql_user_store_enabled,
     require_auth,
 )
+from src.request_origin import require_same_origin_json
 from src.pipeline.user_store import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -118,6 +119,18 @@ async def require_admin_role(current_user: AuthenticatedUser = Depends(require_a
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Administrator privileges required for this action.",
         )
+    return current_user
+
+
+async def require_admin_write(
+    request: Request, current_user: AuthenticatedUser = Depends(require_admin_role),
+) -> AuthenticatedUser:
+    """require_admin_role for a state change. A browser session (cookie) must
+    also prove the request came from this app's own origin with a JSON body:
+    SameSite=Lax cookies are still sent from same-site sibling origins. An
+    API key (Authorization: Bearer) isn't sent ambiently, so it's exempt."""
+    if current_user.auth_method != "api_key":
+        require_same_origin_json(request)
     return current_user
 
 
@@ -242,11 +255,12 @@ async def list_users(
     )
 
 
-@router.post("/users/{email}/changes", response_model=AccessChangeResponse)
+# {email:path}: an address may contain '/' (sent percent-encoded as %2F).
+@router.post("/users/{email:path}/changes", response_model=AccessChangeResponse)
 async def change_user_access(
     email: str,
     payload: AccessChangeRequest,
-    current_user: AuthenticatedUser = Depends(require_admin_role),
+    current_user: AuthenticatedUser = Depends(require_admin_write),
 ) -> AccessChangeResponse:
     """Set a user's role and/or status in one transaction, logged in
     role_changes with the acting admin as actor. A no-op writes nothing."""
@@ -306,7 +320,7 @@ async def list_role_changes(
     return await _role_change_page(None, limit, cursor)
 
 
-@router.get("/users/{email}/changes", response_model=RoleChangePageResponse)
+@router.get("/users/{email:path}/changes", response_model=RoleChangePageResponse)
 async def list_user_role_changes(
     email: str,
     limit: int = Query(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),

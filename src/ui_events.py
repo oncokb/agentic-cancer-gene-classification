@@ -10,7 +10,6 @@ from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Literal, Optional, Union
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -21,6 +20,7 @@ from pydantic import (
 
 from src.auth import _uses_api_key, require_auth
 from src.config import settings
+from src.request_origin import parse_origin as _origin
 from src.observability import increment, reset_user_context, set_user_context, stable_user_key
 from src.pipeline.cache import _get_client
 
@@ -160,18 +160,6 @@ _local_rate: dict[str, deque[float]] = {}
 _local_ids: OrderedDict[str, float] = OrderedDict()
 _MAX_LOCAL_IDS = 10000
 _last_redis_warning = 0.0
-
-
-def _origin(value: str, *, allow_path: bool = False) -> Optional[tuple[str, str, int]]:
-    try:
-        url = urlsplit(value)
-        if (url.scheme not in {"http", "https"} or not url.hostname or url.username or
-                url.password or (not allow_path and url.path not in {"", "/"}) or
-                url.query or url.fragment):
-            return None
-        return url.scheme, url.hostname.lower(), url.port or (443 if url.scheme == "https" else 80)
-    except ValueError:
-        return None
 
 
 def _guard(request: Request) -> None:

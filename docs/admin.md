@@ -32,6 +32,10 @@ API keys stop working; a demoted admin loses admin pages and endpoints.
 - Requests that change nothing write nothing.
 - Every change is recorded in `role_changes` with your email as the actor;
   the log is insert-only.
+- Changes made with your browser session are accepted only from ACGC's own
+  pages (same origin as `PUBLIC_APP_BASE_URL`), so another site, including a
+  sibling subdomain, can't make them on your behalf. Scripts using an admin's
+  API key aren't affected.
 
 ## Requirements
 
