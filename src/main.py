@@ -1276,6 +1276,7 @@ def _merge_retried_annotations(
     targets: Dict[str, str],
     kind: RunRetryKind,
     outcomes: Optional[List[RunRetryOutcome]] = None,
+    tumor_types: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Merge a gene retry into a stored run, in place.
 
@@ -1294,8 +1295,14 @@ def _merge_retried_annotations(
     it was; incoming rows for genes the retry wasn't asked for are dropped,
     never appended. The written row keeps the stored row's resolved_inputs
     alongside the retry's. Existing warnings are kept; new warnings about an
-    updated gene are added. genes_annotated is recomputed."""
+    updated gene are added. genes_annotated is recomputed.
+
+    `tumor_types` is the retry's AnnotationResult.annotation_tumor_types: each
+    row actually replaced gets that tumor context in the run's
+    annotation_tumor_types (so its curator override is looked up under the
+    tumor type it was re-annotated with); rows left unchanged keep theirs."""
     rows = list(stored.get("annotations") or [])
+    replaced_context: Dict[str, Optional[str]] = {}
     row_keys = set(targets.values())
     updated_keys: set[str] = set()
     updated_rows: set[str] = set()
@@ -1351,6 +1358,9 @@ def _merge_retried_annotations(
             rows[index] = row
             updated_keys |= keys | {destination}
             updated_rows.add(destination)
+            if tumor_types is not None:
+                written_gene = str(row.get("gene"))
+                replaced_context[written_gene] = tumor_types.get(written_gene)
     if outcomes is not None:
         # Every target row still waiting for a result says why it wasn't
         # updated, whatever the pipeline returned (or didn't) for it.
@@ -1379,6 +1389,9 @@ def _merge_retried_annotations(
     stored["annotations"] = rows
     stored["warnings"] = existing_warnings
     stored["genes_annotated"] = len(rows)
+    if replaced_context:
+        context = stored.get("annotation_tumor_types")
+        stored["annotation_tumor_types"] = {**(context if isinstance(context, dict) else {}), **replaced_context}
     return stored
 
 
@@ -2345,8 +2358,10 @@ async def _persist_retried_annotations(
 
     def merge(stored: Dict[str, Any]) -> Dict[str, Any]:
         outcomes.clear()
+        # The tumor context is merged under the same row lock as the rows.
         return _merge_retried_annotations(
             stored, incoming, result.warnings, targets, kind, outcomes,
+            tumor_types=result.annotation_tumor_types,
         )
 
     merged = await http_request.app.state.run_store.merge_run_result(

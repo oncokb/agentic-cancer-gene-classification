@@ -463,8 +463,10 @@ class CurationStoreMixin:
                 return cursor.rowcount == 1
 
     async def set_run_annotation_tumor_types(self, run_id: str, entries: Dict[str, Optional[str]]) -> None:
-        """Atomically merge confirmed gene -> tumor type entries into the run's
-        annotation_tumor_types, touching no other part of result_json."""
+        """Atomically add reconstructed gene -> tumor type entries to the run's
+        annotation_tumor_types, touching no other part of result_json. Only
+        missing entries are added (JSON_INSERT): an entry written meanwhile,
+        e.g. by a gene retry, is never overwritten by a reconstruction."""
         if not entries:
             return
         assignments = ", ".join(["%s, %s"] * len(entries))
@@ -476,7 +478,7 @@ class CurationStoreMixin:
                 await cursor.execute(
                     f"""
                     UPDATE runs SET
-                        result_json = JSON_SET(
+                        result_json = JSON_INSERT(
                             JSON_SET(
                                 result_json, '$.annotation_tumor_types',
                                 COALESCE(JSON_EXTRACT(result_json, '$.annotation_tumor_types'), JSON_OBJECT())

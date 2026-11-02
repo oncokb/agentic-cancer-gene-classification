@@ -982,6 +982,9 @@ Reads are open to every signed-in user, including viewers. Writes (`PUT`,
 from Keycloak roles or SAML groups (they are stored on the user record only),
 and every request re-reads the user's current role, so a promotion or demotion
 takes effect on the next request, for sessions and API keys alike.
+With `USER_STORE_BACKEND=redis` (legacy), members of `KEYCLOAK_ADMIN_ROLES` /
+`SAML_ADMIN_GROUPS` are promoted to admin at sign-in; with `mysql`, groups never
+change a role.
 `GET /auth/me` reports `can_curate`. For local testing, use dev login with
 `?role=curator` for a new user (or run with auth disabled, which allows
 curation).

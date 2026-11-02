@@ -169,7 +169,7 @@ overrides"). Any signed-in user can read them; saving or reverting one needs the
 `curator` or `admin` role, which an admin grants on `/admin/users` (see
 [Admin user management](#admin-user-management-v1admin)). Roles never come
 from Keycloak roles or SAML groups, and an API key acts with its owner's
-current role.
+current role. With `USER_STORE_BACKEND=redis` (legacy), members of `KEYCLOAK_ADMIN_ROLES` / `SAML_ADMIN_GROUPS` are promoted to admin at sign-in; with `mysql`, groups never change a role.
 
 The gene query API deliberately leaves out abstracts, quotes, evidence cards
 and OpenEvidence content. Open its `view_url` to see them. (The annotate
