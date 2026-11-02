@@ -176,6 +176,10 @@ class DuplicatePendingCuratorRequest(Exception):
     """The email already has a pending curator request."""
 
 
+class CuratorRequestIneligible(Exception):
+    """Approval requires an active viewer, checked under the transaction lock."""
+
+
 class LastActiveAdmin(Exception):
     """The change would leave no active admin."""
 
@@ -1146,8 +1150,8 @@ class UserStoreMixin:
     ) -> CuratorRequest:
         """Approve or reject a pending request in one transaction.
 
-        Approval makes a viewer a curator with a role_changes row linked to
-        the request; a curator or admin keeps their role (never a demotion).
+        Approval requires an active viewer and grants curator with a linked
+        role_changes row. Ineligible applicants leave the request pending.
         Raises CuratorRequestNotFound, CuratorRequestAlreadyDecided, or
         UserNotFound (approval for an email with no user); on any error
         nothing is written."""
@@ -1170,11 +1174,12 @@ class UserStoreMixin:
                     user = await self._fetch_user(cursor, request.email, for_update=True)
                     if user is None:
                         raise UserNotFound(request.email)
-                    if user.role == "viewer":
-                        await self._apply_user_field(
-                            cursor, "role", request.email, "curator", actor=reviewer,
-                            reason=note, request_id=request_id, now=now,
-                        )
+                    if user.role != "viewer" or user.status != "active":
+                        raise CuratorRequestIneligible(request.email)
+                    await self._apply_user_field(
+                        cursor, "role", request.email, "curator", actor=reviewer,
+                        reason=note, request_id=request_id, now=now,
+                    )
         return CuratorRequest(
             id=request.id, email=request.email, reason=request.reason,
             affiliation=request.affiliation, expertise=request.expertise, orcid=request.orcid,

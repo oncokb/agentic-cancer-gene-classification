@@ -95,7 +95,32 @@
         </div>
         <button class="primary-action hidden" id="admin-log-more" type="button">Load more</button>
       </section>
+      <section class="api-keys-card" aria-labelledby="curator-heading">
+        <h2 id="curator-heading">Curator requests</h2>
+        <form id="curator-filters">
+          <label for="curator-filter">Status</label>
+          <select id="curator-filter">
+            <option value="pending">Pending</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+          </select>
+          <button type="submit">Refresh</button>
+        </form>
+        <p id="curator-message" role="status"></p>
+        <div id="curator-rows"></div>
+        <button type="button" class="hidden" id="curator-more">Load more</button>
+      </section>
     </main>
+    <div class="modal-backdrop hidden" id="curator-confirm" role="dialog" aria-modal="true" aria-labelledby="curator-confirm-message">
+      <form class="feedback-modal" id="curator-review">
+        <h2 id="curator-confirm-message">Confirm review</h2>
+        <label for="curator-note">Reviewer note (optional)</label>
+        <textarea id="curator-note" maxlength="1000" rows="3"></textarea>
+        <p id="curator-review-error" role="alert"></p>
+        <button type="button" id="curator-cancel">Cancel</button>
+        <button type="submit" class="primary-action" id="curator-review-submit">Confirm</button>
+      </form>
+    </div>
 
     <div class="modal-backdrop hidden" id="admin-confirm" role="dialog" aria-modal="true" aria-labelledby="admin-confirm-title">
       <div class="feedback-modal">
@@ -115,5 +140,6 @@
     </div>
 
     <script src="/static/admin-users.js"></script>
+    <script src="/static/curator-requests.js"></script>
   </body>
 </html>

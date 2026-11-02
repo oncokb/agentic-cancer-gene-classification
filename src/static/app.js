@@ -161,6 +161,7 @@ const elements = {
   userName: document.querySelector("#user-name"),
   userRole: document.querySelector("#user-role"),
   userEmail: document.querySelector("#user-email"),
+  curatorRequestLink: document.querySelector("#curator-open"),
   adminUsersLink: document.querySelector("#admin-users-link"),
   signoutBtn: document.querySelector("#signout-btn"),
   userSignin: document.querySelector("#user-signin"),
@@ -344,6 +345,7 @@ async function checkAuth() {
         elements.userRole.className = `user-role-badge role-${role.toLowerCase()}`;
       }
       if (elements.userEmail) elements.userEmail.textContent = payload.user.email;
+      if (elements.curatorRequestLink) elements.curatorRequestLink.classList.toggle("hidden", payload.user.role !== "viewer");
       if (elements.adminUsersLink) elements.adminUsersLink.classList.toggle("hidden", payload.user.role !== "admin");
 
       if (elements.userAvatar) {
