@@ -1443,7 +1443,88 @@ async function test_revert_dialog_is_locked_while_delete_is_pending() {
   assert.ok(app.root("curation-aux-body").allText.includes("boom"), "error shown");
 }
 
+async function test_access_lost_during_save_preflight_sends_no_put() {
+  let releasePreflight;
+  let preflightSeen = false;
+  let brafForbidden = false;
+  const puts = [];
+  const app = loadCurationApp({
+    routes: async (method, url, reqBody) => {
+      if (method === "POST" && url === "/v1/curation/reevaluate/jobs") {
+        const id = reqBody.subject_key === "ALK" ? "job-a" : "job-b";
+        return [200, { job_id: id, status_url: `/v1/curation/reevaluate/jobs/${id}` }];
+      }
+      if (url === "/v1/curation/reevaluate/jobs/job-a") {
+        return [200, { status: "succeeded", error: null, invalid_pmids: null, draft: GENE_DRAFT }];
+      }
+      if (url === "/v1/curation/reevaluate/jobs/job-b") {
+        return brafForbidden
+          ? [403, { detail: "Curator privileges required" }]
+          : [200, { status: "running", error: null, invalid_pmids: null, draft: null }];
+      }
+      if (method === "GET" && url.startsWith("/v1/curation/gene/ALK?")) {
+        preflightSeen = true;
+        await new Promise((resolve) => { releasePreflight = resolve; });
+        return [200, { version: 0, override: null }];
+      }
+      if (method === "PUT") puts.push(reqBody);
+      return method === "PUT" ? [200, { version: 1, override: { curator_email: "c", updated_at: "x", payload: reqBody.payload } }] : undefined;
+    },
+  });
+  const result = geneResult({}, { annotation_tumor_types: { ALK: "LUAD", BRAF: "LUAD" } });
+  result.annotations.push({ ...geneAnnotation(), gene: "BRAF" });
+  render(app, result);
+  // Another subject's re-evaluation job is polling in the background.
+  app.openCurationDialog(app.geneCurationSubject(result.annotations[1]));
+  footerButton(app, "submit").click();
+  await waitFor(() => app.curationState.sessions.get("gene|BRAF|luad")?.job?.id === "job-b", "BRAF job");
+  app.closeCurationDialog();
+
+  await toDraft(app);
+  typeInto(oneByData(body(app), "curation", "rationale"), "Typed before the preflight.");
+  footerButton(app, "save").click();
+  await waitFor(() => preflightSeen && releasePreflight, "preflight GET held");
+  brafForbidden = true; // demoted server-side: the other job's poll sees 403
+  await waitFor(() => app.state.auth.can_curate === false, "access lost via the poll");
+  releasePreflight();
+  await waitFor(() => !app.curationState.busy, "save finished");
+  assert.strictEqual(puts.length, 0, "no PUT after access was lost mid-save");
+  assert.ok(app.root("curation-modal").classList.contains("hidden"));
+  assert.strictEqual(app.curationState.sessions.get("gene|ALK|luad").draft.rationale, "Typed before the preflight.");
+  assert.deepStrictEqual(editControls(app.root("results-window")).map((c) => c.dataset.curation || c.tagName), []);
+}
+
+async function test_save_preflight_403_flips_to_read_only_and_keeps_the_draft() {
+  const puts = [];
+  let saving = false;
+  const routes = jobRoutes();
+  const app = loadCurationApp({
+    routes: async (method, url, reqBody) => {
+      if (method === "GET" && /^\/v1\/curation\/gene\/ALK\?/.test(url) && saving) {
+        return [403, { detail: "Curator privileges required" }];
+      }
+      if (method === "PUT") puts.push(reqBody);
+      return routes(method, url, reqBody);
+    },
+  });
+  render(app, geneResult());
+  await toDraft(app);
+  typeInto(oneByData(body(app), "curation", "rationale"), "Typed before the 403 preflight.");
+  saving = true;
+  const before = app.requests.length;
+  footerButton(app, "save").click();
+  await waitFor(() => !app.curationState.busy && app.requests.slice(before).some((r) => r.method === "GET"), "preflight answered");
+  assert.strictEqual(app.state.auth.can_curate, false, "a 403 on the preflight GET means access is gone");
+  assert.ok(app.root("curation-modal").classList.contains("hidden"), "editor closes");
+  assert.ok(noticeText(app).includes(ACCESS_LOST));
+  assert.strictEqual(puts.length, 0);
+  assert.deepStrictEqual(editControls(app.root("results-window")).map((c) => c.dataset.curation || c.tagName), []);
+  assert.strictEqual(app.curationState.sessions.get("gene|ALK|luad").draft.rationale, "Typed before the 403 preflight.");
+}
+
 runTests("curation UI", [
+  test_access_lost_during_save_preflight_sends_no_put,
+  test_save_preflight_403_flips_to_read_only_and_keeps_the_draft,
   test_demotion_on_auth_refresh_removes_controls_and_blocks_writes,
   test_save_403_flips_to_read_only_and_keeps_the_draft,
   test_submit_and_revert_403_flip_to_read_only,
