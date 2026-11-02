@@ -985,7 +985,15 @@ returns `422`.
 
 ### POST /v1/admin/users/{email}/changes
 
-Change a user's role and/or status. URL-encode the email (`@` as `%40`).
+Change a user's role and/or status. URL-encode the email (`@` as `%40`, `/`
+as `%2F`).
+
+Send the body as `Content-Type: application/json` (otherwise `415`). With an
+API key that's all. From a browser session (cookie), the request must also
+come from ACGC's own pages: `Sec-Fetch-Site: same-origin`, or, from a browser
+that doesn't send `Sec-Fetch-Site`, an `Origin` (or `Referer`) exactly
+matching `PUBLIC_APP_BASE_URL`'s scheme, host and port; anything else is
+`403`, so a page on a sibling subdomain can't use an admin's cookie.
 
 ```json
 { "role": "curator", "status": "active", "reason": "Approved by the curation lead" }
@@ -1018,10 +1026,12 @@ is a no-op (`"changes": []`). The change applies to the user's next request
 
 | Status | When |
 |---|---|
+| `403` | Not an admin, or (browser session) no same-origin evidence. Nothing is written. |
 | `404` | No such user (or not an email address). |
 | `409` | The change would leave no **active** admin (the last active admin can't be demoted or disabled; promote or re-enable another admin first). Checked in the same transaction as the change, so two admins can't remove each other at once. |
 | `409` | You tried to disable your own account (demoting yourself is allowed while another active admin remains). |
 | `409` | `USER_STORE_BACKEND` is `redis`. |
+| `415` | The body isn't declared `application/json`. Nothing is written. |
 | `422` | Neither `role` nor `status`, an unknown value, `status: "pending"`, or a reason over 1000 characters. Nothing is written. |
 | `503` | The user store is unavailable. Nothing is written. |
 

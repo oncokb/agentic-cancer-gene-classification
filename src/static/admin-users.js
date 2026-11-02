@@ -96,7 +96,7 @@
       loading: false,
       loaded: false,
       error: null,
-      log: { email: null, changes: [], nextCursor: null, loading: false, loaded: false },
+      log: { email: null, changes: [], nextCursor: null, loading: false, loaded: false, seq: 0 },
       pending: null,
       saving: false,
     };
@@ -267,14 +267,20 @@
       }
     }
 
+    // A reset (new scope, or a reload after a change) supersedes any request
+    // in flight: each request carries the sequence number current when it
+    // started, and a response whose number is stale is dropped, so one scope's
+    // rows or cursor never land under another scope's heading.
     async function loadLog({ reset = false } = {}) {
       const log = state.log;
-      if (log.loading || !state.writable) return;
+      if (!state.writable || (log.loading && !reset)) return;
       if (reset) {
         log.changes = [];
         log.nextCursor = null;
         log.loaded = false;
       }
+      const seq = ++log.seq;
+      const isCurrent = () => seq === log.seq;
       log.loading = true;
       renderLog();
       const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
@@ -284,16 +290,20 @@
         : "/v1/admin/role-changes";
       try {
         const data = await api(`${base}?${params.toString()}`, { method: "GET" });
+        if (!isCurrent()) return;
         if (!data || !Array.isArray(data.changes)) throw new Error("Invalid change log response");
         log.changes = log.changes.concat(data.changes);
         log.nextCursor = data.next_cursor || null;
         log.loaded = true;
       } catch (error) {
+        if (!isCurrent()) return;
         state.error = error;
         renderUsers();
       } finally {
-        log.loading = false;
-        renderLog();
+        if (isCurrent()) {
+          log.loading = false;
+          renderLog();
+        }
       }
     }
 

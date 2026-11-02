@@ -84,8 +84,12 @@ def put(email: str, role: str = "viewer", status: str = "active", name: Optional
     return profile
 
 
-def session(email: str = ADMIN, role: str = "admin") -> TestClient:
-    client = TestClient(app)
+# What a browser sends for a fetch() from the /admin/users page itself.
+SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
+
+
+def session(email: str = ADMIN, role: str = "admin", *, same_origin: bool = True) -> TestClient:
+    client = TestClient(app, headers=SAME_ORIGIN if same_origin else None)
     client.cookies.set(
         settings.auth_cookie_name,
         create_session_token(AuthenticatedUser(email=email, name="X", domain="mskcc.org", role=role)),
@@ -450,7 +454,7 @@ async def test_two_admins_removing_each_other_concurrently_leave_one(monkeypatch
         token = create_session_token(AuthenticatedUser(email=email, name="X", domain="mskcc.org", role="admin"))
         return httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test",
-            cookies={settings.auth_cookie_name: token},
+            cookies={settings.auth_cookie_name: token}, headers=SAME_ORIGIN,
         )
 
     async with client(ADMIN) as a, client(ADMIN2) as b:
@@ -554,3 +558,114 @@ def test_page_serves_admins_only(store):
 def test_page_auth_disabled_serves_page(monkeypatch):
     monkeypatch.setattr(settings, "auth_enabled", False)
     assert TestClient(app).get("/admin/users", follow_redirects=False).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# CSRF: cookie-authenticated changes need same-origin evidence and JSON
+# ---------------------------------------------------------------------------
+
+
+def _assert_unchanged(store):
+    assert stored_profile(VIEWER).role == "viewer"
+    assert all_changes(store) == []
+
+
+def test_cross_subdomain_no_cors_promotion_is_rejected(store):
+    """Codex's repro: a sibling origin's fetch(..., {mode: "no-cors"}) carries
+    the SameSite=Lax cookie, with no Content-Type and a raw JSON body."""
+    seed()
+    client = session(same_origin=False)
+    response = client.post(
+        changes_url(VIEWER), content=b'{"role":"admin"}',
+        headers={"Origin": "https://evil.oncokb.org", "Sec-Fetch-Site": "same-site"},
+    )
+    assert response.status_code == 403
+    _assert_unchanged(store)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Sec-Fetch-Site": "same-site"},
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "none"},
+        # Sec-Fetch-Site wins over a matching Origin.
+        {"Sec-Fetch-Site": "same-site", "Origin": "https://acgc.example"},
+        # No Sec-Fetch-Site (older browser): Origin/Referer must match exactly.
+        {"Origin": "https://evil.acgc.example"},
+        {"Origin": "http://acgc.example"},
+        {"Origin": "https://acgc.example:8443"},
+        {"Origin": "null"},
+        {"Referer": "https://evil.acgc.example/admin/users"},
+        {},
+    ],
+)
+def test_cookie_changes_without_same_origin_evidence_are_403(store, monkeypatch, headers):
+    monkeypatch.setattr(settings, "public_app_base_url", "https://acgc.example/app")
+    seed()
+    response = session(same_origin=False).post(changes_url(VIEWER), json={"role": "admin"}, headers=headers)
+    assert response.status_code == 403
+    _assert_unchanged(store)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Sec-Fetch-Site": "same-origin"},
+        {"Origin": "https://acgc.example"},
+        {"Referer": "https://acgc.example/admin/users?x=1"},
+    ],
+)
+def test_cookie_changes_with_same_origin_evidence_succeed(store, monkeypatch, headers):
+    monkeypatch.setattr(settings, "public_app_base_url", "https://acgc.example/app")
+    seed()
+    response = session(same_origin=False).post(changes_url(VIEWER), json={"role": "curator"}, headers=headers)
+    assert response.status_code == 200
+    assert stored_profile(VIEWER).role == "curator"
+
+
+@pytest.mark.parametrize("content_type", [None, "text/plain", "application/x-www-form-urlencoded"])
+def test_cookie_changes_require_json_content_type(store, content_type):
+    seed()
+    headers = {"Content-Type": content_type} if content_type else {}
+    response = session().post(changes_url(VIEWER), content=b'{"role":"admin"}', headers=headers)
+    assert response.status_code == 415
+    _assert_unchanged(store)
+
+
+def test_api_key_changes_need_no_origin_evidence(store, auth_env):
+    seed()
+    headers = api_key_headers(auth_env, ADMIN)
+    response = TestClient(app).post(changes_url(PENDING), json={"status": "active"}, headers=headers)
+    assert response.status_code == 200
+    # Even a foreign Origin: a bearer key isn't sent ambiently by a browser.
+    headers["Origin"] = "https://evil.example"
+    response = TestClient(app).post(changes_url(VIEWER), json={"role": "curator"}, headers=headers)
+    assert response.status_code == 200
+
+
+def test_cross_origin_reads_stay_allowed(store):
+    # Reads change nothing; CORS keeps their responses from other origins.
+    seed()
+    client = session(same_origin=False)
+    assert client.get(USERS, headers={"Sec-Fetch-Site": "same-site"}).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Emails containing '/'
+# ---------------------------------------------------------------------------
+
+
+def test_email_with_slash_can_be_managed(store):
+    seed()
+    slashed = "a/b@mskcc.org"
+    put(slashed, "viewer")
+    client = session()
+    response = client.post(changes_url(slashed), json={"role": "curator"})
+    assert response.status_code == 200
+    assert response.json()["user"]["email"] == slashed
+    assert stored_profile(slashed).role == "curator"
+    history = client.get(changes_url(slashed)).json()["changes"]
+    assert [(c["email"], c["new_value"]) for c in history] == [(slashed, "curator")]
+    # A user whose address ends like another's isn't confused with it.
+    assert client.get(changes_url("b@mskcc.org")).status_code == 404
