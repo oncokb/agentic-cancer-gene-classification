@@ -349,10 +349,8 @@ REEVALUATE_JOBS = "/v1/curation/reevaluate/jobs"
 
 
 def test_reevaluate_jobs_require_curator(auth_on):
-    """POST/GET re-evaluation jobs are curator-only. They ship in #116
-    (feat/curator-reevaluate); until it merges there is nothing to guard."""
-    if not any(getattr(route, "path", "").startswith(REEVALUATE_JOBS) for route in app.routes):
-        pytest.skip("re-evaluation job routes ship in #116 (feat/curator-reevaluate)")
+    """POST/GET re-evaluation jobs (#116), which the curator UI calls, are
+    curator-only. A missing route would 404 here, not 403."""
     curator_email = "curator.reevaluate@mskcc.org"
     _put_user(EMAIL, "viewer")
     _put_user(curator_email, "curator")

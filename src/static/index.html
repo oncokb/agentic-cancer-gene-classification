@@ -31,6 +31,7 @@
               </div>
               <span class="user-email" id="user-email"></span>
               <div class="user-menu-links">
+                <button type="button" class="user-menu-link hidden" id="curator-open">Request curator access</button>
                 <a class="user-menu-link" id="api-keys-link" href="/api-keys">API keys</a>
                 <a class="user-menu-link" id="runs-link" href="/runs">My runs</a>
                 <a class="user-menu-link hidden" id="admin-users-link" href="/admin/users">Users</a>
@@ -389,6 +390,25 @@
     <div class="toast-region" id="toast-region" role="status" aria-live="polite"></div>
 
     <script src="/static/tracking.js"></script>
+    <div class="modal-backdrop hidden" id="curator-dialog" role="dialog" aria-modal="true" aria-labelledby="curator-title">
+      <div class="feedback-modal">
+        <h2 id="curator-title">Request curator access</h2>
+        <p id="curator-message" role="status"></p>
+        <form id="curator-form" class="hidden">
+          <label for="curator-reason">Reason</label>
+          <textarea id="curator-reason" required maxlength="4000" rows="3"></textarea>
+          <label for="curator-affiliation">Affiliation</label>
+          <input id="curator-affiliation" required maxlength="255" />
+          <label for="curator-expertise">Expertise</label>
+          <textarea id="curator-expertise" required maxlength="4000" rows="3"></textarea>
+          <label for="curator-orcid">ORCID (optional, e.g. 0000-0002-1825-0097)</label>
+          <input id="curator-orcid" maxlength="19" pattern="[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9X]" />
+          <button type="submit" class="primary-action" id="curator-submit">Submit request</button>
+        </form>
+        <button type="button" id="curator-close">Close</button>
+      </div>
+    </div>
+    <script src="/static/curator-requests.js"></script>
     <script src="/static/curation.js"></script>
     <script src="/static/app.js"></script>
   </body>

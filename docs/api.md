@@ -1078,3 +1078,47 @@ approvals (`request_id` set) and bootstrap grants (`actor`
 ### GET /v1/admin/users/{email}/changes
 
 The same, for one user. Unknown users return `404`.
+
+### Curator access requests
+
+These endpoints require authentication and `USER_STORE_BACKEND=mysql`. Redis
+returns **409** with a “require the MySQL user store” explanation. Store outages
+return **503**. No notifications are sent.
+
+- `POST /v1/curator-requests`: active viewers apply with JSON `reason` (required,
+  1–4000 characters), `affiliation` (required, 1–255), `expertise` (required,
+  1–4000), and optional `orcid` (19 characters, `0000-0002-1825-0097` format;
+  final character may be `X`). Required text is trimmed and must not be blank.
+  Returns **201** with the request. Curators/admins and duplicate pending requests
+  receive **409**. Invalid fields receive **422**. Disabled/pending accounts
+  cannot authenticate for this action (**403**).
+- `GET /v1/curator-requests/me`: returns `{status, request}` with the latest
+  request for the authenticated user. Status is `none`, `pending`, `approved`, or
+  `rejected`; `request` is null for `none`. Rejection notes are in
+  `request.review_note`. The applicant-visible request contains only the submitted
+  fields (`reason`, `affiliation`, `expertise`, `orcid`), `created_at`, `decided_at`,
+  and `review_note`; it never includes `reviewer_email` or other administrator
+  identity fields. Active viewers may submit again whenever they have no pending
+  request, including after approval followed by demotion to viewer.
+- `GET /v1/admin/curator-requests`: administrators only (**403** otherwise).
+  Optional `status=pending|approved|rejected`, `limit=1..200` (default 50), and
+  opaque `cursor`. Returns `{requests, next_cursor}`, newest first; null cursor
+  marks the end. Invalid filters/cursors return **422**.
+- `POST /v1/admin/curator-requests/{id}/approve` and `/reject`: administrators
+  only. JSON `{}` or `{"note":"optional reviewer note"}` (maximum 1000
+  characters). Returns the decided request. Unknown requests/applicants return
+  **404**; already decided requests or approval of an applicant who is no longer
+  an active viewer return **409**. Approval grants curator, writes a linked
+  `role_changes` audit entry, and closes the request in one transaction. Rejection
+  records the note without changing the role. Concurrent decisions succeed once.
+
+Admin request objects include `id`, `email`, the application fields, `status`,
+`created_at`, `reviewer_email`, `decided_at`, and `review_note`. The application
+creation response uses this shape with null review fields. `/me` uses the
+restricted applicant-visible shape above. Users can read only their own
+application; administrators can review all applications.
+
+All cookie/session-authenticated mutations above require same-origin evidence
+and `Content-Type: application/json`, using the same checks as admin user changes
+(**403** for cross-origin/missing evidence, **415** for a non-JSON content type).
+API keys use their owner's current role and are exempt from the origin check.

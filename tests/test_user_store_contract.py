@@ -806,14 +806,30 @@ async def test_reject_leaves_role_alone(store, email):
 
 
 @pytest.mark.parametrize("role", ["curator", "admin"])
-async def test_approve_never_demotes(store, email, role):
+async def test_approve_existing_privileged_role_fails(store, email, role):
     address = email("senior")
     await _login(store, address)
     await store.set_role(address, role, actor=email("boss"))
     request = await _request(store, address)
-    await store.decide_request(request.id, True, email("admin"))
+    with pytest.raises(user_store.CuratorRequestIneligible):
+        await store.decide_request(request.id, True, email("admin"))
+    assert (await store.get_curator_request(request.id)).status == "pending"
     assert (await store.get_user(address)).role == role
     assert len((await store.list_role_changes(email=address)).changes) == 1
+
+
+@pytest.mark.parametrize("status", ["disabled", "pending"])
+async def test_approve_inactive_viewer_writes_nothing(store, email, status):
+    address = email("inactive")
+    await _login(store, address, role="viewer")
+    request = await _request(store, address)
+    await store.set_status(address, status, actor=email("admin"))
+    before = (await store.list_role_changes(email=address)).changes
+    with pytest.raises(user_store.CuratorRequestIneligible):
+        await store.decide_request(request.id, True, email("admin"))
+    assert await store.get_curator_request(request.id) == request
+    assert (await store.get_user(address)).role == "viewer"
+    assert (await store.list_role_changes(email=address)).changes == before
 
 
 async def test_approve_for_missing_user_writes_nothing(store, email):

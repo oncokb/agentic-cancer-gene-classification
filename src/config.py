@@ -145,6 +145,8 @@ class Settings(BaseSettings):
     context_score_pubtype_case_report_weight: float = 0.3
     context_score_pubtype_editorial_weight: float = 0.15
     context_score_pubtype_preprint_weight: float = 0.3
+    curation_reevaluate_max_pmids: int = Field(default=50, ge=1)
+    curation_reevaluate_max_inflight_jobs: int = Field(default=2, ge=1)
     annotate_max_inputs: int = Field(
         default=50, ge=1,
         description="Maximum inputs per annotation or fusion-evidence request (ANNOTATE_MAX_INPUTS).",

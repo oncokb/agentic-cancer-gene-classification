@@ -1,0 +1,509 @@
+{
+  "gene": {
+    "request": {
+      "subject_type": "gene",
+      "subject_key": "ALK",
+      "tumor_type": "LUAD",
+      "evidence_pmids": [
+        "123",
+        "456"
+      ],
+      "precedent_pmids": [
+        "789"
+      ]
+    },
+    "response": {
+      "status": "succeeded",
+      "error": null,
+      "invalid_pmids": null,
+      "draft": {
+        "gene": "ALK",
+        "fusions": [],
+        "in_oncokb": null,
+        "cancer_associated": true,
+        "cancer_association_rationale": "Suggested rationale from synthesis.",
+        "cancer_type_prevalence": null,
+        "gene_class": null,
+        "signaling_pathways": null,
+        "gene_summary": null,
+        "citations": [
+          "123",
+          "456"
+        ],
+        "supporting_quotes": [
+          {
+            "pmid": "123",
+            "quote": "Exact sentence from abstract."
+          },
+          {
+            "pmid": "456",
+            "quote": "This second paper was supplied by the curator."
+          }
+        ],
+        "evidence_cards": [
+          {
+            "pmid": "123",
+            "title": "Illustrative evidence paper",
+            "journal": "",
+            "publication_types": [],
+            "is_preprint": false,
+            "evidence_type": "other",
+            "selected_reason": "Curator-selected evidence; review the abstract for relevance to this subject.",
+            "quote": "Exact sentence from abstract.",
+            "abstract": "Exact sentence from abstract. More text."
+          },
+          {
+            "pmid": "456",
+            "title": "Illustrative second paper",
+            "journal": "",
+            "publication_types": [],
+            "is_preprint": false,
+            "evidence_type": "other",
+            "selected_reason": "Curator-selected evidence; review the abstract for relevance to this subject.",
+            "quote": "This second paper was supplied by the curator.",
+            "abstract": "This second paper was supplied by the curator."
+          }
+        ],
+        "clinical_actionability": {
+          "confidence_score": 1.0,
+          "confidence_level": "high",
+          "summary": "Suggested summary of curator-selected precedents.",
+          "confidence_explanation": "Curator-supplied PMIDs: threshold bypassed. Confidence denotes curator selection, not a calibrated evidence assessment.",
+          "pmids": [
+            "789"
+          ],
+          "score_components": [],
+          "evidence": [
+            {
+              "pmid": "789",
+              "title": "Illustrative precedent paper",
+              "evidence_type": "other",
+              "therapies": [
+                "imatinib"
+              ],
+              "domains": [
+                "paper the kinase domain",
+                "kinase domain"
+              ],
+              "matched_terms": [],
+              "quote": "The kinase domain was studied with imatinib.",
+              "abstract": "The kinase domain was studied with imatinib."
+            }
+          ]
+        },
+        "quality_flags": [
+          {
+            "code": "low_evidence_score",
+            "label": "Low evidence score",
+            "severity": "warning",
+            "detail": "Evidence support score is 0.20."
+          },
+          {
+            "code": "curator_pinned_draft",
+            "label": "Curator-selected draft",
+            "severity": "info",
+            "detail": "All supplied evidence PMIDs are included in curator order. Inclusion does not establish relevance; review this unpersisted suggestion. Evidence support is computed from model_citations, not the pinned citation list."
+          }
+        ],
+        "date_annotated": "10/12/26",
+        "retrieval_count": 2,
+        "retrieved_pmids": [
+          "123",
+          "456"
+        ],
+        "retrieval_ranking": [],
+        "insufficient_evidence": false,
+        "evidence_support_score": 0.2,
+        "evidence_support_explanation": "Evidence support score 0.20: 1 verified PMID citation(s). This score estimates literature grounding, not biological truth or clinical actionability.",
+        "cache_status": null,
+        "cache_reason": null,
+        "cached_at": null,
+        "last_pubmed_checked_at": null,
+        "error": null,
+        "timings_ms": {},
+        "model_citations": [
+          "123"
+        ],
+        "model_info": {
+          "synthesis_model": "claude-opus-4-7",
+          "synthesis_escalated": false,
+          "suggestion_model": "claude-haiku-4-5-20251001"
+        },
+        "generated_at": "2026-10-12T18:00:00+00:00"
+      }
+    }
+  },
+  "fusion": {
+    "request": {
+      "subject_type": "fusion",
+      "subject_key": "eml4/alk",
+      "tumor_type": "LUAD",
+      "evidence_pmids": [
+        "123",
+        "456"
+      ],
+      "precedent_pmids": [
+        "789"
+      ]
+    },
+    "response": {
+      "status": "succeeded",
+      "error": null,
+      "invalid_pmids": null,
+      "draft": {
+        "fusions": [
+          "EML4::ALK"
+        ],
+        "in_oncokb": null,
+        "cancer_associated": true,
+        "cancer_association_rationale": "Suggested rationale from synthesis.",
+        "cancer_type_prevalence": null,
+        "gene_class": null,
+        "signaling_pathways": null,
+        "gene_summary": null,
+        "citations": [
+          "123",
+          "456"
+        ],
+        "supporting_quotes": [
+          {
+            "pmid": "123",
+            "quote": "Exact sentence from abstract."
+          },
+          {
+            "pmid": "456",
+            "quote": "This second paper was supplied by the curator."
+          }
+        ],
+        "evidence_cards": [
+          {
+            "pmid": "123",
+            "title": "Illustrative evidence paper",
+            "journal": "",
+            "publication_types": [],
+            "is_preprint": false,
+            "evidence_type": "other",
+            "selected_reason": "Curator-selected evidence; review the abstract for relevance to this subject.",
+            "quote": "Exact sentence from abstract.",
+            "abstract": "Exact sentence from abstract. More text.",
+            "fusion": "EML4::ALK",
+            "matched_via_alias": false,
+            "alias_matches": []
+          },
+          {
+            "pmid": "456",
+            "title": "Illustrative second paper",
+            "journal": "",
+            "publication_types": [],
+            "is_preprint": false,
+            "evidence_type": "other",
+            "selected_reason": "Curator-selected evidence; review the abstract for relevance to this subject.",
+            "quote": "This second paper was supplied by the curator.",
+            "abstract": "This second paper was supplied by the curator.",
+            "fusion": "EML4::ALK",
+            "matched_via_alias": false,
+            "alias_matches": []
+          }
+        ],
+        "clinical_actionability": {
+          "confidence_score": 1.0,
+          "confidence_level": "high",
+          "summary": "Suggested summary of curator-selected precedents.",
+          "confidence_explanation": "Curator-supplied PMIDs: threshold bypassed. Confidence denotes curator selection, not a calibrated evidence assessment.",
+          "pmids": [
+            "789"
+          ],
+          "score_components": [],
+          "evidence": [
+            {
+              "pmid": "789",
+              "title": "Illustrative precedent paper",
+              "evidence_type": "other",
+              "therapies": [
+                "imatinib"
+              ],
+              "domains": [
+                "paper the kinase domain",
+                "kinase domain"
+              ],
+              "matched_terms": [],
+              "quote": "The kinase domain was studied with imatinib.",
+              "abstract": "The kinase domain was studied with imatinib."
+            }
+          ]
+        },
+        "quality_flags": [
+          {
+            "code": "low_evidence_score",
+            "label": "Low evidence score",
+            "severity": "warning",
+            "detail": "Evidence support score is 0.20."
+          },
+          {
+            "code": "curator_pinned_draft",
+            "label": "Curator-selected draft",
+            "severity": "info",
+            "detail": "All supplied evidence PMIDs are included in curator order. Inclusion does not establish relevance; review this unpersisted suggestion. Evidence support is computed from model_citations, not the pinned citation list."
+          }
+        ],
+        "date_annotated": "10/12/26",
+        "retrieval_count": 2,
+        "retrieved_pmids": [
+          "123",
+          "456"
+        ],
+        "retrieval_ranking": [],
+        "insufficient_evidence": false,
+        "evidence_support_score": 0.2,
+        "evidence_support_explanation": "Evidence support score 0.20: 1 verified PMID citation(s). This score estimates literature grounding, not biological truth or clinical actionability.",
+        "cache_status": null,
+        "cache_reason": null,
+        "cached_at": null,
+        "last_pubmed_checked_at": null,
+        "error": null,
+        "timings_ms": {},
+        "model_citations": [
+          "123"
+        ],
+        "fusion": "EML4::ALK",
+        "tumor_type": "LUAD",
+        "pmids": [
+          "123",
+          "456"
+        ],
+        "retrieved_count": 2,
+        "interpretation": "Suggested rationale from synthesis.",
+        "well_supported": true,
+        "model_info": {
+          "synthesis_model": "claude-opus-4-7",
+          "synthesis_escalated": false,
+          "suggestion_model": "claude-haiku-4-5-20251001"
+        },
+        "generated_at": "2026-10-12T18:00:00+00:00"
+      }
+    }
+  },
+  "precedent_only": {
+    "request": {
+      "subject_type": "gene",
+      "subject_key": "ALK",
+      "tumor_type": null,
+      "evidence_pmids": [],
+      "precedent_pmids": [
+        "789"
+      ]
+    },
+    "response": {
+      "status": "succeeded",
+      "error": null,
+      "invalid_pmids": null,
+      "draft": {
+        "gene": "ALK",
+        "fusions": [],
+        "in_oncokb": null,
+        "cancer_associated": null,
+        "cancer_association_rationale": "No evidence PMIDs supplied; precedent-only draft.",
+        "cancer_type_prevalence": null,
+        "gene_class": null,
+        "signaling_pathways": null,
+        "gene_summary": null,
+        "citations": [],
+        "supporting_quotes": [],
+        "evidence_cards": [],
+        "clinical_actionability": {
+          "confidence_score": 1.0,
+          "confidence_level": "high",
+          "summary": "Suggested summary of curator-selected precedents.",
+          "confidence_explanation": "Curator-supplied PMIDs: threshold bypassed. Confidence denotes curator selection, not a calibrated evidence assessment.",
+          "pmids": [
+            "789"
+          ],
+          "score_components": [],
+          "evidence": [
+            {
+              "pmid": "789",
+              "title": "Illustrative precedent paper",
+              "evidence_type": "other",
+              "therapies": [
+                "imatinib"
+              ],
+              "domains": [
+                "paper the kinase domain",
+                "kinase domain"
+              ],
+              "matched_terms": [],
+              "quote": "The kinase domain was studied with imatinib.",
+              "abstract": "The kinase domain was studied with imatinib."
+            }
+          ]
+        },
+        "quality_flags": [
+          {
+            "code": "no_verified_citations",
+            "label": "No verified citations",
+            "severity": "critical",
+            "detail": "The annotation has no PMID that passed retrieval-set verification."
+          },
+          {
+            "code": "low_evidence_score",
+            "label": "Low evidence score",
+            "severity": "warning",
+            "detail": "Evidence support score is 0.00."
+          },
+          {
+            "code": "curator_pinned_draft",
+            "label": "Curator-selected draft",
+            "severity": "info",
+            "detail": "All supplied evidence PMIDs are included in curator order. Inclusion does not establish relevance; review this unpersisted suggestion. Evidence support is computed from model_citations, not the pinned citation list."
+          }
+        ],
+        "date_annotated": "10/12/26",
+        "retrieval_count": 0,
+        "retrieved_pmids": [],
+        "retrieval_ranking": [],
+        "insufficient_evidence": true,
+        "evidence_support_score": 0.0,
+        "evidence_support_explanation": "Evidence support score 0.00: insufficient-evidence flag; no verified citations; sparse retrieval corpus. This score estimates literature grounding, not biological truth or clinical actionability.",
+        "cache_status": null,
+        "cache_reason": null,
+        "cached_at": null,
+        "last_pubmed_checked_at": null,
+        "error": null,
+        "timings_ms": {},
+        "model_citations": [],
+        "model_info": {
+          "synthesis_model": null,
+          "synthesis_escalated": false,
+          "suggestion_model": "claude-haiku-4-5-20251001"
+        },
+        "generated_at": "2026-10-12T18:00:00+00:00"
+      }
+    }
+  },
+  "limits": {
+    "max_pmids_per_array": 50,
+    "max_combined_unique_pmids": 50,
+    "max_inflight_jobs_per_owner": 2
+  },
+  "errors": {
+    "other_owner_get": {
+      "http_status": 404,
+      "response": {
+        "detail": "Job not found"
+      }
+    },
+    "inflight_limit": {
+      "http_status": 429,
+      "response": {
+        "detail": "Too many in-flight re-evaluation jobs"
+      }
+    },
+    "all_unknown": {
+      "http_status": 200,
+      "response": {
+        "status": "failed",
+        "error": "Curator PMIDs failed validation",
+        "invalid_pmids": {
+          "unknown": [
+            "99"
+          ],
+          "retracted": [],
+          "no_abstract": []
+        },
+        "draft": null
+      }
+    },
+    "pmid_limit": {
+      "http_status": 422,
+      "response": {
+        "detail": [
+          {
+            "type": "value_error",
+            "loc": [
+              "body"
+            ],
+            "msg": "Value error, Each PMID list must contain at most 50 IDs",
+            "input": {
+              "subject_type": "gene",
+              "subject_key": "ALK",
+              "evidence_pmids": [
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9",
+                "10",
+                "11",
+                "12",
+                "13",
+                "14",
+                "15",
+                "16",
+                "17",
+                "18",
+                "19",
+                "20",
+                "21",
+                "22",
+                "23",
+                "24",
+                "25",
+                "26",
+                "27",
+                "28",
+                "29",
+                "30",
+                "31",
+                "32",
+                "33",
+                "34",
+                "35",
+                "36",
+                "37",
+                "38",
+                "39",
+                "40",
+                "41",
+                "42",
+                "43",
+                "44",
+                "45",
+                "46",
+                "47",
+                "48",
+                "49",
+                "50",
+                "51"
+              ]
+            },
+            "ctx": {
+              "error": {}
+            }
+          }
+        ]
+      }
+    },
+    "empty_fetch_confirmed_ids": {
+      "http_status": 200,
+      "response": {
+        "status": "failed",
+        "error": "NCBI returned no verifiable PMIDs; please retry.",
+        "invalid_pmids": null,
+        "draft": null
+      }
+    },
+    "lookup_outage": {
+      "http_status": 200,
+      "response": {
+        "status": "failed",
+        "error": "Gene lookup is temporarily unavailable; please retry.",
+        "invalid_pmids": null,
+        "draft": null
+      }
+    }
+  }
+}

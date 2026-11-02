@@ -1507,18 +1507,43 @@ def _ncbi_params(extra: dict) -> dict:
     return params
 
 
-async def _esearch(query: str, max_results: int, client: httpx.AsyncClient) -> List[str]:
-    """Return PMIDs matching a PubMed query string."""
+class NCBIResponseError(RuntimeError):
+    """NCBI returned a response that cannot establish PMID validity."""
+
+
+async def _esearch(
+    query: str,
+    max_results: int,
+    client: httpx.AsyncClient,
+    *,
+    use_cache: bool = True,
+    filter_retracted: bool = True,
+) -> List[str]:
+    """Return matching PMIDs; existence checks can bypass cache and retraction filtering."""
+    search_query = _exclude_retracted_query(query) if filter_retracted else query
 
     async def _fetch() -> List[str]:
-        search_query = _exclude_retracted_query(query)
         params = _ncbi_params(
             {"db": "pubmed", "term": search_query, "retmax": max_results, "sort": "relevance"}
         )
         resp = await _ncbi_post(ESEARCH_URL, params, client, timeout=15.0)
-        return resp.json().get("esearchresult", {}).get("idlist", [])
+        payload = resp.json()
+        if not use_cache:
+            result = payload.get("esearchresult") if isinstance(payload, dict) else None
+            if (
+                not isinstance(result, dict)
+                or "ERROR" in payload
+                or "ERROR" in result
+                or "errorlist" in result
+                or not isinstance(result.get("idlist"), list)
+                or any(not isinstance(pmid, str) for pmid in result["idlist"])
+            ):
+                raise NCBIResponseError("Invalid PubMed existence response")
+        return payload.get("esearchresult", {}).get("idlist", [])
 
-    return await cached_call(f"pubmed:esearch:{_exclude_retracted_query(query)}:{max_results}", _fetch)
+    if not use_cache:
+        return await _fetch()
+    return await cached_call(f"pubmed:esearch:{search_query}:{max_results}", _fetch)
 
 
 async def _esearch_since(
@@ -1601,12 +1626,13 @@ def _parse_pub_year(pub_date_el: Optional[ET.Element]) -> Optional[int]:
 
 async def _efetch(
     pmids: List[str], client: httpx.AsyncClient, *, filter_retracted: bool = True,
+    use_cache: bool = True,
 ) -> List[LiteratureRecord]:
     """Fetch and cache chunks of at most 200 PMIDs, preserving input order."""
     records = []
     for start in range(0, len(pmids), 200):
         records.extend(await _efetch_chunk(
-            pmids[start:start + 200], client, filter_retracted=filter_retracted,
+            pmids[start:start + 200], client, filter_retracted=filter_retracted, use_cache=use_cache,
         ))
     by_pmid = {record.pmid: record for record in records}
     return [by_pmid[pmid] for pmid in pmids if pmid in by_pmid]
@@ -1617,6 +1643,7 @@ async def _efetch_chunk(
     client: httpx.AsyncClient,
     *,
     filter_retracted: bool = True,
+    use_cache: bool = True,
 ) -> List[LiteratureRecord]:
     """Fetch abstracts for a list of PMIDs, including journal and publication type metadata."""
     if not pmids:
@@ -1679,11 +1706,13 @@ async def _efetch_chunk(
                         "pubmed_comment_pmids": comment_pmids,
                     })
         except ET.ParseError as exc:
+            if not use_cache:
+                raise NCBIResponseError("Invalid PubMed article response") from exc
             logger.warning("XML parse error in efetch: %s", exc)
         return records
 
     cache_key = f"pubmed:efetch:v2:{','.join(sorted(pmids))}"
-    records = await cached_call(cache_key, _fetch)
+    records = await cached_call(cache_key, _fetch) if use_cache else await _fetch()
     parsed_records = [LiteratureRecord(**r) for r in records]
     return _filter_retracted_records(parsed_records) if filter_retracted else parsed_records
 
