@@ -1,8 +1,11 @@
 # Curator re-evaluation API (PR 2)
 
 This API returns suggestions for editing. It never saves a run or a gene annotation.
-Both routes require the curator or admin role (`require_curator`); viewers get
-**403** `{"detail": "Curator privileges required for this action."}`.
+Both routes use `require_curator`: only curators and admins may create or poll
+drafts. Viewers receive HTTP 403 on both routes, including for their own jobs.
+Session and API-key requests use the current stored role on every request;
+a demoted curator loses access on the next request without signing in again.
+Job ownership checks still apply after the role check.
 
 ## Create and poll
 
@@ -44,7 +47,7 @@ unique PMID count must fit this cap, or POST returns **422** (standard FastAPI
 validation detail). Both copies of an ID shared across arrays count once toward
 the combined limit. Per-list and combined limits read the live settings on
 each validation; they are not frozen when the module is imported.
-`CURATION_REEVALUATE_MAX_INFLIGHT_JOBS` defaults to **2**:
+`CURATION_REEVALUATE_MAX_INFLIGHT_JOBS` defaults to **2 per user per pod**:
 queued/running jobs count toward the normalized owner email's limit, or POST
 returns **429**:
 
@@ -98,8 +101,11 @@ esearch. If that check confirms they do not exist, the job returns
 `invalid_pmids.unknown`, including when every supplied ID is unknown. If efetch
 returned no records but esearch finds supplied IDs, the job instead fails with
 `invalid_pmids: null` and `error: "NCBI returned no verifiable PMIDs; please retry."`.
-This avoids classifying a cached empty fetch after an XML parse error as invalid
-literature. Network exceptions remain generic job failures.
+Curator validation bypasses both efetch and existence-search caches, so a cached
+empty fetch from an earlier XML parse error cannot invalidate real PMIDs.
+Malformed XML and existence responses with `ERROR` or missing `esearchresult`
+fail with the same retryable NCBI error, never `invalid_pmids.unknown`.
+Network exceptions remain generic job failures.
 
 An actual unresolved subject returns
 `"Could not resolve subject: <input>. Check the gene symbol and retry."`
@@ -213,10 +219,13 @@ partner precedent is kept separate from the exact-fusion evidence array.
 
 ## Operations and timing
 
-Jobs use the same process-local memory/asyncio pattern as annotation jobs.
-The in-flight limit and ownership store are process-local. Completed jobs are evicted on subsequent POSTs after
-`settings.annotation_job_ttl_seconds`. Polling must reach the same worker;
-restarting the worker loses its jobs. No database persistence is involved.
+Jobs use the shared Redis-backed job store with a process-local fallback when
+Redis is unavailable. Any worker can serve status snapshots; owner checks apply
+to local and Redis reads. Snapshots expire according to `JOB_TTL_SECONDS` (or the
+deprecated `ANNOTATION_JOB_TTL_SECONDS`), defaulting to 24 hours after the last
+update. The task and in-flight admission limit remain local to the submitting
+worker, like the other background jobs. Restarting that worker interrupts its
+tasks; Redis retains their last snapshots until expiry.
 
 Plan for roughly **10–60 seconds** for a typical small PMID set on the Haiku
 fast path, with longer times for Opus escalation, upstream retries, or large

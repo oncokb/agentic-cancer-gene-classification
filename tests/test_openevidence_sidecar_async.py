@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import json
 import time
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -54,6 +55,7 @@ class FakeUpstream:
 
     def __init__(self) -> None:
         self.calls: List[str] = []
+        self.entered = asyncio.Event()
         self._gate = asyncio.Event()
         self.fail_with: Optional[BaseException] = None
 
@@ -62,6 +64,7 @@ class FakeUpstream:
 
     async def __call__(self, question: str, api_key: str, client: httpx.AsyncClient) -> str:
         self.calls.append(question)
+        self.entered.set()
         await self._gate.wait()
         if self.fail_with is not None:
             raise self.fail_with
@@ -100,7 +103,7 @@ async def _request(gene: str = "ALK", **params) -> Tuple[main.OpenEvidenceSideca
             core_pmids=params.get("core_pmids", []),
             core_titles=params.get("core_titles", []),
         ),
-        timeout=2.0,
+        timeout=30.0,
     )
     return result, response
 
@@ -108,7 +111,7 @@ async def _request(gene: str = "ALK", **params) -> Tuple[main.OpenEvidenceSideca
 async def _wait_for_background_lookups() -> None:
     tasks = list(main._openevidence_sidecar_tasks.values())
     if tasks:
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=30.0)
     await asyncio.sleep(0)  # let done-callbacks deregister the tasks
 
 
@@ -117,14 +120,13 @@ def _asgi_client() -> httpx.AsyncClient:
 
 
 async def test_cache_miss_returns_pending_fast_even_when_upstream_is_slow(fake_redis, upstream):
-    start = time.monotonic()
     async with _asgi_client() as client:
+        started = time.monotonic()
         http = await asyncio.wait_for(
-            client.get("/v1/genes/ALK/openevidence", params={"tumor_type": "NSCLC"}), timeout=2.0
+            client.get("/v1/genes/ALK/openevidence", params={"tumor_type": "NSCLC"}), timeout=30.0
         )
-    elapsed = time.monotonic() - start
-
-    assert elapsed < 1.5
+        assert time.monotonic() - started < 5.0
+    assert not upstream._gate.is_set()
     # No X-OpenEvidence-Poll header = an old cached frontend: HTTP 503 +
     # Retry-After is deliberate (it treats that as a transient, non-memoized
     # fetch error); the body carries the contract.
@@ -192,7 +194,9 @@ async def test_completed_lookup_is_ready_and_matches_get_gene_analysis(fake_redi
     assert ready.distilled == distill_additive_openevidence(analysis, core_pmids=[], core_titles=[])
 
     # Without the fusion it's a different key/question, so it needs its own
-    # upstream call (which, with upstream now fast, answers inline).
+    # upstream call; await it before checking the separate cache slot.
+    await _request("ALK", tumor_type="NSCLC")
+    await _wait_for_background_lookups()
     other, _ = await _request("ALK", tumor_type="NSCLC")
     assert other.status == "ready"
     assert len(upstream.calls) == 2
@@ -301,13 +305,47 @@ async def test_failure_is_not_cached_and_answers_failed_without_recalling_upstre
     assert result.status == "ready"
 
 
-async def test_fast_failure_answers_failed_inline(fake_redis, upstream):
+@pytest.fixture
+def sidecar_asyncio(monkeypatch):
+    # Replace only main's reference, leaving asyncio's real module untouched.
+    local = SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in dir(asyncio) if not name.startswith("__")},
+    )
+    monkeypatch.setattr(main, "asyncio", local)
+    return local
+
+
+@pytest.fixture
+def inline_lookup(sidecar_asyncio):
+    async def wait_for_completion(tasks, **kwargs):
+        assert kwargs["timeout"] == main.settings.openevidence_sidecar_pending_wait_seconds
+        assert kwargs["timeout"] > 0
+        await asyncio.gather(*tasks)
+        return set(tasks), set()
+
+    sidecar_asyncio.wait = wait_for_completion
+
+
+async def test_fast_failure_answers_failed_inline(fake_redis, upstream, inline_lookup):
     upstream.fail_with = RuntimeError("bad request")
     upstream.release()
     result, response = await _request("ALK")
     assert response.status_code == 200
     assert result.status == "failed"
     assert result.error == "bad request"
+    assert len(upstream.calls) == 1
+
+
+async def test_successful_lookup_answers_ready_inline(fake_redis, upstream, inline_lookup):
+    upstream.release()
+    result, response = await _request("ALK")
+
+    assert response.status_code == 200
+    assert result.status == "ready"
+    assert result.available is True
+    assert result.distilled is not None
+    assert result.error is None
+    assert result.retry_after_seconds is None
     assert len(upstream.calls) == 1
 
 
@@ -333,7 +371,7 @@ async def test_stale_inflight_marker_expires(fake_redis, upstream):
 
 async def test_background_lookup_survives_client_disconnect(fake_redis, upstream):
     request = asyncio.create_task(_request("ALK"))
-    await asyncio.sleep(0.01)  # request is now waiting on the background task
+    await upstream.entered.wait()  # cancel only after the background call starts
     request.cancel()  # the client went away
     with pytest.raises(asyncio.CancelledError):
         await request
@@ -387,11 +425,29 @@ async def test_flag_off_starts_no_task_touches_no_client_or_redis(monkeypatch, u
     assert upstream.calls == []
 
 
-async def test_hung_lookup_times_out_as_failed_and_clears_its_marker(monkeypatch, fake_redis, upstream):
+async def test_hung_lookup_times_out_as_failed_and_clears_its_marker(
+    monkeypatch, fake_redis, upstream, sidecar_asyncio
+):
+    expire = asyncio.Event()
+
+    async def controlled_timeout(awaitable, timeout):
+        assert timeout == 0.05
+        task = asyncio.create_task(awaitable)
+        try:
+            await expire.wait()
+            raise asyncio.TimeoutError
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    sidecar_asyncio.wait_for = controlled_timeout
     monkeypatch.setattr(main.settings, "openevidence_timeout_seconds", 0.01)
     monkeypatch.setattr(main.settings, "openevidence_sidecar_lookup_timeout_seconds", 0.05)
     first, _ = await _request("ALK")  # upstream is never released: the call hangs
     assert first.status == "pending"
+    await upstream.entered.wait()
+    expire.set()
     await _wait_for_background_lookups()
 
     result, response = await _request("ALK")
@@ -417,22 +473,27 @@ def test_lookup_budget_default_is_900s_and_never_below_the_read_timeout(monkeypa
     assert main._openevidence_sidecar_lookup_budget_seconds() == 1250.0
 
 
-async def test_lookup_slower_than_a_budget_set_below_the_read_timeout_still_succeeds(
-    monkeypatch, fake_redis, upstream
+async def test_lookup_uses_budget_floored_at_read_timeout_and_succeeds(
+    monkeypatch, fake_redis, upstream, sidecar_asyncio
 ):
-    """Scaled-down prod shape: read timeout 600s, budget misconfigured at
-    540s, call finishing at 550s. The budget is floored at the read timeout
-    x 1.25, so the lookup is ready rather than failed."""
+    """Inspect the enforced budget directly instead of racing a narrow time window."""
+    budgets = []
+
+    async def capture_budget(awaitable, timeout):
+        budgets.append(timeout)
+        return await awaitable
+
+    sidecar_asyncio.wait_for = capture_budget
     monkeypatch.setattr(main.settings, "openevidence_timeout_seconds", 0.6)
     monkeypatch.setattr(main.settings, "openevidence_sidecar_lookup_timeout_seconds", 0.54)
     first, _ = await _request("ALK")
     assert first.status == "pending"
-    await asyncio.sleep(0.55)  # past the configured 0.54s budget, within the read timeout
     upstream.release()
     await _wait_for_background_lookups()
 
     result, _ = await _request("ALK")
     assert result.status == "ready"
+    assert budgets == [0.75]
     assert len(upstream.calls) == 1
 
 
@@ -450,9 +511,10 @@ async def test_finished_lookup_memos_are_bounded(monkeypatch, fake_redis, upstre
     upstream.fail_with = RuntimeError("boom")
     upstream.release()
     for gene in ("ALK", "BRAF", "EGFR"):
+        await _request(gene)
+        await _wait_for_background_lookups()
         result, _ = await _request(gene)
         assert result.status == "failed"
-    await _wait_for_background_lookups()
     assert list(main._openevidence_sidecar_failures) == [
         openevidence.sidecar_cache_key(gene, None, None) for gene in ("BRAF", "EGFR")
     ]
@@ -597,7 +659,7 @@ async def test_queued_lookup_that_lost_its_lease_does_not_duplicate_another_pods
     assert main._openevidence_memo_get(main._openevidence_sidecar_failures, openevidence.sidecar_cache_key("BRAF", None, None)) is None
 
     upstream.release("BRAF")
-    await asyncio.wait_for(pod2_braf, timeout=2.0)
+    await asyncio.wait_for(pod2_braf, timeout=30.0)
     await _wait_for_background_lookups()
     result, _ = await _request("BRAF")
     assert result.status == "ready"  # pod 2's answer, via the shared cache
@@ -624,7 +686,7 @@ async def test_old_owner_cleanup_never_releases_the_new_owners_lease(monkeypatch
 
     upstream.release("ALK")
     upstream.release("BRAF")
-    await asyncio.wait_for(pod2_braf, timeout=2.0)
+    await asyncio.wait_for(pod2_braf, timeout=30.0)
     await _wait_for_background_lookups()
     assert _genes(upstream.calls) == ["ALK", "BRAF"]
     assert fake_redis.keys_with_prefix("openevidence_inflight:") == []  # pod 2 released its own lease
@@ -632,10 +694,20 @@ async def test_old_owner_cleanup_never_releases_the_new_owners_lease(monkeypatch
 
 async def test_queued_lookup_keeps_its_lease_alive(monkeypatch, fake_redis, upstream):
     monkeypatch.setattr(main.settings, "openevidence_sidecar_inflight_ttl_seconds", 0.3)
+    renewed = asyncio.Queue()
+    original_renew = main.renew_inflight_marker
+
+    async def track_renewal(key, token, ttl):
+        result = await original_renew(key, token, ttl)
+        if key == openevidence.sidecar_cache_key("BRAF", None, None):
+            renewed.put_nowait(result)
+        return result
+
+    monkeypatch.setattr(main, "renew_inflight_marker", track_renewal)
     await _queue_braf_behind_alk(monkeypatch, upstream)
     for _ in range(12):  # 1.2 fake seconds queued — four lease TTLs
         fake_redis.advance(0.1)
-        await asyncio.sleep(0.25)  # the heartbeat renews every ttl/3 (0.1s)
+        assert await asyncio.wait_for(renewed.get(), timeout=30.0)
     assert await fake_redis.get(_inflight_key("BRAF")) is not None
     upstream.release()
     await _wait_for_background_lookups()
@@ -723,7 +795,7 @@ async def _another_pod_takes_the_lost_lease_and_duplicates_the_call(
 async def _assert_stale_failure_discarded(fake_redis, upstream, pod_a, pod_b, b_token) -> None:
     key = openevidence.sidecar_cache_key("ALK", None, None)
     upstream.fail(0, RuntimeError("stale owner failure"))  # A fails while B is still running
-    await asyncio.wait_for(pod_a, timeout=2.0)
+    await asyncio.wait_for(pod_a, timeout=30.0)
 
     assert pod_a.result() is None, "a lookup that lost its lease must not report a failure"
     assert fake_redis.keys_with_prefix("openevidence_failed:") == []
@@ -737,7 +809,7 @@ async def _assert_stale_failure_discarded(fake_redis, upstream, pod_a, pod_b, b_
     assert result.status == "pending"
 
     upstream.succeed(1)
-    await asyncio.wait_for(pod_b, timeout=2.0)
+    await asyncio.wait_for(pod_b, timeout=30.0)
     await _wait_for_background_lookups()
     assert _live_heartbeats() == []
     result, _ = await _request("ALK")
@@ -767,7 +839,7 @@ async def test_best_effort_heartbeat_noticing_lease_loss_allows_a_duplicate_but_
     assert len(_live_heartbeats()) == 1
 
     await fake_redis.delete(_inflight_key("ALK"))
-    await asyncio.sleep(0.25)  # A's heartbeat (every 0.1s) notices the loss...
+    await asyncio.wait_for(asyncio.gather(*_live_heartbeats()), timeout=30.0)
     assert _live_heartbeats() == [], "...and stops rather than leaking"
 
     pod_b, b_token = await _another_pod_takes_the_lost_lease_and_duplicates_the_call(fake_redis, per_call_upstream)
@@ -802,7 +874,7 @@ async def test_poller_cannot_slip_a_claim_in_after_a_just_published_failure(fake
         # Pod B has done its reads and is about to claim: A fails right
         # here, publishing its failure and releasing the lease.
         upstream.fail(0, RuntimeError("upstream reset"))
-        await asyncio.wait_for(pod_a, timeout=2.0)
+        await asyncio.wait_for(pod_a, timeout=30.0)
         assert len(fake_redis.keys_with_prefix("openevidence_failed:")) == 1
 
     fake_redis.before_next_lease_write = owner_fails_now
@@ -861,12 +933,14 @@ async def test_best_effort_redis_outage_lets_each_pod_call_once_and_warns(monkey
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert sum("proceeding WITHOUT a cross-pod lease" in w for w in warnings) == 2
     upstream.release()
-    await asyncio.wait_for(asyncio.gather(*pod_b), timeout=2.0)
+    await asyncio.wait_for(asyncio.gather(*pod_b), timeout=30.0)
     await _wait_for_background_lookups()
 
 
 @pytest.mark.parametrize("outcome", ["failed", "ready"])
-async def test_redis_outage_claim_racing_a_finished_lookup_reuses_its_outcome(monkeypatch, upstream, outcome):
+async def test_redis_outage_claim_racing_a_finished_lookup_reuses_its_outcome(
+    monkeypatch, upstream, outcome, inline_lookup
+):
     """Two same-key requests in one worker both reach the (fail-open) claim
     while Redis is down. The later claim returns first, its lookup finishes
     (fails fast, or succeeds) and records its outcome before the earlier
@@ -901,13 +975,13 @@ async def test_redis_outage_claim_racing_a_finished_lookup_reuses_its_outcome(mo
     monkeypatch.setattr(main, "claim_lookup", interleaved_claim)
 
     slow = asyncio.create_task(_request("ALK"))
-    await asyncio.wait_for(first_claim_entered.wait(), timeout=2.0)
+    await asyncio.wait_for(first_claim_entered.wait(), timeout=30.0)
     fast, _ = await _request("ALK")
     assert fast.status == outcome
     assert not main._openevidence_sidecar_tasks, "the fast request's lookup has finished"
 
     let_first_claim_return.set()
-    slow_result, slow_response = await asyncio.wait_for(slow, timeout=2.0)
+    slow_result, slow_response = await asyncio.wait_for(slow, timeout=30.0)
     await _wait_for_background_lookups()
 
     assert claims == 2

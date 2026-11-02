@@ -73,7 +73,7 @@ class FakeRunStore:
         now = datetime.now(timezone.utc)
         return {"annotation": annotation.model_dump(), "updated_at": now, "last_pubmed_checked_at": now}
 
-    async def save_run(self, run_id, timestamp, request_payload, result_payload):
+    async def save_run(self, run_id, timestamp, request_payload, result_payload, **owner):
         if self.fail_saves:
             raise RuntimeError("mysql: SECRET-DB-ERROR")
         self.saved_runs.append((run_id, timestamp, request_payload, result_payload))
@@ -151,6 +151,8 @@ def test_slim_mapping_is_an_allowlist():
 
     assert set(GeneRationale.model_fields) == {
         "gene",
+        "submitted_inputs",
+        "warnings",
         "tumor_type",
         "cancer_associated",
         "gene_class",
@@ -380,8 +382,26 @@ class FakeEnsemblClient:
             raise httpx.ReadTimeout("timed out", request=request)
         if isinstance(self.mode, int):
             return httpx.Response(self.mode, request=request, json={"error": "nope"})
+        if self.mode == "batch400":
+            return httpx.Response(400, request=request, json={"error": "bad batch"})
         known = {"ENSG00000141510": _ENSEMBL_TP53_DOC}
         return httpx.Response(200, request=request, json={i: known.get(i) for i in json["ids"]})
+
+    async def get(self, url, headers=None, timeout=None):
+        # Per-ID /lookup/id/{id} and /archive/id/{id}; Ensembl answers 400 for unknown IDs.
+        request = httpx.Request("GET", url)
+        if self.mode == "timeout":
+            raise httpx.ReadTimeout("timed out", request=request)
+        if isinstance(self.mode, int):
+            return httpx.Response(self.mode, request=request, json={"error": "nope"})
+        stable_id = url.rsplit("/", 1)[-1]
+        if "/lookup/id/" in url and stable_id == "ENSG00000141510":
+            return httpx.Response(200, request=request, json=_ENSEMBL_TP53_DOC)
+        return httpx.Response(400, request=request, json={"error": f"ID '{stable_id}' not found"})
+
+
+async def _no_sleep(_seconds):
+    pass
 
 
 @pytest.fixture
@@ -420,6 +440,7 @@ def real_pipeline(client, monkeypatch):
 
     monkeypatch.setattr(main, "run_pipeline", orchestrator.run_pipeline)
     monkeypatch.setattr(normalization, "_resolve_ensembl_ids", fake_resolve_ensembl)
+    monkeypatch.setattr(normalization, "_sleep", _no_sleep)  # Ensembl retry backoff
     monkeypatch.setattr(normalization, "_resolve_hgnc_symbols_concurrently", fake_resolve_hgnc)
     monkeypatch.setattr(orchestrator, "find_retracted_annotation_pmids", no_retractions)
     monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
@@ -432,48 +453,62 @@ def _reported(response_json):
 
 
 _COLLISIONS = [
-    # Ensembl ID and symbol for the same gene: production resolves Ensembl IDs first.
-    ({"gene": "TP53", "tumor_type": "LUAD"}, {"gene": _TP53_ENSEMBL, "tumor_type": "AML"}, "TP53", "AML"),
-    # Alias and symbol: production resolves HGNC symbols in sorted order (KAT6A < MOZ).
-    ({"gene": "MOZ", "tumor_type": "AML"}, {"gene": "KAT6A", "tumor_type": "LUAD"}, "KAT6A", "LUAD"),
+    # Two spellings of one gene: the first-submitted tumor type wins, whatever
+    # the identifier type (Ensembl ID vs symbol, alias vs symbol).
+    ({"gene": "TP53", "tumor_type": "LUAD"}, {"gene": _TP53_ENSEMBL, "tumor_type": "AML"}, "TP53"),
+    ({"gene": "MOZ", "tumor_type": "AML"}, {"gene": "KAT6A", "tumor_type": "LUAD"}, "KAT6A"),
 ]
 
 
-@pytest.mark.parametrize("first,second,gene,expected", _COLLISIONS)
+@pytest.mark.parametrize("first,second,gene", _COLLISIONS)
 @pytest.mark.parametrize("reverse", [False, True])
-def test_collision_reports_tumor_type_the_pipeline_used(client, real_pipeline, first, second, gene, expected, reverse):
+def test_collision_reports_tumor_type_the_pipeline_used(client, real_pipeline, first, second, gene, reverse):
     genes = [second, first] if reverse else [first, second]
 
     response = client.post("/v1/genes/query", json={"genes": genes})
 
     assert response.status_code == 200
     assert _reported(response.json()) == {gene: real_pipeline["used"][gene]}
-    assert real_pipeline["used"][gene] == expected
+    assert real_pipeline["used"][gene] == genes[0]["tumor_type"]
 
 
-@pytest.mark.parametrize("first,second,gene,expected", _COLLISIONS)
+@pytest.mark.parametrize("first,second,gene", _COLLISIONS)
 @pytest.mark.parametrize("reverse", [False, True])
-def test_collision_in_job_reports_tumor_type_the_pipeline_used(
-    client, real_pipeline, first, second, gene, expected, reverse
-):
+def test_collision_in_job_reports_tumor_type_the_pipeline_used(client, real_pipeline, first, second, gene, reverse):
     genes = [second, first] if reverse else [first, second]
 
     created = client.post("/v1/genes/query/jobs", json={"genes": genes})
     body = _poll(client, created.json()["status_url"])
 
     assert body["status"] == "complete"
-    assert _reported(body) == {gene: real_pipeline["used"][gene]} == {gene: expected}
+    assert _reported(body) == {gene: real_pipeline["used"][gene]} == {gene: genes[0]["tumor_type"]}
+
+
+@pytest.mark.parametrize("route", ["sync", "job"])
+def test_tumor_type_warning_returned_and_matches_saved_run(client, real_pipeline, route):
+    genes = [{"gene": "MOZ", "tumor_type": "AML"}, {"gene": "KAT6A", "tumor_type": "LUAD"}]
+
+    if route == "sync":
+        body = client.post("/v1/genes/query", json={"genes": genes}).json()
+    else:
+        created = client.post("/v1/genes/query/jobs", json={"genes": genes})
+        body = _poll(client, created.json()["status_url"])
+        assert body["status"] == "complete"
+
+    assert body["warnings"] == ["KAT6A: using tumor type 'AML'; ignored tumor types: 'LUAD'."]
+    assert main.app.state.run_store.saved_runs[-1][3]["warnings"] == body["warnings"]
 
 
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("route", ["sync", "job"])
 def test_cached_annotation_reports_tumor_type_the_pipeline_used(client, real_pipeline, reverse, route):
-    # Only the AML-context TP53 annotation is cached; the pipeline picks AML for
-    # this collision, so it must reuse that entry and report AML.
-    real_pipeline["store"].gene_cache[("TP53", "aml")] = _rich_annotation("TP53")
+    # Only the first-submitted tumor type's TP53 annotation is cached; the
+    # pipeline picks that tumor type, so it must reuse that entry and report it.
     genes = [{"gene": "TP53", "tumor_type": "LUAD"}, {"gene": _TP53_ENSEMBL, "tumor_type": "AML"}]
     if reverse:
         genes.reverse()
+    first = genes[0]["tumor_type"]
+    real_pipeline["store"].gene_cache[("TP53", first.lower())] = _rich_annotation("TP53")
 
     if route == "sync":
         body = client.post("/v1/genes/query", json={"genes": genes}).json()
@@ -481,9 +516,9 @@ def test_cached_annotation_reports_tumor_type_the_pipeline_used(client, real_pip
         body = _poll(client, client.post("/v1/genes/query/jobs", json={"genes": genes}).json()["status_url"])
 
     assert real_pipeline["used"] == {}  # served from cache, no fresh annotation
-    assert real_pipeline["store"].gene_cache_lookups == [("TP53", "aml")]
+    assert real_pipeline["store"].gene_cache_lookups == [("TP53", first.lower())]
     assert body["results"][0]["cache_status"] == "reused"
-    assert _reported(body) == {"TP53": "AML"}
+    assert _reported(body) == {"TP53": first}
 
 
 def test_mixed_and_alias_tumor_types_with_real_pipeline(client, real_pipeline):
@@ -588,11 +623,14 @@ def test_batch_reports_absence_and_lookup_failure_per_gene(client, real_pipeline
     assert errors == {symbol: expected_error, "ALK": None}
 
 
-def test_ensembl_batch_rejection_is_a_lookup_failure_not_absence():
-    # A 400 for a multi-ID batch can't confirm any one ID is absent.
-    resolved = asyncio.run(_REAL_RESOLVE_ENSEMBL([_TP53_ENSEMBL, _ABSENT_ENSEMBL], FakeEnsemblClient(400)))
+def test_ensembl_batch_rejection_falls_back_to_per_id_lookups():
+    # A 400 for a multi-ID batch can't confirm any one ID is absent: each ID is looked up on its own.
+    resolved = asyncio.run(_REAL_RESOLVE_ENSEMBL([_TP53_ENSEMBL, _ABSENT_ENSEMBL], FakeEnsemblClient("batch400")))
 
-    assert all(gene.unresolvable and gene.lookup_failed for gene in resolved.values())
+    assert resolved[_TP53_ENSEMBL].resolved and resolved[_TP53_ENSEMBL].canonical_symbol == "TP53"
+    absent = resolved[_ABSENT_ENSEMBL]
+    assert absent.unresolvable and not absent.lookup_failed
+    assert absent.resolution_error == f"Ensembl did not find ID {_ABSENT_ENSEMBL}."
 
 
 @pytest.fixture
@@ -918,3 +956,15 @@ def test_gene_query_endpoints_require_auth(client, monkeypatch, pipeline_calls, 
 
     assert response.status_code == 401
     assert pipeline_calls == []
+
+
+@pytest.mark.parametrize("path", ["/v1/genes/query", "/v1/genes/query/jobs"])
+def test_gene_query_uses_its_own_cap(client, pipeline_calls, monkeypatch, path):
+    monkeypatch.setattr(settings, "annotate_max_inputs", 1)
+    monkeypatch.setattr(settings, "gene_query_max_genes", 3)
+    response = client.post(path, json={"genes": ["ALK", "BRAF", "TP53"]})
+    assert response.status_code == 200
+    if path.endswith("/jobs"):
+        body = _poll(client, response.json()["status_url"])
+        assert body["status"] == "complete"
+    assert len(pipeline_calls[-1]["fusions"]) == 3

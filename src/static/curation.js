@@ -69,6 +69,8 @@ const curationState = {
   returnFocus: null,
   busy: false,
   auxReturnFocus: null,
+  // The access-lost notice was shown; reset once access is back.
+  accessLostShown: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,6 +79,63 @@ const curationState = {
 
 function canCurate() {
   return Boolean(state.auth && state.auth.can_curate);
+}
+
+const CURATION_ACCESS_LOST_MESSAGE =
+  "You no longer have curator access, so curator editing is off. Your unsaved edits are kept for now.";
+
+// Called after state.auth changes (app.js checkAuth) with the previous
+// can_curate value: re-renders on any transition, and on losing access closes
+// the editors while keeping every session's draft in memory.
+function applyCurationPermissionChange(couldCurate) {
+  const canNow = canCurate();
+  if (Boolean(couldCurate) === canNow) return;
+  if (!canNow) {
+    curationAccessLost();
+    return;
+  }
+  curationState.sessions.forEach((session) => renderCurationNotification(session));
+  if (state.currentResult) renderAnnotationResult(state.currentResult);
+  refreshPartnerCurationViews();
+}
+
+// Read-only from here on: the server said no (403) or /auth/me dropped
+// can_curate. Drafts, notes and PMID edits stay in curationState.sessions.
+function curationAccessLost() {
+  const wasShown = curationState.accessLostShown;
+  if (state.auth) state.auth.can_curate = false;
+  else state.auth = { can_curate: false };
+  curationState.accessLostShown = true;
+  closeCurationDialog({ force: true });
+  closeCurationAuxModal({ force: true });
+  curationState.sessions.forEach((session) => renderCurationNotification(session));
+  if (state.currentResult) renderAnnotationResult(state.currentResult);
+  // Partner-precedent lookups render outside the run result: drop their controls too.
+  refreshPartnerCurationViews();
+  if (!wasShown) showCurationToast(CURATION_ACCESS_LOST_MESSAGE, "error");
+}
+
+// Every curation request (/v1/curation/...) goes through here.
+// - A write (non-GET) is re-checked at the moment it would be sent, after any
+//   awaits by the caller, and returns null without sending once access is gone.
+// - A 403 from any curation request, reads included, means curator access is
+//   gone: the UI turns read-only and every draft is kept.
+async function curationFetch(url, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  if (method !== "GET" && !curationWriteAllowed()) return null;
+  const response = await fetch(url, options);
+  if (response.status === 403 && canCurate()) curationAccessLost();
+  return response;
+}
+
+// Every write path calls this first: no request is sent without permission.
+function curationWriteAllowed() {
+  if (canCurate()) {
+    curationState.accessLostShown = false;
+    return true;
+  }
+  curationAccessLost();
+  return false;
 }
 
 function curationNormalizeTumorType(value) {
@@ -353,7 +412,9 @@ function renderCurationNotification(session) {
   });
   item.appendChild(curationEl("p", { text: curationJobStatusText(session) }));
   const actions = curationEl("div", { className: "curation-notification-actions" });
-  if (status === "succeeded") {
+  if (!canCurate()) {
+    // Read-only: no way back into the editor until access returns.
+  } else if (status === "succeeded") {
     actions.appendChild(
       curationButton("Review draft", () => openCurationDialog(session.subject, { step: "review" }), {
         className: "primary-action",
@@ -561,7 +622,7 @@ function curationJobErrorMessage(status, detail) {
 }
 
 async function submitCurationReevaluation(session) {
-  if (curationLocked(session)) return;
+  if (!curationWriteAllowed() || curationLocked(session)) return;
   if (session.subject.type === "gene" && !session.include.evidence && !session.include.precedent) {
     session.message = { type: "error", text: "Choose evidence, precedent, or both to edit." };
     renderCurationDialog();
@@ -584,11 +645,15 @@ async function submitCurationReevaluation(session) {
   session.message = null;
   renderCurationDialog();
   try {
-    const response = await fetch("/v1/curation/reevaluate/jobs", {
+    const response = await curationFetch("/v1/curation/reevaluate/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (!response || response.status === 403) {
+      session.message = { type: "error", text: CURATION_ACCESS_LOST_MESSAGE };
+      return;
+    }
     if (!response.ok) {
       const detail = await curationResponseDetail(response);
       session.message = { type: "error", text: curationJobErrorMessage(response.status, detail) };
@@ -624,7 +689,7 @@ async function pollCurationJob(session, job) {
     if (!curationJobIsCurrent(session, job)) return;
     let status;
     try {
-      const response = await fetch(job.statusUrl);
+      const response = await curationFetch(job.statusUrl);
       if (response.status === 404) {
         finishCurationJob(session, job, {
           status: "failed",
@@ -635,6 +700,7 @@ async function pollCurationJob(session, job) {
       if (!response.ok) {
         const detail = await curationResponseDetail(response);
         if (response.status === 401 || response.status === 403) {
+          // curationFetch already turned the UI read-only on a 403.
           finishCurationJob(session, job, { status: "failed", error: curationJobErrorMessage(response.status, detail) });
           return;
         }
@@ -873,7 +939,7 @@ function buildCurationPayload(session, currentPayload = {}) {
 // GET the subject's current override: { version, override } (version 0 and
 // override null when there is none). Throws { status, detail } on failure.
 async function fetchCurrentCurationOverride(subject) {
-  const response = await fetch(curationUrl(subject));
+  const response = await curationFetch(curationUrl(subject));
   if (!response.ok) {
     const error = new Error("Couldn't load the current curated version");
     error.response = response;
@@ -981,7 +1047,7 @@ function curatedRecordFromOverride(subject, record, response) {
 }
 
 async function saveCurationDraft(session) {
-  if (curationState.busy || !session.draft || !session.submitted) return;
+  if (!curationWriteAllowed() || curationState.busy || !session.draft || !session.submitted) return;
   curationState.busy = true;
   session.message = { type: "info", text: "Saving curator edits…" };
   renderCurationDialog();
@@ -991,6 +1057,10 @@ async function saveCurationDraft(session) {
       current = await fetchCurrentCurationOverride(session.subject);
     } catch (error) {
       const response = error.response;
+      if (response && response.status === 403) {
+        session.message = { type: "error", text: CURATION_ACCESS_LOST_MESSAGE };
+        return;
+      }
       session.message = response && response.status === 503
         ? { type: "error", text: curationRetryMessage(response, error.detail, "save"), retry: true }
         : { type: "error", text: `${error.message}, so nothing was saved; please retry.`, retry: true };
@@ -1004,11 +1074,16 @@ async function saveCurationDraft(session) {
     const body = { expected_version: expected, payload: buildCurationPayload(session, current.override?.payload) };
     const note = session.note.trim();
     if (note) body.note = note;
-    const response = await fetch(curationUrl(session.subject), {
+    // Sent only if access still holds now, after the preflight await.
+    const response = await curationFetch(curationUrl(session.subject), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (!response) {
+      session.message = { type: "error", text: CURATION_ACCESS_LOST_MESSAGE };
+      return;
+    }
     if (!response.ok) {
       const detail = await curationResponseDetail(response);
       if (response.status === 503) {
@@ -1059,7 +1134,8 @@ function handleCurationSaveError(session, status, detail) {
     return;
   }
   if (status === 403) {
-    session.message = { type: "error", text: curationJobErrorMessage(403) };
+    // The caller flips the UI to read-only; the draft stays in the session.
+    session.message = { type: "error", text: CURATION_ACCESS_LOST_MESSAGE };
     return;
   }
   session.message = { type: "error", text: curationDetailMessage(detail, "Couldn't save curator edits; please retry.") };
@@ -1089,11 +1165,20 @@ function refreshCurationView(subject) {
     return;
   }
   const view = curationState.partnerViews.get(curationSubjectId(subject));
-  if (!view) return;
+  if (view) renderPartnerCurationView(view);
+}
+
+function renderPartnerCurationView(view) {
   view.entries.forEach((entry, container) => {
     if (container.isConnected === false) view.entries.delete(container);
     else renderFusionPartnerResultContent(container, entry.record, entry.request);
   });
+}
+
+// Re-renders every registered partner-precedent lookup (e.g. after a
+// permission change, so edit controls appear or disappear).
+function refreshPartnerCurationViews() {
+  curationState.partnerViews.forEach((view) => renderPartnerCurationView(view));
 }
 
 // Re-fetches each rendered lookup of a partner subject with its own request
@@ -1164,50 +1249,54 @@ function curationCallEditButton(subject, record) {
 }
 
 function openCurationCallEditor(subject) {
+  if (!curationWriteAllowed()) return;
   const record = findCurationRecord(subject);
-  if (!canCurate() || !record || curationTumorContextUnresolved(subject, record)) return;
+  if (!record || curationTumorContextUnresolved(subject, record)) return;
   const initial = curatedCall(record);
   const edit = { call: initial, baseVersion: record.curation_version || 0, note: "" };
   const shown = typeof initial === "boolean"
     ? `${curationCallText(initial)} (curator-set)`
     : `${record.cancer_associated === true ? "Yes" : record.cancer_associated === false ? "No" : "undetermined"} (pipeline)`;
+  const select = curationCallSelect(initial, (call) => { edit.call = call; });
+  const note = curationTextarea("", (value) => { edit.note = value; }, { rows: 2, dataset: { curation: "call-note" } });
   const body = curationEl("div", { className: "curation-call-editor" }, [
     curationEl("p", {
       text: `Currently: ${shown}. Only the call changes; other curated sections are kept as they are.`,
       dataset: { curation: "call-current" },
     }),
-    curationField("Cancer-associated call", curationCallSelect(initial, (call) => { edit.call = call; }),
-      { id: "curation-call-select" }),
-    curationField("Note for history (optional)",
-      curationTextarea("", (value) => { edit.note = value; }, { rows: 2, dataset: { curation: "call-note" } }),
-      { id: "curation-call-note" }),
+    curationField("Cancer-associated call", select, { id: "curation-call-select" }),
+    curationField("Note for history (optional)", note, { id: "curation-call-note" }),
   ]);
   const error = curationEl("p", { className: "curation-error", attrs: { role: "alert" }, dataset: { curation: "call-error" } });
   body.appendChild(error);
   const save = curationButton("Save call", null, { className: "primary-action", action: "save-call" });
-  save.addEventListener("click", () => saveCurationCall(subject, edit, error, save));
-  openCurationAuxModal(`Cancer-associated call — ${subject.label}`, body, [
-    curationButton("Cancel", closeCurationAuxModal, { action: "cancel-call" }),
-    save,
-  ]);
+  const cancel = curationButton("Cancel", () => closeCurationAuxModal(), { action: "cancel-call" });
+  // Every control is read-only while the write is in flight.
+  const controls = [select, note, save, cancel];
+  save.addEventListener("click", () => saveCurationCall(subject, edit, error, controls));
+  openCurationAuxModal(`Cancer-associated call — ${subject.label}`, body, [cancel, save]);
 }
 
 // Merges only `cancer_associated` into the CURRENT override (every other
 // section verbatim) under the version the curator saw. Keeping the pipeline's
 // call when it was the override's only section reverts the override.
-async function saveCurationCall(subject, edit, errorNode, button) {
-  if (curationState.busy) return;
+async function saveCurationCall(subject, edit, errorNode, controls) {
+  if (!curationWriteAllowed() || curationState.busy) return;
   curationState.busy = true;
-  button.disabled = true;
+  const setLocked = (locked) => controls.forEach((control) => { control.disabled = locked; });
+  setLocked(true);
   errorNode.textContent = "";
   try {
     let current;
     try {
       current = await fetchCurrentCurationOverride(subject);
     } catch (error) {
-      errorNode.textContent = error.response && error.response.status === 503
-        ? curationRetryMessage(error.response, error.detail, "save")
-        : `${error.message}, so nothing was saved; please retry.`;
+      const response = error.response;
+      errorNode.textContent = response && response.status === 403
+        ? CURATION_ACCESS_LOST_MESSAGE
+        : response && response.status === 503
+          ? curationRetryMessage(response, error.detail, "save")
+          : `${error.message}, so nothing was saved; please retry.`;
       return;
     }
     const currentPayload = current.override?.payload || {};
@@ -1228,13 +1317,15 @@ async function saveCurationCall(subject, edit, errorNode, button) {
     }
     const note = edit.note.trim() || undefined;
     const reverting = !Object.keys(payload).length;
+    // Sent only if access still holds now, after the preflight await.
     const response = reverting
-      ? await fetch(curationUrl(subject, "", { expected_version: current.version, note }), { method: "DELETE" })
-      : await fetch(curationUrl(subject), {
+      ? await curationFetch(curationUrl(subject, "", { expected_version: current.version, note }), { method: "DELETE" })
+      : await curationFetch(curationUrl(subject), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ expected_version: current.version, payload, ...(note ? { note } : {}) }),
       });
+    if (!response) return;
     if (!response.ok) {
       const detail = await curationResponseDetail(response);
       if (response.status === 409) {
@@ -1250,7 +1341,7 @@ async function saveCurationCall(subject, edit, errorNode, button) {
       } else if (response.status === 503) {
         errorNode.textContent = curationRetryMessage(response, detail, "save");
       } else if (response.status === 403) {
-        errorNode.textContent = curationJobErrorMessage(403);
+        errorNode.textContent = CURATION_ACCESS_LOST_MESSAGE;
       } else {
         errorNode.textContent = curationDetailMessage(detail, "Couldn't save the call; please retry.");
       }
@@ -1278,15 +1369,16 @@ async function saveCurationCall(subject, edit, errorNode, button) {
     errorNode.textContent = `Couldn't save the call: ${error.message}`;
   } finally {
     curationState.busy = false;
-    button.disabled = false;
+    setLocked(false);
   }
 }
 
 // The expected version only advances once the current override has been
 // fetched; its author and changed sections are shown before the re-save.
 async function reloadAfterCurationConflict(session) {
-  if (curationState.busy) return;
+  if (!curationWriteAllowed() || curationState.busy) return;
   curationState.busy = true;
+  renderCurationDialog();
   try {
     let current;
     try {
@@ -1299,7 +1391,9 @@ async function reloadAfterCurationConflict(session) {
       };
       return;
     }
+    if (!canCurate()) return;
     const refreshed = await reloadCurationSubject(session.subject).catch(() => null);
+    if (!canCurate()) return;
     const override = current.override;
     const changes = override
       ? `v${current.version} by ${override.curator_email} on ${formatCurationDate(override.updated_at)}`
@@ -1338,6 +1432,7 @@ async function reloadAfterCurationConflict(session) {
 }
 
 function confirmCurationRevert(subject) {
+  if (!curationWriteAllowed()) return;
   const record = findCurationRecord(subject);
   const version = record?.curation_version || 0;
   const body = curationEl("div", {}, [
@@ -1348,19 +1443,20 @@ function confirmCurationRevert(subject) {
   const error = curationEl("p", { className: "curation-error", attrs: { role: "alert" } });
   body.appendChild(error);
   const confirmButton = curationButton("Revert to pipeline", null, { className: "danger-action", action: "confirm-revert" });
-  confirmButton.addEventListener("click", () => revertCuration(subject, version, error, confirmButton));
-  openCurationAuxModal(`Revert ${subject.label}`, body, [
-    curationButton("Cancel", closeCurationAuxModal, { action: "cancel-revert" }),
-    confirmButton,
-  ]);
+  const cancelButton = curationButton("Cancel", () => closeCurationAuxModal(), { action: "cancel-revert" });
+  confirmButton.addEventListener("click", () => revertCuration(subject, version, error, confirmButton, cancelButton));
+  openCurationAuxModal(`Revert ${subject.label}`, body, [cancelButton, confirmButton]);
 }
 
-async function revertCuration(subject, version, errorNode, button) {
-  if (curationState.busy) return;
+async function revertCuration(subject, version, errorNode, button, cancelButton) {
+  if (!curationWriteAllowed() || curationState.busy) return;
   curationState.busy = true;
+  // Read-only while the DELETE is in flight; Escape/close are blocked by busy.
   button.disabled = true;
+  if (cancelButton) cancelButton.disabled = true;
   try {
-    const response = await fetch(curationUrl(subject, "", { expected_version: version || undefined }), { method: "DELETE" });
+    const response = await curationFetch(curationUrl(subject, "", { expected_version: version || undefined }), { method: "DELETE" });
+    if (!response) return;
     if (!response.ok && response.status !== 404) {
       const detail = await curationResponseDetail(response);
       if (response.status === 409) {
@@ -1370,7 +1466,7 @@ async function revertCuration(subject, version, errorNode, button) {
       } else if (response.status === 503) {
         errorNode.textContent = curationRetryMessage(response, detail, "revert");
       } else if (response.status === 403) {
-        errorNode.textContent = curationJobErrorMessage(403);
+        errorNode.textContent = CURATION_ACCESS_LOST_MESSAGE;
       } else {
         errorNode.textContent = curationDetailMessage(detail, "Couldn't revert; please retry.");
       }
@@ -1392,6 +1488,7 @@ async function revertCuration(subject, version, errorNode, button) {
   } finally {
     curationState.busy = false;
     button.disabled = false;
+    if (cancelButton) cancelButton.disabled = false;
   }
 }
 
@@ -1424,10 +1521,10 @@ async function showCurationHistory(subject) {
     curationEl("p", { className: "subtle", text: "Loading history…" }),
   ]);
   openCurationAuxModal(`${subject.label} curation history`, body, [
-    curationButton("Close", closeCurationAuxModal, { className: "primary-action", action: "close-history" }),
+    curationButton("Close", () => closeCurationAuxModal(), { className: "primary-action", action: "close-history" }),
   ]);
   try {
-    const response = await fetch(curationUrl(subject, "/history"));
+    const response = await curationFetch(curationUrl(subject, "/history"));
     if (!response.ok) {
       const detail = await curationResponseDetail(response);
       body.replaceChildren(curationEl("p", { className: "curation-error", text: curationDetailMessage(detail, "Couldn't load history.") }));
@@ -1602,8 +1699,9 @@ function openCurationDialog(subject, { focus = "evidence", step } = {}) {
   renderCurationDialog({ focusFirst: true });
 }
 
-function closeCurationDialog() {
-  if (curationState.busy) return;
+function closeCurationDialog({ force = false } = {}) {
+  if (curationState.busy && !force) return;
+  if (!curationState.openSubjectId && curationById("curation-modal")?.classList.contains("hidden")) return;
   const subjectId = curationState.openSubjectId;
   curationState.openSubjectId = null;
   curationShow(curationById("curation-modal"), false);
@@ -1731,6 +1829,15 @@ function renderCurationDialog({ focusFirst = false } = {}) {
   renderCurationStatus(session, statusNode);
   bodyNode.replaceChildren(isReview ? renderCurationReview(session) : renderCurationPmidStep(session));
   footer.replaceChildren(...renderCurationFooter(session, isReview));
+  // While a save, submission or reload is in flight the editor is read-only,
+  // so nothing typed can be dropped or saved stale; failure re-renders it
+  // editable from the session, which holds every keystroke.
+  if (curationState.busy) {
+    bodyNode.querySelectorAll("input, textarea, select, button").forEach((control) => { control.disabled = true; });
+    bodyNode.setAttribute("aria-busy", "true");
+  } else {
+    bodyNode.removeAttribute("aria-busy");
+  }
 
   if (focusFirst) {
     const preferred = bodyNode.querySelector(
@@ -1779,7 +1886,7 @@ function renderCurationStatus(session, node) {
     }
     if (session.message.conflict) {
       parts.push(curationButton("Reload latest version", () => reloadAfterCurationConflict(session), {
-        action: "reload-conflict",
+        action: "reload-conflict", disabled: curationState.busy,
       }));
     }
   }
@@ -2237,8 +2344,9 @@ function openCurationAuxModal(titleText, body, buttons) {
   if (first && first.focus) first.focus();
 }
 
-function closeCurationAuxModal() {
-  if (curationState.busy) return;
+function closeCurationAuxModal({ force = false } = {}) {
+  if (curationState.busy && !force) return;
+  if (curationById("curation-aux-modal")?.classList.contains("hidden")) return;
   curationShow(curationById("curation-aux-modal"), false);
   syncCurationModalInert();
   const target = curationState.auxReturnFocus;
@@ -2248,9 +2356,9 @@ function closeCurationAuxModal() {
 
 function bindCurationEvents() {
   const close = curationById("close-curation");
-  if (close) close.addEventListener("click", closeCurationDialog);
+  if (close) close.addEventListener("click", () => closeCurationDialog());
   const closeAux = curationById("close-curation-aux");
-  if (closeAux) closeAux.addEventListener("click", closeCurationAuxModal);
+  if (closeAux) closeAux.addEventListener("click", () => closeCurationAuxModal());
   document.addEventListener("keydown", (event) => {
     if (event.key === "Tab") {
       trapCurationFocus(event);

@@ -30,7 +30,7 @@ class _RecordingRunStore:
         self.pmid_evidence_reads = []
         self.pmid_evidence_writes = []
 
-    async def save_run(self, run_id, timestamp, request_payload, result_payload):
+    async def save_run(self, run_id, timestamp, request_payload, result_payload, **owner):
         self.saved_runs.append(run_id)
 
     async def get_gene_annotation(self, gene, tumor_type=None):
@@ -132,7 +132,7 @@ def default_off_app(monkeypatch):
     monkeypatch.setattr(synthesis, "complete_with_tool", fake_complete_with_tool)
 
     run_store = _RecordingRunStore()
-    monkeypatch.setattr(main.app.state, "run_store", run_store, raising=False)
+    monkeypatch.setitem(main.app.state._state, "run_store", run_store)
     return TestClient(main.app), run_store, seen
 
 

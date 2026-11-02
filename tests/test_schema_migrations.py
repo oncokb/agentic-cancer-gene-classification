@@ -2,34 +2,43 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 import pymysql
 import pytest
 
-from src.pipeline import curation_store, schema_migrations
-from src.pipeline.run_store import RunStore
+from src.pipeline import schema_migrations
 
 
 class FakeCursor:
-    """Records SQL; `columns` is the live schema, `on_alter` simulates what
-    happens when this instance's ALTER runs (e.g. another instance won)."""
+    """Records SQL; `columns` is the live schema and `errors` simulates ALTER races.
 
-    def __init__(self, columns: Dict[str, set], errors: Optional[List[Any]] = None,
-                 primary: Optional[List[str]] = None) -> None:
+    `no_backslash_escapes` models that sql_mode: LIKE then has no default
+    escape character, so a backslash in a pattern is a literal backslash."""
+
+    def __init__(
+        self, columns: Dict[str, set], errors: Optional[List[Any]] = None,
+        *, no_backslash_escapes: bool = False,
+    ) -> None:
         self.columns = columns
+        self.no_backslash_escapes = no_backslash_escapes
         self.errors = list(errors or [])  # popped per ALTER: an errno, or None for success
-        self.primary = primary or ["gene", "tumor_type"]
         self.sql: List[str] = []
+        self.params: List[Any] = []
         self._result: Any = None
 
     async def execute(self, sql, params=None):
         self.sql.append(sql)
+        self.params.append(params)
         if sql.startswith("SHOW COLUMNS"):
             table = sql.split()[3]
-            self._result = (params[0],) if params[0] in self.columns.get(table, set()) else None
-        elif sql.startswith("SHOW INDEX"):
-            self._result = [(None, None, None, i + 1, col) for i, col in enumerate(self.primary)]
+            if sql.endswith("WHERE Field = %s"):
+                matches = lambda name: name == params[0]  # noqa: E731
+            else:
+                escape = None if self.no_backslash_escapes else "\\"
+                matches = lambda name: _like_matches(name, params[0], escape)  # noqa: E731
+            self._result = next(((name,) for name in self.columns.get(table, set()) if matches(name)), None)
         elif sql.startswith("ALTER TABLE"):
             outcome = self.errors.pop(0) if self.errors else None
             table = sql.split()[2]
@@ -40,14 +49,27 @@ class FakeCursor:
                 raise pymysql.err.OperationalError(outcome, "simulated")
             if "ADD COLUMN" in sql:
                 self.columns.setdefault(table, set()).add(sql.split("ADD COLUMN ")[1].split()[0])
-            if "ADD PRIMARY KEY" in sql:
-                self.primary = ["gene", "tumor_type"]
 
     async def fetchone(self):
         return self._result
 
-    async def fetchall(self):
-        return self._result
+
+def _like_matches(value: str, pattern: str, escape: Optional[str] = "\\") -> bool:
+    regex = ""
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if escape is not None and character == escape and index + 1 < len(pattern):
+            index += 1
+            regex += re.escape(pattern[index])
+        elif character == "_":
+            regex += "."
+        elif character == "%":
+            regex += ".*"
+        else:
+            regex += re.escape(character)
+        index += 1
+    return re.fullmatch(regex, value) is not None
 
 
 def _won_race(table, column):
@@ -97,19 +119,51 @@ async def test_present_column_skips_alter():
     assert not any(sql.startswith("ALTER") for sql in cursor.sql)
 
 
-async def test_curation_schema_survives_revision_race():
-    cursor = FakeCursor({"runs": set()}, errors=[(1060, _won_race("runs", "revision"))])
-    await curation_store.CurationStoreMixin()._ensure_curation_schema(cursor)
-    assert "revision" in cursor.columns["runs"]
+@pytest.mark.parametrize(
+    ("table", "column"),
+    [("runs; DROP TABLE users", "revision"), ("runs", "owner-email"), ("1runs", "revision")],
+)
+async def test_invalid_identifier_is_rejected_before_sql(table, column):
+    cursor = FakeCursor({"runs": set()})
+    with pytest.raises(ValueError, match="Invalid SQL identifier"):
+        await schema_migrations.add_column_if_missing(cursor, table, column, "INT")
+    assert cursor.sql == []
 
 
-async def test_gene_annotation_primary_key_race_is_verified():
-    def other_instance_rekeyed(cursor):
-        cursor.primary = ["gene", "tumor_type"]
+@pytest.mark.parametrize("no_backslash_escapes", [False, True])
+async def test_column_check_is_an_exact_match_under_any_sql_mode(no_backslash_escapes):
+    # An underscore is not a wildcard: ownerXemail doesn't count as owner_email.
+    cursor = FakeCursor({"runs": {"ownerXemail"}}, no_backslash_escapes=no_backslash_escapes)
+    await schema_migrations.add_column_if_missing(cursor, "runs", "owner_email", "VARCHAR(255)")
+    assert cursor.sql[0] == "SHOW COLUMNS FROM runs WHERE Field = %s"
+    assert cursor.params[0] == ("owner_email",)
+    assert "owner_email" in cursor.columns["runs"]
 
-    cursor = FakeCursor({"gene_annotations": set()}, primary=["gene"],
-                        errors=[None, (1068, other_instance_rekeyed)])
-    await RunStore(pool=None)._ensure_gene_annotation_schema(cursor)
-    assert cursor.primary == ["gene", "tumor_type"]
-    assert "tumor_type" in cursor.columns["gene_annotations"]
 
+@pytest.mark.parametrize("no_backslash_escapes", [False, True])
+async def test_existing_column_with_underscore_is_found_under_any_sql_mode(no_backslash_escapes):
+    # A backslash-escaped LIKE pattern misses the column under NO_BACKSLASH_ESCAPES.
+    cursor = FakeCursor({"runs": {"owner_email"}}, no_backslash_escapes=no_backslash_escapes)
+    await schema_migrations.add_column_if_missing(cursor, "runs", "owner_email", "VARCHAR(255)")
+    assert not any(sql.startswith("ALTER") for sql in cursor.sql)
+    assert not any("LIKE" in sql or "\\" in sql for sql in cursor.sql)
+
+
+def test_backslash_like_pattern_misses_under_no_backslash_escapes():
+    # Documents the fixed bug, using the fake's LIKE model.
+    assert _like_matches("owner_email", r"owner\_email")
+    assert not _like_matches("owner_email", r"owner\_email", escape=None)
+
+
+@pytest.mark.parametrize("duplicate_errno", [1060, 1061, 1068])
+async def test_concurrent_safe_ddl_tolerates_duplicate_errors(duplicate_errno):
+    sql = "ALTER TABLE runs ADD COLUMN revision INT"
+    cursor = FakeCursor({"runs": set()}, errors=[duplicate_errno])
+    await schema_migrations.run_concurrent_safe_ddl(cursor, sql)
+    assert cursor.sql == [sql]
+
+
+async def test_concurrent_safe_ddl_propagates_other_errors():
+    cursor = FakeCursor({"runs": set()}, errors=[1142])
+    with pytest.raises(pymysql.err.OperationalError):
+        await schema_migrations.run_concurrent_safe_ddl(cursor, "ALTER TABLE runs ADD COLUMN revision INT")

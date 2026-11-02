@@ -1,0 +1,76 @@
+# Managing users (admins)
+
+Admins manage who may use ACGC on the **Users** page, `/admin/users`, linked
+from the user menu (shown to admins only). Signed-out visitors are sent
+through sign-in and back; signed-in non-admins get a 403 page. The page
+uses the [admin API](api.md#admin-user-management-v1admin), which scripts
+can call with an admin's API key.
+
+## What you can do
+
+- **Find users**: search by email or name, filter by role and status. The
+  list is newest sign-in first; **Load more** fetches the next page.
+- **Approve** a pending account (pending → active), **Disable** an active
+  one, **Re-enable** a disabled one.
+- **Change a role** with the role menu: viewer, curator or admin. Curators
+  (and admins) may save and revert curated overrides (`/v1/curation`);
+  viewers can only read them. This page is the only way to grant curator:
+  sign-in never sets curator or lowers a role from Keycloak roles or SAML
+  groups. With `USER_STORE_BACKEND=redis` (legacy), members of `KEYCLOAK_ADMIN_ROLES` / `SAML_ADMIN_GROUPS` are promoted to admin at sign-in; with `mysql`, groups never change a role.
+- **History** shows one user's changes; **Show all changes** returns to the
+  full change log.
+
+Every change opens a confirmation with an optional reason, which is stored
+in the change log. Demotions and disabling are marked as such. A change
+applies on the user's next request: a disabled user loses access (sessions are refused) and their
+API keys stop working; a demoted admin loses admin pages and endpoints; a
+demoted curator can no longer save or revert curated overrides.
+
+## Safety rules
+
+- There is always at least one **active** admin: the last one can't be
+  demoted or disabled (a disabled admin doesn't count). The check runs in the
+  same database transaction as the change, so two admins removing each other
+  at the same moment can't both succeed.
+- You can't disable your own account. You can demote yourself while another
+  active admin remains.
+- Requests that change nothing write nothing.
+- Every change is recorded in `role_changes` with your email as the actor;
+  the log is insert-only.
+- Changes made with your browser session are accepted only from ACGC's own
+  pages (same origin as `PUBLIC_APP_BASE_URL`), so another site, including a
+  sibling subdomain, can't make them on your behalf. Scripts using an admin's
+  API key aren't affected.
+
+## Requirements
+
+Changes need the MySQL user store (`USER_STORE_BACKEND=mysql`, see
+[user-migration.md](user-migration.md)). With `redis` the page shows a
+read-only notice, the role and status controls are disabled, and the change
+log is unavailable. If the user store can't be reached, the page shows an
+error and nothing is changed.
+
+## Curator access requests
+
+Active viewers can choose **Request curator access** in the user menu, submit
+reason, affiliation, expertise and an optional ORCID, and return there to see
+status. Only one request may be pending per user. Rejection displays the reviewer
+note and allows another application. There are no email or other notifications.
+
+On `/admin/users`, the **Curator requests** section starts with the pending
+queue, newest first. Use the status selector to see approved or rejected requests
+and **Load more** to paginate. Read the application, choose **Approve** or
+**Reject**, optionally enter a reviewer note (up to 1000 characters), then confirm.
+The page refreshes after review so the users table and change log reflect the
+result. Application fields and notes are rendered as text.
+
+Approval atomically grants curator access, records the acting admin and request
+ID in the role change log, and closes the request. It fails without changing
+anything if another reviewer has already decided it or the applicant is no
+longer an active viewer (for example, disabled or already promoted). A stale
+request can still be rejected. Rejection records the reviewer and note without
+changing access. Current roles apply on the user's next request.
+
+This feature requires `USER_STORE_BACKEND=mysql`; Redis shows an explicit
+unavailable-feature message. The API endpoints and limits are documented in
+[api.md](api.md#curator-access-requests).

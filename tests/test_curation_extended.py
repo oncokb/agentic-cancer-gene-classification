@@ -414,7 +414,7 @@ async def test_partner_job_rejections(case, monkeypatch):
     def user(email, role="curator"):
         return AuthenticatedUser(email=email, name=email, domain="test", role=role)
 
-    routes._jobs.clear()
+    routes._jobs.clear_local()
     pending = []
     monkeypatch.setattr(main, "_track_background_task", pending.append)
     monkeypatch.setattr(routes, "reevaluate", AsyncMock(return_value={"pmids": ["1"]}))
@@ -451,13 +451,13 @@ async def test_partner_job_rejections(case, monkeypatch):
                 assert (await create()).status_code == 200
                 assert (await create()).status_code == 429
             if case != "third_inflight_job":
-                assert all(job.status == "queued" for job in routes._jobs.values())
-                assert len(routes._jobs) == (1 if case == "other_users_job" else 0)
+                assert all(job.status == "queued" for job, _ in routes._jobs.local.values())
+                assert len(routes._jobs.local) == (1 if case == "other_users_job" else 0)
     finally:
         for coro in pending:
             coro.close()
         main.app.dependency_overrides.pop(routes._curator_dependency, None)
-        routes._jobs.clear()
+        routes._jobs.clear_local()
 
 
 async def test_partner_job_route_lifecycle(mocked, monkeypatch):
@@ -468,7 +468,7 @@ async def test_partner_job_route_lifecycle(mocked, monkeypatch):
     from src.api import curation_reevaluate_routes as routes
     from src.auth import AuthenticatedUser
 
-    routes._jobs.clear()
+    routes._jobs.clear_local()
     tasks = []
     original_track = main._track_background_task
     monkeypatch.setattr(main, "_track_background_task", lambda coro: tasks.append(original_track(coro)) or tasks[-1])

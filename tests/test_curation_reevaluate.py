@@ -93,7 +93,7 @@ async def test_invalid_pmids_reports_each_reason_before_llm(mocked):
             )
         )
     assert error.value.reasons == {"unknown": ["3"], "retracted": ["1"], "no_abstract": ["2"]}
-    assert fetch.call_args.kwargs == {"filter_retracted": False}
+    assert fetch.call_args.kwargs == {"filter_retracted": False, "use_cache": False}
     llm.assert_not_awaited()
     suggestions.assert_not_awaited()
 
@@ -211,7 +211,7 @@ def test_pinned_filter_bypasses_mismatch_cap_and_ranking_only_when_enabled():
 
 
 async def test_routes_lifecycle_unknown_and_failure(mocked, monkeypatch):
-    routes._jobs.clear()
+    routes._jobs.clear_local()
     tasks = []
     original_track = main._track_background_task
 
@@ -261,7 +261,7 @@ async def test_routes_lifecycle_unknown_and_failure(mocked, monkeypatch):
         assert result["status"] == "failed"
         assert result["invalid_pmids"]["unknown"] == ["99"]
         assert result["draft"] is None
-    routes._jobs.clear()
+    routes._jobs.clear_local()
 
 
 @pytest.mark.parametrize(
@@ -289,7 +289,7 @@ async def test_efetch_omitted_no_abstract_is_not_unknown(mocked):
 
 
 async def test_route_queued_generic_failure_and_auth(mocked, monkeypatch):
-    routes._jobs.clear()
+    routes._jobs.clear_local()
     pending = []
     monkeypatch.setattr(main, "_track_background_task", pending.append)
     async with httpx.AsyncClient(
@@ -317,7 +317,7 @@ async def test_route_queued_generic_failure_and_auth(mocked, monkeypatch):
                 json={"subject_type": "gene", "subject_key": "RP1", "evidence_pmids": ["1"]},
             )
         ).status_code == 401
-    routes._jobs.clear()
+    routes._jobs.clear_local()
 
 
 async def test_verbatim_suggestion_used_after_paraphrased_synthesis(mocked):
@@ -477,7 +477,7 @@ def user(email, role="curator"):
 
 
 async def test_job_limits_ownership_admin_and_audits(monkeypatch):
-    routes._jobs.clear()
+    routes._jobs.clear_local()
     pending, audits = [], []
     monkeypatch.setattr(main, "_track_background_task", pending.append)
     monkeypatch.setattr(routes, "record_user_action", lambda **kwargs: audits.append(kwargs))
@@ -492,7 +492,7 @@ async def test_job_limits_ownership_admin_and_audits(monkeypatch):
             first = await client.post("/v1/curation/reevaluate/jobs", json=body)
             second = await client.post("/v1/curation/reevaluate/jobs", json=body)
             url = first.json()["status_url"]
-            routes._jobs[second.json()["job_id"]].status = "running"
+            routes._jobs.local[second.json()["job_id"]][0].status = "running"
             assert (await client.post("/v1/curation/reevaluate/jobs", json=body)).status_code == 429
             identity = user("another@test")
             assert (await client.get(url)).status_code == 404
@@ -513,7 +513,7 @@ async def test_job_limits_ownership_admin_and_audits(monkeypatch):
         for coro in pending:
             coro.close()
         main.app.dependency_overrides.pop(routes._curator_dependency, None)
-        routes._jobs.clear()
+        routes._jobs.clear_local()
 
 
 @pytest.mark.parametrize(
@@ -528,19 +528,19 @@ async def test_typed_job_failures_preserve_owner_and_audit(monkeypatch, error):
     audits = []
     monkeypatch.setattr(routes, "record_user_action", lambda **kwargs: audits.append(kwargs))
     monkeypatch.setattr(routes, "reevaluate", AsyncMock(side_effect=error))
-    routes._jobs["test"] = routes.JobStatus(owner_email="owner@test")
+    await routes._jobs.put(routes.JobStatus(job_id="test", owner_email="owner@test"))
     try:
         await routes._run_job(
             "test",
             curator.ReevaluateRequest(subject_type="gene", subject_key="RP1", evidence_pmids=["1"]),
             None,
         )
-        assert routes._jobs["test"].error == str(error)
-        assert routes._jobs["test"].owner_email == "owner@test"
-        assert routes._jobs["test"].invalid_pmids is None
+        assert routes._jobs.local["test"][0].error == str(error)
+        assert routes._jobs.local["test"][0].owner_email == "owner@test"
+        assert routes._jobs.local["test"][0].invalid_pmids is None
         assert audits[-1]["action"] == "curation_reevaluate_failure"
     finally:
-        routes._jobs.clear()
+        routes._jobs.clear_local()
 
 
 @pytest.mark.parametrize("length", [20, 400])
@@ -612,12 +612,12 @@ async def test_lookup_outage_is_retryable(mocked, kind, subject):
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
 async def test_audit_failure_cannot_leak_slot(monkeypatch, outcome):
-    routes._jobs.clear()
-    routes._jobs["test"] = routes.JobStatus(owner_email="owner@test")
+    routes._jobs.clear_local()
+    await routes._jobs.put(routes.JobStatus(job_id="test", owner_email="owner@test"))
     observed = []
 
     def failed_audit(**kwargs):
-        observed.append(routes._jobs["test"].status)
+        observed.append(routes._jobs.local["test"][0].status)
         raise RuntimeError("Audit unavailable")
 
     monkeypatch.setattr(routes, "record_user_action", failed_audit)
@@ -637,12 +637,12 @@ async def test_audit_failure_cannot_leak_slot(monkeypatch, outcome):
         else:
             await routes._run_job("test", request, None)
         expected = "succeeded" if outcome == "success" else "failed"
-        assert routes._jobs["test"].status == expected
-        assert routes._jobs["test"].finished_at is not None
+        assert routes._jobs.local["test"][0].status == expected
+        assert routes._jobs.local["test"][0].finished_at is not None
         assert observed == ["running", expected]
-        assert not any(job.status in ("queued", "running") for job in routes._jobs.values())
+        assert not any(job.status in ("queued", "running") for job, _ in routes._jobs.local.values())
     finally:
-        routes._jobs.clear()
+        routes._jobs.clear_local()
 
 
 def test_list_cap_reads_live_settings(monkeypatch):
@@ -677,14 +677,14 @@ async def test_existence_search_bypasses_cache(monkeypatch):
     response = MagicMock()
     response.json.return_value = {"esearchresult": {"idlist": ["99"]}}
     client = AsyncMock()
-    client.get.return_value = response
+    client.post.return_value = response
     cached = AsyncMock(side_effect=AssertionError("Existence lookup must be uncached"))
     monkeypatch.setattr(curator.literature, "cached_call", cached)
     found = await curator.literature._esearch(
         "99[uid]", 1, client, use_cache=False, filter_retracted=False
     )
     assert found == ["99"]
-    assert client.get.call_args.kwargs["params"]["term"] == "99[uid]"
+    assert client.post.call_args.kwargs["data"]["term"] == "99[uid]"
     cached.assert_not_called()
 
 
@@ -692,7 +692,7 @@ async def test_network_existence_error_is_generic_job_failure(mocked, monkeypatc
     mocked[1].return_value = []
     curator.literature._esearch.side_effect = httpx.ConnectError("Private network detail")
     monkeypatch.setattr(routes, "reevaluate", curator.reevaluate)
-    routes._jobs["test"] = routes.JobStatus(owner_email="owner@test")
+    await routes._jobs.put(routes.JobStatus(job_id="test", owner_email="owner@test"))
     try:
         await routes._run_job(
             "test",
@@ -701,7 +701,163 @@ async def test_network_existence_error_is_generic_job_failure(mocked, monkeypatc
             ),
             None,
         )
-        assert routes._jobs["test"].error == "Re-evaluation failed; please retry."
-        assert routes._jobs["test"].invalid_pmids is None
+        assert routes._jobs.local["test"][0].error == "Re-evaluation failed; please retry."
+        assert routes._jobs.local["test"][0].invalid_pmids is None
     finally:
-        routes._jobs.clear()
+        routes._jobs.clear_local()
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "succeeded", "failed"])
+async def test_shared_job_snapshots_enforce_owner_on_another_worker(monkeypatch, status):
+    from src.job_store import JobStore
+    from tests.conftest import FakeRedis
+
+    redis = FakeRedis()
+    submitter = JobStore("curation_reevaluate", routes.JobStatus, redis_client_factory=lambda: redis)
+    poller = JobStore("curation_reevaluate", routes.JobStatus, redis_client_factory=lambda: redis)
+    await submitter.put(routes.JobStatus(job_id="shared", owner_email="owner@test", status=status))
+    monkeypatch.setattr(routes, "_jobs", poller)
+    identity = user("Owner@TEST")
+    main.app.dependency_overrides[routes._curator_dependency] = lambda: identity
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+        ) as client:
+            url = "/v1/curation/reevaluate/jobs/shared"
+            response = await client.get(url)
+            assert response.status_code == 200
+            assert response.json() == {
+                "status": status, "error": None, "invalid_pmids": None, "draft": None
+            }
+            assert poller.local == {}  # The result came from Redis.
+            identity = user("other@test")
+            assert (await client.get(url)).status_code == 404
+            identity = user("admin@test", role="admin")
+            assert (await client.get(url)).status_code == 200
+    finally:
+        main.app.dependency_overrides.pop(routes._curator_dependency, None)
+        submitter.clear_local()
+        poller.clear_local()
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed"])
+async def test_terminal_curator_jobs_expire_locally_and_in_redis(monkeypatch, status):
+    from src.job_store import JobStore
+    from tests.conftest import FakeRedis
+
+    redis = FakeRedis()
+    monkeypatch.setattr(routes.settings, "job_ttl_seconds", 5)
+    store = JobStore(
+        "curation_reevaluate", routes.JobStatus,
+        redis_client_factory=lambda: redis, clock=lambda: redis.now,
+    )
+    await store.put(routes.JobStatus(job_id="expiring", owner_email="owner@test", status=status))
+    assert await store.get("expiring") is not None
+    redis.advance(5)
+    assert await store.get("expiring") is None
+    assert store.local == {}
+    assert await redis.get(store.key("expiring")) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ERROR": "NCBI temporarily unavailable"},
+        {"ERROR": "NCBI temporarily unavailable", "esearchresult": {"idlist": []}},
+        {"header": {"type": "esearch"}},
+        {"esearchresult": {"ERROR": "Search failed", "idlist": []}},
+        {"esearchresult": {}},
+        {"esearchresult": {"idlist": None}},
+    ],
+)
+async def test_http_200_invalid_existence_response_is_retryable_job_failure(monkeypatch, payload):
+    def respond(request):
+        if str(request.url) == curator.literature.EFETCH_URL:
+            return httpx.Response(200, text="<PubmedArticleSet />")
+        assert str(request.url) == curator.literature.ESEARCH_URL
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(curator.literature, "_get_ncbi_client", lambda: client)
+        with pytest.raises(curator.NCBIUnavailable, match="please retry"):
+            await curator.validated_records(["1"])
+        await routes._jobs.put(routes.JobStatus(job_id="invalid-response", owner_email="owner@test"))
+        await routes._run_job(
+            "invalid-response",
+            curator.ReevaluateRequest(subject_type="gene", subject_key="RP1", evidence_pmids=["1"]),
+            None,
+        )
+        job = await routes._jobs.get("invalid-response")
+        assert job.status == "failed"
+        assert "please retry" in job.error
+        assert job.invalid_pmids is None
+
+
+async def test_validation_bypasses_cached_empty_efetch(monkeypatch):
+    xml = """<PubmedArticleSet><PubmedArticle><MedlineCitation>
+    <PMID>1</PMID><Article><ArticleTitle>Study</ArticleTitle>
+    <Abstract><AbstractText>Real abstract.</AbstractText></Abstract></Article>
+    </MedlineCitation></PubmedArticle></PubmedArticleSet>"""
+    cached_empty = AsyncMock(return_value=[])
+    monkeypatch.setattr(curator.literature, "cached_call", cached_empty)
+    calls = []
+
+    def respond(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, text=xml)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(curator.literature, "_get_ncbi_client", lambda: client)
+        records = await curator.validated_records(["1"])
+    assert records["1"].abstract == "Real abstract."
+    assert calls == [curator.literature.EFETCH_URL]
+    cached_empty.assert_not_awaited()
+
+
+async def test_validation_xml_parse_failure_is_retryable_and_uncached(monkeypatch):
+    cached = AsyncMock()
+    monkeypatch.setattr(curator.literature, "cached_call", cached)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="<broken"))
+    ) as client:
+        monkeypatch.setattr(curator.literature, "_get_ncbi_client", lambda: client)
+        with pytest.raises(curator.NCBIUnavailable, match="please retry"):
+            await curator.validated_records(["1"])
+    cached.assert_not_awaited()
+
+
+async def test_slow_status_poll_does_not_serialize_other_polls(monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_get(job_id):
+        if job_id == "slow":
+            entered.set()
+            await release.wait()
+        return routes.JobStatus(job_id=job_id, owner_email="owner@test")
+
+    monkeypatch.setattr(routes._jobs, "get", slow_get)
+    slow_poll = asyncio.create_task(routes.get_job("slow", user("owner@test")))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        fast_result = await asyncio.wait_for(
+            routes.get_job("fast", user("owner@test")), timeout=1
+        )
+        assert fast_result.job_id == "fast"
+    finally:
+        release.set()
+        await slow_poll
+
+
+async def test_worker_updates_do_not_wait_for_admission_lock(monkeypatch):
+    await routes._jobs.put(routes.JobStatus(job_id="unlocked", owner_email=None))
+    monkeypatch.setattr(routes, "reevaluate", AsyncMock(return_value={}))
+    request = curator.ReevaluateRequest(subject_type="gene", subject_key="RP1", evidence_pmids=["1"])
+    async with routes._jobs_lock:
+        await asyncio.wait_for(routes._run_job("unlocked", request, None), timeout=1)
+    job = await routes._jobs.get("unlocked")
+    assert job.status == "succeeded"
+    assert job.owner_email is None
+    with pytest.raises(main.HTTPException) as error:
+        await routes.get_job("unlocked", user("owner@test"))
+    assert error.value.status_code == 404
+    assert (await routes.get_job("unlocked", user("admin@test", role="admin"))).status == "succeeded"

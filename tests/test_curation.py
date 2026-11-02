@@ -57,6 +57,7 @@ class FakeCurationStore:
         self.checked: List[Any] = []
         self.runs: Dict[str, Dict[str, Any]] = {}
         self.requests: Dict[str, Dict[str, Any]] = {}
+        self.owners: Dict[str, Dict[str, Any]] = {}
         self.fail_curation = False  # simulate the curation tables being unreachable
         self.revisions: Dict[str, int] = {}
         self.before_cas = None  # one-shot async hook: a concurrent write before the next CAS
@@ -135,9 +136,15 @@ class FakeCurationStore:
 
     # -- runs (result_json + revision, like curation_store.py) --------------
     # Reads and writes copy, as a database would; every write bumps revision.
-    async def save_run(self, run_id, timestamp, request_payload, result_payload):
+    async def save_run(self, run_id, timestamp, request_payload, result_payload, owner_email=None, source=None):
         self.runs[run_id] = copy.deepcopy(result_payload)
         self.requests[run_id] = request_payload
+        self.owners[run_id] = {"owner_email": owner_email, "source": source}
+
+    async def get_run_metadata(self, run_id):
+        if run_id not in self.runs:
+            return None
+        return dict(self.owners.get(run_id, {"owner_email": None, "source": None}))
 
     async def get_run(self, run_id):
         return copy.deepcopy(self.runs.get(run_id))
@@ -169,13 +176,26 @@ class FakeCurationStore:
 
     async def set_run_annotation_tumor_types(self, run_id, entries):
         if run_id in self.runs:
-            self.runs[run_id].setdefault("annotation_tumor_types", {}).update(entries)
+            context = self.runs[run_id].setdefault("annotation_tumor_types", {})
+            for gene, tumor_type in entries.items():  # JSON_INSERT: only missing entries
+                context.setdefault(gene, tumor_type)
             self._bump(run_id)
 
+    async def merge_run_result(self, run_id, mutate, *, sync_genes_annotated=False):
+        """Row-locked read-mutate-write (RunStore.merge_run_result); bumps revision."""
+        if run_id not in self.runs:
+            return None
+        stored = copy.deepcopy(self.runs[run_id])
+        updated = mutate(stored)
+        self.runs[run_id] = copy.deepcopy(stored if updated is None else updated)
+        self._bump(run_id)
+        return copy.deepcopy(self.runs[run_id])
+
     async def set_run_fusion_evidence(self, run_id, fusion_evidence):
-        if run_id in self.runs:
-            self.runs[run_id]["fusion_evidence"] = copy.deepcopy(fusion_evidence)
-            self._bump(run_id)
+        """Test helper: a concurrent fusion-evidence job's merge onto the run."""
+        await self.merge_run_result(
+            run_id, lambda stored: {**stored, "fusion_evidence": copy.deepcopy(fusion_evidence)}
+        )
 
     # -- gene_annotations ---------------------------------------------------
     async def get_gene_annotation(self, gene, tumor_type=None):
@@ -402,7 +422,7 @@ def test_put_validation_errors(client, url, body):
 
 
 def test_fusion_put_fills_cards_and_snapshots_pipeline(client, store, monkeypatch):
-    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None):
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None, **_kwargs):
         assert fusion == "EML4::ALK" and tumor_type == "nsclc"
         return FusionEvidenceResult(fusion=fusion, pmids=["111", "444"])
 
@@ -680,7 +700,7 @@ def test_run_link_matches_tumor_type_from_fusion_inputs(client, store):
 
 
 def test_fusion_evidence_job_applies_override_and_persists_pure(client, store, monkeypatch):
-    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None):
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None, **_kwargs):
         return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, pmids=["111"], retrieved_count=1,
                                     interpretation="Pipeline.")
 
@@ -802,7 +822,7 @@ def test_gene_query_job_poll_reflects_post_completion_edit(client, store, monkey
 
 
 def test_fusion_job_poll_reflects_post_completion_edit(client, store, monkeypatch):
-    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None):
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None, **_kwargs):
         return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, pmids=["111"], interpretation="Pipeline.")
 
     monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_fusion_evidence)
@@ -1009,13 +1029,13 @@ async def test_pipeline_and_reconstruction_share_duplicate_input_rule(pipeline_e
     monkeypatch.setattr(orchestrator, "_annotate_gene", fake_annotate_gene)
     inputs = [FusionInput(fusion="ALK", tumor_type="LUAD"), FusionInput(fusion="ALK", tumor_type="NSCLC")]
     result = await run_pipeline(inputs, run_store=FakeCurationStore())
-    assert result.annotation_tumor_types == {"ALK": "NSCLC"}  # the pipeline's rule
+    assert result.annotation_tumor_types == {"ALK": "LUAD"}  # the pipeline's rule: first wins
 
     store = FakeCurationStore()
     _legacy_run(store, "run-dup", [_pipeline_annotation()], {"fusions": [i.model_dump() for i in inputs]})
     legacy = AnnotationResult(**store.runs["run-dup"])
     monkeypatch.setattr(curation, "normalize_fusions", _fake_normalize_fusions)
-    assert await curation.ensure_annotation_tumor_types(legacy, store, "run-dup") == {"ALK": "NSCLC"}
+    assert await curation.ensure_annotation_tumor_types(legacy, store, "run-dup") == {"ALK": "LUAD"}
     assert legacy.annotation_tumor_types == result.annotation_tumor_types
 
 
@@ -1024,7 +1044,7 @@ def test_legacy_link_with_duplicate_inputs_uses_pipeline_tumor_context(client, s
                 {"fusions": [{"fusion": "ALK", "tumor_type": "LUAD"}, {"fusion": "ALK", "tumor_type": "NSCLC"}]})
     store.overrides[("gene", "ALK", "luad")] = _override({"citations": ["333"]}, tumor_type="luad")
     store.overrides[("gene", "ALK", "nsclc")] = _override({"citations": ["222"]}, tumor_type="nsclc")
-    assert client.get("/v1/annotate/run-dup").json()["annotations"][0]["citations"] == ["222"]
+    assert client.get("/v1/annotate/run-dup").json()["annotations"][0]["citations"] == ["333"]  # first wins
 
 
 def test_unresolved_alias_never_applies_untyped_override_or_persists_guess(client, store, monkeypatch):
@@ -1253,7 +1273,7 @@ def test_sanitizer_write_back_reloads_instead_of_overwriting_concurrent_writes(
 
 
 def test_fusion_job_persists_only_fusion_evidence(client, store, monkeypatch):
-    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None):
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None, **_kwargs):
         return FusionEvidenceResult(fusion=fusion, pmids=["222"])
 
     monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_fusion_evidence)
@@ -1269,3 +1289,175 @@ def test_fusion_job_persists_only_fusion_evidence(client, store, monkeypatch):
     assert persisted["fusion_evidence"][0]["pmids"] == ["222"]
     assert persisted["annotations"][0]["citations"] == ["sanitized-meanwhile"]
     assert persisted["annotation_tumor_types"] == {"ALK": "LUAD"}
+
+
+# ---------------------------------------------------------------------------
+# Paths added on main after #117: run retries and inline fusion evidence
+# ---------------------------------------------------------------------------
+
+
+def test_run_retry_merges_pipeline_pure_rows_and_polls_show_live_override(client, store, monkeypatch):
+    main._annotation_jobs.clear_local()
+    store.runs["run-retry"] = AnnotationResult(
+        run_id="run-retry", timestamp=NOW, fusions_processed=1, genes_annotated=1,
+        annotations=[GeneAnnotation(gene="ALK", insufficient_evidence=True, error="Synthesis error: timeout")],
+        annotation_tumor_types={"ALK": "LUAD"},
+    ).model_dump()
+    store.requests["run-retry"] = {"fusions": [{"fusion": "ALK", "tumor_type": "LUAD"}]}
+    store.owners["run-retry"] = {"owner_email": "local@internal", "source": "local"}
+    store.overrides[("gene", "ALK", "luad")] = _override({"citations": ["222"]})
+
+    async def fake_run_pipeline(fusions, **_kwargs):
+        annotation = _pipeline_annotation()
+        annotation.analysis_tumor_type = "LUAD"
+        # run_pipeline returns annotations with the current override applied.
+        curated = apply_override(annotation, store.overrides[("gene", "ALK", "luad")])
+        return AnnotationResult(run_id="pipeline-id", timestamp=NOW, fusions_processed=1, genes_annotated=1,
+                                annotations=[curated], annotation_tumor_types={"ALK": "LUAD"})
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    resp = client.post("/v1/runs/run-retry/retry",
+                       json={"kind": "errors", "inputs": [{"fusion": "ALK", "tumor_type": "LUAD"}]})
+    assert resp.status_code == 200, resp.text
+    job = _poll(client, resp.json()["status_url"])
+    assert job["status"] == "complete", job
+    assert job["annotations"][0]["curated"] is True and job["annotations"][0]["citations"] == ["222"]
+
+    stored = store.runs["run-retry"]["annotations"][0]
+    assert stored["error"] is None
+    assert stored["curated"] is False and stored["citations"] == ["111"]  # runs stay pipeline-pure
+
+    client.delete("/v1/curation/gene/ALK?tumor_type=LUAD")
+    assert client.get(resp.json()["status_url"]).json()["annotations"][0]["citations"] == ["111"]
+    main._annotation_jobs.clear_local()
+
+
+def test_sync_annotate_inline_fusion_evidence_serves_override_and_persists_pure(client, store, monkeypatch):
+    async def fake_run_pipeline(fusions, **_kwargs):
+        return AnnotationResult(run_id="run-inline", timestamp=NOW, fusions_processed=1, genes_annotated=0,
+                                annotations=[])
+
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None, **_kwargs):
+        return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, pmids=["111"], interpretation="Pipeline.")
+
+    monkeypatch.setattr(main, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_fusion_evidence)
+    store.overrides[("fusion", "EML4::ALK", "nsclc")] = _override(
+        {"interpretation": "Curated."}, subject_type="fusion", key="EML4::ALK", tumor_type="nsclc"
+    )
+    resp = client.post("/v1/annotate", json={
+        "fusions": [{"fusion": "EML4::ALK", "tumor_type": "NSCLC"}], "include_fusion_evidence": True,
+    })
+    assert resp.status_code == 200, resp.text
+    served = resp.json()["fusion_evidence"][0]
+    assert served["curated"] is True and served["interpretation"] == "Curated."
+    assert store.runs["run-inline"]["fusion_evidence"][0]["interpretation"] == "Pipeline."
+    assert store.runs["run-inline"]["fusion_evidence"][0]["curated"] is False
+
+
+def _retry_run(store: FakeCurationStore, run_id: str, tumor_type: str = "LUAD") -> None:
+    """A saved run whose ALK row failed, annotated under `tumor_type`."""
+    store.runs[run_id] = AnnotationResult(
+        run_id=run_id, timestamp=NOW, fusions_processed=2, genes_annotated=2,
+        annotations=[GeneAnnotation(gene="ALK", insufficient_evidence=True, error="Synthesis error: timeout"),
+                     _pipeline_annotation(gene="TP53")],
+        annotation_tumor_types={"ALK": tumor_type, "TP53": tumor_type},
+    ).model_dump()
+    store.requests[run_id] = {"fusions": [{"fusion": "ALK", "tumor_type": tumor_type},
+                                          {"fusion": "TP53", "tumor_type": tumor_type}]}
+    store.owners[run_id] = {"owner_email": "local@internal", "source": "local"}
+
+
+def _retry_pipeline(tumor_type: str, **annotation_overrides):
+    async def fake_run_pipeline(fusions, **_kwargs):
+        annotation = _pipeline_annotation(**annotation_overrides)
+        annotation.analysis_tumor_type = tumor_type
+        return AnnotationResult(run_id="pipeline-id", timestamp=NOW, fusions_processed=1, genes_annotated=1,
+                                annotations=[annotation], annotation_tumor_types={annotation.gene: tumor_type})
+
+    return fake_run_pipeline
+
+
+def test_retry_with_another_tumor_type_updates_the_rows_tumor_context(client, store, monkeypatch):
+    main._annotation_jobs.clear_local()
+    _retry_run(store, "run-tt")
+    store.overrides[("gene", "ALK", "luad")] = _override({"citations": ["333"]}, tumor_type="luad")
+    store.overrides[("gene", "ALK", "nsclc")] = _override({"citations": ["222"]}, tumor_type="nsclc")
+    monkeypatch.setattr(main, "run_pipeline", _retry_pipeline("NSCLC"))
+
+    resp = client.post("/v1/runs/run-tt/retry",
+                       json={"kind": "errors", "inputs": [{"fusion": "ALK", "tumor_type": "NSCLC"}]})
+    assert resp.status_code == 200, resp.text
+    assert _poll(client, resp.json()["status_url"])["status"] == "complete"
+
+    # Merged under the same lock as the row; the untouched row keeps its context.
+    assert store.runs["run-tt"]["annotation_tumor_types"] == {"ALK": "NSCLC", "TP53": "LUAD"}
+    reopened = client.get("/v1/annotate/run-tt").json()
+    alk = next(a for a in reopened["annotations"] if a["gene"] == "ALK")
+    assert alk["curated"] is True and alk["citations"] == ["222"]  # the NSCLC override, not LUAD's
+    assert reopened["annotation_tumor_types"]["ALK"] == "NSCLC"
+    main._annotation_jobs.clear_local()
+
+
+def test_retry_that_leaves_the_row_unchanged_keeps_its_tumor_context(client, store, monkeypatch):
+    main._annotation_jobs.clear_local()
+    _retry_run(store, "run-keep")
+    store.overrides[("gene", "ALK", "luad")] = _override({"citations": ["333"]}, tumor_type="luad")
+    # The retry resolves to another gene: the ALK row is not replaced.
+    monkeypatch.setattr(main, "run_pipeline", _retry_pipeline("NSCLC", gene="ROS1"))
+
+    resp = client.post("/v1/runs/run-keep/retry",
+                       json={"kind": "errors", "inputs": [{"fusion": "ALK", "tumor_type": "NSCLC"}]})
+    assert _poll(client, resp.json()["status_url"])["status"] == "complete"
+    assert store.runs["run-keep"]["annotations"][0]["error"]  # unchanged
+    assert store.runs["run-keep"]["annotation_tumor_types"] == {"ALK": "LUAD", "TP53": "LUAD"}
+    main._annotation_jobs.clear_local()
+
+
+def test_merge_retried_annotations_sets_context_only_for_replaced_rows():
+    stored = AnnotationResult(
+        run_id="r", timestamp=NOW, fusions_processed=2, genes_annotated=2,
+        annotations=[GeneAnnotation(gene="ALK", insufficient_evidence=True, error="Synthesis error: timeout"),
+                     GeneAnnotation(gene="BRAF", insufficient_evidence=True, error="Synthesis error: timeout")],
+    ).model_dump()
+    del stored["annotation_tumor_types"]  # a run saved before the map existed
+    retried_alk = _pipeline_annotation().model_dump()
+    other_gene = _pipeline_annotation(gene="ROS1").model_dump()  # BRAF's input now resolves to ROS1
+    other_gene["resolved_inputs"] = [{"input": "BRAF", "resolved": "ROS1"}]
+    merged = main._merge_retried_annotations(
+        stored, [retried_alk, other_gene], [], {"ALK": "ALK", "BRAF": "BRAF"}, "errors",
+        tumor_types={"ALK": "NSCLC", "ROS1": "COAD"},
+    )
+    assert [bool(a.get("error")) for a in merged["annotations"]] == [False, True]  # BRAF row unchanged
+    assert merged["annotation_tumor_types"] == {"ALK": "NSCLC"}  # only the replaced row
+
+
+async def test_reconstruction_never_overwrites_a_tumor_context_written_meanwhile(store):
+    store.runs["run-ins"] = {"annotation_tumor_types": {"ALK": "NSCLC"}}
+    await store.set_run_annotation_tumor_types("run-ins", {"ALK": "LUAD", "TP53": "LUAD"})
+    assert store.runs["run-ins"]["annotation_tumor_types"] == {"ALK": "NSCLC", "TP53": "LUAD"}
+
+
+def test_fusion_rerun_with_another_tumor_type_uses_that_items_override(client, store, monkeypatch):
+    """#152/#157 re-runs merge fusion evidence items keyed by input + tumor
+    type, and each item carries its own tumor_type, so there is no separate
+    context to go stale: the re-run item gets its own tumor type's override."""
+    async def fake_fusion_evidence(fusion, tumor_type=None, max_results=None, **_kwargs):
+        return FusionEvidenceResult(fusion=fusion, tumor_type=tumor_type, pmids=["111"], interpretation="Pipeline.")
+
+    monkeypatch.setattr(main, "retrieve_fusion_evidence", fake_fusion_evidence)
+    store.runs["run-fe-tt"] = AnnotationResult(
+        run_id="run-fe-tt", timestamp=NOW, fusions_processed=1, genes_annotated=0, annotations=[],
+        fusion_evidence=[FusionEvidenceResult(fusion="EML4::ALK", tumor_type="LUAD", retrieval_status="failed")],
+    ).model_dump()
+    for tumor_type, text in (("luad", "LUAD curated."), ("nsclc", "NSCLC curated.")):
+        store.overrides[("fusion", "EML4::ALK", tumor_type)] = _override(
+            {"interpretation": text}, subject_type="fusion", key="EML4::ALK", tumor_type=tumor_type
+        )
+    url = client.post("/v1/fusion-evidence/jobs", json={
+        "fusions": [{"fusion": "EML4::ALK", "tumor_type": "NSCLC"}], "run_id": "run-fe-tt",
+    }).json()["status_url"]
+    assert _poll(client, url)["status"] == "complete"
+    served = {item["tumor_type"]: item for item in client.get("/v1/annotate/run-fe-tt").json()["fusion_evidence"]}
+    assert served["NSCLC"]["interpretation"] == "NSCLC curated."
+    assert served["LUAD"]["interpretation"] == "LUAD curated."

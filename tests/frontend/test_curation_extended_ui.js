@@ -586,6 +586,173 @@ async function test_partner_flags_and_viewer_controls() {
   assert.strictEqual(byData(unavailable, "flag", "curation_unavailable").length, 1);
 }
 
+// ---------------------------------------------------------------------------
+// Permissions: controls only for curators, every write rechecks, 403 -> read-only
+// ---------------------------------------------------------------------------
+
+// A gene card (results-window) and a partner lookup (its own host) side by side.
+function renderGeneAndPartner(app, annotationOverrides = {}, partner = PARTNER) {
+  const win = render(app, annotationOverrides);
+  const host = app.root("partner-host");
+  const outer = new FakeElement("div");
+  host.replaceChildren(outer);
+  app.renderFusionPartnerResultBody(outer, partner, { tumorType: "NSCLC", agnostic: false });
+  return { win, outer };
+}
+
+const EXTENDED_CONTROLS = ["edit-call", "edit-evidence", "revert", "save-call"];
+const extendedControls = (node) => EXTENDED_CONTROLS.flatMap((action) => byData(node, "curation", action));
+
+async function test_viewer_sees_no_extended_controls() {
+  const viewer = loadCurationApp({ auth: { can_curate: false } });
+  const curatedPartner = { ...PARTNER, curated: true, curated_by: "cur@x", curated_at: "2026-10-12", curation_version: 1, curated_fields: ["pmids"] };
+  const { win, outer } = renderGeneAndPartner(viewer, curatedNoCall(), curatedPartner);
+  assert.deepStrictEqual(extendedControls(win), [], "no call or evidence controls on the gene");
+  assert.deepStrictEqual(extendedControls(outer), [], "no partner edit/revert controls");
+  assert.ok(byData(win, "curation", "curator-set").length, "viewers still see the curator-set tag");
+  viewer.openCurationCallEditor(viewer.geneCurationSubject(viewer.state.currentResult.annotations[0]));
+  assert.ok(viewer.root("curation-aux-modal").classList.contains("hidden"), "the call editor never opens for a viewer");
+  assert.strictEqual(viewer.requests.length, 0);
+}
+
+async function test_demotion_removes_call_and_partner_controls() {
+  const app = loadCurationApp();
+  const { win, outer } = renderGeneAndPartner(app);
+  assert.strictEqual(byData(win, "curation", "edit-call").length, 1);
+  assert.strictEqual(byData(outer, "curation", "edit-evidence").length, 1);
+  // /auth/me now reports the stored role without can_curate.
+  app.state.auth.can_curate = false;
+  app.applyCurationPermissionChange(true);
+  assert.deepStrictEqual(extendedControls(app.root("results-window")), [], "call control gone");
+  assert.deepStrictEqual(extendedControls(app.root("partner-host")), [], "partner control gone without re-expanding");
+  // Promotion brings them back.
+  app.state.auth.can_curate = true;
+  app.applyCurationPermissionChange(false);
+  assert.strictEqual(byData(app.root("results-window"), "curation", "edit-call").length, 1);
+  assert.strictEqual(byData(app.root("partner-host"), "curation", "edit-evidence").length, 1);
+}
+
+async function test_call_save_rechecks_permission_before_sending() {
+  let release;
+  const writes = [];
+  const app = loadCurationApp({
+    routes: async (method, url, reqBody) => {
+      if (method === "GET" && url.startsWith("/v1/curation/gene/ALK")) {
+        await new Promise((resolve) => { release = resolve; });
+        return [200, { version: 0, override: null }];
+      }
+      if (method === "PUT" || method === "DELETE") writes.push({ method, url, body: reqBody });
+      return method === "PUT" ? [200, { version: 1, override: { ...OVERRIDE_META, payload: reqBody.payload } }] : undefined;
+    },
+  });
+  render(app);
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const select = oneByData(app.root("curation-aux-body"), "curation", "cancer-associated");
+  select.value = "false";
+  select.fire("change");
+  oneByData(app.root("curation-aux-footer"), "curation", "save-call").click();
+  await waitFor(() => release, "preflight GET held");
+  app.state.auth.can_curate = false; // demoted while the preflight was in flight
+  release();
+  await waitFor(() => !app.curationState.busy, "save finished");
+  assert.deepStrictEqual(writes, [], "no PUT once permission is gone");
+  assert.ok(app.root("curation-aux-modal").classList.contains("hidden"), "the editor closed");
+  assert.deepStrictEqual(extendedControls(app.root("results-window")), []);
+
+  // Already demoted: clicking a stale control sends nothing at all.
+  const stale = loadCurationApp({ routes: async (method, url, reqBody) => { writes.push({ method, url, body: reqBody }); } });
+  render(stale);
+  const button = oneByData(stale.root("results-window"), "curation", "edit-call");
+  stale.state.auth.can_curate = false;
+  button.click();
+  assert.deepStrictEqual(stale.requests, []);
+  assert.ok(stale.root("curation-aux-modal").classList.contains("hidden"));
+}
+
+async function test_call_save_403_turns_read_only_and_keeps_drafts() {
+  const app = loadCurationApp({
+    routes: async (method, url) => {
+      if (method === "GET" && url.startsWith("/v1/curation/")) return [200, { version: 0, override: null }];
+      if (method === "PUT") return [403, { detail: "Curator privileges required for this action." }];
+      return undefined;
+    },
+  });
+  const { outer } = renderGeneAndPartner(app);
+  // A partner draft in progress elsewhere.
+  oneByData(outer, "curation", "edit-evidence").click();
+  const partnerId = "fusion_partner|ALK|nsclc";
+  app.curationState.sessions.get(partnerId).note = "Partner note kept.";
+  app.closeCurationDialog();
+
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const select = oneByData(app.root("curation-aux-body"), "curation", "cancer-associated");
+  select.value = "false";
+  select.fire("change");
+  oneByData(app.root("curation-aux-footer"), "curation", "save-call").click();
+  await waitFor(() => app.state.auth.can_curate === false, "access lost on 403");
+  await waitFor(() => !app.curationState.busy, "save finished");
+  assert.ok(app.root("curation-aux-modal").classList.contains("hidden"));
+  assert.deepStrictEqual(extendedControls(app.root("results-window")), []);
+  assert.deepStrictEqual(extendedControls(app.root("partner-host")), []);
+  assert.strictEqual(app.curationState.sessions.get(partnerId).note, "Partner note kept.", "drafts are kept");
+}
+
+async function test_partner_save_403_turns_read_only_and_keeps_draft() {
+  let puts = 0;
+  const app = loadCurationApp({
+    routes: routes({ draft: PARTNER_DRAFT, onPut: () => { puts += 1; } }),
+  });
+  const forbidden = app.fetch;
+  app.fetch = async (url, options = {}) => (String(options.method || "GET").toUpperCase() === "PUT"
+    ? { ok: false, status: 403, headers: { get: () => null }, json: async () => ({ detail: "Curator privileges required for this action." }), text: async () => "" }
+    : forbidden(url, options));
+  const outer = renderPartner(app, PARTNER, { tumorType: "NSCLC", agnostic: false });
+  oneByData(outer, "curation", "edit-evidence").click();
+  footerButton(app, "submit").click();
+  await waitFor(() => app.curationState.sessions.get("fusion_partner|ALK|nsclc")?.draft, "draft");
+  footerButton(app, "review").click();
+  const rationale = oneByData(body(app), "curation", "rationale");
+  rationale.value = "Typed partner interpretation.";
+  rationale.fire("input");
+  footerButton(app, "save").click();
+  await waitFor(() => app.state.auth.can_curate === false, "access lost on 403");
+  await waitFor(() => !app.curationState.busy, "save finished");
+  assert.strictEqual(puts, 0, "the route never accepted a write");
+  assert.ok(app.root("curation-modal").classList.contains("hidden"));
+  assert.strictEqual(app.curationState.sessions.get("fusion_partner|ALK|nsclc").draft.rationale, "Typed partner interpretation.");
+  assert.deepStrictEqual(extendedControls(outer), []);
+}
+
+async function test_call_editor_read_only_while_write_pending() {
+  let release;
+  const app = loadCurationApp({
+    routes: async (method, url, reqBody) => {
+      if (method === "GET" && url.startsWith("/v1/curation/gene/ALK")) return [200, { version: 0, override: null }];
+      if (method === "PUT") {
+        await new Promise((resolve) => { release = resolve; });
+        return [200, { version: 1, override: { ...OVERRIDE_META, payload: reqBody.payload } }];
+      }
+      return undefined;
+    },
+  });
+  render(app);
+  oneByData(app.root("results-window"), "curation", "edit-call").click();
+  const aux = app.root("curation-aux-body");
+  const footer = app.root("curation-aux-footer");
+  const select = oneByData(aux, "curation", "cancer-associated");
+  select.value = "false";
+  select.fire("change");
+  oneByData(footer, "curation", "save-call").click();
+  await waitFor(() => release, "PUT in flight");
+  const controls = [select, oneByData(aux, "curation", "call-note"), oneByData(footer, "curation", "save-call"), oneByData(footer, "curation", "cancel-call")];
+  assert.deepStrictEqual(controls.map((c) => c.disabled), [true, true, true, true], "read-only while the write is pending");
+  app.pressKey("Escape");
+  app.closeCurationAuxModal();
+  assert.ok(!app.root("curation-aux-modal").classList.contains("hidden"), "can't close mid-write");
+  release();
+  await waitFor(() => app.root("curation-aux-modal").classList.contains("hidden"), "closed after the write");
+}
+
 runTests("curation extended UI", [
   test_suggested_call_offered_applied_flipped_and_sent_in_put,
   test_untouched_call_in_evidence_edit_is_not_written,
@@ -603,4 +770,10 @@ runTests("curation extended UI", [
   test_partner_revert_with_failed_reload_shows_pending,
   test_partner_subject_keyed_by_searched_tumor_type,
   test_partner_flags_and_viewer_controls,
+  test_viewer_sees_no_extended_controls,
+  test_demotion_removes_call_and_partner_controls,
+  test_call_save_rechecks_permission_before_sending,
+  test_call_save_403_turns_read_only_and_keeps_drafts,
+  test_partner_save_403_turns_read_only_and_keeps_draft,
+  test_call_editor_read_only_while_write_pending,
 ]);

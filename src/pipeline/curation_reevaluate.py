@@ -103,24 +103,29 @@ class InvalidPMIDs(ValueError):
 
 
 async def validated_records(pmids: list[str]) -> dict[str, LiteratureRecord]:
-    records = await literature._efetch(pmids, literature._get_ncbi_client(), filter_retracted=False)
-    by_pmid = {record.pmid: record for record in records}
-    # _efetch omits non-retracted articles with no abstract. Verify existence
-    # of missing IDs so these are reported separately from unknown IDs.
-    missing = [pmid for pmid in pmids if pmid not in by_pmid]
-    existing_pmids = (
-        set(
-            await literature._esearch(
-                " OR ".join(f"{pmid}[uid]" for pmid in missing),
-                len(missing),
-                literature._get_ncbi_client(),
-                use_cache=False,
-                filter_retracted=False,
-            )
+    try:
+        records = await literature._efetch(
+            pmids, literature._get_ncbi_client(), filter_retracted=False, use_cache=False
         )
-        if missing
-        else set()
-    )
+        by_pmid = {record.pmid: record for record in records}
+        # _efetch omits non-retracted articles with no abstract. Verify existence
+        # of missing IDs so these are reported separately from unknown IDs.
+        missing = [pmid for pmid in pmids if pmid not in by_pmid]
+        existing_pmids = (
+            set(
+                await literature._esearch(
+                    " OR ".join(f"{pmid}[uid]" for pmid in missing),
+                    len(missing),
+                    literature._get_ncbi_client(),
+                    use_cache=False,
+                    filter_retracted=False,
+                )
+            )
+            if missing
+            else set()
+        )
+    except (literature.NCBIResponseError, ValueError) as exc:
+        raise NCBIUnavailable("NCBI returned no verifiable PMIDs; please retry.") from exc
     reasons: dict[str, list[str]] = {"unknown": [], "retracted": [], "no_abstract": []}
     for pmid in pmids:
         record = by_pmid.get(pmid)
