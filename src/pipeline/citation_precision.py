@@ -140,6 +140,7 @@ def filter_and_rank_citations(
     max_citations: int,
     gene_identity: str | None = None,
     min_score: int = 4,
+    pinned: bool = False,
 ) -> List[str]:
     """
     Deduplicate, verify, identity-filter, score, and cap emitted PMIDs.
@@ -148,6 +149,9 @@ def filter_and_rank_citations(
     weak or ambiguous citations and reorders the survivors by direct support.
     """
     records_by_pmid = {record.pmid: record for record in records}
+    if pinned:
+        # Preserve emitted citation order in pinned mode; reject unretrieved identifiers.
+        return [pmid for pmid in dict.fromkeys(emitted_citations) if pmid in records_by_pmid]
     ranked: list[tuple[int, int, str]] = []
 
     for position, pmid in enumerate(dict.fromkeys(emitted_citations)):

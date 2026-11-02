@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 JobT = TypeVar("JobT", bound=BaseModel)
 
 DEFAULT_JOB_TTL_SECONDS = 86400
-TERMINAL_STATUSES = frozenset({"complete", "failed"})
+TERMINAL_STATUSES = frozenset({"complete", "succeeded", "failed"})
 # After a Redis error, don't retry the same client for this long — a down
 # Redis must not add a connect timeout to every progress update.
 REDIS_RETRY_BACKOFF_SECONDS = 30.0

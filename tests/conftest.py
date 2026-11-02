@@ -136,7 +136,9 @@ def _job_stores_use_fake_redis(monkeypatch):
         yield
         return
     redis = FakeRedis()
-    stores = (main._annotation_jobs, main._enrichment_jobs, main._fusion_evidence_jobs)
+    from src.api.curation_reevaluate_routes import _jobs as curation_jobs
+
+    stores = (main._annotation_jobs, main._enrichment_jobs, main._fusion_evidence_jobs, curation_jobs)
     for store in stores:
         store.clear_local()
         monkeypatch.setattr(store, "_redis_client_factory", lambda: redis)

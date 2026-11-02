@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
+from src.api.curation_reevaluate_routes import router as curation_reevaluate_router
 from src.api.run_persistence import can_modify_run, run_owner, save_run_or_raise
 from src.api.runs import router as runs_router
 from src.admin_users_routes import router as admin_users_router
@@ -3483,6 +3484,7 @@ async def benchmark(
 from src.api.curation_routes import router as curation_router  # noqa: E402
 from src.api.gene_query import router as gene_query_router  # noqa: E402
 
+app.include_router(curation_reevaluate_router)
 app.include_router(gene_query_router)
 app.include_router(curation_router)
 
