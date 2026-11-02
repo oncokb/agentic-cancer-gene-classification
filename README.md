@@ -963,9 +963,11 @@ info flag `curator_set_cancer_association` naming the pipeline's call. In the UI
 "Edit call" changes only the call (other curated sections are saved verbatim,
 no re-evaluation); an evidence edit writes the call only if the curator changes
 it, with the re-evaluation's suggested call offered one click away.
-A `fusion_partner` save may drop a PMID that the stored override (at
-`expected_version`) references only if the request lists it in `removed_pmids`;
-otherwise it is rejected with 422 (`unacknowledged_removed_pmids`). Follow-up
+A `fusion_partner` save may drop a PMID that the stored override references
+only if the request lists it in `removed_pmids`; otherwise it is rejected with
+422 (`unacknowledged_removed_pmids`). The check runs inside the save
+transaction, against the locked row actually being replaced (after the
+`expected_version` check), so a concurrent save can't slip in between. Follow-up
 lookups hide PMIDs shown earlier, so this stops a save built from a filtered view
 from silently replacing the saved list. The editor always starts from the complete
 stored override (or the unfiltered lookup when none is stored) and sends the PMIDs

@@ -383,6 +383,46 @@ def test_partner_save_from_follow_up_view_cannot_drop_saved_pmids(client, store,
     assert client.put(url, json=filtered).status_code == 409
 
 
+def test_partner_removal_guard_runs_against_the_row_actually_replaced(client, store, monkeypatch):
+    """#120 review race: stored v1 [111, 222]; request A sends expected_version 2
+    and [222] without removed_pmids; while A is in flight, B saves v2
+    [111, 222, 333]. A's version now matches, but it must still be rejected
+    because it would drop 111 and 333 from the row it replaces."""
+
+    async def fake_partner(gene, tumor_type=None, agnostic=False, **_kwargs):
+        return _partner(("111", "222"), tumor_type=tumor_type, scope="all_tumor_types")
+
+    monkeypatch.setattr(curation_routes.literature, "retrieve_fusion_partner_evidence", fake_partner)
+    url = "/v1/curation/fusion_partner/ALK"
+    assert client.put(url, json={"payload": {"pmids": ["111", "222"]}}).status_code == 200
+
+    real_snapshot = curation_routes._pipeline_pmids_snapshot
+    interleaved = []
+
+    async def snapshot_then_concurrent_save(*args, **kwargs):
+        result = await real_snapshot(*args, **kwargs)
+        if not interleaved:  # B lands between A's validation and A's write
+            interleaved.append(await store.save_curated_override(
+                subject_type="fusion_partner", subject_key="ALK", tumor_type="",
+                payload={"pmids": ["111", "222", "333"]}, curator_email="b@mskcc.org",
+                expected_version=1, pipeline_pmids_snapshot=None,
+            ))
+        return result
+
+    monkeypatch.setattr(curation_routes, "_pipeline_pmids_snapshot", snapshot_then_concurrent_save)
+    a = client.put(url, json={"expected_version": 2, "payload": {"pmids": ["222"]}})
+    assert interleaved and interleaved[0].version == 2
+    assert a.status_code == 422, a.text
+    assert a.json()["detail"]["unacknowledged_removed_pmids"] == ["111", "333"]
+    current = client.get(url).json()
+    assert current["version"] == 2 and current["override"]["payload"]["pmids"] == ["111", "222", "333"]
+    assert [e["version"] for e in client.get(f"{url}/history").json()["entries"]] == [2, 1]
+
+
+async def test_fake_store_replace_check_contract(store):
+    await assert_replace_check_contract(store, "CURTEST-PARTNER")
+
+
 def test_removal_acknowledgement_only_applies_to_partner_subjects(client, store):
     gene = "/v1/curation/gene/ALK?tumor_type=LUAD"
     assert client.put(gene, json={"payload": {"citations": ["111", "222"]}}).status_code == 200
@@ -537,3 +577,35 @@ async def test_partner_job_route_lifecycle(mocked, monkeypatch):
             assert rejected.status_code == 422
     finally:
         main.app.dependency_overrides.pop(routes._curator_dependency, None)
+
+
+async def assert_replace_check_contract(store, key: str) -> None:
+    """Shared by the fake and the MySQL store: replace_check sees the payload of
+    the row being replaced (None when creating), after the version check, and a
+    CurationReplaceRejected writes nothing."""
+    from src.pipeline.curation_store import CurationReplaceRejected, CurationVersionConflict
+
+    seen = []
+    subject = dict(subject_type="fusion_partner", subject_key=key, tumor_type="")
+
+    async def save(expected, payload, check):
+        return await store.save_curated_override(
+            **subject, payload=payload, curator_email="c@mskcc.org", expected_version=expected,
+            pipeline_pmids_snapshot=None, replace_check=check,
+        )
+
+    await save(0, {"pmids": ["111"]}, seen.append)
+    await save(1, {"pmids": ["111", "222"]}, seen.append)
+    assert seen == [None, {"pmids": ["111"]}]
+
+    def reject(_payload):
+        raise CurationReplaceRejected({"message": "no"})
+
+    with pytest.raises(CurationReplaceRejected):
+        await save(2, {"pmids": ["222"]}, reject)
+    with pytest.raises(CurationVersionConflict):  # the version check comes first
+        await save(1, {"pmids": ["222"]}, reject)
+    current = await store.get_curated_override(**subject)
+    assert current.version == 2 and current.payload == {"pmids": ["111", "222"]}
+    history = await store.list_curation_history(*subject.values())
+    assert sorted(e.version for e in history) == [1, 2]

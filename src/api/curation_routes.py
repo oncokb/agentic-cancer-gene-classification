@@ -42,7 +42,12 @@ from src.pipeline.curation import (
     payload_fields,
     payload_pmids,
 )
-from src.pipeline.curation_store import CurationStorageContention, CurationVersionConflict
+from src.pipeline.curation_store import (
+    CurationReplaceRejected,
+    CurationStorageContention,
+    CurationVersionConflict,
+    ReplaceCheck,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +91,9 @@ class CurationSaveRequest(BaseModel):
         max_length=500,
         description=(
             "fusion_partner only: PMIDs the curator deliberately removed. A save that drops a PMID the "
-            "stored override (at expected_version) references is rejected (422) unless the PMID is listed "
-            "here, so a save built from a filtered follow-up view can't silently lose saved evidence."
+            "override it replaces references is rejected (422) unless the PMID is listed here (checked in "
+            "the save transaction), so a save built from a filtered follow-up view can't silently lose "
+            "saved evidence."
         ),
     )
 
@@ -131,10 +137,11 @@ _STORE_UNAVAILABLE = "Curation storage is unavailable; please retry."
 
 async def _store_call(awaitable: Awaitable[T]) -> T:
     """Await a curation store call; storage errors become 503 (never a silent
-    'no override'). Version conflicts propagate for the caller to map to 409."""
+    'no override'). Version conflicts and replace-check rejections propagate
+    for the caller to map to 409/422."""
     try:
         return await awaitable
-    except CurationVersionConflict:
+    except (CurationVersionConflict, CurationReplaceRejected):
         raise
     except CurationStorageContention as exc:
         logger.warning("Curation write gave up on lock contention: %s", exc)
@@ -250,40 +257,38 @@ async def get_curation(
     )
 
 
-async def _reject_unacknowledged_removals(
-    store: Any, key: str, tumor_type: str, request: CurationSaveRequest, pmids: List[str]
-) -> None:
-    """422 when a fusion_partner save drops a PMID the stored override references
-    without listing it in removed_pmids.
+def _removal_guard(removed_pmids: List[str], pmids: List[str]) -> ReplaceCheck:
+    """fusion_partner replace_check: reject a save that drops a PMID the replaced
+    override references unless it is listed in removed_pmids.
 
-    Follow-up partner lookups hide previously shown PMIDs, so a payload built from
-    that view would otherwise replace the complete stored list with a filtered one.
-    Checked against the override at expected_version: if another save landed in the
-    meantime the save 409s anyway (the store compares versions), so the content
-    checked here is exactly the content being replaced."""
-    current = await _store_call(store.get_curated_override(FUSION_PARTNER, key, tumor_type))
-    if current is None or current.version != request.expected_version:
-        return
-    try:
-        stored = payload_pmids(parse_payload(FUSION_PARTNER, current.payload))
-    except ValidationError:
-        logger.warning("Stored fusion_partner override for %s is unreadable", key, exc_info=True)
-        return
-    acknowledged = set(request.removed_pmids)
+    Follow-up partner lookups hide previously shown PMIDs, so a payload built
+    from that view would otherwise replace the complete stored list with a
+    filtered one. The store runs this inside the save transaction against the
+    row it actually replaces (after the version check), so no concurrent save
+    can slip in between the check and the write."""
+    acknowledged = set(removed_pmids)
     kept = set(pmids)
-    missing = [pmid for pmid in stored if pmid not in kept and pmid not in acknowledged]
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail={
+
+    def check(stored_payload: Optional[Dict[str, Any]]) -> None:
+        if not stored_payload:
+            return
+        try:
+            stored = payload_pmids(parse_payload(FUSION_PARTNER, stored_payload))
+        except ValidationError:
+            # Unreadable stored content: refuse rather than replace it blind.
+            raise CurationReplaceRejected({"message": "The saved partner precedent could not be read; reload and retry."})
+        missing = [pmid for pmid in stored if pmid not in kept and pmid not in acknowledged]
+        if missing:
+            raise CurationReplaceRejected({
                 "message": (
                     "This save would remove saved partner-precedent PMIDs that were not explicitly removed "
                     "(was it built from a filtered follow-up view?). Reload the full precedent list, or list "
                     "them in removed_pmids to remove them."
                 ),
                 "unacknowledged_removed_pmids": missing,
-            },
-        )
+            })
+
+    return check
 
 
 @router.put("/{subject_type}/{subject_key}", response_model=CurationResponse)
@@ -312,8 +317,6 @@ async def save_curation(
         )
 
     pmids = payload_pmids(payload)
-    if subject_type == FUSION_PARTNER:
-        await _reject_unacknowledged_removals(store, key, tt, request, pmids)
     records = await _fetch_pubmed(pmids) if pmids else {}
     invalid = _invalid_pmids(pmids, records)
     if invalid:
@@ -335,8 +338,11 @@ async def save_curation(
                 expected_version=request.expected_version,
                 pipeline_pmids_snapshot=snapshot,
                 note=request.note,
+                replace_check=_removal_guard(request.removed_pmids, pmids) if subject_type == FUSION_PARTNER else None,
             )
         )
+    except CurationReplaceRejected as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     except CurationVersionConflict as exc:
         raise HTTPException(
             status_code=409,

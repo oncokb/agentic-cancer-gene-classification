@@ -845,7 +845,9 @@ async function test_partner_unacknowledged_removal_422_explains_and_keeps_draft(
   footerButton(app, "review").click();
   footerButton(app, "save").click();
   await waitFor(() => !app.curationState.busy && app.curationState.sessions.get("fusion_partner|ALK|nsclc").message?.type === "error", "error");
-  assert.match(app.curationState.sessions.get("fusion_partner|ALK|nsclc").message.text, /999/);
+  assert.match(app.curationState.sessions.get("fusion_partner|ALK|nsclc").message.text, /999.*draft is kept/);
+  assert.ok(app.curationState.sessions.get("fusion_partner|ALK|nsclc").draft, "the draft is kept");
+  assert.ok(!app.root("curation-modal").classList.contains("hidden"), "the editor stays open");
   assert.strictEqual(app.state.auth.can_curate, true);
 }
 
@@ -887,6 +889,33 @@ async function test_call_draft_survives_403_and_repromotion() {
   assert.strictEqual(oneByData(app.root("curation-aux-body"), "curation", "call-note").value, "");
 }
 
+async function test_partner_save_409_is_a_conflict_and_keeps_draft() {
+  const base = routes({ draft: PARTNER_DRAFT, onPut: () => {} });
+  const app = loadCurationApp({
+    routes: async (method, url, reqBody) => (method === "PUT"
+      ? [409, { detail: { message: "changed", current_version: 3 } }]
+      : base(method, url, reqBody)),
+  });
+  const outer = renderPartner(app, PARTNER, { tumorType: "NSCLC", agnostic: false });
+  oneByData(outer, "curation", "edit-evidence").click();
+  await editorOpen(app);
+  const id = "fusion_partner|ALK|nsclc";
+  footerButton(app, "submit").click();
+  await waitFor(() => app.curationState.sessions.get(id)?.draft, "draft");
+  footerButton(app, "review").click();
+  const rationale = oneByData(body(app), "curation", "rationale");
+  rationale.value = "Kept through the conflict.";
+  rationale.fire("input");
+  footerButton(app, "save").click();
+  await waitFor(() => !app.curationState.busy && app.curationState.sessions.get(id).message?.conflict, "conflict");
+  const session = app.curationState.sessions.get(id);
+  assert.match(session.message.text, /Another curator saved changes \(now v3\)/);
+  assert.strictEqual(session.draft.rationale, "Kept through the conflict.");
+  assert.ok(!app.root("curation-modal").classList.contains("hidden"), "the editor stays open on the conflict");
+  assert.ok(body(app).allText.includes("Another curator saved changes") || app.root("curation-status").allText.includes("Another curator saved changes"),
+    "the conflict is shown in the editor");
+}
+
 runTests("curation extended UI", [
   test_suggested_call_offered_applied_flipped_and_sent_in_put,
   test_untouched_call_in_evidence_edit_is_not_written,
@@ -914,4 +943,5 @@ runTests("curation extended UI", [
   test_partner_explicit_removal_is_sent_as_removed_pmids,
   test_partner_unacknowledged_removal_422_explains_and_keeps_draft,
   test_call_draft_survives_403_and_repromotion,
+  test_partner_save_409_is_a_conflict_and_keeps_draft,
 ]);

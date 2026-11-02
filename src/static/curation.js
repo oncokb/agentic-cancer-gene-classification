@@ -1155,7 +1155,8 @@ function handleCurationSaveError(session, status, detail) {
     session.message = {
       type: "error",
       text: `Nothing was saved: this would remove saved PMID(s) ${detail.unacknowledged_removed_pmids.join(", ")} ` +
-        "that you didn't remove. Discard this draft and reopen the editor to load the full list.",
+        "that you didn't remove (another curator may have just added them). Your draft is kept; to save, " +
+        "note your changes, discard the draft and reopen the editor to start from the current saved list.",
     };
     return;
   }

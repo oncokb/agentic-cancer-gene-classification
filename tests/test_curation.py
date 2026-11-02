@@ -90,13 +90,15 @@ class FakeCurationStore:
         )
 
     async def save_curated_override(self, *, subject_type, subject_key, tumor_type, payload, curator_email,
-                                    expected_version, pipeline_pmids_snapshot, note=None):
+                                    expected_version, pipeline_pmids_snapshot, note=None, replace_check=None):
         self._maybe_fail()
         subject = (subject_type, subject_key, tumor_type)
         current = self.overrides.get(subject)
         current_version = current.version if current else 0
         if current_version != expected_version:
             raise CurationVersionConflict(current_version)
+        if replace_check is not None:
+            replace_check(current.payload if current else None)
         version = max(current_version, self._max_history_version(subject)) + 1
         override = CuratedOverride(
             subject_type=subject_type, subject_key=subject_key, tumor_type=tumor_type, payload=payload,

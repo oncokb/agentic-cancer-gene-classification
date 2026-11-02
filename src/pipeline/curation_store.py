@@ -79,6 +79,19 @@ class CurationVersionConflict(Exception):
         self.current_version = current_version
 
 
+class CurationReplaceRejected(Exception):
+    """A save's replace_check refused the row it would replace; nothing was written."""
+
+    def __init__(self, detail: Any):
+        super().__init__(str(detail))
+        self.detail = detail
+
+
+# Called inside the save transaction with the payload of the row being replaced
+# (None when creating); raises CurationReplaceRejected to abort the save.
+ReplaceCheck = Callable[[Optional[Dict[str, Any]]], None]
+
+
 class CurationStorageContention(Exception):
     """Lock errors persisted through every retry while the override was still
     at the caller's version: nothing conflicts, the write should just be retried."""
@@ -217,11 +230,14 @@ class CurationStoreMixin:
         expected_version: int,
         pipeline_pmids_snapshot: Optional[List[str]],
         note: Optional[str] = None,
+        replace_check: Optional[ReplaceCheck] = None,
     ) -> CuratedOverride:
         """Create or replace the current override and append a history row.
 
         expected_version is the version the curator edited (0 when creating);
-        raises CurationVersionConflict when it no longer matches."""
+        raises CurationVersionConflict when it no longer matches. replace_check
+        runs inside the transaction, with the locked row being replaced, after
+        the version check; CurationReplaceRejected rolls the save back."""
         return await self._with_lock_retry(
             lambda: self._save_curated_override_once(
                 subject_type=subject_type,
@@ -232,6 +248,7 @@ class CurationStoreMixin:
                 expected_version=expected_version,
                 pipeline_pmids_snapshot=pipeline_pmids_snapshot,
                 note=note,
+                replace_check=replace_check,
             ),
             (subject_type, subject_key, tumor_type),
             expected_version,
@@ -248,6 +265,7 @@ class CurationStoreMixin:
         expected_version: int,
         pipeline_pmids_snapshot: Optional[List[str]],
         note: Optional[str],
+        replace_check: Optional[ReplaceCheck] = None,
     ) -> CuratedOverride:
         now = _utc_now()
         async with self._pool.acquire() as conn:
@@ -255,7 +273,7 @@ class CurationStoreMixin:
             try:
                 async with conn.cursor() as cursor:
                     await cursor.execute(
-                        "SELECT version, created_at FROM curated_overrides "
+                        "SELECT version, created_at, payload_json FROM curated_overrides "
                         "WHERE subject_type = %s AND subject_key = %s AND tumor_type = %s FOR UPDATE",
                         (subject_type, subject_key, tumor_type),
                     )
@@ -263,6 +281,9 @@ class CurationStoreMixin:
                     current_version = row[0] if row else 0
                     if current_version != expected_version:
                         raise CurationVersionConflict(current_version)
+                    if replace_check is not None:
+                        # Checked against the row this transaction holds locked and replaces.
+                        replace_check(json.loads(row[2]) if row else None)
                     # Versions keep counting across reverts so history stays unique.
                     await cursor.execute(
                         "SELECT COALESCE(MAX(version), 0) FROM curation_history "

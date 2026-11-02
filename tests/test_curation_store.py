@@ -268,3 +268,9 @@ async def test_run_updates_are_key_scoped_and_compare_and_swap(mysql_store):
     assert final == fresh and final_revision == 4
     await mysql_store.update_run_result(run_id, final)  # plain writes bump the revision too
     assert (await mysql_store.get_run_with_revision(run_id))[1] == 5
+
+
+async def test_replace_check_runs_in_the_save_transaction(mysql_store):
+    from tests.test_curation_extended import assert_replace_check_contract
+
+    await assert_replace_check_contract(mysql_store, "CURTEST-PARTNER")
