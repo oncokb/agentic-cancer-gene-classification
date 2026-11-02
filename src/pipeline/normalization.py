@@ -18,13 +18,13 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import anyio
 import httpx
 
 from src.config import settings
-from src.models.schema import ResolvedGene
+from src.models.schema import FusionInput, ResolvedGene
 from src.pipeline.cache import cached_call
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,59 @@ def split_fusion(fusion: str) -> Tuple[str, Optional[str]]:
     if len(parts) == 2:
         return parts[0].strip(), parts[1].strip()
     return parts[0].strip(), None
+
+
+def split_input_tumor_types(
+    fusions: Sequence[Union[str, FusionInput]],
+) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Input strings in order, plus the ordered (input, tumor type) pairs of
+    the inputs that carry a tumor type."""
+    input_strings: List[str] = []
+    tumor_contexts: List[Tuple[str, str]] = []
+    for item in fusions:
+        if isinstance(item, str):
+            input_strings.append(item)
+        else:
+            input_strings.append(item.fusion)
+            if item.tumor_type:
+                tumor_contexts.append((item.fusion, item.tumor_type))
+    return input_strings, tumor_contexts
+
+
+def gene_tumor_types(
+    gene_map: Mapping[str, Tuple[Any, List[str]]],
+    tumor_contexts: Sequence[Tuple[str, str]],
+) -> Tuple[Dict[str, Optional[str]], List[str]]:
+    """The tumor type the pipeline annotates each canonical gene with, plus a
+    warning per gene whose inputs carried conflicting tumor types.
+
+    A gene's tumor type is the first non-empty one, in request order, among
+    every input that resolved to it whatever its spelling (symbol, alias,
+    ENSG/ENST/ENSP, GENE(ENST...)); tumor types differing only in case or
+    spacing count as the same. Genes with none are absent from the map.
+
+    Shared by run_pipeline and legacy-run reconstruction (src/pipeline/
+    curation.py) so both apply exactly the same rule."""
+    submitted_by_gene = getattr(gene_map, "submitted", {})
+    gene_tumor_type: Dict[str, Optional[str]] = {}
+    warnings: List[str] = []
+    for canonical, (_, gene_inputs) in gene_map.items():
+        tumor_types_by_key: Dict[str, str] = {}
+        gene_submitted = set(submitted_by_gene.get(canonical, gene_inputs))
+        for submitted, tt in tumor_contexts:
+            if submitted in gene_submitted:
+                key = " ".join(tt.strip().lower().split())
+                if key:
+                    tumor_types_by_key.setdefault(key, tt)
+        tumor_types = list(tumor_types_by_key.values())
+        if tumor_types:
+            gene_tumor_type[canonical] = tumor_types[0]
+        if len(tumor_types) > 1:
+            warnings.append(
+                f"{canonical}: using tumor type {tumor_types[0]!r}; "
+                f"ignored tumor types: {', '.join(repr(tt) for tt in tumor_types[1:])}."
+            )
+    return gene_tumor_type, warnings
 
 
 def is_fusion_input(value: str) -> bool:

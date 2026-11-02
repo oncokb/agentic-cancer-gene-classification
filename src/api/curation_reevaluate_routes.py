@@ -11,7 +11,7 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from src.auth import require_auth
+from src.auth import require_curator
 from src.config import settings
 from src.job_store import JobStore, can_read_job, job_owner
 from src.observability import record_user_action
@@ -25,9 +25,8 @@ from src.pipeline.curation_reevaluate import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/curation/reevaluate", tags=["curation"])
-# TODO(curator-overrides merge): edit this line to use require_curator.
 # Depends binds at route definition time; runtime reassignment does not update the routes.
-_curator_dependency = require_auth
+_curator_dependency = require_curator
 
 
 class JobCreated(BaseModel):

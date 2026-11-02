@@ -122,10 +122,16 @@ Accepted gene identifiers for the gene query API:
       "quality_flags": [],
       "cache_status": "reused",
       "cached_at": "2026-10-01T14:03:11+00:00",
+      "curated": false,
+      "curated_by": null,
+      "curated_at": null,
+      "curation_version": null,
+      "curated_fields": [],
       "error": null
     }
   ],
-  "warnings": []
+  "warnings": [],
+  "curation_unavailable": false
 }
 ```
 
@@ -150,7 +156,20 @@ Accepted gene identifiers for the gene query API:
 | `evidence_support_score` | 0 to 1: how well the answer is backed by the literature ACGC found. It is not a probability that the classification is biologically correct. |
 | `quality_flags` | Codes for any quality concerns raised during classification. |
 | `cache_status`, `cached_at` | Whether a saved result was reused or the gene was classified fresh, and when that result was produced. |
+| `curated` | `true` when an MSK curator has replaced part of this result (for example the rationale or citations) with a reviewed version. |
+| `curated_by`, `curated_at`, `curation_version`, `curated_fields` | Who last edited the curated version, when, its version number, and which sections they replaced. Empty when `curated` is `false`. |
 | `error` | Set only when this gene couldn't be classified. See [Errors](#7-errors). |
+
+If curator edits could not be loaded, `curation_unavailable` is `true` and the
+affected genes carry a `curation_unavailable` quality flag: they show pipeline
+output only. Retry later for the curated versions.
+
+Curated versions are edited through `/v1/curation` (see the README's "Curator
+overrides"). Any signed-in user can read them; saving or reverting one needs the
+`curator` or `admin` role, which an admin grants on `/admin/users` (see
+[Admin user management](#admin-user-management-v1admin)). Roles never come
+from Keycloak roles or SAML groups, and an API key acts with its owner's
+current role. With `USER_STORE_BACKEND=redis` (legacy), members of `KEYCLOAK_ADMIN_ROLES` / `SAML_ADMIN_GROUPS` are promoted to admin at sign-in; with `mysql`, groups never change a role.
 
 The gene query API deliberately leaves out abstracts, quotes, evidence cards
 and OpenEvidence content. Open its `view_url` to see them. (The annotate

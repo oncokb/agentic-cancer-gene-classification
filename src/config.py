@@ -324,7 +324,10 @@ class Settings(BaseSettings):
 
     # JIT (Just-In-Time) Provisioning Settings
     jit_provisioning_enabled: bool = True
-    jit_default_role: str = "curator"  # Default role for new users: curator, annotator, viewer
+    # Role for new users with the redis user store (viewer, curator or admin);
+    # the mysql store always starts new users as viewers. Curator is granted
+    # by an admin on /admin/users, never derived from IdP groups.
+    jit_default_role: str = "viewer"
     jit_require_admin_approval: bool = False  # If True, new JIT users start in pending status
 
     # Where sign-in and per-request permission checks read user records:

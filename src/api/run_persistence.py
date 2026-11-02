@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 from src.auth import AuthenticatedUser
 from src.config import settings
 from src.models.schema import AnnotationResult
+from src.pipeline.curation import result_payload_for_storage
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,11 @@ async def save_run_or_raise(
     """Keep run links out of responses when their run cannot be persisted."""
     try:
         await http_request.app.state.run_store.save_run(
-            result.run_id, result.timestamp, request_payload, result.model_dump(), **run_owner(current_user)
+            result.run_id,
+            result.timestamp,
+            request_payload,
+            result_payload_for_storage(result),
+            **run_owner(current_user),
         )
     except Exception as exc:
         logger.exception("Failed to save linked run %s", result.run_id)

@@ -45,6 +45,7 @@ from src.auth import (
     bootstrap_admins_at_startup,
     describe_store_error,
     build_saml_authn_request,
+    can_curate,
     clear_session_cookie,
     configure_mysql_user_store,
     create_oauth_state,
@@ -109,6 +110,17 @@ from src.observability import (
     tag_user,
 )
 from src.pipeline.cache import cached_call
+from src.pipeline.curation import (
+    apply_current_fusion_overrides,
+    apply_current_gene_overrides,
+    carry_tumor_context,
+    ensure_annotation_tumor_types,
+    has_curation_unavailable,
+    overlay_annotation_result,
+    pipeline_original,
+    pipeline_result,
+    result_payload_for_storage,
+)
 from src.pipeline.enrichment import enrich_gene_annotations
 from src.pipeline.feedback_citations import build_citation_check_section
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
@@ -233,7 +245,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     # X-OpenEvidence-Poll: sent by app.js on every OpenEvidence sidecar
     # request (see get_gene_openevidence); without it a cross-origin
     # frontend's preflight would fail and the card would silently vanish.
@@ -364,6 +376,11 @@ class AnnotationJobStatusResponse(BaseModel):
             "run because the input now resolves to a different gene than its row."
         ),
     )
+    # Set per poll: curator overrides could not be loaded (see curation.py).
+    curation_unavailable: bool = False
+    # Tumor type each completed gene was annotated with (as on AnnotationResult),
+    # so lazy enrichment started mid-run can request the right curator override.
+    annotation_tumor_types: Dict[str, Optional[str]] = Field(default_factory=dict)
     # Internal bookkeeping for callers that reuse this job store (e.g. the gene
     # query API): which endpoint family created the job and its request.
     kind: str = Field(default="annotate", exclude=True)
@@ -420,6 +437,13 @@ class EnrichmentRequest(BaseModel):
         default=None,
         description="Optional local agent backend for enrichment LLM calls.",
     )
+    tumor_types: Dict[str, Optional[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Tumor type each gene was annotated with (AnnotationResult.annotation_tumor_types), "
+            "used to apply that gene's tumor-scoped curator override to the enriched result."
+        ),
+    )
 
 
 class EnrichmentJobStatusResponse(BaseModel):
@@ -430,6 +454,7 @@ class EnrichmentJobStatusResponse(BaseModel):
     annotations: List[GeneAnnotation] = Field(default_factory=list)
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    curation_unavailable: bool = False
     owner: Optional[str] = Field(default=None, exclude=True)
 
 
@@ -458,6 +483,7 @@ class FusionEvidenceJobStatusResponse(BaseModel):
     fusion_evidence: List[FusionEvidenceResult] = Field(default_factory=list)
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    curation_unavailable: bool = False
     owner: Optional[str] = Field(default=None, exclude=True)
 
 
@@ -886,6 +912,28 @@ def _check_annotate_input_limit(fusions: List[FusionInput]) -> None:
         raise HTTPException(status_code=422, detail=f"At most {limit} inputs may be annotated per request")
 
 
+# Job stores hold pipeline output only; every poll overlays the CURRENT curator
+# overrides, so edits, reverts and retractions after a job finished still show.
+
+
+async def _overlay_annotation_job(job: AnnotationJobStatusResponse, run_store: Any) -> AnnotationJobStatusResponse:
+    result = await overlay_annotation_result(job.result, run_store) if job.result else None
+    annotations = (
+        result.annotations if result is not None else await apply_current_gene_overrides(job.annotations, run_store)
+    )
+    tumor_types = {a.gene: pipeline_original(a).analysis_tumor_type for a in job.annotations}
+    if result is not None:
+        tumor_types.update(result.annotation_tumor_types)
+    return job.model_copy(
+        update={
+            "annotations": annotations,
+            "result": result,
+            "curation_unavailable": has_curation_unavailable(annotations),
+            "annotation_tumor_types": tumor_types,
+        }
+    )
+
+
 def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
     seen: set[tuple[str, Optional[str]]] = set()
     inputs: List[FusionInput] = []
@@ -933,6 +981,20 @@ async def _include_inline_fusion_evidence(
         result.timings_ms["total"] = round(result.timings_ms.get("total", 0.0) + elapsed, 2)
 
 
+async def _overlay_inline_fusion_evidence(result: AnnotationResult, run_store: Any) -> AnnotationResult:
+    """`result` with the CURRENT curator overrides applied to its fusion
+    evidence (a no-op when the request didn't include fusion evidence)."""
+    if not result.fusion_evidence:
+        return result
+    fusion_evidence = await apply_current_fusion_overrides(result.fusion_evidence, run_store)
+    return result.model_copy(
+        update={
+            "fusion_evidence": fusion_evidence,
+            "curation_unavailable": result.curation_unavailable or has_curation_unavailable(fusion_evidence),
+        }
+    )
+
+
 async def _save_run_result(
     http_request: Request,
     request_payload: dict,
@@ -947,7 +1009,7 @@ async def _save_run_result(
     if run_source is not None:
         owner["source"] = run_source
     await http_request.app.state.run_store.save_run(
-        result.run_id, result.timestamp, request_payload, result.model_dump(), **owner
+        result.run_id, result.timestamp, request_payload, result_payload_for_storage(result), **owner
     )
 
 
@@ -1215,6 +1277,7 @@ def _merge_retried_annotations(
     targets: Dict[str, str],
     kind: RunRetryKind,
     outcomes: Optional[List[RunRetryOutcome]] = None,
+    tumor_types: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Merge a gene retry into a stored run, in place.
 
@@ -1233,8 +1296,14 @@ def _merge_retried_annotations(
     it was; incoming rows for genes the retry wasn't asked for are dropped,
     never appended. The written row keeps the stored row's resolved_inputs
     alongside the retry's. Existing warnings are kept; new warnings about an
-    updated gene are added. genes_annotated is recomputed."""
+    updated gene are added. genes_annotated is recomputed.
+
+    `tumor_types` is the retry's AnnotationResult.annotation_tumor_types: each
+    row actually replaced gets that tumor context in the run's
+    annotation_tumor_types (so its curator override is looked up under the
+    tumor type it was re-annotated with); rows left unchanged keep theirs."""
     rows = list(stored.get("annotations") or [])
+    replaced_context: Dict[str, Optional[str]] = {}
     row_keys = set(targets.values())
     updated_keys: set[str] = set()
     updated_rows: set[str] = set()
@@ -1290,6 +1359,9 @@ def _merge_retried_annotations(
             rows[index] = row
             updated_keys |= keys | {destination}
             updated_rows.add(destination)
+            if tumor_types is not None:
+                written_gene = str(row.get("gene"))
+                replaced_context[written_gene] = tumor_types.get(written_gene)
     if outcomes is not None:
         # Every target row still waiting for a result says why it wasn't
         # updated, whatever the pipeline returned (or didn't) for it.
@@ -1318,6 +1390,9 @@ def _merge_retried_annotations(
     stored["annotations"] = rows
     stored["warnings"] = existing_warnings
     stored["genes_annotated"] = len(rows)
+    if replaced_context:
+        context = stored.get("annotation_tumor_types")
+        stored["annotation_tumor_types"] = {**(context if isinstance(context, dict) else {}), **replaced_context}
     return stored
 
 
@@ -1531,6 +1606,7 @@ async def auth_me(request: Request) -> AuthMeResponse:
         jit_provisioning_enabled=settings.jit_provisioning_enabled,
         dev_login_enabled=settings.dev_login_enabled,
         keycloak_enabled=settings.keycloak_enabled,
+        can_curate=can_curate(user),
     )
 
 
@@ -1954,8 +2030,8 @@ async def auth_dev_login(
   <div class="card">
     <h2>SSO Dev Login Selector</h2>
     <p>Choose a mock identity to test domain verification (@mskcc.org and @openevidence.com):</p>
-    <a class="btn" href="/auth/dev/login?email=curator@mskcc.org&name=MSK%20Curator">Log in as curator@mskcc.org (MSK domain - Allowed)</a>
-    <a class="btn" href="/auth/dev/login?email=scientist@openevidence.com&name=OpenEvidence%20Scientist">Log in as scientist@openevidence.com (OpenEvidence domain - Allowed)</a>
+    <a class="btn" href="/auth/dev/login?email=curator@mskcc.org&name=MSK%20Curator&role=curator">Log in as curator@mskcc.org (MSK Curator - can edit overrides)</a>
+    <a class="btn" href="/auth/dev/login?email=scientist@openevidence.com&name=OpenEvidence%20Scientist">Log in as scientist@openevidence.com (OpenEvidence viewer - Allowed)</a>
     <a class="btn" href="/auth/dev/login?email=admin@mskcc.org&name=MSK%20Admin&role=admin">Log in as admin@mskcc.org (MSK Admin)</a>
     <a class="btn btn-denied" href="/auth/dev/login?email=unauthorized@gmail.com&name=Unauthorized%20User">Test Unauthorized domain (unauthorized@gmail.com - Blocked)</a>
   </div>
@@ -1981,7 +2057,7 @@ async def auth_dev_login(
         email=profile.email,
         name=profile.name,
         domain=profile.domain,
-        role=role or profile.role,
+        role=profile.role,
         status=profile.status,
         provider="dev",
         groups=profile.groups,
@@ -2051,6 +2127,9 @@ async def annotate(
 
     await _include_inline_fusion_evidence(request, result)
     await _persist_run_result(http_request, request.model_dump(), result, current_user)
+    # run_pipeline already overlaid the gene overrides; inline fusion evidence
+    # is pipeline output (as stored), so overlay its overrides for the response.
+    result = await _overlay_inline_fusion_evidence(result, http_request.app.state.run_store)
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
     record_user_action(
@@ -2134,11 +2213,13 @@ async def _launch_annotation_job(
                 await _save_run_result(http_request, request_payload, result, current_user, run_source)
             else:
                 await _persist_run_result(http_request, request_payload, result, current_user, run_source)
+            # Jobs hold pipeline output only; polls overlay the current overrides.
+            stored = pipeline_result(result)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
             current.phase = "complete"
-            current.result = result
-            current.annotations = result.annotations
+            current.result = stored
+            current.annotations = stored.annotations
             current.genes_completed = result.genes_annotated
             current.genes_total = result.genes_annotated
             current.timings_ms = result.timings_ms
@@ -2254,9 +2335,11 @@ async def rerun_saved_run(
 @app.get("/v1/annotate/jobs/{job_id}", response_model=AnnotationJobStatusResponse)
 async def get_annotation_job(
     job_id: str,
+    http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> AnnotationJobStatusResponse:
-    return await _get_annotation_job(job_id, viewer=current_user)
+    job = await _get_annotation_job(job_id, viewer=current_user)
+    return await _overlay_annotation_job(job, http_request.app.state.run_store)
 
 
 async def _persist_retried_annotations(
@@ -2270,13 +2353,16 @@ async def _persist_retried_annotations(
     can't clobber (or be clobbered by) a concurrent fusion-evidence attach.
     Eligibility is re-checked against the freshly locked run. Returns the
     inputs whose result was left off the run (resolved to another gene)."""
-    incoming = [item.model_dump() for item in result.annotations]
+    # Runs hold pipeline output only (curator overrides are overlaid on read).
+    incoming = [item.model_dump() for item in pipeline_result(result).annotations]
     outcomes: List[RunRetryOutcome] = []
 
     def merge(stored: Dict[str, Any]) -> Dict[str, Any]:
         outcomes.clear()
+        # The tumor context is merged under the same row lock as the rows.
         return _merge_retried_annotations(
             stored, incoming, result.warnings, targets, kind, outcomes,
+            tumor_types=result.annotation_tumor_types,
         )
 
     merged = await http_request.app.state.run_store.merge_run_result(
@@ -2361,12 +2447,14 @@ async def _launch_run_retry_job(
             outcomes = await _persist_retried_annotations(
                 http_request, run_id, result, targets, kind,
             )
+            # Jobs hold pipeline output only; polls overlay the current overrides.
+            stored = pipeline_result(result)
             current = await _get_annotation_job(job_id)
             current.retry_outcomes = outcomes
             current.status = "complete"
             current.phase = "complete"
-            current.result = result
-            current.annotations = result.annotations
+            current.result = stored
+            current.annotations = stored.annotations
             current.genes_completed = result.genes_annotated
             current.genes_total = result.genes_annotated
             current.timings_ms = result.timings_ms
@@ -2460,7 +2548,15 @@ async def create_enrichment_job(
     )
     await _store_enrichment_job(job)
 
+    # Enrichment rebuilds each annotation from scratch, so nothing the client
+    # sent about curation survives; the job keeps that pipeline output (with the
+    # gene's tumor context) and polls overlay the live override server-side.
+    def with_tumor_context(annotation: GeneAnnotation) -> GeneAnnotation:
+        annotation.analysis_tumor_type = request.tumor_types.get(annotation.gene)
+        return annotation
+
     async def on_annotation(annotation: GeneAnnotation) -> None:
+        annotation = with_tumor_context(annotation)
         current = await _get_enrichment_job(job_id)
         current.annotations.append(annotation)
         current.annotations.sort(key=lambda item: item.gene)
@@ -2479,7 +2575,7 @@ async def create_enrichment_job(
             )
             current = await _get_enrichment_job(job_id)
             current.status = "complete"
-            current.annotations = enriched
+            current.annotations = [with_tumor_context(annotation) for annotation in enriched]
             current.annotations_completed = len(enriched)
             current.annotations_total = len(request.annotations)
             current.timings_ms = {
@@ -2506,9 +2602,14 @@ async def create_enrichment_job(
 @app.get("/v1/annotate/enrichment/jobs/{job_id}", response_model=EnrichmentJobStatusResponse)
 async def get_enrichment_job(
     job_id: str,
+    http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> EnrichmentJobStatusResponse:
-    return await _get_enrichment_job(job_id, viewer=current_user)
+    job = await _get_enrichment_job(job_id, viewer=current_user)
+    annotations = await apply_current_gene_overrides(job.annotations, http_request.app.state.run_store)
+    return job.model_copy(
+        update={"annotations": annotations, "curation_unavailable": has_curation_unavailable(annotations)}
+    )
 
 
 @app.post("/v1/fusion-evidence/jobs", response_model=FusionEvidenceJobCreateResponse)
@@ -2583,9 +2684,14 @@ async def create_fusion_evidence_job(
 @app.get("/v1/fusion-evidence/jobs/{job_id}", response_model=FusionEvidenceJobStatusResponse)
 async def get_fusion_evidence_job(
     job_id: str,
+    http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> FusionEvidenceJobStatusResponse:
-    return await _get_fusion_evidence_job(job_id, viewer=current_user)
+    job = await _get_fusion_evidence_job(job_id, viewer=current_user)
+    fusion_evidence = await apply_current_fusion_overrides(job.fusion_evidence, http_request.app.state.run_store)
+    return job.model_copy(
+        update={"fusion_evidence": fusion_evidence, "curation_unavailable": has_curation_unavailable(fusion_evidence)}
+    )
 
 
 @app.post("/v1/annotate/gene", response_model=GeneAnnotationWithRun)
@@ -2640,6 +2746,49 @@ async def annotate_gene(
     )
 
 
+_SANITIZE_WRITE_ATTEMPTS = 3
+
+
+async def _sanitize_stored_run(run_store: Any, run_id: str, result: AnnotationResult) -> AnnotationResult:
+    """Strip retracted PMIDs from a stored run and persist that if anything changed.
+
+    The write-back is a compare-and-swap on the run's revision: if the run was
+    written meanwhile (fusion evidence, tumor context, another sanitizer), it
+    is reloaded and re-sanitized rather than overwritten with a stale copy.
+    Stores without revisions fall back to a plain overwrite."""
+    get_with_revision = getattr(run_store, "get_run_with_revision", None)
+    if get_with_revision is None:
+        try:
+            result, changed = await sanitize_annotation_result(result)
+            if changed:
+                await run_store.update_run_result(run_id, result_payload_for_storage(result))
+        except Exception:
+            logger.exception("Failed to sanitize stored run %s", run_id)
+        return result
+
+    context = result
+    for _ in range(_SANITIZE_WRITE_ATTEMPTS):
+        try:
+            loaded = await get_with_revision(run_id)
+            if loaded is None:
+                return result
+            stored, revision = loaded
+            current = AnnotationResult(**stored)
+            carry_tumor_context(current, context)
+            current, changed = await sanitize_annotation_result(current)
+            result = current
+            if not changed or await run_store.update_run_result_if_unchanged(
+                run_id, result_payload_for_storage(current), revision
+            ):
+                return result
+        except Exception:
+            logger.exception("Failed to sanitize stored run %s", run_id)
+            return result
+        logger.info("Run %s changed during sanitization; reloading", run_id)
+    logger.warning("Gave up persisting sanitization of run %s after concurrent writes", run_id)
+    return result
+
+
 @app.get("/v1/annotate/{run_id}", response_model=AnnotationResult)
 async def get_annotation_run(
     run_id: str,
@@ -2650,14 +2799,20 @@ async def get_annotation_run(
     stored = await http_request.app.state.run_store.get_run(run_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    run_store = http_request.app.state.run_store
     result = AnnotationResult(**stored)
-    try:
-        result, changed = await sanitize_annotation_result(result)
-        if changed:
-            await http_request.app.state.run_store.update_run_result(run_id, result.model_dump())
-    except Exception:
-        logger.exception("Failed to sanitize stored run %s", run_id)
-    return result
+    confirmed = await ensure_annotation_tumor_types(result, run_store, run_id)
+    if confirmed and hasattr(run_store, "set_run_annotation_tumor_types"):
+        # Only the confirmed map entries, atomically, so a slow reconstruction
+        # never overwrites concurrent sanitizer or fusion-evidence writes.
+        try:
+            await run_store.set_run_annotation_tumor_types(run_id, confirmed)
+        except Exception:
+            logger.exception("Failed to persist tumor context for run %s", run_id)
+    result = await _sanitize_stored_run(run_store, run_id, result)
+    # Runs are stored pipeline-pure; overlay the CURRENT curator overrides so
+    # old shared links follow later curator edits and reverts.
+    return await overlay_annotation_result(result, run_store)
 
 
 @app.post("/v1/fusion-context", response_model=FusionContextResponse)
@@ -3326,10 +3481,12 @@ async def benchmark(
 
 # Imported here, after every helper it reuses is defined, to avoid a circular
 # import at module load (the router module looks those helpers up on src.main).
+from src.api.curation_routes import router as curation_router  # noqa: E402
 from src.api.gene_query import router as gene_query_router  # noqa: E402
 
 app.include_router(curation_reevaluate_router)
 app.include_router(gene_query_router)
+app.include_router(curation_router)
 
 
 @app.exception_handler(UserStoreUnavailable)

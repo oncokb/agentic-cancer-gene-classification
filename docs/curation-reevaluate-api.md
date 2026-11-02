@@ -1,8 +1,11 @@
 # Curator re-evaluation API (PR 2)
 
 This API returns suggestions for editing. It never saves a run or a gene annotation.
-Both routes currently use `require_auth`; the marked `_curator_dependency` must be
-swapped to `require_curator` when the curator-overrides PR merges.
+Both routes use `require_curator`: only curators and admins may create or poll
+drafts. Viewers receive HTTP 403 on both routes, including for their own jobs.
+Session and API-key requests use the current stored role on every request;
+a demoted curator loses access on the next request without signing in again.
+Job ownership checks still apply after the role check.
 
 ## Create and poll
 
