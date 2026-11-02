@@ -7,8 +7,10 @@ M0 annotation engine for candidate cancer genes and gene fusions. The pipeline a
 
 ## Setup
 
+Requires Python 3.12 or newer.
+
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 . .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
@@ -207,6 +209,22 @@ curl -s -X POST https://acgc.oncokb.org/v1/annotate \
   -d '{"fusions": ["EML4::ALK"]}'
 ```
 
+That annotates the genes and leaves `fusion_evidence` empty by default. Add
+`"include_fusion_evidence": true` to retrieve exact-pair evidence inline
+before saving and returning the run. Alternatively, start a fusion-evidence job, passing
+the annotation run's `run_id` so ACGC best-effort attaches the evidence to
+that run, then poll its `status_url`.
+
+```bash
+curl -s -X POST https://acgc.oncokb.org/v1/fusion-evidence/jobs \
+  -H "Authorization: Bearer $ACGC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"fusions": [{"fusion": "EML4::ALK", "tumor_type": "LUAD"}], "run_id": "<run_id>"}'
+```
+
+See the [API user guide](docs/api.md) for the full annotate and
+fusion-evidence workflow, batch jobs, and known limitations.
+
 List (secrets are never returned) and revoke keys on the API keys page, or
 with your session (not the key itself):
 
@@ -343,6 +361,23 @@ curl -X POST http://127.0.0.1:8000/v1/annotate/jobs \
 
 curl http://127.0.0.1:8000/v1/annotate/jobs/{job_id}
 ```
+
+Annotation results contain `fusion_evidence: []` by default. Set
+`include_fusion_evidence: true` on `/v1/annotate` or `/v1/annotate/jobs` to
+retrieve exact fusion-pair evidence before saving and returning the run.
+Alternatively, run a second job with the completed annotation job's `run_id`
+and poll it; see the
+[API user guide](docs/api.md#post-v1fusion-evidencejobs) and the
+[batch workflow](docs/api.md#batch-workflow).
+
+`/v1/annotate`, `/v1/annotate/jobs`, and `/v1/fusion-evidence/jobs` accept at
+most `ANNOTATE_MAX_INPUTS` entries (default 50), before deduplication or
+filtering. Larger requests return `422` with a string `detail`, such as
+`{"detail": "At most 50 inputs may be annotated per request"}`.
+Annotation results include `warnings` (default `[]`) naming genes with
+conflicting tumor types, the type used, and the ignored types. Repeated
+identical inputs keep the first non-empty tumor type; annotation still uses
+one tumor type per gene.
 
 Core results can be enriched lazily after the first response returns. The UI
 exposes this through **Enrich results**; API callers can submit returned
@@ -585,12 +620,21 @@ PubMed retrieval excludes records marked as `Retracted Publication` or
 `Retraction of Publication`, and citation verification ignores any retracted
 records that reach synthesis through cached or test fixtures.
 
-Fusion-level evidence is intentionally outside the core annotation critical
-path. The UI starts `/v1/fusion-evidence/jobs` after gene annotations are
-available, polls it in the background, and displays results in a separate
-Fusion evidence tab. Each exact fusion/tumor lookup is cached in Redis under
-`fusion_evidence:*` using `FUSION_EVIDENCE_CACHE_TTL_SECONDS`, with bounded
-per-job fan-out controlled by `FUSION_EVIDENCE_CONCURRENCY`.
+Fusion-level evidence is outside the annotation critical path by default:
+`/v1/annotate` and `/v1/annotate/jobs` return `fusion_evidence: []` unless
+`include_fusion_evidence: true` requests inline retrieval. Inline evidence is
+saved with the run, and its duration is recorded in
+`timings_ms.fusion_evidence` and included in `timings_ms.total`. Annotation
+jobs expose `phase: "fusion_evidence"` during this step. The UI starts
+`/v1/fusion-evidence/jobs` after gene
+annotations are available, polls it in the background, and displays results in
+a separate Fusion evidence tab; pass the annotation run's `run_id` to
+best-effort attach the evidence to the run. Each exact fusion/tumor lookup is
+cached in Redis under `fusion_evidence:*` using
+`FUSION_EVIDENCE_CACHE_TTL_SECONDS`, with bounded per-job fan-out controlled by
+`FUSION_EVIDENCE_CONCURRENCY`. See the
+[API user guide](docs/api.md#post-v1fusion-evidencejobs) for request and
+response shapes.
 
 When a gene is marked `insufficient_evidence`, the JSON result still includes
 `retrieved_pmids` and any grounded `gene_summary` produced from the retrieved
@@ -785,6 +829,12 @@ Metrics emitted:
   cache token usage — Anthropic bills cache reads far cheaper than a fresh
   input token, so a low cache-read share relative to cache-creation points at
   wasted spend on repeated system prompts that aren't hitting cache.
+- `acgc.openevidence.*`: the OpenEvidence sidecar — endpoint outcomes and
+  response time, paid upstream calls/latency/retries (by `model`, `status`,
+  `source`), cache peeks, and the async lookup lifecycle (started, deduped,
+  completed, semaphore wait, time to ready). See
+  [docs/datadog/README.md](docs/datadog/README.md) for the full list and an
+  importable "OpenEvidence sidecar" dashboard widget group.
 
 Metric tags are intentionally low-cardinality: `mode`, `local_backend`,
 `tumor_type_present`, `cache_status`, `is_fusion`, `cache_name`, `result`,
@@ -925,14 +975,16 @@ curl http://127.0.0.1:8000/v1/curation/gene/ALK/history?tumor_type=LUAD   # audi
 curl -X DELETE http://127.0.0.1:8000/v1/curation/gene/ALK?tumor_type=LUAD # revert
 ```
 
-Writes require the `curator` or `admin` role. Roles come from the identity
-provider and are re-derived on every login: `KEYCLOAK_ADMIN_ROLES` /
-`SAML_ADMIN_GROUPS` map to `admin`, `KEYCLOAK_CURATOR_ROLES` /
-`SAML_CURATOR_GROUPS` map to `curator`, and everyone else gets
-`JIT_DEFAULT_ROLE` (`viewer`). API keys may curate only while their owner's
-profile role is curator or admin; a key whose owner has no profile is a viewer. `GET /auth/me` reports `can_curate`. For local
-testing, use dev login with `?role=curator` (or run with auth disabled, which
-allows curation).
+Reads are open to every signed-in user, including viewers. Writes (`PUT`,
+`DELETE`) require the `curator` or `admin` role (`require_curator`); viewers get
+403. New users start as viewers, and an admin grants `curator` on
+`/admin/users` (recorded in `role_changes`). Sign-in never sets or lowers a role
+from Keycloak roles or SAML groups (they are stored on the user record only),
+and every request re-reads the user's current role, so a promotion or demotion
+takes effect on the next request, for sessions and API keys alike.
+`GET /auth/me` reports `can_curate`. For local testing, use dev login with
+`?role=curator` for a new user (or run with auth disabled, which allows
+curation).
 
 ## Benchmark
 

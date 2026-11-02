@@ -227,7 +227,9 @@ async def test_run_updates_are_key_scoped_and_compare_and_swap(mysql_store):
     # Key-scoped atomic updates (also creating the map when absent).
     await mysql_store.set_run_annotation_tumor_types(run_id, {"KAT6A": "AML", 'odd"gene\\x': None})
     await mysql_store.set_run_annotation_tumor_types(run_id, {"BRAF": "melanoma"})
-    await mysql_store.set_run_fusion_evidence(run_id, [{"fusion": "KAT6A::CREBBP", "pmids": ["222"]}])
+    await mysql_store.merge_run_result(  # the row-locked merge fusion-evidence jobs use
+        run_id, lambda stored: {**stored, "fusion_evidence": [{"fusion": "KAT6A::CREBBP", "pmids": ["222"]}]}
+    )
     current, current_revision = await mysql_store.get_run_with_revision(run_id)
     assert current_revision == 3
     assert current["annotation_tumor_types"] == {"KAT6A": "AML", 'odd"gene\\x': None, "BRAF": "melanoma"}

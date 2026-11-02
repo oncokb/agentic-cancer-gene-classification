@@ -19,7 +19,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zlib
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import httpx
@@ -37,6 +37,9 @@ from src.api_keys import (
     should_touch_last_used,
 )
 from src.config import settings
+
+if TYPE_CHECKING:  # src.pipeline.user_store imports this module
+    from src.pipeline.user_store import UserRecord, UserStore
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +87,6 @@ class UserProfile(BaseModel):
     login_count: int = 1
     annotation_count: int = 0
     last_annotation_at: Optional[str] = None
-    # ROLE_DERIVATION_VERSION the stored role was derived under; profiles
-    # saved before role derivation existed load as 1.
-    role_version: int = 1
 
 
 class AuthUserResponse(BaseModel):
@@ -132,36 +132,17 @@ class SAMLAssertionData(BaseModel):
 # ---------------------------------------------------------------------------
 
 # Roles allowed to edit curated overrides. Admins are included so the
-# curation flow can be exercised without a separate curator account.
+# curation flow can be exercised without a separate curator account. Roles are
+# granted on /admin/users (recorded in role_changes); sign-in never derives a
+# role from IdP groups.
 CURATION_ROLES = frozenset({"curator", "admin"})
-
-# Bumped when role derivation changes. Session tokens minted before the
-# current version carry a role from the old rules (everyone defaulted to
-# "curator"), so decode_session_token downgrades them to "viewer" until the
-# user signs in again and gets a re-derived role.
-ROLE_DERIVATION_VERSION = 2
-
-
-def derive_role(groups: Optional[List[str]]) -> str:
-    """Map IdP roles/groups (Keycloak roles or SAML groups) to an ACGC role.
-
-    admin if in any admin role/group, else curator if in any curator
-    role/group, else settings.jit_default_role ("viewer" by default).
-    """
-    user_groups = set(groups or [])
-    if user_groups.intersection(settings.keycloak_admin_roles_list) or user_groups.intersection(
-        settings.saml_admin_groups_list
-    ):
-        return "admin"
-    if user_groups.intersection(settings.keycloak_curator_roles_list) or user_groups.intersection(
-        settings.saml_curator_groups_list
-    ):
-        return "curator"
-    return settings.jit_default_role
 
 
 def can_curate(user: Optional["AuthenticatedUser"]) -> bool:
-    """True when `user` may edit curated overrides (always, with auth disabled)."""
+    """True when `user` may edit curated overrides (always, with auth disabled).
+
+    `user` must carry the CURRENT role and status, as require_auth returns
+    them (re-read from the user store on every request)."""
     if not settings.auth_enabled:
         return True
     return bool(user) and user.status == "active" and user.role in CURATION_ROLES
@@ -172,6 +153,8 @@ def can_curate(user: Optional["AuthenticatedUser"]) -> bool:
 # ---------------------------------------------------------------------------
 
 _user_store: Dict[str, UserProfile] = {}
+# Usage counters kept beside (not in) the profile; see record_user_annotation_activity.
+_user_activity: Dict[str, Dict[str, Any]] = {}
 _user_store_lock = asyncio.Lock()
 
 
@@ -190,7 +173,203 @@ async def _get_auth_redis_client():
     return _redis_client
 
 
+class UserStoreUnavailable(RuntimeError):
+    """The user profile store could not be read; callers must fail closed.
+
+    Messages never name a user: they're logged and shown to operators."""
+
+
+def describe_store_error(exc: BaseException) -> str:
+    """A log-safe description of a user-store failure: exception classes and
+    MySQL error codes along the cause chain, never a driver's message or args
+    (they can quote row data such as emails). Messages of our own
+    UserStoreUnavailable / UserStoreStartupError are kept: they never name a user."""
+    parts = []
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (UserStoreUnavailable, UserStoreStartupError)):
+            parts.append(f"{type(current).__name__}: {current}")
+        else:
+            code = current.args[0] if current.args and isinstance(current.args[0], int) else None
+            parts.append(type(current).__name__ + (f" (MySQL error {code})" if code is not None else ""))
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# MySQL user store (USER_STORE_BACKEND=mysql)
+# ---------------------------------------------------------------------------
+
+# New users signing in with the MySQL store; only admin actions and bootstrap
+# grants change a role after that.
+MYSQL_NEW_USER_ROLE = "viewer"
+BOOTSTRAP_ADMIN_REASON = "bootstrap admin grant (BOOTSTRAP_ADMIN_EMAILS)"
+# Logged when a usage counter write to the MySQL user store fails.
+ACTIVITY_WRITE_FAILED_LOG_KEY = "user_store.activity_write_failed"
+
+_mysql_user_store: Optional["UserStore"] = None
+
+
+def mysql_user_store_enabled() -> bool:
+    return settings.user_store_backend == "mysql"
+
+
+def configure_mysql_user_store(store: Optional["UserStore"]) -> None:
+    """Set the store used when USER_STORE_BACKEND=mysql (the app's RunStore)."""
+    global _mysql_user_store
+    _mysql_user_store = store
+
+
+def _mysql_store() -> "UserStore":
+    if _mysql_user_store is None:
+        raise UserStoreUnavailable("USER_STORE_BACKEND=mysql but no MySQL user store is configured")
+    return _mysql_user_store
+
+
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value is not None else None
+
+
+def _profile_from_record(record: "UserRecord") -> UserProfile:
+    return UserProfile(
+        email=record.email,
+        name=record.name,
+        picture=record.picture,
+        domain=record.domain,
+        role=record.role,
+        status=record.status,
+        provider=record.provider,
+        groups=[str(g) for g in record.groups],
+        claims=dict(record.claims),
+        first_login_at=_iso(record.first_login_at),
+        last_login_at=_iso(record.last_login_at),
+        login_count=record.login_count,
+        annotation_count=record.annotation_count,
+        last_annotation_at=_iso(record.last_annotation_at),
+    )
+
+
+async def _mysql_get_user(email: str) -> Optional["UserRecord"]:
+    """One users-table read, failing closed.
+
+    The email is validated first: a malformed one can't name a user (None,
+    so 401). After that, any exception from the store, including a
+    ValueError from decoding a stored row, is UserStoreUnavailable (503).
+    """
+    from src.pipeline.user_store import normalize_email
+
+    try:
+        clean_email = normalize_email(email)
+    except ValueError:
+        return None
+    store = _mysql_store()
+    try:
+        return await store.get_user(clean_email)
+    except UserStoreUnavailable:
+        raise
+    except Exception as exc:
+        raise UserStoreUnavailable("User store get_user failed") from exc
+
+
+async def grant_bootstrap_admin_if_listed(email: str) -> Optional[str]:
+    """Grant the admin role once to a BOOTSTRAP_ADMIN_EMAILS user (MySQL store).
+
+    grant_bootstrap_admin logs the grant in role_changes under the same
+    actor as the migration script, and refuses when any earlier grant was
+    logged, so an admin's later demotion is never undone. Returns the store's
+    outcome, or None when the email isn't listed.
+    """
+    clean_email = email.strip().lower()
+    if clean_email not in settings.bootstrap_admin_emails_list:
+        return None
+    outcome = await _mysql_store().grant_bootstrap_admin(clean_email, reason=BOOTSTRAP_ADMIN_REASON)
+    logger.info("Bootstrap admin for %s: %s", clean_email, outcome)
+    return outcome
+
+
+class UserStoreStartupError(RuntimeError):
+    """The MySQL user store isn't usable at startup; the app must not serve.
+
+    Raised without its cause: the server prints a startup failure's whole
+    traceback, and a driver's message there can quote row data (emails). The
+    message carries the redacted cause (describe_store_error) instead."""
+
+
+async def bootstrap_admins_at_startup() -> None:
+    """Check the MySQL user store and apply BOOTSTRAP_ADMIN_EMAILS to listed
+    users already in it. Raises UserStoreStartupError, so startup fails, when
+    the store can't be read or a grant fails: serving would leave the operator
+    without the admins they configured. Listed users who haven't signed in
+    yet are skipped and granted at their first sign-in.
+    """
+    from src.pipeline.user_store import UserNotFound
+
+    store = _mysql_store()
+    try:
+        admins = await store.count_admins()
+    except Exception as exc:
+        raise UserStoreStartupError(
+            "USER_STORE_BACKEND=mysql but the MySQL user store can't be read at startup; "
+            f"refusing to start ({describe_store_error(exc)})"
+        ) from None
+    logger.info("MySQL user store ready: %d active admin(s)", admins)
+    for position, email in enumerate(settings.bootstrap_admin_emails_list, start=1):
+        try:
+            await grant_bootstrap_admin_if_listed(email)
+        except UserNotFound:
+            logger.info("Bootstrap admin %s has not signed in yet; granting at first sign-in", email)
+        except Exception as exc:
+            raise UserStoreStartupError(
+                f"Granting the bootstrap admin role to BOOTSTRAP_ADMIN_EMAILS entry {position} "
+                f"failed; refusing to start ({describe_store_error(exc)})"
+            ) from None
+
+
+async def _profile_store_redis():
+    """The Redis client backing authoritative profile reads.
+
+    Returns None only when Redis is intentionally unconfigured (REDIS_URL
+    empty), in which case the in-process store is the profile store. Raises
+    UserStoreUnavailable when Redis is configured but the client failed to
+    initialize, rather than silently degrading to the in-process copy.
+    """
+    if not settings.redis_url.strip():
+        return None
+    redis_client = await _get_auth_redis_client()
+    if redis_client is None:
+        raise UserStoreUnavailable("Redis is configured but the auth client could not be initialized")
+    return redis_client
+
+
+async def load_user_profile_strict(email: str) -> Optional[UserProfile]:
+    """Read a user profile from the authoritative store, failing closed.
+
+    With USER_STORE_BACKEND=mysql the users table alone decides, the same
+    way. With Redis configured, Redis alone decides: a miss means the profile
+    was deleted (None) and any error raises UserStoreUnavailable. The in-process
+    store, which save_user_profile also populates, may hold a stale copy and
+    is consulted only when Redis is intentionally unconfigured.
+    """
+    clean_email = email.strip().lower()
+    if mysql_user_store_enabled():
+        record = await _mysql_get_user(clean_email)
+        return _profile_from_record(record) if record is not None else None
+    redis_client = await _profile_store_redis()
+    if redis_client is None:
+        async with _user_store_lock:
+            return _user_store.get(clean_email)
+    try:
+        payload = await redis_client.get(f"agcg:user:{clean_email}")
+        return UserProfile.model_validate_json(payload) if payload else None
+    except Exception as exc:
+        raise UserStoreUnavailable("Failed to read a user profile from Redis") from exc
+
+
 async def get_user_profile(email: str) -> Optional[UserProfile]:
+    if mysql_user_store_enabled():
+        return await load_user_profile_strict(email)
     clean_email = email.strip().lower()
     redis_client = await _get_auth_redis_client()
     if redis_client is not None:
@@ -219,7 +398,44 @@ async def save_user_profile(profile: UserProfile) -> None:
         _user_store[clean_email] = profile
 
 
+def _with_activity(profile: UserProfile, activity: Dict[str, Any]) -> UserProfile:
+    """Overlay the separately stored usage counters on a profile.
+
+    A profile's own annotation_count/last_annotation_at are the totals from
+    before usage moved to its own record; new usage only lands in `activity`.
+    """
+    if not activity:
+        return profile
+    return profile.model_copy(
+        update={
+            "annotation_count": profile.annotation_count + int(activity.get("annotation_count") or 0),
+            "last_annotation_at": activity.get("last_annotation_at") or profile.last_annotation_at,
+        }
+    )
+
+
+async def _list_mysql_user_profiles() -> List[UserProfile]:
+    from src.pipeline.user_store import MAX_PAGE_LIMIT, UserFilters
+
+    store = _mysql_store()
+    profiles: List[UserProfile] = []
+    cursor: Optional[str] = None
+    try:
+        while True:
+            page = await store.list_users(UserFilters(), limit=MAX_PAGE_LIMIT, cursor=cursor)
+            profiles.extend(_profile_from_record(record) for record in page.users)
+            cursor = page.next_cursor
+            if cursor is None:
+                return profiles  # already most recent login first
+    except UserStoreUnavailable:
+        raise
+    except Exception as exc:
+        raise UserStoreUnavailable("Failed to list users") from exc
+
+
 async def list_user_profiles() -> List[UserProfile]:
+    if mysql_user_store_enabled():
+        return await _list_mysql_user_profiles()
     redis_client = await _get_auth_redis_client()
     if redis_client is not None:
         try:
@@ -228,7 +444,7 @@ async def list_user_profiles() -> List[UserProfile]:
             for email in emails:
                 u = await get_user_profile(email)
                 if u:
-                    users.append(u)
+                    users.append(_with_activity(u, await redis_client.hgetall(_activity_key(u.email))))
             if users:
                 users.sort(key=lambda x: x.last_login_at, reverse=True)
                 return users
@@ -236,7 +452,7 @@ async def list_user_profiles() -> List[UserProfile]:
             logger.debug("Redis error listing users: %s", exc)
 
     async with _user_store_lock:
-        users = list(_user_store.values())
+        users = [_with_activity(u, _user_activity.get(u.email, {})) for u in _user_store.values()]
         users.sort(key=lambda x: x.last_login_at, reverse=True)
         return users
 
@@ -250,27 +466,43 @@ async def provision_or_update_user(
     groups: Optional[List[str]] = None,
     claims: Optional[Dict[str, Any]] = None,
     role: Optional[str] = None,
+    require_approval: Optional[bool] = None,
 ) -> UserProfile:
     """
     Just-In-Time (JIT) provisioning: creates a new user profile on first login,
     or updates login timestamp, groups, and claims for returning users.
 
-    The role is re-derived from this login's groups every time (the IdP is the
-    source of truth), so a stored role from an earlier login never sticks.
-    `role` is an explicit override (dev login) that admin groups still win over.
+    Reads the profile from the authoritative store (load_user_profile_strict):
+    with Redis configured, a profile missing there is a new user subject to the
+    new-user rules (incl. approval), even if a stale in-process copy exists, and
+    a store error raises UserStoreUnavailable instead of provisioning from that
+    copy. `require_approval` overrides JIT_REQUIRE_ADMIN_APPROVAL for new users
+    (logins admitted without JIT provisioning pass False); returning users
+    always get the same merge rules.
     """
     clean_email = email.strip().lower()
     extracted_domain = domain or clean_email.split("@")[-1]
+    if mysql_user_store_enabled():
+        return await _provision_mysql_user(
+            clean_email, name=name, picture=picture, domain=extracted_domain, provider=provider,
+            groups=groups or [], claims=claims or {}, require_approval=require_approval,
+        )
     now_iso = datetime.now(timezone.utc).isoformat()
     user_groups = groups or []
     user_claims = claims or {}
 
-    derived_role = derive_role(user_groups)
-    effective_role = "admin" if derived_role == "admin" else (role or derived_role)
+    # Derive role from SAML/OIDC groups or defaults
+    effective_role = role or settings.jit_default_role
+    if any(g in settings.saml_admin_groups_list for g in user_groups):
+        effective_role = "admin"
+    if any(g in settings.keycloak_admin_roles_list for g in user_groups):
+        effective_role = "admin"
 
-    existing = await get_user_profile(clean_email)
+    existing = await load_user_profile_strict(clean_email)
     if existing is None:
-        status_val = "pending" if settings.jit_require_admin_approval else "active"
+        if require_approval is None:
+            require_approval = settings.jit_require_admin_approval
+        status_val = "pending" if require_approval else "active"
         logger.info(
             "JIT provisioning new user: %s (domain=%s, role=%s, provider=%s, status=%s, groups=%s)",
             clean_email, extracted_domain, effective_role, provider, status_val, user_groups,
@@ -288,12 +520,10 @@ async def provision_or_update_user(
             first_login_at=now_iso,
             last_login_at=now_iso,
             login_count=1,
-            role_version=ROLE_DERIVATION_VERSION,
         )
     else:
         logger.info("JIT sync for returning user %s (login_count=%d)", clean_email, existing.login_count + 1)
-        if existing.role != effective_role:
-            logger.info("Role for %s re-derived: %s -> %s", clean_email, existing.role, effective_role)
+        resolved_role = "admin" if (effective_role == "admin" or existing.role == "admin") else existing.role
         merged_groups = list(dict.fromkeys(existing.groups + user_groups))
         profile = existing.model_copy(
             update={
@@ -303,8 +533,7 @@ async def provision_or_update_user(
                 "login_count": existing.login_count + 1,
                 "groups": merged_groups,
                 "claims": {**existing.claims, **user_claims},
-                "role": effective_role,
-                "role_version": ROLE_DERIVATION_VERSION,
+                "role": resolved_role,
             }
         )
 
@@ -312,19 +541,99 @@ async def provision_or_update_user(
     return profile
 
 
-async def record_user_annotation_activity(email: str, count: int = 1) -> None:
-    """Updates user profile usage metrics in the user store upon annotation completion."""
-    clean_email = email.strip().lower()
-    profile = await get_user_profile(clean_email)
-    if profile:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        updated = profile.model_copy(
-            update={
-                "annotation_count": profile.annotation_count + max(1, count),
-                "last_annotation_at": now_iso,
-            }
+async def _provision_mysql_user(
+    email: str,
+    *,
+    name: str,
+    picture: Optional[str],
+    domain: str,
+    provider: str,
+    groups: List[str],
+    claims: Dict[str, Any],
+    require_approval: Optional[bool],
+) -> UserProfile:
+    """Sign-in against the MySQL users table.
+
+    upsert_login creates a new user as an active viewer (pending when approval
+    is required) and, for an existing user, refreshes identity, groups, claims
+    and login counters but never role or status: IdP groups (Keycloak roles,
+    SAML admin groups) are stored, not mapped to a role. A listed bootstrap
+    admin is then granted admin once. Store errors raise UserStoreUnavailable.
+    """
+    from src.pipeline.user_store import BOOTSTRAP_GRANTED, LoginIdentity
+
+    if require_approval is None:
+        require_approval = settings.jit_require_admin_approval
+    identity = LoginIdentity(
+        email=email, name=name, picture=picture, domain=domain, provider=provider,
+        groups=groups, claims=claims,
+    )
+    store = _mysql_store()
+    try:
+        record = await store.upsert_login(
+            identity,
+            default_role=MYSQL_NEW_USER_ROLE,
+            default_status="pending" if require_approval else "active",
         )
-        await save_user_profile(updated)
+        logger.info(
+            "Sign-in for %s (provider=%s, role=%s, status=%s, login_count=%d)",
+            record.email, provider, record.role, record.status, record.login_count,
+        )
+        if await grant_bootstrap_admin_if_listed(record.email) == BOOTSTRAP_GRANTED:
+            record = await store.get_user(record.email) or record
+    except UserStoreUnavailable:
+        raise
+    except Exception as exc:
+        raise UserStoreUnavailable("User store sign-in failed") from exc
+    return _profile_from_record(record)
+
+
+def _activity_key(email: str) -> str:
+    return f"agcg:user_activity:{email}"
+
+
+async def record_user_annotation_activity(email: str, count: int = 1) -> None:
+    """Records usage metrics upon annotation completion (shown by list_user_profiles).
+
+    Write-only: the counters live beside the profile instead of in it, so
+    recording usage neither adds a profile read to the request nor rewrites
+    the profile (a read-modify-write here could undo a concurrent demotion).
+    """
+    clean_email = email.strip().lower()
+    if mysql_user_store_enabled():
+        # Usage counters aren't an access check, and this runs after the work:
+        # on failure the response still succeeds, the count is dropped (never
+        # buffered in-process) and an error is logged under a stable key.
+        # Only the exception type is logged, never the email.
+        try:
+            await _mysql_store().incr_activity(clean_email, max(1, count))
+        except Exception as exc:
+            logger.error(
+                "%s: dropped an annotation usage count of %d (%s)",
+                ACTIVITY_WRITE_FAILED_LOG_KEY, max(1, count), type(exc).__name__,
+            )
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if settings.redis_url.strip():
+        # Redis is the store: on failure drop the increment rather than buffer
+        # it in-process, where it would never reach Redis after recovery.
+        redis_client = await _get_auth_redis_client()
+        if redis_client is None:
+            logger.warning("Dropped annotation activity for %s: Redis auth client unavailable", clean_email)
+            return
+        try:
+            pipe = redis_client.pipeline()
+            pipe.hincrby(_activity_key(clean_email), "annotation_count", max(1, count))
+            pipe.hset(_activity_key(clean_email), "last_annotation_at", now_iso)
+            await pipe.execute()
+        except Exception as exc:
+            logger.warning("Dropped annotation activity for %s: Redis error: %s", clean_email, exc)
+        return
+
+    async with _user_store_lock:
+        activity = _user_activity.setdefault(clean_email, {})
+        activity["annotation_count"] = int(activity.get("annotation_count") or 0) + max(1, count)
+        activity["last_annotation_at"] = now_iso
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +716,6 @@ def create_session_token(user: AuthenticatedUser, ttl_seconds: Optional[int] = N
         "status": user.status,
         "provider": user.provider,
         "groups": user.groups,
-        "rv": ROLE_DERIVATION_VERSION,
         "iat": now,
         "exp": now + ttl,
     }
@@ -455,23 +763,15 @@ def decode_session_token(token: str) -> Optional[AuthenticatedUser]:
             logger.warning("Session token rejected for %s: %s", email, reason)
             return None
 
-        status_val = payload.get("status", "active")
-        if status_val != "active":
-            logger.warning("Session rejected for %s: account status is %s", email, status_val)
-            return None
-
-        role = payload.get("role", settings.jit_default_role)
-        if role == "curator" and payload.get("rv", 1) < ROLE_DERIVATION_VERSION:
-            # Minted when every user defaulted to "curator"; re-login re-derives it.
-            role = "viewer"
-
+        # role/status are login-time snapshots, informational only: session
+        # requests are authorized with the live profile's (_verify_session).
         return AuthenticatedUser(
             email=email,
             name=payload.get("name") or email,
             picture=payload.get("picture"),
             domain=payload.get("domain") or email.split("@")[-1],
-            role=role,
-            status=status_val,
+            role=payload.get("role", settings.jit_default_role),
+            status=payload.get("status", "active"),
             provider=payload.get("provider", "google"),
             groups=payload.get("groups", []),
         )
@@ -782,23 +1082,82 @@ def _uses_api_key(request: Request) -> bool:
 # so the observability middleware and require_auth share a single DB lookup.
 _API_KEY_STATE_ATTR = "acgc_api_key_auth"
 _API_KEY_RATE_CHECKED_ATTR = "acgc_api_key_rate_checked"
+# Same idea for session tokens: (user, failure reason) after the live profile
+# check, so each request reads the user profile at most once.
+_SESSION_STATE_ATTR = "acgc_session_auth"
+
+
+def _session_token(request: Request) -> Optional[str]:
+    return request.cookies.get(settings.auth_cookie_name) or bearer_token(request.headers.get("Authorization"))
 
 
 def get_current_user(request: Request) -> Optional[AuthenticatedUser]:
+    """The caller's identity as already verified for this request.
+
+    API keys and session tokens both need an async lookup (the key record and
+    the live user profile respectively), so this sync helper only returns what
+    resolve_api_key_user() / resolve_session_user() verified, and None
+    otherwise. user_context_middleware resolves both on every request.
+    """
+    attr = _API_KEY_STATE_ATTR if _uses_api_key(request) else _SESSION_STATE_ATTR
+    cached = getattr(request.state, attr, None)
+    return cached[0] if cached else None
+
+
+async def _verify_session(token: str) -> Tuple[Optional[AuthenticatedUser], Optional[str]]:
+    claims = decode_session_token(token)
+    if claims is None:
+        return None, "invalid"
+
+    # The token's role/status are a snapshot from login. Authorize against the
+    # current profile so demotions take effect on already-issued sessions.
+    try:
+        profile = await load_user_profile_strict(claims.email)
+    except UserStoreUnavailable as exc:
+        # No traceback or email: a cause's message can quote stored data.
+        logger.error("User profile lookup failed for a session: %s", describe_store_error(exc))
+        return None, "unavailable"
+
+    if profile is None:
+        logger.warning("Session rejected for %s: user profile no longer exists", claims.email)
+        return None, "invalid"
+
+    if profile.status != "active":
+        logger.warning("Session rejected for %s: account status is %s", claims.email, profile.status)
+        return None, "inactive"
+
+    return claims.model_copy(update={"role": profile.role, "status": profile.status}), None
+
+
+async def resolve_session_user(request: Request) -> Optional[AuthenticatedUser]:
+    """Verify the session cookie / session bearer token (once per request, cached).
+
+    Returns None for API-key requests, a missing/invalid/expired token, a
+    deleted or non-active profile, or an unreadable profile store; the cached
+    failure reason ("invalid", "inactive", "unavailable") tells them apart.
+    """
     if _uses_api_key(request):
-        # API keys need an async DB lookup; this sync helper only sees a key
-        # that resolve_api_key_user() already verified for this request.
-        cached = getattr(request.state, _API_KEY_STATE_ATTR, None)
-        return cached[0] if cached else None
-
-    token = request.cookies.get(settings.auth_cookie_name)
-    if not token:
-        token = bearer_token(request.headers.get("Authorization"))
-
-    if not token:
         return None
+    cached = getattr(request.state, _SESSION_STATE_ATTR, None)
+    if cached is None:
+        token = _session_token(request)
+        if not token:
+            cached = (None, None)
+        elif not settings.auth_enabled:
+            # Auth disabled: nothing to authorize against, so keep the token's
+            # claims (and its pre-existing rejection of inactive snapshots).
+            claims = decode_session_token(token)
+            cached = (claims if claims and claims.status == "active" else None, None)
+        else:
+            cached = await _verify_session(token)
+        setattr(request.state, _SESSION_STATE_ATTR, cached)
+    return cached[0]
 
-    return decode_session_token(token)
+
+def session_store_unavailable(request: Request) -> bool:
+    """True when this request's session couldn't be checked against the user store."""
+    cached = getattr(request.state, _SESSION_STATE_ATTR, None)
+    return bool(cached) and cached[1] == "unavailable"
 
 
 async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[AuthenticatedUser], Optional[str]]:
@@ -837,20 +1196,27 @@ async def _verify_api_key(request: Request, plaintext: str) -> Tuple[Optional[Au
         except Exception as exc:
             logger.warning("Failed to update last_used_at for API key %s: %s", record.id, exc)
 
-    profile = await get_user_profile(owner_email)
-    # No live profile means no IdP-derived role to trust: never let JIT_DEFAULT_ROLE
-    # (which may be configured to curator/admin) confer privileges on a key.
-    role = profile.role if profile else "viewer"
-    if profile and role == "curator" and profile.role_version < ROLE_DERIVATION_VERSION:
-        # Stored before roles were derived from the IdP; re-derived at next login.
-        role = "viewer"
+    # Same authoritative read as sessions: with MySQL or Redis as the store,
+    # an owner missing there was deleted. Without either the in-process store
+    # is lost on restart, so a missing owner keeps the default-role behaviour.
+    try:
+        profile = await load_user_profile_strict(owner_email)
+    except UserStoreUnavailable as exc:
+        logger.error(
+            "User profile lookup failed for API key %s owner: %s", record.id, describe_store_error(exc)
+        )
+        return None, "unavailable"
+    if profile is None and (mysql_user_store_enabled() or settings.redis_url.strip()):
+        logger.warning("API key %s rejected: owner %s has no user profile", record.id, owner_email)
+        return None, "invalid"
+
     return (
         AuthenticatedUser(
             email=owner_email,
             name=(profile.name if profile else None) or owner_email,
             picture=profile.picture if profile else None,
             domain=owner_email.split("@")[-1],
-            role=role,
+            role=profile.role if profile else settings.jit_default_role,
             status=profile.status if profile else "active",
             provider="api_key",
             groups=list(profile.groups) if profile else [],
@@ -881,8 +1247,9 @@ async def resolve_api_key_user(request: Request) -> Optional[AuthenticatedUser]:
 
 
 async def get_request_user(request: Request) -> Optional[AuthenticatedUser]:
-    """Async counterpart of get_current_user that also resolves API keys."""
+    """Async counterpart of get_current_user that resolves API keys and sessions."""
     await resolve_api_key_user(request)
+    await resolve_session_user(request)
     return get_current_user(request)
 
 
@@ -901,6 +1268,9 @@ async def _enforce_api_key_rate_limit(request: Request, user: AuthenticatedUser)
             detail="API key rate limit exceeded. Please slow down and retry later.",
             headers={"Retry-After": str(retry_after)},
         )
+
+
+_INACTIVE_ACCOUNT_DETAIL = "Your account is pending administrator approval. Please contact your AGCG administrator."
 
 
 async def require_auth(request: Request) -> AuthenticatedUser:
@@ -929,7 +1299,15 @@ async def require_auth(request: Request) -> AuthenticatedUser:
                 headers={"WWW-Authenticate": "Bearer"},
             )
     else:
-        user = get_current_user(request)
+        user = await resolve_session_user(request)
+        reason = getattr(request.state, _SESSION_STATE_ATTR, (None, None))[1]
+        if reason == "unavailable":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Session verification is temporarily unavailable. Please retry shortly.",
+            )
+        if reason == "inactive":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_INACTIVE_ACCOUNT_DETAIL)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -940,7 +1318,7 @@ async def require_auth(request: Request) -> AuthenticatedUser:
     if user.status != "active":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account is pending administrator approval. Please contact your AGCG administrator.",
+            detail=_INACTIVE_ACCOUNT_DETAIL,
         )
 
     if uses_api_key:
@@ -963,10 +1341,9 @@ async def require_admin(request: Request) -> AuthenticatedUser:
 async def require_curator(request: Request) -> AuthenticatedUser:
     """Allow curators and admins to edit curated overrides.
 
-    API-key requests are allowed only when the key owner's live JIT profile
-    role is curator/admin (resolved per request in _verify_api_key; a missing
-    profile is a viewer), so a role removed in Keycloak stops working for keys
-    at the owner's next login.
+    require_auth re-reads the user's current role and status from the user
+    store on every request (sessions and API keys alike), so a promotion or
+    demotion on /admin/users applies to the very next request.
     """
     user = await require_auth(request)
     if not can_curate(user):
@@ -1255,7 +1632,13 @@ def parse_keycloak_user(token_data: Dict[str, Any], userinfo: Dict[str, Any]) ->
 
     unique_groups = sorted(list(set(groups)))
 
-    role = derive_role(unique_groups)
+    # Determine user role
+    role = settings.jit_default_role
+    admin_roles = set(settings.keycloak_admin_roles_list)
+    if admin_roles and any(r in admin_roles for r in unique_groups):
+        role = "admin"
+    elif settings.saml_admin_groups_list and any(g in set(settings.saml_admin_groups_list) for g in unique_groups):
+        role = "admin"
 
     return AuthenticatedUser(
         email=clean_email,

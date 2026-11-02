@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tup
 import pymysql
 
 from src.models.schema import CuratedOverride, CurationHistoryEntry
+from src.pipeline.schema_migrations import add_column_if_missing
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +135,8 @@ class CurationStoreMixin:
         await cursor.execute(_CREATE_CURATION_HISTORY_TABLE_SQL)
         # runs.revision: bumped by every result_json write, so whole-result
         # rewrites can compare-and-swap instead of clobbering concurrent ones.
-        await cursor.execute("SHOW COLUMNS FROM runs LIKE 'revision'")
-        if await cursor.fetchone() is None:
-            await cursor.execute("ALTER TABLE runs ADD COLUMN revision INT NOT NULL DEFAULT 0")
+        # Concurrency-safe and ALGORITHM=INSTANT where supported (no table copy).
+        await add_column_if_missing(cursor, "runs", "revision", "INT NOT NULL DEFAULT 0")
 
     async def get_curated_override(
         self, subject_type: str, subject_key: str, tumor_type: str
@@ -487,16 +487,6 @@ class CurationStoreMixin:
                     WHERE run_id = %s
                     """,
                     (*params, run_id),
-                )
-
-    async def set_run_fusion_evidence(self, run_id: str, fusion_evidence: List[Dict[str, Any]]) -> None:
-        """Atomically replace only the run's fusion_evidence."""
-        async with self._pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute(
-                    "UPDATE runs SET result_json = JSON_SET(result_json, '$.fusion_evidence', CAST(%s AS JSON)), "
-                    "revision = revision + 1 WHERE run_id = %s",
-                    (json.dumps(fusion_evidence), run_id),
                 )
 
     async def get_run_request(self, run_id: str) -> Optional[Dict[str, Any]]:

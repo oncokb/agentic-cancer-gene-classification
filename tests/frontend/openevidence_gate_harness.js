@@ -237,7 +237,8 @@ function buildSandbox({ fetchImpl }) {
 // module's own functions/state directly reachable as sandbox properties
 // (e.g. sandbox.state, sandbox.renderOpenEvidenceCard), plus
 // `createdElementTags` — every tag name passed to document.createElement
-// during this sandbox's lifetime, for asserting nothing was created at all.
+// during this sandbox's lifetime, for asserting nothing was created at all —
+// and `createdElements`, the elements themselves.
 function loadApp({ fetchImpl }) {
   const { sandbox, createdElements } = buildSandbox({ fetchImpl });
   const script = new vm.Script(loadedSource(), { filename: "app.js" });
@@ -245,6 +246,9 @@ function loadApp({ fetchImpl }) {
   Object.defineProperty(sandbox, "createdElementTags", {
     get: () => createdElements.map((el) => el.tagName),
   });
+  // The elements themselves, for finding content appended to elements the
+  // fake querySelector hands back detached from the tree.
+  Object.defineProperty(sandbox, "createdElements", { get: () => createdElements.slice() });
   return sandbox;
 }
 

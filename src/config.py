@@ -1,6 +1,7 @@
-from typing import List
+from typing import List, Literal, Optional
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,7 +38,24 @@ class Settings(BaseSettings):
     core_synthesis_escalation_sufficient_score: float = 1.01
     selection_model: str = "claude-haiku-4-5-20251001"
     feedback_issue_creation_enabled: bool = True
+    # Labels applied to bot-created feedback issues. These are best-effort: if
+    # GitHub rejects the labels on creation (e.g. a label doesn't exist in the
+    # repo), issue creation is retried once without labels so the feedback is
+    # still filed.
+    feedback_issue_labels: List[str] = Field(
+        default_factory=lambda: ["feedback", "needs-triage"]
+    )
     feedback_rate_limit_per_hour: int = Field(default=10, ge=1)
+    ui_events_enabled: bool = False
+    ui_events_rate_limit_per_minute: int = Field(default=120, ge=1)
+    ui_events_metric_flag_keys: str = ""
+    # Best-effort check of PMIDs cited in feedback. The check is appended to the
+    # issue body; a timeout or any PubMed/HGNC error renders "check unavailable"
+    # instead of failing the submission.
+    feedback_citation_check_enabled: bool = True
+    feedback_citation_check_timeout_seconds: float = 8.0
+    feedback_citation_alias_timeout_seconds: float = 2.0
+    feedback_citation_max_pmids: int = 5
     feedback_model: str = "claude-haiku-4-5-20251001"
     retrieval_model: str = "claude-haiku-4-5-20251001"
 
@@ -60,9 +78,21 @@ class Settings(BaseSettings):
     aws_default_region: str = ""
     aws_profile: str = ""
     acgc_dev_mode: bool = False
+    # Grants every signed-in user admin and enables dev login: local use only
+    # (see dev_mode_startup_error).
     agcg_dev_mode: bool = False
     public_app_base_url: str = "https://acgc.oncokb.org"
+    # Whether PUBLIC_APP_BASE_URL came from the environment / .env rather than
+    # the default above; captured once at construction.
+    _public_app_base_url_configured: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="after")
+    def record_configured_base_url(self) -> "Settings":
+        self._public_app_base_url_configured = "public_app_base_url" in self.model_fields_set
+        return self
     pubmed_max_results: int = 50
+    # Shared per-gene budget for partner queries in retrieval and freshness probes.
+    pubmed_max_partner_queries: int = Field(default=8, ge=1)
     fusion_evidence_max_results: int = 20
     fusion_evidence_cache_ttl_seconds: int = 604800
     fusion_evidence_concurrency: int = 2
@@ -115,7 +145,16 @@ class Settings(BaseSettings):
     context_score_pubtype_case_report_weight: float = 0.3
     context_score_pubtype_editorial_weight: float = 0.15
     context_score_pubtype_preprint_weight: float = 0.3
-    annotation_job_ttl_seconds: int = 3600
+    annotate_max_inputs: int = Field(
+        default=50, ge=1,
+        description="Maximum inputs per annotation or fusion-evidence request (ANNOTATE_MAX_INPUTS).",
+    )
+    # Async job status snapshots (annotation, enrichment, gene-query and
+    # fusion-evidence jobs) expire this long after the job's last update.
+    # Unset means 24h; see src.job_store.job_ttl_seconds().
+    job_ttl_seconds: Optional[int] = None
+    # Deprecated: used for every job kind only when JOB_TTL_SECONDS is unset.
+    annotation_job_ttl_seconds: Optional[int] = None
     # Max entries accepted per gene query API request (POST /v1/genes/query[/jobs]).
     gene_query_max_genes: int = 50
 
@@ -144,6 +183,22 @@ class Settings(BaseSettings):
     mysql_user: str = "acgc"
     mysql_password: str = ""
     mysql_database: str = "acgc"
+    mysql_pool_minsize: int = Field(default=1, ge=0)
+    mysql_pool_maxsize: int = Field(default=10, ge=1)
+    mysql_pool_recycle_seconds: int = Field(default=3600, ge=-1)
+
+    @field_validator("mysql_pool_recycle_seconds")
+    @classmethod
+    def validate_mysql_pool_recycle_seconds(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("MYSQL_POOL_RECYCLE_SECONDS must be -1 or at least 1")
+        return value
+
+    @model_validator(mode="after")
+    def validate_mysql_pool_sizes(self) -> "Settings":
+        if self.mysql_pool_minsize > self.mysql_pool_maxsize:
+            raise ValueError("MYSQL_POOL_MINSIZE must be <= MYSQL_POOL_MAXSIZE")
+        return self
 
     # Alternative to MYSQL_HOST/MYSQL_PORT: a JDBC-style connection string
     # (e.g. "jdbc:mysql://host:3306"), as used by this org's shared RDS
@@ -154,6 +209,11 @@ class Settings(BaseSettings):
     db_url: str = ""
     db_username: str = ""
     db_password: str = ""
+
+    # Upper bound on how long startup schema changes to `runs` wait for the
+    # table's metadata lock. On timeout the app starts without them (see
+    # RunStore._ensure_runs_schema) instead of stalling behind long queries.
+    runs_ddl_lock_wait_timeout_seconds: int = Field(default=10, ge=1)
 
     fusion_annotation_api_enabled: bool = False
     fusion_annotation_api_base_url: str = ""
@@ -249,7 +309,6 @@ class Settings(BaseSettings):
     saml_idp_entity_id: str = ""  # IdP Issuer / Entity ID
     saml_allowed_groups: str = ""  # Comma-separated list of required SAML groups (optional)
     saml_admin_groups: str = ""  # Groups that map to the "admin" role
-    saml_curator_groups: str = ""  # Groups that map to the "curator" role (may edit curated overrides)
 
     # Keycloak OIDC & PingID SSO Settings (via keycloak.oncokb.org)
     keycloak_url: str = "https://keycloak.oncokb.org"
@@ -260,14 +319,23 @@ class Settings(BaseSettings):
     keycloak_redirect_uri: str = ""  # If left empty, computed from request or public_app_base_url
     keycloak_allowed_roles: str = ""  # Optional comma-separated list of required Keycloak roles
     keycloak_admin_roles: str = ""  # Keycloak roles that map to "admin" role
-    keycloak_curator_roles: str = ""  # Keycloak roles that map to "curator" role (may edit curated overrides)
 
     # JIT (Just-In-Time) Provisioning Settings
     jit_provisioning_enabled: bool = True
-    # Role for users in none of the admin/curator roles or groups above. The role
-    # is re-derived from the IdP's roles/groups on every login.
+    # Role for new users with the redis user store (viewer, curator or admin);
+    # the mysql store always starts new users as viewers. Curator is granted
+    # by an admin on /admin/users, never derived from IdP groups.
     jit_default_role: str = "viewer"
     jit_require_admin_approval: bool = False  # If True, new JIT users start in pending status
+
+    # Where sign-in and per-request permission checks read user records:
+    # "redis" (agcg:user:<email>, the default) or "mysql" (the users table).
+    # With "mysql", new users start as active viewers (pending if
+    # JIT_REQUIRE_ADMIN_APPROVAL) and sign-in never changes an existing role.
+    user_store_backend: Literal["redis", "mysql"] = "redis"
+    # Comma-separated emails made admin once (at startup or sign-in) when
+    # USER_STORE_BACKEND=mysql; never re-granted after an admin removes it.
+    bootstrap_admin_emails: str = ""
 
     # ACGC API keys (scripted access: `Authorization: Bearer acgc_...`)
     api_key_rate_limit_per_minute: int = Field(default=60, ge=1)  # Per-key request budget
@@ -291,12 +359,6 @@ class Settings(BaseSettings):
         return [r.strip() for r in self.keycloak_admin_roles.split(",") if r.strip()]
 
     @property
-    def keycloak_curator_roles_list(self) -> List[str]:
-        if not self.keycloak_curator_roles:
-            return []
-        return [r.strip() for r in self.keycloak_curator_roles.split(",") if r.strip()]
-
-    @property
     def allowed_domains_list(self) -> List[str]:
         if not self.allowed_email_domains:
             return []
@@ -309,6 +371,12 @@ class Settings(BaseSettings):
         return [e.strip().lower() for e in self.allowed_emails.split(",") if e.strip()]
 
     @property
+    def bootstrap_admin_emails_list(self) -> List[str]:
+        if not self.bootstrap_admin_emails:
+            return []
+        return [e.strip().lower() for e in self.bootstrap_admin_emails.split(",") if e.strip()]
+
+    @property
     def saml_allowed_groups_list(self) -> List[str]:
         if not self.saml_allowed_groups:
             return []
@@ -319,12 +387,6 @@ class Settings(BaseSettings):
         if not self.saml_admin_groups:
             return []
         return [g.strip() for g in self.saml_admin_groups.split(",") if g.strip()]
-
-    @property
-    def saml_curator_groups_list(self) -> List[str]:
-        if not self.saml_curator_groups:
-            return []
-        return [g.strip() for g in self.saml_curator_groups.split(",") if g.strip()]
 
     log_level: str = "INFO"
 
@@ -347,6 +409,43 @@ class Settings(BaseSettings):
     datadog_gene_latency_watchlist: str = (
         "ALK,ROS1,RET,NTRK1,NTRK2,NTRK3,BRAF,EGFR,MET,FGFR1,FGFR2,FGFR3,"
         "ABL1,KMT2A,ETV6,EWSR1,TMPRSS2,ERG,PAX3,PAX7,FOXO1,DDIT3,NUTM1,BCR"
+    )
+
+
+# PUBLIC_APP_BASE_URL hosts that count as a local deployment.
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def dev_mode_startup_error(config: Settings) -> Optional[str]:
+    """Why the app must refuse to start with AGCG_DEV_MODE on, or None.
+
+    Dev mode makes every signed-in user an admin, so it's only allowed when
+    PUBLIC_APP_BASE_URL is absent (not provided at all) or names a local host
+    (localhost, 127.0.0.1, ::1, 0.0.0.0; any scheme or port). A base URL
+    whose host can't be parsed is treated as non-local, and so is one
+    provided but blank: the app then takes its public URL from each request.
+    """
+    if not config.agcg_dev_mode or not config._public_app_base_url_configured:
+        return None
+    url = config.public_app_base_url.strip()
+    if not url:
+        return (
+            "Refusing to start: AGCG_DEV_MODE is on, which grants every signed-in user admin "
+            "privileges, and PUBLIC_APP_BASE_URL is set but blank, so the public URL would come "
+            "from each request's host. Unset AGCG_DEV_MODE for deployed environments, or set "
+            "PUBLIC_APP_BASE_URL to a localhost URL (or leave it out entirely) for local development."
+        )
+    try:
+        host = urlsplit(url if "://" in url else f"//{url}").hostname
+    except ValueError:
+        host = None
+    if host in _LOCAL_HOSTS:
+        return None
+    return (
+        f"Refusing to start: AGCG_DEV_MODE is on, which grants every signed-in user admin "
+        f"privileges, but PUBLIC_APP_BASE_URL points at a non-local host ({host or url!r}). "
+        "Unset AGCG_DEV_MODE for deployed environments, or point PUBLIC_APP_BASE_URL at "
+        "localhost for local development."
     )
 
 

@@ -19,28 +19,34 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from html import escape as html_escape
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Coroutine, Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import parse_qs, quote
 
 import httpx
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from benchmarks.run_benchmark import DEFAULT_HOLDOUT, run_benchmark
-from src.api.run_persistence import save_run_or_raise
+from src.api.run_persistence import can_modify_run, run_owner, save_run_or_raise
+from src.api.runs import router as runs_router
+from src.admin_users_routes import router as admin_users_router
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
     AuthenticatedUser,
     AuthMeResponse,
     AuthUserResponse,
     UserProfile,
+    UserStoreUnavailable,
+    bootstrap_admins_at_startup,
+    describe_store_error,
     build_saml_authn_request,
     can_curate,
     clear_session_cookie,
+    configure_mysql_user_store,
     create_oauth_state,
     create_session_token,
     exchange_google_code,
@@ -55,6 +61,7 @@ from src.auth import (
     is_email_allowed,
     is_saml_group_allowed,
     list_user_profiles,
+    mysql_user_store_enabled,
     parse_keycloak_user,
     parse_saml_response,
     provision_or_update_user,
@@ -62,11 +69,13 @@ from src.auth import (
     render_access_denied_html,
     require_admin,
     require_auth,
+    session_store_unavailable,
     set_session_cookie,
     validate_redirect_to,
     verify_oauth_state,
 )
-from src.config import settings
+from src.config import dev_mode_startup_error, settings
+from src.job_store import JobStore, can_read_job, job_owner
 from src.logging_utils import install_secret_redaction_filter
 from src.models.schema import (
     AnnotateRequest,
@@ -89,10 +98,13 @@ from src.models.schema import (
 from src.observability import (
     get_user_context,
     increment,
+    init_statsd,
     record_user_action,
     record_user_seen,
     reset_user_context,
     set_user_context,
+    shutdown_statsd,
+    stable_user_key,
     tag_current_span,
     tag_user,
 )
@@ -109,10 +121,14 @@ from src.pipeline.curation import (
     result_payload_for_storage,
 )
 from src.pipeline.enrichment import enrich_gene_annotations
+from src.pipeline.feedback_citations import build_citation_check_section
 from src.pipeline.fusion_context import annotate_fusion_position_contexts, parsed_input_from_fields
-from src.pipeline.literature import retrieve_fusion_evidence, retrieve_fusion_partner_evidence
+from src.pipeline.literature import (
+    pubmed_error_message, retrieve_fusion_evidence, retrieve_fusion_partner_evidence,
+)
 from src.pipeline.llm_client import complete_with_tool
-from src.pipeline.normalization import is_fusion_input
+from src.pipeline import openevidence_metrics as oe_metrics
+from src.pipeline.normalization import has_accession_identifier, is_fusion_input, read_gene_input
 from src.pipeline.openevidence import (
     OpenEvidenceClient,
     claim_lookup,
@@ -127,6 +143,7 @@ from src.pipeline.openevidence import (
 from src.pipeline.orchestrator import run_pipeline
 from src.pipeline.result_sanitizer import sanitize_annotation_result
 from src.pipeline.run_store import RunStore
+from src.ui_events import router as ui_events_router
 
 _log_record_factory = logging.getLogRecordFactory()
 
@@ -137,6 +154,10 @@ def _datadog_log_record_factory(*args, **kwargs):
     usr_id = user_ctx.get("user_id") or "-"
     usr_email = user_ctx.get("email") or "-"
     usr_name = user_ctx.get("name") or "-"
+    if record.name == "src.ui_events" and record.levelno == logging.INFO:
+        usr_id = stable_user_key(usr_id) if usr_id != "-" else "-"
+        usr_email = "-"
+        usr_name = "-"
     auth_method = user_ctx.get("auth_method") or "-"
     api_key_id = user_ctx.get("api_key_id") or "-"
     defaults = {
@@ -174,7 +195,23 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    dev_mode_error = dev_mode_startup_error(settings)
+    if dev_mode_error:
+        logger.critical(dev_mode_error)
+        raise RuntimeError(dev_mode_error)
+    # Build the DogStatsD client (file/DNS I/O) off the event loop, once,
+    # before any request can emit a metric. Metrics are optional: nothing
+    # about them may stop the app from starting.
+    try:
+        await asyncio.to_thread(init_statsd)
+    except Exception:
+        logger.warning("Datadog metrics initialization failed; continuing without metrics", exc_info=True)
     app.state.run_store = await RunStore.create()
+    if mysql_user_store_enabled():
+        # Sign-in and per-request permission checks read the users table;
+        # Redis user records are left untouched (rollback = USER_STORE_BACKEND=redis).
+        configure_mysql_user_store(app.state.run_store)
+        await bootstrap_admins_at_startup()
     logger.info(
         "Application startup: auth_enabled=%s, google_client_id_configured=%s, "
         "google_client_secret_configured=%s (len=%d), auth_secret_key_configured=%s",
@@ -186,7 +223,12 @@ async def lifespan(app: FastAPI):
     )
     yield
     await _cancel_openevidence_sidecar_lookups()
+    configure_mysql_user_store(None)
     await app.state.run_store.close()
+    try:
+        await asyncio.to_thread(shutdown_statsd)
+    except Exception:
+        logger.warning("Datadog metrics shutdown failed", exc_info=True)
 
 
 app = FastAPI(
@@ -208,7 +250,10 @@ app.add_middleware(
     # frontend's preflight would fail and the card would silently vanish.
     allow_headers=["Content-Type", "Authorization", "X-OpenEvidence-Poll"],
 )
+app.include_router(admin_users_router)
 app.include_router(api_keys_router)
+app.include_router(runs_router)
+app.include_router(ui_events_router)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 if _STATIC_DIR.exists():
@@ -223,14 +268,19 @@ async def no_cache_static(request: Request, call_next):
     # app.js/styles.css after a deploy on a plain reload, not just a hard
     # refresh — force revalidation on every request for both.
     response = await call_next(request)
-    if request.url.path in ("/", "/login", "/api-keys") or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/login", "/api-keys", "/runs", "/admin/users") or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
 
+_SKIP_IDENTITY_PREFIXES = ("/static/", "/auth/callback/", "/auth/saml/acs", "/auth/dev/login")
+
+
 @app.middleware("http")
 async def user_context_middleware(request: Request, call_next):
-    user = await get_request_user(request)
+    # Static assets need no identity, and login callbacks read the profile to
+    # provision it; skip resolving any session they carry (a profile read).
+    user = None if request.url.path.startswith(_SKIP_IDENTITY_PREFIXES) else await get_request_user(request)
     if not user:
         header_val = request.headers.get(settings.datadog_user_id_header)
         if header_val and header_val.strip():
@@ -269,6 +319,7 @@ async def user_context_middleware(request: Request, call_next):
 class DevStatusResponse(BaseModel):
     enabled: bool
     openevidence_enabled: bool
+    ui_events_enabled: bool
 
 
 class AnnotationJobCreateResponse(BaseModel):
@@ -276,9 +327,40 @@ class AnnotationJobCreateResponse(BaseModel):
     status_url: str
 
 
+class RerunRequest(BaseModel):
+    force_refresh: bool = Field(
+        default=False,
+        description="Bypass stored gene annotations and fusion evidence instead of reusing cached results.",
+    )
+
+
+class RerunJobCreateResponse(AnnotationJobCreateResponse):
+    rerun_of: str = Field(description="The saved run whose inputs were rerun; it is never modified.")
+    fusions: List[FusionInput] = Field(description="The inputs the new run was started with.")
+    mode: AnnotationMode = Field(description="The annotation mode the new run was started with.")
+
+
+class RunRetryOutcome(BaseModel):
+    """A retried input whose result was not written to its row."""
+
+    input: str = Field(..., description="The spelling that was retried, e.g. `CD246`.")
+    row_gene: str = Field(..., description="The gene of the saved row the input targeted.")
+    resolved_gene: Optional[str] = Field(
+        ...,
+        description=(
+            "The gene the input resolved to on retry: empty when it resolved to no gene, "
+            "null when no usable result was returned for it."
+        ),
+    )
+    message: str
+
+
 class AnnotationJobStatusResponse(BaseModel):
     job_id: str
     status: str
+    phase: Literal["queued", "annotation", "fusion_evidence", "complete", "failed"] = Field(
+        default="queued", description="Current job phase, including optional inline fusion evidence retrieval.",
+    )
     fusions_processed: int
     genes_completed: int = 0
     genes_total: Optional[int] = None
@@ -286,15 +368,23 @@ class AnnotationJobStatusResponse(BaseModel):
     result: Optional[AnnotationResult] = None
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
+    retry_outcomes: List[RunRetryOutcome] = Field(
+        default_factory=list,
+        description=(
+            "POST /v1/runs/{run_id}/retry only: inputs whose result was left off the "
+            "run because the input now resolves to a different gene than its row."
+        ),
+    )
     # Set per poll: curator overrides could not be loaded (see curation.py).
     curation_unavailable: bool = False
     # Tumor type each completed gene was annotated with (as on AnnotationResult),
     # so lazy enrichment started mid-run can request the right curator override.
     annotation_tumor_types: Dict[str, Optional[str]] = Field(default_factory=dict)
-    created_at: float = Field(default_factory=time.monotonic, exclude=True)
     # Internal bookkeeping for callers that reuse this job store (e.g. the gene
     # query API): which endpoint family created the job and its request.
     kind: str = Field(default="annotate", exclude=True)
+    # Lowercased email of the submitting user; only they (or an admin) may poll it.
+    owner: Optional[str] = Field(default=None, exclude=True)
 
 
 class FusionContextResponse(BaseModel):
@@ -364,9 +454,12 @@ class EnrichmentJobStatusResponse(BaseModel):
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
     curation_unavailable: bool = False
+    owner: Optional[str] = Field(default=None, exclude=True)
 
 
 class FusionEvidenceJobRequest(AnnotateRequest):
+    # This endpoint always retrieves evidence; the inline annotation flag does not apply.
+    include_fusion_evidence: ClassVar[bool] = False
     run_id: Optional[str] = Field(
         default=None,
         description=(
@@ -390,7 +483,50 @@ class FusionEvidenceJobStatusResponse(BaseModel):
     error: Optional[str] = None
     timings_ms: Dict[str, float] = Field(default_factory=dict)
     curation_unavailable: bool = False
-    created_at: float = Field(default_factory=time.monotonic, exclude=True)
+    owner: Optional[str] = Field(default=None, exclude=True)
+
+
+class RunRetryRequest(BaseModel):
+    """Genes to re-annotate and merge back into an existing saved run."""
+
+    kind: Literal["errors", "no_result"] = Field(
+        ...,
+        description=(
+            "'errors' retries genes whose annotation failed transiently; 'no_result' "
+            "re-checks genes on the No result tab that have no error."
+        ),
+    )
+    inputs: List[FusionInput] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Plain genes to retry, each with the tumor type it was annotated under. Every "
+            "gene must currently be eligible for `kind` on this run; a fusion, a "
+            "breakpoint field, a permanently rejected gene or any other gene rejects "
+            "the whole request with 422."
+        ),
+    )
+    force_refresh: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Bypass stored gene annotations. Defaults to true for 'no_result' (a cached "
+            "annotation would just repeat the same result) and false for 'errors'."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_string_inputs(cls, data: Any) -> Any:
+        """Accept plain gene/fusion strings, as POST /v1/annotate/jobs does."""
+        if isinstance(data, dict) and isinstance(data.get("inputs"), list):
+            data = {
+                **data,
+                "inputs": [
+                    {"fusion": item} if isinstance(item, str) else item
+                    for item in data["inputs"]
+                ],
+            }
+        return data
 
 
 class BenchmarkRequest(BaseModel):
@@ -573,7 +709,12 @@ async def _keep_openevidence_lease_alive(key: str, token: str, lost: asyncio.Eve
 
 
 async def _run_openevidence_sidecar_lookup(
-    key: str, token: str, gene: str, tumor_type: Optional[str], fusion: Optional[str]
+    key: str,
+    token: str,
+    gene: str,
+    tumor_type: Optional[str],
+    fusion: Optional[str],
+    outcome: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Background body of one sidecar lookup, run by the owner of the
     in-flight lease `token`. Returns None on success (the analysis is then
@@ -591,16 +732,61 @@ async def _run_openevidence_sidecar_lookup(
     outcome lands. A *successful* analysis is still kept even then: it is
     genuine data for this cache key (get_gene_analysis has already written
     it to the shared cache by the time we know), equivalent to what the new
-    owner will write, and serving it sooner is strictly better."""
+    owner will write, and serving it sooner is strictly better.
+
+    `outcome`, when given, receives the terminal result for metrics
+    ("result": success/failed/abandoned/discarded, plus "ready_at" on
+    success); the task's done-callback records it (see
+    _start_openevidence_sidecar_lookup)."""
+    with oe_metrics.call_source("sidecar"):
+        return await _run_openevidence_sidecar_lookup_body(
+            key, token, gene, tumor_type, fusion, outcome if outcome is not None else {}
+        )
+
+
+def _record_openevidence_lookup_completed(
+    task: "asyncio.Task[Optional[str]]", outcome: Dict[str, Any], started: float
+) -> None:
+    """Exactly one terminal metric per started lookup. Runs as the task's
+    done-callback, so it also covers a lookup cancelled before its body ever
+    ran (shutdown, or while queued) — "cancelled" — and an unexpected crash
+    ("error"). A result the body already reached wins over a cancellation
+    that only interrupted its lease cleanup."""
+    result = outcome.get("result") or ("cancelled" if task.cancelled() else "error")
+    model = oe_metrics.model_tag()
+    oe_metrics.increment(oe_metrics.LOOKUPS_COMPLETED, tags=[model, f"result:{result}"])
+    if result == "success" and "ready_at" in outcome:
+        # Server-side time from the lookup's start (the first request that
+        # missed — it then answered "pending" within
+        # openevidence_sidecar_pending_wait_seconds) to the answer landing
+        # in the cache/result memo, i.e. when a poll can first see "ready".
+        oe_metrics.distribution(
+            oe_metrics.LOOKUP_TIME_TO_READY_MS, (outcome["ready_at"] - started) * 1000, tags=[model]
+        )
+
+
+async def _run_openevidence_sidecar_lookup_body(
+    key: str,
+    token: str,
+    gene: str,
+    tumor_type: Optional[str],
+    fusion: Optional[str],
+    outcome: Dict[str, Any],
+) -> Optional[str]:
     lease_lost = asyncio.Event()
     heartbeat = asyncio.create_task(_keep_openevidence_lease_alive(key, token, lease_lost))
     try:
+        queued_at = time.monotonic()
         async with _openevidence_sidecar_semaphore():
+            oe_metrics.distribution(
+                oe_metrics.SEMAPHORE_WAIT_MS, (time.monotonic() - queued_at) * 1000, tags=[oe_metrics.model_tag()]
+            )
             # Last ownership check right before the paid call: if the lease
             # lapsed while queued and another pod claimed it, abandon rather
             # than make a duplicate upstream call.
             if not await renew_inflight_marker(key, token, settings.openevidence_sidecar_inflight_ttl_seconds):
                 logger.info("OpenEvidence sidecar lookup for %s abandoned: lease now held elsewhere", gene)
+                outcome["result"] = "abandoned"
                 return None
             # httpx's timeout is per read, so a slowly trickling stream could
             # otherwise run forever; cap the whole call (not the queue time).
@@ -617,14 +803,17 @@ async def _run_openevidence_sidecar_lookup(
         failed_ttl = settings.openevidence_sidecar_failed_ttl_seconds
         if lease_lost.is_set() or not await publish_failure_and_release(key, token, error, failed_ttl):
             logger.info("OpenEvidence sidecar lookup for %s failed after losing its lease (%s); discarded", gene, error)
+            outcome["result"] = "discarded"
             return None
         logger.warning("OpenEvidence sidecar lookup failed for %s: %s", gene, error)
         _openevidence_memo_put(_openevidence_sidecar_failures, key, failed_ttl, error)
+        outcome["result"] = "failed"
         return error
     else:
         _openevidence_memo_put(
             _openevidence_sidecar_results, key, settings.openevidence_sidecar_inflight_ttl_seconds, analysis
         )
+        outcome.update(result="success", ready_at=time.monotonic())
         return None
     finally:
         heartbeat.cancel()
@@ -639,12 +828,16 @@ def _start_openevidence_sidecar_lookup(
     # Not tied to the request: it keeps running (and caches its answer) if
     # the client disconnects or the request returns "pending". Tracked like
     # the annotation jobs' tasks; the per-key registry below adds dedupe.
-    task = _track_background_task(_run_openevidence_sidecar_lookup(key, token, gene, tumor_type, fusion))
+    started = time.monotonic()
+    outcome: Dict[str, Any] = {}
+    task = _track_background_task(_run_openevidence_sidecar_lookup(key, token, gene, tumor_type, fusion, outcome))
     _openevidence_sidecar_tasks[key] = task
+    oe_metrics.increment(oe_metrics.LOOKUPS_STARTED, tags=[oe_metrics.model_tag()])
 
     def _forget(done: "asyncio.Task[Optional[str]]") -> None:
         if _openevidence_sidecar_tasks.get(key) is done:
             del _openevidence_sidecar_tasks[key]
+        _record_openevidence_lookup_completed(done, outcome, started)
 
     task.add_done_callback(_forget)
     return task
@@ -664,65 +857,58 @@ async def _cancel_openevidence_sidecar_lookups() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-_annotation_jobs: Dict[str, AnnotationJobStatusResponse] = {}
-_annotation_jobs_lock = asyncio.Lock()
-_enrichment_jobs: Dict[str, EnrichmentJobStatusResponse] = {}
-_enrichment_jobs_lock = asyncio.Lock()
-_fusion_evidence_jobs: Dict[str, FusionEvidenceJobStatusResponse] = {}
-_fusion_evidence_jobs_lock = asyncio.Lock()
-
-async def _store_annotation_job(job: AnnotationJobStatusResponse) -> None:
-    async with _annotation_jobs_lock:
-        _annotation_jobs[job.job_id] = job
+# Job status lives in a shared store (Redis + process-local fallback) so any
+# pod can answer a poll; the job's task itself runs in the submitting process.
+# Gene-query jobs are annotation jobs (kind="gene_query"), so their snapshots
+# live under job:annotation:<id> too.
+_annotation_jobs = JobStore("annotation", AnnotationJobStatusResponse)
+_enrichment_jobs = JobStore("enrichment", EnrichmentJobStatusResponse)
+_fusion_evidence_jobs = JobStore("fusion_evidence", FusionEvidenceJobStatusResponse)
 
 
-async def _get_annotation_job(job_id: str) -> AnnotationJobStatusResponse:
-    async with _annotation_jobs_lock:
-        job = _annotation_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Annotation job not found")
+async def _get_job(store: JobStore, job_id: str, viewer: Optional[AuthenticatedUser], not_found: str):
+    """Fetch a job; with `viewer`, a job they may not read is reported as
+    missing (404, not 403) so job IDs don't leak to other users."""
+    job = await store.get(job_id)
+    if job is None or (viewer is not None and not can_read_job(job.owner, viewer)):
+        raise HTTPException(status_code=404, detail=not_found)
     return job
 
 
-async def _evict_stale_annotation_jobs() -> None:
-    """Drop finished jobs older than the TTL so the in-memory job store
-    doesn't grow unbounded over the life of the process. Jobs still queued
-    or running are never evicted, regardless of age."""
-    cutoff = time.monotonic() - settings.annotation_job_ttl_seconds
-    async with _annotation_jobs_lock:
-        stale = [
-            job_id
-            for job_id, job in _annotation_jobs.items()
-            if job.status in ("complete", "failed") and job.created_at < cutoff
-        ]
-        for job_id in stale:
-            del _annotation_jobs[job_id]
+async def _store_annotation_job(job: AnnotationJobStatusResponse) -> None:
+    await _annotation_jobs.put(job)
+
+
+async def _get_annotation_job(
+    job_id: str, viewer: Optional[AuthenticatedUser] = None
+) -> AnnotationJobStatusResponse:
+    return await _get_job(_annotation_jobs, job_id, viewer, "Annotation job not found")
 
 
 async def _store_enrichment_job(job: EnrichmentJobStatusResponse) -> None:
-    async with _enrichment_jobs_lock:
-        _enrichment_jobs[job.job_id] = job
+    await _enrichment_jobs.put(job)
 
 
-async def _get_enrichment_job(job_id: str) -> EnrichmentJobStatusResponse:
-    async with _enrichment_jobs_lock:
-        job = _enrichment_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Enrichment job not found")
-    return job
+async def _get_enrichment_job(
+    job_id: str, viewer: Optional[AuthenticatedUser] = None
+) -> EnrichmentJobStatusResponse:
+    return await _get_job(_enrichment_jobs, job_id, viewer, "Enrichment job not found")
 
 
 async def _store_fusion_evidence_job(job: FusionEvidenceJobStatusResponse) -> None:
-    async with _fusion_evidence_jobs_lock:
-        _fusion_evidence_jobs[job.job_id] = job
+    await _fusion_evidence_jobs.put(job)
 
 
-async def _get_fusion_evidence_job(job_id: str) -> FusionEvidenceJobStatusResponse:
-    async with _fusion_evidence_jobs_lock:
-        job = _fusion_evidence_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Fusion evidence job not found")
-    return job
+async def _get_fusion_evidence_job(
+    job_id: str, viewer: Optional[AuthenticatedUser] = None
+) -> FusionEvidenceJobStatusResponse:
+    return await _get_job(_fusion_evidence_jobs, job_id, viewer, "Fusion evidence job not found")
+
+
+def _check_annotate_input_limit(fusions: List[FusionInput]) -> None:
+    limit = settings.annotate_max_inputs
+    if len(fusions) > limit:
+        raise HTTPException(status_code=422, detail=f"At most {limit} inputs may be annotated per request")
 
 
 # Job stores hold pipeline output only; every poll overlays the CURRENT curator
@@ -761,15 +947,68 @@ def _fusion_evidence_inputs(fusions: List[FusionInput]) -> List[FusionInput]:
     return inputs
 
 
+async def _retrieve_fusion_evidence_input(
+    item: FusionInput, semaphore: asyncio.Semaphore, force_refresh: bool = False,
+) -> FusionEvidenceResult:
+    async with semaphore:
+        try:
+            return await retrieve_fusion_evidence(
+                item.fusion, tumor_type=item.tumor_type, force_refresh=force_refresh,
+            )
+        except Exception as exc:
+            logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
+            return FusionEvidenceResult(
+                fusion=item.fusion,
+                tumor_type=item.tumor_type,
+                interpretation=pubmed_error_message(exc),
+                retrieval_status="failed",
+            )
+
+
+async def _include_inline_fusion_evidence(
+    request: AnnotateRequest, result: AnnotationResult,
+) -> None:
+    if request.include_fusion_evidence:
+        start = time.perf_counter()
+        semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
+        result.fusion_evidence = list(await asyncio.gather(*(
+            _retrieve_fusion_evidence_input(item, semaphore, force_refresh=request.force_refresh)
+            for item in _fusion_evidence_inputs(request.fusions)
+        )))
+        elapsed = round((time.perf_counter() - start) * 1000, 2)
+        result.timings_ms["fusion_evidence"] = elapsed
+        result.timings_ms["total"] = round(result.timings_ms.get("total", 0.0) + elapsed, 2)
+
+
+async def _overlay_inline_fusion_evidence(result: AnnotationResult, run_store: Any) -> AnnotationResult:
+    """`result` with the CURRENT curator overrides applied to its fusion
+    evidence (a no-op when the request didn't include fusion evidence)."""
+    if not result.fusion_evidence:
+        return result
+    fusion_evidence = await apply_current_fusion_overrides(result.fusion_evidence, run_store)
+    return result.model_copy(
+        update={
+            "fusion_evidence": fusion_evidence,
+            "curation_unavailable": result.curation_unavailable or has_curation_unavailable(fusion_evidence),
+        }
+    )
+
+
 async def _save_run_result(
     http_request: Request,
     request_payload: dict,
     result: AnnotationResult,
+    current_user: Optional[AuthenticatedUser],
+    run_source: Optional[str] = None,
 ) -> None:
     """Save a run, raising on failure. For callers that hand out a link to the
-    run and so must not report success unless it was actually saved."""
+    run and so must not report success unless it was actually saved.
+    `run_source` overrides the recorded source (e.g. "rerun")."""
+    owner = run_owner(current_user)
+    if run_source is not None:
+        owner["source"] = run_source
     await http_request.app.state.run_store.save_run(
-        result.run_id, result.timestamp, request_payload, result_payload_for_storage(result)
+        result.run_id, result.timestamp, request_payload, result_payload_for_storage(result), **owner
     )
 
 
@@ -777,13 +1016,55 @@ async def _persist_run_result(
     http_request: Request,
     request_payload: dict,
     result: AnnotationResult,
+    current_user: Optional[AuthenticatedUser],
+    run_source: Optional[str] = None,
 ) -> None:
     try:
-        await _save_run_result(http_request, request_payload, result)
+        await _save_run_result(http_request, request_payload, result, current_user, run_source)
     except Exception:
         # A run's own result always returns even if it can't be persisted for
         # later sharing — the run store isn't on the critical path for the caller.
         logger.exception("Failed to persist run %s", result.run_id)
+
+
+def _fusion_evidence_key(item: Dict[str, Any]) -> tuple[str, Optional[str]]:
+    """Identity a fusion evidence item by the submitted input when known (so a
+    resolved Ensembl/RefSeq input still matches its submitted form) plus the
+    normalized tumor type."""
+    submission = item.get("input") or item.get("fusion") or ""
+    tumor_type = " ".join((item.get("tumor_type") or "").strip().lower().split()) or None
+    return str(submission), tumor_type
+
+
+def _fusion_evidence_succeeded(item: Dict[str, Any]) -> bool:
+    """A complete lookup: neither failed nor partial."""
+    return item.get("retrieval_status") != "failed" and not item.get("partial")
+
+
+def _merge_fusion_evidence(
+    existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Replace matching items in place, keep every other item, then append
+    incoming items the run didn't already have. A failed or partial lookup
+    never replaces an item that succeeded, so a re-run whose lookup fails
+    keeps the run's earlier evidence."""
+    replacements = {_fusion_evidence_key(item): item for item in incoming}
+    merged: List[Dict[str, Any]] = []
+    replaced: set[tuple[str, Optional[str]]] = set()
+    for item in existing:
+        key = _fusion_evidence_key(item)
+        if key in replacements:
+            incoming_item = replacements[key]
+            keep_existing = _fusion_evidence_succeeded(item) and not _fusion_evidence_succeeded(incoming_item)
+            merged.append(item if keep_existing else incoming_item)
+            replaced.add(key)
+        else:
+            merged.append(item)
+    for key, item in replacements.items():
+        if key not in replaced:
+            merged.append(item)
+            replaced.add(key)
+    return merged
 
 
 async def _persist_fusion_evidence(
@@ -792,21 +1073,323 @@ async def _persist_fusion_evidence(
     fusion_evidence: List[FusionEvidenceResult],
 ) -> None:
     """Merge a completed fusion-evidence job back onto its run, so opening a
-    shared link later shows it instead of a hidden/empty fusion evidence tab."""
-    run_store = http_request.app.state.run_store
-    payload = [item.model_dump() for item in fusion_evidence]
+    shared link later shows it instead of a hidden/empty fusion evidence tab.
+    Only the matching fusion/tumor items are replaced; every other item on the
+    run stays put (a retry of failed lookups must not drop earlier evidence)."""
+    incoming = [item.model_dump() for item in fusion_evidence]
+
+    def merge(stored: Dict[str, Any]) -> Dict[str, Any]:
+        stored["fusion_evidence"] = _merge_fusion_evidence(
+            stored.get("fusion_evidence") or [],
+            incoming,
+        )
+        return stored
+
     try:
-        if hasattr(run_store, "set_run_fusion_evidence"):
-            # Only this key, atomically: never clobbers concurrent run updates.
-            await run_store.set_run_fusion_evidence(run_id, payload)
-            return
-        stored = await run_store.get_run(run_id)
-        if stored is None:
-            return
-        stored["fusion_evidence"] = payload
-        await run_store.update_run_result(run_id, stored)
+        await http_request.app.state.run_store.merge_run_result(run_id, merge)
     except Exception:
         logger.exception("Failed to persist fusion evidence for run %s", run_id)
+
+
+_TRANSIENT_ANNOTATION_ERROR_MARKERS = (
+    "please retry",
+    "retry later",
+    "try again",
+    "synthesis error",
+    "timed out",
+    "timeout",
+    "temporarily",
+    "rate limit",
+    "connection",
+    "service unavailable",
+    "lookup failed",
+)
+_DETERMINISTIC_ANNOTATION_ERROR_MARKERS = (
+    "not a valid",
+    "belongs to",
+    "has no human",
+    "is not a gene symbol",
+    "unresolvable gene symbol",
+    "correct the gene",
+    "unannotated locus",
+    "not supported",
+)
+
+
+def _is_transient_annotation_error(message: Optional[str]) -> bool:
+    """Whether an annotation error is worth retrying.
+
+    Deterministic rejections (bad accession form, an accession that belongs to
+    another gene, a symbol HGNC/Ensembl confirmed does not exist) will fail the
+    same way again. Unknown errors default to retryable so a new transient
+    failure mode is not silently hidden."""
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _TRANSIENT_ANNOTATION_ERROR_MARKERS):
+        return True
+    return not any(marker in text for marker in _DETERMINISTIC_ANNOTATION_ERROR_MARKERS)
+
+
+RunRetryKind = Literal["errors", "no_result"]
+
+# FusionInput fields that only describe a fusion breakpoint; a gene retry has none.
+_BREAKPOINT_FIELDS = (
+    "five_exon", "three_exon", "five_genomic", "three_genomic",
+    "five_transcript", "three_transcript",
+)
+
+
+def _is_permanent_rejection(annotation: Dict[str, Any]) -> bool:
+    error = annotation.get("error")
+    return bool(error) and not _is_transient_annotation_error(error)
+
+
+def _is_retry_eligible(annotation: Dict[str, Any], kind: RunRetryKind) -> bool:
+    """Whether a row may be retried by a `kind` retry: a transiently failed
+    annotation for "errors", a no-result gene without an error for "no_result"."""
+    error = annotation.get("error")
+    if kind == "errors":
+        return bool(error) and _is_transient_annotation_error(error)
+    return not error and bool(annotation.get("insufficient_evidence"))
+
+
+def _normalized_retry_token(value: Any) -> str:
+    return " ".join(str(value or "").strip().upper().split())
+
+
+def _annotation_match_keys(annotation: Dict[str, Any]) -> set[str]:
+    """The gene plus the submitted spellings it was resolved from, so a row
+    stored under its raw input (e.g. an Ensembl ID whose lookup failed) is
+    matched by the retried row for the symbol it resolves to."""
+    keys = {_normalized_retry_token(annotation.get("gene"))}
+    for resolution in annotation.get("resolved_inputs") or []:
+        keys.add(_normalized_retry_token(resolution.get("input")))
+    keys.discard("")
+    return keys
+
+
+def _validate_retry_inputs(
+    stored_result: Dict[str, Any], inputs: List[FusionInput], kind: RunRetryKind,
+) -> Tuple[List[FusionInput], Dict[str, str]]:
+    """The retry's inputs and the row each one targets, or a 422 for the
+    whole request.
+
+    A retry works on genes, not submissions: every input must be a plain gene
+    (no fusion, no breakpoint fields) naming exactly one row that is currently
+    eligible for a `kind` retry, by its gene or by a spelling it was resolved
+    from (an alias, Ensembl or RefSeq ID). A fusion would re-annotate its
+    other partner too, and a permanently rejected gene would just fail the
+    same way again, so either one rejects the request instead of being
+    processed in part.
+
+    Returns the inputs (one per target row) and a map from each submitted
+    spelling (normalized) to its row's key, the row's normalized `gene`. The
+    merge writes by that key, never by whatever spelling comes back."""
+    rows = stored_result.get("annotations") or []
+    eligible_rows: Dict[str, set[str]] = {}
+    permanent: set[str] = set()
+    for row in rows:
+        row_key = _normalized_retry_token(row.get("gene"))
+        if _is_retry_eligible(row, kind):
+            for key in _annotation_match_keys(row):
+                eligible_rows.setdefault(key, set()).add(row_key)
+        elif _is_permanent_rejection(row):
+            permanent |= _annotation_match_keys(row)
+    label = "failed" if kind == "errors" else "no-result"
+    problems: List[str] = []
+    accepted: List[FusionInput] = []
+    targets: Dict[str, str] = {}
+    for item in inputs:
+        token = _normalized_retry_token(item.fusion)
+        matched = eligible_rows.get(token, set())
+        if is_fusion_input(item.fusion):
+            problems.append(f"{item.fusion!r} is a fusion; retry its genes individually")
+        elif any(getattr(item, field) is not None for field in _BREAKPOINT_FIELDS):
+            problems.append(f"{item.fusion!r} has breakpoint fields, which only apply to fusions")
+        elif token in permanent:
+            problems.append(f"{item.fusion!r} was rejected permanently and would fail the same way")
+        elif not matched:
+            problems.append(f"{item.fusion!r} is not a {label} gene on this run")
+        elif len(matched) > 1:
+            problems.append(
+                f"{item.fusion!r} matches more than one {label} row "
+                f"({', '.join(sorted(matched))}); retry each by its gene"
+            )
+        else:
+            row_key = next(iter(matched))
+            if row_key not in targets.values():
+                accepted.append(item)
+            targets.setdefault(token, row_key)
+    if problems:
+        raise HTTPException(
+            status_code=422,
+            detail="Not retryable: " + "; ".join(problems) + ".",
+        )
+    return accepted, targets
+
+
+def _annotation_rank(annotation: Dict[str, Any]) -> int:
+    """How good an annotation is: an error < no result < a grounded result."""
+    if annotation.get("error"):
+        return 0
+    if annotation.get("insufficient_evidence"):
+        return 1
+    return 2
+
+
+def _merged_resolved_inputs(
+    stored_row: Dict[str, Any], incoming: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """The stored row's submitted spellings plus the retry's, one per input."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for resolution in [*(stored_row.get("resolved_inputs") or []), *(incoming.get("resolved_inputs") or [])]:
+        merged[_normalized_retry_token(resolution.get("input"))] = resolution
+    return list(merged.values())
+
+
+def _row_has_gene_identity(row: Dict[str, Any]) -> bool:
+    """False for a row whose input never resolved to a gene (its `gene` is the
+    raw submission, e.g. an Ensembl ID whose lookup failed); the first
+    successful resolution is its identity, not a change of gene."""
+    return not str(row.get("error") or "").lower().startswith("unresolvable gene symbol")
+
+
+def _retry_spelling(
+    item: Dict[str, Any], keys: set[str], targets: Dict[str, str], destination: str,
+) -> str:
+    """The submitted spelling that routed `item` to the `destination` row."""
+    spellings = [
+        resolution.get("input")
+        for resolution in item.get("resolved_inputs") or []
+        if targets.get(_normalized_retry_token(resolution.get("input"))) == destination
+    ] or [key for key in sorted(keys) if targets.get(key) == destination]
+    if not spellings:
+        spellings = [key for key in sorted(targets) if targets[key] == destination]
+    return str(spellings[0]) if spellings else destination
+
+
+def _merge_retried_annotations(
+    stored: Dict[str, Any],
+    incoming: List[Dict[str, Any]],
+    warnings: List[str],
+    targets: Dict[str, str],
+    kind: RunRetryKind,
+    outcomes: Optional[List[RunRetryOutcome]] = None,
+) -> Dict[str, Any]:
+    """Merge a gene retry into a stored run, in place.
+
+    `targets` maps each submitted spelling to the key (normalized `gene`) of
+    the row it was validated against. An incoming annotation is routed to a
+    target row by that map (via its gene or the spellings it was resolved
+    from) and written there only when its gene is the row's gene (an input
+    that now resolves to a different gene, or to no gene at all, leaves the
+    row unchanged and adds a RunRetryOutcome to `outcomes`; a result with a
+    blank gene is never written, not even as an unresolved row's first
+    resolution; any other target row left waiting gets a "no usable result"
+    outcome), while the row is still eligible for a
+    `kind` retry, and only with a result at least as good (a retry that fails
+    again never overwrites a no-result row with an error). Every other row,
+    including a target that got a good result meanwhile, is left exactly as
+    it was; incoming rows for genes the retry wasn't asked for are dropped,
+    never appended. The written row keeps the stored row's resolved_inputs
+    alongside the retry's. Existing warnings are kept; new warnings about an
+    updated gene are added. genes_annotated is recomputed."""
+    rows = list(stored.get("annotations") or [])
+    row_keys = set(targets.values())
+    updated_keys: set[str] = set()
+    updated_rows: set[str] = set()
+    for item in incoming:
+        keys = _annotation_match_keys(item)
+        item_gene = _normalized_retry_token(item.get("gene"))
+        destinations = {targets[key] for key in keys if key in targets} | (keys & row_keys)
+        if not item_gene and not destinations and len(row_keys) == 1:
+            # A blank result that names no spelling: a one-gene retry's.
+            destinations = set(row_keys)
+        for destination in destinations:
+            index = next(
+                (
+                    i for i, row in enumerate(rows)
+                    if _normalized_retry_token(row.get("gene")) == destination
+                    and _is_retry_eligible(row, kind)
+                ),
+                None,
+            )
+            if index is None:
+                continue
+            if not item_gene:
+                # Never written anywhere, not even as a first resolution.
+                if outcomes is not None:
+                    spelling = _retry_spelling(item, keys, targets, destination)
+                    outcomes.append(RunRetryOutcome(
+                        input=spelling,
+                        row_gene=str(rows[index].get("gene")),
+                        resolved_gene="",
+                        message=f"{spelling} did not resolve to a gene; not updated",
+                    ))
+                continue
+            if item_gene != destination and _row_has_gene_identity(rows[index]):
+                if outcomes is not None:
+                    row_gene = str(rows[index].get("gene"))
+                    spelling = _retry_spelling(item, keys, targets, destination)
+                    outcomes.append(RunRetryOutcome(
+                        input=spelling,
+                        row_gene=row_gene,
+                        resolved_gene=str(item.get("gene")),
+                        message=(
+                            f"{spelling} now resolves to {item.get('gene')}, not {row_gene}; "
+                            f"{row_gene} was not updated"
+                        ),
+                    ))
+                continue
+            if _annotation_rank(item) < _annotation_rank(rows[index]):
+                continue
+            row = dict(item)
+            resolved_inputs = _merged_resolved_inputs(rows[index], item)
+            if resolved_inputs:
+                row["resolved_inputs"] = resolved_inputs
+            rows[index] = row
+            updated_keys |= keys | {destination}
+            updated_rows.add(destination)
+    if outcomes is not None:
+        # Every target row still waiting for a result says why it wasn't
+        # updated, whatever the pipeline returned (or didn't) for it.
+        reported = {_normalized_retry_token(outcome.row_gene) for outcome in outcomes}
+        for row in rows:
+            row_key = _normalized_retry_token(row.get("gene"))
+            if (
+                row_key not in row_keys
+                or row_key in updated_rows
+                or row_key in reported
+                or not _is_retry_eligible(row, kind)
+            ):
+                continue
+            spelling = next(key for key, target in targets.items() if target == row_key)
+            outcomes.append(RunRetryOutcome(
+                input=spelling,
+                row_gene=str(row.get("gene")),
+                resolved_gene=None,
+                message=f"{spelling}: no usable result was returned; not updated",
+            ))
+            reported.add(row_key)
+    existing_warnings = list(stored.get("warnings") or [])
+    for warning in warnings:
+        if warning not in existing_warnings and _warning_mentions_any(warning, updated_keys):
+            existing_warnings.append(warning)
+    stored["annotations"] = rows
+    stored["warnings"] = existing_warnings
+    stored["genes_annotated"] = len(rows)
+    return stored
+
+
+def _warning_mentions_any(warning: str, tokens: set[str]) -> bool:
+    for token in tokens:
+        if not token:
+            continue
+        pattern = r"(?<![A-Za-z0-9_])" + re.escape(token) + r"(?![A-Za-z0-9_])"
+        if re.search(pattern, warning, re.IGNORECASE):
+            return True
+    return False
 
 
 def _public_app_base_url(request: Request) -> str:
@@ -889,9 +1472,23 @@ def _record_annotation_request_metrics(
         )
 
 
-def _login_redirect(request: Request) -> Optional[RedirectResponse]:
+def _require_session_store(request: Request) -> None:
+    """Fail closed (503) when the session couldn't be checked against the user store,
+    rather than treating the caller as signed out (or signed in on token claims)."""
+    if session_store_unavailable(request):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session verification is temporarily unavailable. Please retry shortly.",
+        )
+
+
+async def _login_redirect(request: Request) -> Optional[RedirectResponse]:
     """Send a signed-out browser to /login, returning to this page afterwards."""
-    if not settings.auth_enabled or get_current_user(request):
+    if not settings.auth_enabled:
+        return None
+    user = await get_request_user(request)
+    _require_session_store(request)
+    if user:
         return None
     target = request.url.path
     if request.url.query:
@@ -904,7 +1501,7 @@ def _login_redirect(request: Request) -> Optional[RedirectResponse]:
 
 @app.get("/")
 async def root(request: Request) -> Response:
-    redirect = _login_redirect(request)
+    redirect = await _login_redirect(request)
     if redirect:
         return redirect
     return FileResponse(_STATIC_DIR / "index.html")
@@ -912,7 +1509,7 @@ async def root(request: Request) -> Response:
 
 @app.get("/api-keys")
 async def api_keys_page(request: Request) -> Response:
-    redirect = _login_redirect(request)
+    redirect = await _login_redirect(request)
     if redirect:
         return redirect
     public_base_url = (settings.public_app_base_url or str(request.base_url)).rstrip("/")
@@ -924,11 +1521,40 @@ async def api_keys_page(request: Request) -> Response:
     return HTMLResponse(page)
 
 
+@app.get("/runs")
+async def runs_page(request: Request) -> Response:
+    redirect = await _login_redirect(request)
+    if redirect:
+        return redirect
+    return FileResponse(_STATIC_DIR / "runs.html")
+
+
+_ADMIN_ONLY_PAGE_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><title>Admins only</title>
+<link rel="stylesheet" href="/static/styles.css" /></head>
+<body class="api-keys-body"><main class="api-keys-page">
+<h1>Admins only</h1><p>User management is available to administrators.</p>
+<p><a href="/">&larr; Back to annotations</a></p></main></body></html>
+"""
+
+
+@app.get("/admin/users")
+async def admin_users_page(request: Request) -> Response:
+    redirect = await _login_redirect(request)
+    if redirect:
+        return redirect
+    user = await get_request_user(request)
+    if settings.auth_enabled and (user is None or user.role != "admin"):
+        return HTMLResponse(_ADMIN_ONLY_PAGE_HTML, status_code=403)
+    return FileResponse(_STATIC_DIR / "admin-users.html")
+
+
 @app.get("/login")
 async def login_page(request: Request, redirect_to: Optional[str] = "/") -> Response:
     if not settings.auth_enabled:
         return RedirectResponse(url="/", status_code=303)
-    user = get_current_user(request)
+    user = await get_request_user(request)
+    _require_session_store(request)
     if user:
         return RedirectResponse(url=validate_redirect_to(redirect_to), status_code=303)
     login_html = _STATIC_DIR / "login.html"
@@ -944,7 +1570,8 @@ async def health() -> dict:
 
 @app.get("/auth/me", response_model=AuthMeResponse)
 async def auth_me(request: Request) -> AuthMeResponse:
-    user = get_current_user(request)
+    user = await get_request_user(request)
+    _require_session_store(request)
     return AuthMeResponse(
         auth_enabled=settings.auth_enabled,
         authenticated=bool(user),
@@ -1073,7 +1700,7 @@ async def auth_callback_google(
         domain=profile.domain,
         role=profile.role,
         status=profile.status,
-        provider=profile.provider,
+        provider="google",
         groups=profile.groups,
     )
     session_token = create_session_token(user)
@@ -1193,7 +1820,7 @@ async def auth_saml_acs(request: Request) -> Response:
         domain=profile.domain,
         role=profile.role,
         status=profile.status,
-        provider=profile.provider,
+        provider="saml",
         groups=profile.groups,
     )
     session_token = create_session_token(user)
@@ -1304,7 +1931,9 @@ async def auth_callback_keycloak(
             status_code=status.HTTP_403_FORBIDDEN,
         )
 
-    # JIT Provisioning
+    # JIT Provisioning. Without it, admission is unchanged (no approval gate for
+    # new users) but the login still stores the authorization profile that
+    # every session request checks, merged exactly like a JIT returning user.
     if settings.jit_provisioning_enabled:
         profile = await provision_or_update_user(
             email=user.email,
@@ -1315,16 +1944,27 @@ async def auth_callback_keycloak(
             role=user.role,
             groups=user.groups,
         )
-        if profile.status == "pending":
-            return HTMLResponse(
-                render_access_denied_html(
-                    email=user.email,
-                    reason="Your account has been provisioned but is pending administrator approval before access is granted.",
-                ),
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        user.role = profile.role
-        user.status = profile.status
+    else:
+        profile = await provision_or_update_user(
+            email=user.email,
+            name=user.name,
+            picture=user.picture,
+            domain=user.domain,
+            provider="keycloak",
+            role=user.role,
+            groups=user.groups,
+            require_approval=False,
+        )
+    if profile.status == "pending":
+        return HTMLResponse(
+            render_access_denied_html(
+                email=user.email,
+                reason="Your account has been provisioned but is pending administrator approval before access is granted.",
+            ),
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    user.role = profile.role
+    user.status = profile.status
 
     session_token = create_session_token(user)
     response = RedirectResponse(url=redirect_to, status_code=status.HTTP_303_SEE_OTHER)
@@ -1436,6 +2076,7 @@ async def dev_status() -> DevStatusResponse:
     return DevStatusResponse(
         enabled=settings.acgc_dev_mode,
         openevidence_enabled=settings.openevidence_enabled,
+        ui_events_enabled=settings.ui_events_enabled,
     )
 
 
@@ -1455,6 +2096,7 @@ async def annotate(
     Input supports plain strings or structured objects with optional tumor_type and breakpoint fields:
     `{ "fusions": ["ALK", {"fusion": "EML4::ALK", "tumor_type": "LUAD"}] }`
     """
+    _check_annotate_input_limit(request.fusions)
     _record_annotation_request_metrics(request, http_request, current_user)
     try:
         result = await run_pipeline(
@@ -1469,7 +2111,11 @@ async def annotate(
         logger.exception("Pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    await _persist_run_result(http_request, request.model_dump(), result)
+    await _include_inline_fusion_evidence(request, result)
+    await _persist_run_result(http_request, request.model_dump(), result, current_user)
+    # run_pipeline already overlaid the gene overrides; inline fusion evidence
+    # is pipeline output (as stored), so overlay its overrides for the response.
+    result = await _overlay_inline_fusion_evidence(result, http_request.app.state.run_store)
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=result.genes_annotated)
     record_user_action(
@@ -1494,20 +2140,23 @@ async def _launch_annotation_job(
     complete_action: str = "job_complete",
     error_action: str = "job_error",
     extra_details: Optional[Dict[str, Any]] = None,
+    run_source: Optional[str] = None,
+    saved_request_extras: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Queue a background annotation run in the in-memory job store and
-    return its job ID. Shared by /v1/annotate/jobs and the gene query API.
+    """Queue a background annotation run in the job store and
+    return its job ID. Shared by /v1/annotate/jobs, run reruns and the gene
+    query API.
 
     With require_persistence, a failure to save the run fails the job instead
-    of being logged and ignored."""
-    await _evict_stale_annotation_jobs()
-
+    of being logged and ignored. `run_source` overrides the saved run's
+    source; `saved_request_extras` are stored alongside the request."""
     job_id = str(uuid.uuid4())
     job = AnnotationJobStatusResponse(
         job_id=job_id,
         status="queued",
         fusions_processed=len(request.fusions),
         kind=kind,
+        owner=job_owner(current_user),
     )
     await _store_annotation_job(job)
 
@@ -1526,6 +2175,7 @@ async def _launch_annotation_job(
     async def run_job() -> None:
         current = await _get_annotation_job(job_id)
         current.status = "running"
+        current.phase = "annotation"
         await _store_annotation_job(current)
         try:
             result = await run_pipeline(
@@ -1539,13 +2189,21 @@ async def _launch_annotation_job(
                 on_total_known=on_total_known,
                 **({"strict_gene_lookup": True} if kind == "gene_query" else {}),
             )
+            if request.include_fusion_evidence:
+                current = await _get_annotation_job(job_id)
+                current.phase = "fusion_evidence"
+                await _store_annotation_job(current)
+            await _include_inline_fusion_evidence(request, result)
+            request_payload = {**request.model_dump(), **(saved_request_extras or {})}
             if require_persistence:
-                await _save_run_result(http_request, request.model_dump(), result)
+                await _save_run_result(http_request, request_payload, result, current_user, run_source)
             else:
-                await _persist_run_result(http_request, request.model_dump(), result)
+                await _persist_run_result(http_request, request_payload, result, current_user, run_source)
+            # Jobs hold pipeline output only; polls overlay the current overrides.
             stored = pipeline_result(result)
             current = await _get_annotation_job(job_id)
             current.status = "complete"
+            current.phase = "complete"
             current.result = stored
             current.annotations = stored.annotations
             current.genes_completed = result.genes_annotated
@@ -1573,6 +2231,7 @@ async def _launch_annotation_job(
             )
             current = await _get_annotation_job(job_id)
             current.status = "failed"
+            current.phase = "failed"
             current.error = str(exc)
             await _store_annotation_job(current)
 
@@ -1586,11 +2245,76 @@ async def create_annotation_job(
     http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> AnnotationJobCreateResponse:
+    _check_annotate_input_limit(request.fusions)
     _record_annotation_request_metrics(request, http_request, current_user)
     job_id = await _launch_annotation_job(request, http_request, current_user)
     return AnnotationJobCreateResponse(
         job_id=job_id,
         status_url=f"/v1/annotate/jobs/{job_id}",
+    )
+
+
+_NO_RERUN_REQUEST_DETAIL = (
+    "This run can't be rerun: its original request wasn't saved in a rerunnable form. "
+    "Start a new annotation with its inputs instead."
+)
+
+
+def _rerun_request(stored: Dict[str, Any], force_refresh: bool) -> AnnotateRequest:
+    """The AnnotateRequest to rerun a saved run's stored request with.
+
+    Handles annotate payloads (`fusions`) and single-gene payloads saved by
+    POST /v1/annotate/gene (`gene`, `tumor_type`). Raises 422 for anything
+    else (older or malformed requests)."""
+    payload = {key: value for key, value in stored.items() if key != "rerun_of"}
+    if "fusions" not in payload and isinstance(payload.get("gene"), str) and payload["gene"].strip():
+        gene = {"fusion": payload.pop("gene"), "tumor_type": payload.pop("tumor_type", None)}
+        payload["fusions"] = [gene]
+    if not payload.get("fusions"):
+        raise HTTPException(status_code=422, detail=_NO_RERUN_REQUEST_DETAIL)
+    try:
+        request = AnnotateRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=_NO_RERUN_REQUEST_DETAIL) from exc
+    request.force_refresh = force_refresh
+    return request
+
+
+@app.post("/v1/runs/{run_id}/rerun", response_model=RerunJobCreateResponse)
+async def rerun_saved_run(
+    run_id: str,
+    http_request: Request,
+    body: Optional[RerunRequest] = Body(default=None),
+    current_user: AuthenticatedUser = Depends(require_auth),
+) -> RerunJobCreateResponse:
+    """Start a new annotation job with a saved run's original request.
+
+    Any signed-in user who can open the run may rerun it; the new run is
+    theirs (source "rerun", with `rerun_of` stored on its request). The
+    original run is never modified, so links to it keep working."""
+    store = getattr(http_request.app.state, "run_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Run storage is unavailable.")
+    stored = await store.get_run_request(run_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    request = _rerun_request(stored, force_refresh=bool(body and body.force_refresh))
+    _check_annotate_input_limit(request.fusions)
+    _record_annotation_request_metrics(request, http_request, current_user)
+    job_id = await _launch_annotation_job(
+        request,
+        http_request,
+        current_user,
+        run_source="rerun",
+        saved_request_extras={"rerun_of": run_id},
+        extra_details={"rerun_of": run_id},
+    )
+    return RerunJobCreateResponse(
+        job_id=job_id,
+        status_url=f"/v1/annotate/jobs/{job_id}",
+        rerun_of=run_id,
+        fusions=request.fusions,
+        mode=request.mode,
     )
 
 
@@ -1600,8 +2324,197 @@ async def get_annotation_job(
     http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> AnnotationJobStatusResponse:
-    job = await _get_annotation_job(job_id)
+    job = await _get_annotation_job(job_id, viewer=current_user)
     return await _overlay_annotation_job(job, http_request.app.state.run_store)
+
+
+async def _persist_retried_annotations(
+    http_request: Request,
+    run_id: str,
+    result: AnnotationResult,
+    targets: Dict[str, str],
+    kind: RunRetryKind,
+) -> List[RunRetryOutcome]:
+    """Merge a completed retry onto its run under the run's row lock, so it
+    can't clobber (or be clobbered by) a concurrent fusion-evidence attach.
+    Eligibility is re-checked against the freshly locked run. Returns the
+    inputs whose result was left off the run (resolved to another gene)."""
+    # Runs hold pipeline output only (curator overrides are overlaid on read).
+    incoming = [item.model_dump() for item in pipeline_result(result).annotations]
+    outcomes: List[RunRetryOutcome] = []
+
+    def merge(stored: Dict[str, Any]) -> Dict[str, Any]:
+        outcomes.clear()
+        return _merge_retried_annotations(
+            stored, incoming, result.warnings, targets, kind, outcomes,
+        )
+
+    merged = await http_request.app.state.run_store.merge_run_result(
+        run_id, merge, sync_genes_annotated=True,
+    )
+    if merged is None:
+        raise RuntimeError("Run not found")
+    return outcomes
+
+
+def _run_retry_request(
+    stored_request: Dict[str, Any], retry_inputs: List[FusionInput], force_refresh: bool,
+) -> AnnotateRequest:
+    """The AnnotateRequest a retry runs: the saved run's options (mode, local
+    backend, OncoKB shortcut) with only the retried inputs, validated exactly
+    like a fresh request. An unreadable saved request falls back to defaults."""
+    fusions = [item.model_dump(exclude_none=True) for item in retry_inputs]
+    options = {
+        key: stored_request[key]
+        for key in ("local_backend", "skip_literature_for_oncokb", "mode")
+        if key in stored_request
+    }
+    try:
+        request = AnnotateRequest.model_validate({**options, "fusions": fusions})
+    except ValidationError:
+        request = AnnotateRequest.model_validate({"fusions": fusions})
+    request.force_refresh = force_refresh
+    return request
+
+
+async def _launch_run_retry_job(
+    run_id: str,
+    request: AnnotateRequest,
+    kind: RunRetryKind,
+    targets: Dict[str, str],
+    http_request: Request,
+    current_user: Optional[AuthenticatedUser],
+) -> str:
+    """Re-annotate only `request.fusions` in the background, then merge the
+    completed annotations into the existing run under its row lock. Nothing is
+    written to the run unless the whole job succeeds."""
+    job_id = str(uuid.uuid4())
+    job = AnnotationJobStatusResponse(
+        job_id=job_id,
+        status="queued",
+        fusions_processed=len(request.fusions),
+        kind="run_retry",
+        owner=job_owner(current_user),
+    )
+    await _store_annotation_job(job)
+    user_id = current_user.email if current_user else _request_user_id(http_request)
+
+    async def on_annotation(annotation: GeneAnnotation) -> None:
+        current = await _get_annotation_job(job_id)
+        current.annotations.append(annotation)
+        current.annotations.sort(key=lambda item: item.gene)
+        current.genes_completed = len(current.annotations)
+        await _store_annotation_job(current)
+
+    async def on_total_known(total: int) -> None:
+        current = await _get_annotation_job(job_id)
+        current.genes_total = total
+        await _store_annotation_job(current)
+
+    async def run_job() -> None:
+        current = await _get_annotation_job(job_id)
+        current.status = "running"
+        current.phase = "annotation"
+        await _store_annotation_job(current)
+        try:
+            result = await run_pipeline(
+                request.fusions,
+                local_backend=request.local_backend,
+                run_store=http_request.app.state.run_store,
+                force_refresh=request.force_refresh,
+                skip_literature_for_oncokb=request.skip_literature_for_oncokb,
+                mode=request.mode,
+                on_annotation=on_annotation,
+                on_total_known=on_total_known,
+            )
+            result.run_id = run_id
+            outcomes = await _persist_retried_annotations(
+                http_request, run_id, result, targets, kind,
+            )
+            # Jobs hold pipeline output only; polls overlay the current overrides.
+            stored = pipeline_result(result)
+            current = await _get_annotation_job(job_id)
+            current.retry_outcomes = outcomes
+            current.status = "complete"
+            current.phase = "complete"
+            current.result = stored
+            current.annotations = stored.annotations
+            current.genes_completed = result.genes_annotated
+            current.genes_total = result.genes_annotated
+            current.timings_ms = result.timings_ms
+            await _store_annotation_job(current)
+            record_user_action(
+                user_id=user_id,
+                action="run_retry_complete",
+                details={
+                    "job_id": job_id,
+                    "run_id": run_id,
+                    "genes_completed": result.genes_annotated,
+                    "force_refresh": request.force_refresh,
+                },
+            )
+        except Exception as exc:
+            logger.exception("Run retry job %s failed", job_id)
+            record_user_action(
+                user_id=user_id,
+                action="run_retry_error",
+                details={"job_id": job_id, "run_id": run_id, "error": str(exc)},
+            )
+            current = await _get_annotation_job(job_id)
+            current.status = "failed"
+            current.phase = "failed"
+            current.error = str(exc)
+            await _store_annotation_job(current)
+
+    _track_background_task(run_job())
+    return job_id
+
+
+@app.post("/v1/runs/{run_id}/retry", response_model=AnnotationJobCreateResponse)
+async def retry_run_annotations(
+    run_id: str,
+    request: RunRetryRequest,
+    http_request: Request,
+    current_user: AuthenticatedUser = Depends(require_auth),
+) -> AnnotationJobCreateResponse:
+    """Retry failed or no-result gene annotations on an existing saved run.
+
+    A retry works on genes: every input must be a plain gene whose row is
+    eligible for `kind` (see _validate_retry_inputs), or the whole request is
+    rejected with 422. Results are merged into the stored run in place once
+    the whole job succeeds, writing only the submitted genes' rows; the run's
+    other annotations, original inputs, attribution and fusion evidence are
+    left untouched, and a row is only replaced by one at least as good."""
+    store = getattr(http_request.app.state, "run_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="Run storage is unavailable.")
+    metadata = await store.get_run_metadata(run_id)
+    if metadata is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not can_modify_run(metadata.get("owner_email"), current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only this run's owner or an administrator may retry its annotations.",
+        )
+    _check_annotate_input_limit(request.inputs)
+    stored = await store.get_run(run_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    retry_inputs, targets = _validate_retry_inputs(stored, request.inputs, request.kind)
+    force_refresh = (
+        request.force_refresh if request.force_refresh is not None
+        else request.kind == "no_result"
+    )
+    stored_request = await store.get_run_request(run_id) or {}
+    annotate_request = _run_retry_request(stored_request, retry_inputs, force_refresh)
+    _record_annotation_request_metrics(annotate_request, http_request, current_user)
+    job_id = await _launch_run_retry_job(
+        run_id, annotate_request, request.kind, targets, http_request, current_user,
+    )
+    return AnnotationJobCreateResponse(
+        job_id=job_id,
+        status_url=f"/v1/annotate/jobs/{job_id}",
+    )
 
 
 @app.post("/v1/annotate/enrichment/jobs", response_model=EnrichmentJobCreateResponse)
@@ -1615,6 +2528,7 @@ async def create_enrichment_job(
         job_id=job_id,
         status="queued",
         annotations_total=len(request.annotations),
+        owner=job_owner(current_user),
     )
     await _store_enrichment_job(job)
 
@@ -1675,7 +2589,7 @@ async def get_enrichment_job(
     http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> EnrichmentJobStatusResponse:
-    job = await _get_enrichment_job(job_id)
+    job = await _get_enrichment_job(job_id, viewer=current_user)
     annotations = await apply_current_gene_overrides(job.annotations, http_request.app.state.run_store)
     return job.model_copy(
         update={"annotations": annotations, "curation_unavailable": has_curation_unavailable(annotations)}
@@ -1689,26 +2603,25 @@ async def create_fusion_evidence_job(
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> FusionEvidenceJobCreateResponse:
     """Run exact fusion-pair PubMed evidence retrieval outside the annotation critical path."""
+    _check_annotate_input_limit(request.fusions)
+    if request.run_id:
+        metadata = await http_request.app.state.run_store.get_run_metadata(request.run_id)
+        if metadata is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if not can_modify_run(metadata.get("owner_email"), current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Only this run's owner or an administrator may update it.",
+            )
     fusion_inputs = _fusion_evidence_inputs(request.fusions)
     job_id = str(uuid.uuid4())
     job = FusionEvidenceJobStatusResponse(
         job_id=job_id,
         status="queued",
         fusions_total=len(fusion_inputs),
+        owner=job_owner(current_user),
     )
     await _store_fusion_evidence_job(job)
-
-    async def run_one(item: FusionInput, semaphore: asyncio.Semaphore) -> FusionEvidenceResult:
-        async with semaphore:
-            try:
-                return await retrieve_fusion_evidence(item.fusion, tumor_type=item.tumor_type)
-            except Exception as exc:
-                logger.exception("Fusion evidence retrieval failed for %s", item.fusion)
-                return FusionEvidenceResult(
-                    fusion=item.fusion,
-                    tumor_type=item.tumor_type,
-                    interpretation=f"Fusion evidence retrieval failed: {exc}",
-                )
 
     async def run_job() -> None:
         start = time.perf_counter()
@@ -1717,7 +2630,12 @@ async def create_fusion_evidence_job(
         await _store_fusion_evidence_job(current)
         try:
             semaphore = asyncio.Semaphore(max(1, settings.fusion_evidence_concurrency))
-            tasks = [asyncio.create_task(run_one(item, semaphore)) for item in fusion_inputs]
+            tasks = [
+                asyncio.create_task(_retrieve_fusion_evidence_input(
+                    item, semaphore, force_refresh=request.force_refresh,
+                ))
+                for item in fusion_inputs
+            ]
             for task in asyncio.as_completed(tasks):
                 result = await task
                 current = await _get_fusion_evidence_job(job_id)
@@ -1753,7 +2671,7 @@ async def get_fusion_evidence_job(
     http_request: Request,
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> FusionEvidenceJobStatusResponse:
-    job = await _get_fusion_evidence_job(job_id)
+    job = await _get_fusion_evidence_job(job_id, viewer=current_user)
     fusion_evidence = await apply_current_fusion_overrides(job.fusion_evidence, http_request.app.state.run_store)
     return job.model_copy(
         update={"fusion_evidence": fusion_evidence, "curation_unavailable": has_curation_unavailable(fusion_evidence)}
@@ -1789,7 +2707,7 @@ async def annotate_gene(
         logger.exception("Gene annotation pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    await save_run_or_raise(http_request, request.model_dump(), result)
+    await save_run_or_raise(http_request, request.model_dump(), result, current_user)
 
     if not result.annotations:
         raise HTTPException(status_code=500, detail="No gene annotation was returned")
@@ -1808,6 +2726,7 @@ async def annotate_gene(
         **result.annotations[0].model_dump(),
         run_id=result.run_id,
         view_url=_run_view_url(http_request, result.run_id),
+        warnings=result.warnings,
     )
 
 
@@ -1899,15 +2818,26 @@ async def fusion_context(
     if not settings.fusion_annotation_api_enabled or not settings.fusion_annotation_api_base_url.strip():
         return FusionContextResponse(available=False)
 
+    fusion = request.fusion
+    five_transcript, three_transcript = request.five_transcript, request.three_transcript
+    if has_accession_identifier(fusion):
+        # ENST...::ENST..., GENE(ENST...)::GENE(NM_...) and the like: annotate the resolved
+        # genes, taking each partner's transcript unless one was given explicitly.
+        reading = await read_gene_input(fusion)
+        if reading.errors:
+            raise HTTPException(status_code=503 if reading.lookup_failed else 400, detail=" ".join(reading.errors))
+        fusion = reading.canonical
+        five_transcript = five_transcript or reading.five_transcript
+        three_transcript = three_transcript or reading.three_transcript
     try:
         parsed = parsed_input_from_fields(
-            request.fusion,
+            fusion,
             five_exon=request.five_exon,
             three_exon=request.three_exon,
             five_genomic=request.five_genomic,
             three_genomic=request.three_genomic,
-            five_transcript=request.five_transcript,
-            three_transcript=request.three_transcript,
+            five_transcript=five_transcript,
+            three_transcript=three_transcript,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -2024,98 +2954,155 @@ async def get_gene_openevidence(
     show an empty-looking component, and shows a short failed note for
     "failed".
     """
-    if not settings.openevidence_enabled:
-        # Byte-for-byte the pre-"pending + poll" flag-off body (no `status`
-        # key): flag off must behave exactly as before. A client reading
-        # `status` should treat its absence as "disabled".
-        return JSONResponse({"available": False, "distilled": None, "error": None})
-    if cancer_associated is False and not insufficient_evidence:
-        return OpenEvidenceSidecarResponse(available=False, status="unavailable")
-    # core_pmids/core_titles use Query(default=[]) so FastAPI correctly binds
-    # repeated query params through the ASGI path; a handful of existing
-    # tests call this endpoint function directly (bypassing ASGI/dependency
-    # resolution entirely) without passing them, which leaves the raw
-    # fastapi.params.Query sentinel — not a plain list — as the value. Guard
-    # against that here rather than relaxing those tests to always go
-    # through TestClient.
-    safe_core_pmids = core_pmids if isinstance(core_pmids, list) else []
-    safe_core_titles = core_titles if isinstance(core_titles, list) else []
-
-    def ready(analysis: OpenEvidenceAnalysis) -> OpenEvidenceSidecarResponse:
-        distilled = distill_additive_openevidence(
-            analysis, core_pmids=safe_core_pmids, core_titles=safe_core_titles
-        )
-        if not distilled_openevidence_has_additive_content(distilled):
+    started = time.monotonic()
+    # "error" only if the body raises; every return sets the real outcome.
+    outcome = "error"
+    available = False
+    try:
+        if not settings.openevidence_enabled:
+            # Byte-for-byte the pre-"pending + poll" flag-off body (no `status`
+            # key): flag off must behave exactly as before. A client reading
+            # `status` should treat its absence as "disabled".
+            outcome = "disabled"
+            return JSONResponse({"available": False, "distilled": None, "error": None})
+        if cancer_associated is False and not insufficient_evidence:
+            outcome = "not_cancer_associated"
             return OpenEvidenceSidecarResponse(available=False, status="unavailable")
-        return OpenEvidenceSidecarResponse(available=True, distilled=distilled, status="ready")
+        # core_pmids/core_titles use Query(default=[]) so FastAPI correctly binds
+        # repeated query params through the ASGI path; a handful of existing
+        # tests call this endpoint function directly (bypassing ASGI/dependency
+        # resolution entirely) without passing them, which leaves the raw
+        # fastapi.params.Query sentinel — not a plain list — as the value. Guard
+        # against that here rather than relaxing those tests to always go
+        # through TestClient.
+        safe_core_pmids = core_pmids if isinstance(core_pmids, list) else []
+        safe_core_titles = core_titles if isinstance(core_titles, list) else []
 
-    def failed(error: str) -> OpenEvidenceSidecarResponse:
-        return OpenEvidenceSidecarResponse(available=False, error=error, status="failed")
+        def ready(analysis: OpenEvidenceAnalysis) -> OpenEvidenceSidecarResponse:
+            nonlocal available
+            distilled = distill_additive_openevidence(
+                analysis, core_pmids=safe_core_pmids, core_titles=safe_core_titles
+            )
+            if not distilled_openevidence_has_additive_content(distilled):
+                return OpenEvidenceSidecarResponse(available=False, status="unavailable")
+            available = True
+            return OpenEvidenceSidecarResponse(available=True, distilled=distilled, status="ready")
 
-    def pending() -> OpenEvidenceSidecarResponse:
-        retry_after = max(1, int(settings.openevidence_sidecar_retry_after_seconds))
-        if response is not None:
-            understands_pending = isinstance(x_openevidence_poll, str) and x_openevidence_poll.strip() == "1"
-            response.status_code = 202 if understands_pending else 503
-            response.headers["Retry-After"] = str(retry_after)
-            response.headers["Vary"] = OPENEVIDENCE_POLL_HEADER
-        return OpenEvidenceSidecarResponse(
-            available=False, status="pending", retry_after_seconds=retry_after
-        )
+        def failed(error: str) -> OpenEvidenceSidecarResponse:
+            return OpenEvidenceSidecarResponse(available=False, error=error, status="failed")
 
-    key = sidecar_cache_key(gene, tumor_type, fusion)
-    analysis = _openevidence_memo_get(_openevidence_sidecar_results, key)
-    if analysis is None:
-        analysis = await get_cached_gene_analysis(gene, tumor_type=tumor_type, fusion=fusion)
-    if analysis is not None:
-        return ready(analysis)
+        def pending() -> OpenEvidenceSidecarResponse:
+            retry_after = max(1, int(settings.openevidence_sidecar_retry_after_seconds))
+            if response is not None:
+                understands_pending = isinstance(x_openevidence_poll, str) and x_openevidence_poll.strip() == "1"
+                response.status_code = 202 if understands_pending else 503
+                response.headers["Retry-After"] = str(retry_after)
+                response.headers["Vary"] = OPENEVIDENCE_POLL_HEADER
+            return OpenEvidenceSidecarResponse(
+                available=False, status="pending", retry_after_seconds=retry_after
+            )
 
-    task = _live_openevidence_sidecar_task(key)
-    if task is None:
-        error = _openevidence_memo_get(_openevidence_sidecar_failures, key)
-        if error is not None:
-            return failed(error)
-        # One atomic step (see claim_lookup): a failure on record — even one
-        # published a moment ago by another pod — is answered as "failed"
-        # rather than paid for again; otherwise claim the lease.
-        claim = await claim_lookup(key, settings.openevidence_sidecar_inflight_ttl_seconds)
-        if claim.failed is not None:
-            return failed(claim.failed)
-        token = claim.token
-        if token is None:
-            # Another worker/pod is already running this lookup — poll its
-            # result out of the shared cache instead of paying for a second.
-            return pending()
-        # Re-check after the awaits above: a concurrent request in this
-        # worker may have started the task meanwhile — or even started and
-        # finished it, leaving only its outcome in the memos (no await
-        # between these checks and registering a new task, so exactly one
-        # gets started and a fresh outcome is never paid for twice). That
-        # can only happen when Redis is unreachable (the claim is NX
-        # otherwise), so releasing the spare token is just tidiness.
-        task = _live_openevidence_sidecar_task(key)
-        if task is None:
-            analysis = _openevidence_memo_get(_openevidence_sidecar_results, key)
-            error = None if analysis is not None else _openevidence_memo_get(_openevidence_sidecar_failures, key)
-            if analysis is None and error is None:
-                task = _start_openevidence_sidecar_lookup(key, token, gene, tumor_type, fusion)
-            else:
-                await release_inflight_marker(key, token)
-                return ready(analysis) if analysis is not None else failed(error)
-        else:
-            await release_inflight_marker(key, token)
-
-    # asyncio.wait never cancels the task — if this request times out here,
-    # or the client disconnects, the lookup keeps running in the background.
-    await asyncio.wait({task}, timeout=max(0.0, settings.openevidence_sidecar_pending_wait_seconds))
-    if task.done() and not task.cancelled():
-        error = task.result()
-        if error is not None:
-            return failed(error)
+        key = sidecar_cache_key(gene, tumor_type, fusion)
         analysis = _openevidence_memo_get(_openevidence_sidecar_results, key)
         if analysis is not None:
+            # This worker's own recently finished lookup (typically a poll
+            # after "pending"): "ready", not a cache hit, so the cache hit
+            # rate isn't inflated by the lookups that filled the cache.
+            outcome = "ready"
             return ready(analysis)
-    return pending()
+        analysis = await get_cached_gene_analysis(gene, tumor_type=tumor_type, fusion=fusion)
+        if analysis is not None:
+            outcome = "cache_hit"
+            return ready(analysis)
+
+        task = _live_openevidence_sidecar_task(key)
+        if task is not None:
+            _record_openevidence_dedupe("in_process")
+        else:
+            error = _openevidence_memo_get(_openevidence_sidecar_failures, key)
+            if error is not None:
+                outcome = "failed"
+                return failed(error)
+            # One atomic step (see claim_lookup): a failure on record — even one
+            # published a moment ago by another pod — is answered as "failed"
+            # rather than paid for again; otherwise claim the lease.
+            claim = await claim_lookup(key, settings.openevidence_sidecar_inflight_ttl_seconds)
+            if claim.failed is not None:
+                outcome = "failed"
+                return failed(claim.failed)
+            token = claim.token
+            if token is None:
+                # Another worker/pod is already running this lookup — poll its
+                # result out of the shared cache instead of paying for a second.
+                _record_openevidence_dedupe("cross_pod")
+                outcome = "pending"
+                return pending()
+            # Re-check after the awaits above: a concurrent request in this
+            # worker may have started the task meanwhile — or even started and
+            # finished it, leaving only its outcome in the memos (no await
+            # between these checks and registering a new task, so exactly one
+            # gets started and a fresh outcome is never paid for twice). That
+            # can only happen when Redis is unreachable (the claim is NX
+            # otherwise), so releasing the spare token is just tidiness.
+            task = _live_openevidence_sidecar_task(key)
+            if task is None:
+                analysis = _openevidence_memo_get(_openevidence_sidecar_results, key)
+                error = None if analysis is not None else _openevidence_memo_get(_openevidence_sidecar_failures, key)
+                if analysis is None and error is None:
+                    task = _start_openevidence_sidecar_lookup(key, token, gene, tumor_type, fusion)
+                else:
+                    await release_inflight_marker(key, token)
+                    outcome = "ready" if analysis is not None else "failed"
+                    return ready(analysis) if analysis is not None else failed(error)
+            else:
+                _record_openevidence_dedupe("in_process")
+                await release_inflight_marker(key, token)
+
+        # asyncio.wait never cancels the task — if this request times out here,
+        # or the client disconnects, the lookup keeps running in the background.
+        await asyncio.wait({task}, timeout=max(0.0, settings.openevidence_sidecar_pending_wait_seconds))
+        if task.done() and not task.cancelled():
+            error = task.result()
+            if error is not None:
+                outcome = "failed"
+                return failed(error)
+            analysis = _openevidence_memo_get(_openevidence_sidecar_results, key)
+            if analysis is not None:
+                outcome = "ready"
+                return ready(analysis)
+        outcome = "pending"
+        return pending()
+    finally:
+        _record_openevidence_endpoint_request(
+            outcome, available, started, has_fusion=bool(fusion), has_tumor_type=bool(tumor_type)
+        )
+
+
+def _record_openevidence_dedupe(scope: str) -> None:
+    """A request that joined a lookup already in flight instead of paying
+    for its own: `in_process` (this worker's task registry — including every
+    poll while a lookup runs) or `cross_pod` (the Redis lease is held by
+    another worker/pod)."""
+    oe_metrics.increment(oe_metrics.LOOKUPS_DEDUPED, tags=[oe_metrics.model_tag(), f"scope:{scope}"])
+
+
+def _record_openevidence_endpoint_request(
+    outcome: str, available: bool, started: float, *, has_fusion: bool, has_tumor_type: bool
+) -> None:
+    model = oe_metrics.model_tag()
+    oe_metrics.increment(
+        oe_metrics.ENDPOINT_REQUESTS,
+        tags=[
+            f"outcome:{outcome}",
+            model,
+            oe_metrics.bool_tag("available", available),
+            oe_metrics.bool_tag("has_fusion", has_fusion),
+            oe_metrics.bool_tag("has_tumor_type", has_tumor_type),
+        ],
+    )
+    oe_metrics.distribution(
+        oe_metrics.ENDPOINT_DURATION_MS, (time.monotonic() - started) * 1000, tags=[f"outcome:{outcome}", model]
+    )
 
 
 @app.post("/v1/fusion-partner-evidence", response_model=FusionPartnerEvidenceResult)
@@ -2332,6 +3319,8 @@ async def _create_github_issue(title: str, body: str) -> Optional[str]:
         return None
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            labels = list(settings.feedback_issue_labels)
+            request_body = {"title": title, "body": body, "labels": labels}
             response = await client.post(
                 f"https://api.github.com/repos/{settings.github_repo}/issues",
                 headers={
@@ -2339,8 +3328,26 @@ async def _create_github_issue(title: str, body: str) -> Optional[str]:
                     "Accept": "application/vnd.github+json",
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
-                json={"title": title, "body": body},
+                json=request_body,
             )
+            if labels and response.status_code == 422:
+                # GitHub returns 422 when a label cannot be applied; retry once
+                # without labels so the feedback is still filed.
+                increment("feedback.github_issue_labels_rejected")
+                logger.warning(
+                    "GitHub rejected feedback issue labels %s (status %s); retrying without labels",
+                    labels,
+                    response.status_code,
+                )
+                response = await client.post(
+                    f"https://api.github.com/repos/{settings.github_repo}/issues",
+                    headers={
+                        "Authorization": f"Bearer {settings.oncokbdev_private_access_token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                    json={"title": title, "body": body},
+                )
             response.raise_for_status()
             increment("feedback.github_issue_created")
             return response.json().get("html_url")
@@ -2408,6 +3415,22 @@ async def submit_feedback(
     if not settings.feedback_issue_creation_enabled:
         return FeedbackResponse(feedback_id=feedback_id)
     issue_title, issue_body = await _draft_feedback_issue(payload, feedback_id)
+    if issue_body is not None:
+        try:
+            citation_section = await build_citation_check_section(
+                payload.message,
+                gene=payload.gene,
+                structured_pmids=payload.pmids,
+            )
+        except Exception:
+            # The check is informational; feedback storage and issue creation
+            # must continue even if the check itself has a bug.
+            logger.exception("Feedback citation check wrapper failed")
+            citation_section = (
+                "## Automated citation check\n\ncheck unavailable (citation check failed)."
+            )
+        if citation_section:
+            issue_body = f"{issue_body}\n\n{citation_section}"
     issue_url = (
         await _create_github_issue(issue_title, issue_body)
         if issue_title is not None and issue_body is not None else None
@@ -2447,6 +3470,20 @@ from src.api.gene_query import router as gene_query_router  # noqa: E402
 
 app.include_router(gene_query_router)
 app.include_router(curation_router)
+
+
+@app.exception_handler(UserStoreUnavailable)
+async def user_store_unavailable_handler(request: Request, exc: UserStoreUnavailable):
+    """Fail closed when the user profile store can't be read (e.g. during login
+    provisioning): never provision or authorize from a stale in-process copy."""
+    logger.error("User profile store unavailable for %s: %s", request.url.path, describe_store_error(exc))
+    detail = "Sign-in is temporarily unavailable. Please retry shortly."
+    if request.url.path.startswith("/auth/"):
+        return HTMLResponse(
+            render_access_denied_html(email="", reason=detail),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": detail})
 
 
 @app.exception_handler(Exception)
