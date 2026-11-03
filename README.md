@@ -948,8 +948,32 @@ storage, which hold pure pipeline output:
 - `curation_history`: append-only, one row per save or revert.
 
 A subject is a gene annotation (`gene`, keyed like `gene_annotations` by gene and
-tumor type) or an exact fusion-pair evidence result (`fusion`, keyed by
-`GENEA::GENEB` and tumor type). Retracted PMIDs are still stripped from curated
+tumor type), an exact fusion-pair evidence result (`fusion`, keyed by
+`GENEA::GENEB` and tumor type), or a fusion-partner precedent lookup
+(`fusion_partner`, keyed by the partner gene and the tumor type the lookup
+searched; an all-tumor-types search, including the "explore all tumor types"
+follow-up, uses the override saved with no tumor type). Overrides match
+tumor type exactly: an override saved with no tumor type applies only to
+results with no tumor type, never as a fallback for a tumor type that has no
+override of its own. A gene override can set the cancer-associated call
+(`cancer_associated: true|false`); the curator's call wins wherever the gene
+is served (UI, run links, `/v1/genes/*`, exports), counts as a decided call
+(`insufficient_evidence: false`), is listed in `curated_fields`, and carries an
+info flag `curator_set_cancer_association` naming the pipeline's call. In the UI,
+"Edit call" changes only the call (other curated sections are saved verbatim,
+no re-evaluation); an evidence edit writes the call only if the curator changes
+it, with the re-evaluation's suggested call offered one click away.
+A `fusion_partner` save may drop a PMID that the stored override references
+only if the request lists it in `removed_pmids`; otherwise it is rejected with
+422 (`unacknowledged_removed_pmids`). The check runs inside the save
+transaction, against the locked row actually being replaced (after the
+`expected_version` check), so a concurrent save can't slip in between. Follow-up
+lookups hide PMIDs shown earlier, so this stops a save built from a filtered view
+from silently replacing the saved list. The editor always starts from the complete
+stored override (or the unfiltered lookup when none is stored) and sends the PMIDs
+the curator removed.
+`evidence_support_score` stays the pipeline's literature-grounding score, and
+benchmarks score pipeline output only. Retracted PMIDs are still stripped from curated
 content (flag `curated_retracted_pmids_removed`), and when the pipeline later
 cites PMIDs that were not in its evidence at curation time the result carries a
 non-blocking `newer_pipeline_evidence` flag. If overrides cannot be loaded,
@@ -973,6 +997,15 @@ curl -X PUT http://127.0.0.1:8000/v1/curation/gene/ALK?tumor_type=LUAD \
   -d '{"expected_version": 0, "payload": {"citations": ["17625570"]}}'
 curl http://127.0.0.1:8000/v1/curation/gene/ALK/history?tumor_type=LUAD   # audit trail
 curl -X DELETE http://127.0.0.1:8000/v1/curation/gene/ALK?tumor_type=LUAD # revert
+curl -X PUT http://127.0.0.1:8000/v1/curation/gene/ALK?tumor_type=LUAD \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 1, "payload": {"cancer_associated": false}}'   # curator-set call
+curl -X PUT http://127.0.0.1:8000/v1/curation/fusion_partner/ALK?tumor_type=NSCLC \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 0, "payload": {"pmids": ["17625570"], "interpretation": "..."}}'
+curl -X PUT http://127.0.0.1:8000/v1/curation/fusion_partner/ALK?tumor_type=NSCLC \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 1, "payload": {"pmids": []}, "removed_pmids": ["17625570"]}'  # deliberate removal
 ```
 
 Reads are open to every signed-in user, including viewers. Writes (`PUT`,

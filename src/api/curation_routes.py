@@ -1,8 +1,10 @@
 """Curator override API: read, save, revert, and audit curated overrides.
 
 Subjects are a gene annotation (`gene`, keyed like gene_annotations by gene
-and tumor type) or an exact fusion-pair evidence result (`fusion`, keyed by
-'GENEA::GENEB' and tumor type). Reads need any login; writes need the curator
+and tumor type), an exact fusion-pair evidence result (`fusion`, keyed by
+'GENEA::GENEB' and tumor type), or a fusion-partner precedent lookup
+(`fusion_partner`, keyed by the partner gene and the tumor type the lookup was
+scoped to; '' for an all-tumor-types search). Reads need any login; writes need the curator
 or admin role (require_curator). See src/pipeline/curation.py for how
 overrides are applied wherever results are served.
 """
@@ -28,7 +30,10 @@ from src.models.schema import (
 from src.observability import record_user_action
 from src.pipeline import literature
 from src.pipeline.curation import (
+    FUSION,
+    FUSION_PARTNER,
     GENE,
+    CurationPayload,
     fusion_evidence_pmids,
     gene_evidence_pmids,
     normalize_subject_key,
@@ -37,7 +42,12 @@ from src.pipeline.curation import (
     payload_fields,
     payload_pmids,
 )
-from src.pipeline.curation_store import CurationStorageContention, CurationVersionConflict
+from src.pipeline.curation_store import (
+    CurationReplaceRejected,
+    CurationStorageContention,
+    CurationVersionConflict,
+    ReplaceCheck,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +55,7 @@ router = APIRouter(prefix="/v1/curation", tags=["curation"])
 
 T = TypeVar("T")
 
-SubjectTypeParam = Literal["gene", "fusion"]
+SubjectTypeParam = Literal["gene", "fusion", "fusion_partner"]
 
 # Upper bound on the PubMed call that snapshots fusion evidence on save; a
 # cache miss would otherwise run a full fusion retrieval inside the request.
@@ -70,11 +80,22 @@ class CurationSaveRequest(BaseModel):
     payload: Dict[str, Any] = Field(
         ...,
         description=(
-            "GeneCurationPayload for genes, FusionCurationPayload for fusions. Omitted/null "
-            "sections keep the pipeline value."
+            "GeneCurationPayload for genes, FusionCurationPayload for fusions, "
+            "FusionPartnerCurationPayload for fusion partners. Omitted/null sections keep the "
+            "pipeline value."
         ),
     )
     note: Optional[str] = Field(default=None, max_length=2000, description="Optional note kept in history.")
+    removed_pmids: List[str] = Field(
+        default_factory=list,
+        max_length=500,
+        description=(
+            "fusion_partner only: PMIDs the curator deliberately removed. A save that drops a PMID the "
+            "override it replaces references is rejected (422) unless the PMID is listed here (checked in "
+            "the save transaction), so a save built from a filtered follow-up view can't silently lose "
+            "saved evidence."
+        ),
+    )
 
 
 class CurationResponse(BaseModel):
@@ -116,10 +137,11 @@ _STORE_UNAVAILABLE = "Curation storage is unavailable; please retry."
 
 async def _store_call(awaitable: Awaitable[T]) -> T:
     """Await a curation store call; storage errors become 503 (never a silent
-    'no override'). Version conflicts propagate for the caller to map to 409."""
+    'no override'). Version conflicts and replace-check rejections propagate
+    for the caller to map to 409/422."""
     try:
         return await awaitable
-    except CurationVersionConflict:
+    except (CurationVersionConflict, CurationReplaceRejected):
         raise
     except CurationStorageContention as exc:
         logger.warning("Curation write gave up on lock contention: %s", exc)
@@ -162,7 +184,7 @@ def _invalid_pmids(pmids: List[str], records: Dict[str, LiteratureRecord]) -> Li
 
 
 def _fill_from_pubmed(
-    payload: GeneCurationPayload | FusionCurationPayload,
+    payload: CurationPayload,
     records: Dict[str, LiteratureRecord],
     subject_key: str,
 ) -> None:
@@ -179,7 +201,7 @@ def _fill_from_pubmed(
             card.fusion = subject_key
             card.matched_via_alias = False
             card.alias_matches = []
-    elif payload.therapeutic_precedent:
+    elif isinstance(payload, GeneCurationPayload) and payload.therapeutic_precedent:
         for precedent in payload.therapeutic_precedent.precedents:
             record = records[precedent.pmid]
             precedent.title = record.title
@@ -196,10 +218,14 @@ async def _pipeline_pmids_snapshot(
             if cached is None:
                 return None
             return gene_evidence_pmids(GeneAnnotation(**cached["annotation"]))
-        result = await asyncio.wait_for(
-            literature.retrieve_fusion_evidence(subject_key, tumor_type=tumor_type or None),
-            timeout=_FUSION_SNAPSHOT_TIMEOUT_SECONDS,
-        )
+        if subject_type == FUSION:
+            lookup = literature.retrieve_fusion_evidence(subject_key, tumor_type=tumor_type or None)
+        else:
+            # The same search the subject is keyed by: tumor-scoped, or all tumor types for ''.
+            lookup = literature.retrieve_fusion_partner_evidence(
+                subject_key, tumor_type=tumor_type or None, agnostic=not tumor_type
+            )
+        result = await asyncio.wait_for(lookup, timeout=_FUSION_SNAPSHOT_TIMEOUT_SECONDS)
         return fusion_evidence_pmids(result)
     except Exception:
         logger.warning("Could not snapshot pipeline PMIDs for %s %s", subject_type, subject_key, exc_info=True)
@@ -214,8 +240,8 @@ async def _pipeline_pmids_snapshot(
 @router.get("/{subject_type}/{subject_key}", response_model=CurationResponse)
 async def get_curation(
     http_request: Request,
-    subject_type: SubjectTypeParam = Path(..., description="`gene` or `fusion`."),
-    subject_key: str = Path(..., description="Gene symbol, or fusion as `GENEA::GENEB`."),
+    subject_type: SubjectTypeParam = Path(..., description="`gene`, `fusion` or `fusion_partner`."),
+    subject_key: str = Path(..., description="Gene symbol (gene, fusion_partner), or fusion as `GENEA::GENEB`."),
     tumor_type: Optional[str] = Query(default=None, description="Tumor type context; omit for none."),
     current_user: AuthenticatedUser = Depends(require_auth),
 ) -> CurationResponse:
@@ -229,6 +255,40 @@ async def get_curation(
         version=override.version if override else 0,
         override=override,
     )
+
+
+def _removal_guard(removed_pmids: List[str], pmids: List[str]) -> ReplaceCheck:
+    """fusion_partner replace_check: reject a save that drops a PMID the replaced
+    override references unless it is listed in removed_pmids.
+
+    Follow-up partner lookups hide previously shown PMIDs, so a payload built
+    from that view would otherwise replace the complete stored list with a
+    filtered one. The store runs this inside the save transaction against the
+    row it actually replaces (after the version check), so no concurrent save
+    can slip in between the check and the write."""
+    acknowledged = set(removed_pmids)
+    kept = set(pmids)
+
+    def check(stored_payload: Optional[Dict[str, Any]]) -> None:
+        if not stored_payload:
+            return
+        try:
+            stored = payload_pmids(parse_payload(FUSION_PARTNER, stored_payload))
+        except ValidationError:
+            # Unreadable stored content: refuse rather than replace it blind.
+            raise CurationReplaceRejected({"message": "The saved partner precedent could not be read; reload and retry."})
+        missing = [pmid for pmid in stored if pmid not in kept and pmid not in acknowledged]
+        if missing:
+            raise CurationReplaceRejected({
+                "message": (
+                    "This save would remove saved partner-precedent PMIDs that were not explicitly removed "
+                    "(was it built from a filtered follow-up view?). Reload the full precedent list, or list "
+                    "them in removed_pmids to remove them."
+                ),
+                "unacknowledged_removed_pmids": missing,
+            })
+
+    return check
 
 
 @router.put("/{subject_type}/{subject_key}", response_model=CurationResponse)
@@ -278,8 +338,11 @@ async def save_curation(
                 expected_version=request.expected_version,
                 pipeline_pmids_snapshot=snapshot,
                 note=request.note,
+                replace_check=_removal_guard(request.removed_pmids, pmids) if subject_type == FUSION_PARTNER else None,
             )
         )
+    except CurationReplaceRejected as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
     except CurationVersionConflict as exc:
         raise HTTPException(
             status_code=409,
