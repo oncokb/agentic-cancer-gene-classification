@@ -200,15 +200,19 @@ through DogStatsD. OpenEvidence names are constants in
 
 - `$section` filters the section funnel, UI section/variant charts, and top
   gene/item logs. OpenEvidence widgets keep their fixed sections.
-- `$variant` filters UI metrics only. Values have the form `key.variant` and
-  are emitted only for exact pairs allowed by `UI_EVENTS_METRIC_FLAG_KEYS`.
-  The current browser sends `flags:null` until a flags provider is configured;
-  keep `*` selected until variants exist. No example variant values are baked
-  into the dashboard. Top gene/item logs are not variant-filtered: their
-  `flags` objects are not flattened metric variant tags.
-- `$tab` filters **only tab-selection logs**, using `@item_id`. There is no
-  emitted `tab` tag or log field. `switchResultsView` in `src/static/app.js`
-  records `type:open`, `section:tab`, `item_id:mode` (`results`, `fusion`, or
+- `$variant` filters only the dedicated **UI engagement by variant** widget.
+  Values have the form `key.variant` and are emitted only for exact pairs
+  allowed by `UI_EVENTS_METRIC_FLAG_KEYS`. The current browser sends
+  `flags:null` until a flags provider is configured, so that widget is expected
+  to have no data today. Even `variant:*` requires a variant tag; all other
+  widgets omit this filter to include untagged events. No example variant
+  values are baked into the dashboard. Log `flags` objects are not flattened
+  metric variant tags.
+- `$tab` filters **only tab-selection logs**, using `@item_id`. Its template
+  prefix is `@item_id` because this is a parsed log attribute, rather than a
+  metric tag; queries use `$tab.value` for its value in `@item_id:$tab.value`.
+  There is no emitted `tab` tag or log field. `switchResultsView` in
+  `src/static/app.js` records `type:open`, `section:tab`, `item_id:mode` (`results`, `fusion`, or
   `noresult`); `tracking.js:build` omits its internal tab context from the wire
   payload. The tab table counts selections, not time spent or per-tab card
   engagement. Card events cannot be joined to a tab from their current fields.
@@ -249,7 +253,8 @@ log. In the Datadog log pipeline scoped to this service and `ui_event` messages:
 ### Reading the OpenEvidence decision
 
 Compare service-wide paid upstream attempts with card-frame impressions over
-the same representative window (leave `$variant=*`). The fetched/viewed widget
+the same representative window. This comparison is independent of `$variant`
+so untagged impressions are included. The fetched/viewed widget
 is `sum(acgc.openevidence.upstream.calls) / sum(acgc.ui.events{section:openevidence,type:impression})`:
 paid attempts per frame impression. A high ratio suggests checking whether
 prefetch/warmup is buying answers users rarely see. It is a diagnostic signal,
@@ -259,9 +264,12 @@ The value is undefined when there are no impressions.
 
 Use upstream `source,status`, endpoint `outcome`, background `lookups.started`,
 and cache peek `result` alongside this ratio. Endpoint requests and cache peeks
-include polls; upstream calls count every paid attempt, including retries and
-warmup. A cache hit is not a new paid fetch. The state chart shows every UI
-transition, including cached/pending/timeout/failed; these are not distinct
+include polls; upstream calls count every paid attempt, including retries,
+warmup (`source:warmup`), and ad-hoc/benchmark calls (`source:other`). The
+numerator intentionally keeps all sources to show total paid usage; use the
+source breakdown to check whether benchmarks or warmup dominate before
+attributing a high ratio to UI fetching. A cache hit is not a new paid fetch.
+The state chart shows every UI transition, including cached/pending/timeout/failed; these are not distinct
 cards. Card-frame impressions may occur during loading, so compare ready-body
 `openevidence_content` impressions and guideline clicks before deciding to
 fetch only on demand. The current OpenEvidence card has no expand control;

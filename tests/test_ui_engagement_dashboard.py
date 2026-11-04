@@ -26,6 +26,7 @@ def string_constants(tree):
 def metric_contract():
     """Resolve metric constants and each emitter's tags, including local tag lists.
 
+    Metric types come from the emission method (increment or distribution).
     Follow assignments/appends and helper return expressions rather than sharing
     one tag allowlist across unrelated metrics. DD_SERVICE is injected by the
     DogStatsD library; the deployment service is also the log factory's default.
@@ -86,7 +87,9 @@ def metric_contract():
                     continue
                 tags = next((kw.value for kw in call.keywords if kw.arg == "tags"), None)
                 keys = tag_keys(tags) if tags is not None else set()
-                contract.setdefault("acgc." + metric, set()).update(keys | {"service"})
+                entry = contract.setdefault("acgc." + metric, {"tags": set(), "types": set()})
+                entry["tags"].update(keys | {"service"})
+                entry["types"].add(name)
     return contract
 
 
@@ -117,6 +120,13 @@ def validate_dashboard(dashboard):
     assert variables == {"variant": "variant", "tab": "@item_id", "section": "section"}
     assert dashboard["layout_type"] == "ordered" and dashboard["widgets"]
     assert "agentic-cancer-gene-classification" in string_constants(source("src/main.py"))
+    for widget in dashboard["widgets"]:
+        if widget["definition"].get("title") == "UI engagement by variant (requires configured flag allowlist)":
+            continue
+        for obj in walk_objects(widget):
+            query = obj.get("query")
+            if isinstance(query, str):
+                assert "$variant" not in query, "variant filter outside dedicated variant widget"
     for obj in walk_objects(dashboard):
         if obj.get("data_source") == "metrics":
             query = obj["query"]
@@ -124,6 +134,7 @@ def validate_dashboard(dashboard):
             assert match, query
             metric, filters, groups = match.groups()
             assert metric in contract, metric
+            assert contract[metric]["types"] == {"increment"}, (metric, "expected count metric")
             keys = set((groups or "").split(",")) - {""}
             for term in filters.split(","):
                 if term.startswith("$"):
@@ -135,7 +146,7 @@ def validate_dashboard(dashboard):
                         assert value in enum_tags[key], (key, value)
                     if key == "service":
                         assert value == "agentic-cancer-gene-classification"
-            assert keys <= contract[metric], (metric, keys - contract[metric])
+            assert keys <= contract[metric]["tags"], (metric, keys - contract[metric]["tags"])
         elif obj.get("data_source") == "logs":
             query = obj["search"]["query"]
             assert '"ui_event"' in query
@@ -153,15 +164,36 @@ def test_dashboard_queries_match_emitters():
 
 @pytest.mark.no_real_redis
 @pytest.mark.parametrize("replacement", [
+    "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant}.as_count()",
     "sum:acgc.ui.imaginary{service:agentic-cancer-gene-classification}.as_count()",
     "sum:acgc.ui.events{tab:results}.as_count()",
     "sum:acgc.openevidence.lookups.started{section:openevidence}.as_count()",
     "sum:acgc.ui.events{type:expand}.as_count()",
     "sum:acgc.ui.events{service:agentic-cancer-gene-classification} by {gene}.as_count()",
 ])
-def test_validator_rejects_invented_metrics_and_tags(replacement):
+def test_validator_rejects_invalid_queries(replacement):
     dashboard = copy.deepcopy(json.loads(DASHBOARD.read_text()))
     query = next(obj for obj in walk_objects(dashboard) if obj.get("data_source") == "metrics")
     query["query"] = replacement
     with pytest.raises((AssertionError, ValueError)):
         validate_dashboard(dashboard)
+
+
+@pytest.mark.no_real_redis
+def test_validator_rejects_as_count_for_distribution(monkeypatch):
+    original_source = source
+
+    def distribution_source(path):
+        tree = original_source(path)
+        if path == "src/ui_events.py":
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id == "increment" and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value == "ui.events"):
+                    node.func.id = "distribution"
+        return tree
+
+    monkeypatch.setitem(globals(), "source", distribution_source)
+    with pytest.raises(AssertionError, match="expected count metric"):
+        validate_dashboard(json.loads(DASHBOARD.read_text()))

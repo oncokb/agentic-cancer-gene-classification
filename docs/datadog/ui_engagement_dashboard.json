@@ -6,7 +6,7 @@
     {
       "definition": {
         "type": "note",
-        "content": "UI engagement event counts, not a unique-user or ordered-session funnel. Open = user expansion. Clicks belong to their own link sections. Missing stages are expected for non-interactive sections. $variant/$section filter UI metrics only; $tab filters only tab-selection logs. Server totals stay unfiltered. See docs/datadog/README.md for log parsing and interpretation.",
+        "content": "UI engagement event counts, not a unique-user or ordered-session funnel. Open = user expansion. Clicks belong to their own link sections. Missing stages are expected for non-interactive sections. $variant filters only the variant widget; $section filters general UI metrics; $tab filters only tab-selection logs. Server totals stay unfiltered. See docs/datadog/README.md for log parsing and interpretation.",
         "background_color": "white",
         "font_size": "14",
         "text_align": "left",
@@ -25,25 +25,25 @@
               {
                 "data_source": "metrics",
                 "name": "surfaced",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,$section,type:surfaced} by {section}.as_count()",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section,type:surfaced} by {section}.as_count()",
                 "aggregator": "sum"
               },
               {
                 "data_source": "metrics",
                 "name": "impression",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,$section,type:impression} by {section}.as_count()",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section,type:impression} by {section}.as_count()",
                 "aggregator": "sum"
               },
               {
                 "data_source": "metrics",
                 "name": "open",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,$section,type:open} by {section}.as_count()",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section,type:open} by {section}.as_count()",
                 "aggregator": "sum"
               },
               {
                 "data_source": "metrics",
                 "name": "click",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,$section,type:click} by {section}.as_count()",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section,type:click} by {section}.as_count()",
                 "aggregator": "sum"
               }
             ],
@@ -81,7 +81,7 @@
               {
                 "data_source": "metrics",
                 "name": "events",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,$section} by {section,type}.as_count()"
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section} by {section,type}.as_count()"
               }
             ],
             "formulas": [
@@ -194,12 +194,12 @@
               {
                 "data_source": "metrics",
                 "name": "impressions",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,section:openevidence,type:impression}.as_count()"
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence,type:impression}.as_count()"
               },
               {
                 "data_source": "metrics",
                 "name": "opens",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,section:openevidence,type:open}.as_count()"
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence,type:open}.as_count()"
               }
             ],
             "formulas": [
@@ -250,7 +250,7 @@
               {
                 "data_source": "metrics",
                 "name": "viewed",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,section:openevidence,type:impression}.as_count()",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence,type:impression}.as_count()",
                 "aggregator": "sum"
               }
             ],
@@ -350,7 +350,7 @@
               {
                 "data_source": "metrics",
                 "name": "states",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,section:openevidence,type:state} by {state}.as_count()"
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence,type:state} by {state}.as_count()"
               }
             ],
             "formulas": [
@@ -375,12 +375,12 @@
               {
                 "data_source": "metrics",
                 "name": "ready_views",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,section:openevidence_content,type:impression}.as_count()"
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence_content,type:impression}.as_count()"
               },
               {
                 "data_source": "metrics",
                 "name": "guidelines",
-                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,section:openevidence_guideline_link,type:click}.as_count()"
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence_guideline_link,type:click}.as_count()"
               }
             ],
             "formulas": [
