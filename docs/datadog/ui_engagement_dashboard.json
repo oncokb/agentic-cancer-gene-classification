@@ -1,0 +1,563 @@
+{
+  "title": "ACGC UI engagement",
+  "description": "UI section engagement and OpenEvidence fetched versus viewed. Namespace acgc; service agentic-cancer-gene-classification. Tab is log-only; variants require a server allowlist and client flags provider. See repository docs/datadog/README.md.",
+  "layout_type": "ordered",
+  "widgets": [
+    {
+      "definition": {
+        "type": "note",
+        "content": "UI engagement event counts, not a unique-user or ordered-session funnel. Open = user expansion. Clicks belong to their own link sections. Missing stages are expected for non-interactive sections. $variant filters only the variant widget; $section filters general UI metrics; $tab filters only tab-selection logs. Server totals stay unfiltered. See docs/datadog/README.md for log parsing and interpretation.",
+        "background_color": "white",
+        "font_size": "14",
+        "text_align": "left",
+        "vertical_align": "center",
+        "show_tick": false
+      }
+    },
+    {
+      "definition": {
+        "type": "query_table",
+        "title": "Section funnel: surfaced \u2192 impression \u2192 open / expand \u2192 click",
+        "requests": [
+          {
+            "response_format": "scalar",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "surfaced",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section,type:surfaced} by {section}.as_count()",
+                "aggregator": "sum"
+              },
+              {
+                "data_source": "metrics",
+                "name": "impression",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section,type:impression} by {section}.as_count()",
+                "aggregator": "sum"
+              },
+              {
+                "data_source": "metrics",
+                "name": "open",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section,type:open} by {section}.as_count()",
+                "aggregator": "sum"
+              },
+              {
+                "data_source": "metrics",
+                "name": "click",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section,type:click} by {section}.as_count()",
+                "aggregator": "sum"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "surfaced",
+                "alias": "surfaced"
+              },
+              {
+                "formula": "impression",
+                "alias": "impression"
+              },
+              {
+                "formula": "open",
+                "alias": "open"
+              },
+              {
+                "formula": "click",
+                "alias": "click"
+              }
+            ]
+          }
+        ],
+        "has_search_bar": "auto"
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "UI engagement by section and event",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "events",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$section} by {section,type}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "events",
+                "alias": "events"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "UI engagement by variant (requires configured flag allowlist)",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "events",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,$variant,$section} by {variant,type}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "events",
+                "alias": "events"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "query_table",
+        "title": "Tab selections (tab filter applies here only)",
+        "requests": [
+          {
+            "response_format": "scalar",
+            "queries": [
+              {
+                "data_source": "logs",
+                "name": "tabs",
+                "indexes": [
+                  "*"
+                ],
+                "compute": {
+                  "aggregation": "count"
+                },
+                "search": {
+                  "query": "service:agentic-cancer-gene-classification \"ui_event\" @section:tab @type:open @item_id:$tab.value"
+                },
+                "group_by": [
+                  {
+                    "facet": "@item_id",
+                    "limit": 10,
+                    "sort": {
+                      "aggregation": "count",
+                      "order": "desc"
+                    }
+                  }
+                ]
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "tabs",
+                "alias": "tabs"
+              }
+            ]
+          }
+        ],
+        "has_search_bar": "auto"
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "OpenEvidence: server requests / lookups / paid calls vs card views",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "requests",
+                "query": "sum:acgc.openevidence.endpoint.requests{service:agentic-cancer-gene-classification}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "started",
+                "query": "sum:acgc.openevidence.lookups.started{service:agentic-cancer-gene-classification}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "paid",
+                "query": "sum:acgc.openevidence.upstream.calls{service:agentic-cancer-gene-classification}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "cache",
+                "query": "sum:acgc.openevidence.cache.lookups{service:agentic-cancer-gene-classification,result:hit}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "impressions",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence,type:impression}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "opens",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence,type:open}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "requests",
+                "alias": "Endpoint requests (includes polls)"
+              },
+              {
+                "formula": "started",
+                "alias": "Background lookups started"
+              },
+              {
+                "formula": "paid",
+                "alias": "Paid attempts (includes warmup/retries)"
+              },
+              {
+                "formula": "cache",
+                "alias": "Cache peek hits (includes polls)"
+              },
+              {
+                "formula": "impressions",
+                "alias": "Card frame impressions"
+              },
+              {
+                "formula": "opens",
+                "alias": "Card opens (currently not emitted by UI)"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "query_value",
+        "title": "OpenEvidence fetched / viewed: paid attempts per card impression",
+        "requests": [
+          {
+            "response_format": "scalar",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "paid",
+                "query": "sum:acgc.openevidence.upstream.calls{service:agentic-cancer-gene-classification}.as_count()",
+                "aggregator": "sum"
+              },
+              {
+                "data_source": "metrics",
+                "name": "viewed",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence,type:impression}.as_count()",
+                "aggregator": "sum"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "paid / viewed",
+                "alias": "Paid attempts / card impression"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "OpenEvidence endpoint outcomes",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "requests",
+                "query": "sum:acgc.openevidence.endpoint.requests{service:agentic-cancer-gene-classification} by {outcome}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "requests",
+                "alias": "requests"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "OpenEvidence upstream attempts by source and status",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "calls",
+                "query": "sum:acgc.openevidence.upstream.calls{service:agentic-cancer-gene-classification} by {source,status}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "calls",
+                "alias": "calls"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "OpenEvidence cache peeks by result",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "peeks",
+                "query": "sum:acgc.openevidence.cache.lookups{service:agentic-cancer-gene-classification} by {result}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "peeks",
+                "alias": "peeks"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "OpenEvidence UI states: cached / pending / timeout / failed (and all transitions)",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "states",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence,type:state} by {state}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "states",
+                "alias": "states"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "OpenEvidence ready content impressions and guideline clicks",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "ready_views",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence_content,type:impression}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "guidelines",
+                "query": "sum:acgc.ui.events{service:agentic-cancer-gene-classification,section:openevidence_guideline_link,type:click}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "ready_views",
+                "alias": "ready_views"
+              },
+              {
+                "formula": "guidelines",
+                "alias": "guidelines"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "query_table",
+        "title": "Top genes by accepted UI event count",
+        "requests": [
+          {
+            "response_format": "scalar",
+            "queries": [
+              {
+                "data_source": "logs",
+                "name": "genes",
+                "indexes": [
+                  "*"
+                ],
+                "compute": {
+                  "aggregation": "count"
+                },
+                "search": {
+                  "query": "service:agentic-cancer-gene-classification \"ui_event\" @subject_kind:gene @subject_id:* @section:$section.value"
+                },
+                "group_by": [
+                  {
+                    "facet": "@subject_id",
+                    "limit": 10,
+                    "sort": {
+                      "aggregation": "count",
+                      "order": "desc"
+                    }
+                  }
+                ]
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "genes",
+                "alias": "genes"
+              }
+            ]
+          }
+        ],
+        "has_search_bar": "auto"
+      }
+    },
+    {
+      "definition": {
+        "type": "query_table",
+        "title": "Top items by section and item ID (accepted UI events)",
+        "requests": [
+          {
+            "response_format": "scalar",
+            "queries": [
+              {
+                "data_source": "logs",
+                "name": "items",
+                "indexes": [
+                  "*"
+                ],
+                "compute": {
+                  "aggregation": "count"
+                },
+                "search": {
+                  "query": "service:agentic-cancer-gene-classification \"ui_event\" @item_id:* @section:$section.value"
+                },
+                "group_by": [
+                  {
+                    "facet": "@section",
+                    "limit": 10,
+                    "sort": {
+                      "aggregation": "count",
+                      "order": "desc"
+                    }
+                  },
+                  {
+                    "facet": "@item_id",
+                    "limit": 10,
+                    "sort": {
+                      "aggregation": "count",
+                      "order": "desc"
+                    }
+                  }
+                ]
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "items",
+                "alias": "items"
+              }
+            ]
+          }
+        ],
+        "has_search_bar": "auto"
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "Intake health: batches by outcome",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "batches",
+                "query": "sum:acgc.ui.batches{service:agentic-cancer-gene-classification} by {outcome}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "batches",
+                "alias": "batches"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    },
+    {
+      "definition": {
+        "type": "timeseries",
+        "title": "Intake health: rejected events by reason",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "rejected",
+                "query": "sum:acgc.ui.events.rejected{service:agentic-cancer-gene-classification} by {reason}.as_count()"
+              }
+            ],
+            "formulas": [
+              {
+                "formula": "rejected",
+                "alias": "rejected"
+              }
+            ],
+            "display_type": "line"
+          }
+        ]
+      }
+    }
+  ],
+  "template_variables": [
+    {
+      "name": "variant",
+      "prefix": "variant",
+      "default": "*"
+    },
+    {
+      "name": "tab",
+      "prefix": "@item_id",
+      "default": "*"
+    },
+    {
+      "name": "section",
+      "prefix": "section",
+      "default": "*"
+    }
+  ]
+}
