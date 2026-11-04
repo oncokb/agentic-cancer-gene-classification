@@ -154,3 +154,117 @@ which only apply to fixed-reflow dashboards. Restore
 Neither the API script nor the UI route has been run against a live
 Datadog dashboard yet (no keys were available when this was written).
 Verify the result on the dashboard after importing.
+
+## UI engagement dashboard
+
+[`ui_engagement_dashboard.json`](ui_engagement_dashboard.json) is a complete
+standalone dashboard. It can be imported directly in one operation, without
+appending widgets to the existing OpenEvidence group. It follows the
+[Datadog dashboard API schema](https://docs.datadoghq.com/api/latest/dashboards/create-a-new-dashboard/).
+
+### Import
+
+In Datadog, create a dashboard, open **Configure → Import dashboard JSON**,
+and paste the entire file, then save. This imports all widgets at once. Use a
+new dashboard so an existing dashboard is not replaced. UI menu names can vary.
+
+Alternatively, from the repository root, create it with the API:
+
+```bash
+export DD_SITE="datadoghq.com"  # change for your Datadog site
+export DD_API_KEY="<YOUR_DD_API_KEY>"
+export DD_APP_KEY="<YOUR_DD_APP_KEY>"
+curl --fail-with-body -X POST "https://api.${DD_SITE}/api/v1/dashboard" \
+  -H "Content-Type: application/json" \
+  -H "DD-API-KEY: ${DD_API_KEY}" \
+  -H "DD-APPLICATION-KEY: ${DD_APP_KEY}" \
+  --data-binary @docs/datadog/ui_engagement_dashboard.json
+```
+
+Use your own environment credentials; never commit keys. Each POST creates a
+new dashboard. A live import has not been verified with organization credentials.
+
+### Signals and filters
+
+Enable both `UI_EVENTS_ENABLED` and `DATADOG_METRICS_ENABLED` for UI metrics.
+Production uses namespace `acgc` and service
+`agentic-cancer-gene-classification`. `src/ui_events.py:post_events` emits
+`ui.events` with `type`, `surface`, `section`, optional `state`, and optional
+`variant`; it also emits `ui.batches{outcome}` and
+`ui.events.rejected{reason}`. The namespace comes from
+`src/observability.py:_build_statsd`; the service tag comes from `DD_SERVICE`
+through DogStatsD. OpenEvidence names are constants in
+`src/pipeline/openevidence_metrics.py`; their emitters are
+`src/main.py:_record_openevidence_endpoint_request`, `_start_openevidence_sidecar_lookup`,
+`src/pipeline/openevidence.py:_record_upstream_call`, and `_record_cache_peek`.
+
+- `$section` filters the section funnel, UI section/variant charts, and top
+  gene/item logs. OpenEvidence widgets keep their fixed sections.
+- `$variant` filters UI metrics only. Values have the form `key.variant` and
+  are emitted only for exact pairs allowed by `UI_EVENTS_METRIC_FLAG_KEYS`.
+  The current browser sends `flags:null` until a flags provider is configured;
+  keep `*` selected until variants exist. No example variant values are baked
+  into the dashboard. Top gene/item logs are not variant-filtered: their
+  `flags` objects are not flattened metric variant tags.
+- `$tab` filters **only tab-selection logs**, using `@item_id`. There is no
+  emitted `tab` tag or log field. `switchResultsView` in `src/static/app.js`
+  records `type:open`, `section:tab`, `item_id:mode` (`results`, `fusion`, or
+  `noresult`); `tracking.js:build` omits its internal tab context from the wire
+  payload. The tab table counts selections, not time spent or per-tab card
+  engagement. Card events cannot be joined to a tab from their current fields.
+- Server OpenEvidence metrics have no UI section, variant, or tab dimension;
+  they remain service-wide when UI filters change.
+
+The section table presents **event counts** for surfaced → impression →
+open/expand → click, grouped by section. This is not a session-cohort funnel or
+unique-user conversion rate. `tracking.js` deduplicates surfaced/impression per
+logical element per page view; impressions require ≥50% visible for ≥1 second
+with the document visible and its tab active. Opens and clicks can repeat.
+Sections without controls have no opens; clicks on child links are attributed
+to their own sections (for example `openevidence_guideline_link`), not their
+parent card. A zero or absent stage can therefore be expected.
+
+### Log parsing and facets
+
+The handler logs `ui_event ` followed by `json.dumps(event.model_dump(...))`,
+with `page_view_id`, hashed `user_key`, `server_ts`, and `auth_provider` added.
+This JSON is embedded in the log message, not automatically a top-level JSON
+log. In the Datadog log pipeline scoped to this service and `ui_event` messages:
+
+1. Extract the JSON suffix after `ui_event ` (for example a Grok rule
+   `ui_event %{data::json}` on the message when it starts with that prefix;
+   account for any logging prefix in your ingestion format).
+2. Parse attributes into the root so queries use `@subject_id`, not a nested
+   extraction attribute. Inspect a real accepted event to verify extraction.
+3. Create string facets for `subject_kind`, `subject_id`, `item_id`, `section`,
+   `type`, `surface`, and `state`. The top-genes table groups `@subject_id`
+   restricted to `@subject_kind:gene`; the top-items table groups `@section`
+   and `@item_id`; the tab table groups `@item_id` restricted to `@section:tab`
+   and `@type:open`. Null IDs are excluded. IDs remain logs, never metric tags.
+4. Ensure accepted INFO events are indexed and retained for the dashboard
+   window. Counts reflect indexed logs and may differ from metrics if logs are
+   sampled, excluded, or retained for a shorter period. The top tables count
+   all accepted event types, not distinct users or click-only popularity.
+
+### Reading the OpenEvidence decision
+
+Compare service-wide paid upstream attempts with card-frame impressions over
+the same representative window (leave `$variant=*`). The fetched/viewed widget
+is `sum(acgc.openevidence.upstream.calls) / sum(acgc.ui.events{section:openevidence,type:impression})`:
+paid attempts per frame impression. A high ratio suggests checking whether
+prefetch/warmup is buying answers users rarely see. It is a diagnostic signal,
+not the fraction of fetched answers viewed: retries, warmup, multiple page
+views, and asynchronous window boundaries prevent a one-to-one mapping.
+The value is undefined when there are no impressions.
+
+Use upstream `source,status`, endpoint `outcome`, background `lookups.started`,
+and cache peek `result` alongside this ratio. Endpoint requests and cache peeks
+include polls; upstream calls count every paid attempt, including retries and
+warmup. A cache hit is not a new paid fetch. The state chart shows every UI
+transition, including cached/pending/timeout/failed; these are not distinct
+cards. Card-frame impressions may occur during loading, so compare ready-body
+`openevidence_content` impressions and guideline clicks before deciding to
+fetch only on demand. The current OpenEvidence card has no expand control;
+its explicitly plotted `type:open` series is expected to be empty. Do not
+interpret that as zero readership. Change fetching policy only after comparing
+these signals with latency and failure behavior in the existing server dashboard.
