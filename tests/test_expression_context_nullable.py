@@ -11,7 +11,10 @@ Fixture genes/MYCN.json mirrors what the producer emits:
 
 from __future__ import annotations
 
+import json
+import math
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -26,6 +29,7 @@ from tests.expression_context_helpers import (
     FakeLiteratureGate,
     add_artifacts,
     gene_file,
+    load_fixture,
     module_redis,
     url,
 )
@@ -131,3 +135,51 @@ def test_surfaced_sorting_tolerates_null_q_values():
     ]
     result = ExpressionContextService._gene_result("MYCN", rows, include_excluded=True)
     assert [p.oncotree_code for p in result.surfaced] == ["BRCA", "LUAD", "GBM", "STAD"]
+
+
+FLOOR = math.log2(11)  # method_version 2: RSEM 10
+
+
+def _v2_stats_pass(record: dict, params: dict) -> bool:
+    """Recompute the method_version 2 stats gate from a record's own fields."""
+    median, rest = record["median_log2"], record["rest_median_log2"]
+    if None in (median, rest, record["cliffs_delta"], record["q_value"]):
+        return False
+    return (
+        record["q_value"] < params["fdr"]
+        and record["log2fc"] >= params["log2fc"]
+        and record["cliffs_delta"] >= params["cliffs_delta"]
+        and median >= params["detection_log2"]
+        and record["n"] >= params["min_n"]
+    )
+
+
+@pytest.mark.parametrize("symbol", ["ERBB2", "MYCN"])
+def test_fixtures_are_consistent_with_method_v2(symbol):
+    """Fixture records must be what the v2 producer would emit: stats_pass
+    matches the gates, log2fc is the floor-clamped median difference, and a
+    pre-check is only recorded for stats-passing pairs."""
+    params = load_fixture("manifest.json")["params"]
+    assert load_fixture("manifest.json")["method_version"] == "2"
+    assert params["floor_log2"] == pytest.approx(FLOOR)
+    for record in gene_file(symbol)["cancer_types"]:
+        code = record["oncotree_code"]
+        assert record["stats_pass"] is _v2_stats_pass(record, params), code
+        if record["median_log2"] is not None and record["rest_median_log2"] is not None:
+            expected = max(record["median_log2"], FLOOR) - max(record["rest_median_log2"], FLOOR)
+            assert record["log2fc"] == pytest.approx(expected, abs=0.01), code
+        if not record["stats_pass"]:
+            assert record["literature_precheck_pass"] in (None, False), code
+
+
+def test_contract_doc_example_satisfies_method_v2():
+    doc = (Path(__file__).resolve().parents[1] / "docs/expression-context.md").read_text()
+    blocks = [b.split("```", 1)[0] for b in doc.split("```json")[1:]]
+    gene_example = json.loads(next(b for b in blocks if '"gene":' in b).replace("…", "x"))
+    manifest_example = json.loads(next(b for b in blocks if '"params"' in b))
+    record = gene_example["cancer_types"][0]
+    assert manifest_example["method_version"] == "2"
+    assert record["stats_pass"] is True and _v2_stats_pass(record, manifest_example["params"])
+    expected = max(record["median_log2"], FLOOR) - max(record["rest_median_log2"], FLOOR)
+    assert record["log2fc"] == pytest.approx(expected, abs=0.01)
+    CancerTypeStats.model_validate(record)

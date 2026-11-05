@@ -129,16 +129,22 @@ gene absent)
   "gene": {"hugo_symbol": "ERBB2", "entrez_gene_id": 2064},
   "cancer_types": [
     {"oncotree_code": "BRCA", "n": 1082, "n_rest": 8989,
-     "median_log2": 0.0, "rest_median_log2": 0.0,
-     "p90_log2": 0.0, "rest_p90_log2": 0.0,
-     "log2fc": 0.0, "log2fc_vs_median_of_type_medians": 0.0,
-     "cliffs_delta": 0.0, "auc": 0.0, "p_value": 0.0, "q_value": 0.0,
+     "median_log2": 6.2, "rest_median_log2": 3.1,
+     "p90_log2": 8.4, "rest_p90_log2": 5.3,
+     "log2fc": 2.74, "log2fc_vs_median_of_type_medians": 2.74,
+     "cliffs_delta": 0.71, "auc": 0.855, "p_value": 1.2e-41, "q_value": 3.8e-40,
      "stats_pass": true,
      "pubmed_count": 1234, "literature_precheck_pass": true,
      "flags": []}
   ]
 }
 ```
+
+In the example, `rest_median_log2` (3.1) is below the floor F = log2(11) ≈ 3.459,
+so `log2fc = max(6.2, F) − max(3.1, F) = 6.2 − 3.459 ≈ 2.74` (the pooled-rest and
+median-of-type-medians baselines are both clamped to F here); together with
+`cliffs_delta` 0.71 ≥ 0.5, `median_log2` 6.2 ≥ F, q < 0.05 and n ≥ 10 this gives
+`stats_pass: true`.
 
 `release_id` identifies the datahub commit, the method version and a build
 hash of the producer (so a code-only rebuild is a new release).

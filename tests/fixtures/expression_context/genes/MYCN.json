@@ -27,7 +27,7 @@
     {"oncotree_code": "UCEC", "n": 529, "n_rest": 9542,
      "median_log2": 5.1, "rest_median_log2": 5.0,
      "p90_log2": 7.0, "rest_p90_log2": 7.1,
-     "log2fc": 0.0, "log2fc_vs_median_of_type_medians": 0.0,
+     "log2fc": 0.1, "log2fc_vs_median_of_type_medians": 0.1,
      "cliffs_delta": 0.02, "auc": 0.51, "p_value": 0.6, "q_value": 0.7,
      "stats_pass": false, "pubmed_count": null, "literature_precheck_pass": null,
      "flags": []},
