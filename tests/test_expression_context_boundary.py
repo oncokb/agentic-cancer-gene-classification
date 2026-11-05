@@ -168,26 +168,33 @@ def ddl_recorder(monkeypatch):
     return calls
 
 
-def _expression_context_flag_set() -> bool:
-    return os.environ.get("EXPRESSION_CONTEXT_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-@pytest.mark.skipif(_expression_context_flag_set(), reason="EXPRESSION_CONTEXT_ENABLED set in env")
-def test_flag_off_app_boots_routes_404_and_no_ddl(monkeypatch, ddl_recorder):
+def _boot_flag_off_app(monkeypatch):
+    """An app wired exactly like src.main (its lifespan + the registration
+    call), with the flag forced off whatever the surrounding env says."""
     from src import main
 
+    monkeypatch.setenv("EXPRESSION_CONTEXT_ENABLED", "false")
     fake_run_store = SimpleNamespace(close=AsyncMock())
     monkeypatch.setattr(main, "RunStore", SimpleNamespace(create=AsyncMock(return_value=fake_run_store)))
+    app = FastAPI(lifespan=main.lifespan)
+    assert register_expression_context(app) is False
+    return app
 
-    assert _module_paths(main.app) == []
-    with TestClient(main.app) as client:
-        assert client.get("/health").status_code in (200, 404)  # booted
+
+@pytest.mark.httpx_mock(assert_all_requests_were_expected=True)
+def test_flag_off_app_boots_routes_404_no_ddl_no_outbound(monkeypatch, ddl_recorder, httpx_mock):
+    # No responses are registered: any outbound httpx request during boot or
+    # the requests below fails the test (pytest-httpx asserts at teardown).
+    app = _boot_flag_off_app(monkeypatch)
+    assert _module_paths(app) == []
+    with TestClient(app) as client:
         assert client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2"}).status_code == 404
         assert client.get(f"{PREFIX}/jobs/abc").status_code == 404
         assert client.get(f"{PREFIX}/genes/ERBB2").status_code == 404
         assert client.get(f"{PREFIX}/genes").status_code == 404
-        assert getattr(main.app.state, "expression_context", None) is None
+        assert getattr(app.state, "expression_context", None) is None
     assert ddl_recorder == []
+    assert httpx_mock.get_requests() == []
 
 
 def test_flag_on_default_factory_creates_table(ddl_recorder, monkeypatch):
@@ -203,18 +210,66 @@ def test_flag_on_default_factory_creates_table(ddl_recorder, monkeypatch):
         assert app.state.expression_context is not None
 
 
-@pytest.mark.skipif(_expression_context_flag_set(), reason="EXPRESSION_CONTEXT_ENABLED set in env")
-def test_flag_off_imports_no_module_internals():
-    """Importing the app with the flag off loads only the module's settings."""
+_REAL_MAIN_FLAG_OFF_SCRIPT = r"""
+import json, sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import httpx
+
+outbound = []
+for transport in (httpx.HTTPTransport, httpx.AsyncHTTPTransport):
+    def _record(self, request, *a, **k):
+        outbound.append(str(request.url))
+        raise httpx.ConnectError("outbound disabled in test", request=request)
+    if transport is httpx.HTTPTransport:
+        transport.handle_request = _record
+    else:
+        async def _arecord(self, request, *a, **k):
+            return _record(self, request)
+        transport.handle_async_request = _arecord
+
+from src import main
+# Snapshot before this script imports the store module for patching.
+loaded = sorted(m for m in sys.modules if m.startswith("src.expression_context"))
+
+from src.expression_context import store as ec_store
+ddl = []
+async def _create(cls, maxsize=2):
+    ddl.append("create_pool")
+async def _ensure(self):
+    ddl.append("ensure_schema")
+ec_store.MySQLExpressionContextStore.create = classmethod(_create)
+ec_store.MySQLExpressionContextStore.ensure_schema = _ensure
+
+main.RunStore = SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace(close=AsyncMock())))
+from fastapi.testclient import TestClient
+prefix = "/v1/expression-context"
+with TestClient(main.app) as client:
+    codes = [
+        client.post(prefix + "/jobs", json={"gene": "ERBB2"}).status_code,
+        client.get(prefix + "/jobs/abc").status_code,
+        client.get(prefix + "/genes/ERBB2").status_code,
+        client.get(prefix + "/genes").status_code,
+    ]
+print(json.dumps({"codes": codes, "ddl": ddl, "outbound": outbound, "loaded": loaded}))
+"""
+
+
+def test_real_main_flag_off_boots_404_no_ddl_no_outbound_no_internals():
+    """src.main itself, imported fresh in a subprocess with the flag forced off
+    (so this never depends on, or skips because of, the test runner's env)."""
+    import json
+
     env = {k: v for k, v in os.environ.items() if not k.startswith("EXPRESSION_CONTEXT_")}
-    code = (
-        "import sys, src.main; "
-        "print(sorted(m for m in sys.modules if m.startswith('src.expression_context')))"
-    )
+    env["EXPRESSION_CONTEXT_ENABLED"] = "false"  # beats any .env value
     out = subprocess.run(
-        [sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True,
-        timeout=120,
+        [sys.executable, "-c", _REAL_MAIN_FLAG_OFF_SCRIPT], cwd=ROOT, env=env,
+        capture_output=True, text=True, timeout=180,
     )
-    assert out.returncode == 0, out.stderr[-2000:]
-    loaded = out.stdout.strip().splitlines()[-1]
-    assert loaded == "['src.expression_context', 'src.expression_context.settings']"
+    assert out.returncode == 0, out.stderr[-3000:]
+    report = json.loads(out.stdout.strip().splitlines()[-1])
+    assert report["codes"] == [404, 404, 404, 404]
+    assert report["ddl"] == []
+    assert report["outbound"] == []
+    assert report["loaded"] == ["src.expression_context", "src.expression_context.settings"]

@@ -102,3 +102,5 @@ async def get_gene(
         raise HTTPException(
             status_code=404, detail=f"No stored expression-context result for {exc}."
         ) from exc
+    except ArtifactError as exc:
+        raise _artifact_http_error(exc) from exc

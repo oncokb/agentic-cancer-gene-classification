@@ -16,12 +16,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from src.expression_context.artifact_client import ArtifactClient, ArtifactContractError
+from src.expression_context.lease import VerdictLease, lease_key
 from src.expression_context.literature_gate import LiteratureGate, is_supported
 from src.expression_context.models import (
     CancerTypeStats,
@@ -89,13 +91,22 @@ class ExpressionContextService:
         jobs: JobStoreLike,
         literature_concurrency: int = 2,
         history_max_limit: int = 100,
+        lease: Optional[VerdictLease] = None,
+        lease_wait_seconds: float = 300.0,
+        lease_poll_seconds: float = 2.0,
     ) -> None:
         self.artifacts = artifacts
         self.gate = gate
         self.store = store
         self.jobs = jobs
-        self._literature_concurrency = literature_concurrency
+        # One bound for the whole process (the service is an app singleton),
+        # shared by every job, on concurrent literature-gate evaluations.
+        self._gate_slots = asyncio.Semaphore(literature_concurrency)
         self.history_max_limit = history_max_limit
+        self._lease = lease or VerdictLease(ttl_seconds=120.0)
+        self._lease_wait_seconds = lease_wait_seconds
+        self._lease_poll_seconds = lease_poll_seconds
+        self._inflight: Dict[Tuple[str, str, str, str], asyncio.Future] = {}
         self._tasks: Set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ gene
@@ -157,9 +168,9 @@ class ExpressionContextService:
         return job
 
     async def _run_job(self, job: JobRecord, resolved: ResolvedGene) -> None:
-        job.status = "running"
-        await self.jobs.put(job)
         try:
+            job.status = "running"
+            await self.jobs.put(job)
             result, evaluated, reused, errors = await self.evaluate(resolved, job.owner)
         except Exception as exc:
             logger.exception("Expression-context job %s failed", job.job_id)
@@ -229,30 +240,146 @@ class ExpressionContextService:
                 continue
             to_check.append((stats, cancer_type.tumor_type_query))
 
-        semaphore = asyncio.Semaphore(self._literature_concurrency)
-
         async def check(stats: CancerTypeStats, query: str):
-            async with semaphore:
-                try:
-                    return stats, await self.gate.evaluate(symbol, query), None
-                except Exception as exc:
-                    logger.warning(
-                        "Literature gate %s failed for %s/%s: %s",
-                        gate_name, symbol, stats.oncotree_code, exc,
-                    )
-                    return stats, None, f"{type(exc).__name__}: {exc}"[:300]
+            try:
+                verdict, was_reused = await self._single_flight_verdict(
+                    symbol, stats.oncotree_code, manifest.release_id, query,
+                    lambda verdict: _verdict_row(row, stats, verdict),
+                )
+                return stats, verdict, was_reused, None
+            except Exception as exc:
+                logger.warning(
+                    "Literature gate %s failed for %s/%s: %s",
+                    gate_name, symbol, stats.oncotree_code, exc,
+                )
+                return stats, None, False, f"{type(exc).__name__}: {exc}"[:300]
 
         evaluated = 0
-        for stats, verdict, error in await asyncio.gather(*(check(s, q) for s, q in to_check)):
+        outcomes = await asyncio.gather(*(check(s, q) for s, q in to_check))
+        for stats, verdict, was_reused, error in outcomes:
             if verdict is None:
                 errors.append(JobPairError(oncotree_code=stats.oncotree_code, error=error or ""))
                 continue
-            evaluated += 1
+            if was_reused:
+                reused += 1
+            else:
+                evaluated += 1
             rows.append(_verdict_row(row, stats, verdict))
 
         await self.store.upsert_pairs(rows)
         result = self._gene_result(symbol, rows, include_excluded=True)
         return result, evaluated, reused, errors
+
+    # ------------------------------------------------- literature single-flight
+
+    async def _single_flight_verdict(
+        self,
+        symbol: str,
+        oncotree_code: str,
+        release_id: str,
+        tumor_type_query: str,
+        make_row: Callable[[LiteratureVerdict], StoredPair],
+    ) -> Tuple[LiteratureVerdict, bool]:
+        """(verdict, reused) for one verdict key, computing it at most once.
+
+        In-process: concurrent jobs share one future per key. Cross-pod: a
+        Redis lease on the key; non-holders poll the store for the holder's
+        verdict (and take over if the holder gives up), falling back to their
+        own evaluation only after ``lease_wait_seconds``.
+        """
+        key = (symbol, oncotree_code, release_id, self.gate.name)
+        pending = self._inflight.get(key)
+        if pending is not None:
+            verdict, _ = await asyncio.shield(pending)
+            return verdict, True
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        # Waiters retrieve the exception; don't warn if there were none.
+        future.add_done_callback(lambda f: f.cancelled() or f.exception())
+        self._inflight[key] = future
+        try:
+            outcome = await self._resolve_verdict(key, tumor_type_query, make_row)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(outcome)
+            return outcome
+        finally:
+            self._inflight.pop(key, None)
+
+    async def _stored_verdict(self, key: Tuple[str, str, str, str]) -> Optional[LiteratureVerdict]:
+        symbol, oncotree_code, release_id, gate_name = key
+        prior = (await self.store.get_pairs(symbol, release_id, gate_name)).get(oncotree_code)
+        if prior is None or prior.evidence is None:
+            return None
+        return LiteratureVerdict.model_validate(prior.evidence)
+
+    async def _resolve_verdict(
+        self,
+        key: Tuple[str, str, str, str],
+        tumor_type_query: str,
+        make_row: Callable[[LiteratureVerdict], StoredPair],
+    ) -> Tuple[LiteratureVerdict, bool]:
+        lkey = lease_key(*key)
+        deadline = time.monotonic() + self._lease_wait_seconds
+        while True:
+            stored = await self._stored_verdict(key)
+            if stored is not None:
+                return stored, True
+            claim = await self._lease.claim(lkey)
+            if claim.outcome == "held":
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "Gave up waiting for another pod's literature verdict for %s; "
+                        "evaluating it here", lkey,
+                    )
+                    return await self._evaluate_and_store(key, tumor_type_query, make_row), False
+                await asyncio.sleep(self._lease_poll_seconds)
+                continue
+            try:
+                # Re-check: the previous holder may have stored it just now.
+                stored = await self._stored_verdict(key)
+                if stored is not None:
+                    return stored, True
+                verdict = await self._evaluate_and_store(
+                    key, tumor_type_query, make_row, lease=(lkey, claim.token)
+                )
+                return verdict, False
+            finally:
+                if claim.token:
+                    await self._lease.release(lkey, claim.token)
+
+    async def _evaluate_and_store(
+        self,
+        key: Tuple[str, str, str, str],
+        tumor_type_query: str,
+        make_row: Callable[[LiteratureVerdict], StoredPair],
+        lease: Optional[Tuple[str, Optional[str]]] = None,
+    ) -> LiteratureVerdict:
+        heartbeat = None
+        if lease is not None and lease[1]:
+            heartbeat = asyncio.create_task(self._heartbeat(*lease))
+        try:
+            async with self._gate_slots:
+                verdict = await self.gate.evaluate(key[0], tumor_type_query)
+            # Store before the lease is released so waiters find it.
+            await self.store.upsert_pairs([make_row(verdict)])
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+        return verdict
+
+    async def _heartbeat(self, lkey: str, token: str) -> None:
+        interval = max(self._lease.ttl_seconds / 3, 0.05)
+        while True:
+            await asyncio.sleep(interval)
+            if not await self._lease.renew(lkey, token):
+                logger.warning("Lost the literature lease %s while evaluating", lkey)
+                return
 
     # ---------------------------------------------------------------- reads
 
@@ -270,12 +397,9 @@ class ExpressionContextService:
         return self._gene_result(rows[0].hugo_symbol, rows, include_excluded)
 
     async def _alias_target(self, symbol: str) -> Optional[str]:
-        try:
-            manifest = await self.artifacts.get_manifest()
-            return (await self.artifacts.get_aliases(manifest.release_id)).get(symbol)
-        except Exception:
-            logger.info("Alias lookup unavailable for %s", symbol)
-            return None
+        # Artifact errors propagate (-> 502): an outage must not read as 404.
+        manifest = await self.artifacts.get_manifest()
+        return (await self.artifacts.get_aliases(manifest.release_id)).get(symbol)
 
     async def history(self, limit: int, cursor: Optional[str]) -> HistoryPage:
         decoded = decode_cursor(cursor) if cursor else None

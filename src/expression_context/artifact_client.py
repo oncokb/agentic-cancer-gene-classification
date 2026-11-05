@@ -27,7 +27,10 @@ from src.pipeline.cache import cached_call
 
 logger = logging.getLogger(__name__)
 
-_MISSING = {"__expression_context_missing__": True}
+
+
+class _GeneAbsent(Exception):
+    """Raised inside cached_call's compute so a 404 is never stored at the hit TTL."""
 
 
 class ArtifactError(RuntimeError):
@@ -40,6 +43,26 @@ class ArtifactUnavailable(ArtifactError):
 
 class ArtifactContractError(ArtifactError):
     """The artifact parsed but violates the contract (e.g. unknown schema_version)."""
+
+
+async def _redis_get(key: str) -> Any:
+    """Fail-open read through the same client cached_call uses."""
+    from src.pipeline import cache
+
+    try:
+        return await cache._get_client().get(key)
+    except Exception as exc:
+        logger.warning("Redis read failed for %r: %s", key, exc)
+        return None
+
+
+async def _redis_set(key: str, ttl_seconds: int) -> None:
+    from src.pipeline import cache
+
+    try:
+        await cache._get_client().set(key, "1", ex=ttl_seconds)
+    except Exception as exc:
+        logger.warning("Redis write failed for %r: %s", key, exc)
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -142,20 +165,25 @@ class ArtifactClient:
     ) -> Optional[GeneArtifact]:
         """The gene file, or None when the stats repo has no file for the symbol."""
         path = f"genes/{hugo_symbol}.json"
+        absent_key = self._key("gene_absent", release_id, hugo_symbol)
+        if not force_refresh and await _redis_get(absent_key) is not None:
+            return None
 
         async def fetch() -> Dict[str, Any]:
             payload = await self._get_json(path, allow_404=True)
             if payload is None:
-                return dict(_MISSING)
+                raise _GeneAbsent(path)
             return _check_schema_version(payload, path)
 
-        payload = await cached_call(
-            self._key("gene", release_id, hugo_symbol),
-            fetch,
-            ttl_seconds=self._settings.gene_cache_ttl_seconds,
-            force_refresh=force_refresh,
-        )
-        if isinstance(payload, dict) and payload.get(next(iter(_MISSING))):
+        try:
+            payload = await cached_call(
+                self._key("gene", release_id, hugo_symbol),
+                fetch,
+                ttl_seconds=self._settings.gene_cache_ttl_seconds,
+                force_refresh=force_refresh,
+            )
+        except _GeneAbsent:
+            await _redis_set(absent_key, self._settings.gene_negative_cache_ttl_seconds)
             return None
         payload = _check_schema_version(payload, path)
         try:

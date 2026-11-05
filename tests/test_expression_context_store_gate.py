@@ -216,3 +216,42 @@ async def test_pipeline_gate_errors(monkeypatch):
     monkeypatch.setattr(orchestrator, "run_pipeline", empty)
     with pytest.raises(LiteratureGateError):
         await AcgcPipelineGate(lambda: None).evaluate("ERBB2", "breast cancer")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"db_url": "jdbc:mysql://db.internal:3307/acgc?useSSL=false",
+         "db_username": "svc", "db_password": "pw"},
+        {"mysql_host": "h", "mysql_port": 1234, "mysql_user": "u", "mysql_password": "p",
+         "mysql_database": "d"},
+    ],
+)
+def test_connection_kwargs_match_run_store(monkeypatch, overrides):
+    """The module derives its pool kwargs from public settings with the same
+    precedence as the RunStore (compared here only; the module never imports it)."""
+    from src.config import settings
+    from src.expression_context.store import mysql_connection_kwargs
+    from src.pipeline import run_store
+
+    for name, value in overrides.items():
+        monkeypatch.setattr(settings, name, value)
+    assert mysql_connection_kwargs(settings) == run_store._mysql_connection_kwargs()
+
+
+def test_connection_kwargs_reject_bad_db_url(monkeypatch):
+    from src.config import settings
+    from src.expression_context.store import mysql_connection_kwargs
+
+    monkeypatch.setattr(settings, "db_url", "mysql://nope")
+    with pytest.raises(ValueError):
+        mysql_connection_kwargs(settings)
+
+
+def test_module_does_not_import_run_store_private_helpers():
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "src/expression_context/store.py").read_text()
+    assert "_mysql_connection_kwargs" not in source
+    assert "run_store" not in source

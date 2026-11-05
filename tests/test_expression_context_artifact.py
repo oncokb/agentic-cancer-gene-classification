@@ -175,3 +175,23 @@ async def test_cached_payload_with_unknown_version_rejected(httpx_mock, client, 
     await fake_redis.set(key, json.dumps(manifest(schema_version="2")))
     with pytest.raises(ArtifactContractError):
         await client.get_manifest()
+
+
+async def test_absent_gene_uses_short_negative_ttl(httpx_mock, fake_redis):
+    artifact_client = ArtifactClient(_settings(gene_negative_cache_ttl_seconds=300))
+    httpx_mock.add_response(url=url("genes/NOPE1.json"), status_code=404, is_reusable=True)
+    httpx_mock.add_response(url=url("genes/ERBB2.json"), json=gene_file())
+    try:
+        assert await artifact_client.get_gene("NOPE1", RELEASE_ID) is None
+        await artifact_client.get_gene("ERBB2", RELEASE_ID)
+        absent = [k for k in fake_redis.keys_with_prefix("expression_context:") if "absent" in k]
+        assert len(absent) == 1
+        # Hits keep the long TTL; the absence marker expires after 5 minutes.
+        hit = next(k for k in fake_redis.keys_with_prefix("expression_context:") if ":gene:" in k)
+        assert fake_redis._store[absent[0]][1] == fake_redis.now + 300
+        assert fake_redis._store[hit][1] == fake_redis.now + 86400
+        fake_redis.advance(301)
+        assert await artifact_client.get_gene("NOPE1", RELEASE_ID) is None
+        assert len(httpx_mock.get_requests(url=url("genes/NOPE1.json"))) == 2
+    finally:
+        await artifact_client.aclose()

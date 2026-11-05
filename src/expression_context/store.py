@@ -78,6 +78,31 @@ def _naive_utc(value: datetime) -> datetime:
     return _utc(value).replace(tzinfo=None)
 
 
+def mysql_connection_kwargs(acgc_settings: Any) -> Dict[str, Any]:
+    """Connection kwargs from ACGC's public settings, same precedence as the
+    RunStore uses: DB_URL (jdbc:mysql://host:port[/db][?...]) and
+    DB_USERNAME/DB_PASSWORD win over MYSQL_HOST/PORT/USER/PASSWORD."""
+    db_url = (acgc_settings.db_url or "").strip()
+    if db_url:
+        prefix = "jdbc:mysql://"
+        if not db_url.startswith(prefix):
+            raise ValueError(f"Expected a jdbc:mysql:// URL, got {db_url!r}")
+        host_port = db_url[len(prefix):].split("/", 1)[0].split("?", 1)[0]
+        host, sep, port = host_port.rpartition(":")
+        if not sep:
+            raise ValueError(f"jdbc:mysql URL missing port: {db_url!r}")
+        port_number = int(port)
+    else:
+        host, port_number = acgc_settings.mysql_host, acgc_settings.mysql_port
+    return {
+        "host": host,
+        "port": port_number,
+        "user": acgc_settings.db_username or acgc_settings.mysql_user,
+        "password": acgc_settings.db_password or acgc_settings.mysql_password,
+        "db": acgc_settings.mysql_database,
+    }
+
+
 class ExpressionContextStore(Protocol):
     async def ensure_schema(self) -> None: ...
 
@@ -167,10 +192,9 @@ class MySQLExpressionContextStore:
         import aiomysql
 
         from src.config import settings as acgc_settings
-        from src.pipeline.run_store import _mysql_connection_kwargs
 
         pool = await aiomysql.create_pool(
-            **_mysql_connection_kwargs(),
+            **mysql_connection_kwargs(acgc_settings),
             autocommit=True,
             minsize=1,
             maxsize=maxsize,

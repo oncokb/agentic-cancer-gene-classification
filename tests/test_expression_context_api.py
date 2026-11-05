@@ -8,6 +8,7 @@ module's in-memory implementation, so nothing needs MySQL, Redis or an LLM.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -353,3 +354,47 @@ def test_service_closed_on_shutdown(harness):
         service.store.close = close
     assert closed == [True]
     assert harness.app.state.expression_context is None
+
+
+def test_alias_lookup_during_artifact_outage_is_502(httpx_mock, client):
+    # Nothing stored for HER2, so the read resolves the alias -> artifact is down.
+    httpx_mock.add_response(url=url("manifest.json"), status_code=503, is_reusable=True)
+    response = client.get(f"{PREFIX}/genes/HER2")
+    assert response.status_code == 502
+    assert "unavailable" in response.json()["detail"]
+
+
+def test_alias_lookup_contract_violation_is_502(httpx_mock, client):
+    httpx_mock.add_response(url=url("manifest.json"), json=manifest(schema_version="2"))
+    assert client.get(f"{PREFIX}/genes/HER2").status_code == 502
+
+
+async def test_running_status_write_failure_marks_job_failed(httpx_mock):
+    add_artifacts(httpx_mock)
+
+    class FlakyJobs:
+        def __init__(self):
+            self.jobs = {}
+
+        async def put(self, job):
+            if job.status == "running":
+                raise RuntimeError("job store down")
+            self.jobs[job.job_id] = job.model_copy(deep=True)
+
+        async def get(self, job_id):
+            return self.jobs.get(job_id)
+
+    settings = ExpressionContextSettings(
+        enabled=True, artifact_base_url=BASE_URL, http_retry_backoff_seconds=0
+    )
+    gate = FakeLiteratureGate()
+    service = ExpressionContextService(
+        artifacts=ArtifactClient(settings), gate=gate,
+        store=InMemoryExpressionContextStore(), jobs=FlakyJobs(),
+    )
+    job = await service.submit("ERBB2", owner="alice@example.org")
+    await asyncio.gather(*service._tasks)
+    stored = await service.jobs.get(job.job_id)
+    assert stored.status == "failed" and "job store down" in stored.error
+    assert stored.finished_at is not None and gate.calls == []
+    await service.aclose()

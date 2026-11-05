@@ -31,6 +31,7 @@ __all__ = ["ExpressionContextSettings", "register_expression_context"]
 
 async def _default_service_factory(app: Any, settings: ExpressionContextSettings) -> Any:
     from src.expression_context.artifact_client import ArtifactClient
+    from src.expression_context.lease import VerdictLease
     from src.expression_context.literature_gate import AcgcPipelineGate
     from src.expression_context.models import JobRecord
     from src.expression_context.service import ExpressionContextService
@@ -52,6 +53,9 @@ async def _default_service_factory(app: Any, settings: ExpressionContextSettings
         jobs=JobStore("expression_context", JobRecord),
         literature_concurrency=settings.literature_concurrency,
         history_max_limit=settings.history_max_limit,
+        lease=VerdictLease(ttl_seconds=settings.lease_ttl_seconds),
+        lease_wait_seconds=settings.lease_wait_seconds,
+        lease_poll_seconds=settings.lease_poll_seconds,
     )
 
 

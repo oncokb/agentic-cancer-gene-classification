@@ -39,11 +39,20 @@ class ExpressionContextSettings(BaseSettings):
     # keyed by release_id, so they can live longer than the manifest.
     manifest_cache_ttl_seconds: int = Field(default=3600, ge=1)
     gene_cache_ttl_seconds: int = Field(default=86400, ge=1)
+    # "Gene file absent" (404) is cached much more briefly than a hit.
+    gene_negative_cache_ttl_seconds: int = Field(default=300, ge=1)
 
     # Literature gate implementation (the stored verdict key includes it).
     literature_gate: Literal["acgc_pipeline_v1"] = "acgc_pipeline_v1"
-    # Max literature-gate evaluations running at once within one job.
+    # Max literature-gate evaluations running at once in this process,
+    # shared across all jobs.
     literature_concurrency: int = Field(default=2, ge=1, le=16)
+    # Cross-pod single-flight lease on a verdict key (renewed while the gate
+    # runs); non-holders poll the store for the holder's verdict and fall
+    # back to evaluating themselves after lease_wait_seconds.
+    lease_ttl_seconds: float = Field(default=120.0, gt=0)
+    lease_wait_seconds: float = Field(default=600.0, ge=0)
+    lease_poll_seconds: float = Field(default=2.0, gt=0)
     # Annotation mode for the ACGC pipeline gate.
     pipeline_mode: Literal["full", "core"] = "full"
 
