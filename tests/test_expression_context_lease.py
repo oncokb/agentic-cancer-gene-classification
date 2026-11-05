@@ -16,8 +16,17 @@ from src.expression_context.service import ExpressionContextService
 from src.expression_context.settings import ExpressionContextSettings
 from src.expression_context.store import InMemoryExpressionContextStore
 from src.job_store import JobStore
-from tests.conftest import FakeRedis
-from tests.expression_context_helpers import BASE_URL, RELEASE_ID, FakeLiteratureGate, add_artifacts
+from src.expression_context.redis_client import ModuleRedis, build_client
+from tests.conftest import destructive_tests_allowed
+from tests.expression_context_helpers import (
+    BASE_URL,
+    RELEASE_ID,
+    DownRedis,
+    FakeLiteratureGate,
+    LeaseFakeRedis,
+    add_artifacts,
+    module_redis,
+)
 from tests.test_expression_context_api import PREFIX, Harness, wait_for_job
 
 pytestmark = [
@@ -56,12 +65,12 @@ def _settings():
 def _pod(gate, store, redis, *, concurrency=4, wait=5.0, lease_ttl=5.0):
     """One 'pod': its own service (in-flight map, semaphore) on shared store + Redis."""
     return ExpressionContextService(
-        artifacts=ArtifactClient(_settings()),
+        artifacts=ArtifactClient(_settings(), redis=module_redis(redis)),
         gate=gate,
         store=store,
         jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
         literature_concurrency=concurrency,
-        lease=VerdictLease(ttl_seconds=lease_ttl, client_factory=lambda: redis),
+        lease=VerdictLease(ttl_seconds=lease_ttl, redis=module_redis(redis)),
         lease_wait_seconds=wait,
         lease_poll_seconds=0.01,
     )
@@ -70,39 +79,131 @@ def _pod(gate, store, redis, *, concurrency=4, wait=5.0, lease_ttl=5.0):
 # ------------------------------------------------------------------ lease unit
 
 
+KEY = lease_key("ERBB2", "BRCA", RELEASE_ID, "acgc_pipeline_v1")
+
+
 async def test_lease_claim_hold_release_renew():
-    redis = FakeRedis()
-    lease = VerdictLease(ttl_seconds=10, client_factory=lambda: redis)
-    key = lease_key("ERBB2", "BRCA", RELEASE_ID, "acgc_pipeline_v1")
-    first = await lease.claim(key)
+    redis = LeaseFakeRedis()
+    lease = VerdictLease(ttl_seconds=10, redis=module_redis(redis))
+    first = await lease.claim(KEY)
     assert first.outcome == "claimed" and first.token
-    assert (await lease.claim(key)).outcome == "held"
-    assert await lease.is_held(key)
+    assert (await lease.claim(KEY)).outcome == "held"
     # Only the owner can renew or release.
-    assert await lease.renew(key, "someone-else") is False
-    await lease.release(key, "someone-else")
-    assert await lease.is_held(key)
-    assert await lease.renew(key, first.token) is True
-    await lease.release(key, first.token)
-    assert not await lease.is_held(key)
+    assert await lease.renew(KEY, "someone-else") is False
+    assert await lease.release(KEY, "someone-else") is False
+    assert redis._live(KEY).decode() == first.token
+    redis.advance(5)
+    assert await lease.renew(KEY, first.token) is True
+    assert redis.expires_at(KEY) == redis.now + 10
+    assert await lease.release(KEY, first.token) is True
+    assert redis._live(KEY) is None
     # TTL bounds a dead holder.
-    again = await lease.claim(key)
+    assert (await lease.claim(KEY)).outcome == "claimed"
     redis.advance(11)
-    assert (await lease.claim(key)).outcome == "claimed" and again.token
+    assert (await lease.claim(KEY)).outcome == "claimed"
+
+
+async def _expire_and_reclaim(redis, new_lease, holder):
+    """Another pod's move: the old lease expires and a new holder claims it."""
+    redis.advance(2)
+    holder.append(await new_lease.claim(KEY))
+
+
+@pytest.mark.parametrize("operation", ["renew", "release"])
+async def test_stale_holder_never_touches_new_holders_lease(operation):
+    """Expiry + a new claim lands between the old holder's ownership check and
+    its mutation: the new holder's lease must survive intact."""
+    redis = LeaseFakeRedis()
+    old = VerdictLease(ttl_seconds=1, redis=module_redis(redis))
+    new = VerdictLease(ttl_seconds=10, redis=module_redis(redis))
+    old_claim = await old.claim(KEY)
+    new_claim = []
+    redis.race = lambda: _expire_and_reclaim(redis, new, new_claim)
+
+    result = await getattr(old, operation)(KEY, old_claim.token)
+
+    assert result is False
+    assert new_claim[0].outcome == "claimed"
+    assert redis._live(KEY).decode() == new_claim[0].token
+    assert redis.expires_at(KEY) == redis.now + 10  # not shortened to the old TTL either
+
+
+def test_lease_scripts_are_compare_and_act():
+    from src.expression_context import lease
+
+    for script, action in ((lease.RENEW_SCRIPT, "PEXPIRE"), (lease.RELEASE_SCRIPT, "DEL")):
+        assert 'redis.call("GET", KEYS[1]) == ARGV[1]' in script
+        assert action in script
+
+
+@pytest.fixture
+async def real_redis():
+    if not destructive_tests_allowed():
+        pytest.skip("real Redis only in CI mode (ACGC_ALLOW_DESTRUCTIVE_TESTS=1)")
+    module = ModuleRedis(factory=build_client)
+    try:
+        await module.client().ping()
+    except Exception as exc:
+        pytest.skip(f"Redis not reachable: {exc}")
+    yield module
+    try:
+        await module.client().delete(KEY)
+    finally:
+        await module.aclose()
+
+
+async def test_lease_scripts_on_real_redis(real_redis):
+    old = VerdictLease(ttl_seconds=30, redis=real_redis)
+    first = await old.claim(KEY)
+    assert first.outcome == "claimed"
+    assert await old.renew(KEY, "intruder") is False
+    assert await old.release(KEY, "intruder") is False
+    assert await old.renew(KEY, first.token) is True
+    assert 0 < await real_redis.client().pttl(KEY) <= 30_000
+    assert await old.release(KEY, first.token) is True
+    assert await real_redis.client().get(KEY) is None
 
 
 async def test_lease_fails_open_without_redis():
-    class Down:
-        async def set(self, *a, **k):
-            raise ConnectionError("down")
-
-        async def get(self, *a, **k):
-            raise ConnectionError("down")
-
-    lease = VerdictLease(ttl_seconds=1, client_factory=lambda: Down())
+    lease = VerdictLease(ttl_seconds=1, redis=module_redis(DownRedis()))
     assert await lease.claim("k") == Claim("unavailable")
-    assert await lease.is_held("k") is False
-    await lease.release("k", "t")  # no raise
+    assert await lease.renew("k", "t") is True
+    assert await lease.release("k", "t") is False  # no raise
+
+
+async def test_module_redis_backs_off_after_error():
+    calls = []
+
+    class Counting(DownRedis):
+        async def get(self, *a, **k):
+            calls.append(1)
+            raise ConnectionError("down")
+
+    now = [0.0]
+    module = ModuleRedis(factory=lambda: Counting(), clock=lambda: now[0])
+    assert await module.get("k") is None
+    assert await module.get("k") is None  # skipped during back-off
+    assert calls == [1]
+    now[0] += 31
+    assert await module.get("k") is None
+    assert calls == [1, 1]
+
+
+async def test_module_redis_is_lazy_and_closed():
+    built, closed = [], []
+
+    class Client:
+        async def aclose(self):
+            closed.append(1)
+
+    module = ModuleRedis(factory=lambda: built.append(1) or Client())
+    assert built == []
+    module.client()
+    module.client()
+    assert built == [1]
+    await module.aclose()
+    await module.aclose()
+    assert closed == [1]
 
 
 # -------------------------------------------------------- in-process (one pod)
@@ -129,7 +230,7 @@ def test_concurrent_duplicate_jobs_call_gate_once_per_key(httpx_mock):
 async def test_concurrency_bound_is_shared_across_jobs(httpx_mock):
     add_artifacts(httpx_mock)
     gate = SlowGate(delay=0.02)
-    pod = _pod(gate, InMemoryExpressionContextStore(), FakeRedis(), concurrency=1)
+    pod = _pod(gate, InMemoryExpressionContextStore(), LeaseFakeRedis(), concurrency=1)
     resolved = await pod.resolve("ERBB2")
     other = resolved.__class__(
         query="x", hugo_symbol="OTHER1", manifest=resolved.manifest, artifact=resolved.artifact
@@ -145,7 +246,7 @@ async def test_concurrency_bound_is_shared_across_jobs(httpx_mock):
 
 async def test_two_pods_share_one_evaluation_per_key(httpx_mock):
     add_artifacts(httpx_mock)
-    store, redis = InMemoryExpressionContextStore(), FakeRedis()
+    store, redis = InMemoryExpressionContextStore(), LeaseFakeRedis()
     gate_a, gate_b = SlowGate(delay=0.1), SlowGate(delay=0.1)
     pod_a, pod_b = _pod(gate_a, store, redis), _pod(gate_b, store, redis)
     resolved_a, resolved_b = await pod_a.resolve("ERBB2"), await pod_b.resolve("ERBB2")
@@ -165,7 +266,7 @@ async def test_two_pods_share_one_evaluation_per_key(httpx_mock):
 
 async def test_waiter_takes_over_when_holder_fails(httpx_mock):
     add_artifacts(httpx_mock)
-    store, redis = InMemoryExpressionContextStore(), FakeRedis()
+    store, redis = InMemoryExpressionContextStore(), LeaseFakeRedis()
     failing = SlowGate(delay=0.05)
     failing.fail_for = set(QUERIES)
     healthy = SlowGate(delay=0.0)
@@ -189,7 +290,7 @@ async def test_waiter_takes_over_when_holder_fails(httpx_mock):
 
 async def test_waiter_falls_back_after_wait_timeout(httpx_mock):
     add_artifacts(httpx_mock)
-    redis = FakeRedis()
+    redis = LeaseFakeRedis()
     gate = SlowGate(delay=0.0)
     pod = _pod(gate, InMemoryExpressionContextStore(), redis, wait=0.05)
     resolved = await pod.resolve("ERBB2")
@@ -208,16 +309,8 @@ async def test_waiter_falls_back_after_wait_timeout(httpx_mock):
 
 async def test_redis_down_still_dedupes_in_process(httpx_mock):
     add_artifacts(httpx_mock)
-
-    class Down:
-        async def set(self, *a, **k):
-            raise ConnectionError("down")
-
-        async def get(self, *a, **k):
-            raise ConnectionError("down")
-
     gate = SlowGate(delay=0.05)
-    pod = _pod(gate, InMemoryExpressionContextStore(), Down())
+    pod = _pod(gate, InMemoryExpressionContextStore(), DownRedis())
     resolved = await pod.resolve("ERBB2")
     results = await asyncio.gather(*(pod.evaluate(resolved, None) for _ in range(3)))
     assert sorted(q for _, q in gate.calls) == QUERIES
@@ -227,9 +320,9 @@ async def test_redis_down_still_dedupes_in_process(httpx_mock):
 
 async def test_lease_renewed_while_gate_runs(httpx_mock):
     add_artifacts(httpx_mock)
-    redis = FakeRedis()
+    redis = LeaseFakeRedis()
     renewals = []
-    lease = VerdictLease(ttl_seconds=0.15, client_factory=lambda: redis)
+    lease = VerdictLease(ttl_seconds=0.15, redis=module_redis(redis))
     original = lease.renew
 
     async def renew(key, token):
@@ -239,7 +332,7 @@ async def test_lease_renewed_while_gate_runs(httpx_mock):
     lease.renew = renew
     gate = SlowGate(delay=0.2, verdicts={"breast cancer": (False, ["1"])})
     pod = ExpressionContextService(
-        artifacts=ArtifactClient(_settings()), gate=gate,
+        artifacts=ArtifactClient(_settings(), redis=module_redis(redis)), gate=gate,
         store=InMemoryExpressionContextStore(),
         jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
         lease=lease, lease_poll_seconds=0.01,
@@ -247,4 +340,51 @@ async def test_lease_renewed_while_gate_runs(httpx_mock):
     resolved = await pod.resolve("ERBB2")
     await pod.evaluate(resolved, None)
     assert renewals  # heartbeat ran during the 0.2 s gate call
+    await pod.artifacts.aclose()
+
+
+async def test_waiters_recover_when_single_flight_leader_is_cancelled(httpx_mock):
+    add_artifacts(httpx_mock)
+    redis = LeaseFakeRedis()
+    gate = SlowGate(delay=0.2)
+    pod = _pod(gate, InMemoryExpressionContextStore(), redis)
+    resolved = await pod.resolve("ERBB2")
+
+    leader = asyncio.create_task(pod.evaluate(resolved, None))
+    await asyncio.sleep(0.05)  # leader owns every in-flight key and lease
+    waiters = [asyncio.create_task(pod.evaluate(resolved, None)) for _ in range(2)]
+    await asyncio.sleep(0.05)  # waiters are parked on the leader's futures
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    results = await asyncio.gather(*waiters)
+    assert all(errors == [] for _, _, _, errors in results)
+    assert all([p.oncotree_code for p in res.surfaced] == ["BRCA"] for res, _, _, _ in results)
+    # The leader's 3 calls were cancelled mid-flight (SlowGate records only
+    # completed calls); one waiter re-ran each key, the other reused it.
+    assert gate.max_active >= 3
+    assert sorted(q for _, q in gate.calls) == QUERIES
+    assert sum(evaluated for _, evaluated, _, _ in results) == 3
+    assert sum(reused for _, _, reused, _ in results) == 3
+    assert pod._inflight == {}
+    assert redis.keys_with_prefix("expression_context:lease:") == []
+    await pod.artifacts.aclose()
+
+
+async def test_cancelled_waiter_does_not_take_over(httpx_mock):
+    add_artifacts(httpx_mock)
+    gate = SlowGate(delay=0.2)
+    pod = _pod(gate, InMemoryExpressionContextStore(), LeaseFakeRedis())
+    resolved = await pod.resolve("ERBB2")
+    leader = asyncio.create_task(pod.evaluate(resolved, None))
+    await asyncio.sleep(0.05)
+    waiter = asyncio.create_task(pod.evaluate(resolved, None))
+    await asyncio.sleep(0.05)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    _, evaluated, _, errors = await leader
+    assert evaluated == 3 and errors == []
+    assert len(gate.calls) == 3
     await pod.artifacts.aclose()

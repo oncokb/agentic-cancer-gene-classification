@@ -35,6 +35,10 @@ class ExpressionContextSettings(BaseSettings):
     http_retry_backoff_seconds: float = Field(default=1.0, ge=0)
     http_retry_backoff_max_seconds: float = Field(default=8.0, ge=0)
 
+    # Redis for the module's lease and negative-cache keys. Empty = ACGC's
+    # REDIS_URL / REDIS_SENTINEL_* settings (read, never modified).
+    redis_url: str = ""
+
     # Redis cached_call TTLs for the artifact files. Gene and alias files are
     # keyed by release_id, so they can live longer than the manifest.
     manifest_cache_ttl_seconds: int = Field(default=3600, ge=1)

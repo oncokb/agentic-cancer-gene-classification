@@ -28,11 +28,14 @@ from tests.expression_context_helpers import (
     BASE_URL,
     RELEASE_ID,
     FakeLiteratureGate,
+    LeaseFakeRedis,
     add_artifacts,
     gene_file,
     manifest,
+    module_redis,
     url,
 )
+from src.expression_context.lease import VerdictLease
 
 pytestmark = [
     pytest.mark.no_real_redis,
@@ -49,6 +52,7 @@ class Harness:
         self.gate = gate or FakeLiteratureGate()
         self.store = store or InMemoryExpressionContextStore()
         self.user = ALICE
+        self.redis = LeaseFakeRedis()
         self.app = FastAPI()
         settings = ExpressionContextSettings(
             enabled=True, artifact_base_url=BASE_URL, http_retry_backoff_seconds=0
@@ -56,10 +60,12 @@ class Harness:
 
         async def factory(app, s):
             return ExpressionContextService(
-                artifacts=ArtifactClient(s),
+                artifacts=ArtifactClient(s, redis=module_redis(self.redis)),
                 gate=self.gate,
                 store=self.store,
                 jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
+                lease=VerdictLease(ttl_seconds=5, redis=module_redis(self.redis)),
+                lease_poll_seconds=0.01,
             )
 
         assert register_expression_context(self.app, settings=settings, service_factory=factory)
@@ -388,9 +394,11 @@ async def test_running_status_write_failure_marks_job_failed(httpx_mock):
         enabled=True, artifact_base_url=BASE_URL, http_retry_backoff_seconds=0
     )
     gate = FakeLiteratureGate()
+    redis = LeaseFakeRedis()
     service = ExpressionContextService(
-        artifacts=ArtifactClient(settings), gate=gate,
+        artifacts=ArtifactClient(settings, redis=module_redis(redis)), gate=gate,
         store=InMemoryExpressionContextStore(), jobs=FlakyJobs(),
+        lease=VerdictLease(ttl_seconds=5, redis=module_redis(redis)),
     )
     job = await service.submit("ERBB2", owner="alice@example.org")
     await asyncio.gather(*service._tasks)

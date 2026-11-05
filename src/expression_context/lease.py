@@ -1,15 +1,17 @@
-"""Best-effort cross-pod lease on a literature-verdict key (Redis SET NX PX).
+"""Best-effort cross-pod lease on a literature-verdict key.
 
 Only one holder should run the (expensive) literature gate for a given
 (hugo_symbol, oncotree_code, release_id, literature_gate) at a time. Other
 pods wait for the holder's stored verdict instead of duplicating the work.
 
+- claim: ``SET key token NX PX ttl``.
+- renew / release: owner-safe Lua (compare-and-PEXPIRE / compare-and-DEL), so
+  a holder whose lease expired can never extend or delete a newer holder's
+  lease.
+
 Fails open like the rest of ACGC's Redis use: if Redis is unreachable the
 claim reports ``unavailable`` and the caller proceeds with only in-process
-de-duplication. Release and renewal are compare-then-act (GET, then DEL/SET)
-rather than Lua, so they also work against the test FakeRedis; the tiny race
-(the lease expiring between the GET and the DEL) can at worst cause one
-duplicate gate call, and the store re-check after every claim bounds that.
+de-duplication.
 """
 
 from __future__ import annotations
@@ -17,21 +19,31 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Literal, Optional
+
+from src.expression_context.redis_client import ModuleRedis, RedisUnavailable
 
 logger = logging.getLogger(__name__)
 
 LEASE_PREFIX = "expression_context:lease:"
 
+# KEYS[1]=lease key, ARGV[1]=owner token, ARGV[2]=ttl ms
+RENEW_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+# KEYS[1]=lease key, ARGV[1]=owner token
+RELEASE_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+"""
+
 ClaimOutcome = Literal["claimed", "held", "unavailable"]
-
-
-def _default_client() -> Any:
-    # Same shared client (and Sentinel handling) as the reference-data cache
-    # and JobStore use.
-    from src.pipeline import cache
-
-    return cache._get_client()
 
 
 def lease_key(hugo_symbol: str, oncotree_code: str, release_id: str, literature_gate: str) -> str:
@@ -45,52 +57,46 @@ class Claim:
 
 
 class VerdictLease:
-    def __init__(self, ttl_seconds: float, client_factory: Callable[[], Any] = _default_client):
+    def __init__(self, ttl_seconds: float, redis: Optional[ModuleRedis] = None):
         self.ttl_seconds = ttl_seconds
         self._ttl_ms = max(1, int(ttl_seconds * 1000))
-        self._client_factory = client_factory
+        self.redis = redis or ModuleRedis()
 
     async def claim(self, key: str) -> Claim:
         token = uuid.uuid4().hex
         try:
-            acquired = await self._client_factory().set(key, token, px=self._ttl_ms, nx=True)
+            acquired = await self.redis.client().set(key, token, px=self._ttl_ms, nx=True)
         except Exception as exc:
+            if not isinstance(exc, RedisUnavailable):
+                self.redis.mark_down(exc)
             logger.warning(
-                "Expression-context lease claim failed for %r (%s); proceeding without a "
+                "Expression-context lease claim unavailable for %r (%s); proceeding without a "
                 "cross-pod lease, so another pod may duplicate this literature check",
                 key, exc,
             )
             return Claim("unavailable")
         return Claim("claimed", token) if acquired else Claim("held")
 
-    async def is_held(self, key: str) -> bool:
-        """Whether anyone holds the lease. Unknown (Redis error) counts as not held."""
+    async def renew(self, key: str, token: str) -> bool:
+        """Extend the lease iff ``token`` still owns it. False if it doesn't;
+        True (fail open) if Redis is unreachable."""
         try:
-            return await self._client_factory().get(key) is not None
-        except Exception:
+            return bool(await self.redis.client().eval(RENEW_SCRIPT, 1, key, token, self._ttl_ms))
+        except Exception as exc:
+            if not isinstance(exc, RedisUnavailable):
+                self.redis.mark_down(exc)
+            logger.warning("Expression-context lease renewal unavailable for %r: %s", key, exc)
+            return True
+
+    async def release(self, key: str, token: str) -> bool:
+        """Delete the lease iff ``token`` still owns it."""
+        try:
+            return bool(await self.redis.client().eval(RELEASE_SCRIPT, 1, key, token))
+        except Exception as exc:
+            if not isinstance(exc, RedisUnavailable):
+                self.redis.mark_down(exc)
+            logger.warning("Expression-context lease release unavailable for %r: %s", key, exc)
             return False
 
-    async def _owned(self, client: Any, key: str, token: str) -> bool:
-        current = await client.get(key)
-        if isinstance(current, bytes):
-            current = current.decode()
-        return current == token
-
-    async def renew(self, key: str, token: str) -> bool:
-        try:
-            client = self._client_factory()
-            if not await self._owned(client, key, token):
-                return False
-            await client.set(key, token, px=self._ttl_ms)
-            return True
-        except Exception as exc:
-            logger.warning("Expression-context lease renewal failed for %r: %s", key, exc)
-            return True
-
-    async def release(self, key: str, token: str) -> None:
-        try:
-            client = self._client_factory()
-            if await self._owned(client, key, token):
-                await client.delete(key)
-        except Exception as exc:
-            logger.warning("Expression-context lease release failed for %r: %s", key, exc)
+    async def aclose(self) -> None:
+        await self.redis.aclose()

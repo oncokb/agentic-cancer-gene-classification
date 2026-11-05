@@ -33,6 +33,7 @@ async def _default_service_factory(app: Any, settings: ExpressionContextSettings
     from src.expression_context.artifact_client import ArtifactClient
     from src.expression_context.lease import VerdictLease
     from src.expression_context.literature_gate import AcgcPipelineGate
+    from src.expression_context.redis_client import ModuleRedis
     from src.expression_context.models import JobRecord
     from src.expression_context.service import ExpressionContextService
     from src.expression_context.store import MySQLExpressionContextStore
@@ -44,8 +45,9 @@ async def _default_service_factory(app: Any, settings: ExpressionContextSettings
     except BaseException:
         await store.close()
         raise
+    redis = ModuleRedis(redis_url=settings.redis_url)  # one lazily-built client, shared
     return ExpressionContextService(
-        artifacts=ArtifactClient(settings),
+        artifacts=ArtifactClient(settings, redis=redis),
         gate=AcgcPipelineGate(
             lambda: getattr(app.state, "run_store", None), mode=settings.pipeline_mode
         ),
@@ -53,7 +55,7 @@ async def _default_service_factory(app: Any, settings: ExpressionContextSettings
         jobs=JobStore("expression_context", JobRecord),
         literature_concurrency=settings.literature_concurrency,
         history_max_limit=settings.history_max_limit,
-        lease=VerdictLease(ttl_seconds=settings.lease_ttl_seconds),
+        lease=VerdictLease(ttl_seconds=settings.lease_ttl_seconds, redis=redis),
         lease_wait_seconds=settings.lease_wait_seconds,
         lease_poll_seconds=settings.lease_poll_seconds,
     )

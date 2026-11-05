@@ -22,6 +22,7 @@ from pydantic import ValidationError
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.expression_context.models import SUPPORTED_SCHEMA_VERSION, GeneArtifact, Manifest
+from src.expression_context.redis_client import ModuleRedis
 from src.expression_context.settings import ExpressionContextSettings
 from src.pipeline.cache import cached_call
 
@@ -43,26 +44,6 @@ class ArtifactUnavailable(ArtifactError):
 
 class ArtifactContractError(ArtifactError):
     """The artifact parsed but violates the contract (e.g. unknown schema_version)."""
-
-
-async def _redis_get(key: str) -> Any:
-    """Fail-open read through the same client cached_call uses."""
-    from src.pipeline import cache
-
-    try:
-        return await cache._get_client().get(key)
-    except Exception as exc:
-        logger.warning("Redis read failed for %r: %s", key, exc)
-        return None
-
-
-async def _redis_set(key: str, ttl_seconds: int) -> None:
-    from src.pipeline import cache
-
-    try:
-        await cache._get_client().set(key, "1", ex=ttl_seconds)
-    except Exception as exc:
-        logger.warning("Redis write failed for %r: %s", key, exc)
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -91,8 +72,12 @@ class ArtifactClient:
         self,
         settings: ExpressionContextSettings,
         http_client: Optional[httpx.AsyncClient] = None,
+        redis: Optional[ModuleRedis] = None,
     ) -> None:
         self._settings = settings
+        # Module-owned client for the short-lived "gene absent" markers; hits
+        # go through ACGC's public cached_call.
+        self._redis = redis or ModuleRedis(redis_url=settings.redis_url)
         self._base = settings.base_url
         # Short, stable namespace so two deployments pointing at different
         # artifact hosts never share cache entries.
@@ -109,6 +94,7 @@ class ArtifactClient:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._http.aclose()
+        await self._redis.aclose()
 
     def _key(self, *parts: str) -> str:
         return ":".join(("expression_context", self._ns, *parts))
@@ -166,7 +152,7 @@ class ArtifactClient:
         """The gene file, or None when the stats repo has no file for the symbol."""
         path = f"genes/{hugo_symbol}.json"
         absent_key = self._key("gene_absent", release_id, hugo_symbol)
-        if not force_refresh and await _redis_get(absent_key) is not None:
+        if not force_refresh and await self._redis.get(absent_key) is not None:
             return None
 
         async def fetch() -> Dict[str, Any]:
@@ -183,7 +169,7 @@ class ArtifactClient:
                 force_refresh=force_refresh,
             )
         except _GeneAbsent:
-            await _redis_set(absent_key, self._settings.gene_negative_cache_ttl_seconds)
+            await self._redis.set(absent_key, "1", ex=self._settings.gene_negative_cache_ttl_seconds)
             return None
         payload = _check_schema_version(payload, path)
         try:

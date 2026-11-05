@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from src.expression_context import lease as lease_module
 from src.expression_context.models import LiteratureVerdict
+from src.expression_context.redis_client import ModuleRedis
+from tests.conftest import FakeRedis
 
 FIXTURES = Path(__file__).parent / "fixtures" / "expression_context"
 BASE_URL = "https://stats.example.test/expression"
@@ -80,3 +83,60 @@ class FakeLiteratureGate:
             evidence_support_score=0.8,
             evaluated_at=datetime.now(timezone.utc),
         )
+
+
+class LeaseFakeRedis(FakeRedis):
+    """tests.conftest.FakeRedis plus the module's owner-safe lease scripts.
+
+    ``race`` (an async callable) simulates another pod acting at the worst
+    moment: for EVAL it runs just before the (atomic) script; for a plain GET
+    of a lease key it runs right after the value was read, i.e. between a
+    non-atomic implementation's ownership check and its mutation.
+    """
+
+    race = None
+
+    async def _run_race(self):
+        if self.race is not None:
+            race, self.race = self.race, None
+            await race()
+
+    async def get(self, key):
+        value = await super().get(key)
+        if key.startswith(lease_module.LEASE_PREFIX):
+            await self._run_race()
+        return value
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        if script not in (lease_module.RENEW_SCRIPT, lease_module.RELEASE_SCRIPT):
+            return await super().eval(script, numkeys, *keys_and_args)
+        await self._run_race()
+        keys, args = keys_and_args[:numkeys], keys_and_args[numkeys:]
+        current = self._live(keys[0])
+        if current is None or current.decode() != str(args[0]):
+            return 0
+        if script == lease_module.RENEW_SCRIPT:
+            self._store[keys[0]] = (current, self.now + int(args[1]) / 1000)
+            return 1
+        del self._store[keys[0]]
+        return 1
+
+    def expires_at(self, key):
+        return self._store[key][1]
+
+
+def module_redis(fake):
+    return ModuleRedis(factory=lambda: fake)
+
+
+class DownRedis:
+    """Every command fails like an unreachable Redis."""
+
+    async def set(self, *a, **k):
+        raise ConnectionError("down")
+
+    async def get(self, *a, **k):
+        raise ConnectionError("down")
+
+    async def eval(self, *a, **k):
+        raise ConnectionError("down")

@@ -17,6 +17,7 @@ from tests.expression_context_helpers import (
     aliases,
     gene_file,
     manifest,
+    module_redis,
     url,
 )
 
@@ -33,8 +34,9 @@ def _settings(**overrides) -> ExpressionContextSettings:
 
 
 @pytest.fixture
-async def client():
-    artifact_client = ArtifactClient(_settings())
+async def client(fake_redis):
+    # Core cached_call and the module's own client both hit the same fake.
+    artifact_client = ArtifactClient(_settings(), redis=module_redis(fake_redis))
     yield artifact_client
     await artifact_client.aclose()
 
@@ -178,7 +180,9 @@ async def test_cached_payload_with_unknown_version_rejected(httpx_mock, client, 
 
 
 async def test_absent_gene_uses_short_negative_ttl(httpx_mock, fake_redis):
-    artifact_client = ArtifactClient(_settings(gene_negative_cache_ttl_seconds=300))
+    artifact_client = ArtifactClient(
+        _settings(gene_negative_cache_ttl_seconds=300), redis=module_redis(fake_redis)
+    )
     httpx_mock.add_response(url=url("genes/NOPE1.json"), status_code=404, is_reusable=True)
     httpx_mock.add_response(url=url("genes/ERBB2.json"), json=gene_file())
     try:

@@ -288,10 +288,18 @@ class ExpressionContextService:
         own evaluation only after ``lease_wait_seconds``.
         """
         key = (symbol, oncotree_code, release_id, self.gate.name)
-        pending = self._inflight.get(key)
-        if pending is not None:
-            verdict, _ = await asyncio.shield(pending)
-            return verdict, True
+        while (pending := self._inflight.get(key)) is not None:
+            try:
+                verdict, _ = await asyncio.shield(pending)
+                return verdict, True
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if not pending.cancelled() or (current is not None and current.cancelling()):
+                    raise  # this waiter itself was cancelled
+                # The leader was cancelled (e.g. its job was torn down): the
+                # leader has already dropped the key, so the first waiter to
+                # get here becomes the new leader and the rest wait on it.
+                logger.info("Literature single-flight leader cancelled for %s; taking over", key)
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         # Waiters retrieve the exception; don't warn if there were none.
         future.add_done_callback(lambda f: f.cancelled() or f.exception())
@@ -308,7 +316,8 @@ class ExpressionContextService:
             future.set_result(outcome)
             return outcome
         finally:
-            self._inflight.pop(key, None)
+            if self._inflight.get(key) is future:
+                del self._inflight[key]
 
     async def _stored_verdict(self, key: Tuple[str, str, str, str]) -> Optional[LiteratureVerdict]:
         symbol, oncotree_code, release_id, gate_name = key
@@ -417,6 +426,7 @@ class ExpressionContextService:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.artifacts.aclose()
+        await self._lease.aclose()
         await self.store.close()
 
     # -------------------------------------------------------------- helpers

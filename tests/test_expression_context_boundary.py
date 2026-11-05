@@ -101,6 +101,89 @@ def test_import_boundary():
     assert len({line for line, _ in main_refs}) == 1
 
 
+def _is_private(name: str) -> bool:
+    return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
+
+
+def _is_acgc_core(module: str) -> bool:
+    return (module == "src" or module.startswith("src.")) and not _references_module(module)
+
+
+def _dotted(node: ast.AST) -> str | None:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _private_core_uses(path: Path) -> list[tuple[int, str]]:
+    """Private (underscore) names the module takes from ACGC core: imported
+    directly (``from src.x import _y``), or reached through an imported core
+    module/object (``from src.pipeline import cache; cache._get_client()``,
+    ``import src.pipeline.cache; src.pipeline.cache._client``)."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+    core_bindings: dict[str, str] = {}
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and not node.level and _is_acgc_core(node.module or ""):
+            for alias in node.names:
+                if _is_private(alias.name):
+                    found.append((node.lineno, f"{node.module}.{alias.name}"))
+                core_bindings[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _is_acgc_core(alias.name):
+                    if any(_is_private(part) for part in alias.name.split(".")):
+                        found.append((node.lineno, alias.name))
+                    core_bindings[alias.asname or alias.name.split(".")[0]] = (
+                        alias.name if alias.asname else alias.name.split(".")[0]
+                    )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _is_private(node.attr):
+            dotted = _dotted(node)
+            if dotted is None:
+                continue
+            root = dotted.split(".")[0]
+            if root in core_bindings:
+                found.append((node.lineno, dotted))
+    return found
+
+
+def test_module_uses_no_private_acgc_names():
+    """The module may use ACGC internals only through public names."""
+    offenders = {
+        str(path.relative_to(ROOT)): uses
+        for path in sorted(MODULE_DIR.rglob("*.py"))
+        if (uses := _private_core_uses(path))
+    }
+    assert offenders == {}, f"private ACGC names used by {MODULE}: {offenders}"
+
+
+def test_private_name_check_catches_violations(tmp_path):
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "from src.pipeline import cache\n"
+        "from src.pipeline.run_store import _mysql_connection_kwargs\n"
+        "import src.pipeline.cache as core_cache\n"
+        "from src.expression_context.store import _utc\n"
+        "def f(self):\n"
+        "    cache._get_client()\n"
+        "    core_cache._client\n"
+        "    self._private_is_fine\n"
+        "    _utc\n"
+    )
+    names = sorted(name for _, name in _private_core_uses(probe))
+    assert names == [
+        "cache._get_client",
+        "core_cache._client",
+        "src.pipeline.run_store._mysql_connection_kwargs",
+    ]
+
+
 def test_main_has_exactly_one_registration_call():
     source = (SRC / "main.py").read_text()
     tree = ast.parse(source)
