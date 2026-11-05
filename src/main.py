@@ -36,6 +36,7 @@ from src.api.run_persistence import can_modify_run, run_owner, save_run_or_raise
 from src.api.runs import router as runs_router
 from src.admin_users_routes import router as admin_users_router
 from src.curator_requests_routes import router as curator_requests_router
+from src.expression_context import register_expression_context
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
     AuthenticatedUser,
@@ -258,6 +259,7 @@ app.include_router(admin_users_router)
 app.include_router(api_keys_router)
 app.include_router(runs_router)
 app.include_router(ui_events_router)
+register_expression_context(app)  # optional module; no-op unless EXPRESSION_CONTEXT_ENABLED
 
 _STATIC_DIR = Path(__file__).parent / "static"
 if _STATIC_DIR.exists():

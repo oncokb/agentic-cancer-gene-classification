@@ -1,0 +1,26 @@
+{
+  "schema_version": "1",
+  "release_id": "2026-11-05-datahub-abc1234-m1",
+  "method_version": "1",
+  "params": {"fdr": 0.05, "log2fc": 1.0, "cliffs_delta": 0.33,
+             "min_n": 10, "detection_log2": 1.0, "precheck_min_pmids": 1},
+  "source": {"datahub_commit": "abc1234def", "generated_at": "2026-11-05T00:00:00Z"},
+  "future_top_level_field": {"ignored": true},
+  "cancer_types": [
+    {"study_id": "brca_tcga_pan_can_atlas_2018", "oncotree_code": "BRCA",
+     "name": "Breast Invasive Carcinoma", "tumor_type_query": "breast cancer",
+     "import_date": "2026-06-05 15:34:03", "future_field": 1},
+    {"study_id": "stad_tcga_pan_can_atlas_2018", "oncotree_code": "STAD",
+     "name": "Stomach Adenocarcinoma", "tumor_type_query": "gastric cancer",
+     "import_date": "2026-06-05 15:34:03"},
+    {"study_id": "esca_tcga_pan_can_atlas_2018", "oncotree_code": "ESCA",
+     "name": "Esophageal Carcinoma", "tumor_type_query": "esophageal cancer",
+     "import_date": "2026-06-05 15:34:03"},
+    {"study_id": "ucec_tcga_pan_can_atlas_2018", "oncotree_code": "UCEC",
+     "name": "Uterine Corpus Endometrial Carcinoma", "tumor_type_query": "endometrial cancer",
+     "import_date": "2026-06-05 15:34:03"},
+    {"study_id": "luad_tcga_pan_can_atlas_2018", "oncotree_code": "LUAD",
+     "name": "Lung Adenocarcinoma", "tumor_type_query": "lung adenocarcinoma",
+     "import_date": "2026-06-05 15:34:03"}
+  ]
+}
