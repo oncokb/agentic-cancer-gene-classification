@@ -1,9 +1,10 @@
 {
   "schema_version": "1",
-  "release_id": "2026-11-05-datahub-abc1234-m1",
-  "method_version": "1",
-  "params": {"fdr": 0.05, "log2fc": 1.0, "cliffs_delta": 0.33,
-             "min_n": 10, "detection_log2": 1.0, "precheck_min_pmids": 1},
+  "release_id": "2026-11-05-datahub-abc1234-m2-b7e9f01",
+  "method_version": "2",
+  "params": {"fdr": 0.05, "log2fc": 1.0, "cliffs_delta": 0.5,
+             "min_n": 10, "floor_log2": 3.4594316186372973,
+             "detection_log2": 3.4594316186372973, "precheck_min_pmids": 1},
   "source": {"datahub_commit": "abc1234def", "generated_at": "2026-11-05T00:00:00Z"},
   "future_top_level_field": {"ignored": true},
   "cancer_types": [

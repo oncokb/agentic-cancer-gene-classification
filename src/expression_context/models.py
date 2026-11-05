@@ -55,20 +55,30 @@ class GeneRef(_Artifact):
 
 
 class CancerTypeStats(_Artifact):
-    oncotree_code: str
+    """One (gene, cancer type) row of a gene file.
+
+    The producer emits null for the statistics when they are undefined (e.g.
+    n == 0 or the test can't run) and for the pre-check fields when the
+    pre-check was not run (stats_pass false, or a skip mode).
+    """
+
+    oncotree_code: str  # TCGA PanCancer cohort code, e.g. BRCA, COADREAD, GBM
     n: int
     n_rest: int
-    median_log2: float
-    rest_median_log2: float
-    log2fc: float
+    median_log2: Optional[float] = None
+    rest_median_log2: Optional[float] = None
+    p90_log2: Optional[float] = None
+    rest_p90_log2: Optional[float] = None
+    log2fc: Optional[float] = None
     log2fc_vs_median_of_type_medians: Optional[float] = None
-    cliffs_delta: float
-    auc: float
-    p_value: float
-    q_value: float
+    cliffs_delta: Optional[float] = None
+    auc: Optional[float] = None
+    p_value: Optional[float] = None
+    q_value: Optional[float] = None
     stats_pass: bool
     pubmed_count: Optional[int] = None
-    literature_precheck_pass: bool = False
+    # None = pre-check not run; only an explicit False excludes a pair.
+    literature_precheck_pass: Optional[bool] = None
     flags: List[str] = Field(default_factory=list)
 
 

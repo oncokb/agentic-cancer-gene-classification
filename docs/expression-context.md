@@ -1,6 +1,6 @@
 # Expression context (optional, removable module)
 
-Status: design v1 — 2026-11-05
+Status: design v1 — 2026-11-05 (stats method_version "2"; artifact schema_version "1")
 
 ## Goal
 
@@ -68,24 +68,30 @@ ACGC must be able to drop this feature by deleting one package and two lines.
   (delete package, delete registration line + import, delete tests,
   `DROP TABLE expression_context_results`, remove env from k8s manifest).
 
-## Statistics (stats repo; method_version "1")
+## Statistics (stats repo; method_version "2")
 
-Per gene, per TCGA PanCancer study (32; COAD+READ combined as COADREAD):
+Per gene, per TCGA PanCancer cohort (32; COAD+READ combined as COADREAD).
+`oncotree_code` values are these TCGA PanCancer **cohort codes** (e.g. `BRCA`,
+`COADREAD`, `GBM`, `LGG`, `PCPG`, `SARC`), not necessarily OncoTree leaf codes.
 
 - Input: `data_mrna_seq_v2_rsem.txt` (batch-normalized RSEM, linear scale).
 - Samples: primary tumors only (TCGA sample type `01`; `03` for LAML);
   one sample per patient.
 - Transform: `log2(x + 1)`.
+- Expression floor: `F = log2(11)` (RSEM 10), so near-zero expression can't
+  produce large fold changes.
 - Test: Mann-Whitney U, cancer type vs all other tumors pooled; BH FDR across
   the 32 cancer types for that gene.
-- Effect sizes: `log2fc = median(T) - median(rest)`, Cliff's delta, AUC; also
+- Effect sizes (floor-clamped):
+  `log2fc = max(median(T), F) - max(median(rest), F)`; the same floor applies to
   `log2fc_vs_median_of_type_medians` (guards against large cohorts dominating
-  the pooled rest).
-- `stats_pass` = q < 0.05 AND log2fc >= 1 AND cliffs_delta >= 0.33 AND
-  median(T) >= detection threshold (log2(1+1)=1) AND n >= 10.
+  the pooled rest). Also Cliff's delta, AUC, and informational 90th
+  percentiles `p90_log2` / `rest_p90_log2`.
+- `stats_pass` = q < 0.05 AND log2fc >= 1 AND cliffs_delta >= 0.5 AND
+  median(T) >= F (detection) AND n >= 10.
 - Flags (informational): `tissue_of_origin_risk`, `small_n`.
 - Literature pre-check (stats-passing pairs only): PubMed count for
-  `"GENE" AND (<tumor aliases>)`; `literature_precheck_pass` = count >= 1.
+  `"GENE"[tiab] AND (<tumor query>)`; `literature_precheck_pass` = count >= 1.
   Requires only an NCBI API key secret; no LLM secrets in CI.
 
 All thresholds are parameters recorded in the manifest.
@@ -99,10 +105,11 @@ Base URL configured in ACGC as `EXPRESSION_CONTEXT_ARTIFACT_BASE_URL`.
 ```json
 {
   "schema_version": "1",
-  "release_id": "2026-11-05-datahub-<shortsha>-m1",
-  "method_version": "1",
-  "params": {"fdr": 0.05, "log2fc": 1.0, "cliffs_delta": 0.33,
-             "min_n": 10, "detection_log2": 1.0, "precheck_min_pmids": 1},
+  "release_id": "2026-11-05-datahub-<shortsha>-m2-<buildhash>",
+  "method_version": "2",
+  "params": {"fdr": 0.05, "log2fc": 1.0, "cliffs_delta": 0.5,
+             "min_n": 10, "floor_log2": 3.4594316186372973,
+             "detection_log2": 3.4594316186372973, "precheck_min_pmids": 1},
   "source": {"datahub_commit": "<sha>", "generated_at": "<iso8601>"},
   "cancer_types": [
     {"study_id": "brca_tcga_pan_can_atlas_2018", "oncotree_code": "BRCA",
@@ -123,6 +130,7 @@ gene absent)
   "cancer_types": [
     {"oncotree_code": "BRCA", "n": 1082, "n_rest": 8989,
      "median_log2": 0.0, "rest_median_log2": 0.0,
+     "p90_log2": 0.0, "rest_p90_log2": 0.0,
      "log2fc": 0.0, "log2fc_vs_median_of_type_medians": 0.0,
      "cliffs_delta": 0.0, "auc": 0.0, "p_value": 0.0, "q_value": 0.0,
      "stats_pass": true,
@@ -132,6 +140,22 @@ gene absent)
 }
 ```
 
+`release_id` identifies the datahub commit, the method version and a build
+hash of the producer (so a code-only rebuild is a new release).
+
+Nullable per-type fields (consumers must accept `null`):
+
+| Field(s) | `null` when |
+|---|---|
+| `median_log2`, `rest_median_log2`, `p90_log2`, `rest_p90_log2`, `log2fc`, `log2fc_vs_median_of_type_medians`, `cliffs_delta`, `auc`, `p_value`, `q_value` | statistic undefined (e.g. `n == 0`, or the test can't be run) |
+| `pubmed_count`, `literature_precheck_pass` | pre-check not run (`stats_pass` false, or a skip mode) |
+
+`oncotree_code`, `n`, `n_rest`, `stats_pass` and `flags` are always present.
+A pair goes to ACGC's literature gate iff `stats_pass` is true AND
+`literature_precheck_pass` is not `false` (`null` = pre-check not run; the
+literature gate itself is authoritative). It is excluded with reason
+`precheck` only when `literature_precheck_pass` is explicitly `false`.
+
 `GET {base}/v1/aliases.json` → `{"HER2": "ERBB2", …}` (unambiguous aliases only).
 
 Consumers must ignore unknown fields and reject unknown `schema_version`.
@@ -140,7 +164,7 @@ Consumers must ignore unknown fields and reject unknown `schema_version`.
 
 - `POST /v1/expression-context/jobs` `{ "gene": "ERBB2" }` → 202
   `{job_id, status_url}`. Runs the literature gate for each pair with
-  `stats_pass && literature_precheck_pass`. Reuses stored verdicts for the same
+  `stats_pass` true and `literature_precheck_pass` not `false` (`null` passes). Reuses stored verdicts for the same
   (gene, oncotree_code, release_id, literature_gate).
 - `GET /v1/expression-context/jobs/{job_id}` → status + result when done.
 - `GET /v1/expression-context/genes/{gene}` → latest stored result.

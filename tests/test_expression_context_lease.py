@@ -144,6 +144,7 @@ async def real_redis():
     try:
         await module.client().ping()
     except Exception as exc:
+        await module.aclose()  # don't leak the client (and its pool) on skip
         pytest.skip(f"Redis not reachable: {exc}")
     yield module
     try:
@@ -388,3 +389,68 @@ async def test_cancelled_waiter_does_not_take_over(httpx_mock):
     assert evaluated == 3 and errors == []
     assert len(gate.calls) == 3
     await pod.artifacts.aclose()
+
+
+def _config(kwargs):
+    """The configuration values only (drops per-instance objects such as the
+    pool weakref and registries)."""
+    return {k: v for k, v in kwargs.items() if isinstance(v, (str, int, float, bool, type(None)))}
+
+
+def _core_client_kwargs(client):
+    pool = client.connection_pool
+    return pool.connection_class, _config(pool.connection_kwargs)
+
+
+def test_module_redis_matches_core_cache_client_for_url(monkeypatch):
+    from src.config import settings
+    from src.pipeline import cache
+
+    monkeypatch.setattr(settings, "redis_sentinel_enabled", False)
+    monkeypatch.setattr(settings, "redis_url", "redis://cache.internal:6380/3")
+    monkeypatch.setattr(cache, "_client", None)
+    core = cache._get_client()  # comparison only; the module never calls this
+    ours = build_client()
+    assert _core_client_kwargs(ours) == _core_client_kwargs(core)
+    monkeypatch.setattr(cache, "_client", None)
+
+
+def test_module_redis_matches_core_cache_client_for_sentinel(monkeypatch):
+    """Sentinel config parity: same sentinels, sentinel/connection kwargs,
+    password and master set as the core cache client."""
+    from src.config import settings
+    from src.pipeline import cache
+
+    monkeypatch.setattr(settings, "redis_sentinel_enabled", True)
+    monkeypatch.setattr(settings, "redis_sentinel_hosts", "s-0:26379, s-1 ,s-2:26380")
+    monkeypatch.setattr(settings, "redis_sentinel_master_set", "acgc-master")
+    monkeypatch.setattr(settings, "redis_sentinel_password", "pw")
+    monkeypatch.setattr(cache, "_client", None)
+    core = cache._get_client()
+    ours = build_client()
+    monkeypatch.setattr(cache, "_client", None)
+
+    core_pool, our_pool = core.connection_pool, ours.connection_pool
+    assert our_pool.service_name == core_pool.service_name == "acgc-master"
+    assert _config(our_pool.connection_kwargs) == _config(core_pool.connection_kwargs)
+    assert _config(our_pool.connection_kwargs)["password"] == "pw"
+    core_sentinel, our_sentinel = core_pool.sentinel_manager, our_pool.sentinel_manager
+    assert _config(our_sentinel.sentinel_kwargs) == _config(core_sentinel.sentinel_kwargs)
+    assert _config(our_sentinel.connection_kwargs) == _config(core_sentinel.connection_kwargs)
+    hosts = lambda s: [  # noqa: E731
+        (c.connection_pool.connection_kwargs["host"], c.connection_pool.connection_kwargs["port"])
+        for c in s.sentinels
+    ]
+    assert hosts(our_sentinel) == hosts(core_sentinel) == [
+        ("s-0", 26379), ("s-1", 26379), ("s-2", 26380),
+    ]
+
+
+def test_explicit_module_redis_url_overrides_app_settings(monkeypatch):
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "redis_sentinel_enabled", True)
+    monkeypatch.setattr(settings, "redis_sentinel_hosts", "s-0:26379")
+    client = build_client("redis://ec.internal:6379/5")
+    kwargs = client.connection_pool.connection_kwargs
+    assert (kwargs["host"], kwargs["port"], kwargs["db"]) == ("ec.internal", 6379, 5)

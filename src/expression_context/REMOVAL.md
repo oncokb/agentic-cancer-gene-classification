@@ -13,7 +13,7 @@ The feature is self-contained by design (see `docs/expression-context.md`,
    git rm -r tests/fixtures/expression_context/
    ```
    (`test_expression_context_api.py`, `..._artifact.py`, `..._boundary.py`,
-   `..._store_gate.py`, `..._lease.py`.)
+   `..._store_gate.py`, `..._lease.py`, `..._nullable.py`.)
 4. **Delete the design doc** (optional): `git rm docs/expression-context.md`
 5. **Drop the table** (only exists where the flag was ever enabled):
    ```sql

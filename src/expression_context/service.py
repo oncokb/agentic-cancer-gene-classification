@@ -3,11 +3,15 @@
 A (gene, cancer type) pair is *surfaced* iff:
 
 1. ``stats_pass`` (stats repo), and
-2. ``literature_precheck_pass`` (stats repo's PubMed-count pre-check), and
+2. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
+   pre-check; null means it was not run, and the literature gate itself is
+   authoritative), and
 3. the literature gate's verdict is supported (``insufficient_evidence`` is
    false AND >=1 cited PMID).
 
-Only pairs passing 1 and 2 reach the literature gate. Verdicts are stored per
+Only pairs passing 1 and 2 reach the literature gate; exclusion reason
+``precheck`` is recorded only for an explicit ``literature_precheck_pass:
+false``. Verdicts are stored per
 (hugo_symbol, oncotree_code, release_id, literature_gate) and reused.
 """
 
@@ -222,7 +226,7 @@ class ExpressionContextService:
             if not stats.stats_pass:
                 rows.append(row(stats, False, "stats"))
                 continue
-            if not stats.literature_precheck_pass:
+            if stats.literature_precheck_pass is False:
                 rows.append(row(stats, False, "precheck"))
                 continue
             prior = existing.get(stats.oncotree_code)
@@ -440,7 +444,12 @@ class ExpressionContextService:
         pairs = [_pair_result(row) for row in rows]
         surfaced = sorted(
             (pair for pair in pairs if pair.surfaced),
-            key=lambda pair: (pair.stats.q_value, pair.oncotree_code),
+            # Undefined q-values (null) sort last.
+            key=lambda pair: (
+                pair.stats.q_value is None,
+                pair.stats.q_value if pair.stats.q_value is not None else 0.0,
+                pair.oncotree_code,
+            ),
         )
         excluded = sorted(
             (pair for pair in pairs if not pair.surfaced), key=lambda pair: pair.oncotree_code

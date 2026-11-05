@@ -1,6 +1,6 @@
 {
   "schema_version": "1",
-  "release_id": "2026-11-05-datahub-abc1234-m1",
+  "release_id": "2026-11-05-datahub-abc1234-m2-b7e9f01",
   "gene": {"hugo_symbol": "ERBB2", "entrez_gene_id": 2064},
   "future_field": "ignored",
   "cancer_types": [
