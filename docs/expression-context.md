@@ -1,6 +1,6 @@
 # Expression context (optional, removable module)
 
-Status: design v1 — 2026-11-05 (stats method_version "2"; artifact schema_version "1")
+Status: design v1 — 2026-11-05 (supports artifact schema_version "1", method_version "2"; contract owned by the producer repo)
 
 ## Goal
 
@@ -21,7 +21,7 @@ Each surfaced pair shows the statistics and the supporting citations side by sid
  │  1. download 32 *_tcga_pan_can_atlas_2018                  │
  │     data_mrna_seq_v2_rsem.txt from cBioPortal datahub      │
  │     (pinned commit)                                        │
- │  2. stats gate for every gene (one-vs-rest, see below)     │
+ │  2. stats gate for every gene (one-vs-rest, producer doc)  │
  │  3. cheap PubMed-count pre-check for stats-passing pairs   │
  │  4. publish versioned JSON to GitHub Pages                 │
  └───────────────────────┬────────────────────────────────────┘
@@ -56,8 +56,8 @@ ACGC must be able to drop this feature by deleting one package and two lines.
   public functions, never by editing their schema.
 - No new heavy dependencies in ACGC (no numpy/scipy/pandas): all statistics are
   computed in the stats repo.
-- Dependency on the stats repo is HTTP-only against the versioned contract
-  below (no submodule, no shared package).
+- Dependency on the stats repo is HTTP-only against the producer's versioned
+  contract (see "Artifact contract"; no submodule, no shared package).
 - Literature access goes through a `LiteratureGate` protocol so the ACGC
   pipeline implementation can be swapped for LRAS without touching the router.
 - Guard tests: (a) an import-boundary test fails if any module outside
@@ -68,103 +68,60 @@ ACGC must be able to drop this feature by deleting one package and two lines.
   (delete package, delete registration line + import, delete tests,
   `DROP TABLE expression_context_results`, remove env from k8s manifest).
 
-## Statistics (stats repo; method_version "2")
+## Artifact contract (owned by the producer)
 
-Per gene, per TCGA PanCancer cohort (32; COAD+READ combined as COADREAD).
-`oncotree_code` values are these TCGA PanCancer **cohort codes** (e.g. `BRCA`,
-`COADREAD`, `GBM`, `LGG`, `PCPG`, `SARC`), not necessarily OncoTree leaf codes.
+The statistics method and the artifact contract are defined in **one place**,
+the producer repo:
+[`oncokb/gene-expression-relevance` → `docs/acgc-contract.md`](https://github.com/oncokb/gene-expression-relevance/blob/main/docs/acgc-contract.md).
+This document does not restate them; if anything here disagrees with that file,
+that file wins and this module should be updated.
 
-- Input: `data_mrna_seq_v2_rsem.txt` (batch-normalized RSEM, linear scale).
-- Samples: primary tumors only (TCGA sample type `01`; `03` for LAML);
-  one sample per patient.
-- Transform: `log2(x + 1)`.
-- Expression floor: `F = log2(11)` (RSEM 10), so near-zero expression can't
-  produce large fold changes.
-- Test: Mann-Whitney U, cancer type vs all other tumors pooled; BH FDR across
-  the 32 cancer types for that gene.
-- Effect sizes (floor-clamped):
-  `log2fc = max(median(T), F) - max(median(rest), F)`; the same floor applies to
-  `log2fc_vs_median_of_type_medians` (guards against large cohorts dominating
-  the pooled rest). Also Cliff's delta, AUC, and informational 90th
-  percentiles `p90_log2` / `rest_p90_log2`.
-- `stats_pass` = q < 0.05 AND log2fc >= 1 AND cliffs_delta >= 0.5 AND
-  median(T) >= F (detection) AND n >= 10.
-- Flags (informational): `tissue_of_origin_risk`, `small_n`.
-- Literature pre-check (stats-passing pairs only): PubMed count for
-  `"GENE"[tiab] AND (<tumor query>)`; `literature_precheck_pass` = count >= 1.
-  Requires only an NCBI API key secret; no LLM secrets in CI.
+Supported by this module:
 
-All thresholds are parameters recorded in the manifest.
-
-## Artifact contract v1 (stats repo → ACGC)
-
-Base URL configured in ACGC as `EXPRESSION_CONTEXT_ARTIFACT_BASE_URL`.
-
-`GET {base}/v1/manifest.json`
-
-```json
-{
-  "schema_version": "1",
-  "release_id": "2026-11-05-datahub-<shortsha>-m2-<buildhash>",
-  "method_version": "2",
-  "params": {"fdr": 0.05, "log2fc": 1.0, "cliffs_delta": 0.5,
-             "min_n": 10, "floor_log2": 3.4594316186372973,
-             "detection_log2": 3.4594316186372973, "precheck_min_pmids": 1},
-  "source": {"datahub_commit": "<sha>", "generated_at": "<iso8601>"},
-  "cancer_types": [
-    {"study_id": "brca_tcga_pan_can_atlas_2018", "oncotree_code": "BRCA",
-     "name": "Breast Invasive Carcinoma", "tumor_type_query": "breast cancer",
-     "import_date": "2026-06-05 15:34:03"}
-  ]
-}
-```
-
-`GET {base}/v1/genes/{HUGO_SYMBOL}.json` (upper-case canonical symbol; 404 if
-gene absent)
-
-```json
-{
-  "schema_version": "1",
-  "release_id": "…",
-  "gene": {"hugo_symbol": "ERBB2", "entrez_gene_id": 2064},
-  "cancer_types": [
-    {"oncotree_code": "BRCA", "n": 1082, "n_rest": 8989,
-     "median_log2": 6.2, "rest_median_log2": 3.1,
-     "p90_log2": 8.4, "rest_p90_log2": 5.3,
-     "log2fc": 2.74, "log2fc_vs_median_of_type_medians": 2.74,
-     "cliffs_delta": 0.71, "auc": 0.855, "p_value": 1.2e-41, "q_value": 3.8e-40,
-     "stats_pass": true,
-     "pubmed_count": 1234, "literature_precheck_pass": true,
-     "flags": []}
-  ]
-}
-```
-
-In the example, `rest_median_log2` (3.1) is below the floor F = log2(11) ≈ 3.459,
-so `log2fc = max(6.2, F) − max(3.1, F) = 6.2 − 3.459 ≈ 2.74` (the pooled-rest and
-median-of-type-medians baselines are both clamped to F here); together with
-`cliffs_delta` 0.71 ≥ 0.5, `median_log2` 6.2 ≥ F, q < 0.05 and n ≥ 10 this gives
-`stats_pass: true`.
-
-`release_id` identifies the datahub commit, the method version and a build
-hash of the producer (so a code-only rebuild is a new release).
-
-Nullable per-type fields (consumers must accept `null`):
-
-| Field(s) | `null` when |
+| | Value |
 |---|---|
-| `median_log2`, `rest_median_log2`, `p90_log2`, `rest_p90_log2`, `log2fc`, `log2fc_vs_median_of_type_medians`, `cliffs_delta`, `auc`, `p_value`, `q_value` | statistic undefined (e.g. `n == 0`, or the test can't be run) |
-| `pubmed_count`, `literature_precheck_pass` | pre-check not run (`stats_pass` false, or a skip mode) |
+| `schema_version` | `"1"` (any other value is rejected) |
+| `method_version` | `"2"` |
 
-`oncotree_code`, `n`, `n_rest`, `stats_pass` and `flags` are always present.
-A pair goes to ACGC's literature gate iff `stats_pass` is true AND
-`literature_precheck_pass` is not `false` (`null` = pre-check not run; the
-literature gate itself is authoritative). It is excluded with reason
-`precheck` only when `literature_precheck_pass` is explicitly `false`.
+Endpoints read (under `EXPRESSION_CONTEXT_ARTIFACT_BASE_URL`):
+`v1/manifest.json`, `v1/genes/{HUGO_SYMBOL}.json` (404 = gene absent) and
+`v1/aliases.json`.
 
-`GET {base}/v1/aliases.json` → `{"HER2": "ERBB2", …}` (unambiguous aliases only).
+`release_id` has the form `datahub-<12hex>-m<method>-<build_sha12>` and changes
+only when the producer's inputs change (datahub commit, method, build
+fingerprint); it does not change on a PubMed-count refresh. ACGC treats it as an
+opaque string: it is a cache and verdict-reuse key, never parsed.
 
-Consumers must ignore unknown fields and reject unknown `schema_version`.
+## Consumer semantics
+
+What ACGC relies on from the contract:
+
+- **Manifest:** `schema_version`, `release_id`, and per cancer type
+  `oncotree_code` (a TCGA PanCancer cohort code, e.g. `COADREAD`, `GBM`, `LGG`,
+  `PCPG`, `SARC`), `study_id`, `name`, `tumor_type_query` (passed to the
+  literature gate as the tumor type). `method_version`, `params` (e.g.
+  `expression_floor_log2`, `detection_log2`) and `source` are informational.
+- **Gene file:** `schema_version`, `release_id` (must equal the manifest's),
+  `gene.hugo_symbol`, and per cancer type `oncotree_code`, `n`, `n_rest`,
+  `stats_pass`, `literature_precheck_pass`, `flags`. The statistics
+  (`median_log2`, `rest_median_log2`, `p90_log2`, `rest_p90_log2`, `log2fc`,
+  `log2fc_vs_median_of_type_medians`, `cliffs_delta`, `auc`, `p_value`,
+  `q_value`) and `pubmed_count` are displayed and stored, not re-gated.
+- **Aliases:** `aliases.json` maps an alias to its canonical symbol; used only
+  when the canonical gene file is absent.
+- **Nulls are tolerated:** every statistic and `pubmed_count` may be `null`
+  (undefined, e.g. `n == 0`); nulls are stored and returned as `null`, never as
+  zero, and sort last.
+- **Gating:** a pair goes to the literature gate iff `stats_pass` is true AND
+  `literature_precheck_pass` is not `false`. `null` (pre-check not run) is sent
+  to the literature gate, which is authoritative; only an explicit `false`
+  excludes, with reason `precheck`. `stats_pass` false excludes with reason
+  `stats`.
+- **Unknown fields are ignored; an unknown `schema_version` is rejected**
+  (HTTP 502 from the ACGC endpoints).
+- **Verdict reuse:** literature verdicts are stored and reused per
+  `(hugo_symbol, oncotree_code, release_id, literature_gate)`, so a new
+  `release_id` re-evaluates and a PubMed-count refresh alone does not.
 
 ## ACGC API (when enabled)
 

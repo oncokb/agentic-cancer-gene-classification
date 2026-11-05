@@ -11,8 +11,8 @@ Fixture genes/MYCN.json mirrors what the producer emits:
 
 from __future__ import annotations
 
-import json
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -161,7 +161,9 @@ def test_fixtures_are_consistent_with_method_v2(symbol):
     pre-check is only recorded for stats-passing pairs."""
     params = load_fixture("manifest.json")["params"]
     assert load_fixture("manifest.json")["method_version"] == "2"
-    assert params["floor_log2"] == pytest.approx(FLOOR)
+    assert params["expression_floor_log2"] == pytest.approx(FLOOR)
+    assert params["detection_log2"] == params["expression_floor_log2"]
+    assert "floor_log2" not in params  # producer name is expression_floor_log2
     for record in gene_file(symbol)["cancer_types"]:
         code = record["oncotree_code"]
         assert record["stats_pass"] is _v2_stats_pass(record, params), code
@@ -172,14 +174,35 @@ def test_fixtures_are_consistent_with_method_v2(symbol):
             assert record["literature_precheck_pass"] in (None, False), code
 
 
-def test_contract_doc_example_satisfies_method_v2():
+RELEASE_ID_FORMAT = re.compile(r"datahub-[0-9a-f]{12}-m\d+-[0-9a-f]{12}\Z")
+PRODUCER_CONTRACT_URL = (
+    "https://github.com/oncokb/gene-expression-relevance/blob/main/docs/acgc-contract.md"
+)
+
+
+def test_fixture_release_ids_use_producer_format():
+    manifest = load_fixture("manifest.json")
+    assert RELEASE_ID_FORMAT.fullmatch(manifest["release_id"])
+    assert manifest["release_id"].split("-")[2] == f"m{manifest['method_version']}"
+    for symbol in ("ERBB2", "MYCN"):
+        assert gene_file(symbol)["release_id"] == manifest["release_id"]
+
+
+def test_design_doc_defers_to_producer_contract():
+    """The contract lives in the producer repo only: the design doc links it,
+    states the supported versions and consumer semantics, and does not carry
+    its own copy of the artifact examples or statistics method."""
+    from src.expression_context.models import SUPPORTED_SCHEMA_VERSION
+
     doc = (Path(__file__).resolve().parents[1] / "docs/expression-context.md").read_text()
-    blocks = [b.split("```", 1)[0] for b in doc.split("```json")[1:]]
-    gene_example = json.loads(next(b for b in blocks if '"gene":' in b).replace("…", "x"))
-    manifest_example = json.loads(next(b for b in blocks if '"params"' in b))
-    record = gene_example["cancer_types"][0]
-    assert manifest_example["method_version"] == "2"
-    assert record["stats_pass"] is True and _v2_stats_pass(record, manifest_example["params"])
-    expected = max(record["median_log2"], FLOOR) - max(record["rest_median_log2"], FLOOR)
-    assert record["log2fc"] == pytest.approx(expected, abs=0.01)
-    CancerTypeStats.model_validate(record)
+    assert PRODUCER_CONTRACT_URL in doc
+    assert f'| `schema_version` | `"{SUPPORTED_SCHEMA_VERSION}"`' in doc
+    assert '| `method_version` | `"2"` |' in doc
+    assert "## Consumer semantics" in doc
+    assert "datahub-<12hex>-m<method>-<build_sha12>" in doc
+    assert "```json" not in doc  # no duplicated artifact examples
+    assert "## Statistics" not in doc and "Mann-Whitney" not in doc
+    assert "floor_log2" not in doc.replace("expression_floor_log2", "")
+    # Sections that stay owned by this repo.
+    for section in ("## Removability requirements", "## ACGC API", "## Table `expression_context_results`"):
+        assert section in doc

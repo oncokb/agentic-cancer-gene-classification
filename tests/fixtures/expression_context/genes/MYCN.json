@@ -1,6 +1,6 @@
 {
   "schema_version": "1",
-  "release_id": "2026-11-05-datahub-abc1234-m2-b7e9f01",
+  "release_id": "datahub-abc1234def56-m2-b7e9f01a2c3d",
   "gene": {"hugo_symbol": "MYCN", "entrez_gene_id": 4613},
   "cancer_types": [
     {"oncotree_code": "BRCA", "n": 0, "n_rest": 9000,

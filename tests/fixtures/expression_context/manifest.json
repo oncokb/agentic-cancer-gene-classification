@@ -1,11 +1,11 @@
 {
   "schema_version": "1",
-  "release_id": "2026-11-05-datahub-abc1234-m2-b7e9f01",
+  "release_id": "datahub-abc1234def56-m2-b7e9f01a2c3d",
   "method_version": "2",
   "params": {"fdr": 0.05, "log2fc": 1.0, "cliffs_delta": 0.5,
-             "min_n": 10, "floor_log2": 3.4594316186372973,
+             "min_n": 10, "expression_floor_log2": 3.4594316186372973,
              "detection_log2": 3.4594316186372973, "precheck_min_pmids": 1},
-  "source": {"datahub_commit": "abc1234def", "generated_at": "2026-11-05T00:00:00Z"},
+  "source": {"datahub_commit": "abc1234def567777777777777777777777777777", "generated_at": "2026-11-05T00:00:00Z"},
   "future_top_level_field": {"ignored": true},
   "cancer_types": [
     {"study_id": "brca_tcga_pan_can_atlas_2018", "oncotree_code": "BRCA",

@@ -18,7 +18,8 @@ JobState = Literal["queued", "running", "succeeded", "failed"]
 
 
 # --------------------------------------------------------------------------
-# Artifact contract v1 (stats repo -> ACGC)
+# Artifact contract, schema_version 1 (authoritative: gene-expression-relevance
+# docs/acgc-contract.md)
 # --------------------------------------------------------------------------
 
 

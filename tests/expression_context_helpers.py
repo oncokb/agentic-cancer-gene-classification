@@ -15,7 +15,7 @@ from tests.conftest import FakeRedis
 
 FIXTURES = Path(__file__).parent / "fixtures" / "expression_context"
 BASE_URL = "https://stats.example.test/expression"
-RELEASE_ID = "2026-11-05-datahub-abc1234-m2-b7e9f01"
+RELEASE_ID = "datahub-abc1234def56-m2-b7e9f01a2c3d"
 
 
 def load_fixture(name: str) -> dict:
