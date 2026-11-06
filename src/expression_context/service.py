@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from src.expression_context.catalog import ActiveBundle, StatsCatalog
+from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
 from src.expression_context.lease import VerdictLease, lease_key
 from src.expression_context.literature_gate import LiteratureGate, is_supported
 from src.expression_context.models import (
@@ -81,6 +81,30 @@ class ResolvedGene:
         return self.bundle.tag if self.bundle else None
 
 
+def precheck_expires_at(manifest: Manifest) -> Optional[datetime]:
+    """``source.precheck_expires_at`` (contract freshness marker), if parseable."""
+    raw = manifest.source.get("precheck_expires_at") if manifest.source else None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("Unparseable source.precheck_expires_at %r; treating as fresh", raw)
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def precheck_expired(manifest: Manifest, now: datetime) -> bool:
+    expires = precheck_expires_at(manifest)
+    return expires is not None and now >= expires
+
+
+def effective_precheck(stats: CancerTypeStats, expired: bool) -> Optional[bool]:
+    """An expired PubMed pre-check is unavailable (None): it never excludes a
+    pair; like "not run", the literature gate decides."""
+    return None if expired else stats.literature_precheck_pass
+
+
 def normalize_symbol(gene: str) -> str:
     symbol = (gene or "").strip().upper()
     if not _SYMBOL.fullmatch(symbol):
@@ -115,7 +139,9 @@ class ExpressionContextService:
         closers: Sequence[Callable[[], Awaitable[None]]] = (),
         releases_repo: str = "",
         pinned_bundle_tag: Optional[str] = None,
+        clock: Callable[[], datetime] = None,
     ) -> None:
+        self._clock = clock or _utcnow
         self.releases_repo = releases_repo
         self.pinned_bundle_tag = pinned_bundle_tag
         self.catalog = catalog
@@ -140,14 +166,21 @@ class ExpressionContextService:
 
     async def resolve(self, gene: str) -> ResolvedGene:
         """Canonical symbol first, then the bundle's aliases. Raises GeneNotFound,
-        or BundleNotLoaded when no bundle is active yet."""
+        or BundleNotLoaded when no bundle is active yet. If the bundle this pod
+        had cached disappears meanwhile, the active one is re-read (never a 404)."""
         symbol = normalize_symbol(gene)
-        bundle = await self.catalog.active()
-        artifact = await self.catalog.gene(bundle, symbol)
-        if artifact is None:
-            target = await self.catalog.alias(bundle, symbol)
-            if target and target != symbol:
-                artifact = await self.catalog.gene(bundle, target)
+        for attempt in range(2):
+            bundle = await self.catalog.active()
+            try:
+                artifact = await self.catalog.gene(bundle, symbol)
+                if artifact is None:
+                    target = await self.catalog.alias(bundle, symbol)
+                    if target and target != symbol:
+                        artifact = await self.catalog.gene(bundle, target)
+                break
+            except BundleGone:
+                if attempt:
+                    raise BundleNotLoaded("the active bundle changed while reading it")
         if artifact is None:
             raise GeneNotFound(symbol)
         return ResolvedGene(
@@ -203,7 +236,8 @@ class ExpressionContextService:
         symbol = resolved.hugo_symbol
         gate_name = self.gate.name
         existing = await self.store.get_pairs(symbol, manifest.release_id, gate_name)
-        now = _utcnow()
+        now = self._clock()
+        expired = precheck_expired(manifest, now)
 
         rows: List[StoredPair] = []
         to_check: List[Tuple[CancerTypeStats, str]] = []
@@ -217,6 +251,8 @@ class ExpressionContextService:
             stored_stats["cancer_type_name"] = cancer_type.name if cancer_type else None
             stored_stats["study_id"] = cancer_type.study_id if cancer_type else None
             stored_stats["bundle_tag"] = resolved.bundle_tag
+            if expired:
+                stored_stats["precheck_expired"] = True
             return StoredPair(
                 hugo_symbol=symbol,
                 oncotree_code=stats.oncotree_code,
@@ -234,7 +270,7 @@ class ExpressionContextService:
             if not stats.stats_pass:
                 rows.append(row(stats, False, "stats"))
                 continue
-            if stats.literature_precheck_pass is False:
+            if effective_precheck(stats, expired) is False:
                 rows.append(row(stats, False, "precheck"))
                 continue
             prior = existing.get(stats.oncotree_code)
@@ -419,8 +455,14 @@ class ExpressionContextService:
 
     async def _alias_target(self, symbol: str) -> Optional[str]:
         # BundleNotLoaded propagates (-> 503): "can't resolve yet" is not a 404.
-        bundle = await self.catalog.active()
-        return await self.catalog.alias(bundle, symbol)
+        for attempt in range(2):
+            bundle = await self.catalog.active()
+            try:
+                return await self.catalog.alias(bundle, symbol)
+            except BundleGone:
+                if attempt:
+                    raise BundleNotLoaded("the active bundle changed while reading it")
+        return None  # pragma: no cover
 
     async def bundle_status(self) -> BundleStatus:
         return await self.catalog.status(
@@ -438,10 +480,13 @@ class ExpressionContextService:
         )
         pairs: List[PairStatsView] = []
         summary = GeneStatsSummary()
+        expired = precheck_expired(resolved.manifest, self._clock())
         for stats in resolved.artifact.cancer_types:
             cancer_type = resolved.manifest.cancer_type(stats.oncotree_code)
             precheck = {True: "pass", False: "fail", None: "not_run"}[stats.literature_precheck_pass]
-            eligible = stats.stats_pass and stats.literature_precheck_pass is not False
+            if expired and stats.literature_precheck_pass is not None:
+                precheck = "expired"
+            eligible = stats.stats_pass and effective_precheck(stats, expired) is not False
             verdict = None
             prior = stored.get(stats.oncotree_code)
             if eligible and prior is not None and prior.evidence is not None:

@@ -18,10 +18,12 @@ own removal notes in that directory.
    git rm -r tests/fixtures/expression_context/
    ```
    (`test_expression_context_api.py`, `..._boundary.py`, `..._bundle.py`,
-   `..._lease.py`, `..._nullable.py`, `..._releases.py`, `..._store_gate.py`,
-   `..._web.py`.)
+   `..._hardening.py`, `..._lease.py`, `..._nullable.py`, `..._releases.py`,
+   `..._store_gate.py`, `..._web.py`.)
 4. **Delete the design doc** (optional): `git rm docs/expression-context.md`
-5. **Drop the tables** (they only exist where the flag was ever enabled):
+5. **Drop the tables** (they only exist where the flag was ever enabled; the
+   single-loader lease lives in a column of `expression_context_state`, so
+   there is nothing else to clean up):
    ```sql
    DROP TABLE IF EXISTS expression_context_results;
    DROP TABLE IF EXISTS expression_context_stats;
@@ -34,7 +36,8 @@ own removal notes in that directory.
    `EXPRESSION_CONTEXT_ENABLED`, and any of `EXPRESSION_CONTEXT_RELEASES_REPO`,
    `EXPRESSION_CONTEXT_PINNED_BUNDLE_TAG`, `EXPRESSION_CONTEXT_GITHUB_TOKEN`
    (and its secret), `EXPRESSION_CONTEXT_REFRESH_INTERVAL`,
-   `EXPRESSION_CONTEXT_REFRESH_ERROR_RETRY`, `EXPRESSION_CONTEXT_REDIS_URL`
+   `EXPRESSION_CONTEXT_REFRESH_ERROR_RETRY`, `EXPRESSION_CONTEXT_MAX_RELEASE_PAGES`,
+   `EXPRESSION_CONTEXT_BUNDLE_PRUNE_GRACE`, `EXPRESSION_CONTEXT_REDIS_URL`
    that were set.
 7. Optional Redis cleanup (entries expire on their own TTLs):
    `expression_context:lease:*` keys and `job:expression_context:*` job

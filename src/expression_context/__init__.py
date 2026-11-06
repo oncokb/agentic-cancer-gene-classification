@@ -56,11 +56,7 @@ async def _default_service_factory(app: Any, settings: ExpressionContextSettings
     catalog = StatsCatalog(bundles, cache_seconds=settings.active_bundle_cache_seconds)
     releases = ReleasesClient(settings)
     refresher = BundleRefresher(
-        settings,
-        bundles=bundles,
-        releases=releases,
-        lease=VerdictLease(ttl_seconds=settings.bundle_lock_ttl_seconds, redis=redis),
-        on_activated=catalog.invalidate,
+        settings, bundles=bundles, releases=releases, on_activated=catalog.invalidate
     )
     return ExpressionContextService(
         catalog=catalog,

@@ -9,23 +9,26 @@ no foreign keys to (and no columns on) any existing ACGC table:
   gene's JSON document from ``genes.jsonl.gz``, zlib-compressed.
 - ``expression_context_aliases``: (bundle_tag, alias) → canonical symbol.
 - ``expression_context_state``: a single row (id = 1) holding the *active
-  bundle pointer* plus the cluster-wide refresh bookkeeping (last GitHub check,
-  back-off, last error). Switching bundles is one UPDATE of this row.
+  bundle pointer*, the cluster-wide refresh bookkeeping (last GitHub check,
+  back-off, last error) and the *single-loader lease* (owner token + expiry,
+  set and renewed by compare-and-set on the database clock). Switching
+  bundles is one UPDATE of this row, fenced on holding the lease.
 
 A bundle's rows are written while its status is ``loading`` and are never read
-until the pointer names it, so readers only ever see a complete bundle.
+until the pointer names it, so readers only ever see a complete bundle. A
+bundle that stops being active/previous is marked ``retired_at`` and deleted
+only after a grace period, so pods with a cached pointer keep finding it.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
+import time
 import zlib
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +38,6 @@ ALIASES_TABLE = "expression_context_aliases"
 STATE_TABLE = "expression_context_state"
 BUNDLE_TABLES = (BUNDLES_TABLE, STATS_TABLE, ALIASES_TABLE, STATE_TABLE)
 
-ADVISORY_LOCK_NAME = "expression_context_bundle_load"
 _DELETE_CHUNK = 5000
 _ZLIB_LEVEL = 6
 
@@ -58,6 +60,7 @@ CREATE TABLE IF NOT EXISTS {BUNDLES_TABLE} (
     error VARCHAR(1000) NULL,
     load_started_at DATETIME(6) NOT NULL,
     finished_at DATETIME(6) NULL,
+    retired_at DATETIME(6) NULL,
     INDEX idx_expression_context_bundles_release (release_id)
 )
 """,
@@ -87,7 +90,9 @@ CREATE TABLE IF NOT EXISTS {STATE_TABLE} (
     last_checked_at DATETIME(6) NULL,
     next_check_after DATETIME(6) NULL,
     last_error VARCHAR(1000) NULL,
-    last_error_at DATETIME(6) NULL
+    last_error_at DATETIME(6) NULL,
+    loader_owner VARCHAR(64) NULL,
+    loader_expires_at DATETIME(6) NULL
 )
 """,
 )
@@ -127,6 +132,7 @@ class BundleRecord:
     loaded_rows: int = 0
     error: Optional[str] = None
     finished_at: Optional[datetime] = None
+    retired_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -167,17 +173,21 @@ class BundleStore(Protocol):
 
     async def fail_load(self, bundle_tag: str, error: str, at: datetime) -> None: ...
 
-    async def activate(self, bundle_tag: str, at: datetime) -> bool: ...
+    async def activate(
+        self, bundle_tag: str, at: datetime, lock_token: Optional[str] = None
+    ) -> bool: ...
 
-    async def prune(self, keep: Set[str]) -> List[str]: ...
+    async def prune(self, keep: Set[str], at: datetime, grace_seconds: float) -> List[str]: ...
+
+    async def acquire_loader_lock(self, token: str, ttl_seconds: float) -> bool: ...
+
+    async def renew_loader_lock(self, token: str, ttl_seconds: float) -> bool: ...
+
+    async def release_loader_lock(self, token: str) -> None: ...
 
     async def get_gene_doc(self, bundle_tag: str, hugo_symbol: str) -> Optional[bytes]: ...
 
     async def get_alias(self, bundle_tag: str, alias: str) -> Optional[str]: ...
-
-    def advisory_lock(self) -> Any:
-        """Async context manager yielding True iff this caller got the lock."""
-        ...
 
 
 # --------------------------------------------------------------------------
@@ -195,8 +205,9 @@ class InMemoryBundleStore:
     aliases: Dict[Tuple[str, str], str] = field(default_factory=dict)
     schema_created: bool = False
     gene_batches: List[int] = field(default_factory=list)
-    advisory_lock_calls: int = 0
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    loader_owner: Optional[str] = None
+    loader_expires: float = 0.0
+    lock_clock: Callable[[], float] = time.monotonic
 
     async def ensure_schema(self) -> None:
         self.schema_created = True
@@ -255,9 +266,14 @@ class InMemoryBundleStore:
                 finished_at=_utc(at), loaded_rows=0,
             )
 
-    async def activate(self, bundle_tag, at):
+    def _holds(self, token: Optional[str]) -> bool:
+        return token is not None and self.loader_owner == token and self.lock_clock() <= self.loader_expires
+
+    async def activate(self, bundle_tag, at, lock_token=None):
         record = self.bundles.get(bundle_tag)
         if record is None or record.status != "ready":
+            return False
+        if lock_token is not None and not self._holds(lock_token):
             return False
         previous = self.state.previous_bundle_tag
         if self.state.active_bundle_tag != bundle_tag:
@@ -268,12 +284,37 @@ class InMemoryBundleStore:
         )
         return True
 
-    async def prune(self, keep):
-        removed = sorted(tag for tag in self.bundles if tag not in keep)
+    async def prune(self, keep, at, grace_seconds):
+        at = _utc(at)
+        removed = []
+        for tag, record in sorted(self.bundles.items()):
+            if tag in keep:
+                if record.retired_at is not None:
+                    self.bundles[tag] = replace(record, retired_at=None)
+            elif record.retired_at is None:
+                self.bundles[tag] = replace(record, retired_at=at)
+            elif (at - record.retired_at).total_seconds() >= grace_seconds:
+                removed.append(tag)
         for tag in removed:
             self._drop_rows(tag)
             del self.bundles[tag]
         return removed
+
+    async def acquire_loader_lock(self, token, ttl_seconds):
+        now = self.lock_clock()
+        if self.loader_owner is None or now > self.loader_expires:
+            self.loader_owner, self.loader_expires = token, now + ttl_seconds
+        return self.loader_owner == token
+
+    async def renew_loader_lock(self, token, ttl_seconds):
+        if not self._holds(token):
+            return False
+        self.loader_expires = self.lock_clock() + ttl_seconds
+        return True
+
+    async def release_loader_lock(self, token):
+        if self.loader_owner == token:
+            self.loader_owner, self.loader_expires = None, 0.0
 
     async def get_gene_doc(self, bundle_tag, hugo_symbol):
         row = self.genes.get((bundle_tag, hugo_symbol))
@@ -281,15 +322,6 @@ class InMemoryBundleStore:
 
     async def get_alias(self, bundle_tag, alias):
         return self.aliases.get((bundle_tag, alias))
-
-    @asynccontextmanager
-    async def advisory_lock(self) -> AsyncIterator[bool]:
-        self.advisory_lock_calls += 1
-        if self._lock.locked():
-            yield False
-            return
-        async with self._lock:
-            yield True
 
 
 # --------------------------------------------------------------------------
@@ -299,8 +331,10 @@ class InMemoryBundleStore:
 _BUNDLE_COLUMNS = (
     "bundle_tag, release_id, schema_version, method_version, pubmed_snapshot_date, "
     "published_at, release_url, gene_count, sha256, size_bytes, manifest_json, status, "
-    "loaded_rows, error, load_started_at, finished_at"
+    "loaded_rows, error, load_started_at, finished_at, retired_at"
 )
+# The lease is judged on the database clock, never on pods' clocks.
+_LOCK_HELD = "loader_owner = %s AND loader_expires_at >= UTC_TIMESTAMP(6)"
 
 
 class MySQLBundleStore:
@@ -360,7 +394,7 @@ class MySQLBundleStore:
     def _row_to_record(row: Tuple[Any, ...]) -> BundleRecord:
         (tag, release_id, schema_version, method_version, snapshot, published_at, release_url,
          gene_count, sha256, size_bytes, manifest_json, status, loaded_rows, error,
-         started_at, finished_at) = row
+         started_at, finished_at, retired_at) = row
         manifest = json.loads(manifest_json) if isinstance(manifest_json, (str, bytes)) else manifest_json
         return BundleRecord(
             bundle_tag=tag, release_id=release_id, schema_version=schema_version,
@@ -368,7 +402,7 @@ class MySQLBundleStore:
             published_at=_utc(published_at), release_url=release_url, gene_count=int(gene_count),
             sha256=sha256, size_bytes=int(size_bytes), manifest=manifest, status=status,
             loaded_rows=int(loaded_rows), error=error, load_started_at=_utc(started_at),
-            finished_at=_utc(finished_at),
+            finished_at=_utc(finished_at), retired_at=_utc(retired_at),
         )
 
     async def get_bundle(self, bundle_tag):
@@ -399,7 +433,7 @@ class MySQLBundleStore:
                 await self._delete_rows(cursor, record.bundle_tag)
                 await cursor.execute(
                     f"REPLACE INTO {BUNDLES_TABLE} ({_BUNDLE_COLUMNS}) VALUES "
-                    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'loading', 0, NULL, %s, NULL)",
+                    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'loading', 0, NULL, %s, NULL, NULL)",
                     (
                         record.bundle_tag, record.release_id, record.schema_version,
                         record.method_version, record.pubmed_snapshot_date,
@@ -457,8 +491,9 @@ class MySQLBundleStore:
                     (_clip(error), _naive(at), bundle_tag),
                 )
 
-    async def activate(self, bundle_tag, at):
-        """Atomically point the cluster at a ready bundle (one single-table UPDATE)."""
+    async def activate(self, bundle_tag, at, lock_token=None):
+        """Atomically point the cluster at a ready bundle (one single-table
+        UPDATE), fenced on still holding the loader lease when a token is given."""
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 # Single-table UPDATE assignments run left to right, so
@@ -468,26 +503,87 @@ class MySQLBundleStore:
                     "previous_bundle_tag = IF(active_bundle_tag <=> %s, previous_bundle_tag, "
                     "active_bundle_tag), active_bundle_tag = %s, activated_at = %s "
                     f"WHERE id = 1 AND EXISTS (SELECT 1 FROM {BUNDLES_TABLE} "
-                    "WHERE bundle_tag = %s AND status = 'ready')",
-                    (bundle_tag, bundle_tag, _naive(at), bundle_tag),
+                    "WHERE bundle_tag = %s AND status = 'ready') "
+                    f"AND (%s IS NULL OR ({_LOCK_HELD}))",
+                    (bundle_tag, bundle_tag, _naive(at), bundle_tag, lock_token, lock_token),
                 )
+                # Report success only if the tag is active AND (when fenced) the
+                # caller still holds the lease, so a stale owner never reads its
+                # no-op UPDATE as success just because the tag was already active.
                 await cursor.execute(
-                    f"SELECT active_bundle_tag FROM {STATE_TABLE} WHERE id = 1"
+                    f"SELECT active_bundle_tag = %s AND (%s IS NULL OR ({_LOCK_HELD})) "
+                    f"FROM {STATE_TABLE} WHERE id = 1",
+                    (bundle_tag, lock_token, lock_token),
                 )
                 row = await cursor.fetchone()
-        return row is not None and row[0] == bundle_tag
+        return bool(row and row[0])
 
-    async def prune(self, keep):
+    async def prune(self, keep, at, grace_seconds):
+        """Mark bundles that left {active, previous} as retired; delete those
+        retired for at least ``grace_seconds``. Kept bundles are un-retired."""
+        at_naive = _naive(at)
+        removed: List[str] = []
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute(f"SELECT bundle_tag FROM {BUNDLES_TABLE}")
-                removed = sorted(row[0] for row in await cursor.fetchall() if row[0] not in keep)
-                for tag in removed:
+                await cursor.execute(f"SELECT bundle_tag, retired_at FROM {BUNDLES_TABLE}")
+                for tag, retired_at in await cursor.fetchall():
+                    if tag in keep:
+                        if retired_at is not None:
+                            await cursor.execute(
+                                f"UPDATE {BUNDLES_TABLE} SET retired_at = NULL WHERE bundle_tag = %s",
+                                (tag,),
+                            )
+                    elif retired_at is None:
+                        await cursor.execute(
+                            f"UPDATE {BUNDLES_TABLE} SET retired_at = %s WHERE bundle_tag = %s",
+                            (at_naive, tag),
+                        )
+                    elif (at_naive - retired_at).total_seconds() >= grace_seconds:
+                        removed.append(tag)
+                for tag in sorted(removed):
                     await self._delete_rows(cursor, tag)
                     await cursor.execute(
                         f"DELETE FROM {BUNDLES_TABLE} WHERE bundle_tag = %s", (tag,)
                     )
-        return removed
+        return sorted(removed)
+
+    async def _lock_holder(self, cursor: Any, token: str) -> bool:
+        await cursor.execute(
+            f"SELECT COUNT(*) FROM {STATE_TABLE} WHERE id = 1 AND {_LOCK_HELD}", (token,)
+        )
+        row = await cursor.fetchone()
+        return bool(row and row[0])
+
+    async def acquire_loader_lock(self, token, ttl_seconds):
+        """Compare-and-set: take the lease if it's free or expired."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"UPDATE {STATE_TABLE} SET loader_owner = %s, "
+                    "loader_expires_at = UTC_TIMESTAMP(6) + INTERVAL %s MICROSECOND "
+                    "WHERE id = 1 AND (loader_owner IS NULL OR loader_expires_at < UTC_TIMESTAMP(6))",
+                    (token, int(ttl_seconds * 1_000_000)),
+                )
+                return await self._lock_holder(cursor, token)
+
+    async def renew_loader_lock(self, token, ttl_seconds):
+        """Extend the lease iff ``token`` still holds it (unexpired)."""
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"UPDATE {STATE_TABLE} SET "
+                    "loader_expires_at = UTC_TIMESTAMP(6) + INTERVAL %s MICROSECOND "
+                    f"WHERE id = 1 AND {_LOCK_HELD}",
+                    (int(ttl_seconds * 1_000_000), token),
+                )
+                return await self._lock_holder(cursor, token)
+
+    async def release_loader_lock(self, token):
+        await self._execute(
+            f"UPDATE {STATE_TABLE} SET loader_owner = NULL, loader_expires_at = NULL "
+            "WHERE id = 1 AND loader_owner = %s",
+            (token,),
+        )
 
     async def get_gene_doc(self, bundle_tag, hugo_symbol):
         async with self._pool.acquire() as conn:
@@ -508,34 +604,3 @@ class MySQLBundleStore:
                 )
                 row = await cursor.fetchone()
         return None if row is None else row[0]
-
-    @asynccontextmanager
-    async def advisory_lock(self) -> AsyncIterator[bool]:
-        """MySQL GET_LOCK fallback for when Redis is unavailable. Holds one
-        pool connection for the duration (the lock is per connection)."""
-        try:
-            conn = await self._pool.acquire()
-        except Exception as exc:
-            logger.warning("Expression-context advisory lock unavailable: %s", exc)
-            yield False
-            return
-        try:
-            try:
-                async with conn.cursor() as cursor:
-                    await cursor.execute("SELECT GET_LOCK(%s, 0)", (ADVISORY_LOCK_NAME,))
-                    row = await cursor.fetchone()
-                acquired = bool(row and row[0] == 1)
-            except Exception as exc:
-                logger.warning("Expression-context GET_LOCK failed: %s", exc)
-                acquired = False
-            try:
-                yield acquired
-            finally:
-                if acquired:
-                    try:
-                        async with conn.cursor() as cursor:
-                            await cursor.execute("SELECT RELEASE_LOCK(%s)", (ADVISORY_LOCK_NAME,))
-                    except Exception as exc:
-                        logger.warning("Expression-context RELEASE_LOCK failed: %s", exc)
-        finally:
-            self._pool.release(conn)

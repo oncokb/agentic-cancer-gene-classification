@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -215,9 +216,20 @@ async def _exercise_bundle_store(bundles):
     state = await bundles.get_state()
     assert (state.active_bundle_tag, state.previous_bundle_tag) == ("tag-b", "tag-a")
 
-    removed = await bundles.prune({"tag-b", "tag-a"})
+    # Pruning retires first and deletes only after the grace period.
+    hour = 3600
+    assert await bundles.prune({"tag-b", "tag-a"}, t0, hour) == []
+    assert (await bundles.get_bundle("tag-bad")).retired_at == t0
+    assert await bundles.prune({"tag-b", "tag-a"}, t0 + timedelta(minutes=59), hour) == []
+    removed = await bundles.prune({"tag-b", "tag-a"}, t0 + timedelta(hours=1), hour)
     assert removed == ["tag-bad"] and await bundles.get_bundle("tag-bad") is None
-    assert await bundles.prune({"tag-b"}) == ["tag-a"]
+    t1 = t0 + timedelta(hours=2)
+    assert await bundles.prune({"tag-b"}, t1, hour) == []  # tag-a retired now...
+    assert await bundles.get_gene_doc("tag-a", "ERBB2") == b'{"g": "erbb2"}'  # ...still readable
+    assert await bundles.prune({"tag-b", "tag-a"}, t1 + timedelta(minutes=30), hour) == []
+    assert (await bundles.get_bundle("tag-a")).retired_at is None  # back in use: un-retired
+    assert await bundles.prune({"tag-b"}, t1, hour) == []
+    assert await bundles.prune({"tag-b"}, t1 + timedelta(hours=1), hour) == ["tag-a"]
     assert await bundles.get_gene_doc("tag-a", "ERBB2") is None
     assert await bundles.get_alias("tag-a", "HER2") is None
     assert await bundles.get_gene_doc("tag-b", "ERBB2") == b'{"v": 3}'
@@ -231,12 +243,24 @@ async def _exercise_bundle_store(bundles):
     assert state.last_checked_at == retry and state.last_error is None
     assert state.next_check_after is None and state.active_bundle_tag == "tag-b"
 
-    async with bundles.advisory_lock() as first:
-        assert first
-        async with bundles.advisory_lock() as second:
-            assert not second
-    async with bundles.advisory_lock() as again:
-        assert again
+    # The single-loader lease: compare-and-set acquire/renew, owner-only release.
+    assert await bundles.acquire_loader_lock("pod-a", 0.3)
+    assert not await bundles.acquire_loader_lock("pod-b", 0.3)
+    assert await bundles.renew_loader_lock("pod-a", 0.3)
+    assert not await bundles.renew_loader_lock("pod-b", 0.3)
+    await bundles.release_loader_lock("pod-b")  # not the owner: no effect
+    assert not await bundles.acquire_loader_lock("pod-b", 0.3)
+    await asyncio.sleep(0.4)  # pod-a's lease expires (judged on the store's clock)
+    assert not await bundles.renew_loader_lock("pod-a", 0.3)
+    assert await bundles.acquire_loader_lock("pod-b", 0.3)
+    # Activation is fenced on holding the lease.
+    assert not await bundles.activate("tag-b", t0, lock_token="pod-a")
+    assert await bundles.activate("tag-b", t0, lock_token="pod-b")
+    await bundles.release_loader_lock("pod-a")  # stale owner: no effect
+    assert not await bundles.acquire_loader_lock("pod-c", 0.3)
+    await bundles.release_loader_lock("pod-b")
+    assert await bundles.acquire_loader_lock("pod-c", 0.3)
+    await bundles.release_loader_lock("pod-c")
 
 
 async def test_in_memory_bundle_store_contract():

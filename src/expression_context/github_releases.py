@@ -46,6 +46,11 @@ class TransientReleasesError(ReleasesError):
     """A download failed in a way worth retrying (transport error, HTTP 5xx)."""
 
 
+class DiscoveryIncomplete(ReleasesError):
+    """The page cap was reached before the end of the release list, so the
+    newest bundle can't be known; callers must not activate anything."""
+
+
 class RateLimited(ReleasesError):
     """GitHub refused with 403/429; do not call again before ``retry_at``."""
 
@@ -225,29 +230,33 @@ class ReleasesClient:
     async def latest_bundle(self) -> Optional[BundleRelease]:
         """Newest published bundle release, or None if the repo has none.
 
-        Pages through the release list (GitHub returns newest-created first)
-        and stops at the first page that contains any bundle, choosing the
-        newest by ``published_at`` among them; at most ``max_release_pages``
-        API calls.
+        GitHub lists releases by creation, but the contract picks the newest
+        by ``published_at``, so every page is read (at most
+        ``max_release_pages`` API calls). If the list goes on past the cap,
+        :class:`DiscoveryIncomplete` is raised rather than guessing.
         """
         url: Optional[str] = f"{self._api}/repos/{self._repo}/releases?per_page={_PER_PAGE}"
-        for _ in range(self._settings.max_release_pages):
-            if url is None:
-                break
+        bundles: List[BundleRelease] = []
+        pages = 0
+        while url is not None:
+            if pages >= self._settings.max_release_pages:
+                raise DiscoveryIncomplete(
+                    f"release list continues past {pages} pages "
+                    "(EXPRESSION_CONTEXT_MAX_RELEASE_PAGES); discovery incomplete"
+                )
             response = await self._api_get(url)
+            pages += 1
             payload = self._json(response)
             if not isinstance(payload, list):
                 raise ReleasesError("GitHub release list is not a JSON array")
-            bundles = [
+            bundles.extend(
                 release
                 for release in (parse_release(item) for item in payload if isinstance(item, dict))
                 if release is not None
-            ]
-            if bundles:
-                return newest_bundle(bundles)
+            )
             match = _NEXT_LINK.search(response.headers.get("link", ""))
-            url = match.group(1) if match and len(payload) >= _PER_PAGE else None
-        return None
+            url = match.group(1) if match else None
+        return newest_bundle(bundles)
 
     async def bundle_by_tag(self, tag: str) -> Optional[BundleRelease]:
         response = await self._api_get(

@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.expression_context.github_releases import (
+    DiscoveryIncomplete,
     RateLimited,
     ReleaseAsset,
     ReleasesClient,
@@ -129,7 +130,7 @@ async def test_latest_bundle_pages_until_a_bundle_appears(httpx_mock, client):
     assert len(httpx_mock.get_requests()) == 2
 
 
-async def test_latest_bundle_stops_at_max_pages(httpx_mock):
+async def test_latest_bundle_raises_when_the_page_cap_cuts_the_list(httpx_mock):
     client = ReleasesClient(make_settings(max_release_pages=2))
     pages = [f"{GITHUB_API}/repositories/1/releases?per_page=100&page={n}" for n in (2, 3)]
     httpx_mock.add_response(url=LIST_URL, json=[APP_RELEASE] * 100,
@@ -137,7 +138,8 @@ async def test_latest_bundle_stops_at_max_pages(httpx_mock):
     httpx_mock.add_response(url=pages[0], json=[APP_RELEASE] * 100,
                             headers={"Link": f'<{pages[1]}>; rel="next"'})
     try:
-        assert await client.latest_bundle() is None
+        with pytest.raises(DiscoveryIncomplete, match="discovery incomplete"):
+            await client.latest_bundle()
         assert len(httpx_mock.get_requests()) == 2
     finally:
         await client.aclose()

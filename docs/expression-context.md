@@ -96,22 +96,33 @@ Supported by this module:
 How ACGC consumes it:
 
 1. **Discover.** List the releases of `EXPRESSION_CONTEXT_RELEASES_REPO`
-   (default `oncokb/agentic-cancer-gene-classification`), keep non-draft,
-   non-prerelease releases whose tag starts with `expression-stats-`, pick the
-   newest by `published_at`. Pages of 100, stopping at the first page that has
-   a bundle (at most `EXPRESSION_CONTEXT_MAX_RELEASE_PAGES`).
+   (default `oncokb/agentic-cancer-gene-classification`) and keep non-draft,
+   non-prerelease releases whose tag starts with `expression-stats-`. GitHub
+   orders the list by creation, so **every page** (100 releases each, at most
+   `EXPRESSION_CONTEXT_MAX_RELEASE_PAGES`) is read and the newest by
+   `published_at` wins. If the list continues past the page cap, discovery is
+   *incomplete*: nothing is activated, the active bundle keeps serving, and the
+   refresh reports `outcome:discovery_incomplete`.
    `EXPRESSION_CONTEXT_PINNED_BUNDLE_TAG` instead loads exactly that tag and
    never advances (rollback/pinning).
-2. **Download and verify.** `manifest.json` (schema_version, bundle fields,
-   `bundle_tag` = release tag = `expression-stats-<release_id>-pubmed-<YYYYMMDD
-   of pubmed_snapshot_date>`), optional `aliases.json`, then `genes.jsonl.gz`
+2. **Download and verify.** All three assets are required. `manifest.json`
+   (schema_version, bundle fields, `bundle_tag` = release tag =
+   `expression-stats-<release_id>-pubmed-<YYYYMMDD of pubmed_snapshot_date>`)
+   and `aliases.json` (a JSON object of string alias → string symbol; any other
+   shape rejects the bundle) are validated first. Then `genes.jsonl.gz` is
    streamed once: SHA-256 and byte count over the compressed bytes, inflated
    incrementally (bounded memory), every line validated as a gene document of
    the same `release_id`, inserted in batches. The bundle becomes `ready` only
-   if `size_bytes`, `sha256` and `gene_count` all match; otherwise its rows
-   are deleted.
+   if `size_bytes`, `sha256` and `gene_count` all match and the aliases were
+   imported; otherwise it is marked failed, its rows are deleted and the
+   active bundle keeps serving.
 3. **Switch.** One UPDATE of the single-row pointer table makes the new
-   bundle active. The previous bundle is kept; older ones are pruned.
+   bundle active, fenced on still holding the loader lease. The previous
+   bundle is kept. Any other bundle is marked *retired* and deleted only after
+   `EXPRESSION_CONTEXT_BUNDLE_PRUNE_GRACE` (default 1 h, at least the pointer
+   cache time + 5 minutes), so pods with a cached pointer and in-flight
+   requests keep finding it. A reader whose bundle has vanished anyway re-reads
+   the active bundle and retries; it never answers 404 because of pruning.
 4. **Serve.** Requests read the active bundle from MySQL (no outbound call on
    the request path). No bundle yet → HTTP 503 with `Retry-After`. A failed
    refresh logs a warning, emits `expression_context.bundle.refresh` with
@@ -122,18 +133,28 @@ Coordination and rate limits:
 - The refresh check is due every `EXPRESSION_CONTEXT_REFRESH_INTERVAL`
   (default 6 h; seconds or ISO 8601 such as `PT6H`; minimum 5 minutes). The
   "last checked" time is shared in MySQL, so the whole cluster makes about one
-  discovery call per interval however many pods run (each pod only wakes every
-  15 minutes to ask whether a check is due).
-- One pod loads at a time: a Redis lease (renewed while loading; the load
-  aborts if it is lost), falling back to a MySQL `GET_LOCK` when Redis is
-  down. The import is idempotent either way.
+  discovery per interval however many pods run (each pod only wakes every
+  `min(REFRESH_ERROR_RETRY, REFRESH_INTERVAL / 12)` to ask whether one is due).
+- **One authoritative loader lock**: a lease row in
+  `expression_context_state` (owner token + expiry), taken and renewed by
+  compare-and-set on the *database* clock and held for the whole load. Every
+  loader must hold it; Redis plays no part in loading, so a pod whose Redis is
+  unreachable can't start a second import. If a renewal fails or errors, the
+  load aborts before activation (and leaves its rows for the next owner rather
+  than deleting rows another pod may be writing). A crashed holder's lease
+  simply expires (`EXPRESSION_CONTEXT_BUNDLE_LOCK_TTL_SECONDS`, 120 s).
 - Only discovery uses the GitHub API (60 requests/h per IP unauthenticated;
   `EXPRESSION_CONTEXT_GITHUB_TOKEN` is optional and only raises that limit).
   Asset downloads go to `github.com` release URLs, which are not API-metered,
   and never carry the token. A 403/429 is not retried: the cluster waits until
   GitHub's `Retry-After`/`X-RateLimit-Reset`. Other GitHub errors retry after
-  `EXPRESSION_CONTEXT_REFRESH_ERROR_RETRY` (15 minutes); a bundle that violates
+  `EXPRESSION_CONTEXT_REFRESH_ERROR_RETRY` (30 minutes); a bundle that violates
   the contract is not downloaded again before a full interval.
+- **Budget enforced at startup:** the worst case `3600 / min(REFRESH_INTERVAL,
+  REFRESH_ERROR_RETRY) × MAX_RELEASE_PAGES × HTTP_RETRY_ATTEMPTS` must be at
+  most 30 requests/hour without a token (1000/hour with one); otherwise the
+  settings are rejected with an error naming the numbers. The defaults are
+  exactly 30/hour (2 × 5 × 3).
 
 `release_id` (`datahub-<12hex>-m<method>-<build_sha12>`) changes only when the
 producer's inputs change; a PubMed-count refresh keeps it and publishes a new
@@ -167,6 +188,11 @@ What ACGC relies on from the contract:
   excludes, with reason `precheck`. `stats_pass` false excludes with reason
   `stats`. Pre-check values come from the active bundle, so a PubMed refresh
   that flips a pair to pass takes effect on the next job.
+- **Expired pre-checks:** if the manifest's `source.precheck_expires_at` is in
+  the past when a job runs or the page is viewed, every
+  `literature_precheck_pass` in the bundle is treated as unavailable (like
+  `null`): it never excludes a pair, the literature gate decides, and the page
+  shows "Pre-check expired". The raw value is still stored and displayed.
 - **Unknown fields are ignored; an unknown `schema_version` is rejected** (the
   bundle is not loaded; the previous one keeps serving).
 - **Verdict reuse:** literature verdicts are stored and reused per
@@ -194,7 +220,8 @@ What ACGC relies on from the contract:
 - `GET /v1/expression-context/genes?limit&cursor` → history of genes run.
 - `GET /expression-context` → the "Expression stats" page (signed-out browsers
   go through `/login`): enter a gene, see per-cancer-type statistics with the
-  pass/fail call, flags (incl. tissue-of-origin), the literature verdict and
+  pass/fail call, the PubMed pre-check (pass / fail / not run / expired),
+  flags (incl. tissue-of-origin), the literature verdict and
   citations for passing pairs, the bundle/release provenance, and start the
   literature check. Its files live in `src/expression_context/static/`; a
   "Expression stats" tab is added to the main page only while enabled.
@@ -217,16 +244,18 @@ All created by the module, only when enabled; dropped on removal.
   `bundle_tag` (PK), `release_id`, `schema_version`, `method_version`,
   `pubmed_snapshot_date`, `published_at`, `release_url`, `gene_count`,
   `sha256`, `size_bytes`, `manifest_json`, `status` (`loading|ready|failed`),
-  `loaded_rows`, `error`, `load_started_at`, `finished_at`.
+  `loaded_rows`, `error`, `load_started_at`, `finished_at`, `retired_at`
+  (set when it left {active, previous}; deleted after the grace period).
 - `expression_context_stats` — `(bundle_tag, hugo_symbol)` PK,
   `entrez_gene_id`, `doc_zlib` (the gene's JSON line, zlib-compressed: a
   32-cancer-type document is ~16 KB of JSON and ~4.5 KB compressed, so
   ~90 MB per ~20.5k-gene bundle; the active and previous bundles are kept,
-  plus a third while one is loading).
+  plus a loading one and recently retired ones for up to the grace period).
 - `expression_context_aliases` — `(bundle_tag, alias)` PK, `hugo_symbol`.
 - `expression_context_state` — one row (`id = 1`): `active_bundle_tag`,
   `previous_bundle_tag`, `activated_at`, `last_checked_at`,
-  `next_check_after`, `last_error`, `last_error_at`.
+  `next_check_after`, `last_error`, `last_error_at`, and the single-loader
+  lease `loader_owner`, `loader_expires_at`.
 
 ## Settings
 
@@ -237,7 +266,9 @@ All created by the module, only when enabled; dropped on removal.
 | `EXPRESSION_CONTEXT_PINNED_BUNDLE_TAG` | unset | Load exactly this tag; never advance. |
 | `EXPRESSION_CONTEXT_GITHUB_TOKEN` | unset | Optional; raises the API rate limit only. |
 | `EXPRESSION_CONTEXT_REFRESH_INTERVAL` | `PT6H` | How often the cluster checks for a newer bundle. |
-| `EXPRESSION_CONTEXT_REFRESH_ERROR_RETRY` | `PT15M` | Back-off after a failed GitHub call. |
+| `EXPRESSION_CONTEXT_REFRESH_ERROR_RETRY` | `PT30M` | Back-off after a failed GitHub call; re-check cadence while nothing is loaded. |
+| `EXPRESSION_CONTEXT_MAX_RELEASE_PAGES` | `5` | Release-list pages read per discovery (counts toward the API budget). |
+| `EXPRESSION_CONTEXT_BUNDLE_PRUNE_GRACE` | `PT1H` | How long a retired bundle stays readable before deletion. |
 | `EXPRESSION_CONTEXT_REDIS_URL` | ACGC's Redis | Redis for the module's leases. |
 
 Further tuning knobs (timeouts, size limits, batch size, lease timings, pool

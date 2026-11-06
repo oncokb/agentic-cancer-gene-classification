@@ -221,7 +221,9 @@ class HistoryPage(BaseModel):
 # Bundles: provenance and the per-gene statistics view (stats page)
 # --------------------------------------------------------------------------
 
-PrecheckState = Literal["pass", "fail", "not_run"]
+# "expired": the bundle's pre-check counts are past source.precheck_expires_at,
+# so the pre-check doesn't exclude (the literature gate decides).
+PrecheckState = Literal["pass", "fail", "not_run", "expired"]
 PairStatus = Literal["surfaced", "excluded", "literature_pending"]
 
 

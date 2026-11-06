@@ -194,6 +194,24 @@ test("renders statistics, calls, flags and the literature verdict", async () => 
   assert.strictEqual(page.state.view.hugo_symbol, "ERBB2");
 });
 
+test("an expired PubMed pre-check is labelled, not shown as a failure", async () => {
+  const expired = view({
+    bundle: { ...BUNDLE, source: { ...BUNDLE.source, precheck_expires_at: "2026-10-01T00:00:00Z" } },
+  });
+  expired.pairs[2] = {
+    ...expired.pairs[2], precheck: "expired", literature_eligible: true,
+    status: "literature_pending", exclusion_reason: null,
+  };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(expired) });
+  await page.lookup("ERBB2");
+  const ucec = nodes["ec-tbody"].children[2].children.map((c) => c.text);
+  assert.strictEqual(ucec[8], "Pre-check expired (0)");
+  assert.strictEqual(ucec[11], "Awaiting literature check");
+  const prov = nodes["ec-provenance"].children.map((c) => c.text);
+  const at = prov.indexOf("PubMed pre-check expires");
+  assert.ok(at >= 0 && prov[at + 1] === "2026-10-01T00:00:00Z");
+});
+
 test("invalid input is rejected without a request", async () => {
   const { nodes, calls } = env({});
   nodes["ec-gene"].value = "BAD$GENE";

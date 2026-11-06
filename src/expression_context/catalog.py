@@ -26,6 +26,11 @@ class BundleNotLoaded(RuntimeError):
     """No statistics bundle has been loaded into this deployment yet."""
 
 
+class BundleGone(RuntimeError):
+    """The bundle a reader was using is no longer available (pruned/replaced);
+    re-read the active bundle and retry instead of answering 404."""
+
+
 @dataclass(frozen=True)
 class ActiveBundle:
     record: BundleRecord
@@ -93,12 +98,26 @@ class StatsCatalog:
         self._cached_at = now
         return self._cached
 
+    async def _check_still_there(self, bundle: ActiveBundle) -> None:
+        record = await self._bundles.get_bundle(bundle.tag)
+        if record is None or record.status != "ready":
+            self.invalidate()
+            raise BundleGone(bundle.tag)
+
     async def gene(self, bundle: ActiveBundle, hugo_symbol: str) -> Optional[GeneArtifact]:
+        """The gene's document, None if the bundle doesn't have it; BundleGone
+        if the bundle itself has gone away meanwhile."""
         raw = await self._bundles.get_gene_doc(bundle.tag, hugo_symbol)
-        return None if raw is None else GeneArtifact.model_validate_json(raw)
+        if raw is None:
+            await self._check_still_there(bundle)
+            return None
+        return GeneArtifact.model_validate_json(raw)
 
     async def alias(self, bundle: ActiveBundle, symbol: str) -> Optional[str]:
-        return await self._bundles.get_alias(bundle.tag, symbol)
+        target = await self._bundles.get_alias(bundle.tag, symbol)
+        if target is None:
+            await self._check_still_there(bundle)
+        return target
 
     async def status(self, *, releases_repo: str, pinned_bundle_tag: Optional[str]) -> BundleStatus:
         state = await self._bundles.get_state()

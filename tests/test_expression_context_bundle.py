@@ -22,12 +22,12 @@ from src.expression_context.bundle_loader import (
     BundleRefresher,
     GzipLineReader,
     LoaderLockLost,
-    bundle_lock_key,
 )
 from src.expression_context.bundle_store import BUNDLE_TABLES, InMemoryBundleStore, MySQLBundleStore
 from src.expression_context.catalog import BundleNotLoaded, StatsCatalog
 from src.expression_context.github_releases import ReleasesClient, parse_release
 from src.expression_context.lease import VerdictLease
+from src.expression_context.settings import ExpressionContextSettings
 from src.expression_context.models import JobRecord
 from src.expression_context.service import ExpressionContextService
 from src.expression_context.store import InMemoryExpressionContextStore, MySQLExpressionContextStore
@@ -55,7 +55,7 @@ pytestmark = pytest.mark.no_real_redis
 
 T0 = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
 INTERVAL = timedelta(hours=6)
-ERROR_RETRY = timedelta(minutes=15)
+ERROR_RETRY = ExpressionContextSettings(_env_file=None).refresh_error_retry  # 30 min
 BUNDLE_2 = date(2026, 11, 9)
 BUNDLE_3 = date(2026, 11, 16)
 
@@ -77,6 +77,8 @@ class Pod:
     def __init__(self, bundles, *, redis=None, clock=None, **settings):
         self.settings = make_settings(**settings)
         self.releases = ReleasesClient(self.settings)
+        # Redis plays no part in bundle loading (the loader lock lives in the
+        # bundle store); kept so tests can show a pod's Redis state is irrelevant.
         self.redis = redis if redis is not None else LeaseFakeRedis()
         self.catalog = StatsCatalog(bundles, cache_seconds=0)
         self.clock = clock or Clock()
@@ -84,9 +86,6 @@ class Pod:
             self.settings,
             bundles=bundles,
             releases=self.releases,
-            lease=VerdictLease(
-                ttl_seconds=self.settings.bundle_lock_ttl_seconds, redis=module_redis(self.redis)
-            ),
             on_activated=self.catalog.invalidate,
             clock=self.clock,
         )
@@ -217,10 +216,10 @@ async def test_polling_stays_far_below_the_unauthenticated_rate_limit(httpx_mock
             await pod.refresh()
     discovery_calls = len(_requests(httpx_mock, LIST_URL)) - before
     assert 3 <= discovery_calls <= 5  # 24h / 6h, regardless of pod count
-    assert first.refresher.wake_seconds == 15 * 60
+    assert first.refresher.wake_seconds == 30 * 60
 
 
-async def test_new_bundle_swaps_keeps_previous_and_prunes_older(httpx_mock, pods):
+async def test_new_bundle_swaps_keeps_previous_and_retires_older(httpx_mock, pods):
     bundles, first_bundle, pod = await _load_first(httpx_mock, pods)
     second = build_bundle(pubmed=BUNDLE_2, published_at="2026-11-09T06:00:00Z")
     third = build_bundle(pubmed=BUNDLE_3, published_at="2026-11-16T06:00:00Z")
@@ -240,6 +239,13 @@ async def test_new_bundle_swaps_keeps_previous_and_prunes_older(httpx_mock, pods
     assert await pod.refresh() == "loaded"
     state = await bundles.get_state()
     assert (state.active_bundle_tag, state.previous_bundle_tag) == (third.tag, second.tag)
+    # The first bundle is retired, not yet deleted (grace period).
+    assert bundles.bundles[first_bundle.tag].retired_at == pod.clock.now
+    assert bundles.bundles[second.tag].retired_at is None
+
+    pod.clock.advance(max(INTERVAL, pod.settings.bundle_prune_grace))  # next check, past grace
+    add_release_list(httpx_mock, [release_json(third), release_json(second)], reusable=False)
+    assert await pod.refresh() == "up_to_date"
     assert set(bundles.bundles) == {second.tag, third.tag}
     assert {tag for tag, _ in bundles.genes} == {second.tag, third.tag}
     assert first_bundle.tag not in {tag for tag, _ in bundles.aliases}
@@ -409,9 +415,9 @@ async def test_no_bundle_yet_rechecks_sooner_and_requests_get_503(httpx_mock, po
     assert await pod.refresh() == "no_bundle"
     with pytest.raises(BundleNotLoaded):
         await pod.catalog.active()
-    pod.clock.advance(ERROR_RETRY - timedelta(minutes=1))
+    pod.clock.advance(ERROR_RETRY / 2)
     assert await pod.refresh() == "not_due"
-    pod.clock.advance(timedelta(minutes=1))
+    pod.clock.advance(ERROR_RETRY / 2)
     assert await pod.refresh() == "no_bundle"
 
 
@@ -429,59 +435,91 @@ async def test_only_one_pod_loads_at_a_time(httpx_mock, pods):
     assert "loaded" in outcomes and outcomes.count("loaded") == 1
     assert set(outcomes) - {"loaded"} <= {"locked", "not_due"}
     assert len(_requests(httpx_mock, asset_url(bundle.tag, "genes.jsonl.gz"))) == 1
-    assert redis.keys_with_prefix("expression_context:lease:") == []  # released
+    assert bundles.loader_owner is None  # released
 
 
-async def test_held_lease_means_locked_and_no_github_call(httpx_mock, pods):
-    bundles, redis = InMemoryBundleStore(), LeaseFakeRedis()
-    await redis.set(bundle_lock_key(REPO), "another-pod", px=60_000)
-    pod = pods(bundles, redis=redis)
+async def test_held_loader_lock_means_locked_and_no_github_call(httpx_mock, pods):
+    bundles = InMemoryBundleStore()
+    assert await bundles.acquire_loader_lock("another-pod", 60)
+    pod = pods(bundles)
     assert await pod.refresh() == "locked"
     assert httpx_mock.get_requests() == []
+    assert bundles.loader_owner == "another-pod"  # never released someone else's
 
 
-async def test_redis_down_falls_back_to_mysql_advisory_lock(httpx_mock, pods):
+async def test_an_expired_loader_lock_is_taken_over(httpx_mock, pods):
+    now = [0.0]
+    bundles = InMemoryBundleStore(lock_clock=lambda: now[0])
+    assert await bundles.acquire_loader_lock("crashed-pod", 120)
+    now[0] += 121
+    add_bundle_release(httpx_mock, build_bundle(), reusable=False)
+    assert await pods(bundles).refresh() == "loaded"
+
+
+async def test_redis_down_does_not_block_loading(httpx_mock, pods):
     bundles = InMemoryBundleStore()
-    bundle = build_bundle()
-    add_bundle_release(httpx_mock, bundle, reusable=False)
-    pod = pods(bundles, redis=DownRedis())
-    assert await pod.refresh() == "loaded"
-    assert bundles.advisory_lock_calls == 1
-
-    async with bundles.advisory_lock() as held:  # another pod holds the advisory lock
-        assert held
-        pod.clock.advance(INTERVAL)
-        assert await pod.refresh() == "locked"
+    add_bundle_release(httpx_mock, build_bundle(), reusable=False)
+    assert await pods(bundles, redis=DownRedis()).refresh() == "loaded"
 
 
-async def test_lost_lease_aborts_the_load_before_activation(httpx_mock):
+@pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+async def test_lock_lost_before_import_writes_nothing(httpx_mock):
     bundles = InMemoryBundleStore()
     bundle = build_bundle()
     add_assets(httpx_mock, bundle, reusable=False)
     settings = make_settings(load_batch_size=1)
     releases = ReleasesClient(settings)
     try:
-        payload = release_json(bundle)
         with pytest.raises(LoaderLockLost):
             await BundleLoader(settings, releases, bundles).load(
-                parse_release(payload), should_abort=lambda: True
+                parse_release(release_json(bundle)), should_abort=lambda: True
             )
     finally:
         await releases.aclose()
-    assert (await bundles.get_bundle(bundle.tag)).status == "failed"
+    assert await bundles.get_bundle(bundle.tag) is None
     assert bundles.genes == {} and (await bundles.get_state()).active_bundle_tag is None
 
 
-async def test_heartbeat_flags_a_lost_lease(pods):
-    redis = LeaseFakeRedis()
-    pod = pods(InMemoryBundleStore(), redis=redis, bundle_lock_ttl_seconds=0.03)
-    async with pod.refresher._single_loader() as acquired:
-        assert acquired
-        await redis.delete(bundle_lock_key(REPO))
-        await redis.set(bundle_lock_key(REPO), "thief", px=60_000)
+async def test_lock_lost_mid_import_leaves_rows_for_the_next_owner(httpx_mock):
+    """After losing the lock, another pod may be importing the same tag: the
+    loser must not delete rows (they'd be the new owner's)."""
+    bundles = InMemoryBundleStore()
+    bundle = build_bundle()
+    add_assets(httpx_mock, bundle, reusable=False)
+    settings = make_settings(load_batch_size=1)
+    releases = ReleasesClient(settings)
+    lost = []
+    original = bundles.add_genes
+
+    async def add_genes(tag, rows):
+        await original(tag, rows)
+        lost.append(True)  # the lock goes away after the first batch
+
+    bundles.add_genes = add_genes
+    try:
+        with pytest.raises(LoaderLockLost):
+            await BundleLoader(settings, releases, bundles).load(
+                parse_release(release_json(bundle)), should_abort=lambda: bool(lost)
+            )
+    finally:
+        await releases.aclose()
+    assert (await bundles.get_bundle(bundle.tag)).status == "loading"  # not "failed"
+    assert any(tag == bundle.tag for tag, _ in bundles.genes)
+    assert (await bundles.get_state()).active_bundle_tag is None
+
+
+async def test_heartbeat_flags_a_lost_lock_and_activation_is_fenced(pods):
+    now = [0.0]
+    bundles = InMemoryBundleStore(lock_clock=lambda: now[0])
+    pod = pods(bundles, bundle_lock_ttl_seconds=0.03)
+    async with pod.refresher._single_loader() as token:
+        assert token
+        now[0] += 1  # expired...
+        assert await bundles.acquire_loader_lock("thief", 60)  # ...and taken over
         await asyncio.sleep(0.05)
-        assert pod.refresher._lease_lost is True
-    assert (await redis.get(bundle_lock_key(REPO))) == b"thief"  # never released someone else's
+        assert pod.refresher._lock_lost is True
+        assert not await bundles.activate("anything", T0, lock_token=token)
+    assert bundles.loader_owner == "thief"  # never released someone else's
 
 
 # --------------------------------------------------------------------- pinning
@@ -657,3 +695,32 @@ async def test_load_swap_and_reject_on_real_mysql(httpx_mock, pods, mysql_bundle
     assert (await pod.catalog.active()).tag == second.tag
     assert await mysql_bundles.get_gene_doc(bad.tag, "ERBB2") is None
     assert (await mysql_bundles.get_bundle(bad.tag)).status == "failed"
+
+
+@pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+async def test_redis_down_split_brain_on_real_mysql(httpx_mock, pods, mysql_bundles):
+    """Pod A (Redis fine) is mid-download; pod B's Redis is unreachable. The
+    MySQL lease row is the only loader lock, so B must not load as well."""
+    bundle = build_bundle()
+    add_release_list(httpx_mock, [release_json(bundle)])
+
+    async def slow_genes(request):
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, content=bundle.genes_gz)
+
+    httpx_mock.add_callback(slow_genes, url=asset_url(bundle.tag, "genes.jsonl.gz"), is_reusable=True)
+    httpx_mock.add_response(url=asset_url(bundle.tag, "manifest.json"), json=bundle.manifest, is_reusable=True)
+    httpx_mock.add_response(url=asset_url(bundle.tag, "aliases.json"), json=bundle.aliases, is_reusable=True)
+    clock = Clock()
+    a = pods(mysql_bundles, redis=LeaseFakeRedis(), clock=clock)
+    b = pods(mysql_bundles, redis=DownRedis(), clock=clock)
+
+    async def b_later():
+        await asyncio.sleep(0.1)
+        return await b.refresh()
+
+    assert await asyncio.gather(a.refresh(), b_later()) == ["loaded", "locked"]
+    assert len(_requests(httpx_mock, asset_url(bundle.tag, "genes.jsonl.gz"))) == 1
+    assert (await mysql_bundles.get_state()).active_bundle_tag == bundle.tag
+    assert await mysql_bundles.acquire_loader_lock("after", 1)  # released by A
+    await mysql_bundles.release_loader_lock("after")

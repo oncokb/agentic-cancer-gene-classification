@@ -129,6 +129,8 @@
       const suffix = count === null || count === undefined ? "" : ` (${count})`;
       if (pair.precheck === "pass") return [badge(`Pass${suffix}`, "pass")];
       if (pair.precheck === "fail") return [badge(`Fail${suffix}`, "fail")];
+      // Counts past source.precheck_expires_at: they don't exclude the pair.
+      if (pair.precheck === "expired") return [badge(`Pre-check expired${suffix}`, "warn")];
       return [badge("Not run", "neutral")];
     }
 
@@ -190,6 +192,7 @@
         add("Genes", bundle.gene_count);
         add("Datahub commit", source.datahub_commit);
         add("Generated", source.generated_at);
+        add("PubMed pre-check expires", source.precheck_expires_at);
         add("Published", bundle.published_at);
         add("Loaded", bundle.loaded_at);
       }

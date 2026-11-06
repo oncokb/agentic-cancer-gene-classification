@@ -14,10 +14,16 @@ import re
 from datetime import timedelta
 from typing import Literal, Optional
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BUNDLE_TAG_PREFIX = "expression-stats-"
+
+# Worst-case GitHub API calls per hour the whole cluster may make (discovery
+# is coordinated cluster-wide). GitHub allows 60/h per IP unauthenticated and
+# 5000/h with a token; stay well under either.
+UNAUTHENTICATED_API_BUDGET_PER_HOUR = 30
+AUTHENTICATED_API_BUDGET_PER_HOUR = 1000
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _TAG = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
@@ -49,12 +55,18 @@ class ExpressionContextSettings(BaseSettings):
     # together. Seconds or ISO 8601 (e.g. "PT6H").
     refresh_interval: timedelta = Field(default=timedelta(hours=6), ge=timedelta(minutes=5))
     # Back-off before retrying after a failed GitHub call (a rate-limit
-    # response uses GitHub's own reset time instead, if later).
+    # response uses GitHub's own reset time instead, if later). Also the
+    # re-check cadence while no bundle is loaded yet.
     refresh_error_retry: timedelta = Field(
-        default=timedelta(minutes=15), ge=timedelta(minutes=1)
+        default=timedelta(minutes=30), ge=timedelta(minutes=1)
     )
-    # Release-list pages (100 each) scanned per discovery.
+    # Release-list pages (100 each) scanned per discovery. Every page is read
+    # (the list is ordered by creation, the newest bundle is chosen by
+    # published_at); if more pages remain, nothing is activated.
     max_release_pages: int = Field(default=5, ge=1, le=20)
+    # A bundle that stops being active/previous is deleted only after this
+    # long, so pods with a cached pointer and in-flight requests never lose it.
+    bundle_prune_grace: timedelta = Field(default=timedelta(hours=1))
 
     http_timeout_seconds: float = Field(default=30.0, gt=0)
     http_connect_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -138,6 +150,44 @@ class ExpressionContextSettings(BaseSettings):
         if not value.startswith("https://"):
             raise ValueError("EXPRESSION_CONTEXT_GITHUB_API_URL must be an https:// URL")
         return value
+
+    @property
+    def github_requests_per_hour_worst_case(self) -> float:
+        """Upper bound on cluster-wide GitHub API calls per hour: discovery at
+        the fastest cadence (errors / nothing loaded yet), every page, every
+        retry attempt."""
+        fastest = min(self.refresh_interval_seconds, self.refresh_error_retry_seconds)
+        return 3600.0 / fastest * self.max_release_pages * self.http_retry_attempts
+
+    @model_validator(mode="after")
+    def _check_budget_and_grace(self) -> "ExpressionContextSettings":
+        budget = (
+            AUTHENTICATED_API_BUDGET_PER_HOUR
+            if self.github_token is not None
+            else UNAUTHENTICATED_API_BUDGET_PER_HOUR
+        )
+        worst = self.github_requests_per_hour_worst_case
+        if worst > budget:
+            raise ValueError(
+                f"GitHub API budget exceeded: up to {worst:.0f} requests/hour "
+                f"(3600 / min(REFRESH_INTERVAL, REFRESH_ERROR_RETRY) x MAX_RELEASE_PAGES "
+                f"{self.max_release_pages} x HTTP_RETRY_ATTEMPTS {self.http_retry_attempts}) "
+                f"> {budget}/hour allowed "
+                f"{'with' if self.github_token is not None else 'without'} "
+                "EXPRESSION_CONTEXT_GITHUB_TOKEN. Lengthen the intervals or lower the "
+                "page cap / retries."
+            )
+        minimum = self.active_bundle_cache_seconds + 300
+        if self.bundle_prune_grace.total_seconds() < minimum:
+            raise ValueError(
+                "EXPRESSION_CONTEXT_BUNDLE_PRUNE_GRACE must be at least "
+                f"ACTIVE_BUNDLE_CACHE_SECONDS + 5 minutes ({minimum:.0f}s)"
+            )
+        return self
+
+    @property
+    def bundle_prune_grace_seconds(self) -> float:
+        return self.bundle_prune_grace.total_seconds()
 
     @property
     def refresh_interval_seconds(self) -> float:
