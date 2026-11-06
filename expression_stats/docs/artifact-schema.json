@@ -1,0 +1,330 @@
+{
+  "manifest": {
+    "type": "object",
+    "properties": {
+      "schema_version": {
+        "const": "1"
+      },
+      "release_id": {
+        "type": "string",
+        "pattern": "^datahub-[0-9a-f]{12}-m2-[0-9a-f]{12}$"
+      },
+      "method_version": {
+        "const": "2"
+      },
+      "params": {
+        "type": "object",
+        "properties": {
+          "fdr": {
+            "type": "number"
+          },
+          "log2fc": {
+            "type": "number"
+          },
+          "cliffs_delta": {
+            "type": "number"
+          },
+          "min_n": {
+            "type": "number"
+          },
+          "detection_log2": {
+            "type": "number"
+          },
+          "precheck_min_pmids": {
+            "type": "number"
+          },
+          "expression_floor_log2": {
+            "type": "number"
+          },
+          "precheck_cache_ttl_days": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "fdr",
+          "log2fc",
+          "cliffs_delta",
+          "min_n",
+          "detection_log2",
+          "precheck_min_pmids",
+          "expression_floor_log2",
+          "precheck_cache_ttl_days"
+        ]
+      },
+      "source": {
+        "type": "object",
+        "properties": {
+          "datahub_commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "hgnc_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "code_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "overrides_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "build_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "precheck_expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "cohort_mapping_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "datahub_commit",
+          "generated_at",
+          "hgnc_sha256",
+          "code_sha256",
+          "overrides_sha256",
+          "build_sha256",
+          "cohort_mapping_sha256"
+        ]
+      },
+      "cancer_types": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "study_id": {
+              "type": "string"
+            },
+            "oncotree_code": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "tumor_type_query": {
+              "type": "string"
+            },
+            "import_date": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "study_id",
+            "oncotree_code",
+            "name",
+            "tumor_type_query",
+            "import_date"
+          ]
+        },
+        "minItems": 32,
+        "maxItems": 32
+      },
+      "build": {
+        "type": "object",
+        "properties": {
+          "genes": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "skip_precheck": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "genes",
+          "skip_precheck"
+        ]
+      }
+    },
+    "required": [
+      "schema_version",
+      "release_id",
+      "method_version",
+      "params",
+      "source",
+      "cancer_types",
+      "build"
+    ]
+  },
+  "gene": {
+    "type": "object",
+    "properties": {
+      "schema_version": {
+        "const": "1"
+      },
+      "release_id": {
+        "type": "string",
+        "pattern": "^datahub-[0-9a-f]{12}-m2-[0-9a-f]{12}$"
+      },
+      "gene": {
+        "type": "object",
+        "properties": {
+          "hugo_symbol": {
+            "type": "string",
+            "pattern": "^[A-Z0-9_.-]+$"
+          },
+          "entrez_gene_id": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "hugo_symbol",
+          "entrez_gene_id"
+        ]
+      },
+      "cancer_types": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "median_log2": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "rest_median_log2": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "log2fc": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "log2fc_vs_median_of_type_medians": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "cliffs_delta": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "auc": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "p_value": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "q_value": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "oncotree_code": {
+              "type": "string"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "n_rest": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "stats_pass": {
+              "type": "boolean"
+            },
+            "pubmed_count": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "literature_precheck_pass": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "flags": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "small_n",
+                  "tissue_of_origin_risk"
+                ]
+              }
+            },
+            "p90_log2": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "rest_p90_log2": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "median_log2",
+            "rest_median_log2",
+            "log2fc",
+            "log2fc_vs_median_of_type_medians",
+            "cliffs_delta",
+            "auc",
+            "p_value",
+            "q_value",
+            "oncotree_code",
+            "n",
+            "n_rest",
+            "stats_pass",
+            "pubmed_count",
+            "literature_precheck_pass",
+            "flags",
+            "p90_log2",
+            "rest_p90_log2"
+          ]
+        },
+        "minItems": 32,
+        "maxItems": 32
+      }
+    },
+    "required": [
+      "schema_version",
+      "release_id",
+      "gene",
+      "cancer_types"
+    ]
+  },
+  "aliases": {
+    "type": "object",
+    "additionalProperties": {
+      "type": "string"
+    }
+  }
+}

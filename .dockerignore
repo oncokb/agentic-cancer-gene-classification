@@ -17,3 +17,6 @@ dist
 results.json
 test_results.json
 benchmarks/results
+
+# Independent statistics pipeline; excluded from the application image.
+expression_stats/

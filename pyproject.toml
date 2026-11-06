@@ -43,6 +43,8 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.ruff]
+# Pipeline uses its own stricter lint workflow and environment.
+extend-exclude = ["expression_stats"]
 line-length = 100
 target-version = "py312"
 
