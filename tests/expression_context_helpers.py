@@ -180,6 +180,8 @@ def add_bundle_release(httpx_mock, bundle: FixtureBundle, *, reusable: bool = Tr
 
 async def seed_bundle(bundles: InMemoryBundleStore, bundle: FixtureBundle) -> None:
     """Import and activate a fixture bundle directly (no HTTP, no loader)."""
+    token = "seed"
+    assert await bundles.acquire_loader_lock(token, 60)
     data = bundle.manifest
     await bundles.begin_load(BundleRecord(
         bundle_tag=bundle.tag, release_id=data["release_id"],
@@ -189,20 +191,21 @@ async def seed_bundle(bundles: InMemoryBundleStore, bundle: FixtureBundle) -> No
         manifest=data, status="loading", load_started_at=datetime.now(timezone.utc),
         published_at=datetime.fromisoformat(bundle.published_at.replace("Z", "+00:00")),
         release_url=f"https://github.com/{REPO}/releases/tag/{bundle.tag}",
-    ))
+    ), token)
     await bundles.add_genes(bundle.tag, [
         (doc["gene"]["hugo_symbol"].upper(), doc["gene"].get("entrez_gene_id"),
          json.dumps(doc).encode())
         for doc in bundle.genes
-    ])
+    ], token)
     symbols = {doc["gene"]["hugo_symbol"].upper() for doc in bundle.genes}
     await bundles.add_aliases(bundle.tag, [
         (alias.upper(), target.upper())
         for alias, target in (bundle.aliases or {}).items()
         if target.upper() in symbols
-    ])
-    await bundles.finish_load(bundle.tag, len(bundle.genes), datetime.now(timezone.utc))
-    assert await bundles.activate(bundle.tag, datetime.now(timezone.utc))
+    ], token)
+    await bundles.finish_load(bundle.tag, len(bundle.genes), datetime.now(timezone.utc), token)
+    assert await bundles.activate(bundle.tag, datetime.now(timezone.utc), token)
+    await bundles.release_loader_lock(token)
 
 
 def seeded_bundles(bundle: Optional[FixtureBundle] = None) -> InMemoryBundleStore:

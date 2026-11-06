@@ -113,10 +113,12 @@ def _requests(httpx_mock, url):
 
 
 async def _load_first(httpx_mock, pods, bundles=None, **kwargs):
-    bundles = bundles if bundles is not None else InMemoryBundleStore()
+    clock = kwargs.pop("clock", None) or Clock()
+    # The in-memory "database clock" (retirement/grace) follows the test clock.
+    bundles = bundles if bundles is not None else InMemoryBundleStore(db_clock=clock)
     bundle = build_bundle()
     add_bundle_release(httpx_mock, bundle, reusable=False)
-    pod = pods(bundles, **kwargs)
+    pod = pods(bundles, clock=clock, **kwargs)
     assert await pod.refresh() == "loaded"
     return bundles, bundle, pod
 
@@ -472,7 +474,7 @@ async def test_lock_lost_before_import_writes_nothing(httpx_mock):
     try:
         with pytest.raises(LoaderLockLost):
             await BundleLoader(settings, releases, bundles).load(
-                parse_release(release_json(bundle)), should_abort=lambda: True
+                parse_release(release_json(bundle)), lock_token="t", should_abort=lambda: True
             )
     finally:
         await releases.aclose()
@@ -480,31 +482,38 @@ async def test_lock_lost_before_import_writes_nothing(httpx_mock):
     assert bundles.genes == {} and (await bundles.get_state()).active_bundle_tag is None
 
 
+@pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
 async def test_lock_lost_mid_import_leaves_rows_for_the_next_owner(httpx_mock):
-    """After losing the lock, another pod may be importing the same tag: the
-    loser must not delete rows (they'd be the new owner's)."""
-    bundles = InMemoryBundleStore()
+    """The lease expires after A's first batch and B takes over: the store
+    refuses A's next write (even though A's own abort flag never fired), and
+    A deletes nothing (the rows may be B's)."""
+    now = [0.0]
+    bundles = InMemoryBundleStore(lock_clock=lambda: now[0])
     bundle = build_bundle()
     add_assets(httpx_mock, bundle, reusable=False)
     settings = make_settings(load_batch_size=1)
     releases = ReleasesClient(settings)
-    lost = []
+    assert await bundles.acquire_loader_lock("A", 120)
     original = bundles.add_genes
+    stolen = []
 
-    async def add_genes(tag, rows):
-        await original(tag, rows)
-        lost.append(True)  # the lock goes away after the first batch
+    async def add_genes(tag, rows, token):
+        await original(tag, rows, token)
+        if not stolen:
+            stolen.append(True)
+            now[0] += 121
+            assert await bundles.acquire_loader_lock("B", 120)
 
     bundles.add_genes = add_genes
     try:
         with pytest.raises(LoaderLockLost):
             await BundleLoader(settings, releases, bundles).load(
-                parse_release(release_json(bundle)), should_abort=lambda: bool(lost)
+                parse_release(release_json(bundle)), lock_token="A", should_abort=lambda: False
             )
     finally:
         await releases.aclose()
     assert (await bundles.get_bundle(bundle.tag)).status == "loading"  # not "failed"
-    assert any(tag == bundle.tag for tag, _ in bundles.genes)
+    assert len([key for key in bundles.genes if key[0] == bundle.tag]) == 1  # only A's first batch
     assert (await bundles.get_state()).active_bundle_tag is None
 
 

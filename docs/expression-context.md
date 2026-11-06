@@ -116,12 +116,16 @@ How ACGC consumes it:
    if `size_bytes`, `sha256` and `gene_count` all match and the aliases were
    imported; otherwise it is marked failed, its rows are deleted and the
    active bundle keeps serving.
-3. **Switch.** One UPDATE of the single-row pointer table makes the new
-   bundle active, fenced on still holding the loader lease. The previous
-   bundle is kept. Any other bundle is marked *retired* and deleted only after
-   `EXPRESSION_CONTEXT_BUNDLE_PRUNE_GRACE` (default 1 h, at least the pointer
-   cache time + 5 minutes), so pods with a cached pointer and in-flight
-   requests keep finding it. A reader whose bundle has vanished anyway re-reads
+3. **Switch.** One transaction swaps the single-row pointer, fenced on still
+   holding the loader lease. The previous bundle is kept. A bundle that leaves
+   {active, previous} gets `retired_at` from the **database clock at the
+   swap** (a re-activated bundle has it cleared), and pruning deletes it only
+   once it has been retired for `EXPRESSION_CONTEXT_BUNDLE_PRUNE_GRACE`
+   (default 1 h, at least the pointer cache time + 5 minutes), again on the
+   database clock. Pruning reads the *current* pointers inside its own fenced
+   transaction, never a snapshot, so it can't delete a bundle that just became
+   active again. Pods with a cached pointer and in-flight requests keep
+   finding retired bundles during the grace period. A reader whose bundle has vanished anyway re-reads
    the active bundle and retries; it never answers 404 because of pruning.
 4. **Serve.** Requests read the active bundle from MySQL (no outbound call on
    the request path). No bundle yet → HTTP 503 with `Retry-After`. A failed
@@ -139,10 +143,15 @@ Coordination and rate limits:
   `expression_context_state` (owner token + expiry), taken and renewed by
   compare-and-set on the *database* clock and held for the whole load. Every
   loader must hold it; Redis plays no part in loading, so a pod whose Redis is
-  unreachable can't start a second import. If a renewal fails or errors, the
-  load aborts before activation (and leaves its rows for the next owner rather
-  than deleting rows another pod may be writing). A crashed holder's lease
-  simply expires (`EXPRESSION_CONTEXT_BUNDLE_LOCK_TTL_SECONDS`, 120 s).
+  unreachable can't start a second import. **Every bundle write is fenced:**
+  row inserts, the per-tag reset, failure cleanup, status updates, activation
+  and pruning each carry the lease token and run in one transaction that
+  first locks the state row (`SELECT … FOR UPDATE`) and checks the lease on
+  the database clock. Acquiring or renewing the lease updates that same row,
+  so ownership can't change between the check and the write; a stale loader's
+  writes are refused (`LoaderLockNotHeld`) and touch nothing. A failed or
+  erroring renewal also aborts the load early. A crashed holder's lease simply
+  expires (`EXPRESSION_CONTEXT_BUNDLE_LOCK_TTL_SECONDS`, 120 s).
 - Only discovery uses the GitHub API (60 requests/h per IP unauthenticated;
   `EXPRESSION_CONTEXT_GITHUB_TOKEN` is optional and only raises that limit).
   Asset downloads go to `github.com` release URLs, which are not API-metered,
@@ -154,7 +163,8 @@ Coordination and rate limits:
   REFRESH_ERROR_RETRY) × MAX_RELEASE_PAGES × HTTP_RETRY_ATTEMPTS` must be at
   most 30 requests/hour without a token (1000/hour with one); otherwise the
   settings are rejected with an error naming the numbers. The defaults are
-  exactly 30/hour (2 × 5 × 3).
+  exactly 30/hour (2 × 5 × 3). The refresher never checks earlier than those
+  cadences (no early-check slack), so the bound is real.
 
 `release_id` (`datahub-<12hex>-m<method>-<build_sha12>`) changes only when the
 producer's inputs change; a PubMed-count refresh keeps it and publishes a new

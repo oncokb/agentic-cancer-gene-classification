@@ -38,7 +38,12 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set
 
 from pydantic import ValidationError
 
-from src.expression_context.bundle_store import BundleRecord, BundleStore, GeneRow
+from src.expression_context.bundle_store import (
+    BundleRecord,
+    BundleStore,
+    GeneRow,
+    LoaderLockNotHeld,
+)
 from src.expression_context.github_releases import (
     BundleRelease,
     DiscoveryIncomplete,
@@ -209,10 +214,17 @@ class BundleLoader:
         self._releases = releases
         self._bundles = bundles
         self._clock = clock
+        self._token = ""
 
     async def load(
-        self, release: BundleRelease, *, should_abort: Callable[[], bool] = lambda: False
+        self,
+        release: BundleRelease,
+        *,
+        lock_token: str,
+        should_abort: Callable[[], bool] = lambda: False,
     ) -> BundleRecord:
+        """Import ``release``. Every write carries ``lock_token`` and is refused
+        by the store unless that token still holds the single-loader lease."""
         for name in (MANIFEST_ASSET, GENES_ASSET, ALIASES_ASSET):
             if name not in release.assets:
                 raise BundleContractError(f"release {release.tag} has no {name} asset")
@@ -242,6 +254,7 @@ class BundleLoader:
         tag = release.tag
         if should_abort():
             raise LoaderLockLost("single-loader lock lost before the import started")
+        self._token = lock_token
         await self._bundles.begin_load(
             BundleRecord(
                 bundle_tag=tag,
@@ -257,7 +270,8 @@ class BundleLoader:
                 load_started_at=self._clock(),
                 published_at=release.published_at,
                 release_url=release.html_url,
-            )
+            ),
+            lock_token,
         )
         try:
             async with asyncio.timeout(self._settings.download_timeout_seconds):
@@ -265,7 +279,11 @@ class BundleLoader:
             await self._import_aliases(tag, aliases, symbols)
             if should_abort():
                 raise LoaderLockLost("single-loader lock lost before finishing")
-            await self._bundles.finish_load(tag, len(symbols), self._clock())
+            await self._bundles.finish_load(tag, len(symbols), self._clock(), lock_token)
+        except LoaderLockNotHeld as exc:
+            # The store refused a write: our lease is gone, and the rows for
+            # this tag may now be another loader's. Touch nothing.
+            raise LoaderLockLost("single-loader lock lost: the store refused a write") from exc
         except BaseException as exc:
             reason = "timed out" if isinstance(exc, TimeoutError) else f"{type(exc).__name__}: {exc}"
             # After losing the lock another pod may be importing this tag:
@@ -273,7 +291,9 @@ class BundleLoader:
             # owner's begin_load() resets the tag.
             if not should_abort():
                 try:
-                    await self._bundles.fail_load(tag, reason, self._clock())
+                    await self._bundles.fail_load(tag, reason, self._clock(), lock_token)
+                except LoaderLockNotHeld:
+                    logger.warning("Lost the loader lock; leaving bundle %s rows to its new owner", tag)
                 except Exception:
                     logger.exception("Could not clean up failed expression-context bundle %s", tag)
             if isinstance(exc, TimeoutError):
@@ -305,7 +325,7 @@ class BundleLoader:
                     continue
                 batch.append(self._gene_row(line.rstrip(b"\r"), manifest, symbols, line_no))
                 if len(batch) >= self._settings.load_batch_size:
-                    await self._bundles.add_genes(tag, batch)
+                    await self._bundles.add_genes(tag, batch, self._token)
                     batch = []
                     if should_abort():
                         raise LoaderLockLost("single-loader lock lost during import")
@@ -327,7 +347,7 @@ class BundleLoader:
             raise BundleContractError(f"{GENES_ASSET} SHA-256 does not match the manifest")
         await accept(reader.finish())
         if batch:
-            await self._bundles.add_genes(tag, batch)
+            await self._bundles.add_genes(tag, batch, self._token)
         if len(symbols) != manifest.gene_count:
             raise BundleContractError(
                 f"{GENES_ASSET} has {len(symbols)} genes but the manifest declares "
@@ -369,7 +389,7 @@ class BundleLoader:
         ]
         size = self._settings.load_batch_size * 4
         for start in range(0, len(rows), size):
-            await self._bundles.add_aliases(tag, rows[start : start + size])
+            await self._bundles.add_aliases(tag, rows[start : start + size], self._token)
 
 
 class BundleRefresher:
@@ -406,10 +426,11 @@ class BundleRefresher:
         if state.last_checked_at is None:
             return True
         # With nothing loaded yet, look again sooner than the full interval.
+        # No early-check slack: the API budget assumes exactly these cadences.
         interval = self._settings.refresh_interval_seconds
         if state.active_bundle_tag is None:
-            interval = min(interval, self._settings.refresh_error_retry_seconds)
-        return (now - state.last_checked_at).total_seconds() >= interval * 0.95
+            interval = self._settings.min_check_period_seconds
+        return (now - state.last_checked_at).total_seconds() >= interval
 
     @asynccontextmanager
     async def _single_loader(self) -> AsyncIterator[Optional[str]]:
@@ -454,12 +475,16 @@ class BundleRefresher:
         logger.warning("Expression-context bundle refresh failed: %s", message)
         await self._bundles.mark_error(now, message, retry_at)
 
-    async def _prune(self, now: datetime) -> List[str]:
+    async def _prune(self, token: str) -> List[str]:
+        """Fenced, and computed by the store from the current pointers and the
+        database clock (no snapshot, no pod clock)."""
         if self._lock_lost:
             return []
-        state = await self._bundles.get_state()
-        keep = {tag for tag in (state.active_bundle_tag, state.previous_bundle_tag) if tag}
-        return await self._bundles.prune(keep, now, self._settings.bundle_prune_grace_seconds)
+        try:
+            return await self._bundles.prune(token, self._settings.bundle_prune_grace_seconds)
+        except LoaderLockNotHeld:
+            self._lock_lost = True
+            return []
 
     async def refresh_once(self) -> str:
         """One refresh attempt; returns an outcome label (also sent as a metric tag)."""
@@ -508,7 +533,7 @@ class BundleRefresher:
                 await self._bundles.mark_checked(now)
                 return "no_bundle"
             if release.tag == state.active_bundle_tag:
-                await self._prune(now)
+                await self._prune(token)
                 await self._bundles.mark_checked(now)
                 return "up_to_date"
             return await self._load_and_activate(release, token, now, error_retry)
@@ -518,7 +543,9 @@ class BundleRefresher:
     ) -> str:
         started = time.monotonic()
         try:
-            record = await self._loader.load(release, should_abort=lambda: self._lock_lost)
+            record = await self._loader.load(
+                release, lock_token=token, should_abort=lambda: self._lock_lost
+            )
         except RateLimited as exc:
             await self._record_error(now, f"bundle {release.tag}: {exc}", max(exc.retry_at, now))
             return "rate_limited"
@@ -537,7 +564,7 @@ class BundleRefresher:
                 now, f"could not activate bundle {release.tag}: single-loader lock lost", error_retry
             )
             return "load_failed"
-        pruned = await self._prune(now)
+        pruned = await self._prune(token)
         await self._bundles.mark_checked(now)
         if self._on_activated is not None:
             self._on_activated()

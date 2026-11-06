@@ -13,6 +13,7 @@ from src.expression_context.bundle_store import (
     STATE_TABLE,
     BundleRecord,
     InMemoryBundleStore,
+    LoaderLockNotHeld,
     MySQLBundleStore,
 )
 
@@ -172,14 +173,16 @@ def _record(tag, release_id="datahub-aaaaaaaaaaaa-m2-bbbbbbbbbbbb", status="load
 async def _exercise_bundle_store(bundles):
     t0 = datetime(2026, 11, 6, 12, 0, 0, 123456, tzinfo=timezone.utc)
     assert (await bundles.get_state()).active_bundle_tag is None
+    L = "loader"
+    assert await bundles.acquire_loader_lock(L, 60)
 
-    await bundles.begin_load(_record("tag-a"))
-    await bundles.add_genes("tag-a", [("ERBB2", 2064, b'{"g": "erbb2"}'), ("MYCN", None, b'{"g": 2}')])
-    await bundles.add_aliases("tag-a", [("HER2", "ERBB2"), ("NEU", "ERBB2")])
-    assert not await bundles.activate("tag-a", t0)  # never while loading
+    await bundles.begin_load(_record("tag-a"), L)
+    await bundles.add_genes("tag-a", [("ERBB2", 2064, b'{"g": "erbb2"}'), ("MYCN", None, b'{"g": 2}')], L)
+    await bundles.add_aliases("tag-a", [("HER2", "ERBB2"), ("NEU", "ERBB2")], L)
+    assert not await bundles.activate("tag-a", t0, L)  # never while loading
     assert (await bundles.get_state()).active_bundle_tag is None
-    await bundles.finish_load("tag-a", 2, t0)
-    assert await bundles.activate("tag-a", t0)
+    await bundles.finish_load("tag-a", 2, t0, L)
+    assert await bundles.activate("tag-a", t0, L)
     record = await bundles.get_bundle("tag-a")
     assert record.status == "ready" and record.loaded_rows == 2 and record.finished_at == t0
     assert record.pubmed_snapshot_date == date(2026, 11, 2)
@@ -193,46 +196,55 @@ async def _exercise_bundle_store(bundles):
     assert state.active_bundle_tag == "tag-a" and state.activated_at == t0
 
     # A failed load cleans up after itself and never touches the pointer.
-    await bundles.begin_load(_record("tag-bad"))
-    await bundles.add_genes("tag-bad", [("ERBB2", 2064, b"{}")])
-    await bundles.fail_load("tag-bad", "sha mismatch" * 200, t0)
+    await bundles.begin_load(_record("tag-bad"), L)
+    await bundles.add_genes("tag-bad", [("ERBB2", 2064, b"{}")], L)
+    await bundles.fail_load("tag-bad", "sha mismatch" * 200, t0, L)
     bad = await bundles.get_bundle("tag-bad")
     assert bad.status == "failed" and len(bad.error) == 1000
     assert await bundles.get_gene_doc("tag-bad", "ERBB2") is None
-    assert not await bundles.activate("tag-bad", t0)
+    assert not await bundles.activate("tag-bad", t0, L)
     assert (await bundles.get_state()).active_bundle_tag == "tag-a"
 
     # Re-loading a tag replaces whatever rows it had (idempotent import).
-    await bundles.begin_load(_record("tag-b"))
-    await bundles.add_genes("tag-b", [("STALE", None, b"{}")])
-    await bundles.begin_load(_record("tag-b"))
-    await bundles.add_genes("tag-b", [("ERBB2", 2064, b'{"v": 2}'), ("MYCN", None, b"{}")])
-    await bundles.add_genes("tag-b", [("ERBB2", 2064, b'{"v": 3}')])  # upsert
-    await bundles.finish_load("tag-b", 2, t0)
+    await bundles.begin_load(_record("tag-b"), L)
+    await bundles.add_genes("tag-b", [("STALE", None, b"{}")], L)
+    await bundles.begin_load(_record("tag-b"), L)
+    await bundles.add_genes("tag-b", [("ERBB2", 2064, b'{"v": 2}'), ("MYCN", None, b"{}")], L)
+    await bundles.add_genes("tag-b", [("ERBB2", 2064, b'{"v": 3}')], L)  # upsert
+    await bundles.finish_load("tag-b", 2, t0, L)
     assert await bundles.get_gene_doc("tag-b", "STALE") is None
     assert await bundles.get_gene_doc("tag-b", "ERBB2") == b'{"v": 3}'
-    assert await bundles.activate("tag-b", t0 + timedelta(hours=1))
-    assert await bundles.activate("tag-b", t0 + timedelta(hours=2))  # same tag: previous kept
+    assert await bundles.activate("tag-b", t0 + timedelta(hours=1), L)
+    assert await bundles.activate("tag-b", t0 + timedelta(hours=2), L)  # same tag: previous kept
     state = await bundles.get_state()
     assert (state.active_bundle_tag, state.previous_bundle_tag) == ("tag-b", "tag-a")
+    assert (await bundles.get_bundle("tag-a")).retired_at is None  # still the previous
 
-    # Pruning retires first and deletes only after the grace period.
-    hour = 3600
-    assert await bundles.prune({"tag-b", "tag-a"}, t0, hour) == []
-    assert (await bundles.get_bundle("tag-bad")).retired_at == t0
-    assert await bundles.prune({"tag-b", "tag-a"}, t0 + timedelta(minutes=59), hour) == []
-    removed = await bundles.prune({"tag-b", "tag-a"}, t0 + timedelta(hours=1), hour)
-    assert removed == ["tag-bad"] and await bundles.get_bundle("tag-bad") is None
-    t1 = t0 + timedelta(hours=2)
-    assert await bundles.prune({"tag-b"}, t1, hour) == []  # tag-a retired now...
-    assert await bundles.get_gene_doc("tag-a", "ERBB2") == b'{"g": "erbb2"}'  # ...still readable
-    assert await bundles.prune({"tag-b", "tag-a"}, t1 + timedelta(minutes=30), hour) == []
-    assert (await bundles.get_bundle("tag-a")).retired_at is None  # back in use: un-retired
-    assert await bundles.prune({"tag-b"}, t1, hour) == []
-    assert await bundles.prune({"tag-b"}, t1 + timedelta(hours=1), hour) == ["tag-a"]
-    assert await bundles.get_gene_doc("tag-a", "ERBB2") is None
-    assert await bundles.get_alias("tag-a", "HER2") is None
-    assert await bundles.get_gene_doc("tag-b", "ERBB2") == b'{"v": 3}'
+    # Pruning: grace on the database clock, exclusions from the current pointers.
+    grace = 0.3
+    assert await bundles.prune(L, grace) == []  # tag-bad (never active) starts its grace now
+    assert (await bundles.get_bundle("tag-bad")).retired_at is not None
+    await asyncio.sleep(grace + 0.1)
+    assert await bundles.prune(L, grace) == ["tag-bad"]
+    assert await bundles.get_bundle("tag-bad") is None
+    await bundles.begin_load(_record("tag-c"), L)
+    await bundles.add_genes("tag-c", [("ERBB2", 2064, b'{"v": "c"}')], L)
+    await bundles.finish_load("tag-c", 1, t0, L)
+    assert await bundles.activate("tag-c", t0, L)  # tag-a leaves the pair: retired at the swap
+    assert (await bundles.get_bundle("tag-a")).retired_at is not None
+    assert await bundles.prune(L, grace) == []  # inside the grace period
+    assert await bundles.get_gene_doc("tag-a", "ERBB2") == b'{"g": "erbb2"}'
+    await asyncio.sleep(grace + 0.1)
+    assert await bundles.activate("tag-a", t0, L)  # rollback: tag-a is active again
+    assert (await bundles.get_bundle("tag-a")).retired_at is None
+    state = await bundles.get_state()
+    assert (state.active_bundle_tag, state.previous_bundle_tag) == ("tag-a", "tag-c")
+    assert await bundles.prune(L, grace) == []  # tag-b retired just now; tag-a kept
+    await asyncio.sleep(grace + 0.1)
+    assert await bundles.prune(L, grace) == ["tag-b"]
+    assert await bundles.get_gene_doc("tag-b", "ERBB2") is None
+    assert await bundles.get_gene_doc("tag-a", "ERBB2") == b'{"g": "erbb2"}'
+    assert await bundles.get_alias("tag-a", "HER2") == "ERBB2"
 
     retry = t0 + timedelta(minutes=15)
     await bundles.mark_error(t0, "rate limited", retry)
@@ -241,7 +253,8 @@ async def _exercise_bundle_store(bundles):
     await bundles.mark_checked(retry)
     state = await bundles.get_state()
     assert state.last_checked_at == retry and state.last_error is None
-    assert state.next_check_after is None and state.active_bundle_tag == "tag-b"
+    assert state.next_check_after is None and state.active_bundle_tag == "tag-a"
+    await bundles.release_loader_lock(L)
 
     # The single-loader lease: compare-and-set acquire/renew, owner-only release.
     assert await bundles.acquire_loader_lock("pod-a", 0.3)
@@ -253,9 +266,11 @@ async def _exercise_bundle_store(bundles):
     await asyncio.sleep(0.4)  # pod-a's lease expires (judged on the store's clock)
     assert not await bundles.renew_loader_lock("pod-a", 0.3)
     assert await bundles.acquire_loader_lock("pod-b", 0.3)
-    # Activation is fenced on holding the lease.
-    assert not await bundles.activate("tag-b", t0, lock_token="pod-a")
-    assert await bundles.activate("tag-b", t0, lock_token="pod-b")
+    # Every write is fenced on holding the lease.
+    assert not await bundles.activate("tag-c", t0, "pod-a")
+    with pytest.raises(LoaderLockNotHeld):
+        await bundles.add_genes("tag-c", [("TP53", 7157, b"{}")], "pod-a")
+    assert await bundles.activate("tag-c", t0, "pod-b")
     await bundles.release_loader_lock("pod-a")  # stale owner: no effect
     assert not await bundles.acquire_loader_lock("pod-c", 0.3)
     await bundles.release_loader_lock("pod-b")

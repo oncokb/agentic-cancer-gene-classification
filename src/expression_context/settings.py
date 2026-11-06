@@ -152,12 +152,16 @@ class ExpressionContextSettings(BaseSettings):
         return value
 
     @property
+    def min_check_period_seconds(self) -> float:
+        """The fastest cluster-wide discovery cadence (errors / nothing loaded
+        yet). The refresher never checks earlier than this: no slack factor."""
+        return min(self.refresh_interval_seconds, self.refresh_error_retry_seconds)
+
+    @property
     def github_requests_per_hour_worst_case(self) -> float:
         """Upper bound on cluster-wide GitHub API calls per hour: discovery at
-        the fastest cadence (errors / nothing loaded yet), every page, every
-        retry attempt."""
-        fastest = min(self.refresh_interval_seconds, self.refresh_error_retry_seconds)
-        return 3600.0 / fastest * self.max_release_pages * self.http_retry_attempts
+        the fastest cadence, every page, every retry attempt."""
+        return 3600.0 / self.min_check_period_seconds * self.max_release_pages * self.http_retry_attempts
 
     @model_validator(mode="after")
     def _check_budget_and_grace(self) -> "ExpressionContextSettings":
