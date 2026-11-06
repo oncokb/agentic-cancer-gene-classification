@@ -1,9 +1,9 @@
 name: Expression stats CI
 on:
   pull_request:
-    paths: ['expression_stats/**', '.github/workflows/expression-stats-*.yml']
+    paths: ['src/**', 'expression_stats/**', '.github/workflows/expression-stats-*.yml']
   push:
-    paths: ['expression_stats/**', '.github/workflows/expression-stats-*.yml']
+    paths: ['src/**', 'expression_stats/**', '.github/workflows/expression-stats-*.yml']
 permissions:
   contents: read
 jobs:

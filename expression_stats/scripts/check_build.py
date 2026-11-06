@@ -89,8 +89,9 @@ def main():
     code_sha = PROVENANCE["code_fingerprint"]()
     hgnc_sha = PROVENANCE["hgnc_pin"]()["sha256"]
     manifest = published_manifest()
-    # Subsets and skipped prechecks are review artifacts, never public releases.
-    deployable = not genes and not skip
+    # Branch dispatches, subsets and skipped prechecks always build review artifacts.
+    on_main = os.environ.get("GITHUB_REF", "refs/heads/main") == "refs/heads/main"
+    deployable = on_main and not genes and not skip
     changed = not deployable or not unchanged(
         manifest, commit, SETTINGS["METHOD_VERSION"], None, skip, code_sha, hgnc_sha
     )

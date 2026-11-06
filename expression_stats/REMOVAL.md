@@ -9,6 +9,14 @@
 4. Remove the `NCBI_API_KEY` repository secret if no other workflow uses it.
 5. Remove the `expression_stats` exclusion from root ruff configuration and
    `expression_stats/` from `.dockerignore` (both are harmless if retained).
+6. Delete leftover releases/drafts whose tags start with `expression-stats-`,
+   then delete their corresponding Git tags (release deletion alone does not
+   remove tags). Paginate repository releases/tags and review this exact prefix
+   before deletion; do not delete application releases/tags.
+7. Delete Actions caches with prefixes `expression-pubmed-*`,
+   `expression-objects-*`, and `expression-hgnc-*` using repository Actions cache
+   management (paginate when listing). Retained caches otherwise expire normally.
+8. Optionally delete `tests/test_expression_stats_isolation.py`; it uses only
+   stdlib and passes trivially when `expression_stats/` is absent.
 
-Existing release bundles may be retained as historical data. Consumer removal
-is a separate task and this producer has no application registration or imports.
+Consumer removal is a separate task and this producer has no application registration or imports.

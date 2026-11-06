@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -23,9 +24,13 @@ def publish(directory):
     tag = manifest["bundle_tag"]
     # Paginate: application releases and old bundles may exceed one API page.
     releases = json.loads(gh("api", "--paginate", "--slurp", "repos/{owner}/{repo}/releases"))
-    if any(release["tag_name"] == tag for page in releases for release in page):
-        print(f"Release {tag} already exists; skipping")
-        return
+    for page in releases:
+        for release in page:
+            if release["tag_name"] == tag:
+                if release["draft"]:
+                    raise ValueError(f"stale draft {release['id']}; delete it")
+                print(f"Release {tag} already exists; skipping")
+                return
     payload = directory / "genes.jsonl.gz"
     if sha256(payload) != manifest["sha256"] or payload.stat().st_size != manifest["size_bytes"]:
         raise ValueError("Bundle integrity mismatch")
@@ -37,6 +42,8 @@ def publish(directory):
             "-f",
             f"tag_name={tag}",
             "-f",
+            f"target_commitish={os.environ['GITHUB_SHA']}",
+            "-f",
             f"name={name}",
             "-F",
             "draft=true",
@@ -46,17 +53,25 @@ def publish(directory):
             "make_latest=false",
         )
     )
-    assets = sorted(directory.iterdir())
-    gh("release", "upload", tag, *(str(path) for path in assets))
-    with tempfile.TemporaryDirectory() as temporary:
-        gh("release", "download", tag, "--dir", temporary)
-        for path in assets:
-            downloaded = Path(temporary) / path.name
-            if downloaded.stat().st_size != path.stat().st_size or sha256(downloaded) != sha256(
-                path
-            ):
-                raise ValueError(f"Downloaded asset integrity mismatch: {path.name}")
-    # A failed upload/verification leaves a draft, never a discoverable partial release.
+    try:
+        assets = sorted(directory.iterdir())
+        gh("release", "upload", tag, *(str(path) for path in assets))
+        with tempfile.TemporaryDirectory() as temporary:
+            gh("release", "download", tag, "--dir", temporary)
+            for path in assets:
+                downloaded = Path(temporary) / path.name
+                if downloaded.stat().st_size != path.stat().st_size or sha256(downloaded) != sha256(
+                    path
+                ):
+                    raise ValueError(f"Downloaded asset integrity mismatch: {path.name}")
+    except Exception:
+        # Delete only the draft this invocation created; preserve the original error.
+        try:
+            gh("api", "--method", "DELETE", f"repos/{{owner}}/{{repo}}/releases/{created['id']}")
+        except Exception as cleanup_error:
+            print(f"Could not delete draft {created['id']}: {cleanup_error}")
+        raise
+    # Only verified assets can become discoverable.
     gh(
         "api",
         "--method",

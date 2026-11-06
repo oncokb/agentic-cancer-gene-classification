@@ -15,9 +15,9 @@ on:
         type: boolean
         default: false
 permissions:
-  contents: write
+  contents: read
 concurrency:
-  group: expression-stats-release
+  group: expression-stats-release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   build:
@@ -26,10 +26,13 @@ jobs:
     defaults:
       run:
         working-directory: expression_stats
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      deployable: ${{ steps.check.outputs.deployable }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Validate full precheck credentials
         env:
           INPUT_SKIP: ${{ inputs.skip_precheck }}
@@ -50,6 +53,7 @@ jobs:
       - name: Resolve pin and check published release
         id: check
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_COMMIT: ${{ inputs.datahub_commit }}
           INPUT_GENES: ${{ inputs.genes }}
           INPUT_SKIP: ${{ inputs.skip_precheck }}
@@ -96,6 +100,28 @@ jobs:
         with:
           name: expression-stats-review
           path: expression_stats/bundle
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true' && needs.build.outputs.deployable == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: expression-stats-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: expression-stats-review
+          path: expression_stats/bundle
       - name: Publish verified full bundle
-        if: steps.check.outputs.changed == 'true' && steps.check.outputs.deployable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: expression_stats
         run: python scripts/publish.py bundle

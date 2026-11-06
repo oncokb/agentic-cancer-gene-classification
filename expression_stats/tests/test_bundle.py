@@ -57,11 +57,24 @@ def test_refresh_changes_tag_without_changing_release_id(bundled):
     assert before["bundle_tag"] != after["bundle_tag"]
 
 
-@pytest.mark.parametrize("failure", [None, "upload", "corrupt", "existing", "subset", "skip"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "upload",
+        "corrupt",
+        "cleanup",
+        "existing",
+        "stale",
+        "subset",
+        "skip",
+    ],
+)
 def test_atomic_release_policy(bundled, monkeypatch, failure):
     module, _, directory, manifest, _ = bundled
     monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
     publisher = load("publish")
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
     if failure in {"subset", "skip"}:
         manifest["build"] = dict(
             genes=["TP53"] if failure == "subset" else None, skip_precheck=failure == "skip"
@@ -73,9 +86,13 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
         calls.append(args)
         if "--slurp" in args:
             return json.dumps(
-                [[dict(tag_name=manifest["bundle_tag"])]] if failure == "existing" else [[]]
+                [[dict(tag_name=manifest["bundle_tag"], draft=failure == "stale", id=7)]]
+                if failure in {"existing", "stale"}
+                else [[]]
             )
-        if "upload" in args and failure == "upload":
+        if "DELETE" in args and failure == "cleanup":
+            raise RuntimeError("cleanup failed")
+        if "upload" in args and failure in {"upload", "cleanup"}:
             raise RuntimeError("upload failed")
         if "download" in args:
             target = Path(args[-1])
@@ -86,8 +103,11 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
         return '{"id":42}'
 
     monkeypatch.setattr(publisher, "gh", gh)
-    if failure in {"upload", "corrupt", "subset", "skip"}:
-        with pytest.raises((ValueError, RuntimeError)):
+    if failure in {"upload", "corrupt", "cleanup", "stale", "subset", "skip"}:
+        match = "stale draft 7; delete it" if failure == "stale" else None
+        if failure == "cleanup":
+            match = "upload failed"
+        with pytest.raises((ValueError, RuntimeError), match=match):
             publisher.publish(directory)
     else:
         publisher.publish(directory)
@@ -96,8 +116,15 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
     for call in calls:
         if "draft=true" in call or "draft=false" in call:
             assert "make_latest=false" in call and "prerelease=false" in call
-    if failure == "existing":
+    deleted = [call for call in calls if "DELETE" in call]
+    assert bool(deleted) == (failure in {"upload", "corrupt", "cleanup"})
+    if deleted:
+        assert deleted[0][-1].endswith("/releases/42")
+    if failure in {"existing", "stale"}:
         assert len(calls) == 1
+    created = [call for call in calls if "draft=true" in call]
+    for call in created:
+        assert f"target_commitish={'a' * 40}" in call
 
 
 def test_discovery_paginates_filters_and_uses_published_at(monkeypatch):

@@ -223,7 +223,8 @@ Consumers must ignore unknown fields and reject unknown `schema_version`.
 - `pubmed_snapshot_date` is the UTC date the completed build began; counts may
   come from the existing 30-day TTL cache. It is a bundle snapshot date, not a
   claim that every PubMed count was fetched on that date. Earliest count expiry
-  remains `source.precheck_expires_at`.
+  remains `source.precheck_expires_at`. Readers requiring PubMed freshness must
+  check `source.precheck_expires_at`, not the tag date or snapshot date.
 - Releases are not prereleases and are created and undrafted with
   `make_latest=false`, preserving the application's Latest release.
 - Assets: `manifest.json`, `genes.jsonl.gz`, and existing `aliases.json` with
@@ -233,9 +234,12 @@ Consumers must ignore unknown fields and reject unknown `schema_version`.
   `sha256` (lower-case SHA-256 hex of compressed `genes.jsonl.gz`), and
   `size_bytes` (compressed asset byte length). Consumers verify size/hash before import.
 - Publish atomically: create draft, upload all assets, download each and verify
-  byte size and SHA-256, then undraft. Failure leaves a draft for inspection.
-  Any existing matching tag (including a failed draft) is skipped; remove a failed
-  draft explicitly before retrying. Partial gene or skipped-precheck builds are
+  byte size and SHA-256, then undraft. Upload/verification failures best-effort
+  delete only the draft created by that invocation, then re-raise the failure.
+  If cleanup fails or the job is interrupted, a matching existing draft fails
+  with `stale draft <id>; delete it`; an existing published tag skips successfully.
+  Release creation sets `target_commitish` to the building `GITHUB_SHA`.
+  Partial gene or skipped-precheck builds are
   review artifacts only and never published. Missing NCBI_API_KEY fails fast
   before dependency installation for any requested precheck build.
 - Discovery: paginate the repository's releases, filter non-draft tags beginning
@@ -244,7 +248,21 @@ Consumers must ignore unknown fields and reject unknown `schema_version`.
   dated tag, so readers detect refreshes while reusing literature verdicts.
 - Full fresh matching manifests may be reused until PubMed expiry; this checks
   input fingerprints and current cohort mapping. Existing matching tags are
-  also skipped immediately before upload. Generated artifacts are not committed.
+  also skipped immediately before upload if published; stale drafts fail loudly.
+  Generated artifacts are not committed.
+- The build job has only `contents: read`; checkout never persists credentials.
+  A read token is scoped to the release-discovery step, never pip or data builds.
+  Bundles cross to a separate publisher via Actions upload/download-artifact.
+  Only that job has `contents: write`, and its GH_TOKEN is scoped to publication.
+  Publishing requires `github.ref == 'refs/heads/main'`; branch dispatches always
+  build review artifacts, even when a matching published build is fresh.
+- Workflow concurrency is keyed by event name and ref, so queued manual runs
+  cannot replace pending cron runs. Same-event/ref pending runs may coalesce
+  under GitHub's concurrency policy. A shared `expression-stats-publish` job
+  concurrency group serializes all main-branch publications, preventing tag
+  races across schedule and dispatch. Running jobs are never cancelled.
+  Since only schedule/main and dispatch/main reach publication, each with one
+  active workflow run, at most one publisher waits behind the active publisher.
 
 ## ACGC API (when enabled)
 

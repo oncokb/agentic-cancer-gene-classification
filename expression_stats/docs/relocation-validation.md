@@ -1,5 +1,8 @@
 # Relocation validation — 2026-11-06
 
+The initial results below describe commit `4a456a1`. Current review-fix gates
+are recorded in the final section.
+
 Ported from read-only `gene-expression-relevance-wt-stats` at
 `a7c7cc6d320f3d2c64d444e0a6d145dc2dfa6bc4`. Statistical implementation,
 fetching, symbol resolution, precheck, provenance, pins and exact constraints
@@ -131,3 +134,52 @@ statistical pass lists.
 Both local bundles were decompressed and every JSON line parsed; gene counts,
 release IDs and compressed SHA-256 were verified against their manifests.
 Generated full files remain ignored under `artifacts-full/` and `bundle-full/`.
+
+## Cross-vendor review fixes — current gates
+
+The root stdlib-only AST guard now runs in app CI; pipeline CI also triggers
+on `src/**`. Packaging exports only `src` (`pyproject.toml` wheel packages and
+`annotate` entry point; Docker runs `src.main:app`). Adding `src/` to sys.path
+also exposes its immediate modules/packages, so the pipeline guard rejects
+those bare names as well. The root guard scans app files regardless of how they
+are imported and was exercised against forbidden static/dynamic imports and
+with the producer directory absent.
+
+Pipeline commands, from `expression_stats/`:
+
+```sh
+.venv/bin/ruff check .
+.venv/bin/pytest -q
+```
+
+Ruff passes; **114 collected test cases passed** (61 test functions) in 5.65s.
+Coverage includes draft cleanup and cleanup failure preserving the original
+error, stale draft rejection, target commit, workflow token/job boundaries,
+branch review builds, concurrency configuration, and root guard removal.
+
+Root commands, with fresh disposable MySQL/Redis containers:
+
+```sh
+.venv/bin/ruff check .
+.venv/bin/python -c "import importlib.util; assert all(importlib.util.find_spec(n) is None for n in ('numpy', 'scipy', 'pandas'))"
+env PATH="$PWD/.venv/bin:/usr/bin:/bin" \
+  MYSQL_HOST=127.0.0.1 MYSQL_PORT=49268 MYSQL_USER=acgc MYSQL_PASSWORD=acgc \
+  MYSQL_DATABASE=acgc_test REDIS_URL=redis://127.0.0.1:49269/0 \
+  ACGC_ALLOW_DESTRUCTIVE_TESTS=1 .venv/bin/pytest tests/ -v -rA
+docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 \
+  .github/workflows/expression-stats-ci.yml \
+  .github/workflows/expression-stats-release.yml
+```
+
+Root ruff and actionlint pass. **2,969 app cases collected; 2,895 passed,
+74 skipped**, 907 warnings, 50.57 seconds. This adds exactly one root isolation
+case. The environment contains no numpy/scipy/pandas. Source application code,
+existing app tests, `pages.yml`, and the reader work in #167 remain untouched.
+
+No releases were created. **First live publish remains a known risk.** On the
+first authorized main publish, verify tag target equals building `GITHUB_SHA`,
+all assets download and match manifest size/hash/count, the release is neither
+draft nor prerelease, and the application release remains Latest. Confirm a
+repeat does not create duplicates, branch dispatch only produces review
+artifacts, failed uploads/verification clean up their own draft (or surface an
+explicit stale-draft error if cleanup failed), and Docker Hub is not triggered.

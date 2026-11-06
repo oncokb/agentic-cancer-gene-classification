@@ -33,10 +33,15 @@ without replacing completed artifacts. Generated files are ignored.
 
 Pipeline CI runs its own stricter ruff rules and tests. Root ruff explicitly
 excludes this directory; ACGC pytest's existing `testpaths = ["tests"]` excludes
-these tests. The isolation test statically checks imports in both directions.
+these tests. The pipeline isolation test checks both directions, including bare app module
+aliases exposed by adding src/ to sys.path. A stdlib-only root test also guards
+app imports on every app CI run and passes if this directory is removed.
 The app dependencies are unchanged, and `.dockerignore` excludes this directory.
 
 Only the release workflow calls `scripts/publish.py`; running the build and
 bundle commands above never creates a release. Publish requires `GH_TOKEN`
-with contents write permission and uses GitHub CLI on the runner. A failed
-publication stays draft; investigate/delete that draft before retrying.
+with contents write permission and uses GitHub CLI on the runner. Upload/verification
+failures best-effort delete their own draft; surviving stale drafts fail loudly
+and require explicit deletion. Only a separate main-only publish job receives
+write permission, and GH_TOKEN is scoped to its publication step. See the
+contract for concurrency and freshness semantics.
