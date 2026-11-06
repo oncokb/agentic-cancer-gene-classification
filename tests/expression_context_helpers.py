@@ -1,21 +1,42 @@
-"""Shared fixtures/fakes for tests/test_expression_context_*.py."""
+"""Shared fixtures/fakes for tests/test_expression_context_*.py.
+
+The fixture *bundle* is built from tests/fixtures/expression_context/ (the
+release manifest, genes/*.json and aliases.json) exactly as the producer
+publishes it: ``genes.jsonl.gz`` (one gene document per line) plus a
+``manifest.json`` carrying bundle_tag, pubmed_snapshot_date, gene_count,
+sha256 and size_bytes. GitHub is mocked with pytest-httpx; nothing touches the
+network.
+"""
 
 from __future__ import annotations
 
 import copy
+import gzip
+import hashlib
 import json
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from src.expression_context import lease as lease_module
-from src.expression_context.models import LiteratureVerdict
+from src.expression_context.bundle_store import BundleRecord, BundleState, InMemoryBundleStore
+from src.expression_context.catalog import StatsCatalog
+from src.expression_context.lease import VerdictLease
+from src.expression_context.models import JobRecord, LiteratureVerdict
 from src.expression_context.redis_client import ModuleRedis
+from src.expression_context.service import ExpressionContextService
+from src.expression_context.settings import ExpressionContextSettings
+from src.expression_context.store import InMemoryExpressionContextStore
+from src.job_store import JobStore
 from tests.conftest import FakeRedis
 
 FIXTURES = Path(__file__).parent / "fixtures" / "expression_context"
-BASE_URL = "https://stats.example.test/expression"
 RELEASE_ID = "datahub-abc1234def56-m2-b7e9f01a2c3d"
+PUBMED_DATE = date(2026, 11, 2)
+REPO = "oncokb/agentic-cancer-gene-classification"
+GITHUB_API = "https://api.github.com"
+LIST_URL = f"{GITHUB_API}/repos/{REPO}/releases?per_page=100"
 
 
 def load_fixture(name: str) -> dict:
@@ -38,18 +59,214 @@ def aliases() -> dict:
     return load_fixture("aliases.json")
 
 
-def url(path: str) -> str:
-    return f"{BASE_URL}/v1/{path}"
+def bundle_tag(release_id: str = RELEASE_ID, pubmed: date = PUBMED_DATE) -> str:
+    return f"expression-stats-{release_id}-pubmed-{pubmed.strftime('%Y%m%d')}"
 
 
-def add_artifacts(httpx_mock, *, genes: Tuple[str, ...] = ("ERBB2",), reusable: bool = True):
-    """Serve the v1 artifact contract from the fixture files."""
-    httpx_mock.add_response(url=url("manifest.json"), json=manifest(), is_reusable=reusable)
-    httpx_mock.add_response(url=url("aliases.json"), json=aliases(), is_reusable=reusable)
+def asset_url(tag: str, name: str) -> str:
+    return f"https://github.com/{REPO}/releases/download/{tag}/{name}"
+
+
+@dataclass
+class FixtureBundle:
+    tag: str
+    manifest: Dict[str, Any]
+    genes: List[Dict[str, Any]]
+    genes_gz: bytes
+    aliases: Optional[Dict[str, str]]
+    published_at: str
+
+    @property
+    def release_id(self) -> str:
+        return self.manifest["release_id"]
+
+
+def build_bundle(
+    genes: Iterable[str] = ("ERBB2", "MYCN"),
+    *,
+    pubmed: date = PUBMED_DATE,
+    release_id: str = RELEASE_ID,
+    published_at: str = "2026-11-02T06:00:00Z",
+    edit_gene: Optional[Callable[[Dict[str, Any]], None]] = None,
+    manifest_overrides: Optional[Dict[str, Any]] = None,
+    with_aliases: bool = True,
+    gz_bytes: Optional[bytes] = None,
+) -> FixtureBundle:
+    docs = []
     for symbol in genes:
+        doc = gene_file(symbol, release_id=release_id)
+        if edit_gene is not None:
+            edit_gene(doc)
+        docs.append(doc)
+    jsonl = "".join(json.dumps(doc, separators=(",", ":")) + "\n" for doc in docs).encode()
+    genes_gz = gz_bytes if gz_bytes is not None else gzip.compress(jsonl, mtime=0)
+    tag = bundle_tag(release_id, pubmed)
+    data = manifest(release_id=release_id)
+    data.update(
+        bundle_tag=tag,
+        pubmed_snapshot_date=pubmed.isoformat(),
+        gene_count=len(docs),
+        sha256=hashlib.sha256(genes_gz).hexdigest(),
+        size_bytes=len(genes_gz),
+    )
+    data.update(manifest_overrides or {})
+    return FixtureBundle(
+        tag=data["bundle_tag"] if "bundle_tag" in (manifest_overrides or {}) else tag,
+        manifest=data,
+        genes=docs,
+        genes_gz=genes_gz,
+        aliases=aliases() if with_aliases else None,
+        published_at=published_at,
+    )
+
+
+def release_json(
+    bundle: FixtureBundle,
+    *,
+    draft: bool = False,
+    prerelease: bool = False,
+    omit_assets: Tuple[str, ...] = (),
+    genes_asset_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    assets = [
+        ("manifest.json", len(json.dumps(bundle.manifest))),
+        ("genes.jsonl.gz", genes_asset_size if genes_asset_size is not None else len(bundle.genes_gz)),
+    ]
+    if bundle.aliases is not None:
+        assets.append(("aliases.json", len(json.dumps(bundle.aliases))))
+    return {
+        "tag_name": bundle.tag,
+        "name": f"Expression stats {bundle.release_id}",
+        "draft": draft,
+        "prerelease": prerelease,
+        "published_at": bundle.published_at,
+        "html_url": f"https://github.com/{REPO}/releases/tag/{bundle.tag}",
+        "assets": [
+            {"name": name, "size": size, "browser_download_url": asset_url(bundle.tag, name)}
+            for name, size in assets
+            if name not in omit_assets
+        ],
+    }
+
+
+APP_RELEASE = {
+    "tag_name": "v0.4.5", "draft": False, "prerelease": False,
+    "published_at": "2026-11-03T15:49:55Z", "assets": [],
+}
+
+
+def add_assets(httpx_mock, bundle: FixtureBundle, *, reusable: bool = True) -> None:
+    httpx_mock.add_response(
+        url=asset_url(bundle.tag, "manifest.json"), json=bundle.manifest, is_reusable=reusable
+    )
+    httpx_mock.add_response(
+        url=asset_url(bundle.tag, "genes.jsonl.gz"), content=bundle.genes_gz, is_reusable=reusable
+    )
+    if bundle.aliases is not None:
         httpx_mock.add_response(
-            url=url(f"genes/{symbol}.json"), json=gene_file(symbol), is_reusable=reusable
+            url=asset_url(bundle.tag, "aliases.json"), json=bundle.aliases, is_reusable=reusable
         )
+
+
+def add_release_list(httpx_mock, releases: List[Dict[str, Any]], *, reusable: bool = True) -> None:
+    httpx_mock.add_response(url=LIST_URL, json=releases, is_reusable=reusable)
+
+
+def add_bundle_release(httpx_mock, bundle: FixtureBundle, *, reusable: bool = True) -> None:
+    """GitHub lists one app release and the bundle; the bundle's assets download."""
+    add_release_list(httpx_mock, [APP_RELEASE, release_json(bundle)], reusable=reusable)
+    add_assets(httpx_mock, bundle, reusable=reusable)
+
+
+async def seed_bundle(bundles: InMemoryBundleStore, bundle: FixtureBundle) -> None:
+    """Import and activate a fixture bundle directly (no HTTP, no loader)."""
+    data = bundle.manifest
+    await bundles.begin_load(BundleRecord(
+        bundle_tag=bundle.tag, release_id=data["release_id"],
+        schema_version=data["schema_version"], method_version=data["method_version"],
+        pubmed_snapshot_date=date.fromisoformat(data["pubmed_snapshot_date"]),
+        gene_count=data["gene_count"], sha256=data["sha256"], size_bytes=data["size_bytes"],
+        manifest=data, status="loading", load_started_at=datetime.now(timezone.utc),
+        published_at=datetime.fromisoformat(bundle.published_at.replace("Z", "+00:00")),
+        release_url=f"https://github.com/{REPO}/releases/tag/{bundle.tag}",
+    ))
+    await bundles.add_genes(bundle.tag, [
+        (doc["gene"]["hugo_symbol"].upper(), doc["gene"].get("entrez_gene_id"),
+         json.dumps(doc).encode())
+        for doc in bundle.genes
+    ])
+    symbols = {doc["gene"]["hugo_symbol"].upper() for doc in bundle.genes}
+    await bundles.add_aliases(bundle.tag, [
+        (alias.upper(), target.upper())
+        for alias, target in (bundle.aliases or {}).items()
+        if target.upper() in symbols
+    ])
+    await bundles.finish_load(bundle.tag, len(bundle.genes), datetime.now(timezone.utc))
+    assert await bundles.activate(bundle.tag, datetime.now(timezone.utc))
+
+
+def seeded_bundles(bundle: Optional[FixtureBundle] = None) -> InMemoryBundleStore:
+    """A new in-memory bundle store with the fixture bundle active (synchronous)."""
+    bundle = bundle or build_bundle()
+    data = bundle.manifest
+    now = datetime.now(timezone.utc)
+    store = InMemoryBundleStore()
+    store.bundles[bundle.tag] = BundleRecord(
+        bundle_tag=bundle.tag, release_id=data["release_id"],
+        schema_version=data["schema_version"], method_version=data["method_version"],
+        pubmed_snapshot_date=date.fromisoformat(data["pubmed_snapshot_date"]),
+        gene_count=data["gene_count"], sha256=data["sha256"], size_bytes=data["size_bytes"],
+        manifest=data, status="ready", load_started_at=now, loaded_rows=len(bundle.genes),
+        finished_at=now,
+    )
+    symbols = set()
+    for doc in bundle.genes:
+        symbol = doc["gene"]["hugo_symbol"].upper()
+        symbols.add(symbol)
+        store.genes[(bundle.tag, symbol)] = (doc["gene"].get("entrez_gene_id"), json.dumps(doc).encode())
+    for alias, target in (bundle.aliases or {}).items():
+        if target.upper() in symbols:
+            store.aliases[(bundle.tag, alias.upper())] = target.upper()
+    store.state = BundleState(active_bundle_tag=bundle.tag, activated_at=now)
+    return store
+
+
+def make_settings(**overrides) -> ExpressionContextSettings:
+    values: Dict[str, Any] = dict(
+        enabled=True,
+        http_retry_backoff_seconds=0,
+        http_retry_attempts=3,
+        active_bundle_cache_seconds=0,
+    )
+    values.update(overrides)
+    return ExpressionContextSettings(_env_file=None, **values)
+
+
+def make_service(
+    *,
+    gate,
+    store=None,
+    bundles: Optional[InMemoryBundleStore] = None,
+    redis=None,
+    concurrency: int = 4,
+    lease_wait: float = 5.0,
+    lease_ttl: float = 5.0,
+    lease: Optional[VerdictLease] = None,
+) -> ExpressionContextService:
+    """One 'pod': its own service (in-flight map, semaphore, catalog cache)."""
+    bundles = bundles if bundles is not None else seeded_bundles()
+    redis = redis if redis is not None else LeaseFakeRedis()
+    return ExpressionContextService(
+        catalog=StatsCatalog(bundles, cache_seconds=0),
+        gate=gate,
+        store=store if store is not None else InMemoryExpressionContextStore(),
+        jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
+        literature_concurrency=concurrency,
+        lease=lease or VerdictLease(ttl_seconds=lease_ttl, redis=module_redis(redis)),
+        lease_wait_seconds=lease_wait,
+        lease_poll_seconds=0.01,
+        releases_repo=REPO,
+    )
 
 
 class FakeLiteratureGate:
@@ -140,3 +357,4 @@ class DownRedis:
 
     async def eval(self, *a, **k):
         raise ConnectionError("down")
+

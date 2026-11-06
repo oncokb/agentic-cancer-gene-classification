@@ -1,25 +1,29 @@
-"""Pydantic models: the v1 artifact contract (input) and the API (output).
+"""Pydantic models: the release-bundle contract (input) and the API (output).
 
+Contract: expression_stats/docs/contract.md ("Release bundle contract v1").
 Artifact models ignore unknown fields (pydantic's default), as the contract
-requires; ``schema_version`` is checked by the artifact client before parsing.
+requires; ``schema_version`` is checked by the bundle loader before parsing.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 SUPPORTED_SCHEMA_VERSION = "1"
+SUPPORTED_METHOD_VERSION = "2"
+# Canonical/alias gene symbols as accepted from users and from bundles.
+SYMBOL_PATTERN = r"[A-Z0-9][A-Z0-9._-]{0,63}\Z"
 
 ExclusionReason = Literal["stats", "precheck", "literature"]
 JobState = Literal["queued", "running", "succeeded", "failed"]
 
 
 # --------------------------------------------------------------------------
-# Artifact contract, schema_version 1 (authoritative: gene-expression-relevance
-# docs/acgc-contract.md)
+# Release bundle contract, schema_version 1 (authoritative:
+# expression_stats/docs/contract.md)
 # --------------------------------------------------------------------------
 
 
@@ -48,6 +52,17 @@ class Manifest(_Artifact):
             if cancer_type.oncotree_code == oncotree_code:
                 return cancer_type
         return None
+
+
+class BundleManifest(Manifest):
+    """``manifest.json`` release asset: the release manifest plus bundle fields."""
+
+    bundle_tag: str
+    pubmed_snapshot_date: date
+    gene_count: int = Field(ge=0)
+    # Lower-case SHA-256 hex and byte length of the compressed genes.jsonl.gz.
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
 
 
 class GeneRef(_Artifact):
@@ -135,6 +150,7 @@ class PairResult(BaseModel):
     stats: CancerTypeStats
     literature: Optional[LiteratureVerdict] = None
     computed_at: datetime
+    bundle_tag: Optional[str] = None
 
 
 class GeneResult(BaseModel):
@@ -168,6 +184,7 @@ class JobStatus(BaseModel):
     gene: str
     hugo_symbol: str
     release_id: str
+    bundle_tag: Optional[str] = None
     created_at: datetime
     finished_at: Optional[datetime] = None
     error: Optional[str] = None
@@ -198,3 +215,70 @@ class HistoryEntry(BaseModel):
 class HistoryPage(BaseModel):
     items: List[HistoryEntry]
     next_cursor: Optional[str] = None
+
+
+# --------------------------------------------------------------------------
+# Bundles: provenance and the per-gene statistics view (stats page)
+# --------------------------------------------------------------------------
+
+PrecheckState = Literal["pass", "fail", "not_run"]
+PairStatus = Literal["surfaced", "excluded", "literature_pending"]
+
+
+class BundleProvenance(BaseModel):
+    bundle_tag: str
+    release_id: str
+    schema_version: str
+    method_version: str
+    pubmed_snapshot_date: date
+    gene_count: int
+    published_at: Optional[datetime] = None
+    loaded_at: Optional[datetime] = None
+    release_url: Optional[str] = None
+    source: Dict[str, Any] = Field(default_factory=dict)
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RefreshState(BaseModel):
+    last_checked_at: Optional[datetime] = None
+    next_check_after: Optional[datetime] = None
+    last_error: Optional[str] = None
+    last_error_at: Optional[datetime] = None
+    pinned_bundle_tag: Optional[str] = None
+    releases_repo: str
+
+
+class BundleStatus(BaseModel):
+    active: Optional[BundleProvenance] = None
+    refresh: RefreshState
+
+
+class PairStatsView(BaseModel):
+    oncotree_code: str
+    cancer_type_name: Optional[str] = None
+    study_id: Optional[str] = None
+    tumor_type_query: Optional[str] = None
+    stats: CancerTypeStats
+    stats_pass: bool
+    precheck: PrecheckState
+    # Sent to the literature gate: stats_pass AND precheck is not "fail".
+    literature_eligible: bool
+    status: PairStatus
+    exclusion_reason: Optional[ExclusionReason] = None
+    literature: Optional[LiteratureVerdict] = None
+
+
+class GeneStatsSummary(BaseModel):
+    surfaced: int = 0
+    literature_pending: int = 0
+    excluded: int = 0
+
+
+class GeneStatsView(BaseModel):
+    query: str
+    hugo_symbol: str
+    entrez_gene_id: Optional[int] = None
+    literature_gate: str
+    bundle: BundleProvenance
+    summary: GeneStatsSummary
+    pairs: List[PairStatsView]

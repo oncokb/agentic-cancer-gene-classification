@@ -1,4 +1,6 @@
-"""Module-owned persistence: the ``expression_context_results`` table.
+"""Module-owned persistence: the ``expression_context_results`` table (verdicts).
+
+The statistics bundle tables live in ``bundle_store.py``.
 
 The table is created by this module only when the feature is enabled. It has
 no foreign keys to, and adds no columns on, any existing ACGC table. The
@@ -186,6 +188,11 @@ class InMemoryExpressionContextStore:
 class MySQLExpressionContextStore:
     def __init__(self, pool: Any) -> None:
         self._pool = pool
+
+    @property
+    def pool(self) -> Any:
+        """The module's MySQL pool (shared with the bundle store; closed by close())."""
+        return self._pool
 
     @classmethod
     async def create(cls, maxsize: int = 2) -> "MySQLExpressionContextStore":

@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
+
+from src.expression_context.bundle_store import (
+    BUNDLE_TABLES,
+    CREATE_BUNDLE_TABLES_SQL,
+    STATE_TABLE,
+    BundleRecord,
+    InMemoryBundleStore,
+    MySQLBundleStore,
+)
 
 from src.expression_context.literature_gate import (
     AcgcPipelineGate,
@@ -130,6 +139,141 @@ async def mysql_store():
 
 async def test_mysql_store_contract(mysql_store):
     await _exercise_store(mysql_store)
+
+
+# ------------------------------------------------------------- bundle store
+
+
+def test_bundle_ddl_is_module_owned():
+    assert BUNDLE_TABLES == (
+        "expression_context_bundles", "expression_context_stats",
+        "expression_context_aliases", "expression_context_state",
+    )
+    ddl = "\n".join(CREATE_BUNDLE_TABLES_SQL)
+    for table in BUNDLE_TABLES:
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in ddl
+    assert "FOREIGN KEY" not in ddl.upper()
+    assert "PRIMARY KEY (bundle_tag, hugo_symbol)" in ddl
+    assert "PRIMARY KEY (bundle_tag, alias)" in ddl
+
+
+def _record(tag, release_id="datahub-aaaaaaaaaaaa-m2-bbbbbbbbbbbb", status="loading"):
+    return BundleRecord(
+        bundle_tag=tag, release_id=release_id, schema_version="1", method_version="2",
+        pubmed_snapshot_date=date(2026, 11, 2), gene_count=2, sha256="a" * 64, size_bytes=10,
+        manifest={"schema_version": "1", "release_id": release_id, "cancer_types": []},
+        status=status, load_started_at=datetime(2026, 11, 6, tzinfo=timezone.utc),
+        published_at=datetime(2026, 11, 2, 6, tzinfo=timezone.utc),
+        release_url=f"https://github.com/o/r/releases/tag/{tag}",
+    )
+
+
+async def _exercise_bundle_store(bundles):
+    t0 = datetime(2026, 11, 6, 12, 0, 0, 123456, tzinfo=timezone.utc)
+    assert (await bundles.get_state()).active_bundle_tag is None
+
+    await bundles.begin_load(_record("tag-a"))
+    await bundles.add_genes("tag-a", [("ERBB2", 2064, b'{"g": "erbb2"}'), ("MYCN", None, b'{"g": 2}')])
+    await bundles.add_aliases("tag-a", [("HER2", "ERBB2"), ("NEU", "ERBB2")])
+    assert not await bundles.activate("tag-a", t0)  # never while loading
+    assert (await bundles.get_state()).active_bundle_tag is None
+    await bundles.finish_load("tag-a", 2, t0)
+    assert await bundles.activate("tag-a", t0)
+    record = await bundles.get_bundle("tag-a")
+    assert record.status == "ready" and record.loaded_rows == 2 and record.finished_at == t0
+    assert record.pubmed_snapshot_date == date(2026, 11, 2)
+    assert record.published_at == datetime(2026, 11, 2, 6, tzinfo=timezone.utc)
+    assert record.manifest["release_id"].startswith("datahub-")
+    assert await bundles.get_gene_doc("tag-a", "ERBB2") == b'{"g": "erbb2"}'
+    assert await bundles.get_gene_doc("tag-a", "NOPE") is None
+    assert await bundles.get_alias("tag-a", "HER2") == "ERBB2"
+    assert await bundles.get_alias("tag-a", "XYZ") is None
+    state = await bundles.get_state()
+    assert state.active_bundle_tag == "tag-a" and state.activated_at == t0
+
+    # A failed load cleans up after itself and never touches the pointer.
+    await bundles.begin_load(_record("tag-bad"))
+    await bundles.add_genes("tag-bad", [("ERBB2", 2064, b"{}")])
+    await bundles.fail_load("tag-bad", "sha mismatch" * 200, t0)
+    bad = await bundles.get_bundle("tag-bad")
+    assert bad.status == "failed" and len(bad.error) == 1000
+    assert await bundles.get_gene_doc("tag-bad", "ERBB2") is None
+    assert not await bundles.activate("tag-bad", t0)
+    assert (await bundles.get_state()).active_bundle_tag == "tag-a"
+
+    # Re-loading a tag replaces whatever rows it had (idempotent import).
+    await bundles.begin_load(_record("tag-b"))
+    await bundles.add_genes("tag-b", [("STALE", None, b"{}")])
+    await bundles.begin_load(_record("tag-b"))
+    await bundles.add_genes("tag-b", [("ERBB2", 2064, b'{"v": 2}'), ("MYCN", None, b"{}")])
+    await bundles.add_genes("tag-b", [("ERBB2", 2064, b'{"v": 3}')])  # upsert
+    await bundles.finish_load("tag-b", 2, t0)
+    assert await bundles.get_gene_doc("tag-b", "STALE") is None
+    assert await bundles.get_gene_doc("tag-b", "ERBB2") == b'{"v": 3}'
+    assert await bundles.activate("tag-b", t0 + timedelta(hours=1))
+    assert await bundles.activate("tag-b", t0 + timedelta(hours=2))  # same tag: previous kept
+    state = await bundles.get_state()
+    assert (state.active_bundle_tag, state.previous_bundle_tag) == ("tag-b", "tag-a")
+
+    removed = await bundles.prune({"tag-b", "tag-a"})
+    assert removed == ["tag-bad"] and await bundles.get_bundle("tag-bad") is None
+    assert await bundles.prune({"tag-b"}) == ["tag-a"]
+    assert await bundles.get_gene_doc("tag-a", "ERBB2") is None
+    assert await bundles.get_alias("tag-a", "HER2") is None
+    assert await bundles.get_gene_doc("tag-b", "ERBB2") == b'{"v": 3}'
+
+    retry = t0 + timedelta(minutes=15)
+    await bundles.mark_error(t0, "rate limited", retry)
+    state = await bundles.get_state()
+    assert (state.last_error, state.last_error_at, state.next_check_after) == ("rate limited", t0, retry)
+    await bundles.mark_checked(retry)
+    state = await bundles.get_state()
+    assert state.last_checked_at == retry and state.last_error is None
+    assert state.next_check_after is None and state.active_bundle_tag == "tag-b"
+
+    async with bundles.advisory_lock() as first:
+        assert first
+        async with bundles.advisory_lock() as second:
+            assert not second
+    async with bundles.advisory_lock() as again:
+        assert again
+
+
+async def test_in_memory_bundle_store_contract():
+    bundles = InMemoryBundleStore()
+    await bundles.ensure_schema()
+    assert bundles.schema_created
+    await _exercise_bundle_store(bundles)
+
+
+@pytest.fixture
+async def mysql_bundle_store():
+    try:
+        store = await MySQLExpressionContextStore.create(maxsize=4)
+        bundles = MySQLBundleStore(store.pool)
+        await bundles.ensure_schema()
+    except Exception as exc:
+        pytest.skip(f"MySQL not reachable: {exc}")
+    async with store.pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            for table in BUNDLE_TABLES:
+                await cursor.execute(f"DROP TABLE IF EXISTS {table}")
+    await bundles.ensure_schema()
+    await bundles.ensure_schema()  # idempotent; the state row is created once
+    async with store.pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(f"SELECT COUNT(*) FROM {STATE_TABLE}")
+            assert (await cursor.fetchone())[0] == 1
+    yield bundles
+    async with store.pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            for table in BUNDLE_TABLES:
+                await cursor.execute(f"DROP TABLE IF EXISTS {table}")
+    await store.close()
+
+
+async def test_mysql_bundle_store_contract(mysql_bundle_store):
+    await _exercise_bundle_store(mysql_bundle_store)
 
 
 # ------------------------------------------------------------- literature gate

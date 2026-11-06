@@ -3,8 +3,12 @@
 (a) Import boundary: nothing under src/ outside src/expression_context/
     references the module, except the single import + registration call in
     src/main.py.
-(b) Flag off (the default): the app boots, the routes 404, the module's table
-    DDL is never executed and no outbound/artifact code is even imported.
+(b) Flag off (the default): the app boots, the API routes and the stats page
+    404, the main page has no "Expression stats" nav entry, none of the
+    module's tables is created, and nothing calls out (GitHub included) — the
+    module's internals aren't even imported.
+(c) The core UI (src/static/) never references the module; its page lives in
+    src/expression_context/static/ and is removed with the package.
 """
 
 from __future__ import annotations
@@ -22,15 +26,21 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from src.expression_context import bundle_store as bundle_store_module
 from src.expression_context import register_expression_context
+from src.expression_context.bundle_store import InMemoryBundleStore
 from src.expression_context.settings import ExpressionContextSettings
 from src.expression_context.store import InMemoryExpressionContextStore, MySQLExpressionContextStore
+from src.expression_context.web import NAV_LINK_ID
+from tests.expression_context_helpers import LIST_URL
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 MODULE_DIR = SRC / "expression_context"
 MODULE = "src.expression_context"
 PREFIX = "/v1/expression-context"
+PAGE = "/expression-context"
+INDEX_HTML = SRC / "static" / "index.html"
 
 
 def _module_paths(app) -> list[str]:
@@ -226,14 +236,28 @@ def test_register_is_noop_when_disabled():
     assert app.router.lifespan_context is before_lifespan
 
 
+def test_core_ui_does_not_reference_the_module():
+    offenders = [
+        str(path.relative_to(ROOT))
+        for path in sorted((SRC / "static").rglob("*"))
+        if path.is_file() and path.suffix in {".html", ".js", ".css"}
+        and any(word in path.read_text(errors="ignore") for word in ("expression-context", "expression_context"))
+    ]
+    assert offenders == []
+    assert sorted(p.name for p in (MODULE_DIR / "static").iterdir()) == [
+        "expression-context.css", "expression-context.html", "expression-context.js",
+    ]
+
+
 @pytest.fixture
 def ddl_recorder(monkeypatch):
-    """Record any attempt by the module to open its pool or run its DDL."""
+    """Record any attempt by the module to open its pool or run any of its DDL."""
     calls = []
 
     async def create(cls, maxsize=2):
         calls.append("create_pool")
         store = InMemoryExpressionContextStore()
+        store.pool = None
         original = store.ensure_schema
 
         async def ensure_schema():
@@ -246,8 +270,21 @@ def ddl_recorder(monkeypatch):
     async def ensure_schema(self):
         calls.append("ensure_schema")
 
+    class RecordingBundleStore(InMemoryBundleStore):
+        def __init__(self, pool=None):
+            super().__init__()
+
+        async def ensure_schema(self):
+            calls.append("ensure_bundle_schema")
+            await super().ensure_schema()
+
+    async def bundle_ensure_schema(self):
+        calls.append("ensure_bundle_schema")
+
     monkeypatch.setattr(MySQLExpressionContextStore, "create", classmethod(create))
     monkeypatch.setattr(MySQLExpressionContextStore, "ensure_schema", ensure_schema)
+    monkeypatch.setattr(bundle_store_module.MySQLBundleStore, "ensure_schema", bundle_ensure_schema)
+    monkeypatch.setattr(bundle_store_module, "MySQLBundleStore", RecordingBundleStore)
     return calls
 
 
@@ -260,6 +297,13 @@ def _boot_flag_off_app(monkeypatch):
     fake_run_store = SimpleNamespace(close=AsyncMock())
     monkeypatch.setattr(main, "RunStore", SimpleNamespace(create=AsyncMock(return_value=fake_run_store)))
     app = FastAPI(lifespan=main.lifespan)
+
+    @app.get("/")
+    async def index():
+        from fastapi.responses import FileResponse
+
+        return FileResponse(INDEX_HTML)
+
     assert register_expression_context(app) is False
     return app
 
@@ -275,22 +319,40 @@ def test_flag_off_app_boots_routes_404_no_ddl_no_outbound(monkeypatch, ddl_recor
         assert client.get(f"{PREFIX}/jobs/abc").status_code == 404
         assert client.get(f"{PREFIX}/genes/ERBB2").status_code == 404
         assert client.get(f"{PREFIX}/genes").status_code == 404
+        assert client.get(f"{PREFIX}/stats/ERBB2").status_code == 404
+        assert client.get(f"{PREFIX}/bundle").status_code == 404
+        assert client.get(PAGE).status_code == 404
+        assert client.get(f"{PAGE}/static/expression-context.js").status_code == 404
+        home = client.get("/")
+        assert home.status_code == 200 and NAV_LINK_ID not in home.text
         assert getattr(app.state, "expression_context", None) is None
     assert ddl_recorder == []
-    assert httpx_mock.get_requests() == []
+    assert httpx_mock.get_requests() == []  # no GitHub (or any other) call
 
 
-def test_flag_on_default_factory_creates_table(ddl_recorder, monkeypatch):
-    """Counterpart of the flag-off test: the DDL path exists and runs only when enabled."""
+def test_flag_on_default_factory_creates_tables_and_checks_github(ddl_recorder, httpx_mock):
+    """Counterpart of the flag-off tests: with the flag on (and no URL or
+    token configured) the tables are created and the first bundle check runs
+    at startup — against the mocked GitHub API."""
+    import time
+
+    httpx_mock.add_response(url=LIST_URL, json=[])  # repo has no bundles yet
     app = FastAPI()
-    settings = ExpressionContextSettings(enabled=True, artifact_base_url="https://stats.test")
+    settings = ExpressionContextSettings(_env_file=None, enabled=True)
     assert register_expression_context(app, settings=settings)
     assert sorted(_module_paths(app)) == [
-        f"{PREFIX}/genes", f"{PREFIX}/genes/{{gene}}", f"{PREFIX}/jobs", f"{PREFIX}/jobs/{{job_id}}",
+        f"{PREFIX}/bundle", f"{PREFIX}/genes", f"{PREFIX}/genes/{{gene}}", f"{PREFIX}/jobs",
+        f"{PREFIX}/jobs/{{job_id}}", f"{PREFIX}/stats/{{gene}}",
     ]
-    with TestClient(app):
-        assert ddl_recorder == ["create_pool", "ensure_schema"]
+    with TestClient(app) as client:
+        assert ddl_recorder == ["create_pool", "ensure_schema", "ensure_bundle_schema"]
         assert app.state.expression_context is not None
+        deadline = time.monotonic() + 5
+        while not httpx_mock.get_requests() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert [str(r.url) for r in httpx_mock.get_requests()] == [LIST_URL]
+        assert client.get(f"{PREFIX}/stats/ERBB2").status_code == 503
+        assert client.get(PAGE).status_code in (200, 303)
 
 
 _REAL_MAIN_FLAG_OFF_SCRIPT = r"""
@@ -317,6 +379,7 @@ from src import main
 loaded = sorted(m for m in sys.modules if m.startswith("src.expression_context"))
 
 from src.expression_context import store as ec_store
+from src.expression_context import bundle_store as ec_bundle_store
 ddl = []
 async def _create(cls, maxsize=2):
     ddl.append("create_pool")
@@ -324,8 +387,10 @@ async def _ensure(self):
     ddl.append("ensure_schema")
 ec_store.MySQLExpressionContextStore.create = classmethod(_create)
 ec_store.MySQLExpressionContextStore.ensure_schema = _ensure
+ec_bundle_store.MySQLBundleStore.ensure_schema = _ensure
 
 main.RunStore = SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace(close=AsyncMock())))
+main.settings.auth_enabled = False  # so "/" serves the page instead of redirecting
 from fastapi.testclient import TestClient
 prefix = "/v1/expression-context"
 with TestClient(main.app) as client:
@@ -334,8 +399,15 @@ with TestClient(main.app) as client:
         client.get(prefix + "/jobs/abc").status_code,
         client.get(prefix + "/genes/ERBB2").status_code,
         client.get(prefix + "/genes").status_code,
+        client.get(prefix + "/stats/ERBB2").status_code,
+        client.get(prefix + "/bundle").status_code,
+        client.get("/expression-context").status_code,
+        client.get("/expression-context/static/expression-context.js").status_code,
     ]
-print(json.dumps({"codes": codes, "ddl": ddl, "outbound": outbound, "loaded": loaded}))
+    home = client.get("/")
+    nav = {"status": home.status_code, "has_link": "nav-expression-context" in home.text,
+           "has_tabs": 'class="app-tabs"' in home.text}
+print(json.dumps({"codes": codes, "ddl": ddl, "outbound": outbound, "loaded": loaded, "nav": nav}))
 """
 
 
@@ -352,7 +424,8 @@ def test_real_main_flag_off_boots_404_no_ddl_no_outbound_no_internals():
     )
     assert out.returncode == 0, out.stderr[-3000:]
     report = json.loads(out.stdout.strip().splitlines()[-1])
-    assert report["codes"] == [404, 404, 404, 404]
+    assert report["codes"] == [404] * 8
+    assert report["nav"] == {"status": 200, "has_link": False, "has_tabs": True}
     assert report["ddl"] == []
     assert report["outbound"] == []
     assert report["loaded"] == ["src.expression_context", "src.expression_context.settings"]

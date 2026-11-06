@@ -19,19 +19,15 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from src.expression_context.artifact_client import ArtifactClient
+from src.expression_context.catalog import StatsCatalog
 from src.expression_context.models import CancerTypeStats, GeneArtifact, StoredPair
 from src.expression_context.service import ExpressionContextService
-from src.expression_context.settings import ExpressionContextSettings
 from tests.expression_context_helpers import (
-    BASE_URL,
     RELEASE_ID,
     FakeLiteratureGate,
-    add_artifacts,
     gene_file,
     load_fixture,
-    module_redis,
-    url,
+    seeded_bundles,
 )
 from tests.test_expression_context_api import PREFIX, Harness, run_job
 
@@ -71,20 +67,15 @@ def test_missing_precheck_fields_default_to_not_run():
     assert stats.q_value is None and stats.flags == []
 
 
-async def test_artifact_client_parses_null_gene_file(httpx_mock, fake_redis):
-    settings = ExpressionContextSettings(enabled=True, artifact_base_url=BASE_URL)
-    client = ArtifactClient(settings, redis=module_redis(fake_redis))
-    httpx_mock.add_response(url=url("genes/MYCN.json"), json=gene_file("MYCN"))
-    try:
-        parsed = await client.get_gene("MYCN", RELEASE_ID)
-        assert parsed.gene.hugo_symbol == "MYCN"
-        assert parsed.cancer_types[0].q_value is None
-    finally:
-        await client.aclose()
+async def test_bundle_gene_with_nulls_parses_from_the_store():
+    catalog = StatsCatalog(seeded_bundles(), cache_seconds=0)
+    bundle = await catalog.active()
+    parsed = await catalog.gene(bundle, "MYCN")
+    assert parsed.gene.hugo_symbol == "MYCN"
+    assert parsed.cancer_types[0].q_value is None
 
 
-def test_gating_semantics_with_nulls(httpx_mock):
-    add_artifacts(httpx_mock, genes=("ERBB2", "MYCN"))
+def test_gating_semantics_with_nulls():
     gate = FakeLiteratureGate({
         "gastric cancer": (False, ["11111111"]),
         "lung adenocarcinoma": (False, ["22222222"]),
@@ -175,9 +166,8 @@ def test_fixtures_are_consistent_with_method_v2(symbol):
 
 
 RELEASE_ID_FORMAT = re.compile(r"datahub-[0-9a-f]{12}-m\d+-[0-9a-f]{12}\Z")
-PRODUCER_CONTRACT_URL = (
-    "https://github.com/oncokb/gene-expression-relevance/blob/main/docs/acgc-contract.md"
-)
+BUNDLE_CONTRACT_LINK = "](../expression_stats/docs/contract.md)"
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_fixture_release_ids_use_producer_format():
@@ -188,21 +178,44 @@ def test_fixture_release_ids_use_producer_format():
         assert gene_file(symbol)["release_id"] == manifest["release_id"]
 
 
-def test_design_doc_defers_to_producer_contract():
-    """The contract lives in the producer repo only: the design doc links it,
-    states the supported versions and consumer semantics, and does not carry
-    its own copy of the artifact examples or statistics method."""
-    from src.expression_context.models import SUPPORTED_SCHEMA_VERSION
+def test_fixture_bundle_tag_format():
+    from tests.expression_context_helpers import build_bundle
 
-    doc = (Path(__file__).resolve().parents[1] / "docs/expression-context.md").read_text()
-    assert PRODUCER_CONTRACT_URL in doc
+    bundle = build_bundle()
+    assert bundle.tag == f"expression-stats-{bundle.release_id}-pubmed-20261102"
+    assert bundle.manifest["bundle_tag"] == bundle.tag
+    assert bundle.manifest["pubmed_snapshot_date"] == "2026-11-02"
+
+
+def test_design_doc_defers_to_the_bundle_contract():
+    """The bundle contract lives in expression_stats/docs/contract.md only: the
+    design doc links it by relative path, states the supported versions and
+    the consumer semantics, and carries no copy of its examples or method."""
+    from src.expression_context.models import SUPPORTED_METHOD_VERSION, SUPPORTED_SCHEMA_VERSION
+
+    doc = (REPO_ROOT / "docs/expression-context.md").read_text()
+    assert BUNDLE_CONTRACT_LINK in doc
     assert f'| `schema_version` | `"{SUPPORTED_SCHEMA_VERSION}"`' in doc
-    assert '| `method_version` | `"2"` |' in doc
-    assert "## Consumer semantics" in doc
+    assert f'| `method_version` | `"{SUPPORTED_METHOD_VERSION}"` |' in doc
+    assert "## Consumer semantics" in doc and "## Release bundle transport" in doc
     assert "datahub-<12hex>-m<method>-<build_sha12>" in doc
-    assert "```json" not in doc  # no duplicated artifact examples
+    assert "expression-stats-<release_id>-pubmed-<YYYYMMDD>" in doc
+    assert "```json" not in doc  # no duplicated bundle examples
     assert "## Statistics" not in doc and "Mann-Whitney" not in doc
     assert "floor_log2" not in doc.replace("expression_floor_log2", "")
-    # Sections that stay owned by this repo.
-    for section in ("## Removability requirements", "## ACGC API", "## Table `expression_context_results`"):
+    # The old transport is gone.
+    for gone in ("ARTIFACT_BASE_URL", "gene-expression-relevance", "GitHub Pages", "v1/genes/"):
+        assert gone not in doc, gone
+    for section in ("## Removability requirements", "## ACGC API and page", "## Tables", "## Settings"):
         assert section in doc
+
+
+def test_bundle_contract_names_the_fields_this_module_reads():
+    """Runs once the sibling PR lands expression_stats/docs/contract.md."""
+    contract = REPO_ROOT / "expression_stats/docs/contract.md"
+    if not contract.exists():
+        pytest.skip("expression_stats/docs/contract.md lands with the producer PR")
+    text = contract.read_text()
+    for field in ("bundle_tag", "pubmed_snapshot_date", "gene_count", "sha256", "size_bytes",
+                  "genes.jsonl.gz", "aliases.json", "expression-stats-"):
+        assert field in text, field

@@ -1,9 +1,11 @@
 """Expression-context API with the flag on: job flow, surfaced/excluded logic,
-verdict reuse, gene resolution, 404/422/502 paths and history pagination.
+verdict reuse, gene resolution, the per-gene stats view, bundle status,
+404/422/503 paths and history pagination.
 
-The artifact contract is served by pytest-httpx from tests/fixtures/
-expression_context/, the literature gate is a fake, and the store is the
-module's in-memory implementation, so nothing needs MySQL, Redis or an LLM.
+The fixture bundle (tests/fixtures/expression_context/) is seeded straight
+into the module's in-memory bundle store (the loader itself is covered by
+test_expression_context_bundle.py), the literature gate is a fake and the
+stores are in-memory, so nothing needs MySQL, Redis, GitHub or an LLM.
 """
 
 from __future__ import annotations
@@ -18,24 +20,24 @@ from fastapi.testclient import TestClient
 
 from src.auth import AuthenticatedUser, require_auth
 from src.expression_context import register_expression_context
-from src.expression_context.artifact_client import ArtifactClient
+from src.expression_context.bundle_store import InMemoryBundleStore
+from src.expression_context.catalog import StatsCatalog
+from src.expression_context.lease import VerdictLease
 from src.expression_context.models import JobRecord, StoredPair
 from src.expression_context.service import ExpressionContextService
-from src.expression_context.settings import ExpressionContextSettings
 from src.expression_context.store import InMemoryExpressionContextStore
 from src.job_store import JobStore
 from tests.expression_context_helpers import (
-    BASE_URL,
     RELEASE_ID,
+    REPO,
     FakeLiteratureGate,
     LeaseFakeRedis,
-    add_artifacts,
+    build_bundle,
     gene_file,
-    manifest,
+    make_settings,
     module_redis,
-    url,
+    seed_bundle,
 )
-from src.expression_context.lease import VerdictLease
 
 pytestmark = [
     pytest.mark.no_real_redis,
@@ -48,24 +50,27 @@ BOB = AuthenticatedUser(email="bob@example.org", name="Bob", domain="example.org
 
 
 class Harness:
-    def __init__(self, gate=None, store=None):
+    def __init__(self, gate=None, store=None, bundle=None, seed=True):
         self.gate = gate or FakeLiteratureGate()
         self.store = store or InMemoryExpressionContextStore()
+        self.bundles = InMemoryBundleStore()
+        self.bundle = bundle or build_bundle()
         self.user = ALICE
         self.redis = LeaseFakeRedis()
         self.app = FastAPI()
-        settings = ExpressionContextSettings(
-            enabled=True, artifact_base_url=BASE_URL, http_retry_backoff_seconds=0
-        )
+        settings = make_settings()
 
         async def factory(app, s):
+            if seed:
+                await seed_bundle(self.bundles, self.bundle)
             return ExpressionContextService(
-                artifacts=ArtifactClient(s, redis=module_redis(self.redis)),
+                catalog=StatsCatalog(self.bundles, cache_seconds=0),
                 gate=self.gate,
                 store=self.store,
                 jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
                 lease=VerdictLease(ttl_seconds=5, redis=module_redis(self.redis)),
                 lease_poll_seconds=0.01,
+                releases_repo=REPO,
             )
 
         assert register_expression_context(self.app, settings=settings, service_factory=factory)
@@ -107,12 +112,12 @@ def _by_code(pairs):
     return {pair["oncotree_code"]: pair for pair in pairs}
 
 
-def test_job_flow_surfaces_only_stats_and_literature_supported_pairs(httpx_mock, harness, client):
-    add_artifacts(httpx_mock)
+def test_job_flow_surfaces_only_stats_and_literature_supported_pairs(harness, client):
     job = run_job(client)
 
     assert job["status"] == "succeeded"
     assert job["hugo_symbol"] == "ERBB2" and job["release_id"] == RELEASE_ID
+    assert job["bundle_tag"] == harness.bundle.tag
     assert "owner" not in job
     result = job["result"]
     assert [pair["oncotree_code"] for pair in result["surfaced"]] == ["BRCA"]
@@ -154,8 +159,7 @@ def test_job_flow_surfaces_only_stats_and_literature_supported_pairs(httpx_mock,
     assert all(row.literature_gate == "acgc_pipeline_v1" for row in stored.values())
 
 
-def test_get_gene_returns_surfaced_by_default(httpx_mock, client):
-    add_artifacts(httpx_mock)
+def test_get_gene_returns_surfaced_by_default(client):
     run_job(client)
 
     default = client.get(f"{PREFIX}/genes/erbb2")
@@ -170,8 +174,7 @@ def test_get_gene_returns_surfaced_by_default(httpx_mock, client):
     assert reasons == {"ESCA": "literature", "LUAD": "stats", "STAD": "literature", "UCEC": "precheck"}
 
 
-def test_stored_verdicts_are_reused(httpx_mock, harness, client):
-    add_artifacts(httpx_mock)
+def test_stored_verdicts_are_reused(harness, client):
     first = run_job(client)
     calls_after_first = list(harness.gate.calls)
 
@@ -181,8 +184,7 @@ def test_stored_verdicts_are_reused(httpx_mock, harness, client):
     assert second["result"]["surfaced"][0]["literature"] == first["result"]["surfaced"][0]["literature"]
 
 
-def test_verdicts_from_another_release_or_gate_are_not_reused(httpx_mock, harness, client):
-    add_artifacts(httpx_mock)
+def test_verdicts_from_another_release_or_gate_are_not_reused(harness, client):
     now = datetime.now(timezone.utc)
     evidence = {
         "literature_gate": "acgc_pipeline_v1", "tumor_type_query": "breast cancer",
@@ -201,8 +203,7 @@ def test_verdicts_from_another_release_or_gate_are_not_reused(httpx_mock, harnes
     assert job["literature_reused"] == 0
 
 
-def test_gate_failure_is_reported_and_retried_next_run(httpx_mock, harness, client):
-    add_artifacts(httpx_mock)
+def test_gate_failure_is_reported_and_retried_next_run(harness, client):
     harness.gate.fail_for = {"gastric cancer"}
     job = run_job(client)
     assert job["status"] == "succeeded"
@@ -216,8 +217,7 @@ def test_gate_failure_is_reported_and_retried_next_run(httpx_mock, harness, clie
     assert again["literature_reused"] == 2 and again["pair_errors"] == []
 
 
-def test_job_fails_cleanly_when_store_write_fails(httpx_mock, harness, client):
-    add_artifacts(httpx_mock)
+def test_job_fails_cleanly_when_store_write_fails(harness, client):
 
     async def broken(pairs):
         raise RuntimeError("db down")
@@ -228,26 +228,21 @@ def test_job_fails_cleanly_when_store_write_fails(httpx_mock, harness, client):
     assert job["finished_at"] is not None
 
 
-def test_gene_resolved_through_aliases(httpx_mock, client):
-    add_artifacts(httpx_mock)
-    httpx_mock.add_response(url=url("genes/HER2.json"), status_code=404, is_reusable=True)
+def test_gene_resolved_through_aliases(client):
     job = run_job(client, "her2")
     assert job["gene"] == "her2" and job["hugo_symbol"] == "ERBB2"
     # Reads also resolve through aliases.
     assert client.get(f"{PREFIX}/genes/HER2").json()["hugo_symbol"] == "ERBB2"
 
 
-def test_unknown_gene_is_404(httpx_mock, harness, client):
-    add_artifacts(httpx_mock)
-    httpx_mock.add_response(url=url("genes/NOPE1.json"), status_code=404)
+def test_unknown_gene_is_404(harness, client):
     response = client.post(f"{PREFIX}/jobs", json={"gene": "NOPE1"})
     assert response.status_code == 404
     assert "NOPE1" in response.json()["detail"]
     assert harness.gate.calls == []
 
 
-def test_gene_never_run_is_404(httpx_mock, client):
-    add_artifacts(httpx_mock)
+def test_gene_never_run_is_404(client):
     assert client.get(f"{PREFIX}/genes/ERBB2").status_code == 404
     assert client.get(f"{PREFIX}/genes/NOPE1").status_code == 404
 
@@ -264,20 +259,26 @@ def test_invalid_gene_path_is_422(client):
     assert client.get(f"{PREFIX}/genes/BAD$SYMBOL").status_code == 422
 
 
-def test_unknown_schema_version_is_502(httpx_mock, client):
-    httpx_mock.add_response(url=url("manifest.json"), json=manifest(schema_version="2"))
-    response = client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2"})
-    assert response.status_code == 502
-    assert "schema_version" in response.json()["detail"]
+def test_no_bundle_loaded_is_503_with_retry_after():
+    harness = Harness(seed=False)
+    with TestClient(harness.app) as client:
+        for response in (
+            client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2"}),
+            client.get(f"{PREFIX}/stats/ERBB2"),
+            # Nothing stored, and aliases can't be resolved without a bundle.
+            client.get(f"{PREFIX}/genes/HER2"),
+        ):
+            assert response.status_code == 503, response.text
+            assert response.headers["retry-after"] == "60"
+            assert "not loaded yet" in response.json()["detail"]
+        # Endpoints that don't need statistics keep working.
+        assert client.get(f"{PREFIX}/genes").json() == {"items": [], "next_cursor": None}
+        status = client.get(f"{PREFIX}/bundle").json()
+        assert status["active"] is None and status["refresh"]["releases_repo"] == REPO
+    assert harness.gate.calls == []
 
 
-def test_artifact_outage_is_502(httpx_mock, client):
-    httpx_mock.add_response(url=url("manifest.json"), status_code=503, is_reusable=True)
-    assert client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2"}).status_code == 502
-
-
-def test_job_visible_only_to_owner_or_admin(httpx_mock, harness, client):
-    add_artifacts(httpx_mock)
+def test_job_visible_only_to_owner_or_admin(harness, client):
     accepted = client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2"}).json()
     wait_for_job(client, accepted["status_url"])
 
@@ -345,6 +346,8 @@ def test_routes_require_auth(monkeypatch, harness):
         assert client.get(f"{PREFIX}/jobs/x").status_code == 401
         assert client.get(f"{PREFIX}/genes/ERBB2").status_code == 401
         assert client.get(f"{PREFIX}/genes").status_code == 401
+        assert client.get(f"{PREFIX}/stats/ERBB2").status_code == 401
+        assert client.get(f"{PREFIX}/bundle").status_code == 401
 
 
 def test_service_closed_on_shutdown(harness):
@@ -362,21 +365,7 @@ def test_service_closed_on_shutdown(harness):
     assert harness.app.state.expression_context is None
 
 
-def test_alias_lookup_during_artifact_outage_is_502(httpx_mock, client):
-    # Nothing stored for HER2, so the read resolves the alias -> artifact is down.
-    httpx_mock.add_response(url=url("manifest.json"), status_code=503, is_reusable=True)
-    response = client.get(f"{PREFIX}/genes/HER2")
-    assert response.status_code == 502
-    assert "unavailable" in response.json()["detail"]
-
-
-def test_alias_lookup_contract_violation_is_502(httpx_mock, client):
-    httpx_mock.add_response(url=url("manifest.json"), json=manifest(schema_version="2"))
-    assert client.get(f"{PREFIX}/genes/HER2").status_code == 502
-
-
-async def test_running_status_write_failure_marks_job_failed(httpx_mock):
-    add_artifacts(httpx_mock)
+async def test_running_status_write_failure_marks_job_failed():
 
     class FlakyJobs:
         def __init__(self):
@@ -390,13 +379,12 @@ async def test_running_status_write_failure_marks_job_failed(httpx_mock):
         async def get(self, job_id):
             return self.jobs.get(job_id)
 
-    settings = ExpressionContextSettings(
-        enabled=True, artifact_base_url=BASE_URL, http_retry_backoff_seconds=0
-    )
     gate = FakeLiteratureGate()
     redis = LeaseFakeRedis()
+    bundles = InMemoryBundleStore()
+    await seed_bundle(bundles, build_bundle())
     service = ExpressionContextService(
-        artifacts=ArtifactClient(settings, redis=module_redis(redis)), gate=gate,
+        catalog=StatsCatalog(bundles, cache_seconds=0), gate=gate,
         store=InMemoryExpressionContextStore(), jobs=FlakyJobs(),
         lease=VerdictLease(ttl_seconds=5, redis=module_redis(redis)),
     )
@@ -406,3 +394,63 @@ async def test_running_status_write_failure_marks_job_failed(httpx_mock):
     assert stored.status == "failed" and "job store down" in stored.error
     assert stored.finished_at is not None and gate.calls == []
     await service.aclose()
+
+
+def test_stats_view_before_and_after_literature_check(harness, client):
+    before = client.get(f"{PREFIX}/stats/erbb2")
+    assert before.status_code == 200, before.text
+    view = before.json()
+    assert view["hugo_symbol"] == "ERBB2" and view["query"] == "erbb2"
+    assert view["entrez_gene_id"] == 2064
+    assert view["literature_gate"] == "acgc_pipeline_v1"
+    bundle = view["bundle"]
+    assert bundle["bundle_tag"] == harness.bundle.tag and bundle["release_id"] == RELEASE_ID
+    assert bundle["method_version"] == "2" and bundle["pubmed_snapshot_date"] == "2026-11-02"
+    assert bundle["source"]["datahub_commit"].startswith("abc1234def56")
+    assert bundle["release_url"].startswith("https://github.com/")
+    pairs = _by_code(view["pairs"])
+    # Statistics-passing pairs first (by q), then the rest.
+    assert [p["oncotree_code"] for p in view["pairs"]] == ["BRCA", "STAD", "ESCA", "UCEC", "LUAD"]
+    assert {code: (p["status"], p["exclusion_reason"], p["precheck"]) for code, p in pairs.items()} == {
+        "BRCA": ("literature_pending", None, "pass"),
+        "STAD": ("literature_pending", None, "pass"),
+        "ESCA": ("literature_pending", None, "pass"),
+        "UCEC": ("excluded", "precheck", "fail"),
+        "LUAD": ("excluded", "stats", "fail"),  # stats fail wins over the pre-check
+    }
+    assert pairs["BRCA"]["stats"]["flags"] == ["tissue_of_origin_risk"]
+    assert pairs["BRCA"]["cancer_type_name"] == "Breast Invasive Carcinoma"
+    assert pairs["BRCA"]["tumor_type_query"] == "breast cancer"
+    assert view["summary"] == {"surfaced": 0, "literature_pending": 3, "excluded": 2}
+    assert harness.gate.calls == []  # viewing statistics never runs the literature gate
+
+    run_job(client)
+    after = client.get(f"{PREFIX}/stats/ERBB2").json()
+    pairs = _by_code(after["pairs"])
+    assert pairs["BRCA"]["status"] == "surfaced"
+    assert pairs["BRCA"]["literature"]["pmids"] == ["12345678", "23456789"]
+    assert pairs["STAD"]["status"] == "excluded" and pairs["STAD"]["exclusion_reason"] == "literature"
+    assert pairs["STAD"]["literature"]["supported"] is False  # recomputed, not trusted
+    assert after["summary"] == {"surfaced": 1, "literature_pending": 0, "excluded": 4}
+
+
+def test_stats_view_resolves_aliases_and_rejects_unknown(client):
+    assert client.get(f"{PREFIX}/stats/her2").json()["hugo_symbol"] == "ERBB2"
+    missing = client.get(f"{PREFIX}/stats/NOPE1")
+    assert missing.status_code == 404 and "NOPE1" in missing.json()["detail"]
+    assert client.get(f"{PREFIX}/stats/BAD$SYMBOL").status_code == 422
+
+
+def test_bundle_status_reports_active_bundle(harness, client):
+    status = client.get(f"{PREFIX}/bundle").json()
+    assert status["active"]["bundle_tag"] == harness.bundle.tag
+    assert status["active"]["gene_count"] == 2
+    assert status["refresh"]["pinned_bundle_tag"] is None
+
+
+def test_stored_results_carry_bundle_provenance(harness, client):
+    run_job(client)
+    row = harness.store.rows[("ERBB2", "BRCA", RELEASE_ID, "acgc_pipeline_v1")]
+    assert row.stats["bundle_tag"] == harness.bundle.tag
+    body = client.get(f"{PREFIX}/genes/ERBB2").json()
+    assert body["surfaced"][0]["bundle_tag"] == harness.bundle.tag

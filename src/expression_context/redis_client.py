@@ -1,4 +1,4 @@
-"""The module's own small Redis client (lease + negative cache).
+"""The module's own small Redis client (single-flight and single-loader leases).
 
 Built lazily from public settings only: ``EXPRESSION_CONTEXT_REDIS_URL`` if
 set, else ACGC's public ``REDIS_URL`` / ``REDIS_SENTINEL_*`` settings (same
@@ -88,25 +88,6 @@ class ModuleRedis:
             exc, RETRY_BACKOFF_SECONDS,
         )
         self._down_until = self._clock() + RETRY_BACKOFF_SECONDS
-
-    async def get(self, key: str) -> Any:
-        """Fail-open GET: None on any error."""
-        try:
-            return await self.client().get(key)
-        except RedisUnavailable:
-            return None
-        except Exception as exc:
-            self.mark_down(exc)
-            return None
-
-    async def set(self, key: str, value: str, *, ex: int) -> None:
-        """Fail-open SET with TTL."""
-        try:
-            await self.client().set(key, value, ex=ex)
-        except RedisUnavailable:
-            return
-        except Exception as exc:
-            self.mark_down(exc)
 
     async def aclose(self) -> None:
         client, self._client = self._client, None

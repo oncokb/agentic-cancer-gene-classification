@@ -1,5 +1,8 @@
 """Joins the precomputed stats gate with the on-demand literature gate.
 
+Statistics come from the active release bundle (``catalog.py``); nothing on
+the request path calls out to GitHub.
+
 A (gene, cancer type) pair is *surfaced* iff:
 
 1. ``stats_pass`` (stats repo), and
@@ -24,21 +27,26 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from src.expression_context.artifact_client import ArtifactClient, ArtifactContractError
+from src.expression_context.catalog import ActiveBundle, StatsCatalog
 from src.expression_context.lease import VerdictLease, lease_key
 from src.expression_context.literature_gate import LiteratureGate, is_supported
 from src.expression_context.models import (
+    SYMBOL_PATTERN,
+    BundleStatus,
     CancerTypeStats,
     GeneArtifact,
     GeneResult,
+    GeneStatsSummary,
+    GeneStatsView,
     HistoryPage,
     JobPairError,
     JobRecord,
     LiteratureVerdict,
     Manifest,
     PairResult,
+    PairStatsView,
     StoredPair,
 )
 from src.expression_context.store import (
@@ -49,7 +57,7 @@ from src.expression_context.store import (
 
 logger = logging.getLogger(__name__)
 
-_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9._-]{0,63}\Z")
+_SYMBOL = re.compile(SYMBOL_PATTERN)
 
 
 class InvalidGene(ValueError):
@@ -66,6 +74,11 @@ class ResolvedGene:
     hugo_symbol: str
     manifest: Manifest
     artifact: GeneArtifact
+    bundle: Optional[ActiveBundle] = None
+
+    @property
+    def bundle_tag(self) -> Optional[str]:
+        return self.bundle.tag if self.bundle else None
 
 
 def normalize_symbol(gene: str) -> str:
@@ -89,7 +102,7 @@ class ExpressionContextService:
     def __init__(
         self,
         *,
-        artifacts: ArtifactClient,
+        catalog: StatsCatalog,
         gate: LiteratureGate,
         store: ExpressionContextStore,
         jobs: JobStoreLike,
@@ -98,8 +111,18 @@ class ExpressionContextService:
         lease: Optional[VerdictLease] = None,
         lease_wait_seconds: float = 300.0,
         lease_poll_seconds: float = 2.0,
+        refresher: Optional[Any] = None,
+        closers: Sequence[Callable[[], Awaitable[None]]] = (),
+        releases_repo: str = "",
+        pinned_bundle_tag: Optional[str] = None,
     ) -> None:
-        self.artifacts = artifacts
+        self.releases_repo = releases_repo
+        self.pinned_bundle_tag = pinned_bundle_tag
+        self.catalog = catalog
+        # BundleRefresher (or None in tests that seed bundles directly).
+        self.refresher = refresher
+        self._closers = list(closers)
+        self._refresh_task: Optional[asyncio.Task] = None
         self.gate = gate
         self.store = store
         self.jobs = jobs
@@ -116,41 +139,24 @@ class ExpressionContextService:
     # ------------------------------------------------------------------ gene
 
     async def resolve(self, gene: str) -> ResolvedGene:
-        """Canonical symbol first, then aliases.json. Raises GeneNotFound."""
+        """Canonical symbol first, then the bundle's aliases. Raises GeneNotFound,
+        or BundleNotLoaded when no bundle is active yet."""
         symbol = normalize_symbol(gene)
-        manifest = await self.artifacts.get_manifest()
-        artifact, manifest = await self._gene_file(symbol, manifest)
+        bundle = await self.catalog.active()
+        artifact = await self.catalog.gene(bundle, symbol)
         if artifact is None:
-            aliases = await self.artifacts.get_aliases(manifest.release_id)
-            target = aliases.get(symbol)
+            target = await self.catalog.alias(bundle, symbol)
             if target and target != symbol:
-                artifact, manifest = await self._gene_file(target, manifest)
+                artifact = await self.catalog.gene(bundle, target)
         if artifact is None:
             raise GeneNotFound(symbol)
         return ResolvedGene(
             query=gene,
             hugo_symbol=artifact.gene.hugo_symbol.upper(),
-            manifest=manifest,
+            manifest=bundle.manifest,
             artifact=artifact,
+            bundle=bundle,
         )
-
-    async def _gene_file(
-        self, symbol: str, manifest: Manifest
-    ) -> Tuple[Optional[GeneArtifact], Manifest]:
-        artifact = await self.artifacts.get_gene(symbol, manifest.release_id)
-        if artifact is not None and artifact.release_id != manifest.release_id:
-            # A new release was published after the manifest was cached:
-            # refresh both once, then insist they agree.
-            manifest = await self.artifacts.get_manifest(force_refresh=True)
-            artifact = await self.artifacts.get_gene(
-                symbol, manifest.release_id, force_refresh=True
-            )
-            if artifact is not None and artifact.release_id != manifest.release_id:
-                raise ArtifactContractError(
-                    f"genes/{symbol}.json release_id {artifact.release_id!r} does not match "
-                    f"manifest release_id {manifest.release_id!r}"
-                )
-        return artifact, manifest
 
     # ------------------------------------------------------------------ jobs
 
@@ -162,6 +168,7 @@ class ExpressionContextService:
             gene=gene,
             hugo_symbol=resolved.hugo_symbol,
             release_id=resolved.manifest.release_id,
+            bundle_tag=resolved.bundle_tag,
             created_at=_utcnow(),
             owner=owner,
         )
@@ -209,6 +216,7 @@ class ExpressionContextService:
             # Denormalized display fields, so reads never need the artifact.
             stored_stats["cancer_type_name"] = cancer_type.name if cancer_type else None
             stored_stats["study_id"] = cancer_type.study_id if cancer_type else None
+            stored_stats["bundle_tag"] = resolved.bundle_tag
             return StoredPair(
                 hugo_symbol=symbol,
                 oncotree_code=stats.oncotree_code,
@@ -410,9 +418,76 @@ class ExpressionContextService:
         return self._gene_result(rows[0].hugo_symbol, rows, include_excluded)
 
     async def _alias_target(self, symbol: str) -> Optional[str]:
-        # Artifact errors propagate (-> 502): an outage must not read as 404.
-        manifest = await self.artifacts.get_manifest()
-        return (await self.artifacts.get_aliases(manifest.release_id)).get(symbol)
+        # BundleNotLoaded propagates (-> 503): "can't resolve yet" is not a 404.
+        bundle = await self.catalog.active()
+        return await self.catalog.alias(bundle, symbol)
+
+    async def bundle_status(self) -> BundleStatus:
+        return await self.catalog.status(
+            releases_repo=self.releases_repo, pinned_bundle_tag=self.pinned_bundle_tag
+        )
+
+    async def stats_view(self, gene: str) -> GeneStatsView:
+        """The active bundle's statistics for every cancer type of a gene, joined
+        with any stored literature verdicts for this release (the stats page)."""
+        resolved = await self.resolve(gene)
+        bundle = resolved.bundle
+        assert bundle is not None
+        stored = await self.store.get_pairs(
+            resolved.hugo_symbol, resolved.manifest.release_id, self.gate.name
+        )
+        pairs: List[PairStatsView] = []
+        summary = GeneStatsSummary()
+        for stats in resolved.artifact.cancer_types:
+            cancer_type = resolved.manifest.cancer_type(stats.oncotree_code)
+            precheck = {True: "pass", False: "fail", None: "not_run"}[stats.literature_precheck_pass]
+            eligible = stats.stats_pass and stats.literature_precheck_pass is not False
+            verdict = None
+            prior = stored.get(stats.oncotree_code)
+            if eligible and prior is not None and prior.evidence is not None:
+                verdict = LiteratureVerdict.model_validate(prior.evidence)
+                verdict = verdict.model_copy(
+                    update={"supported": is_supported(verdict.insufficient_evidence, verdict.pmids)}
+                )
+            if not stats.stats_pass:
+                status, reason = "excluded", "stats"
+            elif not eligible:
+                status, reason = "excluded", "precheck"
+            elif verdict is None:
+                status, reason = "literature_pending", None
+            elif verdict.supported:
+                status, reason = "surfaced", None
+            else:
+                status, reason = "excluded", "literature"
+            setattr(summary, status, getattr(summary, status) + 1)
+            pairs.append(PairStatsView(
+                oncotree_code=stats.oncotree_code,
+                cancer_type_name=cancer_type.name if cancer_type else None,
+                study_id=cancer_type.study_id if cancer_type else None,
+                tumor_type_query=cancer_type.tumor_type_query if cancer_type else None,
+                stats=stats,
+                stats_pass=stats.stats_pass,
+                precheck=precheck,
+                literature_eligible=eligible,
+                status=status,
+                exclusion_reason=reason,
+                literature=verdict,
+            ))
+        pairs.sort(key=lambda pair: (
+            not pair.stats_pass,
+            pair.stats.q_value is None,
+            pair.stats.q_value if pair.stats.q_value is not None else 0.0,
+            pair.oncotree_code,
+        ))
+        return GeneStatsView(
+            query=gene,
+            hugo_symbol=resolved.hugo_symbol,
+            entrez_gene_id=resolved.artifact.gene.entrez_gene_id,
+            literature_gate=self.gate.name,
+            bundle=bundle.provenance(),
+            summary=summary,
+            pairs=pairs,
+        )
 
     async def history(self, limit: int, cursor: Optional[str]) -> HistoryPage:
         decoded = decode_cursor(cursor) if cursor else None
@@ -424,12 +499,25 @@ class ExpressionContextService:
 
     # ------------------------------------------------------------ lifecycle
 
+    def start(self) -> None:
+        """Start the background bundle refresher (first check runs immediately)."""
+        if self.refresher is not None and self._refresh_task is None:
+            self._refresh_task = asyncio.create_task(self.refresher.run_forever())
+
     async def aclose(self) -> None:
-        for task in list(self._tasks):
+        tasks = list(self._tasks)
+        if self._refresh_task is not None:
+            tasks.append(self._refresh_task)
+            self._refresh_task = None
+        for task in tasks:
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        await self.artifacts.aclose()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for close in self._closers:
+            try:
+                await close()
+            except Exception:
+                logger.exception("Expression-context shutdown step failed")
         await self._lease.aclose()
         await self.store.close()
 
@@ -487,5 +575,6 @@ def _pair_result(row: StoredPair) -> PairResult:
         stats=CancerTypeStats.model_validate(row.stats),
         literature=LiteratureVerdict.model_validate(row.evidence) if row.evidence else None,
         computed_at=row.computed_at,
+        bundle_tag=row.stats.get("bundle_tag"),
     )
 
