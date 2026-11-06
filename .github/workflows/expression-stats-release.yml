@@ -21,6 +21,10 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
+    # All builds share one NCBI key, including branch dispatches.
+    concurrency:
+      group: expression-stats-pubmed
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 360
     defaults:

@@ -9,7 +9,8 @@
 4. Remove the `NCBI_API_KEY` repository secret if no other workflow uses it.
 5. Remove the `expression_stats` exclusion from root ruff configuration and
    `expression_stats/` from `.dockerignore` (both are harmless if retained).
-6. Delete leftover releases/drafts whose tags start with `expression-stats-`,
+6. Only after the ACGC consumer (`src/expression_context`, PR #167) is removed
+   or disabled, delete leftover releases/drafts whose tags start with `expression-stats-`,
    then delete their corresponding Git tags (release deletion alone does not
    remove tags). Paginate repository releases/tags and review this exact prefix
    before deletion; do not delete application releases/tags.

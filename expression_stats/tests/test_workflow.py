@@ -62,6 +62,10 @@ def test_release_workflow_limits_write_token_to_main_publisher():
     build, publish = jobs.split("  publish:\n", 1)
     assert "contents: read" in header and "contents: write" not in header + build
     assert "github.event_name" in header and "github.ref" in header
+    assert (
+        "concurrency:\n      group: expression-stats-pubmed\n      cancel-in-progress: false"
+        in build
+    )
     assert "contents: write" in publish
     assert "github.ref == 'refs/heads/main'" in publish
     assert "group: expression-stats-publish" in publish

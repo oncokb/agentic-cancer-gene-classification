@@ -3,12 +3,18 @@
 import ast
 from pathlib import Path
 
+import pytest
 
-def imports(path):
+
+def imports(path, *, skip_relative=False):
     for node in ast.walk(ast.parse(path.read_text())):
         if isinstance(node, ast.Import):
             yield from (alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and (not skip_relative or node.level == 0)
+        ):
             yield node.module
         elif (
             isinstance(node, ast.Call)
@@ -47,14 +53,12 @@ def test_pipeline_and_application_imports_are_isolated():
         for path in root.rglob("*.py"):
             if any(part.startswith(".") for part in path.relative_to(root).parts):
                 continue
-            for name in imports(path):
-                assert name.lstrip(".").split(".")[0] not in forbidden, f"{path} imports {name}"
+            for name in imports(path, skip_relative=root == pipeline):
+                assert name.split(".")[0] not in forbidden, f"{path} imports {name}"
 
 
 def test_root_guard_survives_producer_removal_and_rejects_imports(tmp_path):
     import runpy
-
-    import pytest
 
     guard = runpy.run_path(
         str(Path(__file__).resolve().parents[2] / "tests/test_expression_stats_isolation.py")
@@ -76,3 +80,32 @@ def test_root_guard_survives_producer_removal_and_rejects_imports(tmp_path):
         module.write_text(statement + "\n")
         with pytest.raises(AssertionError):
             guard()
+
+
+@pytest.mark.parametrize(
+    "statement,allowed",
+    [
+        ("from .stats import x", True),
+        ("import src", False),
+        ("import stats", False),
+        ("from stats import x", False),
+    ],
+)
+def test_pipeline_guard_distinguishes_relative_and_app_imports(
+    tmp_path,
+    monkeypatch,
+    statement,
+    allowed,
+):
+    pipeline = tmp_path / "expression_stats"
+    (pipeline / "tests").mkdir(parents=True)
+    (pipeline / "module.py").write_text(statement + "\n")
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "stats.py").write_text("x = 1\n")
+    monkeypatch.setitem(globals(), "__file__", str(pipeline / "tests/test_isolation.py"))
+    if allowed:
+        test_pipeline_and_application_imports_are_isolated()
+    else:
+        with pytest.raises(AssertionError, match="imports"):
+            test_pipeline_and_application_imports_are_isolated()

@@ -258,7 +258,15 @@ Consumers must ignore unknown fields and reject unknown `schema_version`.
   build review artifacts, even when a matching published build is fresh.
 - Workflow concurrency is keyed by event name and ref, so queued manual runs
   cannot replace pending cron runs. Same-event/ref pending runs may coalesce
-  under GitHub's concurrency policy. A shared `expression-stats-publish` job
+  under GitHub's concurrency policy. All build jobs additionally share the
+  `expression-stats-pubmed` concurrency group with `cancel-in-progress: false`,
+  so cron and manual builds (including branch dispatches) cannot simultaneously
+  use the shared NCBI_API_KEY. This serializes the entire build, including cache
+  restore/save and review-only builds. GitHub retains at most one pending job
+  per shared group; a newer pending job can replace an older one, while running
+  jobs are never cancelled. The event/ref workflow groups remain separate so
+  manual runs cannot replace pending cron runs at the workflow queue level.
+  A shared `expression-stats-publish` job
   concurrency group serializes all main-branch publications, preventing tag
   races across schedule and dispatch. Running jobs are never cancelled.
   Since only schedule/main and dispatch/main reach publication, each with one

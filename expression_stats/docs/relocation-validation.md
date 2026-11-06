@@ -152,10 +152,18 @@ Pipeline commands, from `expression_stats/`:
 .venv/bin/pytest -q
 ```
 
-Ruff passes; **114 collected test cases passed** (61 test functions) in 5.65s.
+Ruff passes; **118 collected test cases passed** (62 test functions) in 10.42s.
 Coverage includes draft cleanup and cleanup failure preserving the original
 error, stale draft rejection, target commit, workflow token/job boundaries,
 branch review builds, concurrency configuration, and root guard removal.
+Follow-up coverage verifies that a relative pipeline `from .stats import x`
+stays valid if the app adds `src/stats.py`, while absolute app imports fail.
+Only absolute imports are compared to the app's bare module names.
+The build job now also uses the shared `expression-stats-pubmed` concurrency
+group (`cancel-in-progress: false`), serializing shared-key NCBI usage across
+cron/manual and branch builds while retaining event/ref workflow queues.
+Removal instructions require disabling/removing the consumer before deleting
+bundle releases.
 
 Root commands, with fresh disposable MySQL/Redis containers:
 
@@ -163,8 +171,8 @@ Root commands, with fresh disposable MySQL/Redis containers:
 .venv/bin/ruff check .
 .venv/bin/python -c "import importlib.util; assert all(importlib.util.find_spec(n) is None for n in ('numpy', 'scipy', 'pandas'))"
 env PATH="$PWD/.venv/bin:/usr/bin:/bin" \
-  MYSQL_HOST=127.0.0.1 MYSQL_PORT=49268 MYSQL_USER=acgc MYSQL_PASSWORD=acgc \
-  MYSQL_DATABASE=acgc_test REDIS_URL=redis://127.0.0.1:49269/0 \
+  MYSQL_HOST=127.0.0.1 MYSQL_PORT=55720 MYSQL_USER=acgc MYSQL_PASSWORD=acgc \
+  MYSQL_DATABASE=acgc_test REDIS_URL=redis://127.0.0.1:55719/0 \
   ACGC_ALLOW_DESTRUCTIVE_TESTS=1 .venv/bin/pytest tests/ -v -rA
 docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 \
   .github/workflows/expression-stats-ci.yml \
@@ -172,7 +180,7 @@ docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 \
 ```
 
 Root ruff and actionlint pass. **2,969 app cases collected; 2,895 passed,
-74 skipped**, 907 warnings, 50.57 seconds. This adds exactly one root isolation
+74 skipped**, 907 warnings, 49.94 seconds. This adds exactly one root isolation
 case. The environment contains no numpy/scipy/pandas. Source application code,
 existing app tests, `pages.yml`, and the reader work in #167 remain untouched.
 
