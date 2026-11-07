@@ -5,12 +5,15 @@ the request path calls out to GitHub.
 
 A (gene, cancer type) pair is *surfaced* iff:
 
-1. ``stats_pass`` (stats repo), and
+1. it passes the statistics: ``stats_pass``, and not a method-m3 pair whose
+   lineage enrichment was blocked by broad expression without a subgroup
+   pass (``CancerTypeStats.passes_stats``), and
 2. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
    pre-check; null means it was not run, and the literature gate itself is
    authoritative), and
-3. the literature gate's verdict is supported (``insufficient_evidence`` is
-   false AND >=1 cited PMID).
+3. the literature gate confirms the SPECIFIC tumor type
+   (``literature_gate.verdict_supported``: verdict "supported" AND >=1 PMID
+   judged to describe the gene in that tumor type; only those are cited).
 
 Only pairs passing 1 and 2 reach the literature gate; exclusion reason
 ``precheck`` is recorded only for an explicit ``literature_precheck_pass:
@@ -31,7 +34,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set
 
 from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
 from src.expression_context.lease import VerdictLease, lease_key
-from src.expression_context.literature_gate import LiteratureGate, is_supported
+from src.expression_context.literature_gate import LiteratureGate, verdict_supported
 from src.expression_context.models import (
     SYMBOL_PATTERN,
     BundleStatus,
@@ -48,6 +51,7 @@ from src.expression_context.models import (
     PairResult,
     PairStatsView,
     StoredPair,
+    TumorContext,
 )
 from src.expression_context.store import (
     ExpressionContextStore,
@@ -240,7 +244,7 @@ class ExpressionContextService:
         expired = precheck_expired(manifest, now)
 
         rows: List[StoredPair] = []
-        to_check: List[Tuple[CancerTypeStats, str]] = []
+        to_check: List[Tuple[CancerTypeStats, TumorContext]] = []
         errors: List[JobPairError] = []
         reused = 0
 
@@ -251,6 +255,8 @@ class ExpressionContextService:
             stored_stats["cancer_type_name"] = cancer_type.name if cancer_type else None
             stored_stats["study_id"] = cancer_type.study_id if cancer_type else None
             stored_stats["bundle_tag"] = resolved.bundle_tag
+            if resolved.artifact.broadly_expressed is not None:
+                stored_stats["gene_broadly_expressed"] = resolved.artifact.broadly_expressed
             if expired:
                 stored_stats["precheck_expired"] = True
             return StoredPair(
@@ -267,7 +273,8 @@ class ExpressionContextService:
             )
 
         for stats in resolved.artifact.cancer_types:
-            if not stats.stats_pass:
+            if not stats.passes_stats:
+                # Includes broad-blocked m3 pairs: visible, never sent on.
                 rows.append(row(stats, False, "stats"))
                 continue
             if effective_precheck(stats, expired) is False:
@@ -286,12 +293,16 @@ class ExpressionContextService:
                     error="cancer type missing from manifest (no tumor_type_query)",
                 ))
                 continue
-            to_check.append((stats, cancer_type.tumor_type_query))
+            to_check.append((stats, TumorContext(
+                oncotree_code=stats.oncotree_code,
+                name=cancer_type.name,
+                tumor_type_query=cancer_type.tumor_type_query,
+            )))
 
-        async def check(stats: CancerTypeStats, query: str):
+        async def check(stats: CancerTypeStats, tumor: TumorContext):
             try:
                 verdict, was_reused = await self._single_flight_verdict(
-                    symbol, stats.oncotree_code, manifest.release_id, query,
+                    symbol, stats.oncotree_code, manifest.release_id, tumor,
                     lambda verdict: _verdict_row(row, stats, verdict),
                 )
                 return stats, verdict, was_reused, None
@@ -303,7 +314,7 @@ class ExpressionContextService:
                 return stats, None, False, f"{type(exc).__name__}: {exc}"[:300]
 
         evaluated = 0
-        outcomes = await asyncio.gather(*(check(s, q) for s, q in to_check))
+        outcomes = await asyncio.gather(*(check(s, t) for s, t in to_check))
         for stats, verdict, was_reused, error in outcomes:
             if verdict is None:
                 errors.append(JobPairError(oncotree_code=stats.oncotree_code, error=error or ""))
@@ -325,7 +336,7 @@ class ExpressionContextService:
         symbol: str,
         oncotree_code: str,
         release_id: str,
-        tumor_type_query: str,
+        tumor: TumorContext,
         make_row: Callable[[LiteratureVerdict], StoredPair],
     ) -> Tuple[LiteratureVerdict, bool]:
         """(verdict, reused) for one verdict key, computing it at most once.
@@ -353,7 +364,7 @@ class ExpressionContextService:
         future.add_done_callback(lambda f: f.cancelled() or f.exception())
         self._inflight[key] = future
         try:
-            outcome = await self._resolve_verdict(key, tumor_type_query, make_row)
+            outcome = await self._resolve_verdict(key, tumor, make_row)
         except asyncio.CancelledError:
             future.cancel()
             raise
@@ -377,7 +388,7 @@ class ExpressionContextService:
     async def _resolve_verdict(
         self,
         key: Tuple[str, str, str, str],
-        tumor_type_query: str,
+        tumor: TumorContext,
         make_row: Callable[[LiteratureVerdict], StoredPair],
     ) -> Tuple[LiteratureVerdict, bool]:
         lkey = lease_key(*key)
@@ -393,7 +404,7 @@ class ExpressionContextService:
                         "Gave up waiting for another pod's literature verdict for %s; "
                         "evaluating it here", lkey,
                     )
-                    return await self._evaluate_and_store(key, tumor_type_query, make_row), False
+                    return await self._evaluate_and_store(key, tumor, make_row), False
                 await asyncio.sleep(self._lease_poll_seconds)
                 continue
             try:
@@ -402,7 +413,7 @@ class ExpressionContextService:
                 if stored is not None:
                     return stored, True
                 verdict = await self._evaluate_and_store(
-                    key, tumor_type_query, make_row, lease=(lkey, claim.token)
+                    key, tumor, make_row, lease=(lkey, claim.token)
                 )
                 return verdict, False
             finally:
@@ -412,7 +423,7 @@ class ExpressionContextService:
     async def _evaluate_and_store(
         self,
         key: Tuple[str, str, str, str],
-        tumor_type_query: str,
+        tumor: TumorContext,
         make_row: Callable[[LiteratureVerdict], StoredPair],
         lease: Optional[Tuple[str, Optional[str]]] = None,
     ) -> LiteratureVerdict:
@@ -421,7 +432,7 @@ class ExpressionContextService:
             heartbeat = asyncio.create_task(self._heartbeat(*lease))
         try:
             async with self._gate_slots:
-                verdict = await self.gate.evaluate(key[0], tumor_type_query)
+                verdict = await self.gate.evaluate(key[0], tumor)
             # Store before the lease is released so waiters find it.
             await self.store.upsert_pairs([make_row(verdict)])
         finally:
@@ -486,15 +497,14 @@ class ExpressionContextService:
             precheck = {True: "pass", False: "fail", None: "not_run"}[stats.literature_precheck_pass]
             if expired and stats.literature_precheck_pass is not None:
                 precheck = "expired"
-            eligible = stats.stats_pass and effective_precheck(stats, expired) is not False
+            passes = stats.passes_stats
+            eligible = passes and effective_precheck(stats, expired) is not False
             verdict = None
             prior = stored.get(stats.oncotree_code)
             if eligible and prior is not None and prior.evidence is not None:
                 verdict = LiteratureVerdict.model_validate(prior.evidence)
-                verdict = verdict.model_copy(
-                    update={"supported": is_supported(verdict.insufficient_evidence, verdict.pmids)}
-                )
-            if not stats.stats_pass:
+                verdict = verdict.model_copy(update={"supported": verdict_supported(verdict)})
+            if not passes:
                 status, reason = "excluded", "stats"
             elif not eligible:
                 status, reason = "excluded", "precheck"
@@ -511,7 +521,9 @@ class ExpressionContextService:
                 study_id=cancer_type.study_id if cancer_type else None,
                 tumor_type_query=cancer_type.tumor_type_query if cancer_type else None,
                 stats=stats,
-                stats_pass=stats.stats_pass,
+                stats_pass=passes,
+                enrichment=stats.enrichment_label,
+                broad_blocked=stats.broad_blocked,
                 precheck=precheck,
                 literature_eligible=eligible,
                 status=status,
@@ -528,6 +540,7 @@ class ExpressionContextService:
             query=gene,
             hugo_symbol=resolved.hugo_symbol,
             entrez_gene_id=resolved.artifact.gene.entrez_gene_id,
+            broadly_expressed=resolved.artifact.broadly_expressed,
             literature_gate=self.gate.name,
             bundle=bundle.provenance(),
             summary=summary,
@@ -587,8 +600,10 @@ class ExpressionContextService:
         excluded = sorted(
             (pair for pair in pairs if not pair.surfaced), key=lambda pair: pair.oncotree_code
         )
+        broad = [row.stats.get("gene_broadly_expressed") for row in rows]
         return GeneResult(
             hugo_symbol=symbol,
+            broadly_expressed=next((value for value in broad if value is not None), None),
             release_id=rows[0].release_id if rows else "",
             literature_gate=rows[0].literature_gate if rows else "",
             computed_at=max((row.computed_at for row in rows), default=_utcnow()),
@@ -599,8 +614,8 @@ class ExpressionContextService:
 
 def _verdict_row(make_row, stats: CancerTypeStats, verdict: LiteratureVerdict) -> StoredPair:
     # Recompute "supported" from the stored fields so a gate can't surface a
-    # pair that violates the v1 rule.
-    supported = is_supported(verdict.insufficient_evidence, verdict.pmids)
+    # pair that violates the rule (tumor-specific PMIDs only).
+    supported = verdict_supported(verdict)
     verdict = verdict.model_copy(update={"supported": supported})
     return make_row(
         stats,

@@ -156,7 +156,7 @@ def test_job_flow_surfaces_only_stats_and_literature_supported_pairs(harness, cl
     stored = harness.store.rows
     assert len(stored) == 5
     assert all(row.requested_by == "alice@example.org" for row in stored.values())
-    assert all(row.literature_gate == "acgc_pipeline_v1" for row in stored.values())
+    assert all(row.literature_gate == "acgc_tumor_specific_v2" for row in stored.values())
 
 
 def test_get_gene_returns_surfaced_by_default(client):
@@ -187,12 +187,12 @@ def test_stored_verdicts_are_reused(harness, client):
 def test_verdicts_from_another_release_or_gate_are_not_reused(harness, client):
     now = datetime.now(timezone.utc)
     evidence = {
-        "literature_gate": "acgc_pipeline_v1", "tumor_type_query": "breast cancer",
+        "literature_gate": "acgc_tumor_specific_v2", "tumor_type_query": "breast cancer",
         "supported": True, "insufficient_evidence": False, "pmids": ["1"],
         "evaluated_at": now.isoformat(),
     }
     stats = gene_file()["cancer_types"][0]
-    for release_id, gate in (("older-release", "acgc_pipeline_v1"), (RELEASE_ID, "lras_v1")):
+    for release_id, gate in (("older-release", "acgc_tumor_specific_v2"), (RELEASE_ID, "lras_v1")):
         harness.store.rows[("ERBB2", "BRCA", release_id, gate)] = StoredPair(
             hugo_symbol="ERBB2", oncotree_code="BRCA", release_id=release_id,
             literature_gate=gate, surfaced=True, stats=stats, evidence=evidence,
@@ -208,7 +208,7 @@ def test_gate_failure_is_reported_and_retried_next_run(harness, client):
     job = run_job(client)
     assert job["status"] == "succeeded"
     assert [err["oncotree_code"] for err in job["pair_errors"]] == ["STAD"]
-    assert ("ERBB2", "STAD", RELEASE_ID, "acgc_pipeline_v1") not in harness.store.rows
+    assert ("ERBB2", "STAD", RELEASE_ID, "acgc_tumor_specific_v2") not in harness.store.rows
 
     harness.gate.fail_for = set()
     harness.gate.calls.clear()
@@ -294,9 +294,9 @@ def _seed_history(store, symbols_minutes_ago):
     stats = gene_file()["cancer_types"][0]
     for symbol, minutes_ago, surfaced in symbols_minutes_ago:
         for code in ("BRCA", "STAD"):
-            store.rows[(symbol, code, RELEASE_ID, "acgc_pipeline_v1")] = StoredPair(
+            store.rows[(symbol, code, RELEASE_ID, "acgc_tumor_specific_v2")] = StoredPair(
                 hugo_symbol=symbol, oncotree_code=code, release_id=RELEASE_ID,
-                literature_gate="acgc_pipeline_v1", surfaced=surfaced and code == "BRCA",
+                literature_gate="acgc_tumor_specific_v2", surfaced=surfaced and code == "BRCA",
                 exclusion_reason=None if surfaced and code == "BRCA" else "stats",
                 stats={**stats, "oncotree_code": code},
                 computed_at=now - timedelta(minutes=minutes_ago),
@@ -402,7 +402,7 @@ def test_stats_view_before_and_after_literature_check(harness, client):
     view = before.json()
     assert view["hugo_symbol"] == "ERBB2" and view["query"] == "erbb2"
     assert view["entrez_gene_id"] == 2064
-    assert view["literature_gate"] == "acgc_pipeline_v1"
+    assert view["literature_gate"] == "acgc_tumor_specific_v2"
     bundle = view["bundle"]
     assert bundle["bundle_tag"] == harness.bundle.tag and bundle["release_id"] == RELEASE_ID
     assert bundle["method_version"] == "2" and bundle["pubmed_snapshot_date"] == "2026-11-02"
@@ -450,7 +450,7 @@ def test_bundle_status_reports_active_bundle(harness, client):
 
 def test_stored_results_carry_bundle_provenance(harness, client):
     run_job(client)
-    row = harness.store.rows[("ERBB2", "BRCA", RELEASE_ID, "acgc_pipeline_v1")]
+    row = harness.store.rows[("ERBB2", "BRCA", RELEASE_ID, "acgc_tumor_specific_v2")]
     assert row.stats["bundle_tag"] == harness.bundle.tag
     body = client.get(f"{PREFIX}/genes/ERBB2").json()
     assert body["surfaced"][0]["bundle_tag"] == harness.bundle.tag

@@ -104,16 +104,48 @@
       if (!verdict) {
         return [badge(pair.literature_eligible ? "Not checked yet" : "—", "neutral")];
       }
-      const parts = [verdict.supported ? badge("Supported", "pass") : badge("Not supported", "fail")];
+      // Tumor-specific verdicts (v2) carry `verdict`; older ones don't.
+      const tumorSpecific = typeof verdict.verdict === "string";
+      const tumor = verdict.cancer_type_name || pair.cancer_type_name || pair.oncotree_code;
+      const parts = [verdict.supported
+        ? badge(tumorSpecific ? `Supported in ${tumor}` : "Supported", "pass")
+        : badge("Not supported", "fail")];
       if (!verdict.supported) {
-        parts.push(node("span", verdict.insufficient_evidence ? " insufficient evidence" : " no cited PMIDs", "ec-neutral"));
+        let why = verdict.insufficient_evidence ? " insufficient evidence" : " no cited PMIDs";
+        if (tumorSpecific && verdict.verdict === "not_supported") why = " evidence against this tumor type";
+        else if (tumorSpecific && !verdict.insufficient_evidence) why = " no tumor-specific PMIDs";
+        parts.push(node("span", why, "ec-neutral"));
       }
       if ((verdict.pmids || []).length) {
         const block = node("div");
+        if (tumorSpecific) block.appendChild(node("span", "Tumor-specific: ", "ec-neutral"));
         block.appendChild(pmidLinks(verdict.pmids));
         parts.push(block);
       }
       if (verdict.rationale) parts.push(node("div", verdict.rationale, "ec-rationale"));
+      return parts;
+    }
+
+    function hasSubgroupStats(s) {
+      return ["subgroup_high_count", "subgroup_high_fraction", "subgroup_high_fraction_ratio",
+        "p95_log2_diff", "subgroup_q"].some((key) => s[key] !== null && s[key] !== undefined);
+    }
+
+    function subgroupText(s) {
+      const count = s.subgroup_high_count === null || s.subgroup_high_count === undefined
+        ? "—" : String(s.subgroup_high_count);
+      const fraction = s.subgroup_high_fraction === null || s.subgroup_high_fraction === undefined
+        ? "—" : `${formatNumber(Number(s.subgroup_high_fraction) * 100, 1)}%`;
+      return `Subgroup: high n ${count} (${fraction}) · ratio ${formatNumber(s.subgroup_high_fraction_ratio)}× · ` +
+        `p95 Δlog2 ${formatNumber(s.p95_log2_diff)} · q ${formatQ(s.subgroup_q)}`;
+    }
+
+    function statsCell(pair) {
+      const parts = [pair.stats_pass ? badge("Pass", "pass") : badge("Fail", "fail")];
+      if (pair.stats_pass && pair.enrichment) parts.push(badge(pair.enrichment, "pass"));
+      // Lineage enrichment blocked by broad expression (method m3): shown, never passing.
+      if (pair.broad_blocked) parts.push(badge("Broadly expressed", "warn"));
+      if (hasSubgroupStats(pair.stats)) parts.push(node("div", subgroupText(pair.stats), "ec-subgroup"));
       return parts;
     }
 
@@ -150,7 +182,7 @@
       cell(row, formatNumber(s.cliffs_delta), "ec-num");
       cell(row, formatNumber(s.auc), "ec-num");
       cell(row, formatQ(s.q_value), "ec-num");
-      cell(row, [pair.stats_pass ? badge("Pass", "pass") : badge("Fail", "fail")]);
+      cell(row, statsCell(pair));
       cell(row, precheckCell(pair));
       cell(row, flagsCell(s.flags));
       cell(row, literatureCell(pair));
@@ -210,6 +242,10 @@
         ? `${view.hugo_symbol} (from ${view.query.trim()})`
         : view.hugo_symbol;
       el["ec-gene-title"].textContent = view.entrez_gene_id ? `${title} · Entrez ${view.entrez_gene_id}` : title;
+      if (view.broadly_expressed === true) {
+        // Method m3: the gene is broadly expressed across cohorts.
+        el["ec-gene-title"].appendChild(badge("Broadly expressed", "warn"));
+      }
       const summary = view.summary || {};
       el["ec-summary"].textContent =
         `${summary.surfaced || 0} surfaced · ${summary.literature_pending || 0} awaiting literature check · ` +

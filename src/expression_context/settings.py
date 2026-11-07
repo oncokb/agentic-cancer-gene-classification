@@ -96,8 +96,17 @@ class ExpressionContextSettings(BaseSettings):
     redis_url: str = ""
 
     # ------------------------------------------------------- literature gate
-    # Literature gate implementation (the stored verdict key includes it).
-    literature_gate: Literal["acgc_pipeline_v1"] = "acgc_pipeline_v1"
+    # Literature gate implementation. The stored verdict key includes it, so
+    # changing it (v1 -> v2) re-evaluates every pair instead of reusing
+    # verdicts of the old rule. v2 confirms the SPECIFIC tumor type.
+    literature_gate: Literal["acgc_tumor_specific_v2"] = "acgc_tumor_specific_v2"
+    # Model for the tumor-specific judgement; empty = ACGC's selection_model
+    # (read from the public settings, never modified).
+    judge_model: str = ""
+    # Papers (that mention the tumor type) sent to the judge, and the
+    # abstract length per paper.
+    judge_max_papers: int = Field(default=12, ge=1, le=40)
+    judge_abstract_chars: int = Field(default=1500, ge=200, le=6000)
     # Max literature-gate evaluations running at once in this process,
     # shared across all jobs.
     literature_concurrency: int = Field(default=2, ge=1, le=16)
@@ -107,8 +116,6 @@ class ExpressionContextSettings(BaseSettings):
     lease_ttl_seconds: float = Field(default=120.0, gt=0)
     lease_wait_seconds: float = Field(default=600.0, ge=0)
     lease_poll_seconds: float = Field(default=2.0, gt=0)
-    # Annotation mode for the ACGC pipeline gate.
-    pipeline_mode: Literal["full", "core"] = "full"
 
     # The module's own small MySQL pool (results + bundle tables). The
     # loader holds up to two connections while importing.

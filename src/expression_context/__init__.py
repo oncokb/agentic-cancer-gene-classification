@@ -37,7 +37,7 @@ async def _default_service_factory(app: Any, settings: ExpressionContextSettings
     from src.expression_context.catalog import StatsCatalog
     from src.expression_context.github_releases import ReleasesClient
     from src.expression_context.lease import VerdictLease
-    from src.expression_context.literature_gate import AcgcPipelineGate
+    from src.expression_context.literature_gate import TumorSpecificGate
     from src.expression_context.models import JobRecord
     from src.expression_context.redis_client import ModuleRedis
     from src.expression_context.service import ExpressionContextService
@@ -60,8 +60,10 @@ async def _default_service_factory(app: Any, settings: ExpressionContextSettings
     )
     return ExpressionContextService(
         catalog=catalog,
-        gate=AcgcPipelineGate(
-            lambda: getattr(app.state, "run_store", None), mode=settings.pipeline_mode
+        gate=TumorSpecificGate(
+            model=settings.judge_model or None,
+            max_papers=settings.judge_max_papers,
+            abstract_chars=settings.judge_abstract_chars,
         ),
         store=store,
         jobs=JobStore("expression_context", JobRecord),

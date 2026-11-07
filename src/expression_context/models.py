@@ -1,6 +1,7 @@
 """Pydantic models: the release-bundle contract (input) and the API (output).
 
-Contract: expression_stats/docs/contract.md ("Release bundle contract v1").
+Contract: expression_stats/docs/acgc-contract.md (bundle schema_version 1;
+statistical method m2, plus the additive method-m3 fields).
 Artifact models ignore unknown fields (pydantic's default), as the contract
 requires; ``schema_version`` is checked by the bundle loader before parsing.
 """
@@ -10,10 +11,15 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
+from dataclasses import dataclass
+
 from pydantic import BaseModel, ConfigDict, Field
 
 SUPPORTED_SCHEMA_VERSION = "1"
-SUPPORTED_METHOD_VERSION = "2"
+# Method versions this module understands. m3 only adds optional fields, so
+# m2 bundles still load; method_version is informational, never enforced.
+SUPPORTED_METHOD_VERSIONS = ("2", "3")
+PASS_MODE_LABELS = {"lineage": "Lineage enriched", "subgroup": "Subgroup enriched"}
 # Canonical/alias gene symbols as accepted from users and from bundles.
 SYMBOL_PATTERN = r"[A-Z0-9][A-Z0-9._-]{0,63}\Z"
 
@@ -23,7 +29,7 @@ JobState = Literal["queued", "running", "succeeded", "failed"]
 
 # --------------------------------------------------------------------------
 # Release bundle contract, schema_version 1 (authoritative:
-# expression_stats/docs/contract.md)
+# expression_stats/docs/acgc-contract.md)
 # --------------------------------------------------------------------------
 
 
@@ -97,11 +103,44 @@ class CancerTypeStats(_Artifact):
     literature_precheck_pass: Optional[bool] = None
     flags: List[str] = Field(default_factory=list)
 
+    # ---- method m3 (additive; absent in m2 bundles, so all optional) ----
+    # How the pair passed: "lineage" (whole-cohort enrichment) or "subgroup"
+    # (a high-expressing subset). Kept as a string so an unknown future
+    # value can't reject a whole bundle; only the two known values get a label.
+    pass_mode: Optional[str] = None
+    # The gene is broadly expressed, so lineage enrichment was blocked for
+    # this pair (it can still pass in subgroup mode).
+    lineage_blocked_by_broad: Optional[bool] = None
+    subgroup_high_count: Optional[int] = None
+    subgroup_high_fraction: Optional[float] = None
+    subgroup_high_fraction_ratio: Optional[float] = None
+    p95_log2_diff: Optional[float] = None
+    subgroup_q: Optional[float] = None
+
+    @property
+    def broad_blocked(self) -> bool:
+        """Lineage enrichment blocked by broad expression and no subgroup pass:
+        visible, never passing, never sent to the literature gate."""
+        return bool(self.lineage_blocked_by_broad) and self.pass_mode != "subgroup"
+
+    @property
+    def passes_stats(self) -> bool:
+        """The statistics call ACGC acts on (stats_pass, minus broad-blocked pairs)."""
+        return self.stats_pass and not self.broad_blocked
+
+    @property
+    def enrichment_label(self) -> Optional[str]:
+        if not self.passes_stats or self.pass_mode is None:
+            return None
+        return PASS_MODE_LABELS.get(self.pass_mode, self.pass_mode)
+
 
 class GeneArtifact(_Artifact):
     schema_version: str
     release_id: str
     gene: GeneRef
+    # m3: the gene is broadly expressed across cohorts (absent in m2).
+    broadly_expressed: Optional[bool] = None
     cancer_types: List[CancerTypeStats] = Field(default_factory=list)
 
 
@@ -110,15 +149,57 @@ class GeneArtifact(_Artifact):
 # --------------------------------------------------------------------------
 
 
+TumorVerdict = Literal["supported", "not_supported", "insufficient"]
+
+
+@dataclass(frozen=True)
+class TumorContext:
+    """The tumor type a literature check must confirm."""
+
+    oncotree_code: str  # TCGA PanCancer cohort code from the manifest
+    name: str  # e.g. "Kidney Chromophobe"
+    tumor_type_query: str  # disease phrase, e.g. "chromophobe renal cell carcinoma"
+
+    @property
+    def terms(self) -> List[str]:
+        """Distinct names for the tumor type, most specific first."""
+        out: List[str] = []
+        for term in (self.tumor_type_query, self.name, self.oncotree_code):
+            term = (term or "").strip()
+            if term and term.lower() not in {t.lower() for t in out}:
+                out.append(term)
+        return out
+
+
+class PaperJudgement(BaseModel):
+    """One retrieved paper, judged for the specific tumor type."""
+
+    pmid: str
+    title: Optional[str] = None
+    # Tumor-type terms found in its title/abstract (deterministic match).
+    matched_terms: List[str] = Field(default_factory=list)
+    # Describes the gene's expression/role IN this tumor type.
+    tumor_specific: bool = False
+    reason: Optional[str] = None
+
+
 class LiteratureVerdict(BaseModel):
     literature_gate: str
     tumor_type_query: str
     supported: bool
     insufficient_evidence: bool
+    # Citations shown for the pair. For tumor-specific gates (v2+) these are
+    # ONLY the PMIDs judged to describe the gene in this tumor type.
     pmids: List[str] = Field(default_factory=list)
     rationale: Optional[str] = None
     evidence_support_score: Optional[float] = None
     evaluated_at: datetime
+    # ---- tumor-specific gates (acgc_tumor_specific_v2); None for v1 ----
+    verdict: Optional[TumorVerdict] = None
+    oncotree_code: Optional[str] = None
+    cancer_type_name: Optional[str] = None
+    retrieved_count: Optional[int] = None
+    papers: List[PaperJudgement] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -155,6 +236,7 @@ class PairResult(BaseModel):
 
 class GeneResult(BaseModel):
     hugo_symbol: str
+    broadly_expressed: Optional[bool] = None  # m3; None for m2 bundles
     release_id: str
     literature_gate: str
     computed_at: datetime
@@ -261,7 +343,12 @@ class PairStatsView(BaseModel):
     study_id: Optional[str] = None
     tumor_type_query: Optional[str] = None
     stats: CancerTypeStats
+    # The statistics call: stats_pass, minus pairs whose lineage enrichment
+    # was blocked by broad expression (m3).
     stats_pass: bool
+    # m3 display fields (None/False for m2 bundles).
+    enrichment: Optional[str] = None  # "Lineage enriched" / "Subgroup enriched"
+    broad_blocked: bool = False
     precheck: PrecheckState
     # Sent to the literature gate: stats_pass AND precheck is not "fail".
     literature_eligible: bool
@@ -280,6 +367,7 @@ class GeneStatsView(BaseModel):
     query: str
     hugo_symbol: str
     entrez_gene_id: Optional[int] = None
+    broadly_expressed: Optional[bool] = None  # m3; None for m2 bundles
     literature_gate: str
     bundle: BundleProvenance
     summary: GeneStatsSummary

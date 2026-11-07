@@ -1,4 +1,4 @@
-"""Module store (in-memory + real MySQL when available) and the ACGC pipeline gate."""
+"""Module stores (in-memory + real MySQL when available)."""
 
 from __future__ import annotations
 
@@ -17,12 +17,6 @@ from src.expression_context.bundle_store import (
     MySQLBundleStore,
 )
 
-from src.expression_context.literature_gate import (
-    AcgcPipelineGate,
-    LiteratureGate,
-    LiteratureGateError,
-    is_supported,
-)
 from src.expression_context.models import HistoryEntry, StoredPair
 from src.expression_context.store import (
     CREATE_TABLE_SQL,
@@ -33,10 +27,9 @@ from src.expression_context.store import (
     decode_cursor,
     encode_cursor,
 )
-from src.models.schema import AnnotationResult, GeneAnnotation
-from tests.expression_context_helpers import FakeLiteratureGate, gene_file
+from tests.expression_context_helpers import gene_file
 
-GATE = "acgc_pipeline_v1"
+GATE = "acgc_tumor_specific_v2"
 
 
 def _pair(symbol, code, release="r1", gate=GATE, minutes_ago=0, surfaced=False, evidence=None):
@@ -313,92 +306,6 @@ async def mysql_bundle_store():
 
 async def test_mysql_bundle_store_contract(mysql_bundle_store):
     await _exercise_bundle_store(mysql_bundle_store)
-
-
-# ------------------------------------------------------------- literature gate
-
-
-def test_supported_rule():
-    assert is_supported(False, ["1"])
-    assert not is_supported(True, ["1"])
-    assert not is_supported(False, [])
-
-
-def test_gates_satisfy_protocol():
-    assert isinstance(AcgcPipelineGate(lambda: None), LiteratureGate)
-    assert isinstance(FakeLiteratureGate(), LiteratureGate)
-    assert AcgcPipelineGate.name == GATE
-
-
-def _result(*annotations):
-    return AnnotationResult(
-        run_id="r", timestamp="t", fusions_processed=1, genes_annotated=len(annotations),
-        annotations=list(annotations),
-    )
-
-
-async def test_pipeline_gate_uses_pipeline_and_cache_with_tumor_type(monkeypatch):
-    from src.pipeline import orchestrator
-
-    run_store = object()
-    seen = {}
-
-    async def fake_run_pipeline(fusions, **kwargs):
-        seen["fusions"] = fusions
-        seen.update(kwargs)
-        return _result(GeneAnnotation(
-            gene="ERBB2", citations=["111", " ", "222"], insufficient_evidence=False,
-            cancer_association_rationale="amplified in breast cancer",
-            evidence_support_score=0.9,
-        ))
-
-    monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-    verdict = await AcgcPipelineGate(lambda: run_store).evaluate("ERBB2", "breast cancer")
-
-    assert seen["fusions"][0].fusion == "ERBB2"
-    assert seen["fusions"][0].tumor_type == "breast cancer"
-    # The app's run store is passed, so the gene_annotations cache is used.
-    assert seen["run_store"] is run_store
-    assert seen["mode"] == "full"
-    assert verdict.supported and verdict.pmids == ["111", "222"]
-    assert verdict.rationale == "amplified in breast cancer"
-    assert verdict.tumor_type_query == "breast cancer" and verdict.literature_gate == GATE
-
-
-@pytest.mark.parametrize(
-    "insufficient,citations,supported",
-    [(True, ["1"], False), (False, [], False), (False, ["1"], True)],
-)
-async def test_pipeline_gate_verdict_rule(monkeypatch, insufficient, citations, supported):
-    from src.pipeline import orchestrator
-
-    async def fake_run_pipeline(fusions, **kwargs):
-        return _result(GeneAnnotation(
-            gene="ERBB2", citations=citations, insufficient_evidence=insufficient,
-        ))
-
-    monkeypatch.setattr(orchestrator, "run_pipeline", fake_run_pipeline)
-    verdict = await AcgcPipelineGate(lambda: None).evaluate("ERBB2", "breast cancer")
-    assert verdict.supported is supported
-    assert verdict.insufficient_evidence is insufficient
-
-
-async def test_pipeline_gate_errors(monkeypatch):
-    from src.pipeline import orchestrator
-
-    async def boom(fusions, **kwargs):
-        raise RuntimeError("llm down")
-
-    monkeypatch.setattr(orchestrator, "run_pipeline", boom)
-    with pytest.raises(LiteratureGateError):
-        await AcgcPipelineGate(lambda: None).evaluate("ERBB2", "breast cancer")
-
-    async def empty(fusions, **kwargs):
-        return _result()
-
-    monkeypatch.setattr(orchestrator, "run_pipeline", empty)
-    with pytest.raises(LiteratureGateError):
-        await AcgcPipelineGate(lambda: None).evaluate("ERBB2", "breast cancer")
 
 
 @pytest.mark.parametrize(

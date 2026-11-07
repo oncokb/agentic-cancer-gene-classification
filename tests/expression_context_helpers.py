@@ -23,7 +23,8 @@ from src.expression_context import lease as lease_module
 from src.expression_context.bundle_store import BundleRecord, BundleState, InMemoryBundleStore
 from src.expression_context.catalog import StatsCatalog
 from src.expression_context.lease import VerdictLease
-from src.expression_context.models import JobRecord, LiteratureVerdict
+from src.expression_context.literature_gate import TUMOR_SPECIFIC_GATE
+from src.expression_context.models import JobRecord, LiteratureVerdict, PaperJudgement, TumorContext
 from src.expression_context.redis_client import ModuleRedis
 from src.expression_context.service import ExpressionContextService
 from src.expression_context.settings import ExpressionContextSettings
@@ -39,24 +40,29 @@ GITHUB_API = "https://api.github.com"
 LIST_URL = f"{GITHUB_API}/repos/{REPO}/releases?per_page=100"
 
 
-def load_fixture(name: str) -> dict:
-    return json.loads((FIXTURES / name).read_text())
+# Method-m3 fixture set (tests/fixtures/expression_context/m3/).
+M3 = "m3"
+M3_RELEASE_ID = "datahub-abc1234def56-m3-c0ffee123456"
 
 
-def manifest(**overrides) -> dict:
-    data = load_fixture("manifest.json")
+def load_fixture(name: str, subdir: str = "") -> dict:
+    return json.loads((FIXTURES / subdir / name).read_text())
+
+
+def manifest(subdir: str = "", **overrides) -> dict:
+    data = load_fixture("manifest.json", subdir)
     data.update(overrides)
     return data
 
 
-def gene_file(symbol: str = "ERBB2", **overrides) -> dict:
-    data = copy.deepcopy(load_fixture(f"genes/{symbol}.json"))
+def gene_file(symbol: str = "ERBB2", subdir: str = "", **overrides) -> dict:
+    data = copy.deepcopy(load_fixture(f"genes/{symbol}.json", subdir))
     data.update(overrides)
     return data
 
 
-def aliases() -> dict:
-    return load_fixture("aliases.json")
+def aliases(subdir: str = "") -> dict:
+    return load_fixture("aliases.json", subdir)
 
 
 def bundle_tag(release_id: str = RELEASE_ID, pubmed: date = PUBMED_DATE) -> str:
@@ -91,17 +97,18 @@ def build_bundle(
     manifest_overrides: Optional[Dict[str, Any]] = None,
     with_aliases: bool = True,
     gz_bytes: Optional[bytes] = None,
+    subdir: str = "",
 ) -> FixtureBundle:
     docs = []
     for symbol in genes:
-        doc = gene_file(symbol, release_id=release_id)
+        doc = gene_file(symbol, subdir, release_id=release_id)
         if edit_gene is not None:
             edit_gene(doc)
         docs.append(doc)
     jsonl = "".join(json.dumps(doc, separators=(",", ":")) + "\n" for doc in docs).encode()
     genes_gz = gz_bytes if gz_bytes is not None else gzip.compress(jsonl, mtime=0)
     tag = bundle_tag(release_id, pubmed)
-    data = manifest(release_id=release_id)
+    data = manifest(subdir, release_id=release_id)
     data.update(
         bundle_tag=tag,
         pubmed_snapshot_date=pubmed.isoformat(),
@@ -115,7 +122,7 @@ def build_bundle(
         manifest=data,
         genes=docs,
         genes_gz=genes_gz,
-        aliases=aliases() if with_aliases else None,
+        aliases=aliases(subdir) if with_aliases else None,
         published_at=published_at,
     )
 
@@ -273,9 +280,12 @@ def make_service(
 
 
 class FakeLiteratureGate:
-    """Records calls; returns a scripted verdict per tumor_type_query."""
+    """Records calls; returns a scripted tumor-specific (v2-shaped) verdict per
+    tumor_type_query: (insufficient, pmids) -> verdict "insufficient", or
+    "supported" citing ``pmids`` as the tumor-specific papers. The service
+    re-applies the surfacing rule, so "supported" with no PMIDs is excluded."""
 
-    name = "acgc_pipeline_v1"
+    name = TUMOR_SPECIFIC_GATE
 
     def __init__(self, verdicts: Optional[Dict[str, Tuple[bool, List[str]]]] = None) -> None:
         # tumor_type_query -> (insufficient_evidence, pmids)
@@ -285,23 +295,31 @@ class FakeLiteratureGate:
             "esophageal cancer": (False, []),
         }
         self.calls: List[Tuple[str, str]] = []
+        self.tumors: List[TumorContext] = []
         self.fail_for: set[str] = set()
 
-    async def evaluate(self, hugo_symbol: str, tumor_type_query: str) -> LiteratureVerdict:
-        self.calls.append((hugo_symbol, tumor_type_query))
-        if tumor_type_query in self.fail_for:
+    async def evaluate(self, hugo_symbol: str, tumor: TumorContext) -> LiteratureVerdict:
+        query = tumor.tumor_type_query
+        self.calls.append((hugo_symbol, query))
+        self.tumors.append(tumor)
+        if query in self.fail_for:
             raise RuntimeError("gate exploded")
-        insufficient, pmids = self.verdicts.get(tumor_type_query, (True, []))
+        insufficient, pmids = self.verdicts.get(query, (True, []))
         return LiteratureVerdict(
             literature_gate=self.name,
-            tumor_type_query=tumor_type_query,
+            tumor_type_query=query,
             # Deliberately claim supported: the service must recompute it.
             supported=True,
             insufficient_evidence=insufficient,
             pmids=pmids,
-            rationale=f"{hugo_symbol} in {tumor_type_query}",
+            rationale=f"{hugo_symbol} in {query}",
             evidence_support_score=0.8,
             evaluated_at=datetime.now(timezone.utc),
+            verdict="insufficient" if insufficient else "supported",
+            oncotree_code=tumor.oncotree_code,
+            cancer_type_name=tumor.name,
+            retrieved_count=len(pmids),
+            papers=[PaperJudgement(pmid=p, tumor_specific=not insufficient) for p in pmids],
         )
 
 

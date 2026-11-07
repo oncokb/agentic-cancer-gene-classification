@@ -45,12 +45,12 @@ class SlowGate(FakeLiteratureGate):
         self.active = 0
         self.max_active = 0
 
-    async def evaluate(self, hugo_symbol, tumor_type_query):
+    async def evaluate(self, hugo_symbol, tumor):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
             await asyncio.sleep(self.delay)
-            return await super().evaluate(hugo_symbol, tumor_type_query)
+            return await super().evaluate(hugo_symbol, tumor)
         finally:
             self.active -= 1
 
@@ -66,7 +66,7 @@ def _pod(gate, store, redis, *, concurrency=4, wait=5.0, lease_ttl=5.0):
 # ------------------------------------------------------------------ lease unit
 
 
-KEY = lease_key("ERBB2", "BRCA", RELEASE_ID, "acgc_pipeline_v1")
+KEY = lease_key("ERBB2", "BRCA", RELEASE_ID, "acgc_tumor_specific_v2")
 
 
 async def test_lease_claim_hold_release_renew():

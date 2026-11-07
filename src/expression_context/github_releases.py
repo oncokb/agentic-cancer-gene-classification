@@ -1,6 +1,6 @@
 """GitHub Releases client: discover statistics bundles and download their assets.
 
-Contract (expression_stats/docs/contract.md, "Release transport and atomicity"):
+Contract (expression_stats/docs/acgc-contract.md, "Release transport and atomicity"):
 bundles are non-draft, non-prerelease releases whose tag starts with
 ``expression-stats-``; the newest by ``published_at`` wins. Assets:
 ``manifest.json``, ``genes.jsonl.gz`` and (optionally) ``aliases.json``.
@@ -104,7 +104,9 @@ def rate_limit_retry_at(response: httpx.Response, now: Optional[datetime] = None
     reset = response.headers.get("x-ratelimit-reset")
     if reset:
         try:
-            return max(now, datetime.fromtimestamp(int(reset), tz=timezone.utc))
+            # Not clamped to this host's clock: callers clamp with their own
+            # clock (the refresher uses max(retry_at, its now)).
+            return datetime.fromtimestamp(int(reset), tz=timezone.utc)
         except (ValueError, OverflowError, OSError):
             pass
     return now + _DEFAULT_RATE_LIMIT_BACKOFF

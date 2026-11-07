@@ -1,8 +1,9 @@
 # Expression context (optional, removable module)
 
-Status: design v2 — 2026-11-06. Statistics are produced in this repository
+Status: design v2.1 — 2026-11-07. Statistics are produced in this repository
 (`expression_stats/`) and delivered as GitHub release bundles. Supports bundle
-`schema_version` "1", `method_version` "2".
+`schema_version` "1", `method_version` "2" and "3" (m3 adds optional fields).
+Literature gate `acgc_tumor_specific_v2`.
 
 ## Goal
 
@@ -80,18 +81,19 @@ ACGC must be able to drop this feature by deleting one package and two lines.
 
 ## Release bundle transport
 
-The bundle format is defined in **one place**:
-[`expression_stats/docs/contract.md`](../expression_stats/docs/contract.md)
-("Release bundle contract v1" and "Release transport and atomicity"). This
-document does not restate it; if anything here disagrees with that file, that
-file wins and this module should be updated.
+The bundle format, including the method-m3 fields, is defined in **one
+place**:
+[`expression_stats/docs/acgc-contract.md`](../expression_stats/docs/acgc-contract.md)
+(it lands with the producer PR #168). This document does not restate it; if
+anything here disagrees with that file, that file wins and this module should
+be updated.
 
 Supported by this module:
 
 | | Value |
 |---|---|
 | `schema_version` | `"1"` (any other value is rejected) |
-| `method_version` | `"2"` |
+| `method_version` | `"2"`, `"3"` (informational; m3 fields are optional, so m2 bundles still load) |
 
 How ACGC consumes it:
 
@@ -187,12 +189,22 @@ What ACGC relies on from the contract:
   `rest_p90_log2`, `log2fc`, `log2fc_vs_median_of_type_medians`,
   `cliffs_delta`, `auc`, `p_value`, `q_value`) and `pubmed_count` are displayed
   and stored, not re-gated.
+- **Method m3 (optional, additive):** gene-level `broadly_expressed`; per
+  cancer type `pass_mode` (`"lineage"` / `"subgroup"` / `null`),
+  `lineage_blocked_by_broad`, and the subgroup statistics
+  `subgroup_high_count`, `subgroup_high_fraction`,
+  `subgroup_high_fraction_ratio`, `p95_log2_diff`, `subgroup_q` (all nullable).
+  Absent in m2 bundles (treated as `null`/false). They are kept in the stored
+  gene document and the stats snapshot of each result row, so no table changes.
 - **Aliases:** `aliases.json` maps an alias to its canonical symbol; used only
   when the input is not itself a canonical symbol in the bundle.
 - **Nulls are tolerated:** every statistic and `pubmed_count` may be `null`
   (undefined, e.g. `n == 0`); nulls are stored and returned as `null`, never as
   zero, and sort last.
-- **Gating:** a pair goes to the literature gate iff `stats_pass` is true AND
+- **Gating:** a pair goes to the literature gate iff it passes the statistics
+  — `stats_pass` true, and not `lineage_blocked_by_broad` without a subgroup
+  pass (`pass_mode != "subgroup"`): such broad-blocked pairs are shown with a
+  "Broadly expressed" marker but never pass and are never sent on — AND
   `literature_precheck_pass` is not `false`. `null` (pre-check not run) is sent
   to the literature gate, which is authoritative; only an explicit `false`
   excludes, with reason `precheck`. `stats_pass` false excludes with reason
@@ -208,7 +220,8 @@ What ACGC relies on from the contract:
 - **Verdict reuse:** literature verdicts are stored and reused per
   `(hugo_symbol, oncotree_code, release_id, literature_gate)` — keyed on
   `release_id`, not `bundle_tag` — so a new `release_id` re-evaluates and a
-  PubMed refresh alone does not.
+  PubMed refresh alone does not. Bumping the gate version changes
+  `literature_gate`, so no verdict of the previous version is reused.
 
 ## ACGC API and page (when enabled)
 
@@ -230,17 +243,46 @@ What ACGC relies on from the contract:
 - `GET /v1/expression-context/genes?limit&cursor` → history of genes run.
 - `GET /expression-context` → the "Expression stats" page (signed-out browsers
   go through `/login`): enter a gene, see per-cancer-type statistics with the
-  pass/fail call, the PubMed pre-check (pass / fail / not run / expired),
-  flags (incl. tissue-of-origin), the literature verdict and
-  citations for passing pairs, the bundle/release provenance, and start the
+  pass/fail call, a "Lineage enriched" / "Subgroup enriched" label per
+  passing pair and the subgroup statistics (m3), a "Broadly expressed"
+  marker for the gene and for broad-blocked pairs, the PubMed pre-check
+  (pass / fail / not run / expired), flags (incl. tissue-of-origin), the
+  tumor-specific literature verdict with only the tumor-specific citations
+  for passing pairs, the bundle/release provenance, and start the
   literature check. Its files live in `src/expression_context/static/`; a
   "Expression stats" tab is added to the main page only while enabled.
 - All API routes are behind `require_auth`.
 
-Literature verdict (v1, `literature_gate = "acgc_pipeline_v1"`): run the
-existing pipeline with `tumor_type = tumor_type_query`; supported iff
-`insufficient_evidence` is false AND ≥1 cited PMID. Stored with PMIDs and
-rationale.
+### Literature verdict (`literature_gate = "acgc_tumor_specific_v2"`)
+
+The literature check must confirm the **specific** tumor type. (v1,
+`acgc_pipeline_v1`, ran the annotation pipeline and accepted "not
+insufficient AND ≥1 citation", which is gene-general: KLK3 was "supported" in
+kidney chromophobe purely on prostate-cancer papers.) v2 is a narrow judgement
+modelled on ACGC's fusion-partner evidence check:
+
+1. Retrieve with ACGC's public `retrieve_literature(gene,
+   tumor_type=tumor_type_query)` (its first stage is the tumor-type query with
+   ACGC's alias expansion).
+2. Deterministic guard: only papers whose title/abstract mention the tumor
+   type can count — ACGC's `requested_tumor_terms_in_record` alias matcher,
+   the literal disease phrase or manifest name, the cohort code as a whole
+   word, or (weaker, ranked after those) every distinctive word of the phrase
+   or name. If none do, the verdict is `insufficient` without an LLM call. At
+   most `EXPRESSION_CONTEXT_JUDGE_MAX_PAPERS` (12) papers go to the judge.
+3. One LLM call (ACGC's `complete_with_tool`, model
+   `EXPRESSION_CONTEXT_JUDGE_MODEL`, default ACGC's selection model) judges
+   each paper: does it describe the gene's expression or role **in this tumor
+   type** (code + name + names)? Papers about a different tumor type never
+   count. It returns an overall `supported | not_supported | insufficient`
+   and a short rationale.
+4. Judgements for PMIDs that were not sent are dropped (no hallucinated
+   PMIDs).
+
+A pair is surfaced only if the verdict is `supported` AND ≥1 PMID is judged
+tumor-specific; only those PMIDs are shown as citations. The rule is
+re-applied to every stored verdict. Each verdict is stored with the per-paper
+judgements, the tumor-specific PMIDs and the rationale.
 
 ## Tables
 
@@ -280,6 +322,7 @@ All created by the module, only when enabled; dropped on removal.
 | `EXPRESSION_CONTEXT_MAX_RELEASE_PAGES` | `5` | Release-list pages read per discovery (counts toward the API budget). |
 | `EXPRESSION_CONTEXT_BUNDLE_PRUNE_GRACE` | `PT1H` | How long a retired bundle stays readable before deletion. |
 | `EXPRESSION_CONTEXT_REDIS_URL` | ACGC's Redis | Redis for the module's leases. |
+| `EXPRESSION_CONTEXT_JUDGE_MODEL` | ACGC's `SELECTION_MODEL` | Model for the tumor-specific literature judgement. |
 
 Further tuning knobs (timeouts, size limits, batch size, lease timings, pool
 size) are documented in `src/expression_context/settings.py`.

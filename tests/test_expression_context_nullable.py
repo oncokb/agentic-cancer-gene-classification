@@ -104,7 +104,7 @@ def test_gating_semantics_with_nulls():
     stad = _by_code(result["surfaced"])["STAD"]["stats"]
     assert stad["p90_log2"] == 11.2 and stad["rest_p90_log2"] == 7.1
     assert stad["literature_precheck_pass"] is None
-    stored_row = harness.store.rows[("MYCN", "BRCA", RELEASE_ID, "acgc_pipeline_v1")]
+    stored_row = harness.store.rows[("MYCN", "BRCA", RELEASE_ID, "acgc_tumor_specific_v2")]
     assert stored_row.stats["q_value"] is None and stored_row.stats["p90_log2"] is None
 
     assert stored_view.status_code == 200
@@ -119,7 +119,7 @@ def test_surfaced_sorting_tolerates_null_q_values():
     rows = [
         StoredPair(
             hugo_symbol="MYCN", oncotree_code=code, release_id=RELEASE_ID,
-            literature_gate="acgc_pipeline_v1", surfaced=True,
+            literature_gate="acgc_tumor_specific_v2", surfaced=True,
             stats={**base, "oncotree_code": code, "q_value": q}, computed_at=now,
         )
         for code, q in (("STAD", None), ("LUAD", 1e-3), ("BRCA", 1e-9), ("GBM", None))
@@ -166,7 +166,7 @@ def test_fixtures_are_consistent_with_method_v2(symbol):
 
 
 RELEASE_ID_FORMAT = re.compile(r"datahub-[0-9a-f]{12}-m\d+-[0-9a-f]{12}\Z")
-BUNDLE_CONTRACT_LINK = "](../expression_stats/docs/contract.md)"
+BUNDLE_CONTRACT_LINK = "](../expression_stats/docs/acgc-contract.md)"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -188,15 +188,16 @@ def test_fixture_bundle_tag_format():
 
 
 def test_design_doc_defers_to_the_bundle_contract():
-    """The bundle contract lives in expression_stats/docs/contract.md only: the
+    """The bundle contract lives in expression_stats/docs/acgc-contract.md only: the
     design doc links it by relative path, states the supported versions and
     the consumer semantics, and carries no copy of its examples or method."""
-    from src.expression_context.models import SUPPORTED_METHOD_VERSION, SUPPORTED_SCHEMA_VERSION
+    from src.expression_context.models import SUPPORTED_METHOD_VERSIONS, SUPPORTED_SCHEMA_VERSION
 
     doc = (REPO_ROOT / "docs/expression-context.md").read_text()
     assert BUNDLE_CONTRACT_LINK in doc
     assert f'| `schema_version` | `"{SUPPORTED_SCHEMA_VERSION}"`' in doc
-    assert f'| `method_version` | `"{SUPPORTED_METHOD_VERSION}"` |' in doc
+    versions = ", ".join(f'`"{v}"`' for v in SUPPORTED_METHOD_VERSIONS)
+    assert f"| `method_version` | {versions} " in doc
     assert "## Consumer semantics" in doc and "## Release bundle transport" in doc
     assert "datahub-<12hex>-m<method>-<build_sha12>" in doc
     assert "expression-stats-<release_id>-pubmed-<YYYYMMDD>" in doc
@@ -211,11 +212,15 @@ def test_design_doc_defers_to_the_bundle_contract():
 
 
 def test_bundle_contract_names_the_fields_this_module_reads():
-    """Runs once the sibling PR lands expression_stats/docs/contract.md."""
-    contract = REPO_ROOT / "expression_stats/docs/contract.md"
+    """Runs once the producer PR lands expression_stats/docs/acgc-contract.md."""
+    contract = REPO_ROOT / "expression_stats/docs/acgc-contract.md"
     if not contract.exists():
-        pytest.skip("expression_stats/docs/contract.md lands with the producer PR")
+        pytest.skip("expression_stats/docs/acgc-contract.md lands with the producer PR")
     text = contract.read_text()
     for field in ("bundle_tag", "pubmed_snapshot_date", "gene_count", "sha256", "size_bytes",
-                  "genes.jsonl.gz", "aliases.json", "expression-stats-"):
+                  "genes.jsonl.gz", "aliases.json", "expression-stats-",
+                  # method m3 fields this module reads
+                  "broadly_expressed", "pass_mode", "lineage_blocked_by_broad",
+                  "subgroup_high_count", "subgroup_high_fraction",
+                  "subgroup_high_fraction_ratio", "p95_log2_diff", "subgroup_q"):
         assert field in text, field

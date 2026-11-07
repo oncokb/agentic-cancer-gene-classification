@@ -88,7 +88,7 @@ function stats(code, extra = {}) {
 
 function view(overrides = {}) {
   return {
-    query: "erbb2", hugo_symbol: "ERBB2", entrez_gene_id: 2064, literature_gate: "acgc_pipeline_v1",
+    query: "erbb2", hugo_symbol: "ERBB2", entrez_gene_id: 2064, literature_gate: "acgc_tumor_specific_v2",
     bundle: BUNDLE,
     summary: { surfaced: 1, literature_pending: 1, excluded: 2 },
     pairs: [
@@ -98,7 +98,7 @@ function view(overrides = {}) {
         precheck: "pass", literature_eligible: true, status: "surfaced", exclusion_reason: null,
         literature: {
           supported: true, insufficient_evidence: false, pmids: ["12345678", "javascript:alert(1)"],
-          rationale: "<b>amplified</b>", literature_gate: "acgc_pipeline_v1",
+          rationale: "<b>amplified</b>", literature_gate: "acgc_tumor_specific_v2",
           tumor_type_query: "breast cancer", evaluated_at: "2026-11-05T00:00:00Z",
         },
       },
@@ -210,6 +210,93 @@ test("an expired PubMed pre-check is labelled, not shown as a failure", async ()
   const prov = nodes["ec-provenance"].children.map((c) => c.text);
   const at = prov.indexOf("PubMed pre-check expires");
   assert.ok(at >= 0 && prov[at + 1] === "2026-10-01T00:00:00Z");
+});
+
+test("method m3: enrichment labels, broad markers and subgroup statistics", async () => {
+  const m3 = view({
+    query: "vim", hugo_symbol: "VIM", entrez_gene_id: 7431, broadly_expressed: true,
+    bundle: { ...BUNDLE, method_version: "3" },
+    summary: { surfaced: 1, literature_pending: 0, excluded: 2 },
+    pairs: [
+      {
+        oncotree_code: "BRCA", cancer_type_name: "Breast <i>Invasive</i> Carcinoma",
+        stats: stats("BRCA", {
+          pass_mode: "subgroup", lineage_blocked_by_broad: true, subgroup_high_count: 120,
+          subgroup_high_fraction: 0.11, subgroup_high_fraction_ratio: 3.2, p95_log2_diff: 1.6,
+          subgroup_q: 2e-8,
+        }),
+        stats_pass: true, enrichment: "Subgroup enriched", broad_blocked: false,
+        precheck: "pass", literature_eligible: true, status: "surfaced", exclusion_reason: null,
+        literature: {
+          supported: true, insufficient_evidence: false, pmids: ["11111111"], verdict: "supported",
+          cancer_type_name: "Breast Invasive Carcinoma", rationale: "VIM in breast cancer.",
+          papers: [{ pmid: "11111111", tumor_specific: true }],
+        },
+      },
+      {
+        oncotree_code: "SARC", cancer_type_name: "Sarcoma",
+        stats: stats("SARC", {
+          stats_pass: false, pass_mode: null, lineage_blocked_by_broad: true,
+          literature_precheck_pass: null, pubmed_count: null,
+          subgroup_high_count: 30, subgroup_high_fraction: 0.12, subgroup_high_fraction_ratio: 1.3,
+          p95_log2_diff: 0.4, subgroup_q: 0.2,
+        }),
+        stats_pass: false, enrichment: null, broad_blocked: true, precheck: "not_run",
+        literature_eligible: false, status: "excluded", exclusion_reason: "stats", literature: null,
+      },
+      {
+        oncotree_code: "PRAD", cancer_type_name: "Prostate Adenocarcinoma",
+        stats: stats("PRAD", { pass_mode: "lineage", lineage_blocked_by_broad: false }),
+        stats_pass: true, enrichment: "Lineage enriched", broad_blocked: false, precheck: "pass",
+        literature_eligible: true, status: "excluded", exclusion_reason: "literature",
+        literature: {
+          supported: false, insufficient_evidence: true, pmids: [], verdict: "insufficient",
+          rationale: "No paper reports VIM in prostate cancer.", papers: [],
+        },
+      },
+    ],
+  });
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/VIM": response(m3) });
+  await page.lookup("vim");
+  const title = nodes["ec-gene-title"];
+  assert.strictEqual(title.textContent, "VIM · Entrez 7431");
+  assert.strictEqual(title.text, "VIM · Entrez 7431Broadly expressed");
+  const rows = nodes["ec-tbody"].children;
+  const cells = (row) => row.children.map((c) => c.text);
+  const brca = cells(rows[0]);
+  assert.strictEqual(brca[0], "Breast <i>Invasive</i> Carcinoma (BRCA)", "names stay text");
+  assert.ok(brca[7].startsWith("PassSubgroup enriched"), brca[7]);
+  assert.ok(brca[7].includes("Subgroup: high n 120 (11.0%) · ratio 3.20× · p95 Δlog2 1.60 · q 2.0e-8"), brca[7]);
+  assert.ok(!brca[7].includes("Broadly expressed"), "a subgroup pass is not marked blocked");
+  assert.ok(brca[10].startsWith("Supported in Breast Invasive Carcinoma"), brca[10]);
+  assert.ok(brca[10].includes("Tumor-specific: PMID 11111111"), brca[10]);
+  const sarc = cells(rows[1]);
+  assert.ok(sarc[7].startsWith("FailBroadly expressed"), sarc[7]);
+  assert.strictEqual(sarc[10], "—", "never sent to the literature check");
+  assert.strictEqual(sarc[11], "Excluded: statistics");
+  const prad = cells(rows[2]);
+  assert.ok(prad[7].startsWith("PassLineage enriched"), prad[7]);
+  assert.ok(!prad[7].includes("Subgroup:"), "no subgroup line without subgroup stats");
+  assert.ok(prad[10].startsWith("Not supported insufficient evidence"), prad[10]);
+  assert.deepStrictEqual(rows[2].findAll((n) => n.tagName === "a"), []);
+});
+
+test("tumor-specific verdict without tumor-specific PMIDs explains why", async () => {
+  const v = view();
+  v.pairs[0] = {
+    ...v.pairs[0], status: "excluded", exclusion_reason: "literature",
+    literature: { supported: false, insufficient_evidence: false, pmids: [], verdict: "supported", papers: [] },
+  };
+  v.pairs[1] = {
+    ...v.pairs[1], status: "excluded", exclusion_reason: "literature",
+    literature: { supported: false, insufficient_evidence: false, pmids: [], verdict: "not_supported" },
+  };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  const rows = nodes["ec-tbody"].children.map((row) => row.children.map((c) => c.text));
+  assert.strictEqual(rows[0][10], "Not supported no tumor-specific PMIDs");
+  assert.strictEqual(rows[1][10], "Not supported evidence against this tumor type");
+  assert.strictEqual(nodes["ec-gene-title"].children.length, 0, "no gene marker for m2 bundles");
 });
 
 test("invalid input is rejected without a request", async () => {
