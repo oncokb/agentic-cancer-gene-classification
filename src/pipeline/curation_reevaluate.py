@@ -124,7 +124,7 @@ async def validated_records(pmids: list[str]) -> dict[str, LiteratureRecord]:
             if missing
             else set()
         )
-    except (literature.NCBIResponseError, ValueError) as exc:
+    except (literature.NCBIResponseError, literature.NCBIEmbeddedError, ValueError) as exc:
         raise NCBIUnavailable("NCBI returned no verifiable PMIDs; please retry.") from exc
     reasons: dict[str, list[str]] = {"unknown": [], "retracted": [], "no_abstract": []}
     for pmid in pmids:
