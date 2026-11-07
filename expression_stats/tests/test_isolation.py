@@ -1,6 +1,7 @@
 """Enforce both import boundaries without importing either application."""
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,9 @@ def test_pipeline_and_application_imports_are_isolated():
     app_names = {"src"} | {
         path.stem
         for path in (repo / "src").iterdir()
-        if not path.name.startswith("_") and (path.is_dir() or path.suffix == ".py")
+        if not path.name.startswith("_")
+        and path.stem not in sys.stdlib_module_names
+        and (path.is_dir() or path.suffix == ".py")
     }
     for root, forbidden in [
         (pipeline, app_names),
@@ -87,6 +90,7 @@ def test_root_guard_survives_producer_removal_and_rejects_imports(tmp_path):
     [
         ("from .stats import x", True),
         ("import src", False),
+        ("import json", True),
         ("import stats", False),
         ("from stats import x", False),
     ],
@@ -103,6 +107,7 @@ def test_pipeline_guard_distinguishes_relative_and_app_imports(
     source = tmp_path / "src"
     source.mkdir()
     (source / "stats.py").write_text("x = 1\n")
+    (source / "json.py").write_text("# app name must not shadow the stdlib guard\n")
     monkeypatch.setitem(globals(), "__file__", str(pipeline / "tests/test_isolation.py"))
     if allowed:
         test_pipeline_and_application_imports_are_isolated()

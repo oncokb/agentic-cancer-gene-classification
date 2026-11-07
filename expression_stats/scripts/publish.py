@@ -3,11 +3,19 @@
 import argparse
 import json
 import os
+import runpy
 import subprocess
 import tempfile
 from pathlib import Path
 
 from bundle import sha256
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PANEL_PATH = PROJECT_ROOT / "controls.yaml"
+# This helper is stdlib-only; the publisher installs no stats dependencies.
+expected_counts = runpy.run_path(str(PROJECT_ROOT / "gene_expression_relevance/controls.py"))[
+    "expected_counts"
+]
 
 
 def gh(*args):
@@ -19,21 +27,24 @@ def publish(directory):
     manifest = json.loads((directory / "manifest.json").read_text())
     if manifest["build"] != {"genes": None, "skip_precheck": False}:
         raise ValueError("Only full builds with PubMed precheck can be published")
-    if "precheck_expires_at" not in manifest["source"]:
+    if "precheck_expires_at" not in manifest["source"] or manifest["source"].get(
+        "precheck_incomplete"
+    ):
         raise ValueError("Missing completed PubMed precheck")
     report_path = directory / "controls-report.json"
     report = json.loads(report_path.read_text())
     controls = manifest.get("controls", {})
-    panel_hash = sha256(Path(__file__).resolve().parents[1] / "controls.yaml")
+    panel_hash = sha256(PANEL_PATH)
+    positive_total, negative_total = expected_counts(json.loads(PANEL_PATH.read_text()))
     if (
         controls.get("status") != "passed"
         or report.get("status") != "passed"
         or controls.get("controls_sha256") != panel_hash
         or report.get("controls_sha256") != panel_hash
-        or report.get("positive_passed") != 35
-        or report.get("positive_total") != 35
+        or report.get("positive_passed") != positive_total
+        or report.get("positive_total") != positive_total
         or report.get("negative_passed") != 0
-        or report.get("negative_total") != 27
+        or report.get("negative_total") != negative_total
         or report.get("missing") != 0
         or report.get("failures") != []
     ):

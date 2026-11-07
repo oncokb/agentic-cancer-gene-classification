@@ -33,6 +33,14 @@ mean full build. PubMed defaults to ~3 requests/s with or without an API key.
 Configure `EXPRESSION_STATS_PUBMED_REQUESTS_PER_SECOND` (at most 3 unkeyed or
 10 keyed) only after accounting for shared ACGC production usage; set
 `NCBI_API_KEY` for keyed access. Workflow prechecks require this secret.
+Operational defaults live in `runtime-settings.json` outside the hashed method
+parameters; the manifest records the effective rate in `source`. Changing the
+rate does not change release IDs. Cache expiry is staggered over 15–30 days.
+A 300-minute precheck budget (also capped 315 minutes from build start) fails
+cleanly as incomplete, saves successful counts and preserves prior output.
+Set `EXPRESSION_STATS_PRECHECK_TIME_BUDGET_SECONDS` to lower the phase budget.
+Rerun to resume from cache; inspect `<out>-incomplete/precheck-report.json`.
+Skipped prechecks neither join the PubMed queue nor restore/save its cache.
 `--skip-precheck` and subsets are review-only. No page or web server is needed.
 Downloads and PubMed counts persist in `.cache/`; failed builds stage output
 without replacing completed artifacts. Generated files are ignored.

@@ -1,5 +1,8 @@
 # Method 3 validation — 2026-11-07
 
+These scientific/build measurements are from `63dae68`. Current operational
+follow-up gates are in [runtime-followup-validation.md](runtime-followup-validation.md).
+
 Implements the **recommended branch-aware hybrid**, not the alternative
 curator/strict-median rule. Inputs were read-only from
 `/Users/foriskuang/Projects/agcg-control-eval`: `methods/followup_report.md`,

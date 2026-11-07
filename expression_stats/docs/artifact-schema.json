@@ -71,9 +71,6 @@
           },
           "subgroup_fdr": {
             "type": "number"
-          },
-          "precheck_requests_per_second": {
-            "type": "number"
           }
         },
         "required": [
@@ -95,8 +92,7 @@
           "subgroup_min_fraction_ratio",
           "subgroup_p95_percentile",
           "subgroup_p95_log2_diff",
-          "subgroup_fdr",
-          "precheck_requests_per_second"
+          "subgroup_fdr"
         ]
       },
       "source": {

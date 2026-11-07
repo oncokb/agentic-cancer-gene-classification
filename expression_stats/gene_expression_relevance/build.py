@@ -17,7 +17,7 @@ from .controls import require_passed
 from .fetch import digest, fetch_all
 from .genes import gene_catalog, hgnc, hgnc_path
 from .mapping import cancer_mapping
-from .precheck import Precheck
+from .precheck import Precheck, PrecheckBudgetExceeded
 from .provenance import (
     build_fingerprint,
     code_fingerprint,
@@ -111,6 +111,12 @@ def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     precheck = Precheck(cache)
+    # Throughput/budgets are operational metadata, never hashed method params.
+    manifest["source"].update(
+        precheck_requests_per_second=precheck.requests_per_second,
+        precheck_time_budget_seconds=precheck.time_budget_seconds,
+        build_time_budget_seconds=precheck.build_time_budget_seconds,
+    )
     codes = [item["oncotree_code"] for item in mapping]
     passed = {}
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".build-") as temporary:
@@ -189,19 +195,43 @@ def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
                         record["literature_precheck_pass"] = count >= PARAMS["precheck_min_pmids"]
                 write_json(path, artifact)
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            pool = None
+            try:
+                precheck.start_budget(build_deadline=started + precheck.build_time_budget_seconds)
+                pool = ThreadPoolExecutor(max_workers=8)
                 for _ in pool.map(check_gene, sorted((staging / "v1" / "genes").glob("*.json"))):
                     pass
+                precheck.remaining()
+            except PrecheckBudgetExceeded as exc:
+                precheck.stop()
+                manifest["source"]["precheck_incomplete"] = True
+                incomplete = out.with_name(out.name + "-incomplete")
+                write_json(incomplete / "manifest.json", manifest)
+                write_json(incomplete / "controls-report.json", report)
+                write_json(
+                    incomplete / "precheck-report.json",
+                    dict(
+                        status="incomplete",
+                        reason=str(exc),
+                        cache=str(precheck.path),
+                    ),
+                )
+                raise
+            finally:
+                if pool is not None:
+                    pool.shutdown(wait=True, cancel_futures=True)
+                # Counts commit individually; flush once more before Actions caches them.
+                precheck.db.commit()
         if not skip_precheck:
-            timestamps = [
-                precheck.cache[f"{symbol}|{code}"]["fetched_at"]
+            expiries = [
+                precheck.expires_at(
+                    f"{symbol}|{code}", precheck.cache[f"{symbol}|{code}"]["fetched_at"]
+                )
                 for symbol, types in passed.items()
                 for code in types
                 if f"{symbol}|{code}" in precheck.cache
             ]
-            expires = (
-                min(timestamps, default=now.timestamp()) + PARAMS["precheck_cache_ttl_days"] * 86400
-            )
+            expires = min(expiries, default=now.timestamp() + precheck.ttl_seconds)
             manifest["source"]["precheck_expires_at"] = datetime.fromtimestamp(
                 expires, UTC
             ).isoformat()

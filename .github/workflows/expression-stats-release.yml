@@ -21,9 +21,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    # All builds share one NCBI key, including branch dispatches.
+    # Skipped prechecks use a per-run group and cannot evict a pending PubMed build.
     concurrency:
-      group: expression-stats-pubmed
+      group: ${{ inputs.skip_precheck && format('expression-stats-review-{0}', github.run_id) || 'expression-stats-pubmed' }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -74,7 +74,7 @@ jobs:
           path: expression_stats/.cache/hgnc
           key: expression-hgnc-${{ steps.check.outputs.hgnc_sha }}
       - uses: actions/cache/restore@v4
-        if: steps.check.outputs.changed == 'true'
+        if: steps.check.outputs.changed == 'true' && inputs.skip_precheck != true
         with:
           path: expression_stats/.cache/pubmed.sqlite3*
           key: expression-pubmed-${{ github.run_id }}-${{ github.run_attempt }}
@@ -95,7 +95,7 @@ jobs:
           python -m gene_expression_relevance build "${args[@]}"
           python scripts/bundle.py artifacts bundle
       - uses: actions/cache/save@v4
-        if: always() && steps.check.outputs.changed == 'true' && hashFiles('expression_stats/.cache/pubmed.sqlite3') != ''
+        if: always() && steps.check.outputs.changed == 'true' && inputs.skip_precheck != true && hashFiles('expression_stats/.cache/pubmed.sqlite3') != ''
         with:
           path: expression_stats/.cache/pubmed.sqlite3*
           key: expression-pubmed-${{ github.run_id }}-${{ github.run_attempt }}
@@ -109,6 +109,11 @@ jobs:
         with:
           name: expression-stats-failed-controls
           path: expression_stats/artifacts-failed
+      - uses: actions/upload-artifact@v4
+        if: failure() && hashFiles('expression_stats/artifacts-incomplete/precheck-report.json') != ''
+        with:
+          name: expression-stats-incomplete-precheck
+          path: expression_stats/artifacts-incomplete
   publish:
     needs: build
     if: github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true' && needs.build.outputs.deployable == 'true'

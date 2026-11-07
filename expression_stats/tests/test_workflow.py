@@ -62,10 +62,9 @@ def test_release_workflow_limits_write_token_to_main_publisher():
     build, publish = jobs.split("  publish:\n", 1)
     assert "contents: read" in header and "contents: write" not in header + build
     assert "github.event_name" in header and "github.ref" in header
-    assert (
-        "concurrency:\n      group: expression-stats-pubmed\n      cancel-in-progress: false"
-        in build
-    )
+    assert "inputs.skip_precheck && format('expression-stats-review-{0}', github.run_id)" in build
+    assert "|| 'expression-stats-pubmed'" in build
+    assert "cancel-in-progress: false" in build
     assert "contents: write" in publish
     assert "github.ref == 'refs/heads/main'" in publish
     assert "group: expression-stats-publish" in publish
@@ -102,3 +101,12 @@ def test_branch_dispatch_always_builds_review_artifact(tmp_path, monkeypatch):
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert values["changed"] == "true"
     assert values["deployable"] == "false"
+
+
+def test_skipped_prechecks_cannot_restore_or_overwrite_pubmed_cache():
+    workflow = Path("../.github/workflows/expression-stats-release.yml").read_text()
+    for action in ("actions/cache/restore@v4", "actions/cache/save@v4"):
+        step = workflow.split("      - uses: " + action + "\n")[1].split("      - ")[0]
+        assert "inputs.skip_precheck != true" in step
+    saved = workflow.split("      - uses: actions/cache/save@v4\n")[1].split("      - ")[0]
+    assert "always()" in saved  # A budget failure still saves committed counts.

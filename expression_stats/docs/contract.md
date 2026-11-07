@@ -153,6 +153,10 @@ JSON, with original source SHA-256, PMIDs, class and expected outcomes. It
 contains 25 lineage positives, 10 subgroup positives, 24 negatives and three
 regression negatives. ERBB2/ESCA is reported but excluded from scoring.
 The panel is included in the code fingerprint so changing it changes identity.
+Control IDs and (gene, tcga) pairs must both be unique; evaluation and publication
+reject duplicates. Publisher positive/negative totals are derived from this panel,
+not hard-coded, while requiring all positives pass, zero negative passes and
+zero missing scored pairs.
 
 Every build writes `v1/controls-report.json`. Full builds must pass all 35
 positives and pass none of the 27 negatives; missing scored genes/types fail
@@ -168,13 +172,34 @@ panel, 35/35 positives and 0/27 negatives, in addition to full precheck coverage
 
 PubMed runs only for final stats-passing pairs, using
 `"GENE"[tiab] AND (<tumor_type_query>)`. Precheck passes for count>=1. Cached
-counts expire after 30 days and invalidate when queries change. The default
+counts invalidate when queries change. Expiry is deterministically spread by
+SHA-256 of (gene, type): `fetched_at + max_ttl * (1 - 0.5 * hash_fraction)`,
+giving 15–30 days for the 30-day maximum TTL. Existing fetched timestamps are
+reused; no count ever lives longer than the maximum. The default
 rate is **3 requests/s even with an API key**, reserving capacity for ACGC.
 Configure `EXPRESSION_STATS_PUBMED_REQUESTS_PER_SECOND` (or the Python client
 `requests_per_second` argument); it must be finite and >0, capped at 3 without
-a key or 10 with a key. Retries share the same limiter. The manifest parameter
-records the default operational rate; a runtime override does not change the
-statistical method. Workflow prechecks still require NCBI_API_KEY.
+a key or 10 with a key. Retries share the same limiter. The effective rate is recorded as the unhashed
+`source.precheck_requests_per_second`, never in method `params`.
+`runtime-settings.json` stores operational defaults outside the source fingerprint;
+changing its rate or the environment override leaves `release_id` unchanged.
+Workflow prechecks still require NCBI_API_KEY.
+
+The precheck has a default 300-minute phase budget, configurable with
+`EXPRESSION_STATS_PRECHECK_TIME_BUDGET_SECONDS` or `runtime-settings.json`.
+It is also capped at 315 minutes from builder start, leaving at least 15 minutes
+before the workflow's 330-minute step timeout for thread shutdown and cache
+saving. `source.precheck_time_budget_seconds` and `source.build_time_budget_seconds`
+record these unhashed settings. Socket timeouts, retries, rate-limiter waits and
+`Retry-After` sleeps respect the remaining budget. Pending tasks are cancelled;
+in-flight workers stop at the deadline. Successful counts commit individually.
+Budget exhaustion raises an error, preserves prior complete output and writes
+`<out>-incomplete/{manifest.json,controls-report.json,precheck-report.json}`.
+Its manifest marks `source.precheck_incomplete=true` and has no completed
+`precheck_expires_at`; publication refuses it. The always-run PubMed cache save
+still runs, and the workflow uploads the incomplete report for review. Re-run
+the workflow to reuse committed counts; statistics are rebuilt, but successful
+queries are not repeated while fresh. No partial gene bundle is published.
 
 ## Release bundle contract v1 (expression_stats/ → ACGC)
 
@@ -210,7 +235,6 @@ is maintained separately (PR #167). No shared Python imports are permitted.
     "subgroup_p95_percentile": 95,
     "subgroup_p95_log2_diff": 1.5,
     "subgroup_fdr": 0.025,
-    "precheck_requests_per_second": 3.0,
     "precheck_min_pmids": 1,
     "precheck_cache_ttl_days": 30,
     "detection_log2": 3.4594316186372973
@@ -218,6 +242,9 @@ is maintained separately (PR #167). No shared Python imports are permitted.
   "source": {
     "datahub_commit": "<sha>",
     "generated_at": "<iso8601>",
+    "precheck_requests_per_second": 3.0,
+    "precheck_time_budget_seconds": 18000,
+    "build_time_budget_seconds": 18900,
     "hgnc_sha256": "<sha256>",
     "code_sha256": "<sha256>",
     "overrides_sha256": "<sha256>",
@@ -315,6 +342,7 @@ The code fingerprint hashes package source, override JSONs, pin,
 `pyproject.toml`, `constraints.txt`, and the resolved numpy/scipy/pandas versions.
 Build and CI dependencies use the committed exact constraints. CI installs
 dependencies before computing that fingerprint and deciding early exit.
+Operational `runtime-settings.json` is excluded from this fingerprint.
 The HGNC URL points to a dated quarterly archive snapshot, with SHA-256 verified
 before use. Early exit checks these fingerprints, parameters and options as
 well as datahub commit/method. Before early-exiting a matching release, the
@@ -371,11 +399,13 @@ Consumers must ignore unknown fields and reject unknown `schema_version`.
   build review artifacts, even when a matching published build is fresh.
 - Workflow concurrency is keyed by event name and ref, so queued manual runs
   cannot replace pending cron runs. Same-event/ref pending runs may coalesce
-  under GitHub's concurrency policy. All build jobs additionally share the
+  under GitHub's concurrency policy. Builds with prechecks share the
   `expression-stats-pubmed` concurrency group with `cancel-in-progress: false`,
   so cron and manual builds (including branch dispatches) cannot simultaneously
   use the shared NCBI_API_KEY. This serializes the entire build, including cache
-  restore/save and review-only builds. GitHub retains at most one pending job
+  restore/save for prechecked builds. Skipped prechecks instead use a unique
+  per-run group, cannot displace a pending cron precheck, and never restore/save
+  the PubMed cache (so they cannot shadow newer resumable counts). GitHub retains at most one pending job
   per shared group; a newer pending job can replace an older one, while running
   jobs are never cancelled. The event/ref workflow groups remain separate so
   manual runs cannot replace pending cron runs at the workflow queue level.

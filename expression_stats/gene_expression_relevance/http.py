@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-def request(url, *, data=None, headers=None, before=None, attempts=4):
+def request(url, *, data=None, headers=None, before=None, attempts=4, remaining=None):
     for attempt in range(attempts):
         if before:
             before()
@@ -19,7 +19,7 @@ def request(url, *, data=None, headers=None, before=None, attempts=4):
                     data=data,
                     headers={"User-Agent": "gene-expression-relevance/0.1", **(headers or {})},
                 ),
-                timeout=120,
+                timeout=min(120, remaining()) if remaining else 120,
             )
         except (HTTPError, URLError, TimeoutError) as exc:
             if isinstance(exc, HTTPError) and exc.code not in (408, 429, 500, 502, 503, 504):
@@ -32,7 +32,9 @@ def request(url, *, data=None, headers=None, before=None, attempts=4):
                     delay = max(delay, float(exc.headers.get("Retry-After", 0)))
                 except ValueError:
                     pass
-            time.sleep(delay)
+            time.sleep(min(delay, remaining()) if remaining else delay)
+            if remaining:
+                remaining()
 
 
 def get_json(url, **kwargs):

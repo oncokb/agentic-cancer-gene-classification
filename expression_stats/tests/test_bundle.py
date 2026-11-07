@@ -186,3 +186,70 @@ def test_publisher_rejects_unpassed_controls_before_any_github_call(bundled, mon
     monkeypatch.setattr(publisher, "gh", lambda *args: pytest.fail("Must not contact GitHub"))
     with pytest.raises(ValueError, match="controls report"):
         publisher.publish(directory)
+
+
+@pytest.mark.parametrize("invalid", [None, "positive", "negative", "missing", "total"])
+def test_publisher_derives_required_counts_from_panel(bundled, monkeypatch, tmp_path, invalid):
+    module, _, directory, manifest, _ = bundled
+    monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
+    publisher = load("publish")
+    panel = tmp_path / "panel.yaml"
+    panel.write_text(
+        json.dumps(
+            {
+                "controls": [
+                    dict(id="p1", gene="A", tcga="T", expected=True),
+                    dict(id="p2", gene="B", tcga="T", expected=True),
+                    dict(id="n1", gene="C", tcga="T", expected=False),
+                    dict(id="borderline", gene="D", tcga="T", expected=None),
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(publisher, "PANEL_PATH", panel)
+    report = dict(
+        status="passed",
+        controls_sha256=module.sha256(panel),
+        positive_passed=2,
+        positive_total=2,
+        negative_passed=0,
+        negative_total=1,
+        missing=0,
+        failures=[],
+    )
+    if invalid is not None:
+        key = {
+            "positive": "positive_passed",
+            "negative": "negative_passed",
+            "missing": "missing",
+            "total": "negative_total",
+        }[invalid]
+        report[key] += 1
+    manifest["controls"] = report
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    (directory / "controls-report.json").write_text(json.dumps(report))
+    calls = []
+
+    def gh(*args):
+        calls.append(args)
+        return json.dumps([[dict(tag_name=manifest["bundle_tag"], draft=False)]])
+
+    monkeypatch.setattr(publisher, "gh", gh)
+    if invalid:
+        with pytest.raises(ValueError, match="controls report"):
+            publisher.publish(directory)
+        assert calls == []
+    else:
+        publisher.publish(directory)
+        assert len(calls) == 1  # A valid differently sized panel reaches published-tag discovery.
+
+
+def test_incomplete_precheck_cannot_publish_even_with_expiry(bundled, monkeypatch):
+    _, _, directory, manifest, _ = bundled
+    manifest["source"]["precheck_incomplete"] = True
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
+    publisher = load("publish")
+    monkeypatch.setattr(publisher, "gh", lambda *args: pytest.fail("Must not contact GitHub"))
+    with pytest.raises(ValueError, match="completed PubMed"):
+        publisher.publish(directory)

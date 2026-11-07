@@ -378,7 +378,7 @@ def test_ttl_refresh_changes_precheck_false_to_true_without_new_release(tmp_path
     calls = []
     counts = iter([0, 3])
 
-    def get(url, before):
+    def get(url, before, **kwargs):
         before()
         calls.append(url)
         return {"esearchresult": {"count": str(next(counts))}}
@@ -400,3 +400,102 @@ def test_ttl_refresh_changes_precheck_false_to_true_without_new_release(tmp_path
     assert before["source"]["precheck_expires_at"] != after["source"]["precheck_expires_at"]
     assert after_gene["cancer_types"][0]["pubmed_count"] == 3
     assert after_gene["cancer_types"][0]["literature_precheck_pass"] is True
+
+
+@pytest.mark.parametrize("configuration", ["environment", "runtime_file"])
+def test_pubmed_rate_changes_manifest_but_not_release_id(tmp_path, monkeypatch, configuration):
+    from gene_expression_relevance import precheck
+
+    # Exercise the actual builder and its computed code/build fingerprints.
+    test_build_contract_and_precheck_gating(tmp_path, monkeypatch, False, None)
+    before = builder.build("a" * 40, tmp_path / "site", tmp_path / "cache")
+    if configuration == "environment":
+        monkeypatch.setenv("EXPRESSION_STATS_PUBMED_REQUESTS_PER_SECOND", "1")
+    else:
+        settings = json.loads(precheck.RUNTIME_SETTINGS_PATH.read_text())
+        settings["precheck_requests_per_second"] = 1
+        path = tmp_path / "runtime-settings.json"
+        path.write_text(json.dumps(settings))
+        monkeypatch.setattr(precheck, "RUNTIME_SETTINGS_PATH", path)
+    after = builder.build("a" * 40, tmp_path / "site", tmp_path / "cache")
+    assert before["source"]["precheck_requests_per_second"] == 3
+    assert after["source"]["precheck_requests_per_second"] == 1
+    assert "precheck_requests_per_second" not in after["params"]
+    assert before["source"]["code_sha256"] == after["source"]["code_sha256"]
+    assert before["release_id"] == after["release_id"]
+
+
+def test_budget_exhaustion_preserves_output_and_marks_incomplete(tmp_path, monkeypatch):
+    from gene_expression_relevance.precheck import PrecheckBudgetExceeded
+
+    previous = tmp_path / "site"
+    previous.mkdir()
+    marker = previous / "previous-success"
+    marker.write_text("keep")
+
+    def exhausted(*args, **kwargs):
+        raise PrecheckBudgetExceeded("test budget exhausted")
+
+    monkeypatch.setattr(builder.Precheck, "start_budget", exhausted)
+    with pytest.raises(PrecheckBudgetExceeded):
+        test_build_contract_and_precheck_gating(tmp_path, monkeypatch, False, None)
+    assert marker.read_text() == "keep"
+    incomplete = tmp_path / "site-incomplete"
+    manifest = json.loads((incomplete / "manifest.json").read_text())
+    assert manifest["source"]["precheck_incomplete"] is True
+    assert "precheck_expires_at" not in manifest["source"]
+    assert json.loads((incomplete / "precheck-report.json").read_text())["status"] == "incomplete"
+    assert (tmp_path / "cache/pubmed.sqlite3").exists()
+
+
+def test_budget_expiry_after_request_saves_count_and_next_build_resumes(tmp_path, monkeypatch):
+    import sqlite3
+
+    from gene_expression_relevance import precheck
+
+    clock, requests = [0.0], []
+    snapshot = tmp_path / "hgnc"
+    snapshot.write_text("fixture")
+    codes = ["LIHC"] + [f"T{i}" for i in range(31)]
+    monkeypatch.setattr(builder, "fetch_all", lambda *args: {})
+    monkeypatch.setattr(
+        builder,
+        "cancer_mapping",
+        lambda *args: [
+            dict(study_id=c, oncotree_code=c, name=c, tumor_type_query=c) for c in codes
+        ],
+    )
+    monkeypatch.setattr(builder, "hgnc", lambda *args: ({}, {}))
+    monkeypatch.setattr(builder, "hgnc_path", lambda *args: snapshot)
+    monkeypatch.setattr(builder, "gene_catalog", lambda *args: {213: "ALB"})
+    monkeypatch.setattr(
+        builder,
+        "matrix",
+        lambda *args: (np.array([[31] * 10 + [0] * 310]), np.repeat(codes, 10), [213]),
+    )
+    monkeypatch.setattr(
+        builder,
+        "Precheck",
+        lambda cache: precheck.Precheck(
+            cache, clock=lambda: clock[0], wall_clock=lambda: 1000, time_budget_seconds=1
+        ),
+    )
+
+    def get(url, before, **kwargs):
+        before()
+        requests.append(url)
+        clock[0] += 2  # successful response reaches the budget boundary
+        return {"esearchresult": {"count": "7"}}
+
+    monkeypatch.setattr(precheck.http, "get_json", get)
+    out, cache = tmp_path / "out", tmp_path / "cache"
+    with pytest.raises(precheck.PrecheckBudgetExceeded):
+        builder.build("a" * 40, out, cache)
+    assert not out.exists()
+    assert (tmp_path / "out-incomplete/precheck-report.json").exists()
+    with sqlite3.connect(cache / "pubmed.sqlite3") as db:
+        assert db.execute("SELECT count FROM counts").fetchall() == [(7,)]
+    result = builder.build("a" * 40, out, cache)
+    assert len(requests) == 1  # the resumed build uses the committed count
+    assert "precheck_expires_at" in result["source"]
+    assert "precheck_incomplete" not in result["source"]

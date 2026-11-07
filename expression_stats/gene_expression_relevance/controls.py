@@ -11,9 +11,24 @@ def panel_sha256():
     return hashlib.sha256(PANEL_PATH.read_bytes()).hexdigest()
 
 
+def expected_counts(panel):
+    ids, pairs = set(), set()
+    for row in panel["controls"]:
+        pair = (row["gene"], row["tcga"])
+        if row["id"] in ids or pair in pairs:
+            raise ValueError(f"Duplicate control id or (gene, tcga): {row['id']} {pair}")
+        ids.add(row["id"])
+        pairs.add(pair)
+    return (
+        sum(row["expected"] is True for row in panel["controls"]),
+        sum(row["expected"] is False for row in panel["controls"]),
+    )
+
+
 def evaluate(genes_dir, *, subset=False, panel=None):
     """Missing scored pairs fail closed, including missing negative controls."""
     panel = json.loads(PANEL_PATH.read_text()) if panel is None else panel
+    expected_counts(panel)
     rows, failures = [], []
     for control in panel["controls"]:
         path = Path(genes_dir) / f"{control['gene']}.json"

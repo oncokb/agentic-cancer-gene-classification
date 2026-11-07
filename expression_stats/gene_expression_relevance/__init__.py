@@ -18,7 +18,6 @@ PARAMS = dict(
     subgroup_p95_percentile=95,
     subgroup_p95_log2_diff=1.5,
     subgroup_fdr=0.025,
-    precheck_requests_per_second=3.0,
     precheck_min_pmids=1,
     precheck_cache_ttl_days=30,
 )

@@ -69,3 +69,16 @@ def test_failed_build_retains_report_and_never_runs_pubmed(tmp_path, monkeypatch
         test_build_contract_and_precheck_gating(tmp_path, monkeypatch, False, None)
     assert json.loads((tmp_path / "site-failed/controls-report.json").read_text()) == report
     assert not (tmp_path / "site").exists()
+
+
+@pytest.mark.parametrize("duplicate", ["id", "pair"])
+def test_duplicate_controls_are_rejected_even_for_subsets(tmp_path, duplicate):
+    first = dict(id="first", gene="ALB", tcga="LIHC", expected=True)
+    second = dict(first)
+    if duplicate == "id":
+        second.update(gene="ERBB2", tcga="BRCA")
+    else:
+        second["id"] = "second"
+    for subset in (False, True):
+        with pytest.raises(ValueError, match="Duplicate control"):
+            controls.evaluate(tmp_path, subset=subset, panel={"controls": [first, second]})
