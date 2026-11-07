@@ -166,7 +166,7 @@ def test_fixtures_are_consistent_with_method_v2(symbol):
 
 
 RELEASE_ID_FORMAT = re.compile(r"datahub-[0-9a-f]{12}-m\d+-[0-9a-f]{12}\Z")
-BUNDLE_CONTRACT_LINK = "](../expression_stats/docs/acgc-contract.md)"
+BUNDLE_CONTRACT_LINK = "](../expression_stats/docs/contract.md)"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -188,7 +188,7 @@ def test_fixture_bundle_tag_format():
 
 
 def test_design_doc_defers_to_the_bundle_contract():
-    """The bundle contract lives in expression_stats/docs/acgc-contract.md only: the
+    """The bundle contract lives in expression_stats/docs/contract.md only: the
     design doc links it by relative path, states the supported versions and
     the consumer semantics, and carries no copy of its examples or method."""
     from src.expression_context.models import SUPPORTED_METHOD_VERSIONS, SUPPORTED_SCHEMA_VERSION
@@ -212,10 +212,10 @@ def test_design_doc_defers_to_the_bundle_contract():
 
 
 def test_bundle_contract_names_the_fields_this_module_reads():
-    """Runs once the producer PR lands expression_stats/docs/acgc-contract.md."""
-    contract = REPO_ROOT / "expression_stats/docs/acgc-contract.md"
+    """Runs once the producer PR lands expression_stats/docs/contract.md."""
+    contract = REPO_ROOT / "expression_stats/docs/contract.md"
     if not contract.exists():
-        pytest.skip("expression_stats/docs/acgc-contract.md lands with the producer PR")
+        pytest.skip("expression_stats/docs/contract.md lands with the producer PR")
     text = contract.read_text()
     for field in ("bundle_tag", "pubmed_snapshot_date", "gene_count", "sha256", "size_bytes",
                   "genes.jsonl.gz", "aliases.json", "expression-stats-",

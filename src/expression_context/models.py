@@ -1,6 +1,6 @@
 """Pydantic models: the release-bundle contract (input) and the API (output).
 
-Contract: expression_stats/docs/acgc-contract.md (bundle schema_version 1;
+Contract: expression_stats/docs/contract.md (bundle schema_version 1;
 statistical method m2, plus the additive method-m3 fields).
 Artifact models ignore unknown fields (pydantic's default), as the contract
 requires; ``schema_version`` is checked by the bundle loader before parsing.
@@ -29,7 +29,7 @@ JobState = Literal["queued", "running", "succeeded", "failed"]
 
 # --------------------------------------------------------------------------
 # Release bundle contract, schema_version 1 (authoritative:
-# expression_stats/docs/acgc-contract.md)
+# expression_stats/docs/contract.md)
 # --------------------------------------------------------------------------
 
 

@@ -83,7 +83,7 @@ ACGC must be able to drop this feature by deleting one package and two lines.
 
 The bundle format, including the method-m3 fields, is defined in **one
 place**:
-[`expression_stats/docs/acgc-contract.md`](../expression_stats/docs/acgc-contract.md)
+[`expression_stats/docs/contract.md`](../expression_stats/docs/contract.md)
 (it lands with the producer PR #168). This document does not restate it; if
 anything here disagrees with that file, that file wins and this module should
 be updated.

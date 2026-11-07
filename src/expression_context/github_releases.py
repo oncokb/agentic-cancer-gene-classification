@@ -1,6 +1,6 @@
 """GitHub Releases client: discover statistics bundles and download their assets.
 
-Contract (expression_stats/docs/acgc-contract.md, "Release transport and atomicity"):
+Contract (expression_stats/docs/contract.md, "Release transport and atomicity"):
 bundles are non-draft, non-prerelease releases whose tag starts with
 ``expression-stats-``; the newest by ``published_at`` wins. Assets:
 ``manifest.json``, ``genes.jsonl.gz`` and (optionally) ``aliases.json``.
