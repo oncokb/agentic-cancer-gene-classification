@@ -116,16 +116,62 @@ def test_gating_semantics_with_nulls():
 def test_surfaced_sorting_tolerates_null_q_values():
     base = gene_file("MYCN")["cancer_types"][1]
     now = datetime.now(timezone.utc)
+    evidence = {
+        "literature_gate": "acgc_tumor_specific_v2", "tumor_type_query": "breast cancer",
+        "supported": True, "insufficient_evidence": False, "pmids": ["1"],
+        "verdict": "supported", "papers": [{"pmid": "1", "tumor_specific": True}],
+        "evaluated_at": now.isoformat(),
+    }
     rows = [
         StoredPair(
             hugo_symbol="MYCN", oncotree_code=code, release_id=RELEASE_ID,
             literature_gate="acgc_tumor_specific_v2", surfaced=True,
-            stats={**base, "oncotree_code": code, "q_value": q}, computed_at=now,
+            stats={**base, "oncotree_code": code, "q_value": q}, evidence=evidence,
+            computed_at=now,
         )
         for code, q in (("STAD", None), ("LUAD", 1e-3), ("BRCA", 1e-9), ("GBM", None))
     ]
     result = ExpressionContextService._gene_result("MYCN", rows, include_excluded=True)
     assert [p.oncotree_code for p in result.surfaced] == ["BRCA", "LUAD", "GBM", "STAD"]
+
+
+def test_stored_row_without_evidence_is_never_surfaced():
+    base = gene_file("MYCN")["cancer_types"][1]
+    now = datetime.now(timezone.utc)
+    rows = [
+        StoredPair(
+            hugo_symbol="MYCN", oncotree_code=code, release_id=RELEASE_ID,
+            literature_gate="acgc_tumor_specific_v2", surfaced=True,
+            stats={**base, "oncotree_code": code}, computed_at=now,
+        )
+        for code in ("STAD", "LUAD")
+    ]
+    result = ExpressionContextService._gene_result("MYCN", rows, include_excluded=True)
+    assert result.surfaced == []
+    assert {p.oncotree_code for p in result.excluded} == {"STAD", "LUAD"}
+    assert all(p.exclusion_reason == "literature" for p in result.excluded)
+    assert all(p.literature is None for p in result.excluded)
+
+
+def test_stored_verdict_from_another_gate_is_never_surfaced():
+    base = gene_file("MYCN")["cancer_types"][1]
+    now = datetime.now(timezone.utc)
+    evidence = {
+        "literature_gate": "acgc_pipeline_v1", "tumor_type_query": "breast cancer",
+        "supported": True, "insufficient_evidence": False, "pmids": ["1"],
+        "verdict": "supported", "papers": [{"pmid": "1", "tumor_specific": True}],
+        "evaluated_at": now.isoformat(),
+    }
+    row = StoredPair(
+        hugo_symbol="MYCN", oncotree_code="STAD", release_id=RELEASE_ID,
+        literature_gate="acgc_tumor_specific_v2", surfaced=True,
+        stats={**base, "oncotree_code": "STAD"}, evidence=evidence, computed_at=now,
+    )
+    result = ExpressionContextService._gene_result("MYCN", [row], include_excluded=True)
+    assert result.surfaced == []
+    assert result.excluded[0].exclusion_reason == "literature"
+    assert result.excluded[0].literature is not None
+    assert result.excluded[0].literature.supported is False
 
 
 FLOOR = math.log2(11)  # method_version 2: RSEM 10

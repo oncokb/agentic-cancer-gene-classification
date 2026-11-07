@@ -268,14 +268,15 @@ modelled on ACGC's fusion-partner evidence check:
    ACGC's alias expansion).
 2. Deterministic guard: only papers whose title/abstract mention the tumor
    type can count — ACGC's `requested_tumor_terms_in_record` alias matcher,
-   the literal disease phrase or manifest name, the cohort code as a whole
-   word, the module's curated names for all 32 TCGA cohorts
-   (`tumor_aliases.py`: OncoTree/TCGA codes such as COAD/READ, common
-   abbreviations such as ccRCC, HCC, CRC, PDAC, and histology names; phrases
-   case-insensitive, abbreviations case-sensitive whole words), or (weaker,
-   ranked after those) every distinctive word of the phrase or name. If none
-   do, the verdict is `insufficient` without an LLM call and is stored with
-   `decided_by: "guard"` and a "[Guard only, no judgement]" rationale. At
+   the literal disease phrase or manifest name, the unambiguous cohort code as
+   a whole word (codes that are also a gene symbol or an ordinary word, such
+   as BRCA and READ, are excluded here), the module's curated names for all 32
+   TCGA cohorts (`tumor_aliases.py`: OncoTree/TCGA codes such as COAD/READ,
+   common abbreviations such as ccRCC, HCC, CRC, PDAC, and histology names;
+   phrases case-insensitive, abbreviations case-sensitive whole words), or
+   (weaker, ranked after those) every distinctive word of the phrase or name.
+   If none do, the verdict is `insufficient` without an LLM call and is stored
+   with `decided_by: "guard"` and a "[Guard only, no judgement]" rationale. At
    most `EXPRESSION_CONTEXT_JUDGE_MAX_PAPERS` (12) papers go to the judge.
 3. One LLM call (ACGC's `complete_with_tool`, model
    `EXPRESSION_CONTEXT_JUDGE_MODEL`, default ACGC's selection model) judges
@@ -287,11 +288,13 @@ modelled on ACGC's fusion-partner evidence check:
    escaped) inside `<papers>` tags, and the instructions say paper text is
    untrusted data that must never be followed or speak for another paper.
 4. The tool output is validated: a missing or malformed verdict, papers list,
-   per-paper `pmid` or boolean `tumor_specific`, or a sent paper left
-   unjudged raises an error, so the pair is retried later and nothing is
-   stored (the LLM client returns `{}` when the model made no tool call).
-   Judgements for PMIDs that were not sent are dropped (no hallucinated
-   PMIDs).
+   per-paper `pmid` or boolean `tumor_specific` raises an error, so the pair
+   is retried later and nothing is stored (the LLM client returns `{}` when
+   the model made no tool call). Judgements for PMIDs that were not sent are
+   dropped (no hallucinated PMIDs). If the answer leaves some sent papers
+   unjudged, one bounded recovery call re-judges only those papers; if any
+   are still unjudged after it, the pair fails closed (error, nothing stored).
+   There is never more than one recovery call per pair.
 
 A pair is surfaced only if the verdict is `supported` AND ≥1 PMID is judged
 tumor-specific; only those PMIDs are shown as citations. The rule is

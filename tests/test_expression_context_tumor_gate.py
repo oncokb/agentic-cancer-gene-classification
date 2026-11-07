@@ -371,6 +371,76 @@ async def test_malformed_judgement_is_retried_not_stored():
     assert errors == [] and evaluated == 2 and reused == 0
 
 
+async def test_partial_judgement_recovers_with_one_bounded_retry():
+    calls = []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        # First answer omits one paper; the recovery call asks only for it.
+        judged = sent if len(calls) > 1 else [p for p in sent if p != "30000010"]
+        return {
+            "papers": [{"pmid": p, "tumor_specific": p == "30000020"} for p in judged],
+            "verdict": "supported", "rationale": "KLK3 in KICH.",
+        }
+
+    verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert len(calls) == 2
+    assert set(calls[0]) == {"30000020", "30000010"} and calls[1] == ["30000010"]
+    assert {p.pmid for p in verdict.papers} == {"30000020", "30000010"}
+    assert verdict.verdict == "supported" and verdict.pmids == ["30000020"]
+    recovered = next(p for p in verdict.papers if p.pmid == "30000010")
+    assert recovered.tumor_specific is False
+
+
+async def test_recovery_that_still_misses_fails_closed():
+    calls = []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [{"pmid": p, "tumor_specific": True} for p in sent[:-1]],
+                "verdict": "supported", "rationale": "r",
+            }
+        return {"papers": [], "verdict": "insufficient", "rationale": "r"}
+
+    with pytest.raises(LiteratureGateError, match="after one recovery attempt"):
+        await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert len(calls) == 2
+
+
+async def test_failed_recovery_is_never_stored():
+    calls = []
+    attempts = {}
+
+    async def retrieve(gene, query):
+        return [KICH_PAPER] if "chromophobe" in query else PROSTATE_PAPERS[:2]
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        key = "KICH" if "chromophobe" in kwargs["user"] else "PRAD"
+        attempts[key] = attempts.get(key, 0) + 1
+        if attempts[key] == 1:
+            return {
+                "papers": [{"pmid": p, "tumor_specific": True} for p in sent[:-1]],
+                "verdict": "supported", "rationale": "r",
+            }
+        return {"papers": [], "verdict": "insufficient", "rationale": "r"}
+
+    service = await _klk3_service(TumorSpecificGate(retrieve=retrieve, judge=judge, model="m"))
+    _, evaluated, _, errors = await service.evaluate(await service.resolve("KLK3"), None)
+    assert evaluated == 0 and sorted(e.oncotree_code for e in errors) == ["KICH", "PRAD"]
+    assert len(calls) == 4  # two pairs, at most two judge calls each
+    assert not [
+        key for key, row in service.store.rows.items()
+        if key[3] == TUMOR_SPECIFIC_GATE and key[1] in ("KICH", "PRAD")
+        and row.evidence is not None
+    ]
+
+
 # ------------------------------------------------------- prompt / errors
 
 
@@ -641,6 +711,18 @@ def test_phrases_ignore_case_and_hyphenation():
 
     assert "clear cell renal cell carcinoma" in cohort_terms_in_text(
         "KIRC", "Clear-cell Renal-Cell Carcinoma cohorts")
+
+
+def test_ambiguous_cohort_code_alone_is_not_the_tumor_type():
+    """BRCA is also the BRCA1/2 gene family: a bare "BRCA" mention must not
+    reach the judge as a breast-cancer paper (the curated names still do)."""
+    brca = TumorContext(oncotree_code="BRCA", name="Breast Invasive Carcinoma",
+                        tumor_type_query="breast cancer")
+    g = TumorSpecificGate()
+    gene_only = rec("50000002", "BRCA mutation carriers", "BRCA variants and cancer risk.")
+    assert g._matched_terms(gene_only, brca) == (0, [])
+    real = rec("50000003", "Breast cancer risk", "Breast cancer in BRCA carriers.")
+    assert g._matched_terms(real, brca)[0] == 2
 
 
 # ------------------------------------------------ prompt injection

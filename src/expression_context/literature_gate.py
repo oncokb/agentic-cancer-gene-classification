@@ -38,7 +38,11 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Sequence, runtime_checkable
 
 from src.expression_context.models import LiteratureVerdict, PaperJudgement, TumorContext
-from src.expression_context.tumor_aliases import cohort_names, cohort_terms_in_text
+from src.expression_context.tumor_aliases import (
+    AMBIGUOUS_COHORT_CODES,
+    cohort_names,
+    cohort_terms_in_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -228,10 +232,10 @@ class TumorSpecificGate:
         """(strength, terms): tumor-type terms in the record's title/abstract.
 
         Strength 2: ACGC's alias matcher, the literal disease phrase or name,
-        or the cohort code as a whole upper-case word. Strength 1: every
-        distinctive word of the phrase or the name (recall for wordings the
-        alias table lacks, e.g. "chromophobe kidney tumours"). 0: no mention,
-        so the paper can't count for this tumor type.
+        or an unambiguous cohort code as a whole upper-case word. Strength 1:
+        every distinctive word of the phrase or the name (recall for wordings
+        the alias table lacks, e.g. "chromophobe kidney tumours"). 0: no
+        mention, so the paper can't count for this tumor type.
         """
         strong: List[str] = []
         for phrase in (tumor.tumor_type_query, tumor.name):
@@ -247,7 +251,14 @@ class TumorSpecificGate:
             if phrase and phrase.lower() in lowered:
                 strong.append(phrase)
         code = (tumor.oncotree_code or "").strip()
-        if len(code) >= 3 and _word(code).search(text):
+        # Ambiguous codes (BRCA = the BRCA1/2 genes, READ = an ordinary word)
+        # are never accepted from the bare code alone; their real names come
+        # from the curated table below.
+        if (
+            len(code) >= 3
+            and code.upper() not in AMBIGUOUS_COHORT_CODES
+            and _word(code).search(text)
+        ):
             strong.append(code)
         # Curated cohort names: OncoTree/TCGA codes, common abbreviations
         # (ccRCC, HCC, CRC, ...) and histology names.
@@ -293,19 +304,10 @@ class TumorSpecificGate:
                 decided_by="guard",
             )
 
-        try:
-            result = await self._judge(
-                model=self._model or _default_model(),
-                system=JUDGE_SYSTEM_PROMPT,
-                user=self._prompt(hugo_symbol, tumor, candidates, matched),
-                tool=JUDGE_TOOL,
-                max_tokens=2048,
-                model_purpose=JUDGE_MODEL_PURPOSE,
-            )
-        except Exception as exc:
-            raise LiteratureGateError(f"tumor-specific judgement failed: {type(exc).__name__}") from exc
         sent = {str(record.pmid).strip(): record for record in candidates}
-        verdict, judged, rationale = self._parse_judgement(result, sent, hugo_symbol, tumor)
+        verdict, judged, rationale = await self._judge_with_recovery(
+            hugo_symbol, tumor, candidates, sent, matched
+        )
 
         papers: List[PaperJudgement] = []
         for pmid, record in sent.items():
@@ -325,14 +327,78 @@ class TumorSpecificGate:
             )
         return self._verdict(tumor, verdict, papers, len(seen), rationale, decided_by="judge")
 
-    @staticmethod
-    def _parse_judgement(
-        result: Any, sent: Dict[str, Any], hugo_symbol: str, tumor: TumorContext
+    async def _judge_with_recovery(
+        self,
+        hugo_symbol: str,
+        tumor: TumorContext,
+        candidates: List[Any],
+        sent: Dict[str, Any],
+        matched: Dict[str, List[str]],
     ) -> tuple[str, Dict[str, Dict[str, Any]], Optional[str]]:
+        """Judge the candidates, retrying at most once for papers the model
+        left unjudged.
+
+        A partial answer used to raise, and the identical retry of the whole
+        batch would produce the same partial answer, so the pair could never
+        resolve. The single recovery call asks only for the missing papers; if
+        the answer is still incomplete or malformed we fail closed.
+        """
+        result = await self._call_judge(hugo_symbol, tumor, candidates, matched)
+        verdict, judged, rationale, missing = self._collect_judgement(
+            result, sent, hugo_symbol, tumor
+        )
+        if not missing:
+            return verdict, judged, rationale
+
+        logger.warning(
+            "Tumor-specific judge for %s/%s left %d of %d papers unjudged; retrying them",
+            hugo_symbol, tumor.oncotree_code, len(missing), len(sent),
+        )
+        retry_records = [sent[pmid] for pmid in missing]
+        retry = await self._call_judge(hugo_symbol, tumor, retry_records, matched)
+        _verdict, retried, _rationale, _missing = self._collect_judgement(
+            retry, sent, hugo_symbol, tumor
+        )
+        for pmid, entry in retried.items():
+            judged.setdefault(pmid, entry)
+        still_missing = [pmid for pmid in sent if pmid not in judged]
+        if still_missing:
+            raise LiteratureGateError(
+                f"tumor-specific judgement is missing {len(still_missing)} of {len(sent)} "
+                "papers after one recovery attempt"
+            )
+        return verdict, judged, rationale
+
+    async def _call_judge(
+        self,
+        hugo_symbol: str,
+        tumor: TumorContext,
+        records: List[Any],
+        matched: Dict[str, List[str]],
+    ) -> Any:
+        try:
+            return await self._judge(
+                model=self._model or _default_model(),
+                system=JUDGE_SYSTEM_PROMPT,
+                user=self._prompt(hugo_symbol, tumor, records, matched),
+                tool=JUDGE_TOOL,
+                max_tokens=2048,
+                model_purpose=JUDGE_MODEL_PURPOSE,
+            )
+        except Exception as exc:
+            raise LiteratureGateError(
+                f"tumor-specific judgement failed: {type(exc).__name__}"
+            ) from exc
+
+    @staticmethod
+    def _collect_judgement(
+        result: Any, sent: Dict[str, Any], hugo_symbol: str, tumor: TumorContext
+    ) -> tuple[str, Dict[str, Dict[str, Any]], Optional[str], List[str]]:
         """Validate the tool input. Missing or malformed required fields raise
         LiteratureGateError, so the pair is retried later and nothing is stored
         (the public LLM client returns {} when the model made no tool call).
-        Judgements for PMIDs that were never sent are dropped."""
+        Judgements for PMIDs that were never sent are dropped; the returned
+        ``missing`` list lets the caller make one bounded recovery call."""
         if not isinstance(result, dict) or not result:
             raise LiteratureGateError("tumor-specific judgement returned no tool input")
         verdict = result.get("verdict")
@@ -367,11 +433,7 @@ class TumorSpecificGate:
                 hugo_symbol, tumor.oncotree_code, dropped[:10],
             )
         missing = [pmid for pmid in sent if pmid not in judged]
-        if missing:
-            raise LiteratureGateError(
-                f"tumor-specific judgement is missing {len(missing)} of {len(sent)} papers"
-            )
-        return verdict, judged, _clip(rationale, 1000)
+        return verdict, judged, _clip(rationale, 1000), missing
 
     def _verdict(
         self,

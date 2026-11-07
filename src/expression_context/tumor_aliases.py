@@ -35,6 +35,12 @@ def _c(phrases: Tuple[str, ...], abbreviations: Tuple[str, ...]) -> CohortNames:
 
 NSCLC_PHRASES = ("non-small cell lung cancer", "non-small cell lung carcinoma")
 
+# Cohort codes that are also a gene symbol or an ordinary word. A bare
+# occurrence ("BRCA mutation", "READ the sequence") is not evidence of the
+# tumor type, so the guard must not accept them from its direct code check;
+# the curated phrases/abbreviations above are authoritative instead.
+AMBIGUOUS_COHORT_CODES = frozenset({"BRCA", "READ"})
+
 COHORT_NAMES: Dict[str, CohortNames] = {
     "ACC": _c(("adrenocortical carcinoma", "adrenocortical cancer", "adrenal cortical carcinoma",
                "adrenal cortical cancer"), ("ACC",)),

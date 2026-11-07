@@ -627,14 +627,17 @@ def _verdict_row(make_row, stats: CancerTypeStats, verdict: LiteratureVerdict) -
 
 def _pair_result(row: StoredPair) -> PairResult:
     verdict = LiteratureVerdict.model_validate(row.evidence) if row.evidence else None
-    surfaced, reason = row.surfaced, row.exclusion_reason
+    # Fail closed: a row is only surfaced when its stored evidence is a valid
+    # verdict from the row's own gate that satisfies the surfacing rule. A
+    # row without evidence (or with evidence from another gate) is never
+    # served as surfaced, even if the stored boolean says otherwise.
+    surfaced = False
     if verdict is not None:
-        # Re-apply the surfacing rule to stored evidence too, so a row written
-        # by an older gate (or forged) can't be served as supported without a
-        # tumor-specific per-paper judgement.
-        surfaced = verdict_supported(verdict)
+        surfaced = (
+            verdict.literature_gate == row.literature_gate and verdict_supported(verdict)
+        )
         verdict = verdict.model_copy(update={"supported": surfaced})
-        reason = None if surfaced else (row.exclusion_reason or "literature")
+    reason = None if surfaced else (row.exclusion_reason or "literature")
     return PairResult(
         oncotree_code=row.oncotree_code,
         cancer_type_name=row.stats.get("cancer_type_name"),
