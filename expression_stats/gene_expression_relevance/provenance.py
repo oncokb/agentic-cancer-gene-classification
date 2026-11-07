@@ -22,7 +22,9 @@ def fingerprint(paths):
 
 def code_fingerprint():
     paths = [p for p in ROOT.iterdir() if p.suffix in {".py", ".json", ".html"}]
-    paths.extend(PROJECT_ROOT / name for name in ("pyproject.toml", "constraints.txt"))
+    paths.extend(
+        PROJECT_ROOT / name for name in ("pyproject.toml", "constraints.txt", "controls.yaml")
+    )
     versions = {name: version(name) for name in ("numpy", "scipy", "pandas")}
     payload = dict(files_sha256=fingerprint(paths), resolved_versions=versions)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

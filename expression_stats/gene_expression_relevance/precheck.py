@@ -1,5 +1,6 @@
 """Thread-safe, globally rate-limited PubMed counts persisted across builds."""
 
+import math
 import os
 import sqlite3
 import threading
@@ -14,6 +15,7 @@ class Precheck:
         self,
         cache,
         api_key=None,
+        requests_per_second=None,
         clock=time.monotonic,
         sleep=time.sleep,
         wall_clock=time.time,
@@ -39,7 +41,18 @@ class Precheck:
             )
         }
         self.api_key = os.environ.get("NCBI_API_KEY", "") if api_key is None else api_key
-        self.interval = 1 / (10 if self.api_key else 3) + 0.001
+        rate = float(
+            requests_per_second
+            if requests_per_second is not None
+            else os.environ.get(
+                "EXPRESSION_STATS_PUBMED_REQUESTS_PER_SECOND",
+                PARAMS["precheck_requests_per_second"],
+            )
+        )
+        limit = 10 if self.api_key else 3
+        if not math.isfinite(rate) or not 0 < rate <= limit:
+            raise ValueError(f"PubMed requests_per_second must be >0 and <= {limit}")
+        self.interval = 1 / rate + 0.001
         self.clock, self.sleep, self.last = clock, sleep, None
 
     def throttle(self):

@@ -19,10 +19,23 @@ def bundled(tmp_path):
     source = tmp_path / "artifacts" / "v1"
     (source / "genes").mkdir(parents=True)
     manifest = dict(
-        release_id="datahub-aaaaaaaaaaaa-m2-bbbbbbbbbbbb",
+        release_id="datahub-aaaaaaaaaaaa-m3-bbbbbbbbbbbb",
         source=dict(generated_at="2026-11-06T12:00:00+00:00", precheck_expires_at="later"),
         build=dict(genes=None, skip_precheck=False),
     )
+    control_hash = module.sha256(Path("controls.yaml"))
+    report = dict(
+        status="passed",
+        controls_sha256=control_hash,
+        positive_passed=35,
+        positive_total=35,
+        negative_passed=0,
+        negative_total=27,
+        missing=0,
+        failures=[],
+    )
+    manifest["controls"] = report.copy()
+    (source / "controls-report.json").write_text(json.dumps(report))
     (source / "manifest.json").write_text(json.dumps(manifest))
     (source / "aliases.json").write_text('{"P53":"TP53"}\n')
     gene = dict(release_id=manifest["release_id"], gene={"hugo_symbol": "TP53"})
@@ -158,3 +171,18 @@ def test_discovery_paginates_filters_and_uses_published_at(monkeypatch):
     monkeypatch.setattr(checker.subprocess, "check_output", output)
     assert checker.published_manifest() == {"release_id": "same-inputs"}
     assert calls[1][-1].endswith("/assets/2")
+
+
+@pytest.mark.parametrize("status", ["failed", "skipped_subset", "missing"])
+def test_publisher_rejects_unpassed_controls_before_any_github_call(bundled, monkeypatch, status):
+    _, _, directory, manifest, _ = bundled
+    monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
+    publisher = load("publish")
+    if status == "missing":
+        manifest.pop("controls")
+    else:
+        manifest["controls"]["status"] = status
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(publisher, "gh", lambda *args: pytest.fail("Must not contact GitHub"))
+    with pytest.raises(ValueError, match="controls report"):
+        publisher.publish(directory)

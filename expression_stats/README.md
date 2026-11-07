@@ -1,9 +1,13 @@
 # TCGA expression statistics
 
-Isolated port of `gene-expression-relevance` at `a7c7cc6`, method v2. The
-statistical implementation, exact dependency constraints, HGNC checksum pin,
-and date-free release identity semantics are preserved. Relocation, removal
-of the search page, and transport code change the code fingerprint normally.
+Isolated TCGA producer ported from `gene-expression-relevance` at `a7c7cc6`,
+now method m3: the original lineage arm is blocked for broadly expressed genes,
+and a pooled-P99 subgroup arm rescues supported tails. Dependency constraints,
+HGNC checksum, sample selection, and date-free identity semantics remain.
+Full builds require 35/35 curated positives and 0/27 negative passes; a failed
+control gate stops before PubMed and writes `<out>-failed/controls-report.json`.
+Each successful bundle includes `controls-report.json`. Subsets skip the gate
+and are review-only. The panel in `controls.yaml` uses JSON-compatible YAML.
 
 The single authoritative producer/consumer contract is [docs/contract.md](docs/contract.md).
 Weekly/manual builds publish verified GitHub release bundles for the reader
@@ -25,8 +29,10 @@ python scripts/bundle.py artifacts bundle
 ```
 
 Omit `--genes` for a full build; blank, whitespace and comma-only lists also
-mean full build. Local builds support unkeyed PubMed access below 3 requests/s;
-set `NCBI_API_KEY` for keyed access. Workflow prechecks require this secret.
+mean full build. PubMed defaults to ~3 requests/s with or without an API key.
+Configure `EXPRESSION_STATS_PUBMED_REQUESTS_PER_SECOND` (at most 3 unkeyed or
+10 keyed) only after accounting for shared ACGC production usage; set
+`NCBI_API_KEY` for keyed access. Workflow prechecks require this secret.
 `--skip-precheck` and subsets are review-only. No page or web server is needed.
 Downloads and PubMed counts persist in `.cache/`; failed builds stage output
 without replacing completed artifacts. Generated files are ignored.

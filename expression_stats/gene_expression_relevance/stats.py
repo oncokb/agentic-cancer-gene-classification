@@ -5,7 +5,7 @@ import warnings
 
 import numpy as np
 from scipy.special import ndtr
-from scipy.stats import rankdata
+from scipy.stats import hypergeom, rankdata
 
 from . import PARAMS
 
@@ -92,8 +92,23 @@ def compute(linear, labels, codes, params=PARAMS):
         )
     }
     medians = np.full(shape, np.nan)
+    detection = np.zeros(shape)
+    for key in (
+        "subgroup_high_count",
+        "subgroup_high_fraction",
+        "subgroup_high_fraction_ratio",
+        "p95_log2_diff",
+        "subgroup_p",
+    ):
+        result[key] = np.full(shape, np.nan)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
+        threshold = np.maximum(
+            np.nanpercentile(x, params["subgroup_percentile"], axis=1),
+            params["expression_floor_log2"],
+        )
+        high = x > threshold[:, None]
+        high_total = high.sum(axis=1)
         for j, code in enumerate(codes):
             group = labels == code
             if np.any(group):
@@ -113,7 +128,28 @@ def compute(linear, labels, codes, params=PARAMS):
             rest_median = (
                 np.nanmedian(x[:, ~group], axis=1) if np.any(~group) else np.full(len(x), np.nan)
             )
+            k = high[:, group].sum(axis=1)
+            k_rest = high_total - k
+            detection[:, j] = (x[:, group] >= params["expression_floor_log2"]).sum(axis=1) / n
+            p95 = (
+                np.nanpercentile(x[:, group], params["subgroup_p95_percentile"], axis=1)
+                if np.any(group)
+                else np.full(len(x), np.nan)
+            )
+            rest_p95 = (
+                np.nanpercentile(x[:, ~group], params["subgroup_p95_percentile"], axis=1)
+                if np.any(~group)
+                else np.full(len(x), np.nan)
+            )
             values = dict(
+                subgroup_high_count=np.where(n > 0, k, np.nan),
+                subgroup_high_fraction=k / n,
+                subgroup_high_fraction_ratio=np.where(
+                    rest > 0, (k / n) / (np.maximum(k_rest, 1) / rest), np.nan
+                ),
+                p95_log2_diff=np.maximum(p95, params["expression_floor_log2"])
+                - np.maximum(rest_p95, params["expression_floor_log2"]),
+                subgroup_p=np.where(pairs > 0, hypergeom.sf(k - 1, total, high_total, n), np.nan),
                 n=n,
                 n_rest=rest,
                 median_log2=medians[:, j],
@@ -144,7 +180,7 @@ def compute(linear, labels, codes, params=PARAMS):
             for key, value in values.items():
                 result[key][:, j] = value
     result["q_value"] = np.where(np.isfinite(result["p_value"]), bh(result["p_value"]), np.nan)
-    result["stats_pass"] = passes(
+    lineage_v2 = passes(
         result["q_value"],
         result["log2fc"],
         result["cliffs_delta"],
@@ -152,4 +188,29 @@ def compute(linear, labels, codes, params=PARAMS):
         result["n"],
         params,
     )
+    with np.errstate(invalid="ignore", divide="ignore"):
+        linear_medians = np.exp2(medians) - 1
+        cv = np.std(linear_medians, axis=1) / np.mean(linear_medians, axis=1)
+    broad = (
+        (len(codes) == params["broad_required_types"])
+        & np.all(result["n"] >= params["min_n"], axis=1)
+        & ((detection >= params["broad_sample_fraction"]).sum(axis=1) >= params["broad_min_types"])
+        & (cv <= params["broad_type_median_cv"])
+    )
+    result["broadly_expressed"] = broad
+    result["lineage_blocked_by_broad"] = lineage_v2 & broad[:, None]
+    lineage = lineage_v2 & ~broad[:, None]
+    p = result.pop("subgroup_p")
+    result["subgroup_q"] = np.where(np.isfinite(p), bh(p), np.nan)
+    subgroup = (
+        (result["n"] >= params["min_n"])
+        & (result["n_rest"] >= params["min_n"])
+        & (result["subgroup_high_count"] >= params["subgroup_min_count"])
+        & (result["subgroup_high_fraction"] >= params["subgroup_min_fraction"])
+        & (result["subgroup_high_fraction_ratio"] >= params["subgroup_min_fraction_ratio"])
+        & (result["p95_log2_diff"] >= params["subgroup_p95_log2_diff"])
+        & (result["subgroup_q"] < params["subgroup_fdr"])
+    )
+    result["stats_pass"] = lineage | subgroup
+    result["pass_mode"] = np.where(lineage, "lineage", np.where(subgroup, "subgroup", None))
     return result

@@ -104,6 +104,11 @@ jobs:
         with:
           name: expression-stats-review
           path: expression_stats/bundle
+      - uses: actions/upload-artifact@v4
+        if: failure() && hashFiles('expression_stats/artifacts-failed/controls-report.json') != ''
+        with:
+          name: expression-stats-failed-controls
+          path: expression_stats/artifacts-failed
   publish:
     needs: build
     if: github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true' && needs.build.outputs.deployable == 'true'

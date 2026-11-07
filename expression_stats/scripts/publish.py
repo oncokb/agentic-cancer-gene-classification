@@ -21,6 +21,23 @@ def publish(directory):
         raise ValueError("Only full builds with PubMed precheck can be published")
     if "precheck_expires_at" not in manifest["source"]:
         raise ValueError("Missing completed PubMed precheck")
+    report_path = directory / "controls-report.json"
+    report = json.loads(report_path.read_text())
+    controls = manifest.get("controls", {})
+    panel_hash = sha256(Path(__file__).resolve().parents[1] / "controls.yaml")
+    if (
+        controls.get("status") != "passed"
+        or report.get("status") != "passed"
+        or controls.get("controls_sha256") != panel_hash
+        or report.get("controls_sha256") != panel_hash
+        or report.get("positive_passed") != 35
+        or report.get("positive_total") != 35
+        or report.get("negative_passed") != 0
+        or report.get("negative_total") != 27
+        or report.get("missing") != 0
+        or report.get("failures") != []
+    ):
+        raise ValueError("A complete passing controls report is required for publication")
     tag = manifest["bundle_tag"]
     # Paginate: application releases and old bundles may exceed one API page.
     releases = json.loads(gh("api", "--paginate", "--slurp", "repos/{owner}/{repo}/releases"))

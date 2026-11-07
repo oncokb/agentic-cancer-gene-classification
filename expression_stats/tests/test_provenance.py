@@ -58,9 +58,7 @@ def test_workflow_deployment_policy(tmp_path, monkeypatch, genes, skip, deployab
         ),
         build=dict(genes=[genes] if genes else None, skip_precheck=skip),
     )
-    monkeypatch.setattr(
-        module, "published_manifest", lambda: manifest
-    )
+    monkeypatch.setattr(module, "published_manifest", lambda: manifest)
     output = tmp_path / "output"
     for key, value in dict(
         INPUT_COMMIT="a" * 40,
@@ -87,6 +85,7 @@ def test_resolved_dependency_versions_change_code_identity(monkeypatch, dependen
 def test_pyproject_changes_code_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(provenance, "PROJECT_ROOT", tmp_path)
     (tmp_path / "constraints.txt").write_text("numpy==2.5.4\n")
+    (tmp_path / "controls.yaml").write_text('{"controls": []}\n')
     project = tmp_path / "pyproject.toml"
     project.write_text('[project]\nname = "test"\n')
     first = provenance.code_fingerprint()
@@ -146,9 +145,7 @@ def test_live_mapping_changes_invalidate_early_exit(tmp_path, monkeypatch, mappi
         ),
         build=dict(genes=None, skip_precheck=False),
     )
-    monkeypatch.setattr(
-        module, "published_manifest", lambda: manifest
-    )
+    monkeypatch.setattr(module, "published_manifest", lambda: manifest)
     monkeypatch.setattr(module, "current_mapping_sha", lambda commit: mapping_sha)
     output = tmp_path / "output"
     for key, value in dict(
@@ -161,3 +158,14 @@ def test_live_mapping_changes_invalidate_early_exit(tmp_path, monkeypatch, mappi
     module.main()
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert values["changed"] == changed
+
+
+def test_controls_panel_changes_code_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr(provenance, "PROJECT_ROOT", tmp_path)
+    for name in ("pyproject.toml", "constraints.txt"):
+        (tmp_path / name).write_text("fixture")
+    panel = tmp_path / "controls.yaml"
+    panel.write_text('{"controls": []}')
+    before = provenance.code_fingerprint()
+    panel.write_text('{"controls": [{"gene": "ERBB2"}]}')
+    assert provenance.code_fingerprint() != before

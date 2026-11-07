@@ -7,10 +7,10 @@
       },
       "release_id": {
         "type": "string",
-        "pattern": "^datahub-[0-9a-f]{12}-m2-[0-9a-f]{12}$"
+        "pattern": "^datahub-[0-9a-f]{12}-m3-[0-9a-f]{12}$"
       },
       "method_version": {
-        "const": "2"
+        "const": "3"
       },
       "params": {
         "type": "object",
@@ -38,6 +38,42 @@
           },
           "precheck_cache_ttl_days": {
             "type": "number"
+          },
+          "broad_sample_fraction": {
+            "type": "number"
+          },
+          "broad_min_types": {
+            "type": "number"
+          },
+          "broad_type_median_cv": {
+            "type": "number"
+          },
+          "broad_required_types": {
+            "type": "number"
+          },
+          "subgroup_percentile": {
+            "type": "number"
+          },
+          "subgroup_min_count": {
+            "type": "number"
+          },
+          "subgroup_min_fraction": {
+            "type": "number"
+          },
+          "subgroup_min_fraction_ratio": {
+            "type": "number"
+          },
+          "subgroup_p95_percentile": {
+            "type": "number"
+          },
+          "subgroup_p95_log2_diff": {
+            "type": "number"
+          },
+          "subgroup_fdr": {
+            "type": "number"
+          },
+          "precheck_requests_per_second": {
+            "type": "number"
           }
         },
         "required": [
@@ -48,7 +84,19 @@
           "detection_log2",
           "precheck_min_pmids",
           "expression_floor_log2",
-          "precheck_cache_ttl_days"
+          "precheck_cache_ttl_days",
+          "broad_sample_fraction",
+          "broad_min_types",
+          "broad_type_median_cv",
+          "broad_required_types",
+          "subgroup_percentile",
+          "subgroup_min_count",
+          "subgroup_min_fraction",
+          "subgroup_min_fraction_ratio",
+          "subgroup_p95_percentile",
+          "subgroup_p95_log2_diff",
+          "subgroup_fdr",
+          "precheck_requests_per_second"
         ]
       },
       "source": {
@@ -168,7 +216,7 @@
       },
       "release_id": {
         "type": "string",
-        "pattern": "^datahub-[0-9a-f]{12}-m2-[0-9a-f]{12}$"
+        "pattern": "^datahub-[0-9a-f]{12}-m3-[0-9a-f]{12}$"
       },
       "gene": {
         "type": "object",
@@ -288,6 +336,46 @@
                 "number",
                 "null"
               ]
+            },
+            "pass_mode": {
+              "enum": [
+                "lineage",
+                "subgroup",
+                null
+              ]
+            },
+            "lineage_blocked_by_broad": {
+              "type": "boolean"
+            },
+            "subgroup_high_count": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "subgroup_high_fraction": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "subgroup_high_fraction_ratio": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "p95_log2_diff": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "subgroup_q": {
+              "type": [
+                "number",
+                "null"
+              ]
             }
           },
           "required": [
@@ -307,18 +395,29 @@
             "literature_precheck_pass",
             "flags",
             "p90_log2",
-            "rest_p90_log2"
+            "rest_p90_log2",
+            "pass_mode",
+            "lineage_blocked_by_broad",
+            "subgroup_high_count",
+            "subgroup_high_fraction",
+            "subgroup_high_fraction_ratio",
+            "p95_log2_diff",
+            "subgroup_q"
           ]
         },
         "minItems": 32,
         "maxItems": 32
+      },
+      "broadly_expressed": {
+        "type": "boolean"
       }
     },
     "required": [
       "schema_version",
       "release_id",
       "gene",
-      "cancer_types"
+      "cancer_types",
+      "broadly_expressed"
     ]
   },
   "aliases": {

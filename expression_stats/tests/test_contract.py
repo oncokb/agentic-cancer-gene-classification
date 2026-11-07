@@ -13,6 +13,26 @@ from gene_expression_relevance import build as builder
 SCHEMAS = json.loads((Path(__file__).parent.parent / "docs/artifact-schema.json").read_text())
 
 
+@pytest.fixture(autouse=True)
+def synthetic_controls(monkeypatch):
+    from gene_expression_relevance.controls import evaluate
+
+    panel = {
+        "controls": [
+            {
+                "id": "fixture-ALB-LIHC",
+                "gene": "ALB",
+                "tcga": "LIHC",
+                "classification": "A",
+                "expected": True,
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        builder, "evaluate_controls", lambda directory, **kw: evaluate(directory, panel=panel, **kw)
+    )
+
+
 @pytest.mark.parametrize("skip", [True, False])
 @pytest.mark.parametrize("genes", [None, [], [" ", ""], " , "])
 def test_build_contract_and_precheck_gating(tmp_path, monkeypatch, skip, genes):
@@ -128,7 +148,7 @@ def test_early_exit_checks_method_commit_options_hashes_and_ttl():
     now = datetime(2026, 11, 5, tzinfo=UTC)
     manifest = dict(
         schema_version="1",
-        method_version="2",
+        method_version="3",
         params=PARAMS.copy(),
         source=dict(
             datahub_commit="a" * 40,
@@ -138,11 +158,11 @@ def test_early_exit_checks_method_commit_options_hashes_and_ttl():
         ),
         build=dict(genes=None, skip_precheck=False),
     )
-    args = ["a" * 40, "2", None, False, "code", "hgnc"]
+    args = ["a" * 40, "3", None, False, "code", "hgnc"]
     assert unchanged(manifest, *args, now=now)
     for i, value in [
         (0, "b" * 40),
-        (1, "3"),
+        (1, "4"),
         (2, ["ALB"]),
         (3, True),
         (4, "changed-code"),
@@ -269,11 +289,25 @@ def test_nullable_wire_fields_preserve_schema_one():
         "literature_precheck_pass",
     ]
     record = dict.fromkeys(nullable)
-    record.update(oncotree_code="GBM", n=0, n_rest=10, stats_pass=False, flags=["small_n"])
+    record.update(
+        oncotree_code="GBM",
+        n=0,
+        n_rest=10,
+        stats_pass=False,
+        flags=["small_n"],
+        pass_mode=None,
+        lineage_blocked_by_broad=False,
+        subgroup_high_count=None,
+        subgroup_high_fraction=None,
+        subgroup_high_fraction_ratio=None,
+        p95_log2_diff=None,
+        subgroup_q=None,
+    )
     artifact = dict(
         schema_version="1",
-        release_id="datahub-aaaaaaaaaaaa-m2-bbbbbbbbbbbb",
+        release_id="datahub-aaaaaaaaaaaa-m3-bbbbbbbbbbbb",
         gene=dict(hugo_symbol="ALB", entrez_gene_id=213),
+        broadly_expressed=False,
         cancer_types=[record.copy() for _ in range(32)],
     )
     jsonschema.validate(artifact, SCHEMAS["gene"])
@@ -285,8 +319,8 @@ def test_nullable_wire_fields_preserve_schema_one():
 @pytest.mark.parametrize(
     "release_id",
     [
-        "2026-11-05-datahub-aaaaaaaaaaaa-m2-bbbbbbbbbbbb",
-        "datahub-aaaa-m2-bbbbbbbbbbbb",
+        "2026-11-05-datahub-aaaaaaaaaaaa-m3-bbbbbbbbbbbb",
+        "datahub-aaaa-m3-bbbbbbbbbbbb",
         "datahub-aaaaaaaaaaaa-m1-bbbbbbbbbbbb",
     ],
 )

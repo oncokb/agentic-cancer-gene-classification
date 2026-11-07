@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 
 from . import METHOD_VERSION, PARAMS
+from .controls import evaluate as evaluate_controls
+from .controls import require_passed
 from .fetch import digest, fetch_all
 from .genes import gene_catalog, hgnc, hgnc_path
 from .mapping import cancer_mapping
@@ -123,12 +125,17 @@ def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
                 for j, code in enumerate(codes):
                     record = {}
                     for key, array in arrays.items():
+                        if key == "broadly_expressed":
+                            continue
                         value = array[i, j]
+                        if key == "pass_mode":
+                            record[key] = value
+                            continue
                         record[key] = (
                             bool(value)
-                            if key == "stats_pass"
+                            if key in ("stats_pass", "lineage_blocked_by_broad")
                             else int(value)
-                            if key in ("n", "n_rest")
+                            if key in ("n", "n_rest", "subgroup_high_count") and np.isfinite(value)
                             else float(value)
                             if np.isfinite(value)
                             else None
@@ -152,11 +159,20 @@ def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
                         schema_version="1",
                         release_id=release,
                         gene=dict(hugo_symbol=symbol, entrez_gene_id=entrez),
+                        broadly_expressed=bool(arrays["broadly_expressed"][i]),
                         cancer_types=records,
                     ),
                 )
             print(f"Computed {min(start + batch_size, len(ids))}/{len(ids)} genes", flush=True)
         del data
+        report = evaluate_controls(staging / "v1" / "genes", subset=requested_genes is not None)
+        manifest["controls"] = {key: value for key, value in report.items() if key != "controls"}
+        write_json(staging / "v1" / "controls-report.json", report)
+        if requested_genes is None and report["status"] != "passed":
+            failed = out.with_name(out.name + "-failed")
+            write_json(failed / "controls-report.json", report)
+            write_json(failed / "manifest.json", manifest)
+            require_passed(report)
         if not skip_precheck:
             queries = {item["oncotree_code"]: item["tumor_type_query"] for item in mapping}
 
