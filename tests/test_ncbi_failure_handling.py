@@ -312,3 +312,145 @@ async def test_failed_freshness_check_reuses_cache_without_extending_freshness(m
     assert store.saved == []
     assert len(ncbi.calls) >= literature.NCBI_MAX_ATTEMPTS
     assert all(parse_qs(call.content.decode())["sort"] == ["pub date"] for call in ncbi.calls)
+
+
+# ---------------------------------------------------------------------------
+# Tier 2: only a rejected esearch query (HTTP 400) is tolerated
+# ---------------------------------------------------------------------------
+
+TIER2_QUERIES = ['"NOTCH9" TIER2-BAD', '"NOTCH9" TIER2-OK']
+_ARTICLE_777 = (
+    "<PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>777</PMID><Article>"
+    "<ArticleTitle>NOTCH9 in cancer</ArticleTitle><Abstract><AbstractText>NOTCH9 drives tumors."
+    "</AbstractText></Abstract></Article></MedlineCitation></PubmedArticle></PubmedArticleSet>"
+)
+
+
+def _tier2_handler(*, bad_esearch_status=None, efetch_status=None):
+    """Tier 1 finds nothing; Tier 2 queries find PMID 777 unless told to fail."""
+
+    def handler(request):
+        form = parse_qs(request.content.decode())
+        if request.url.path.endswith("/esearch.fcgi"):
+            term = form["term"][0]
+            if "TIER2-BAD" in term and bad_esearch_status is not None:
+                return httpx.Response(bad_esearch_status)
+            idlist = ["777"] if "TIER2" in term else []
+            return httpx.Response(200, json={"esearchresult": {"count": str(len(idlist)), "idlist": idlist}})
+        if efetch_status is not None:
+            return httpx.Response(efetch_status)
+        return httpx.Response(200, text=_ARTICLE_777)
+
+    return handler
+
+
+def _fake_agentic_client(queries):
+    """Anthropic stand-in: one turn issuing every search, then done()."""
+    from types import SimpleNamespace
+
+    def tool_use(block_id, name, tool_input):
+        return SimpleNamespace(type="tool_use", id=block_id, name=name, input=tool_input)
+
+    turns = iter([
+        SimpleNamespace(
+            stop_reason="tool_use",
+            usage=None,
+            content=[tool_use(f"s{i}", "search_pubmed", {"query": q}) for i, q in enumerate(queries)],
+        ),
+        SimpleNamespace(stop_reason="tool_use", usage=None, content=[tool_use("d", "done", {})]),
+    ])
+
+    async def create(**_kwargs):
+        return next(turns)
+
+    return SimpleNamespace(messages=SimpleNamespace(create=create))
+
+
+def _agentic_stubs(monkeypatch):
+    monkeypatch.setattr(literature, "make_async_sdk_client", lambda: _fake_agentic_client(TIER2_QUERIES))
+    monkeypatch.setattr(literature, "resolve_sdk_model", lambda model, _purpose: model)
+    monkeypatch.setattr(literature, "record_llm_usage", lambda *_args, **_kwargs: None)
+
+
+def _local_stubs(monkeypatch):
+    async def suggest(**_kwargs):
+        return {"queries": TIER2_QUERIES}
+
+    monkeypatch.setattr(literature, "complete_with_tool", suggest)
+
+
+def _synthesis_stubs(monkeypatch):
+    async def select(_gene, records, *_args, **_kwargs):
+        return records
+
+    async def synthesize(**kwargs):
+        pmids = [record.pmid for record in kwargs["records"]]
+        return {
+            "cancer_associated": bool(pmids),
+            "insufficient_evidence": not pmids,
+            "cancer_association_rationale": "Stub synthesis.",
+            "gene_summary": "Stub summary.",
+            "citations": pmids,
+        }
+
+    monkeypatch.setattr(orchestrator, "select_papers_for_synthesis", select)
+    monkeypatch.setattr(orchestrator, "synthesize_gene_annotation", synthesize)
+
+
+TIER2_FAILURES = [
+    pytest.param({"bad_esearch_status": 403}, id="esearch-403"),
+    pytest.param({"bad_esearch_status": 401}, id="esearch-401"),
+    pytest.param({"efetch_status": 400}, id="efetch-400"),
+    pytest.param({"efetch_status": 403}, id="efetch-403"),
+]
+
+
+@pytest.mark.parametrize("failure", TIER2_FAILURES)
+async def test_agentic_tier2_failure_is_surfaced_and_not_cached(monkeypatch, ncbi, failure):
+    ncbi.handler = _tier2_handler(**failure)
+    _pipeline_stubs(monkeypatch, "NOTCH9")
+    _agentic_stubs(monkeypatch)
+    _synthesis_stubs(monkeypatch)
+    store = FakeGeneStore()
+
+    result = await run_pipeline(["NOTCH9"], run_store=store)
+
+    annotation = result.annotations[0]
+    assert store.saved == []
+    assert annotation.error is not None and "Literature retrieval failed" in annotation.error
+    assert annotation.cache_reason == "literature_retrieval_failed"
+
+
+@pytest.mark.parametrize("failure", TIER2_FAILURES)
+async def test_local_tier2_failure_is_surfaced(monkeypatch, ncbi, failure):
+    # Local mode never persists annotations, so the contract is that retrieval raises.
+    ncbi.handler = _tier2_handler(**failure)
+    _local_stubs(monkeypatch)
+
+    with pytest.raises(literature.LiteratureRetrievalError):
+        await literature.retrieve_literature("NOTCH9", local_mode=True, local_backend="claude-code")
+
+
+async def test_agentic_tier2_rejected_esearch_query_is_still_tolerated(monkeypatch, ncbi):
+    ncbi.handler = _tier2_handler(bad_esearch_status=400)
+    _pipeline_stubs(monkeypatch, "NOTCH9")
+    _agentic_stubs(monkeypatch)
+    _synthesis_stubs(monkeypatch)
+    store = FakeGeneStore()
+
+    result = await run_pipeline(["NOTCH9"], run_store=store)
+
+    annotation = result.annotations[0]
+    assert annotation.error is None
+    assert annotation.retrieval_count == 1
+    assert len(store.saved) == 1
+
+
+async def test_local_tier2_rejected_esearch_query_is_still_tolerated(monkeypatch, ncbi):
+    ncbi.handler = _tier2_handler(bad_esearch_status=400)
+    _local_stubs(monkeypatch)
+
+    records, tier = await literature.retrieve_literature("NOTCH9", local_mode=True, local_backend="claude-code")
+
+    assert tier == 2
+    assert [record.pmid for record in records] == ["777"]

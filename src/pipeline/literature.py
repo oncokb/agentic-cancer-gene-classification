@@ -1510,12 +1510,15 @@ def _ncbi_embedded_error(response: httpx.Response) -> Optional[str]:
     return None
 
 
-def _is_ncbi_unavailable(exc: BaseException) -> bool:
-    """True for transient NCBI failures (429/5xx, transport, embedded errors), not bad queries."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
-        return status == 429 or 500 <= status < 600
-    return isinstance(exc, (NCBIEmbeddedError, httpx.TransportError))
+def _is_rejected_esearch_query(exc: BaseException) -> bool:
+    """True only when esearch answered HTTP 400, i.e. NCBI rejected an LLM-written
+    Tier 2 query. Every other search failure and every efetch failure (any status,
+    transport error, embedded error) means the retrieved set is incomplete."""
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code == 400
+        and exc.request.url.path == httpx.URL(ESEARCH_URL).path
+    )
 
 
 def pubmed_error_message(exc: Exception) -> str:
@@ -2132,7 +2135,7 @@ async def _tier2_agentic_retrieve(
                 query, max_res, http_client, set(accumulated.keys())
             )
         except httpx.HTTPError as exc:
-            if _is_ncbi_unavailable(exc):
+            if not _is_rejected_esearch_query(exc):
                 ncbi_failures.append(exc)
             return block.id, f"Search failed: {exc}"
         for r in new_records:
@@ -2186,7 +2189,7 @@ async def _tier2_agentic_retrieve(
             )
         results_by_id = dict(await asyncio.gather(*[_run_search(block) for block in search_blocks]))
         if ncbi_failures:
-            # NCBI itself is failing (not a bad LLM query): the accumulated set is
+            # A search/fetch failed (not a rejected LLM query): the accumulated set is
             # incomplete, so stop spending tokens and report the failure.
             logger.error("Tier 2 NCBI call failed for %s: %s", gene, ncbi_failures[0])
             raise LiteratureRetrievalError(pubmed_error_message(ncbi_failures[0])) from ncbi_failures[0]
@@ -2282,7 +2285,7 @@ async def _tier2_local_retrieve(
                 query, 20, http_client, set(accumulated.keys())
             )
         except httpx.HTTPError as exc:
-            if _is_ncbi_unavailable(exc):
+            if not _is_rejected_esearch_query(exc):
                 logger.error("Local Tier 2 NCBI call failed for %s: %s", gene, exc)
                 raise LiteratureRetrievalError(pubmed_error_message(exc)) from exc
             logger.warning("Local Tier 2 PubMed query failed for %s: %s", gene, exc)
