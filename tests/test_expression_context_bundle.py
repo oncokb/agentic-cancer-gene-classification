@@ -377,6 +377,43 @@ async def test_transient_download_failure_retries_after_error_backoff(httpx_mock
     assert (await bundles.get_state()).active_bundle_tag == bad.tag
 
 
+@pytest.mark.parametrize("headers", [
+    # GitHub's reset already past on this pod's clock (stale or skewed) ...
+    {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int((T0 - timedelta(hours=1)).timestamp()))},
+    # ... or a Retry-After of 0.
+    {"retry-after": "0"},
+])
+async def test_stale_rate_limit_reset_still_backs_off_for_the_error_retry(httpx_mock, pods, headers):
+    """A 403/429 whose reset time is not in the future must not let pods call
+    GitHub again immediately: the error retry interval is the minimum."""
+    bundles, good, pod = await _load_first(httpx_mock, pods)
+    pod.clock.advance(INTERVAL)
+    httpx_mock.add_response(url=LIST_URL, status_code=429, headers=headers)
+    assert await pod.refresh() == "rate_limited"
+    state = await bundles.get_state()
+    assert state.next_check_after == pod.clock.now + ERROR_RETRY
+    before = len(httpx_mock.get_requests())
+    pod.clock.advance(timedelta(minutes=1))
+    assert await pod.refresh() == "not_due"
+    assert len(httpx_mock.get_requests()) == before  # no immediate repeat
+
+
+async def test_stale_rate_limit_on_asset_download_backs_off(httpx_mock, pods):
+    bundles, good, pod = await _load_first(httpx_mock, pods)
+    pod.clock.advance(INTERVAL)
+    newer = build_bundle(pubmed=BUNDLE_2, published_at="2026-11-09T06:00:00Z")
+    add_release_list(httpx_mock, [APP_RELEASE, release_json(newer)])
+    stale = str(int((T0 - timedelta(hours=1)).timestamp()))
+    httpx_mock.add_response(
+        url=asset_url(newer.tag, "manifest.json"), status_code=403,
+        headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": stale},
+    )
+    assert await pod.refresh() == "rate_limited"
+    state = await bundles.get_state()
+    assert state.active_bundle_tag == good.tag
+    assert state.next_check_after == pod.clock.now + ERROR_RETRY
+
+
 async def test_rate_limited_discovery_backs_off_until_reset(httpx_mock, pods, caplog):
     bundles, good, pod = await _load_first(httpx_mock, pods)
     pod.clock.advance(INTERVAL)

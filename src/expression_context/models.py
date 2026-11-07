@@ -200,6 +200,9 @@ class LiteratureVerdict(BaseModel):
     cancer_type_name: Optional[str] = None
     retrieved_count: Optional[int] = None
     papers: List[PaperJudgement] = Field(default_factory=list)
+    # "guard": no paper mentioned the tumor type, so no LLM judgement was made
+    # (always "insufficient"); "judge": the LLM judged the papers.
+    decided_by: Optional[Literal["guard", "judge"]] = None
 
 
 # --------------------------------------------------------------------------

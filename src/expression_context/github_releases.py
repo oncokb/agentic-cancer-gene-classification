@@ -52,11 +52,16 @@ class DiscoveryIncomplete(ReleasesError):
 
 
 class RateLimited(ReleasesError):
-    """GitHub refused with 403/429; do not call again before ``retry_at``."""
+    """GitHub refused with 403/429; do not call again before ``retry_at``.
 
-    def __init__(self, message: str, retry_at: datetime) -> None:
+    ``delay_seconds`` is set when GitHub gave a *relative* wait (Retry-After
+    in seconds, or no hint at all), so callers can apply it on their own
+    clock instead of this host's."""
+
+    def __init__(self, message: str, retry_at: datetime, delay_seconds: Optional[float] = None) -> None:
         super().__init__(message)
         self.retry_at = retry_at
+        self.delay_seconds = delay_seconds
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,33 @@ def _parse_time(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def rate_limit_delay(response: httpx.Response) -> Optional[float]:
+    """Relative wait in seconds (Retry-After seconds, or the default back-off
+    when GitHub gave no usable hint); None when GitHub gave an absolute time."""
+    retry_after = response.headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            try:
+                parsedate_to_datetime(retry_after)
+                return None
+            except (TypeError, ValueError):
+                pass
+    reset = response.headers.get("x-ratelimit-reset")
+    if reset:
+        try:
+            datetime.fromtimestamp(int(reset), tz=timezone.utc)
+            return None
+        except (ValueError, OverflowError, OSError):
+            pass
+    return _DEFAULT_RATE_LIMIT_BACKOFF.total_seconds()
+
+
+def rate_limited(message: str, response: httpx.Response) -> "RateLimited":
+    return RateLimited(message, rate_limit_retry_at(response), rate_limit_delay(response))
 
 
 def rate_limit_retry_at(response: httpx.Response, now: Optional[datetime] = None) -> datetime:
@@ -206,9 +238,8 @@ class ReleasesClient:
                 with attempt:
                     response = await self._http.get(url, headers=self._api_headers())
                     if response.status_code in (403, 429):
-                        raise RateLimited(
-                            f"GitHub API returned HTTP {response.status_code}",
-                            rate_limit_retry_at(response),
+                        raise rate_limited(
+                            f"GitHub API returned HTTP {response.status_code}", response
                         )
                     if allow_404 and response.status_code == 404:
                         return None
@@ -283,9 +314,9 @@ class ReleasesClient:
                 headers={"Accept": "application/octet-stream", "User-Agent": USER_AGENT},
             ) as response:
                 if response.status_code in (403, 429):
-                    raise RateLimited(
+                    raise rate_limited(
                         f"asset {asset.name} download returned HTTP {response.status_code}",
-                        rate_limit_retry_at(response),
+                        response,
                     )
                 if response.status_code != 200:
                     error = (

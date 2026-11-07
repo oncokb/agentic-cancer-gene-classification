@@ -515,7 +515,9 @@ class BundleRefresher:
                     self._releases.bundle_by_tag(pinned) if pinned else self._releases.latest_bundle()
                 )
             except RateLimited as exc:
-                await self._record_error(now, f"GitHub rate limit: {exc}", max(exc.retry_at, now))
+                await self._record_error(
+                    now, f"GitHub rate limit: {exc}", self._rate_limit_retry(exc, now)
+                )
                 return "rate_limited"
             except DiscoveryIncomplete as exc:
                 # Keep the active bundle; activating an older one would be a guess.
@@ -538,6 +540,16 @@ class BundleRefresher:
                 return "up_to_date"
             return await self._load_and_activate(release, token, now, error_retry)
 
+    def _rate_limit_retry(self, exc: RateLimited, now: datetime) -> datetime:
+        """GitHub's reset time, or at least the error retry interval when that
+        reset is already past (stale/skewed), so a 403/429 is never repeated
+        immediately."""
+        error_retry = now + timedelta(seconds=self._settings.refresh_error_retry_seconds)
+        delay = getattr(exc, "delay_seconds", None)
+        # A relative wait (Retry-After seconds) is applied on this clock.
+        retry_at = now + timedelta(seconds=delay) if delay is not None else exc.retry_at
+        return retry_at if retry_at > now else error_retry
+
     async def _load_and_activate(
         self, release: BundleRelease, token: str, now: datetime, error_retry: datetime
     ) -> str:
@@ -547,7 +559,9 @@ class BundleRefresher:
                 release, lock_token=token, should_abort=lambda: self._lock_lost
             )
         except RateLimited as exc:
-            await self._record_error(now, f"bundle {release.tag}: {exc}", max(exc.retry_at, now))
+            await self._record_error(
+                now, f"bundle {release.tag}: {exc}", self._rate_limit_retry(exc, now)
+            )
             return "rate_limited"
         except BundleContractError as exc:
             # A bad bundle won't fix itself: don't re-download before a full interval.

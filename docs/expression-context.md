@@ -158,7 +158,9 @@ Coordination and rate limits:
   `EXPRESSION_CONTEXT_GITHUB_TOKEN` is optional and only raises that limit).
   Asset downloads go to `github.com` release URLs, which are not API-metered,
   and never carry the token. A 403/429 is not retried: the cluster waits until
-  GitHub's `Retry-After`/`X-RateLimit-Reset`. Other GitHub errors retry after
+  GitHub's `Retry-After`/`X-RateLimit-Reset` (a relative `Retry-After` is
+  applied on the refresher's clock; if the reset is not in the future, it
+  waits at least `REFRESH_ERROR_RETRY`). Other GitHub errors retry after
   `EXPRESSION_CONTEXT_REFRESH_ERROR_RETRY` (30 minutes); a bundle that violates
   the contract is not downloaded again before a full interval.
 - **Budget enforced at startup:** the worst case `3600 / min(REFRESH_INTERVAL,
@@ -267,22 +269,37 @@ modelled on ACGC's fusion-partner evidence check:
 2. Deterministic guard: only papers whose title/abstract mention the tumor
    type can count — ACGC's `requested_tumor_terms_in_record` alias matcher,
    the literal disease phrase or manifest name, the cohort code as a whole
-   word, or (weaker, ranked after those) every distinctive word of the phrase
-   or name. If none do, the verdict is `insufficient` without an LLM call. At
+   word, the module's curated names for all 32 TCGA cohorts
+   (`tumor_aliases.py`: OncoTree/TCGA codes such as COAD/READ, common
+   abbreviations such as ccRCC, HCC, CRC, PDAC, and histology names; phrases
+   case-insensitive, abbreviations case-sensitive whole words), or (weaker,
+   ranked after those) every distinctive word of the phrase or name. If none
+   do, the verdict is `insufficient` without an LLM call and is stored with
+   `decided_by: "guard"` and a "[Guard only, no judgement]" rationale. At
    most `EXPRESSION_CONTEXT_JUDGE_MAX_PAPERS` (12) papers go to the judge.
 3. One LLM call (ACGC's `complete_with_tool`, model
    `EXPRESSION_CONTEXT_JUDGE_MODEL`, default ACGC's selection model) judges
    each paper: does it describe the gene's expression or role **in this tumor
    type** (code + name + names)? Papers about a different tumor type never
    count. It returns an overall `supported | not_supported | insufficient`
-   and a short rationale.
-4. Judgements for PMIDs that were not sent are dropped (no hallucinated
+   and a short rationale. The papers are passed as one bounded JSON array
+   (title ≤ 400 chars, abstract ≤ `JUDGE_ABSTRACT_CHARS`; `<`, `>`, `&`
+   escaped) inside `<papers>` tags, and the instructions say paper text is
+   untrusted data that must never be followed or speak for another paper.
+4. The tool output is validated: a missing or malformed verdict, papers list,
+   per-paper `pmid` or boolean `tumor_specific`, or a sent paper left
+   unjudged raises an error, so the pair is retried later and nothing is
+   stored (the LLM client returns `{}` when the model made no tool call).
+   Judgements for PMIDs that were not sent are dropped (no hallucinated
    PMIDs).
 
 A pair is surfaced only if the verdict is `supported` AND ≥1 PMID is judged
 tumor-specific; only those PMIDs are shown as citations. The rule is
-re-applied to every stored verdict. Each verdict is stored with the per-paper
-judgements, the tumor-specific PMIDs and the rationale.
+re-applied to every stored verdict: for `acgc_tumor_specific_v2`, a verdict
+without a `verdict` field or without a tumor-specific judgement for each
+cited PMID is never surfaced. Each verdict is stored with the per-paper
+judgements, the tumor-specific PMIDs, the rationale and `decided_by`
+(`guard` or `judge`).
 
 ## Tables
 
