@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
+import httpx
+
 from src.config import settings
 from src.models.schema import (
     AnnotationMode,
@@ -29,6 +31,7 @@ from src.observability import distribution, gene_latency_tag, increment, trace
 from src.pipeline.curation import apply_current_gene_overrides, has_curation_unavailable
 from src.pipeline.db_lookups import OncoKBGeneLookup, check_oncokb_membership, get_msk_genie_prevalence
 from src.pipeline.literature import (
+    LiteratureRetrievalError,
     rank_literature_for_synthesis,
     retrieve_literature,
     search_recent_pubmed_pmids,
@@ -235,12 +238,31 @@ async def _maybe_reuse_cached_annotation(
             last_pubmed_checked_at,
         )
 
-    recent_pmids = await search_recent_pubmed_pmids(
-        gene,
-        fusions,
-        since=last_pubmed_checked_at,
-        tumor_type=tumor_type,
-    )
+    try:
+        recent_pmids = await search_recent_pubmed_pmids(
+            gene,
+            fusions,
+            since=last_pubmed_checked_at,
+            tumor_type=tumor_type,
+        )
+    except httpx.HTTPError:
+        # The probe could not run, so it proves nothing about new papers: serve
+        # the cached annotation but keep last_pubmed_checked_at unchanged (no
+        # mark_gene_pubmed_checked) so the next request probes again.
+        logger.warning("PubMed freshness check failed for cached annotation %s", gene, exc_info=True)
+        reused = _cached_annotation_for_request(
+            cached["annotation"],
+            fusions,
+            "pubmed_freshness_check_failed",
+            updated_at,
+            last_pubmed_checked_at,
+        )
+        reused.quality_flags.append(QualityFlag(
+            code="pubmed_freshness_check_unavailable", label="PubMed freshness check unavailable",
+            severity="warning",
+            detail="PubMed could not be checked for new papers; this cached annotation was not re-validated.",
+        ))
+        return reused
     if recent_pmids:
         logger.info(
             "Refreshing cached annotation for %s because %d recent PMID(s) were found since %s",
@@ -347,6 +369,18 @@ def _record_annotation_duration(
     )
 
 
+async def _retrieve_literature_or_error(
+    retrieval: Awaitable[tuple],
+) -> tuple[list, int, Optional[LiteratureRetrievalError]]:
+    """Await retrieve_literature, returning a failed search as a value so the
+    concurrent OncoKB lookup still completes and the caller can report it."""
+    try:
+        records, tier = await retrieval
+    except LiteratureRetrievalError as exc:
+        return [], 0, exc
+    return records, tier, None
+
+
 async def _annotate_gene(
     gene: str,
     fusions: List[str],
@@ -427,31 +461,55 @@ async def _annotate_gene(
                 annotation.timings_ms = timings
                 _record_annotation_duration(annotation, gene, fusions, metric_tags)
                 return annotation
-            records, retrieval_tier = await _timed(
+            records, retrieval_tier, retrieval_error = await _timed(
                 "literature_retrieval",
                 timings,
-                retrieve_literature(
+                _retrieve_literature_or_error(retrieve_literature(
                     gene, fusions,
                     tumor_type=tumor_type,
                     local_mode=local_mode,
                     local_backend=local_backend,
-                ),
+                )),
             )
         else:
             # Run DB lookup and literature retrieval concurrently for the normal low-latency path.
-            oncokb_membership, (records, retrieval_tier) = await asyncio.gather(
+            oncokb_membership, (records, retrieval_tier, retrieval_error) = await asyncio.gather(
                 _timed("oncokb", timings, check_oncokb_membership(gene, lookup=oncokb_lookup)),
                 _timed(
                     "literature_retrieval",
                     timings,
-                    retrieve_literature(
+                    _retrieve_literature_or_error(retrieve_literature(
                         gene, fusions,
                         tumor_type=tumor_type,
                         local_mode=local_mode,
                         local_backend=local_backend,
-                    ),
+                    )),
                 ),
             )
+        if retrieval_error is not None:
+            # A failed PubMed search is not "no evidence": return an error
+            # annotation (never persisted, see run_pipeline) instead of
+            # synthesizing a confident insufficient_evidence result from it.
+            logger.error("Literature retrieval failed for gene %s: %s", gene, retrieval_error)
+            annotation = GeneAnnotation(
+                gene=gene,
+                fusions=list(dict.fromkeys(fusions)),
+                in_oncokb=oncokb_membership,
+                retrieval_count=0,
+                insufficient_evidence=True,
+                evidence_support_score=0.0,
+                evidence_support_explanation=(
+                    "Evidence support score 0.00: PubMed retrieval failed, so no "
+                    "literature-grounded annotation was generated."
+                ),
+                cache_status="bypassed",
+                cache_reason="literature_retrieval_failed",
+                error=f"Literature retrieval failed: {retrieval_error}; please retry.",
+            )
+            timings["total"] = _elapsed_ms(total_start)
+            annotation.timings_ms = timings
+            _record_annotation_duration(annotation, gene, fusions, metric_tags)
+            return annotation
 
         # Composite pre-ranking: sort the deduplicated retrieval pool so the
         # citation selection pass sees the strongest candidates first, and so

@@ -1444,6 +1444,80 @@ NCBI_RETRY_DEADLINE_SECONDS = 60.0
 NCBI_MAX_ATTEMPTS = 3
 
 
+class NCBIEmbeddedError(httpx.HTTPError):
+    """NCBI answered HTTP 200 but the body is an error (e.g. "API rate limit exceeded").
+
+    Subclasses httpx.HTTPError so every existing PubMed failure handler treats it
+    like a 429/5xx instead of reading the body as "no papers found".
+    """
+
+    def __init__(self, message: str):
+        super().__init__(f"NCBI error response: {message}")
+        self.message = message
+
+    @property
+    def reason(self) -> str:
+        if "rate limit" in self.message.lower():
+            return "NCBI rate limit"
+        return "NCBI error response"
+
+
+class LiteratureRetrievalError(RuntimeError):
+    """PubMed retrieval did not complete, so its (empty or partial) result is not evidence."""
+
+
+def _ncbi_error_text(value: object) -> Optional[str]:
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:200]
+    return None
+
+
+def _ncbi_embedded_error(response: httpx.Response) -> Optional[str]:
+    """Return the error text NCBI embedded in a 200 response body, if any.
+
+    JSON: a top-level "error"/"ERROR" field (rate-limit payloads, elink/esummary
+    errors) or one inside a top-level result object (esearchresult.ERROR).
+    "errorlist"/"warninglist" are deliberately ignored: NCBI uses them for a
+    legitimate zero-hit search (phrasesnotfound). XML: an <ERROR> root or
+    direct child (eSearchResult/eFetchResult ERROR elements).
+    """
+    text = response.text
+    if not isinstance(text, str):
+        return None
+    text = text.lstrip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        containers = [payload, *(value for value in payload.values() if isinstance(value, dict))]
+        for container in containers:
+            for key in ("error", "ERROR"):
+                message = _ncbi_error_text(container.get(key))
+                if message:
+                    return message
+        return None
+    if text.startswith("<") and "<ERROR" in text:
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return None
+        element = root if root.tag == "ERROR" else root.find("ERROR")
+        if element is not None:
+            return _ncbi_error_text("".join(element.itertext())) or "empty ERROR element"
+    return None
+
+
+def _is_ncbi_unavailable(exc: BaseException) -> bool:
+    """True for transient NCBI failures (429/5xx, transport, embedded errors), not bad queries."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or 500 <= status < 600
+    return isinstance(exc, (NCBIEmbeddedError, httpx.TransportError))
+
+
 def pubmed_error_message(exc: Exception) -> str:
     """Describe HTTP failures without storing request URLs or API keys."""
     if isinstance(exc, RetryError):
@@ -1451,6 +1525,8 @@ def pubmed_error_message(exc: Exception) -> str:
         if isinstance(cause, Exception):
             return pubmed_error_message(cause)
         return "PubMed search failed (retrieval error)"
+    if isinstance(exc, NCBIEmbeddedError):
+        return f"PubMed search failed ({exc.reason})"
     if isinstance(exc, httpx.HTTPStatusError):
         return f"PubMed search failed (HTTP {exc.response.status_code})"
     if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
@@ -1474,7 +1550,10 @@ async def _ncbi_post(url: str, params: dict, client: httpx.AsyncClient, timeout:
         async with _get_ncbi_rate_limiter():
             response = await client.post(url, data=params, timeout=timeout)
             response.raise_for_status()
-            return response
+        embedded_error = _ncbi_embedded_error(response)
+        if embedded_error is not None:
+            raise NCBIEmbeddedError(embedded_error)
+        return response
 
     for attempt in range(NCBI_MAX_ATTEMPTS):
         try:
@@ -1484,9 +1563,11 @@ async def _ncbi_post(url: str, params: dict, client: httpx.AsyncClient, timeout:
             return await asyncio.wait_for(_attempt(), timeout=remaining)
         except asyncio.TimeoutError as exc:
             raise httpx.TimeoutException("PubMed request deadline exceeded") from exc
-        except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+        except (httpx.HTTPStatusError, httpx.TransportError, NCBIEmbeddedError) as exc:
             delay = min(2**attempt, 8)
-            if isinstance(exc, httpx.HTTPStatusError):
+            if isinstance(exc, NCBIEmbeddedError):
+                logger.warning("PubMed request returned an error body (%s)", exc.reason)
+            elif isinstance(exc, httpx.HTTPStatusError):
                 status = exc.response.status_code
                 logger.warning("PubMed request failed (HTTP %s)", status)
                 if status != 429 and not 500 <= status < 600:
@@ -2041,6 +2122,8 @@ async def _tier2_agentic_retrieve(
     client = make_async_sdk_client()
     http_client = _get_ncbi_client()
 
+    ncbi_failures: List[httpx.HTTPError] = []
+
     async def _run_search(block) -> tuple[str, str]:
         query = block.input.get("query", "")
         max_res = min(int(block.input.get("max_results", 10)), 20)
@@ -2049,6 +2132,8 @@ async def _tier2_agentic_retrieve(
                 query, max_res, http_client, set(accumulated.keys())
             )
         except httpx.HTTPError as exc:
+            if _is_ncbi_unavailable(exc):
+                ncbi_failures.append(exc)
             return block.id, f"Search failed: {exc}"
         for r in new_records:
             r.matched_query_tiers = list(set(r.matched_query_tiers) | {"tier2_agentic"})
@@ -2100,6 +2185,11 @@ async def _tier2_agentic_retrieve(
                 tool_calls_made, MAX_AGENTIC_TOOL_CALLS, gene, block.input.get("query", ""),
             )
         results_by_id = dict(await asyncio.gather(*[_run_search(block) for block in search_blocks]))
+        if ncbi_failures:
+            # NCBI itself is failing (not a bad LLM query): the accumulated set is
+            # incomplete, so stop spending tokens and report the failure.
+            logger.error("Tier 2 NCBI call failed for %s: %s", gene, ncbi_failures[0])
+            raise LiteratureRetrievalError(pubmed_error_message(ncbi_failures[0])) from ncbi_failures[0]
 
         # Process all tool_use blocks in this turn, in original order
         tool_results = []
@@ -2192,6 +2282,9 @@ async def _tier2_local_retrieve(
                 query, 20, http_client, set(accumulated.keys())
             )
         except httpx.HTTPError as exc:
+            if _is_ncbi_unavailable(exc):
+                logger.error("Local Tier 2 NCBI call failed for %s: %s", gene, exc)
+                raise LiteratureRetrievalError(pubmed_error_message(exc)) from exc
             logger.warning("Local Tier 2 PubMed query failed for %s: %s", gene, exc)
             continue
         for record in new_records:
@@ -2441,13 +2534,17 @@ async def retrieve_literature(
     Records are ranked by evidence tier (clinical > cell line > mouse > other),
     then high-impact journal, then recency before being passed downstream.
 
-    Returns (records, tier) where tier is 1 or 2.
+    Returns (records, tier) where tier is 1 or 2. Raises LiteratureRetrievalError
+    when NCBI fails (after retries) so a failed search is never mistaken for a
+    legitimate zero-hit one.
     """
     try:
         records = _filter_retracted_records(await _tier1_retrieve(gene, fusions, tumor_type))
     except httpx.HTTPError as exc:
+        # An empty result here is not "no papers": surface the failure so the
+        # caller neither synthesizes nor caches an insufficient_evidence result.
         logger.error("Tier 1 NCBI call failed for %s: %s", gene, exc)
-        records = []
+        raise LiteratureRetrievalError(pubmed_error_message(exc)) from exc
 
     if len(records) >= settings.min_papers_for_strong_association:
         logger.info(
