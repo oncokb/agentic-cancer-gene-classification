@@ -1,0 +1,68 @@
+{
+  "schema_version": "1",
+  "release_id": "datahub-abc1234def56-m3-c0ffee123456",
+  "method_version": "3",
+  "params": {
+    "fdr": 0.05,
+    "log2fc": 1.0,
+    "cliffs_delta": 0.5,
+    "min_n": 10,
+    "expression_floor_log2": 3.4594316186372973,
+    "broad_sample_fraction": 0.9,
+    "broad_min_types": 29,
+    "broad_type_median_cv": 0.5,
+    "broad_required_types": 32,
+    "subgroup_percentile": 99,
+    "subgroup_min_count": 10,
+    "subgroup_min_fraction": 0.03,
+    "subgroup_min_fraction_ratio": 3.0,
+    "subgroup_p95_percentile": 95,
+    "subgroup_p95_log2_diff": 1.5,
+    "subgroup_fdr": 0.025,
+    "precheck_requests_per_second": 3.0,
+    "precheck_min_pmids": 1,
+    "precheck_cache_ttl_days": 30,
+    "detection_log2": 3.4594316186372973
+  },
+  "source": {
+    "datahub_commit": "abc1234def567777777777777777777777777777",
+    "generated_at": "2026-11-07T00:00:00Z"
+  },
+  "cancer_types": [
+    {
+      "study_id": "brca_tcga_pan_can_atlas_2018",
+      "oncotree_code": "BRCA",
+      "name": "Breast Invasive Carcinoma",
+      "tumor_type_query": "breast cancer",
+      "import_date": "2026-06-05 15:34:03"
+    },
+    {
+      "study_id": "prad_tcga_pan_can_atlas_2018",
+      "oncotree_code": "PRAD",
+      "name": "Prostate Adenocarcinoma",
+      "tumor_type_query": "prostate cancer",
+      "import_date": "2026-06-05 15:34:03"
+    },
+    {
+      "study_id": "kich_tcga_pan_can_atlas_2018",
+      "oncotree_code": "KICH",
+      "name": "Kidney Chromophobe",
+      "tumor_type_query": "chromophobe renal cell carcinoma",
+      "import_date": "2026-06-05 15:34:03"
+    },
+    {
+      "study_id": "sarc_tcga_pan_can_atlas_2018",
+      "oncotree_code": "SARC",
+      "name": "Sarcoma",
+      "tumor_type_query": "sarcoma",
+      "import_date": "2026-06-05 15:34:03"
+    },
+    {
+      "study_id": "luad_tcga_pan_can_atlas_2018",
+      "oncotree_code": "LUAD",
+      "name": "Lung Adenocarcinoma",
+      "tumor_type_query": "lung adenocarcinoma",
+      "import_date": "2026-06-05 15:34:03"
+    }
+  ]
+}

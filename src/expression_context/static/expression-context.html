@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="same-origin" />
+    <title>Expression stats — Cancer Gene Classification</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/favicon-180.png" />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/expression-context/static/expression-context.css" />
+  </head>
+  <!-- Optional expression-context module: src/expression_context/ (see REMOVAL.md). -->
+  <body class="api-keys-body">
+    <main class="api-keys-page ec-page" id="ec-page">
+      <header class="api-keys-header">
+        <a class="api-keys-back" href="/">&larr; Back to annotations</a>
+        <div class="brand-title">
+          <img class="brand-icon" src="/static/favicon.svg" alt="" width="28" height="28" />
+          <h1>Expression stats</h1>
+        </div>
+        <p class="api-keys-lead">
+          TCGA PanCancer RNA-seq enrichment of a gene in one cancer type versus all other TCGA
+          tumor types (tumor-only data: tumor-type enrichment, not tumor versus normal), with the
+          literature check for pairs that pass the statistics.
+        </p>
+      </header>
+
+      <section class="api-keys-card" aria-labelledby="ec-search-heading">
+        <h2 id="ec-search-heading" class="ec-visually-hidden">Look up a gene</h2>
+        <form class="ec-form" id="ec-form" autocomplete="off">
+          <label for="ec-gene">Gene</label>
+          <input id="ec-gene" name="gene" type="text" placeholder="e.g. ERBB2" maxlength="64" spellcheck="false" />
+          <button class="primary-action" id="ec-submit" type="submit">Show statistics</button>
+        </form>
+        <div class="api-keys-alert hidden" id="ec-error" role="alert"></div>
+        <p class="api-keys-empty hidden" id="ec-loading">Loading…</p>
+      </section>
+
+      <section class="api-keys-card hidden" id="ec-result" aria-labelledby="ec-gene-title">
+        <div class="ec-result-head">
+          <h2 id="ec-gene-title"></h2>
+          <p class="ec-summary" id="ec-summary"></p>
+        </div>
+        <div class="ec-actions">
+          <button class="primary-action hidden" id="ec-run" type="button">Run literature check</button>
+          <span class="ec-job-status" id="ec-job-status" role="status" aria-live="polite"></span>
+        </div>
+        <div class="api-keys-table-wrap">
+          <table class="api-keys-table ec-table" id="ec-table">
+            <thead>
+              <tr>
+                <th scope="col">Cancer type</th>
+                <th scope="col" title="Primary tumors in this type (all other TCGA tumors)">n (rest)</th>
+                <th scope="col" title="Median log2(RSEM + 1) in this type (all other tumors)">Median (rest)</th>
+                <th scope="col" title="Floor-clamped median difference, log2">log2FC</th>
+                <th scope="col">Cliff's δ</th>
+                <th scope="col">AUC</th>
+                <th scope="col" title="Benjamini–Hochberg q across the cancer types for this gene">q</th>
+                <th scope="col" title="Statistics call; method m3 adds the enrichment mode, a broad-expression marker and subgroup statistics">Statistics</th>
+                <th scope="col" title="PubMed count for the gene and tumor type">PubMed pre-check</th>
+                <th scope="col">Flags</th>
+                <th scope="col">Literature</th>
+                <th scope="col">Result</th>
+              </tr>
+            </thead>
+            <tbody id="ec-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="api-keys-card" id="ec-provenance-card" aria-labelledby="ec-provenance-heading">
+        <h2 id="ec-provenance-heading">Statistics bundle</h2>
+        <p class="api-keys-empty" id="ec-provenance-status">Loading…</p>
+        <dl class="ec-provenance" id="ec-provenance"></dl>
+      </section>
+    </main>
+
+    <script src="/expression-context/static/expression-context.js"></script>
+  </body>
+</html>

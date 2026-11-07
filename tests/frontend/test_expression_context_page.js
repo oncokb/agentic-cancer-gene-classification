@@ -1,0 +1,427 @@
+// Expression stats page (optional expression-context module). Plain Node
+// fake-DOM harness, following test_runs_page.js. Run by
+// tests/test_expression_context_web.py.
+"use strict";
+const assert = require("assert");
+const {
+  createExpressionContextPage, formatNumber, formatQ, pmidUrl,
+} = require("../../src/expression_context/static/expression-context.js");
+
+class Element {
+  constructor(tag) {
+    this.tagName = tag;
+    this.textContent = "";
+    this.children = [];
+    this.attrs = {};
+    this.listeners = {};
+    this.value = "";
+    this.disabled = false;
+    const classes = new Set();
+    this.classList = {
+      toggle: (name, on) => (on ? classes.add(name) : classes.delete(name)),
+      contains: (name) => classes.has(name),
+    };
+  }
+  appendChild(child) { this.children.push(child); return child; }
+  replaceChildren() { this.children = []; }
+  setAttribute(name, value) { this.attrs[name] = String(value); }
+  getAttribute(name) { return this.attrs[name]; }
+  addEventListener(name, fn) { this.listeners[name] = fn; }
+  fire(name, event = {}) { return this.listeners[name](event); }
+  get hidden() { return this.classList.contains("hidden"); }
+  // All text below this node, depth first.
+  get text() { return this.textContent + this.children.map((c) => c.text).join(""); }
+  findAll(predicate) {
+    const out = predicate(this) ? [this] : [];
+    for (const child of this.children) out.push(...child.findAll(predicate));
+    return out;
+  }
+}
+
+const IDS = [
+  "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
+  "ec-summary", "ec-run", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
+];
+
+const response = (body, status = 200) => ({ status, json: async () => body });
+
+function env(routes, { search = "" } = {}) {
+  const nodes = Object.fromEntries(IDS.map((id) => [id, new Element("div")]));
+  nodes["ec-error"].classList.toggle("hidden", true);
+  nodes["ec-result"].classList.toggle("hidden", true);
+  nodes["ec-run"].classList.toggle("hidden", true);
+  const document = { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
+  const calls = [];
+  const replaced = [];
+  const window = {
+    location: { pathname: "/expression-context", search, href: "/expression-context" },
+    history: { replaceState: (_s, _t, url) => replaced.push(url) },
+    setTimeout: (fn) => fn(),
+  };
+  const fetch = async (url, options = {}) => {
+    calls.push({ url, method: options.method || "GET", body: options.body });
+    const handler = routes[`${options.method || "GET"} ${url}`];
+    if (!handler) throw new Error(`unexpected request ${options.method || "GET"} ${url}`);
+    return typeof handler === "function" ? handler() : handler;
+  };
+  const page = createExpressionContextPage({ document, window, fetch, wait: async () => {} });
+  return { nodes, page, calls, window, replaced };
+}
+
+const BUNDLE = {
+  bundle_tag: "expression-stats-datahub-abc1234def56-m2-b7e9f01a2c3d-pubmed-20261102",
+  release_id: "datahub-abc1234def56-m2-b7e9f01a2c3d",
+  schema_version: "1", method_version: "2", pubmed_snapshot_date: "2026-11-02", gene_count: 20531,
+  published_at: "2026-11-02T06:00:00Z", loaded_at: "2026-11-02T06:10:00Z",
+  release_url: "https://github.com/oncokb/agentic-cancer-gene-classification/releases/tag/x",
+  source: { datahub_commit: "abc1234def56", generated_at: "2026-11-01T00:00:00Z" }, params: {},
+};
+
+function stats(code, extra = {}) {
+  return {
+    oncotree_code: code, n: 100, n_rest: 9000, median_log2: 6.2, rest_median_log2: 3.1,
+    p90_log2: 8, rest_p90_log2: 5, log2fc: 2.74, log2fc_vs_median_of_type_medians: 2.5,
+    cliffs_delta: 0.71, auc: 0.855, p_value: 1e-40, q_value: 1e-39, stats_pass: true,
+    pubmed_count: 12, literature_precheck_pass: true, flags: [], ...extra,
+  };
+}
+
+function view(overrides = {}) {
+  return {
+    query: "erbb2", hugo_symbol: "ERBB2", entrez_gene_id: 2064, literature_gate: "acgc_tumor_specific_v2",
+    bundle: BUNDLE,
+    summary: { surfaced: 1, literature_pending: 1, excluded: 2 },
+    pairs: [
+      {
+        oncotree_code: "BRCA", cancer_type_name: "Breast Invasive Carcinoma",
+        stats: stats("BRCA", { flags: ["tissue_of_origin_risk"] }), stats_pass: true,
+        precheck: "pass", literature_eligible: true, status: "surfaced", exclusion_reason: null,
+        literature: {
+          supported: true, insufficient_evidence: false, pmids: ["12345678", "javascript:alert(1)"],
+          rationale: "<b>amplified</b>", literature_gate: "acgc_tumor_specific_v2",
+          tumor_type_query: "breast cancer", evaluated_at: "2026-11-05T00:00:00Z",
+        },
+      },
+      {
+        oncotree_code: "STAD", cancer_type_name: "Stomach Adenocarcinoma", stats: stats("STAD", {
+          literature_precheck_pass: null, pubmed_count: null,
+        }), stats_pass: true, precheck: "not_run", literature_eligible: true,
+        status: "literature_pending", exclusion_reason: null, literature: null,
+      },
+      {
+        oncotree_code: "UCEC", cancer_type_name: null, stats: stats("UCEC", {
+          literature_precheck_pass: false, pubmed_count: 0,
+        }), stats_pass: true, precheck: "fail", literature_eligible: false,
+        status: "excluded", exclusion_reason: "precheck", literature: null,
+      },
+      {
+        oncotree_code: "GBM", cancer_type_name: "Glioblastoma", stats: stats("GBM", {
+          n: 0, median_log2: null, log2fc: null, cliffs_delta: null, auc: null, q_value: null,
+          stats_pass: false, flags: ["small_n"],
+        }), stats_pass: false, precheck: "not_run", literature_eligible: false,
+        status: "excluded", exclusion_reason: "stats", literature: null,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+const tests = [];
+const test = (name, fn) => tests.push([name, fn]);
+
+test("formatters never show null statistics as zero", () => {
+  assert.strictEqual(formatNumber(null), "—");
+  assert.strictEqual(formatNumber(undefined), "—");
+  assert.strictEqual(formatNumber(0), "0.00");
+  assert.strictEqual(formatNumber(2.739), "2.74");
+  assert.strictEqual(formatQ(null), "—");
+  assert.strictEqual(formatQ(1e-39), "1.0e-39");
+  assert.strictEqual(formatQ(0.0123), "0.012");
+});
+
+test("only digit PMIDs become PubMed links", () => {
+  assert.strictEqual(pmidUrl("12345678"), "https://pubmed.ncbi.nlm.nih.gov/12345678/");
+  assert.strictEqual(pmidUrl("javascript:alert(1)"), null);
+  assert.strictEqual(pmidUrl("123/../x"), null);
+});
+
+test("renders statistics, calls, flags and the literature verdict", async () => {
+  const { nodes, page, replaced } = env({
+    "GET /v1/expression-context/stats/ERBB2": response(view()),
+  });
+  nodes["ec-gene"].value = " erbb2 ";
+  await nodes["ec-form"].fire("submit", { preventDefault() {} });
+  assert.ok(!nodes["ec-result"].hidden);
+  assert.strictEqual(nodes["ec-gene-title"].textContent, "ERBB2 · Entrez 2064");
+  assert.strictEqual(nodes["ec-summary"].textContent, "1 surfaced · 1 awaiting literature check · 2 excluded");
+  assert.ok(!nodes["ec-run"].hidden, "pending pairs offer a literature check");
+  const rows = nodes["ec-tbody"].children;
+  assert.strictEqual(rows.length, 4);
+  const cells = (row) => row.children.map((c) => c.text);
+  const brca = cells(rows[0]);
+  assert.strictEqual(brca[0], "Breast Invasive Carcinoma (BRCA)");
+  assert.strictEqual(brca[1], "100 (9000)");
+  assert.strictEqual(brca[2], "6.20 (3.10)");
+  assert.strictEqual(brca[3], "2.74");
+  assert.strictEqual(brca[7], "Pass");
+  assert.strictEqual(brca[8], "Pass (12)");
+  assert.strictEqual(brca[9], "Tissue of origin");
+  assert.ok(brca[10].startsWith("Supported"));
+  assert.ok(brca[10].includes("<b>amplified</b>"), "rationale stays text");
+  assert.strictEqual(brca[11], "Surfaced");
+  assert.strictEqual(rows[0].getAttribute("class"), "ec-row-surfaced");
+  const links = rows[0].findAll((n) => n.tagName === "a");
+  assert.deepStrictEqual(links.map((a) => a.getAttribute("href")), ["https://pubmed.ncbi.nlm.nih.gov/12345678/"]);
+  assert.strictEqual(links[0].getAttribute("rel"), "noopener noreferrer");
+  assert.strictEqual(cells(rows[1])[8], "Not run");
+  assert.strictEqual(cells(rows[1])[10], "Not checked yet");
+  assert.strictEqual(cells(rows[1])[11], "Awaiting literature check");
+  assert.strictEqual(cells(rows[2])[0], "UCEC");
+  assert.strictEqual(cells(rows[2])[8], "Fail (0)");
+  assert.strictEqual(cells(rows[2])[11], "Excluded: PubMed pre-check");
+  const gbm = cells(rows[3]);
+  assert.deepStrictEqual(gbm.slice(2, 7), ["— (3.10)", "—", "—", "—", "—"]);
+  assert.strictEqual(gbm[7], "Fail");
+  assert.strictEqual(gbm[9], "Small n");
+  assert.strictEqual(gbm[11], "Excluded: statistics");
+  assert.deepStrictEqual(replaced, ["?gene=ERBB2"]);
+  // Provenance from the stats view.
+  const prov = nodes["ec-provenance"].children.map((c) => c.text);
+  assert.ok(prov.includes("Release ID") && prov.includes(BUNDLE.release_id));
+  assert.ok(prov.includes("PubMed snapshot") && prov.includes("2026-11-02"));
+  const bundleLink = nodes["ec-provenance"].findAll((n) => n.tagName === "a")[0];
+  assert.strictEqual(bundleLink.getAttribute("href"), BUNDLE.release_url);
+  assert.strictEqual(page.state.view.hugo_symbol, "ERBB2");
+});
+
+test("an expired PubMed pre-check is labelled, not shown as a failure", async () => {
+  const expired = view({
+    bundle: { ...BUNDLE, source: { ...BUNDLE.source, precheck_expires_at: "2026-10-01T00:00:00Z" } },
+  });
+  expired.pairs[2] = {
+    ...expired.pairs[2], precheck: "expired", literature_eligible: true,
+    status: "literature_pending", exclusion_reason: null,
+  };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(expired) });
+  await page.lookup("ERBB2");
+  const ucec = nodes["ec-tbody"].children[2].children.map((c) => c.text);
+  assert.strictEqual(ucec[8], "Pre-check expired (0)");
+  assert.strictEqual(ucec[11], "Awaiting literature check");
+  const prov = nodes["ec-provenance"].children.map((c) => c.text);
+  const at = prov.indexOf("PubMed pre-check expires");
+  assert.ok(at >= 0 && prov[at + 1] === "2026-10-01T00:00:00Z");
+});
+
+test("method m3: enrichment labels, broad markers and subgroup statistics", async () => {
+  const m3 = view({
+    query: "vim", hugo_symbol: "VIM", entrez_gene_id: 7431, broadly_expressed: true,
+    bundle: { ...BUNDLE, method_version: "3" },
+    summary: { surfaced: 1, literature_pending: 0, excluded: 2 },
+    pairs: [
+      {
+        oncotree_code: "BRCA", cancer_type_name: "Breast <i>Invasive</i> Carcinoma",
+        stats: stats("BRCA", {
+          pass_mode: "subgroup", lineage_blocked_by_broad: true, subgroup_high_count: 120,
+          subgroup_high_fraction: 0.11, subgroup_high_fraction_ratio: 3.2, p95_log2_diff: 1.6,
+          subgroup_q: 2e-8,
+        }),
+        stats_pass: true, enrichment: "Subgroup enriched", broad_blocked: false,
+        precheck: "pass", literature_eligible: true, status: "surfaced", exclusion_reason: null,
+        literature: {
+          supported: true, insufficient_evidence: false, pmids: ["11111111"], verdict: "supported",
+          cancer_type_name: "Breast Invasive Carcinoma", rationale: "VIM in breast cancer.",
+          papers: [{ pmid: "11111111", tumor_specific: true }],
+        },
+      },
+      {
+        oncotree_code: "SARC", cancer_type_name: "Sarcoma",
+        stats: stats("SARC", {
+          stats_pass: false, pass_mode: null, lineage_blocked_by_broad: true,
+          literature_precheck_pass: null, pubmed_count: null,
+          subgroup_high_count: 30, subgroup_high_fraction: 0.12, subgroup_high_fraction_ratio: 1.3,
+          p95_log2_diff: 0.4, subgroup_q: 0.2,
+        }),
+        stats_pass: false, enrichment: null, broad_blocked: true, precheck: "not_run",
+        literature_eligible: false, status: "excluded", exclusion_reason: "stats", literature: null,
+      },
+      {
+        oncotree_code: "PRAD", cancer_type_name: "Prostate Adenocarcinoma",
+        stats: stats("PRAD", { pass_mode: "lineage", lineage_blocked_by_broad: false }),
+        stats_pass: true, enrichment: "Lineage enriched", broad_blocked: false, precheck: "pass",
+        literature_eligible: true, status: "excluded", exclusion_reason: "literature",
+        literature: {
+          supported: false, insufficient_evidence: true, pmids: [], verdict: "insufficient",
+          rationale: "No paper reports VIM in prostate cancer.", papers: [],
+        },
+      },
+    ],
+  });
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/VIM": response(m3) });
+  await page.lookup("vim");
+  const title = nodes["ec-gene-title"];
+  assert.strictEqual(title.textContent, "VIM · Entrez 7431");
+  assert.strictEqual(title.text, "VIM · Entrez 7431Broadly expressed");
+  const rows = nodes["ec-tbody"].children;
+  const cells = (row) => row.children.map((c) => c.text);
+  const brca = cells(rows[0]);
+  assert.strictEqual(brca[0], "Breast <i>Invasive</i> Carcinoma (BRCA)", "names stay text");
+  assert.ok(brca[7].startsWith("PassSubgroup enriched"), brca[7]);
+  assert.ok(brca[7].includes("Subgroup: high n 120 (11.0%) · ratio 3.20× · p95 Δlog2 1.60 · q 2.0e-8"), brca[7]);
+  assert.ok(!brca[7].includes("Broadly expressed"), "a subgroup pass is not marked blocked");
+  assert.ok(brca[10].startsWith("Supported in Breast Invasive Carcinoma"), brca[10]);
+  assert.ok(brca[10].includes("Tumor-specific: PMID 11111111"), brca[10]);
+  const sarc = cells(rows[1]);
+  assert.ok(sarc[7].startsWith("FailBroadly expressed"), sarc[7]);
+  assert.strictEqual(sarc[10], "—", "never sent to the literature check");
+  assert.strictEqual(sarc[11], "Excluded: statistics");
+  const prad = cells(rows[2]);
+  assert.ok(prad[7].startsWith("PassLineage enriched"), prad[7]);
+  assert.ok(!prad[7].includes("Subgroup:"), "no subgroup line without subgroup stats");
+  assert.ok(prad[10].startsWith("Not supported insufficient evidence"), prad[10]);
+  assert.deepStrictEqual(rows[2].findAll((n) => n.tagName === "a"), []);
+});
+
+test("tumor-specific verdict without tumor-specific PMIDs explains why", async () => {
+  const v = view();
+  v.pairs[0] = {
+    ...v.pairs[0], status: "excluded", exclusion_reason: "literature",
+    literature: { supported: false, insufficient_evidence: false, pmids: [], verdict: "supported", papers: [] },
+  };
+  v.pairs[1] = {
+    ...v.pairs[1], status: "excluded", exclusion_reason: "literature",
+    literature: { supported: false, insufficient_evidence: false, pmids: [], verdict: "not_supported" },
+  };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  const rows = nodes["ec-tbody"].children.map((row) => row.children.map((c) => c.text));
+  assert.strictEqual(rows[0][10], "Not supported no tumor-specific PMIDs");
+  assert.strictEqual(rows[1][10], "Not supported evidence against this tumor type");
+  assert.strictEqual(nodes["ec-gene-title"].children.length, 0, "no gene marker for m2 bundles");
+});
+
+test("invalid input is rejected without a request", async () => {
+  const { nodes, calls } = env({});
+  nodes["ec-gene"].value = "BAD$GENE";
+  await nodes["ec-form"].fire("submit", { preventDefault() {} });
+  assert.strictEqual(calls.length, 0);
+  assert.ok(!nodes["ec-error"].hidden);
+  assert.match(nodes["ec-error"].textContent, /gene symbol/);
+});
+
+for (const [status, pattern] of [[503, /not loaded yet/], [404, /NOPE1 is not in/], [500, /couldn't load/]]) {
+  test(`HTTP ${status} shows a clear message`, async () => {
+    const { nodes, page } = env({ "GET /v1/expression-context/stats/NOPE1": response({ detail: "x" }, status) });
+    await page.lookup("nope1");
+    assert.match(nodes["ec-error"].textContent, pattern);
+    assert.ok(nodes["ec-result"].hidden);
+    assert.ok(!nodes["ec-submit"].disabled);
+  });
+}
+
+test("401 sends the browser through login and back", async () => {
+  const { page, window } = env({ "GET /v1/expression-context/stats/ERBB2": response({}, 401) }, { search: "?gene=ERBB2" });
+  await page.lookup("ERBB2");
+  assert.strictEqual(window.location.href, "/login?redirect_to=%2Fexpression-context%3Fgene%3DERBB2");
+});
+
+test("literature check: POST, poll until done, then refresh the statistics", async () => {
+  const states = ["queued", "running", "succeeded"];
+  let statsCalls = 0;
+  const { nodes, page, calls } = env({
+    "GET /v1/expression-context/stats/ERBB2": () => {
+      statsCalls += 1;
+      return response(statsCalls === 1 ? view() : view({ summary: { surfaced: 2, literature_pending: 0, excluded: 2 } }));
+    },
+    "POST /v1/expression-context/jobs": response({ job_id: "j1", status: "queued", status_url: "/v1/expression-context/jobs/j1" }, 202),
+    "GET /v1/expression-context/jobs/j1": () => response({
+      status: states.shift(), literature_evaluated: 1, literature_reused: 2, pair_errors: [],
+    }),
+  });
+  await page.lookup("ERBB2");
+  await nodes["ec-run"].fire("click");
+  const post = calls.find((c) => c.method === "POST");
+  assert.deepStrictEqual(JSON.parse(post.body), { gene: "ERBB2" });
+  assert.strictEqual(calls.filter((c) => c.url.endsWith("/jobs/j1")).length, 3);
+  assert.strictEqual(statsCalls, 2);
+  assert.strictEqual(nodes["ec-job-status"].textContent, "Literature check finished: 1 evaluated, 2 reused.");
+  assert.ok(nodes["ec-run"].hidden, "nothing left to check");
+});
+
+test("a failed job or a foreign status URL is reported, not followed", async () => {
+  for (const accepted of [
+    { body: { job_id: "j", status: "queued", status_url: "https://evil.example/jobs/j" }, polls: 0 },
+    { body: { job_id: "j", status: "queued", status_url: "/v1/expression-context/jobs/j" }, polls: 1 },
+  ]) {
+    const { nodes, page, calls } = env({
+      "GET /v1/expression-context/stats/ERBB2": response(view()),
+      "POST /v1/expression-context/jobs": response(accepted.body, 202),
+      "GET /v1/expression-context/jobs/j": response({ status: "failed" }),
+    });
+    await page.lookup("ERBB2");
+    await page.runLiteratureCheck();
+    assert.strictEqual(calls.filter((c) => c.url.includes("/jobs/j")).length, accepted.polls);
+    assert.ok(!nodes["ec-error"].hidden);
+    assert.ok(!nodes["ec-run"].hidden, "the check can be retried");
+  }
+});
+
+test("bundle status: provenance, pinned tag, and only a current refresh error", async () => {
+  const refresh = {
+    last_checked_at: "2026-11-06T12:00:00Z", last_error: "GitHub rate limit", last_error_at: "2026-11-06T13:00:00Z",
+    pinned_bundle_tag: "expression-stats-x-pubmed-20261102", releases_repo: "oncokb/agentic-cancer-gene-classification",
+  };
+  const { nodes, page } = env({ "GET /v1/expression-context/bundle": response({ active: BUNDLE, refresh }) });
+  await page.init();
+  const text = nodes["ec-provenance"].children.map((c) => c.text);
+  assert.ok(text.includes("Pinned to") && text.includes("Last refresh error") && text.includes("GitHub rate limit"));
+  assert.strictEqual(nodes["ec-provenance-status"].textContent, "");
+
+  const stale = { ...refresh, last_error_at: "2026-11-06T11:00:00Z" };
+  const second = env({ "GET /v1/expression-context/bundle": response({ active: { ...BUNDLE, release_url: "https://evil.example/x" }, refresh: stale }) });
+  await second.page.init();
+  const staleText = second.nodes["ec-provenance"].children.map((c) => c.text);
+  assert.ok(!staleText.includes("Last refresh error"), "an error older than the last good check is history");
+  assert.strictEqual(second.nodes["ec-provenance"].findAll((n) => n.tagName === "a").length, 0, "non-GitHub release links are not linked");
+});
+
+test("no bundle loaded yet", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/bundle": response({ active: null, refresh: { releases_repo: "r" } }) });
+  await page.init();
+  assert.strictEqual(nodes["ec-provenance-status"].textContent, "No statistics bundle is loaded yet.");
+});
+
+test("deep link ?gene= loads the gene on init", async () => {
+  const { nodes, calls } = env({
+    "GET /v1/expression-context/bundle": response({ active: BUNDLE, refresh: { releases_repo: "r" } }),
+    "GET /v1/expression-context/stats/HER2": response(view({ query: "her2" })),
+  }, { search: "?gene=her2" });
+  const page = createExpressionContextPage({
+    document: { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) },
+    window: { location: { search: "?gene=her2", pathname: "/expression-context" }, history: null, setTimeout: (fn) => fn() },
+    fetch: async (url) => (url.endsWith("/bundle")
+      ? response({ active: BUNDLE, refresh: { releases_repo: "r" } })
+      : response(view({ query: "her2" }))),
+  });
+  await page.init();
+  assert.strictEqual(nodes["ec-gene"].value, "her2");
+  assert.strictEqual(nodes["ec-gene-title"].textContent, "ERBB2 (from her2) · Entrez 2064");
+  assert.strictEqual(calls.length, 0);
+});
+
+(async () => {
+  let failed = 0;
+  for (const [name, fn] of tests) {
+    try {
+      await fn();
+      console.log(`ok - ${name}`);
+    } catch (error) {
+      failed += 1;
+      console.log(`not ok - ${name}\n${error.stack}`);
+    }
+  }
+  if (failed) {
+    console.log(`${failed} of ${tests.length} failed`);
+    process.exit(1);
+  }
+  console.log(`${tests.length} passed`);
+})();
