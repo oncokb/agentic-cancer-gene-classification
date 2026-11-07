@@ -1,0 +1,141 @@
+name: Publish expression stats bundle
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      datahub_commit:
+        description: Full datahub SHA (blank uses checked-in pin)
+        type: string
+      genes:
+        description: Comma-separated genes (blank builds all genes)
+        type: string
+      skip_precheck:
+        description: Skip PubMed counts (review artifact only)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: expression-stats-release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    # Skipped prechecks use a per-run group and cannot evict a pending PubMed build.
+    concurrency:
+      group: ${{ inputs.skip_precheck && format('expression-stats-review-{0}', github.run_id) || 'expression-stats-pubmed' }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: expression_stats
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      deployable: ${{ steps.check.outputs.deployable }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate full precheck credentials
+        env:
+          INPUT_SKIP: ${{ inputs.skip_precheck }}
+          NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+        shell: bash
+        run: |
+          if [[ "$INPUT_SKIP" != 'true' && -z "$NCBI_API_KEY" ]]; then
+            echo '::error::Precheck builds require the NCBI_API_KEY secret.'
+            exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: expression_stats/constraints.txt
+      - run: pip install -c constraints.txt setuptools
+      - run: pip install --no-build-isolation -c constraints.txt -e .
+      - name: Resolve pin and check published release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_COMMIT: ${{ inputs.datahub_commit }}
+          INPUT_GENES: ${{ inputs.genes }}
+          INPUT_SKIP: ${{ inputs.skip_precheck }}
+        run: python scripts/check_build.py
+      - uses: actions/cache@v4
+        if: steps.check.outputs.changed == 'true'
+        with:
+          path: expression_stats/.cache/objects
+          key: expression-objects-${{ runner.os }}-${{ steps.check.outputs.commit }}
+          restore-keys: expression-objects-${{ runner.os }}-
+      - uses: actions/cache@v4
+        if: steps.check.outputs.changed == 'true'
+        with:
+          path: expression_stats/.cache/hgnc
+          key: expression-hgnc-${{ steps.check.outputs.hgnc_sha }}
+      - uses: actions/cache/restore@v4
+        if: steps.check.outputs.changed == 'true' && inputs.skip_precheck != true
+        with:
+          path: expression_stats/.cache/pubmed.sqlite3*
+          key: expression-pubmed-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: expression-pubmed-
+      - name: Build
+        if: steps.check.outputs.changed == 'true'
+        timeout-minutes: 330
+        env:
+          DATAHUB_COMMIT: ${{ steps.check.outputs.commit }}
+          INPUT_GENES: ${{ inputs.genes }}
+          INPUT_SKIP: ${{ inputs.skip_precheck }}
+          NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+        shell: bash
+        run: |
+          args=(--datahub-commit "$DATAHUB_COMMIT" --out artifacts)
+          if [[ -n "${INPUT_GENES//[[:space:],]/}" ]]; then args+=(--genes "$INPUT_GENES"); fi
+          if [[ "$INPUT_SKIP" == 'true' ]]; then args+=(--skip-precheck); fi
+          python -m gene_expression_relevance build "${args[@]}"
+          python scripts/bundle.py artifacts bundle
+      - uses: actions/cache/save@v4
+        if: always() && steps.check.outputs.changed == 'true' && inputs.skip_precheck != true && hashFiles('expression_stats/.cache/pubmed.sqlite3') != ''
+        with:
+          path: expression_stats/.cache/pubmed.sqlite3*
+          key: expression-pubmed-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.changed == 'true'
+        with:
+          name: expression-stats-review
+          path: expression_stats/bundle
+      - uses: actions/upload-artifact@v4
+        if: failure() && hashFiles('expression_stats/artifacts-failed/controls-report.json') != ''
+        with:
+          name: expression-stats-failed-controls
+          path: expression_stats/artifacts-failed
+      - uses: actions/upload-artifact@v4
+        if: failure() && hashFiles('expression_stats/artifacts-incomplete/precheck-report.json') != ''
+        with:
+          name: expression-stats-incomplete-precheck
+          path: expression_stats/artifacts-incomplete
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && needs.build.outputs.changed == 'true' && needs.build.outputs.deployable == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: expression-stats-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: expression-stats-review
+          path: expression_stats/bundle
+      - name: Publish verified full bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: expression_stats
+        run: python scripts/publish.py bundle

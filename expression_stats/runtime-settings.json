@@ -1,0 +1,6 @@
+{
+  "precheck_requests_per_second": 3.0,
+  "precheck_time_budget_seconds": 18000,
+  "build_time_budget_seconds": 18900,
+  "precheck_ttl_jitter_fraction": 0.5
+}

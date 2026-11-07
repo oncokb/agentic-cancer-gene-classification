@@ -1,0 +1,100 @@
+{
+  "coadread": {
+    "cancer_type_ids": [
+      "coad",
+      "read",
+      "coadread"
+    ],
+    "code": "coadread"
+  },
+  "dlbc": {
+    "cancer_type_ids": [
+      "dlbclnos"
+    ],
+    "code": "dlbc"
+  },
+  "gbm": {
+    "cancer_type_ids": [
+      "difg"
+    ],
+    "code": "gbm"
+  },
+  "kich": {
+    "cancer_type_ids": [
+      "chrcc"
+    ],
+    "code": "kich"
+  },
+  "kirc": {
+    "cancer_type_ids": [
+      "ccrcc"
+    ],
+    "code": "kirc"
+  },
+  "kirp": {
+    "cancer_type_ids": [
+      "prcc"
+    ],
+    "code": "kirp"
+  },
+  "laml": {
+    "cancer_type_ids": [
+      "aml"
+    ],
+    "code": "laml"
+  },
+  "lgg": {
+    "cancer_type_ids": [
+      "difg"
+    ],
+    "code": "lgg"
+  },
+  "lihc": {
+    "cancer_type_ids": [
+      "hcc"
+    ],
+    "code": "lihc"
+  },
+  "meso": {
+    "cancer_type_ids": [
+      "plmeso"
+    ],
+    "code": "meso"
+  },
+  "ov": {
+    "cancer_type_ids": [
+      "hgsoc"
+    ],
+    "code": "ov"
+  },
+  "pcpg": {
+    "cancer_type_ids": [
+      "soft_tissue"
+    ],
+    "code": "pcpg"
+  },
+  "sarc": {
+    "cancer_type_ids": [
+      "soft_tissue"
+    ],
+    "code": "sarc"
+  },
+  "tgct": {
+    "cancer_type_ids": [
+      "testis"
+    ],
+    "code": "tgct"
+  },
+  "thca": {
+    "cancer_type_ids": [
+      "thpa"
+    ],
+    "code": "thca"
+  },
+  "uvm": {
+    "cancer_type_ids": [
+      "um"
+    ],
+    "code": "uvm"
+  }
+}

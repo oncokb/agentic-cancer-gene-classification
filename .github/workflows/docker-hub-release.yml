@@ -6,7 +6,7 @@ on:
 
 jobs:
   build_and_publish:
-    if: github.repository == 'oncokb/agentic-cancer-gene-classification'
+    if: github.repository == 'oncokb/agentic-cancer-gene-classification' && !startsWith(github.event.release.tag_name, 'expression-stats-')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

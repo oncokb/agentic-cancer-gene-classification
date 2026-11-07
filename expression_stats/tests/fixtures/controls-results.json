@@ -1,0 +1,317 @@
+[
+  {
+    "gene": "KLK3",
+    "tcga": "PRAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "AR",
+    "tcga": "PRAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "ALB",
+    "tcga": "LIHC",
+    "stats_pass": true
+  },
+  {
+    "gene": "ESR1",
+    "tcga": "BRCA",
+    "stats_pass": true
+  },
+  {
+    "gene": "NKX2-1",
+    "tcga": "LUAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "TG",
+    "tcga": "THCA",
+    "stats_pass": true
+  },
+  {
+    "gene": "PAX8",
+    "tcga": "KIRC",
+    "stats_pass": true
+  },
+  {
+    "gene": "PAX8",
+    "tcga": "THCA",
+    "stats_pass": true
+  },
+  {
+    "gene": "PAX8",
+    "tcga": "OV",
+    "stats_pass": true
+  },
+  {
+    "gene": "GATA3",
+    "tcga": "BRCA",
+    "stats_pass": true
+  },
+  {
+    "gene": "GATA3",
+    "tcga": "BLCA",
+    "stats_pass": true
+  },
+  {
+    "gene": "CDX2",
+    "tcga": "COADREAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "SOX10",
+    "tcga": "SKCM",
+    "stats_pass": true
+  },
+  {
+    "gene": "PMEL",
+    "tcga": "SKCM",
+    "stats_pass": true
+  },
+  {
+    "gene": "TYR",
+    "tcga": "SKCM",
+    "stats_pass": true
+  },
+  {
+    "gene": "MS4A1",
+    "tcga": "DLBC",
+    "stats_pass": true
+  },
+  {
+    "gene": "MPO",
+    "tcga": "LAML",
+    "stats_pass": true
+  },
+  {
+    "gene": "CALB2",
+    "tcga": "MESO",
+    "stats_pass": true
+  },
+  {
+    "gene": "CYP11B1",
+    "tcga": "ACC",
+    "stats_pass": true
+  },
+  {
+    "gene": "TH",
+    "tcga": "PCPG",
+    "stats_pass": true
+  },
+  {
+    "gene": "GFAP",
+    "tcga": "LGG",
+    "stats_pass": true
+  },
+  {
+    "gene": "KRT5",
+    "tcga": "LUSC",
+    "stats_pass": true
+  },
+  {
+    "gene": "WT1",
+    "tcga": "MESO",
+    "stats_pass": true
+  },
+  {
+    "gene": "POU5F1",
+    "tcga": "TGCT",
+    "stats_pass": true
+  },
+  {
+    "gene": "CD1A",
+    "tcga": "THYM",
+    "stats_pass": true
+  },
+  {
+    "gene": "ERBB2",
+    "tcga": "BRCA",
+    "stats_pass": true
+  },
+  {
+    "gene": "ERBB2",
+    "tcga": "STAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "EGFR",
+    "tcga": "GBM",
+    "stats_pass": true
+  },
+  {
+    "gene": "MDM2",
+    "tcga": "SARC",
+    "stats_pass": true
+  },
+  {
+    "gene": "CDK4",
+    "tcga": "SARC",
+    "stats_pass": true
+  },
+  {
+    "gene": "FGFR3",
+    "tcga": "BLCA",
+    "stats_pass": true
+  },
+  {
+    "gene": "CCNE1",
+    "tcga": "OV",
+    "stats_pass": true
+  },
+  {
+    "gene": "CCNE1",
+    "tcga": "UCS",
+    "stats_pass": true
+  },
+  {
+    "gene": "SOX2",
+    "tcga": "LUSC",
+    "stats_pass": true
+  },
+  {
+    "gene": "MET",
+    "tcga": "KIRP",
+    "stats_pass": true
+  },
+  {
+    "gene": "GAPDH",
+    "tcga": "BRCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "ACTB",
+    "tcga": "BRCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "HPRT1",
+    "tcga": "BRCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "RPLP0",
+    "tcga": "BRCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "TUBB",
+    "tcga": "BRCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "PPIA",
+    "tcga": "LUAD",
+    "stats_pass": false
+  },
+  {
+    "gene": "TPT1",
+    "tcga": "BRCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "EEF1A1",
+    "tcga": "LUAD",
+    "stats_pass": false
+  },
+  {
+    "gene": "KLK3",
+    "tcga": "ACC",
+    "stats_pass": false
+  },
+  {
+    "gene": "KLK3",
+    "tcga": "COADREAD",
+    "stats_pass": false
+  },
+  {
+    "gene": "ALB",
+    "tcga": "LGG",
+    "stats_pass": false
+  },
+  {
+    "gene": "ALB",
+    "tcga": "PCPG",
+    "stats_pass": false
+  },
+  {
+    "gene": "ALB",
+    "tcga": "KIRC",
+    "stats_pass": false
+  },
+  {
+    "gene": "ALB",
+    "tcga": "SKCM",
+    "stats_pass": false
+  },
+  {
+    "gene": "ESR1",
+    "tcga": "PRAD",
+    "stats_pass": false
+  },
+  {
+    "gene": "ESR1",
+    "tcga": "THCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "TG",
+    "tcga": "BRCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "MS4A1",
+    "tcga": "PRAD",
+    "stats_pass": false
+  },
+  {
+    "gene": "CYP11B1",
+    "tcga": "SKCM",
+    "stats_pass": false
+  },
+  {
+    "gene": "NKX2-1",
+    "tcga": "COADREAD",
+    "stats_pass": false
+  },
+  {
+    "gene": "CDX2",
+    "tcga": "LUAD",
+    "stats_pass": false
+  },
+  {
+    "gene": "GFAP",
+    "tcga": "SKCM",
+    "stats_pass": false
+  },
+  {
+    "gene": "POU5F1",
+    "tcga": "BRCA",
+    "stats_pass": false
+  },
+  {
+    "gene": "PMEL",
+    "tcga": "COADREAD",
+    "stats_pass": false
+  },
+  {
+    "gene": "GAPDH",
+    "tcga": "TGCT",
+    "stats_pass": false
+  },
+  {
+    "gene": "ACTB",
+    "tcga": "DLBC",
+    "stats_pass": false
+  },
+  {
+    "gene": "B2M",
+    "tcga": "DLBC",
+    "stats_pass": false
+  },
+  {
+    "gene": "ERBB2",
+    "tcga": "ESCA",
+    "stats_pass": false
+  }
+]
