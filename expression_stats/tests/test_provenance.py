@@ -65,6 +65,7 @@ def test_workflow_deployment_policy(tmp_path, monkeypatch, genes, skip, deployab
         INPUT_GENES=genes,
         INPUT_SKIP=str(skip).lower(),
         GITHUB_OUTPUT=str(output),
+        GITHUB_REF="refs/heads/main",  # Main-only deployment/early-exit policy under test.
     ).items():
         monkeypatch.setenv(key, value)
     module.main()
@@ -153,6 +154,7 @@ def test_live_mapping_changes_invalidate_early_exit(tmp_path, monkeypatch, mappi
         INPUT_GENES="",
         INPUT_SKIP="false",
         GITHUB_OUTPUT=str(output),
+        GITHUB_REF="refs/heads/main",  # Main-only deployment/early-exit policy under test.
     ).items():
         monkeypatch.setenv(key, value)
     module.main()

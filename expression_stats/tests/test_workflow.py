@@ -84,11 +84,12 @@ def test_pipeline_ci_checks_src_changes():
     assert workflow.count("'src/**'") == 2
 
 
-def test_branch_dispatch_always_builds_review_artifact(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ref", ["refs/heads/review", "refs/pull/168/merge"])
+def test_branch_dispatch_always_builds_review_artifact(tmp_path, monkeypatch, ref):
     import runpy
 
     checker = runpy.run_path("scripts/check_build.py")
-    monkeypatch.setenv("GITHUB_REF", "refs/heads/review")
+    monkeypatch.setenv("GITHUB_REF", ref)
     monkeypatch.setenv("INPUT_COMMIT", "a" * 40)
     monkeypatch.setenv("INPUT_GENES", "")
     monkeypatch.setenv("INPUT_SKIP", "false")
@@ -96,7 +97,9 @@ def test_branch_dispatch_always_builds_review_artifact(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_OUTPUT", str(output))
     namespace = checker["main"].__globals__
     monkeypatch.setitem(namespace, "published_manifest", lambda: {})
-    monkeypatch.setitem(namespace, "unchanged", lambda *args: True)
+    monkeypatch.setitem(
+        namespace, "unchanged", lambda *args: pytest.fail("Non-main builds must not early-exit")
+    )
     checker["main"]()
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     assert values["changed"] == "true"
