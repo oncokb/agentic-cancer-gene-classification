@@ -33,15 +33,19 @@
     return PMID.test(text) ? `https://pubmed.ncbi.nlm.nih.gov/${text}/` : null;
   }
 
-  // Public cBioPortal cross-cancer expression plot. A single study must use the
-  // CANCER_TYPE horizontal selection; CANCER_STUDY with one study silently
-  // shows the wrong plot.
-  function expressionURL(symbol, studyIds) {
+  // Public cBioPortal expression plot. `horizontal` is the clinical attribute
+  // shown on the x-axis ("CANCER_STUDY" = study of origin, "CANCER_TYPE_DETAILED"
+  // = mRNA vs Dx). CANCER_STUDY with exactly one study silently opens the wrong
+  // plot (Mutation Count), so fall back to the detailed-diagnosis view.
+  function expressionURL(symbol, studyIds, horizontal) {
+    const selected = horizontal === "CANCER_STUDY" && studyIds.length === 1
+      ? "CANCER_TYPE_DETAILED"
+      : horizontal;
     const query = new URLSearchParams({
       cancer_study_list: studyIds.join(","),
       gene_list: symbol,
       case_set_id: "all",
-      plots_horz_selection: JSON.stringify({ dataType: "clinical_attribute", selectedDataSourceOption: studyIds.length > 1 ? "CANCER_STUDY" : "CANCER_TYPE" }),
+      plots_horz_selection: JSON.stringify({ dataType: "clinical_attribute", selectedDataSourceOption: selected }),
       plots_vert_selection: JSON.stringify({ dataType: "MRNA_EXPRESSION", selectedDataSourceOption: "rna_seq_v2_mrna", logScale: "true" }),
     });
     return `https://www.cbioportal.org/results/plots?${query}`;
@@ -184,9 +188,9 @@
       return (flags || []).map((flag) => badge(FLAG_LABELS[flag] || flag, flag === "tissue_of_origin_risk" ? "warn" : "neutral"));
     }
 
-    function cbioLink(symbol, studyIds) {
-      const link = node("a", "View in cBioPortal");
-      link.setAttribute("href", expressionURL(symbol, studyIds));
+    function cbioLink(label, symbol, studyIds, horizontal) {
+      const link = node("a", label);
+      link.setAttribute("href", expressionURL(symbol, studyIds, horizontal));
       link.setAttribute("target", "_blank");
       link.setAttribute("rel", "noopener noreferrer");
       return link;
@@ -194,7 +198,7 @@
 
     function cbioportalCell(pair, symbol) {
       if (!pair.study_id || !symbol) return [];
-      return [cbioLink(symbol, [pair.study_id])];
+      return [cbioLink("mRNA vs Dx", symbol, [pair.study_id], "CANCER_TYPE_DETAILED")];
     }
 
     function renderCbioCompare(view) {
@@ -208,11 +212,14 @@
         studyIds.push(pair.study_id);
       }
       if (!studyIds.length || !view.hugo_symbol) return;
-      const link = node("a", "Compare across all 32 cancer types in cBioPortal");
-      link.setAttribute("href", expressionURL(view.hugo_symbol, studyIds));
-      link.setAttribute("target", "_blank");
-      link.setAttribute("rel", "noopener noreferrer");
-      container.appendChild(link);
+      container.appendChild(cbioLink(
+        "Compare across all 32 cancer types in cBioPortal",
+        view.hugo_symbol, studyIds, "CANCER_STUDY",
+      ));
+      container.appendChild(cbioLink(
+        "mRNA vs Dx across all 32 (detailed diagnosis)",
+        view.hugo_symbol, studyIds, "CANCER_TYPE_DETAILED",
+      ));
     }
 
     function renderRow(pair, symbol) {

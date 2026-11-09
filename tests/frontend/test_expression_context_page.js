@@ -46,7 +46,7 @@ const IDS = [
 const response = (body, status = 200) => ({ status, json: async () => body });
 
 function cBioPortalLinks(node) {
-  return node.findAll((n) => n.tagName === "a" && n.textContent === "View in cBioPortal");
+  return node.findAll((n) => n.tagName === "a" && n.textContent === "mRNA vs Dx");
 }
 
 function plotParams(href) {
@@ -147,6 +147,15 @@ function view(overrides = {}) {
   };
 }
 
+const ALL_STUDIES = "brca_tcga_pan_can_atlas_2018,stad_tcga_pan_can_atlas_2018,gbm_tcga_pan_can_atlas_2018";
+
+function viewWithStudyIds() {
+  const v = view();
+  v.pairs[2] = { ...v.pairs[2], study_id: null };
+  v.pairs.push({ ...v.pairs[0] });
+  return v;
+}
+
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
@@ -216,21 +225,14 @@ test("renders statistics, calls, flags and the literature verdict", async () => 
   assert.strictEqual(page.state.view.hugo_symbol, "ERBB2");
 });
 
-test("gene-level cBioPortal link compares every study across cancer types", async () => {
-  const v = view();
-  v.pairs[2] = { ...v.pairs[2], study_id: null };
-  v.pairs.push({ ...v.pairs[0] });
-  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+test("gene-level primary link uses CANCER_STUDY across every study", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(viewWithStudyIds()) });
   await page.lookup("ERBB2");
   const links = nodes["ec-cbio"].findAll((n) => n.tagName === "a");
-  assert.strictEqual(links.length, 1);
-  assert.strictEqual(links[0].textContent, "Compare across all 32 cancer types in cBioPortal");
-  const p = plotParams(links[0].getAttribute("href"));
-  assert.strictEqual(
-    p.studies,
-    "brca_tcga_pan_can_atlas_2018,stad_tcga_pan_can_atlas_2018,gbm_tcga_pan_can_atlas_2018",
-    "de-duplicated and skips missing study IDs",
-  );
+  const primary = links.find((a) => a.textContent === "Compare across all 32 cancer types in cBioPortal");
+  assert.ok(primary, "primary comparison link is rendered");
+  const p = plotParams(primary.getAttribute("href"));
+  assert.strictEqual(p.studies, ALL_STUDIES, "de-duplicated and skips missing study IDs");
   assert.strictEqual(p.gene, "ERBB2");
   assert.strictEqual(p.caseSet, "all");
   assert.strictEqual(p.horizontal.dataType, "clinical_attribute");
@@ -238,22 +240,54 @@ test("gene-level cBioPortal link compares every study across cancer types", asyn
   assert.strictEqual(p.vertical.dataType, "MRNA_EXPRESSION");
   assert.strictEqual(p.vertical.selectedDataSourceOption, "rna_seq_v2_mrna");
   assert.strictEqual(p.vertical.logScale, "true");
-  assert.strictEqual(links[0].getAttribute("target"), "_blank");
-  assert.strictEqual(links[0].getAttribute("rel"), "noopener noreferrer");
+  assert.strictEqual(primary.getAttribute("target"), "_blank");
+  assert.strictEqual(primary.getAttribute("rel"), "noopener noreferrer");
 });
 
-test("each row links to its single study with the CANCER_TYPE selection", async () => {
+test("gene-level secondary link uses CANCER_TYPE_DETAILED across every study", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(viewWithStudyIds()) });
+  await page.lookup("ERBB2");
+  const links = nodes["ec-cbio"].findAll((n) => n.tagName === "a");
+  const secondary = links.find((a) => a.textContent === "mRNA vs Dx across all 32 (detailed diagnosis)");
+  assert.ok(secondary, "detailed-diagnosis comparison link is rendered");
+  const p = plotParams(secondary.getAttribute("href"));
+  assert.strictEqual(p.studies, ALL_STUDIES);
+  assert.strictEqual(p.gene, "ERBB2");
+  assert.strictEqual(p.horizontal.selectedDataSourceOption, "CANCER_TYPE_DETAILED");
+  assert.strictEqual(secondary.getAttribute("target"), "_blank");
+  assert.strictEqual(secondary.getAttribute("rel"), "noopener noreferrer");
+});
+
+test("each row links to its single study with the mRNA vs Dx selection", async () => {
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
   await page.lookup("ERBB2");
   const links = cBioPortalLinks(nodes["ec-tbody"].children[0]);
   assert.strictEqual(links.length, 1);
-  assert.strictEqual(links[0].textContent, "View in cBioPortal");
+  assert.strictEqual(links[0].textContent, "mRNA vs Dx");
   const p = plotParams(links[0].getAttribute("href"));
   assert.strictEqual(p.studies, "brca_tcga_pan_can_atlas_2018");
   assert.strictEqual(p.gene, "ERBB2");
-  assert.strictEqual(p.horizontal.selectedDataSourceOption, "CANCER_TYPE");
+  assert.strictEqual(p.horizontal.selectedDataSourceOption, "CANCER_TYPE_DETAILED");
   assert.strictEqual(links[0].getAttribute("target"), "_blank");
   assert.strictEqual(links[0].getAttribute("rel"), "noopener noreferrer");
+});
+
+test("the one-study guard never yields CANCER_STUDY", async () => {
+  const direct = plotParams(expressionURL("ERBB2", ["brca_tcga_pan_can_atlas_2018"], "CANCER_STUDY"));
+  assert.strictEqual(direct.horizontal.selectedDataSourceOption, "CANCER_TYPE_DETAILED");
+
+  const v = view();
+  v.pairs = [v.pairs[0]];
+  v.summary = { surfaced: 1, literature_pending: 0, excluded: 0 };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  const links = nodes["ec-cbio"].findAll((n) => n.tagName === "a");
+  assert.strictEqual(links.length, 2);
+  for (const link of links) {
+    assert.notStrictEqual(plotParams(link.getAttribute("href")).horizontal.selectedDataSourceOption, "CANCER_STUDY");
+  }
+  const primary = links.find((a) => a.textContent === "Compare across all 32 cancer types in cBioPortal");
+  assert.strictEqual(plotParams(primary.getAttribute("href")).horizontal.selectedDataSourceOption, "CANCER_TYPE_DETAILED");
 });
 
 test("a hyphenated symbol like NKX2-1 is encoded correctly", async () => {
@@ -281,7 +315,7 @@ test("a row without a study_id renders no cBioPortal link", async () => {
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
   await page.lookup("ERBB2");
   assert.deepStrictEqual(cBioPortalLinks(nodes["ec-tbody"].children[1]), []);
-  assert.strictEqual(nodes["ec-cbio"].findAll((n) => n.tagName === "a").length, 1, "other studies still compare");
+  assert.strictEqual(nodes["ec-cbio"].findAll((n) => n.tagName === "a").length, 2, "other studies still compare");
 });
 
 test("excluded rows still link to cBioPortal", async () => {
@@ -291,7 +325,7 @@ test("excluded rows still link to cBioPortal", async () => {
   for (const index of [2, 3]) {
     const link = cBioPortalLinks(rows[index])[0];
     assert.ok(link, `excluded row ${index} should have a cBioPortal link`);
-    assert.strictEqual(plotParams(link.getAttribute("href")).horizontal.selectedDataSourceOption, "CANCER_TYPE");
+    assert.strictEqual(plotParams(link.getAttribute("href")).horizontal.selectedDataSourceOption, "CANCER_TYPE_DETAILED");
   }
 });
 

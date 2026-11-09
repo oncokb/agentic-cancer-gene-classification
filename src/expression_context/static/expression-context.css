@@ -43,6 +43,10 @@
   margin: 4px 0;
 }
 
+.ec-cbio a {
+  margin-right: 12px;
+}
+
 .ec-cbio-note {
   max-width: 60rem;
   margin: 4px 0 0;
