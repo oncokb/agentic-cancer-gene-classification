@@ -283,8 +283,15 @@ modelled on ACGC's fusion-partner evidence check:
    `EXPRESSION_CONTEXT_JUDGE_MODEL`, default ACGC's selection model) judges
    each paper: does it describe the gene's expression or role **in this tumor
    type** (code + name + names)? Papers about a different tumor type never
-   count. It returns an overall `supported | not_supported | insufficient`
-   and a short rationale. The papers are passed as one bounded JSON array
+   count. A paper whose evidence for the gene in this tumor type is solely a
+   bioinformatic or pan-cancer re-analysis of TCGA, GTEx, GEO or comparable
+   public datasets does not count either: our statistics already come from
+   TCGA, so such a paper repeats our finding rather than confirming it. A
+   paper that uses TCGA **and** also reports independent evidence (its own
+   patient cohort, IHC, in vitro or in vivo work, clinical data) still counts,
+   and merely mentioning TCGA in passing has no effect. It returns an overall
+   `supported | not_supported | insufficient` and a short rationale. The
+   papers are passed as one bounded JSON array
    (title ≤ 400 chars, abstract ≤ `JUDGE_ABSTRACT_CHARS`; `<`, `>`, `&`
    escaped) inside `<papers>` tags, and the instructions say paper text is
    untrusted data that must never be followed or speak for another paper.

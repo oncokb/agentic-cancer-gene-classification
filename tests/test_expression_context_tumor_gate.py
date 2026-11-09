@@ -78,6 +78,16 @@ KICH_PAPER = rec(
     "30000020", "KLK3 transcripts in chromophobe renal cell carcinoma",
     "We report KLK3 mRNA expression in a subset of chromophobe renal cell carcinoma tumors.",
 )
+# A paper whose only evidence is a re-analysis of TCGA (our own statistics
+# source) and an independent institutional cohort with IHC (which counts).
+TCGA_REANALYSIS = rec(
+    "30000030", "Pan-cancer re-analysis of KLK3 expression",
+    "We re-analysed TCGA PRAD RNA-seq data and found KLK3 elevated in prostate cancer.",
+)
+INDEPENDENT_PRAD = rec(
+    "30000031", "KLK3 immunohistochemistry in prostate cancer",
+    "In our institutional cohort KLK3 protein was detected by IHC in prostate cancer tissue.",
+)
 
 
 class Retriever:
@@ -295,6 +305,50 @@ async def test_prad_supported_on_prostate_papers():
     verdict = await gate(PROSTATE_PAPERS, judge).evaluate("KLK3", PRAD)
     assert verdict.supported
     assert verdict.pmids == ["30000001", "30000002", "30000003", "30000005"]
+
+
+# ------------------------------------------- TCGA re-analysis is not evidence
+
+
+async def test_tcga_reanalysis_rule_is_in_the_judge_prompt():
+    judge = Judge(result={
+        "papers": [{"pmid": "30000030", "tumor_specific": False}],
+        "verdict": "not_supported", "rationale": "r",
+    })
+    await gate([TCGA_REANALYSIS], judge).evaluate("KLK3", PRAD)
+    prompt = " ".join(judge.calls[0]["system"].split())
+    assert "TCGA" in prompt and "GTEx" in prompt and "GEO" in prompt
+    assert "bioinformatic or pan-cancer re-analysis" in prompt
+    assert "independent evidence" in prompt and "in passing" in prompt
+
+
+async def test_tcga_only_reanalysis_is_not_supported_and_not_cited():
+    judge = Judge(result={
+        "papers": [{"pmid": "30000030", "tumor_specific": False,
+                    "reason": "Its only evidence is a re-analysis of TCGA."}],
+        "verdict": "not_supported", "rationale": "Only a re-analysis of TCGA.",
+    })
+    verdict = await gate([TCGA_REANALYSIS], judge).evaluate("KLK3", PRAD)
+    assert not verdict.supported and verdict.verdict == "not_supported"
+    assert verdict.pmids == []
+    assert [p.pmid for p in verdict.papers] == ["30000030"]
+    assert verdict.papers[0].tumor_specific is False
+
+
+async def test_tcga_reanalysis_does_not_count_but_independent_paper_does():
+    judge = Judge(result={
+        "papers": [
+            {"pmid": "30000030", "tumor_specific": False,
+             "reason": "TCGA re-analysis only."},
+            {"pmid": "30000031", "tumor_specific": True,
+             "reason": "Own institutional cohort with IHC."},
+        ],
+        "verdict": "supported", "rationale": "Independent IHC cohort (PMID 30000031).",
+    })
+    verdict = await gate([TCGA_REANALYSIS, INDEPENDENT_PRAD], judge).evaluate("KLK3", PRAD)
+    assert verdict.supported and verdict.verdict == "supported"
+    assert verdict.pmids == ["30000031"]
+    assert "30000030" not in verdict.pmids
 
 
 # ------------------------------------------------------- PMID validation

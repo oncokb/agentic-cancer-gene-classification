@@ -106,6 +106,14 @@ For each paper decide tumor_specific:
   that the gene is absent/negative in this tumor type, or if the gene is
   studied in another tumor type. Papers about a different tumor type never
   count, however strong they are for that other tumor type.
+- false if the paper's evidence for this gene in this tumor type is SOLELY a
+  bioinformatic or pan-cancer re-analysis of public datasets such as TCGA,
+  GTEx, GEO or comparable resources. Our statistics already come from TCGA,
+  so such a paper repeats our finding rather than confirming it in the
+  literature. This does not apply when the paper also reports independent
+  evidence (its own patient cohort, immunohistochemistry, in vitro or in vivo
+  work, or clinical data), even if it uses TCGA too, or when it merely
+  mentions TCGA in passing.
 
 Then give an overall verdict:
 - supported: at least one paper is tumor_specific and, taken together, the
