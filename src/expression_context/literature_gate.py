@@ -117,46 +117,25 @@ _RECOVERY_VERDICTS = ("supported", "not_supported", "insufficient")
 
 
 def _validate_judge_call(
-    result: Any,
     verdict: str,
     judged: Dict[str, Dict[str, Any]],
-    sent_pmids: set[str],
     *,
     call: str,
 ) -> None:
     """Reject a judge call that contradicts its own papers.
 
-    ``judged`` contains only papers sent to that call. A call that says
-    ``supported`` while judging none of its own papers specific, or
-    ``not_supported`` while judging one of them specific, is contradictory and
-    must not be stored or merged into a stored verdict. A specific judgement
-    for a PMID that was not sent to this call is also contradictory.
-    ``insufficient`` is allowed to carry a specific paper: the prompt permits
-    evidence that is specific but too thin.
+    ``judged`` contains only papers sent to that call (any PMIDs never sent to
+    it have already been discarded). A call that says ``supported`` while
+    judging none of its own papers specific, or ``not_supported`` while judging
+    one of them specific, is contradictory and must not be stored or merged into
+    a stored verdict. ``insufficient`` is allowed to carry a specific paper: the
+    prompt permits evidence that is specific but too thin.
     """
     if verdict not in _RECOVERY_VERDICTS:
         raise LiteratureGateError(
             "tumor-specific judgement could not be reconciled: "
             f"invalid verdict {verdict!r}"
         )
-
-    papers = result.get("papers") if isinstance(result, dict) else None
-    if isinstance(papers, list):
-        foreign = []
-        for entry in papers:
-            if not isinstance(entry, dict) or entry.get("tumor_specific") is not True:
-                continue
-            raw_pmid = entry.get("pmid")
-            if isinstance(raw_pmid, bool) or not isinstance(raw_pmid, (str, int)):
-                continue
-            pmid = str(raw_pmid).strip()
-            if pmid not in sent_pmids:
-                foreign.append(pmid)
-        if foreign:
-            raise LiteratureGateError(
-                f"tumor-specific judgement is contradictory: {call} judged "
-                f"{foreign[0]!r} tumor-specific although it was never sent to it"
-            )
 
     specific = [pmid for pmid, entry in judged.items() if entry["tumor_specific"]]
     if verdict == "not_supported" and specific:
@@ -469,9 +448,7 @@ class TumorSpecificGate:
             result, sent, hugo_symbol, tumor
         )
         first_judged = dict(judged)
-        _validate_judge_call(
-            result, verdict, first_judged, set(sent), call="first judgement"
-        )
+        _validate_judge_call(verdict, first_judged, call="first judgement")
         if not missing:
             return verdict, judged, rationale
 
@@ -488,8 +465,7 @@ class TumorSpecificGate:
             pmid: entry for pmid, entry in retried.items() if pmid in missing
         }
         _validate_judge_call(
-            retry, recovery_verdict, recovery_judged, set(missing),
-            call="recovery judgement",
+            recovery_verdict, recovery_judged, call="recovery judgement"
         )
         for pmid, entry in recovery_judged.items():
             judged.setdefault(pmid, entry)

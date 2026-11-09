@@ -307,13 +307,17 @@ async def test_model_saying_insufficient_with_specific_paper_is_accepted():
 
 async def test_paper_about_another_tumor_never_counts_even_if_model_marks_it():
     """The model calls a prostate-only paper (never sent: it doesn't mention
-    KICH) tumor-specific: that contradicts the sent papers and is rejected."""
+    KICH) tumor-specific: it is dropped, and supported without any sent paper
+    judged specific is rejected."""
     judge = Judge(result={
         "papers": [{"pmid": "30000001", "tumor_specific": True},
                    {"pmid": "30000010", "tumor_specific": False}],
         "verdict": "supported", "rationale": "PSA",
     })
-    with pytest.raises(LiteratureGateError, match="never sent"):
+    with pytest.raises(
+        LiteratureGateError,
+        match="supported without judging any of its own papers",
+    ):
         await gate(PROSTATE_PAPERS + [RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
 
 
@@ -398,8 +402,8 @@ async def test_tcga_reanalysis_does_not_count_but_independent_paper_does():
 async def test_hallucinated_pmids_are_dropped():
     judge = Judge(result={
         "papers": [
-            {"pmid": "99999999", "tumor_specific": False},  # never retrieved
-            {"pmid": "PMID:30000020", "tumor_specific": False},  # garbled
+            {"pmid": "99999999", "tumor_specific": True},  # never retrieved
+            {"pmid": "PMID:30000020", "tumor_specific": True},  # garbled
             {"pmid": "30000020", "tumor_specific": True},
             {"pmid": "30000020", "tumor_specific": False},  # duplicate: first wins
         ],
@@ -416,7 +420,10 @@ async def test_only_hallucinated_specific_pmid_is_rejected():
                    {"pmid": "30000010", "tumor_specific": False}],
         "verdict": "supported", "rationale": "see PMID 99999999",
     })
-    with pytest.raises(LiteratureGateError, match="never sent"):
+    with pytest.raises(
+        LiteratureGateError,
+        match="supported without judging any of its own papers",
+    ):
         await gate([RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
 
 
@@ -591,8 +598,11 @@ async def test_recovery_rejects_recovery_not_supported_with_its_own_specific_pap
 
 
 async def test_recovery_rejects_specific_paper_never_sent_to_the_recovery_call():
-    """The recovery call says supported but its only specific paper was never
-    sent to it (it belongs to the first call). That must raise."""
+    """The recovery call cannot overwrite earlier judgements or add papers: an
+    unsent PMID (from the first call or invented) is ignored, so a recovery
+    call that says supported with only unsent specific PMIDs raises, and when
+    its own verdict is consistent the unsent PMIDs have no effect on the merged
+    result."""
     calls = []
 
     async def judge(**kwargs):
@@ -605,13 +615,47 @@ async def test_recovery_rejects_specific_paper_never_sent_to_the_recovery_call()
             }
         return {
             "papers": [{"pmid": p, "tumor_specific": False} for p in sent]
-            + [{"pmid": "30000010", "tumor_specific": True}],
+            + [
+                {"pmid": "30000010", "tumor_specific": True},
+                {"pmid": "99999999", "tumor_specific": True},
+            ],
             "verdict": "supported", "rationale": "r",
         }
 
-    with pytest.raises(LiteratureGateError, match="never sent"):
+    with pytest.raises(
+        LiteratureGateError,
+        match="supported without judging any of its own papers",
+    ):
         await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
     assert calls[1] == ["30000020"]
+
+    calls.clear()
+
+    async def consistent_judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [{"pmid": p, "tumor_specific": False} for p in sent if p != "30000020"],
+                "verdict": "not_supported", "rationale": "r",
+            }
+        return {
+            "papers": [{"pmid": p, "tumor_specific": False} for p in sent]
+            + [
+                {"pmid": "30000010", "tumor_specific": True},
+                {"pmid": "99999999", "tumor_specific": True},
+            ],
+            "verdict": "not_supported", "rationale": "r",
+        }
+
+    verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], consistent_judge).evaluate("KLK3", KICH)
+    assert calls[1] == ["30000020"]
+    assert verdict.verdict == "not_supported" and not verdict.supported
+    assert verdict.pmids == []
+    assert {p.pmid: p.tumor_specific for p in verdict.papers} == {
+        "30000010": False,
+        "30000020": False,
+    }
 
 
 async def test_both_insufficient_calls_cannot_become_supported():
