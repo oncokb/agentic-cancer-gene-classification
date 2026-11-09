@@ -252,7 +252,8 @@ What ACGC relies on from the contract:
   tumor-specific literature verdict with only the tumor-specific citations
   for passing pairs, the bundle/release provenance, and start the
   literature check. Its files live in `src/expression_context/static/`; a
-  "Expression stats" tab is added to the main page only while enabled.
+  "Expression stats" tab is added to the main page only while enabled and
+  `EXPRESSION_CONTEXT_NAV_TAB_ENABLED=true`.
 - All API routes are behind `require_auth`.
 
 ### Literature verdict (`literature_gate = "acgc_tumor_specific_v2"`)
