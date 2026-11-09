@@ -110,10 +110,15 @@ For each paper decide tumor_specific:
   bioinformatic or pan-cancer re-analysis of public datasets such as TCGA,
   GTEx, GEO or comparable resources. Our statistics already come from TCGA,
   so such a paper repeats our finding rather than confirming it in the
-  literature. This does not apply when the paper also reports independent
-  evidence (its own patient cohort, immunohistochemistry, in vitro or in vivo
-  work, or clinical data), even if it uses TCGA too, or when it merely
-  mentions TCGA in passing.
+  literature. If the paper downloaded its data from TCGA, GTEx, GEO or a
+  comparable public resource and reports no independently collected patient
+  cohort, tissue samples, experiments or clinical data of its own, set
+  tumor_specific to false, even when it reports a strong association (AUC,
+  survival, differential expression) specifically in this tumor type. A paper
+  that also reports independent evidence (its own patient cohort,
+  immunohistochemistry, in vitro or in vivo work, or clinical data) still
+  counts, even if it uses TCGA too. A paper that merely mentions TCGA in
+  passing is unaffected.
 
 Then give an overall verdict:
 - supported: at least one paper is tumor_specific and, taken together, the
