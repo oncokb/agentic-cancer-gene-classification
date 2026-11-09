@@ -33,6 +33,20 @@
     return PMID.test(text) ? `https://pubmed.ncbi.nlm.nih.gov/${text}/` : null;
   }
 
+  // Public cBioPortal cross-cancer expression plot. A single study must use the
+  // CANCER_TYPE horizontal selection; CANCER_STUDY with one study silently
+  // shows the wrong plot.
+  function expressionURL(symbol, studyIds) {
+    const query = new URLSearchParams({
+      cancer_study_list: studyIds.join(","),
+      gene_list: symbol,
+      case_set_id: "all",
+      plots_horz_selection: JSON.stringify({ dataType: "clinical_attribute", selectedDataSourceOption: studyIds.length > 1 ? "CANCER_STUDY" : "CANCER_TYPE" }),
+      plots_vert_selection: JSON.stringify({ dataType: "MRNA_EXPRESSION", selectedDataSourceOption: "rna_seq_v2_mrna", logScale: "true" }),
+    });
+    return `https://www.cbioportal.org/results/plots?${query}`;
+  }
+
   function friendlyError(status, gene) {
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
     if (status === 403) return "Your account isn't active yet. Please contact your AGCG administrator.";
@@ -47,7 +61,7 @@
     const el = {};
     for (const id of [
       "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-      "ec-summary", "ec-run", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
+      "ec-summary", "ec-cbio", "ec-run", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
     ]) {
       el[id] = doc.getElementById(id);
     }
@@ -170,7 +184,38 @@
       return (flags || []).map((flag) => badge(FLAG_LABELS[flag] || flag, flag === "tissue_of_origin_risk" ? "warn" : "neutral"));
     }
 
-    function renderRow(pair) {
+    function cbioLink(symbol, studyIds) {
+      const link = node("a", "View in cBioPortal");
+      link.setAttribute("href", expressionURL(symbol, studyIds));
+      link.setAttribute("target", "_blank");
+      link.setAttribute("rel", "noopener noreferrer");
+      return link;
+    }
+
+    function cbioportalCell(pair, symbol) {
+      if (!pair.study_id || !symbol) return [];
+      return [cbioLink(symbol, [pair.study_id])];
+    }
+
+    function renderCbioCompare(view) {
+      const container = el["ec-cbio"];
+      container.replaceChildren();
+      const studyIds = [];
+      const seen = new Set();
+      for (const pair of view.pairs || []) {
+        if (!pair.study_id || seen.has(pair.study_id)) continue;
+        seen.add(pair.study_id);
+        studyIds.push(pair.study_id);
+      }
+      if (!studyIds.length || !view.hugo_symbol) return;
+      const link = node("a", "Compare across all 32 cancer types in cBioPortal");
+      link.setAttribute("href", expressionURL(view.hugo_symbol, studyIds));
+      link.setAttribute("target", "_blank");
+      link.setAttribute("rel", "noopener noreferrer");
+      container.appendChild(link);
+    }
+
+    function renderRow(pair, symbol) {
       const row = doc.createElement("tr");
       if (pair.status === "surfaced") row.setAttribute("class", "ec-row-surfaced");
       const s = pair.stats;
@@ -187,6 +232,7 @@
       cell(row, flagsCell(s.flags));
       cell(row, literatureCell(pair));
       cell(row, resultCell(pair));
+      cell(row, cbioportalCell(pair, symbol));
       return row;
     }
 
@@ -251,8 +297,9 @@
         `${summary.surfaced || 0} surfaced · ${summary.literature_pending || 0} awaiting literature check · ` +
         `${summary.excluded || 0} excluded`;
       show(el["ec-run"], (summary.literature_pending || 0) > 0 && !state.jobRunning);
+      renderCbioCompare(view);
       el["ec-tbody"].replaceChildren();
-      for (const pair of view.pairs || []) el["ec-tbody"].appendChild(renderRow(pair));
+      for (const pair of view.pairs || []) el["ec-tbody"].appendChild(renderRow(pair, view.hugo_symbol));
       show(el["ec-result"], true);
       renderProvenance(view.bundle, null);
     }
@@ -385,7 +432,7 @@
   }
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { createExpressionContextPage, formatNumber, formatQ, pmidUrl };
+    module.exports = { createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL };
   } else {
     createExpressionContextPage({ document: root.document, window: root, fetch: root.fetch.bind(root) }).init();
   }

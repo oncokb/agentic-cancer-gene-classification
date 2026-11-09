@@ -4,7 +4,7 @@
 "use strict";
 const assert = require("assert");
 const {
-  createExpressionContextPage, formatNumber, formatQ, pmidUrl,
+  createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL,
 } = require("../../src/expression_context/static/expression-context.js");
 
 class Element {
@@ -40,10 +40,27 @@ class Element {
 
 const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-  "ec-summary", "ec-run", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
+  "ec-summary", "ec-cbio", "ec-run", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
 ];
 
 const response = (body, status = 200) => ({ status, json: async () => body });
+
+function cBioPortalLinks(node) {
+  return node.findAll((n) => n.tagName === "a" && n.textContent === "View in cBioPortal");
+}
+
+function plotParams(href) {
+  const url = new URL(href);
+  assert.strictEqual(`${url.origin}${url.pathname}`, "https://www.cbioportal.org/results/plots");
+  return {
+    url,
+    studies: url.searchParams.get("cancer_study_list"),
+    gene: url.searchParams.get("gene_list"),
+    caseSet: url.searchParams.get("case_set_id"),
+    horizontal: JSON.parse(url.searchParams.get("plots_horz_selection")),
+    vertical: JSON.parse(url.searchParams.get("plots_vert_selection")),
+  };
+}
 
 function env(routes, { search = "" } = {}) {
   const nodes = Object.fromEntries(IDS.map((id) => [id, new Element("div")]));
@@ -94,6 +111,7 @@ function view(overrides = {}) {
     pairs: [
       {
         oncotree_code: "BRCA", cancer_type_name: "Breast Invasive Carcinoma",
+        study_id: "brca_tcga_pan_can_atlas_2018",
         stats: stats("BRCA", { flags: ["tissue_of_origin_risk"] }), stats_pass: true,
         precheck: "pass", literature_eligible: true, status: "surfaced", exclusion_reason: null,
         literature: {
@@ -103,19 +121,22 @@ function view(overrides = {}) {
         },
       },
       {
-        oncotree_code: "STAD", cancer_type_name: "Stomach Adenocarcinoma", stats: stats("STAD", {
+        oncotree_code: "STAD", cancer_type_name: "Stomach Adenocarcinoma",
+        study_id: "stad_tcga_pan_can_atlas_2018", stats: stats("STAD", {
           literature_precheck_pass: null, pubmed_count: null,
         }), stats_pass: true, precheck: "not_run", literature_eligible: true,
         status: "literature_pending", exclusion_reason: null, literature: null,
       },
       {
-        oncotree_code: "UCEC", cancer_type_name: null, stats: stats("UCEC", {
+        oncotree_code: "UCEC", cancer_type_name: null,
+        study_id: "ucec_tcga_pan_can_atlas_2018", stats: stats("UCEC", {
           literature_precheck_pass: false, pubmed_count: 0,
         }), stats_pass: true, precheck: "fail", literature_eligible: false,
         status: "excluded", exclusion_reason: "precheck", literature: null,
       },
       {
-        oncotree_code: "GBM", cancer_type_name: "Glioblastoma", stats: stats("GBM", {
+        oncotree_code: "GBM", cancer_type_name: "Glioblastoma",
+        study_id: "gbm_tcga_pan_can_atlas_2018", stats: stats("GBM", {
           n: 0, median_log2: null, log2fc: null, cliffs_delta: null, auc: null, q_value: null,
           stats_pass: false, flags: ["small_n"],
         }), stats_pass: false, precheck: "not_run", literature_eligible: false,
@@ -171,8 +192,9 @@ test("renders statistics, calls, flags and the literature verdict", async () => 
   assert.strictEqual(brca[11], "Surfaced");
   assert.strictEqual(rows[0].getAttribute("class"), "ec-row-surfaced");
   const links = rows[0].findAll((n) => n.tagName === "a");
-  assert.deepStrictEqual(links.map((a) => a.getAttribute("href")), ["https://pubmed.ncbi.nlm.nih.gov/12345678/"]);
-  assert.strictEqual(links[0].getAttribute("rel"), "noopener noreferrer");
+  const pubmedLinks = links.filter((a) => a.getAttribute("href").startsWith("https://pubmed.ncbi.nlm.nih.gov/"));
+  assert.deepStrictEqual(pubmedLinks.map((a) => a.getAttribute("href")), ["https://pubmed.ncbi.nlm.nih.gov/12345678/"]);
+  assert.strictEqual(pubmedLinks[0].getAttribute("rel"), "noopener noreferrer");
   assert.strictEqual(cells(rows[1])[8], "Not run");
   assert.strictEqual(cells(rows[1])[10], "Not checked yet");
   assert.strictEqual(cells(rows[1])[11], "Awaiting literature check");
@@ -192,6 +214,85 @@ test("renders statistics, calls, flags and the literature verdict", async () => 
   const bundleLink = nodes["ec-provenance"].findAll((n) => n.tagName === "a")[0];
   assert.strictEqual(bundleLink.getAttribute("href"), BUNDLE.release_url);
   assert.strictEqual(page.state.view.hugo_symbol, "ERBB2");
+});
+
+test("gene-level cBioPortal link compares every study across cancer types", async () => {
+  const v = view();
+  v.pairs[2] = { ...v.pairs[2], study_id: null };
+  v.pairs.push({ ...v.pairs[0] });
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  const links = nodes["ec-cbio"].findAll((n) => n.tagName === "a");
+  assert.strictEqual(links.length, 1);
+  assert.strictEqual(links[0].textContent, "Compare across all 32 cancer types in cBioPortal");
+  const p = plotParams(links[0].getAttribute("href"));
+  assert.strictEqual(
+    p.studies,
+    "brca_tcga_pan_can_atlas_2018,stad_tcga_pan_can_atlas_2018,gbm_tcga_pan_can_atlas_2018",
+    "de-duplicated and skips missing study IDs",
+  );
+  assert.strictEqual(p.gene, "ERBB2");
+  assert.strictEqual(p.caseSet, "all");
+  assert.strictEqual(p.horizontal.dataType, "clinical_attribute");
+  assert.strictEqual(p.horizontal.selectedDataSourceOption, "CANCER_STUDY");
+  assert.strictEqual(p.vertical.dataType, "MRNA_EXPRESSION");
+  assert.strictEqual(p.vertical.selectedDataSourceOption, "rna_seq_v2_mrna");
+  assert.strictEqual(p.vertical.logScale, "true");
+  assert.strictEqual(links[0].getAttribute("target"), "_blank");
+  assert.strictEqual(links[0].getAttribute("rel"), "noopener noreferrer");
+});
+
+test("each row links to its single study with the CANCER_TYPE selection", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const links = cBioPortalLinks(nodes["ec-tbody"].children[0]);
+  assert.strictEqual(links.length, 1);
+  assert.strictEqual(links[0].textContent, "View in cBioPortal");
+  const p = plotParams(links[0].getAttribute("href"));
+  assert.strictEqual(p.studies, "brca_tcga_pan_can_atlas_2018");
+  assert.strictEqual(p.gene, "ERBB2");
+  assert.strictEqual(p.horizontal.selectedDataSourceOption, "CANCER_TYPE");
+  assert.strictEqual(links[0].getAttribute("target"), "_blank");
+  assert.strictEqual(links[0].getAttribute("rel"), "noopener noreferrer");
+});
+
+test("a hyphenated symbol like NKX2-1 is encoded correctly", async () => {
+  const v = view({ query: "nkx2-1", hugo_symbol: "NKX2-1", entrez_gene_id: 7080 });
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/NKX2-1": response(v) });
+  await page.lookup("NKX2-1");
+  const href = cBioPortalLinks(nodes["ec-tbody"].children[0])[0].getAttribute("href");
+  assert.strictEqual(plotParams(href).gene, "NKX2-1");
+  assert.ok(href.includes("gene_list=NKX2-1"), href);
+});
+
+test("an alias links with the resolved hugo_symbol, not the raw query", async () => {
+  const v = view({ query: "her2", hugo_symbol: "ERBB2" });
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/HER2": response(v) });
+  await page.lookup("HER2");
+  const geneLink = nodes["ec-cbio"].findAll((n) => n.tagName === "a")[0];
+  assert.strictEqual(plotParams(geneLink.getAttribute("href")).gene, "ERBB2");
+  const rowHref = cBioPortalLinks(nodes["ec-tbody"].children[0])[0].getAttribute("href");
+  assert.strictEqual(plotParams(rowHref).gene, "ERBB2");
+});
+
+test("a row without a study_id renders no cBioPortal link", async () => {
+  const v = view();
+  v.pairs[1] = { ...v.pairs[1], study_id: null };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  assert.deepStrictEqual(cBioPortalLinks(nodes["ec-tbody"].children[1]), []);
+  assert.strictEqual(nodes["ec-cbio"].findAll((n) => n.tagName === "a").length, 1, "other studies still compare");
+});
+
+test("excluded rows still link to cBioPortal", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const rows = nodes["ec-tbody"].children;
+  for (const index of [2, 3]) {
+    const link = cBioPortalLinks(rows[index])[0];
+    assert.ok(link, `excluded row ${index} should have a cBioPortal link`);
+    assert.strictEqual(plotParams(link.getAttribute("href")).horizontal.selectedDataSourceOption, "CANCER_TYPE");
+  }
 });
 
 test("an expired PubMed pre-check is labelled, not shown as a failure", async () => {

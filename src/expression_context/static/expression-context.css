@@ -39,6 +39,17 @@
   color: var(--muted);
 }
 
+.ec-cbio {
+  margin: 4px 0;
+}
+
+.ec-cbio-note {
+  max-width: 60rem;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
 .ec-actions {
   display: flex;
   flex-wrap: wrap;
