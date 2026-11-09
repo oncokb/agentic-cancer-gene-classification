@@ -86,6 +86,69 @@ def verdict_supported(verdict: LiteratureVerdict) -> bool:
     return bool(specific) and all(pmid in specific for pmid in verdict.pmids)
 
 
+def stored_v2_verdict(
+    literature_gate: str, evidence: Optional[Dict[str, Any]]
+) -> Optional[LiteratureVerdict]:
+    """The stored verdict only when both the row and its evidence are v2.
+
+    Read paths use this instead of the stored ``surfaced`` boolean, which can
+    be stale or written by a different gate. Malformed evidence fails closed.
+    """
+    if literature_gate != TUMOR_SPECIFIC_GATE or not evidence:
+        return None
+    try:
+        verdict = LiteratureVerdict.model_validate(evidence)
+    except ValueError:
+        return None
+    if verdict.literature_gate != TUMOR_SPECIFIC_GATE:
+        return None
+    return verdict
+
+
+def stored_verdict_surfaced(
+    literature_gate: str, evidence: Optional[Dict[str, Any]]
+) -> bool:
+    """The surfacing rule for a stored row (shared by both history stores)."""
+    verdict = stored_v2_verdict(literature_gate, evidence)
+    return verdict is not None and verdict_supported(verdict)
+
+
+_RECOVERY_VERDICTS = ("supported", "not_supported", "insufficient")
+
+
+def _derive_recovery_verdict(
+    first_verdict: str,
+    first_judged: Dict[str, Dict[str, Any]],
+    recovery_verdict: str,
+    recovery_judged: Dict[str, Dict[str, Any]],
+) -> str:
+    """Combine the two partial judge calls without trusting either overall verdict.
+
+    A call's ``supported`` counts only when that same call judged one of the
+    papers it saw tumor-specific. If neither call qualifies, ``insufficient``
+    wins when either call said so, otherwise ``not_supported``.
+    """
+    for verdict in (first_verdict, recovery_verdict):
+        if verdict not in _RECOVERY_VERDICTS:
+            raise LiteratureGateError(
+                "tumor-specific judgement could not be reconciled: "
+                f"invalid verdict {verdict!r}"
+            )
+
+    def qualifies(verdict: str, judged: Dict[str, Dict[str, Any]]) -> bool:
+        return verdict == "supported" and any(
+            entry["tumor_specific"] for entry in judged.values()
+        )
+
+    if qualifies(first_verdict, first_judged) or qualifies(
+        recovery_verdict, recovery_judged
+    ):
+        return "supported"
+    if "insufficient" in (first_verdict, recovery_verdict):
+        return "insufficient"
+    return "not_supported"
+
+
 # --------------------------------------------------------------------------
 # v2: tumor-specific judgement
 # --------------------------------------------------------------------------
@@ -365,6 +428,7 @@ class TumorSpecificGate:
         )
         if not missing:
             return verdict, judged, rationale
+        first_judged = dict(judged)
 
         logger.warning(
             "Tumor-specific judge for %s/%s left %d of %d papers unjudged; retrying them",
@@ -372,10 +436,13 @@ class TumorSpecificGate:
         )
         retry_records = [sent[pmid] for pmid in missing]
         retry = await self._call_judge(hugo_symbol, tumor, retry_records, matched)
-        _verdict, retried, _rationale, _missing = self._collect_judgement(
+        recovery_verdict, retried, _rationale, _missing = self._collect_judgement(
             retry, sent, hugo_symbol, tumor
         )
-        for pmid, entry in retried.items():
+        recovery_judged = {
+            pmid: entry for pmid, entry in retried.items() if pmid in missing
+        }
+        for pmid, entry in recovery_judged.items():
             judged.setdefault(pmid, entry)
         still_missing = [pmid for pmid in sent if pmid not in judged]
         if still_missing:
@@ -383,8 +450,9 @@ class TumorSpecificGate:
                 f"tumor-specific judgement is missing {len(still_missing)} of {len(sent)} "
                 "papers after one recovery attempt"
             )
-        has_specific = any(entry["tumor_specific"] for entry in judged.values())
-        derived = "supported" if has_specific else "not_supported"
+        derived = _derive_recovery_verdict(
+            verdict, first_judged, recovery_verdict, recovery_judged
+        )
         if derived != verdict:
             note = f"[Verdict derived from the merged per-paper judgements: {derived}.]"
             rationale = (rationale + " " if rationale else "") + note

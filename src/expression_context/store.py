@@ -17,6 +17,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
+from src.expression_context.literature_gate import stored_verdict_surfaced
 from src.expression_context.models import HistoryEntry, StoredPair
 
 logger = logging.getLogger(__name__)
@@ -175,7 +176,11 @@ class InMemoryExpressionContextStore:
                 literature_gate=literature_gate,
                 computed_at=max(row.computed_at for row in rows),
                 pair_count=len(rows),
-                surfaced_count=sum(1 for row in rows if row.surfaced),
+                surfaced_count=sum(
+                    1
+                    for row in rows
+                    if stored_verdict_surfaced(row.literature_gate, row.evidence)
+                ),
             )
             for (symbol, release_id), rows in groups.items()
         ]
@@ -321,7 +326,7 @@ class MySQLExpressionContextStore:
             async with conn.cursor() as db_cursor:
                 await db_cursor.execute(
                     "SELECT hugo_symbol, release_id, MAX(computed_at) AS last_computed_at, "
-                    "COUNT(*) AS pair_count, SUM(surfaced) AS surfaced_count "
+                    "COUNT(*) AS pair_count "
                     f"FROM {TABLE_NAME} WHERE literature_gate = %s "
                     "GROUP BY hugo_symbol, release_id "
                     f"{having}"
@@ -330,6 +335,31 @@ class MySQLExpressionContextStore:
                     params,
                 )
                 rows = await db_cursor.fetchall()
+                surfaced_counts: Dict[Tuple[str, str], int] = {}
+                if rows:
+                    # Bounded by the page: at most `limit` (API max 100) groups,
+                    # one row per cancer type within each. The v2 evidence rule
+                    # is applied in Python so the stores cannot drift.
+                    keys = [(symbol, release_id) for symbol, release_id, *_ in rows]
+                    placeholders = ", ".join(["(%s, %s)"] * len(keys))
+                    evidence_params: List[Any] = [literature_gate]
+                    for key in keys:
+                        evidence_params.extend(key)
+                    await db_cursor.execute(
+                        "SELECT hugo_symbol, release_id, evidence_json "
+                        f"FROM {TABLE_NAME} WHERE literature_gate = %s "
+                        f"AND (hugo_symbol, release_id) IN ({placeholders})",
+                        evidence_params,
+                    )
+                    for symbol, release_id, evidence_json in await db_cursor.fetchall():
+                        evidence = (
+                            json.loads(evidence_json)
+                            if isinstance(evidence_json, (str, bytes))
+                            else evidence_json
+                        )
+                        if stored_verdict_surfaced(literature_gate, evidence):
+                            key = (symbol, release_id)
+                            surfaced_counts[key] = surfaced_counts.get(key, 0) + 1
         return [
             HistoryEntry(
                 hugo_symbol=symbol,
@@ -337,7 +367,7 @@ class MySQLExpressionContextStore:
                 literature_gate=literature_gate,
                 computed_at=_utc(computed_at),
                 pair_count=int(pair_count),
-                surfaced_count=int(surfaced_count or 0),
+                surfaced_count=surfaced_counts.get((symbol, release_id), 0),
             )
-            for symbol, release_id, computed_at, pair_count, surfaced_count in rows
+            for symbol, release_id, computed_at, pair_count in rows
         ]

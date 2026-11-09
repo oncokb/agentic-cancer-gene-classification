@@ -37,6 +37,7 @@ from src.expression_context.lease import VerdictLease, lease_key
 from src.expression_context.literature_gate import (
     TUMOR_SPECIFIC_GATE,
     LiteratureGate,
+    stored_v2_verdict,
     verdict_supported,
 )
 from src.expression_context.models import (
@@ -645,18 +646,13 @@ def _verdict_row(make_row, stats: CancerTypeStats, verdict: LiteratureVerdict) -
 
 
 def _pair_result(row: StoredPair) -> PairResult:
-    verdict = LiteratureVerdict.model_validate(row.evidence) if row.evidence else None
-    # Fail closed: a row is only surfaced when it is a v2 row whose stored
-    # evidence is a valid v2 verdict that satisfies the surfacing rule. A row
-    # without evidence, a legacy v1 row, or evidence from another gate is
-    # never served as surfaced, even if the stored boolean says otherwise.
-    surfaced = False
+    # Fail closed: only a v2 row whose stored evidence is a valid v2 verdict is
+    # returned as literature. A row without evidence, a legacy v1 row, or
+    # evidence from another gate is hidden, even if the stored boolean says
+    # otherwise.
+    verdict = stored_v2_verdict(row.literature_gate, row.evidence)
+    surfaced = verdict is not None and verdict_supported(verdict)
     if verdict is not None:
-        surfaced = (
-            row.literature_gate == TUMOR_SPECIFIC_GATE
-            and verdict.literature_gate == TUMOR_SPECIFIC_GATE
-            and verdict_supported(verdict)
-        )
         verdict = verdict.model_copy(update={"supported": surfaced})
     reason = None if surfaced else (row.exclusion_reason or "literature")
     return PairResult(

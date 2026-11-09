@@ -294,11 +294,20 @@ def _seed_history(store, symbols_minutes_ago):
     stats = gene_file()["cancer_types"][0]
     for symbol, minutes_ago, surfaced in symbols_minutes_ago:
         for code in ("BRCA", "STAD"):
+            is_surfaced = surfaced and code == "BRCA"
+            evidence = {
+                "literature_gate": "acgc_tumor_specific_v2",
+                "tumor_type_query": "breast cancer",
+                "supported": True, "insufficient_evidence": False,
+                "pmids": ["1"], "verdict": "supported",
+                "papers": [{"pmid": "1", "tumor_specific": True}],
+                "evaluated_at": now.isoformat(),
+            } if is_surfaced else None
             store.rows[(symbol, code, RELEASE_ID, "acgc_tumor_specific_v2")] = StoredPair(
                 hugo_symbol=symbol, oncotree_code=code, release_id=RELEASE_ID,
-                literature_gate="acgc_tumor_specific_v2", surfaced=surfaced and code == "BRCA",
-                exclusion_reason=None if surfaced and code == "BRCA" else "stats",
-                stats={**stats, "oncotree_code": code},
+                literature_gate="acgc_tumor_specific_v2", surfaced=is_surfaced,
+                exclusion_reason=None if is_surfaced else "stats",
+                stats={**stats, "oncotree_code": code}, evidence=evidence,
                 computed_at=now - timedelta(minutes=minutes_ago),
             )
 

@@ -499,6 +499,34 @@ async def test_recovery_negative_verdict_is_derived_from_merged_judgements():
     assert "merged per-paper judgements" in verdict.rationale
 
 
+async def test_both_insufficient_calls_cannot_become_supported():
+    """Call 1 says insufficient but marks a paper specific; the recovery also
+    says insufficient. ``supported`` needs a call whose own verdict was
+    supported, so the pair stays insufficient despite the specific paper."""
+    calls = []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [
+                    {"pmid": p, "tumor_specific": p == "30000010"}
+                    for p in sent if p != "30000020"
+                ],
+                "verdict": "insufficient", "rationale": "Evidence is too thin.",
+            }
+        return {
+            "papers": [{"pmid": p, "tumor_specific": False} for p in sent],
+            "verdict": "insufficient", "rationale": "No independent support.",
+        }
+
+    verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert calls[1] == ["30000020"]
+    assert verdict.verdict == "insufficient" and not verdict.supported
+    assert verdict.insufficient_evidence is True
+
+
 async def test_recovery_that_still_misses_fails_closed():
     calls = []
 

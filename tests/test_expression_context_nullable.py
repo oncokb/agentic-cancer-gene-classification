@@ -170,8 +170,7 @@ def test_stored_verdict_from_another_gate_is_never_surfaced():
     result = ExpressionContextService._gene_result("MYCN", [row], include_excluded=True)
     assert result.surfaced == []
     assert result.excluded[0].exclusion_reason == "literature"
-    assert result.excluded[0].literature is not None
-    assert result.excluded[0].literature.supported is False
+    assert result.excluded[0].literature is None
 
 
 def test_matching_v1_row_and_evidence_is_never_surfaced():
@@ -192,8 +191,7 @@ def test_matching_v1_row_and_evidence_is_never_surfaced():
     result = ExpressionContextService._gene_result("MYCN", [row], include_excluded=True)
     assert result.surfaced == []
     assert result.excluded[0].exclusion_reason == "literature"
-    assert result.excluded[0].literature is not None
-    assert result.excluded[0].literature.supported is False
+    assert result.excluded[0].literature is None
 
 
 FLOOR = math.log2(11)  # method_version 2: RSEM 10

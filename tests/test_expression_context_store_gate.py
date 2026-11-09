@@ -44,6 +44,16 @@ def _pair(symbol, code, release="r1", gate=GATE, minutes_ago=0, surfaced=False, 
     )
 
 
+def _v2_evidence(pmid="1"):
+    return {
+        "literature_gate": GATE, "tumor_type_query": "breast cancer",
+        "supported": True, "insufficient_evidence": False, "pmids": [pmid],
+        "verdict": "supported",
+        "papers": [{"pmid": pmid, "tumor_specific": True}],
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # ---------------------------------------------------------------- cursors
 
 
@@ -79,19 +89,23 @@ def test_ddl_is_module_owned_and_keyed_as_contracted():
 async def _exercise_store(store):
     await store.upsert_pairs([
         _pair("ERBB2", "BRCA", release="r1", minutes_ago=10, surfaced=True,
-              evidence={"pmids": ["1"]}),
+              evidence=_v2_evidence("1")),
         _pair("ERBB2", "STAD", release="r1", minutes_ago=10),
         _pair("ERBB2", "BRCA", release="r2", minutes_ago=5),
-        _pair("EGFR", "LUAD", release="r2", minutes_ago=1, surfaced=True),
+        _pair("EGFR", "LUAD", release="r2", minutes_ago=1, surfaced=True,
+              evidence=_v2_evidence("2")),
         _pair("EGFR", "LUAD", release="r2", gate="other_gate", minutes_ago=0),
     ])
     pairs = await store.get_pairs("ERBB2", "r1", GATE)
     assert set(pairs) == {"BRCA", "STAD"}
-    assert pairs["BRCA"].evidence == {"pmids": ["1"]} and pairs["BRCA"].surfaced is True
+    assert pairs["BRCA"].evidence["literature_gate"] == GATE
+    assert pairs["BRCA"].evidence["pmids"] == ["1"]
+    assert pairs["BRCA"].surfaced is True
     assert pairs["BRCA"].computed_at.tzinfo is not None
 
     # Upsert replaces on the unique key.
-    await store.upsert_pairs([_pair("ERBB2", "STAD", release="r1", minutes_ago=10, surfaced=True)])
+    await store.upsert_pairs([_pair("ERBB2", "STAD", "r1", minutes_ago=10, surfaced=True,
+                                    evidence=_v2_evidence("2"))])
     assert (await store.get_pairs("ERBB2", "r1", GATE))["STAD"].surfaced is True
 
     latest = await store.latest_pairs("ERBB2", GATE)
@@ -106,6 +120,16 @@ async def _exercise_store(store):
     after = (history[0].computed_at, history[0].hugo_symbol, history[0].release_id)
     page = await store.list_history(GATE, 1, after)
     assert [(e.hugo_symbol, e.release_id) for e in page] == [("ERBB2", "r2")]
+
+    # A v2-key row whose evidence is from an old gate must not be counted,
+    # even though its stored surfaced boolean is True.
+    await store.upsert_pairs([_pair(
+        "ERBB2", "LUAD", release="r3", minutes_ago=0, surfaced=True,
+        evidence={**_v2_evidence("3"), "literature_gate": "acgc_pipeline_v1"},
+    )])
+    refreshed = await store.list_history(GATE, 10, None)
+    assert (refreshed[0].hugo_symbol, refreshed[0].release_id) == ("ERBB2", "r3")
+    assert refreshed[0].pair_count == 1 and refreshed[0].surfaced_count == 0
 
 
 async def test_in_memory_store_contract():
