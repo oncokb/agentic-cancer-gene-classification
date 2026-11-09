@@ -406,6 +406,8 @@ class TumorSpecificGate:
             hugo_symbol, tumor, candidates, sent, matched
         )
 
+        specific = [pmid for pmid in sent if judged[pmid]["tumor_specific"]]
+        allowed = set(specific)
         papers: List[PaperJudgement] = []
         for pmid, record in sent.items():
             entry = judged[pmid]
@@ -414,9 +416,8 @@ class TumorSpecificGate:
                 title=(getattr(record, "title", None) or None),
                 matched_terms=matched.get(pmid, []),
                 tumor_specific=entry["tumor_specific"],
-                reason=_clip(entry.get("reason"), 300),
+                reason=_clip(entry.get("reason"), 300, allowed | {pmid}),
             ))
-        specific = [paper.pmid for paper in papers if paper.tumor_specific]
         if verdict == "supported" and not specific:
             verdict = "insufficient"
             rationale = (rationale + " " if rationale else "") + (
@@ -548,7 +549,7 @@ class TumorSpecificGate:
         return (
             verdict,
             judged,
-            _clip(_strip_unverified_pmids(rationale, set(sent)), 1000),
+            rationale,
             missing,
         )
 
@@ -563,6 +564,8 @@ class TumorSpecificGate:
         decided_by: str,
     ) -> LiteratureVerdict:
         pmids = [paper.pmid for paper in papers if paper.tumor_specific]
+        if decided_by == "judge":
+            rationale = _clip(rationale, 1000, set(pmids))
         result = LiteratureVerdict(
             literature_gate=self.name,
             tumor_type_query=tumor.tumor_type_query,
@@ -631,9 +634,18 @@ def _safe_json(value: Any) -> str:
     )
 
 
-_PMID_MENTION = re.compile(
-    r"\b(?:PMIDs?|PubMed\s+IDs?)\s*(?:[:#]\s*|\s+)"
-    r"(\d{1,9}(?:\s*(?:,\s*(?:and\s+|or\s+)?|;\s*|\s+(?:and|or)\s+|/\s*)\d{1,9})*)",
+_UNVERIFIED_PMID = "[unverified PMID removed]"
+_PMID_CANDIDATE = re.compile(
+    r"(?P<url>(?:https?://)?(?:www\.)?"
+    r"(?:pubmed\.ncbi\.nlm\.nih\.gov/|ncbi\.nlm\.nih\.gov/pubmed/)"
+    r"(?P<url_pmid>\d{1,9})/?(?![A-Za-z0-9]))"
+    r"|(?P<label>(?<![A-Za-z0-9])(?:PMIDs?|PubMed(?:\s*IDs?)?)\s*(?:[:#]\s*)*"
+    r"(?P<first_pmid>\d{1,9})(?![A-Za-z0-9]))"
+    r"|(?P<bare>(?<!\d\.)(?<![A-Za-z0-9])\d{7,9}(?![A-Za-z0-9]))",
+    re.IGNORECASE,
+)
+_PMID_CONTINUATION = re.compile(
+    r"\s*(?:,\s*(?:(?:and|or)\s+)?|;\s*|\s+(?:and|or)\s+|/\s*)#?(\d{1,9})(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -641,25 +653,90 @@ _PMID_MENTION = re.compile(
 def _strip_unverified_pmids(
     rationale: Optional[str], sent_pmids: set[str]
 ) -> Optional[str]:
-    """Remove labelled PMID mentions that are not in ``sent_pmids``."""
+    """Remove PMID mentions (labelled, PubMed URLs, or bare 7-9 digit numbers)
+    that are not in ``sent_pmids``."""
     if rationale is None:
         return None
 
-    def replace(match: re.Match[str]) -> str:
-        numbers = re.findall(r"\d{1,9}", match.group(1))
-        kept = [pmid for pmid in numbers if pmid in sent_pmids]
-        if not kept:
-            return "[unverified PMID removed]"
-        if len(kept) == len(numbers):
-            return match.group(0)
-        label = "PMIDs" if len(kept) > 1 else "PMID"
-        return f"{label} {', '.join(kept)}"
+    out: List[str] = []
+    pos = 0
+    while match := _PMID_CANDIDATE.search(rationale, pos):
+        out.append(rationale[pos : match.start()])
+        if match.group("url") is not None:
+            pmid = match.group("url_pmid")
+            out.append(match.group("url") if pmid in sent_pmids else _UNVERIFIED_PMID)
+            pos = match.end()
+        elif match.group("label") is not None:
+            numbers = [match.group("first_pmid")]
+            end = match.end()
+            while cont := _PMID_CONTINUATION.match(rationale, end):
+                next_pmid = cont.group(1)
+                if next_pmid in sent_pmids or len(next_pmid) >= 6:
+                    numbers.append(next_pmid)
+                    end = cont.end()
+                else:
+                    break
+            kept = [pmid for pmid in numbers if pmid in sent_pmids]
+            if not kept:
+                out.append(_UNVERIFIED_PMID)
+            elif len(kept) == len(numbers):
+                out.append(rationale[match.start() : end])
+            else:
+                label = "PMIDs" if len(kept) > 1 else "PMID"
+                out.append(f"{label} {', '.join(kept)}")
+            pos = end
+        else:
+            pmid = match.group("bare")
+            out.append(pmid if pmid in sent_pmids else _UNVERIFIED_PMID)
+            pos = match.end()
+    out.append(rationale[pos:])
+    return "".join(out)
 
-    return _PMID_MENTION.sub(replace, rationale)
 
-
-def _clip(value: Any, limit: int) -> Optional[str]:
+def _clip(
+    value: Any, limit: int, allowed_pmids: Optional[set[str]] = None
+) -> Optional[str]:
     if not isinstance(value, str):
         return None
-    value = " ".join(value.split())
-    return value[:limit] if value else None
+    full = " ".join(value.split())
+    if not full:
+        return None
+    cut_number = (
+        len(full) > limit and full[limit - 1].isdigit() and full[limit].isdigit()
+    )
+    text = full[:limit]
+    if allowed_pmids is None:
+        return text
+    if cut_number:
+        trail = re.search(r"\d+$", text)
+        rest = re.match(r"\d+", full[limit:])
+        if trail and rest and len(trail.group(0)) + len(rest.group(0)) >= 6:
+            prefix = text[: trail.start()]
+            if not re.search(
+                r"(?:PMIDs?|PubMed(?:\s*IDs?)?)\s*(?:[:#]\s*)*$"
+                r"|(?:pubmed\.ncbi\.nlm\.nih\.gov/|ncbi\.nlm\.nih\.gov/pubmed/)$",
+                prefix,
+                re.IGNORECASE,
+            ):
+                text = prefix + "PMID " + trail.group(0)
+    text = _strip_unverified_pmids(text, allowed_pmids) or ""
+    if len(text) <= limit and not cut_number:
+        return text or None
+    if len(text) > limit:
+        cut = limit
+        marker_start = text.rfind("[", 0, limit)
+        if (
+            marker_start != -1
+            and text.startswith(_UNVERIFIED_PMID, marker_start)
+            and marker_start + len(_UNVERIFIED_PMID) > limit
+        ):
+            cut = marker_start
+        space = text.rfind(" ", 0, cut)
+        if space != -1:
+            text = text[:space].rstrip()
+        else:
+            text = re.sub(r"\d+$", "", text[:cut]).rstrip()
+    elif cut_number and text and text[-1].isdigit():
+        space = text.rfind(" ")
+        text = text[:space].rstrip() if space != -1 else re.sub(r"\d+$", "", text).rstrip()
+    return text or None

@@ -116,6 +116,50 @@
   white-space: nowrap;
 }
 
+.ec-details-toggle {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+.ec-details-toggle:hover,
+.ec-details-toggle:focus-visible {
+  border-color: var(--muted);
+}
+
+.ec-table td.ec-detail-cell {
+  white-space: normal;
+  background: color-mix(in srgb, var(--line) 12%, transparent);
+  padding: 10px 12px;
+}
+
+.ec-details-list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 16px;
+  margin: 0;
+  font-size: 0.9em;
+}
+
+.ec-details-list dt {
+  color: var(--muted);
+}
+
+.ec-details-list dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.ec-detail-hint {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
 .ec-result-head h2 .ec-badge {
   margin-left: 8px;
   font-size: 0.6em;

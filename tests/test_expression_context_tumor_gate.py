@@ -446,17 +446,28 @@ async def test_rationale_keeps_sent_paper_judged_not_tumor_specific():
     verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
     assert verdict.pmids == ["30000020"]
     assert "30000020" in verdict.rationale
-    assert "30000010" in verdict.rationale
-    assert "[unverified PMID removed]" not in verdict.rationale
+    assert "30000010" not in verdict.rationale
+    assert "[unverified PMID removed]" in verdict.rationale
 
 
 @pytest.mark.parametrize("mention", [
+    "PMID99999999",
     "PMID 99999999",
+    "PMID: 99999999",
     "pmid:99999999",
     "PMID#99999999",
     "pmids 99999999, 88888888 and 77777777",
+    "PubMed 99999999",
+    "PubMed:99999999",
     "PubMed ID 99999999",
     "pubmed id: 99999999",
+    "pubmed.ncbi.nlm.nih.gov/99999999",
+    "https://pubmed.ncbi.nlm.nih.gov/99999999/",
+    "ncbi.nlm.nih.gov/pubmed/99999999",
+    "https://www.ncbi.nlm.nih.gov/pubmed/99999999",
+    "9999999",
+    "99999999",
+    "999999999",
 ])
 async def test_rationale_strips_labelled_pmid_forms(mention):
     judge = Judge(result={
@@ -466,9 +477,10 @@ async def test_rationale_strips_labelled_pmid_forms(mention):
     })
     verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
     assert "30000020" in verdict.rationale
-    assert "99999999" not in verdict.rationale
+    assert "9999999" not in verdict.rationale
     assert "88888888" not in verdict.rationale
     assert "77777777" not in verdict.rationale
+    assert "ncbi.nlm.nih.gov" not in verdict.rationale
     assert "[unverified PMID removed]" in verdict.rationale
 
 
@@ -485,7 +497,10 @@ async def test_recovery_path_strips_invented_pmid_from_rationale():
             return {
                 "papers": [{"pmid": p, "tumor_specific": False} for p in sent if p != "30000020"],
                 "verdict": "not_supported",
-                "rationale": "PMID 30000010 is differential only; PMID 99999999 is unrelated.",
+                "rationale": (
+                    "PMID 30000020 is noted; PMID 30000010 is differential only; "
+                    "PMID 99999999 is unrelated."
+                ),
             }
         return {
             "papers": [{"pmid": p, "tumor_specific": p == "30000020"} for p in sent],
@@ -500,9 +515,111 @@ async def test_recovery_path_strips_invented_pmid_from_rationale():
     kich = service.store.rows[("KLK3", "KICH", M3_RELEASE_ID, TUMOR_SPECIFIC_GATE)]
     rationale = kich.evidence["rationale"]
     assert calls == [["30000020", "30000010"], ["30000020"]]
-    assert "30000010" in rationale
+    assert "30000020" in rationale
+    assert "30000010" not in rationale
     assert "99999999" not in rationale
     assert "[unverified PMID removed]" in rationale
+
+
+async def test_per_paper_reason_allows_own_and_final_pmids_but_strips_others():
+    judge = Judge(result={
+        "papers": [
+            {
+                "pmid": "30000020",
+                "tumor_specific": True,
+                "reason": "PMID 30000020 reports chRCC; PMID 30000010 and PMID 99999999 do not.",
+            },
+            {
+                "pmid": "30000010",
+                "tumor_specific": False,
+                "reason": "Paper PMID 30000010 is differential (unlike PMID 30000020 or PubMed 88888888).",
+            },
+        ],
+        "verdict": "supported",
+        "rationale": "Supported by PMID 30000020.",
+    })
+    verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    by_pmid = {p.pmid: p.reason for p in verdict.papers}
+    assert "30000020" in by_pmid["30000020"]
+    assert "30000010" not in by_pmid["30000020"]
+    assert "99999999" not in by_pmid["30000020"]
+    assert "[unverified PMID removed]" in by_pmid["30000020"]
+    assert "30000010" in by_pmid["30000010"]
+    assert "30000020" in by_pmid["30000010"]
+    assert "88888888" not in by_pmid["30000010"]
+    assert "[unverified PMID removed]" in by_pmid["30000010"]
+
+
+@pytest.mark.parametrize("rationale,kept_prose", [
+    ("PMID 30000020; 2024 study of KICH.", "; 2024 study"),
+    ("PMID 30000020, 42 patients with KICH.", ", 42 patients"),
+])
+async def test_sanitizer_does_not_consume_adjacent_prose_numbers(rationale, kept_prose):
+    judge = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "supported",
+        "rationale": rationale,
+    })
+    verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
+    assert verdict.rationale == rationale
+    assert kept_prose in verdict.rationale
+
+
+async def test_pmid_straddling_clip_limit_is_treated_as_unverified_and_fits_limit():
+    prefix = "KLK3 in KICH (PMID 30000020). " + ("word " * 192) + "ab "
+    assert len(prefix) == 993
+    straddling_rationale = prefix + "PMID 30000020"
+    assert len(straddling_rationale) > 1000
+
+    reason_prefix = "KLK3 in KICH " + ("word " * 56)
+    assert len(reason_prefix) == 293
+    straddling_reason = reason_prefix + "PMID 30000020"
+    assert len(straddling_reason) > 300
+
+    judge = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True, "reason": straddling_reason}],
+        "verdict": "supported",
+        "rationale": straddling_rationale,
+    })
+    verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
+    assert len(verdict.rationale) <= 1000
+    assert verdict.rationale.startswith("KLK3 in KICH (PMID 30000020).")
+    assert not verdict.rationale.endswith(("30", "30000020", "PMID"))
+    assert len(verdict.papers[0].reason) <= 300
+    assert not verdict.papers[0].reason.endswith(("30", "30000020", "PMID"))
+
+    # When an earlier replacement pushes a trailing number over the limit, cut
+    # back to the last whitespace before the limit rather than slicing the number.
+    pushed = "See PMID 1. " + ("word " * 193) + "in 2024"
+    assert len(pushed) <= 1000
+    verdict_pushed = await gate(
+        [KICH_PAPER],
+        Judge(result={
+            "papers": [{"pmid": "30000020", "tumor_specific": True}],
+            "verdict": "supported",
+            "rationale": pushed,
+        }),
+    ).evaluate("KLK3", KICH)
+    assert len(verdict_pushed.rationale) <= 1000
+    assert "[unverified PMID removed]" in verdict_pushed.rationale
+    assert not re.search(r"\d$", verdict_pushed.rationale)
+
+
+async def test_empty_final_pmids_removes_every_pmid_reference():
+    judge = Judge(result={
+        "papers": [{"pmid": "30000010", "tumor_specific": False}],
+        "verdict": "insufficient",
+        "rationale": (
+            "Neither PMID 30000010, PubMed:30000020, pubmed.ncbi.nlm.nih.gov/30000010 "
+            "nor 30000010 supports KLK3 in KICH."
+        ),
+    })
+    verdict = await gate([RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert verdict.pmids == []
+    assert "30000010" not in verdict.rationale
+    assert "30000020" not in verdict.rationale
+    assert "pubmed.ncbi.nlm.nih.gov" not in verdict.rationale
+    assert "[unverified PMID removed]" in verdict.rationale
 
 
 async def test_rationale_without_pmid_or_none_is_unchanged():

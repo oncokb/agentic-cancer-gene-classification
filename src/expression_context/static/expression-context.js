@@ -70,7 +70,7 @@
       el[id] = doc.getElementById(id);
     }
     const sleep = wait || ((ms) => new Promise((done) => win.setTimeout(done, ms)));
-    const state = { view: null, loading: false, jobRunning: false };
+    const state = { view: null, loading: false, jobRunning: false, expanded: new Set() };
 
     function show(node, visible) { if (node) node.classList.toggle("hidden", !visible); }
 
@@ -163,7 +163,6 @@
       if (pair.stats_pass && pair.enrichment) parts.push(badge(pair.enrichment, "pass"));
       // Lineage enrichment blocked by broad expression (method m3): shown, never passing.
       if (pair.broad_blocked) parts.push(badge("Broadly expressed", "warn"));
-      if (hasSubgroupStats(pair.stats)) parts.push(node("div", subgroupText(pair.stats), "ec-subgroup"));
       return parts;
     }
 
@@ -222,25 +221,102 @@
       ));
     }
 
-    function renderRow(pair, symbol) {
+    function renderDetailRow(pair, detailId, expanded) {
+      const s = pair.stats;
+      const detailRow = doc.createElement("tr");
+      detailRow.setAttribute("id", detailId);
+      detailRow.setAttribute("class", "ec-detail-row");
+      show(detailRow, expanded);
+      const td = doc.createElement("td");
+      td.setAttribute("colspan", "7");
+      td.setAttribute("class", "ec-detail-cell");
+      const dl = node("dl", null, "ec-details-list");
+      const addDetail = (label, value, tooltip, ddClass) => {
+        const dt = node("dt", label);
+        if (tooltip) {
+          dt.setAttribute("title", tooltip);
+          dt.appendChild(node("span", ` (${tooltip})`, "ec-detail-hint"));
+        }
+        const dd = doc.createElement("dd");
+        if (ddClass) dd.setAttribute("class", ddClass);
+        if (typeof value === "string" || typeof value === "number") {
+          dd.textContent = String(value);
+        } else {
+          for (const child of [].concat(value)) dd.appendChild(child);
+        }
+        dl.appendChild(dt);
+        dl.appendChild(dd);
+      };
+      addDetail(
+        "n (rest)",
+        `${s.n} (${s.n_rest})`,
+        "Primary tumors in this type (all other TCGA tumors)",
+        "ec-num",
+      );
+      addDetail(
+        "Median (rest)",
+        `${formatNumber(s.median_log2)} (${formatNumber(s.rest_median_log2)})`,
+        "Median log2(RSEM + 1) in this type (all other tumors)",
+        "ec-num",
+      );
+      addDetail(
+        "log2FC",
+        formatNumber(s.log2fc),
+        "Floor-clamped median difference, log2",
+        "ec-num",
+      );
+      addDetail("Cliff's delta", formatNumber(s.cliffs_delta), "Cliff's δ", "ec-num");
+      addDetail("AUC", formatNumber(s.auc), null, "ec-num");
+      addDetail(
+        "q",
+        formatQ(s.q_value),
+        "Benjamini–Hochberg q across the cancer types for this gene",
+        "ec-num",
+      );
+      addDetail(
+        "Subgroup statistics",
+        hasSubgroupStats(s) ? subgroupText(s) : "—",
+        null,
+        "ec-subgroup",
+      );
+      addDetail(
+        "PubMed pre-check",
+        precheckCell(pair),
+        "PubMed count for the gene and tumor type",
+      );
+      td.appendChild(dl);
+      detailRow.appendChild(td);
+      return detailRow;
+    }
+
+    function renderRows(pair, symbol) {
       const row = doc.createElement("tr");
       if (pair.status === "surfaced") row.setAttribute("class", "ec-row-surfaced");
       const s = pair.stats;
-      const name = pair.cancer_type_name ? `${pair.cancer_type_name} (${pair.oncotree_code})` : pair.oncotree_code;
+      const code = pair.oncotree_code;
+      const name = pair.cancer_type_name ? `${pair.cancer_type_name} (${code})` : code;
+      const detailId = `ec-details-${code}`;
+      const expanded = state.expanded.has(code);
+      const toggleBtn = node("button", "Details", "ec-details-toggle");
+      toggleBtn.setAttribute("type", "button");
+      toggleBtn.setAttribute("aria-expanded", expanded ? "true" : "false");
+      toggleBtn.setAttribute("aria-controls", detailId);
+      const detailRow = renderDetailRow(pair, detailId, expanded);
+      toggleBtn.addEventListener("click", () => {
+        const next = !state.expanded.has(code);
+        if (next) state.expanded.add(code);
+        else state.expanded.delete(code);
+        toggleBtn.setAttribute("aria-expanded", next ? "true" : "false");
+        show(detailRow, next);
+      });
       cell(row, name);
-      cell(row, `${s.n} (${s.n_rest})`, "ec-num");
-      cell(row, `${formatNumber(s.median_log2)} (${formatNumber(s.rest_median_log2)})`, "ec-num");
-      cell(row, formatNumber(s.log2fc), "ec-num");
-      cell(row, formatNumber(s.cliffs_delta), "ec-num");
-      cell(row, formatNumber(s.auc), "ec-num");
-      cell(row, formatQ(s.q_value), "ec-num");
       cell(row, statsCell(pair));
-      cell(row, precheckCell(pair));
       cell(row, flagsCell(s.flags));
       cell(row, literatureCell(pair));
       cell(row, resultCell(pair));
       cell(row, cbioportalCell(pair, symbol));
-      return row;
+      cell(row, toggleBtn, "ec-toggle-cell");
+      return [row, detailRow];
     }
 
     function renderProvenance(bundle, refresh) {
@@ -290,6 +366,9 @@
     }
 
     function render(view) {
+      if (!state.view || state.view.hugo_symbol !== view.hugo_symbol) {
+        state.expanded.clear();
+      }
       state.view = view;
       const title = view.query && view.query.trim().toUpperCase() !== view.hugo_symbol
         ? `${view.hugo_symbol} (from ${view.query.trim()})`
@@ -306,7 +385,11 @@
       show(el["ec-run"], (summary.literature_pending || 0) > 0 && !state.jobRunning);
       renderCbioCompare(view);
       el["ec-tbody"].replaceChildren();
-      for (const pair of view.pairs || []) el["ec-tbody"].appendChild(renderRow(pair, view.hugo_symbol));
+      for (const pair of view.pairs || []) {
+        for (const row of renderRows(pair, view.hugo_symbol)) {
+          el["ec-tbody"].appendChild(row);
+        }
+      }
       show(el["ec-result"], true);
       renderProvenance(view.bundle, null);
     }
@@ -346,6 +429,13 @@
       if (!SYMBOL.test(gene)) {
         setError(friendlyError(422, gene));
         return;
+      }
+      if (
+        state.view &&
+        gene !== state.view.hugo_symbol &&
+        (!state.view.query || gene !== state.view.query.trim().toUpperCase())
+      ) {
+        state.expanded.clear();
       }
       state.loading = true;
       show(el["ec-loading"], true);

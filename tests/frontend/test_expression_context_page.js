@@ -3,9 +3,13 @@
 // tests/test_expression_context_web.py.
 "use strict";
 const assert = require("assert");
+const fs = require("fs");
+const path = require("path");
 const {
   createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL,
 } = require("../../src/expression_context/static/expression-context.js");
+
+const HTML_PATH = path.join(__dirname, "../../src/expression_context/static/expression-context.html");
 
 class Element {
   constructor(tag) {
@@ -47,6 +51,14 @@ const response = (body, status = 200) => ({ status, json: async () => body });
 
 function cBioPortalLinks(node) {
   return node.findAll((n) => n.tagName === "a" && n.textContent === "mRNA vs Dx");
+}
+
+function summaryRows(nodes) {
+  return nodes["ec-tbody"].children.filter((r) => r.getAttribute("class") !== "ec-detail-row");
+}
+
+function detailRows(nodes) {
+  return nodes["ec-tbody"].children.filter((r) => r.getAttribute("class") === "ec-detail-row");
 }
 
 function plotParams(href) {
@@ -185,36 +197,37 @@ test("renders statistics, calls, flags and the literature verdict", async () => 
   assert.strictEqual(nodes["ec-gene-title"].textContent, "ERBB2 · Entrez 2064");
   assert.strictEqual(nodes["ec-summary"].textContent, "1 surfaced · 1 awaiting literature check · 2 excluded");
   assert.ok(!nodes["ec-run"].hidden, "pending pairs offer a literature check");
-  const rows = nodes["ec-tbody"].children;
+  const rows = summaryRows(nodes);
+  const details = detailRows(nodes);
   assert.strictEqual(rows.length, 4);
+  assert.strictEqual(details.length, 4);
   const cells = (row) => row.children.map((c) => c.text);
   const brca = cells(rows[0]);
+  assert.strictEqual(brca.length, 7);
   assert.strictEqual(brca[0], "Breast Invasive Carcinoma (BRCA)");
-  assert.strictEqual(brca[1], "100 (9000)");
-  assert.strictEqual(brca[2], "6.20 (3.10)");
-  assert.strictEqual(brca[3], "2.74");
-  assert.strictEqual(brca[7], "Pass");
-  assert.strictEqual(brca[8], "Pass (12)");
-  assert.strictEqual(brca[9], "Tissue of origin");
-  assert.ok(brca[10].startsWith("Supported"));
-  assert.ok(brca[10].includes("<b>amplified</b>"), "rationale stays text");
-  assert.strictEqual(brca[11], "Surfaced");
+  assert.strictEqual(brca[1], "Pass");
+  assert.strictEqual(brca[2], "Tissue of origin");
+  assert.ok(brca[3].startsWith("Supported"));
+  assert.ok(brca[3].includes("<b>amplified</b>"), "rationale stays text");
+  assert.strictEqual(brca[4], "Surfaced");
+  assert.strictEqual(brca[5], "mRNA vs Dx");
+  assert.strictEqual(brca[6], "Details");
   assert.strictEqual(rows[0].getAttribute("class"), "ec-row-surfaced");
   const links = rows[0].findAll((n) => n.tagName === "a");
   const pubmedLinks = links.filter((a) => a.getAttribute("href").startsWith("https://pubmed.ncbi.nlm.nih.gov/"));
   assert.deepStrictEqual(pubmedLinks.map((a) => a.getAttribute("href")), ["https://pubmed.ncbi.nlm.nih.gov/12345678/"]);
   assert.strictEqual(pubmedLinks[0].getAttribute("rel"), "noopener noreferrer");
-  assert.strictEqual(cells(rows[1])[8], "Not run");
-  assert.strictEqual(cells(rows[1])[10], "Not checked yet");
-  assert.strictEqual(cells(rows[1])[11], "Awaiting literature check");
+  assert.strictEqual(cells(rows[1])[3], "Not checked yet");
+  assert.strictEqual(cells(rows[1])[4], "Awaiting literature check");
+  assert.ok(details[1].text.includes("Not run"));
   assert.strictEqual(cells(rows[2])[0], "UCEC");
-  assert.strictEqual(cells(rows[2])[8], "Fail (0)");
-  assert.strictEqual(cells(rows[2])[11], "Excluded: PubMed pre-check");
+  assert.strictEqual(cells(rows[2])[4], "Excluded: PubMed pre-check");
+  assert.ok(details[2].text.includes("Fail (0)"));
   const gbm = cells(rows[3]);
-  assert.deepStrictEqual(gbm.slice(2, 7), ["— (3.10)", "—", "—", "—", "—"]);
-  assert.strictEqual(gbm[7], "Fail");
-  assert.strictEqual(gbm[9], "Small n");
-  assert.strictEqual(gbm[11], "Excluded: statistics");
+  assert.strictEqual(gbm[1], "Fail");
+  assert.strictEqual(gbm[2], "Small n");
+  assert.strictEqual(gbm[4], "Excluded: statistics");
+  assert.ok(details[3].text.includes("— (3.10)"));
   assert.deepStrictEqual(replaced, ["?gene=ERBB2"]);
   // Provenance from the stats view.
   const prov = nodes["ec-provenance"].children.map((c) => c.text);
@@ -314,14 +327,14 @@ test("a row without a study_id renders no cBioPortal link", async () => {
   v.pairs[1] = { ...v.pairs[1], study_id: null };
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
   await page.lookup("ERBB2");
-  assert.deepStrictEqual(cBioPortalLinks(nodes["ec-tbody"].children[1]), []);
+  assert.deepStrictEqual(cBioPortalLinks(summaryRows(nodes)[1]), []);
   assert.strictEqual(nodes["ec-cbio"].findAll((n) => n.tagName === "a").length, 2, "other studies still compare");
 });
 
 test("excluded rows still link to cBioPortal", async () => {
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
   await page.lookup("ERBB2");
-  const rows = nodes["ec-tbody"].children;
+  const rows = summaryRows(nodes);
   for (const index of [2, 3]) {
     const link = cBioPortalLinks(rows[index])[0];
     assert.ok(link, `excluded row ${index} should have a cBioPortal link`);
@@ -339,9 +352,10 @@ test("an expired PubMed pre-check is labelled, not shown as a failure", async ()
   };
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(expired) });
   await page.lookup("ERBB2");
-  const ucec = nodes["ec-tbody"].children[2].children.map((c) => c.text);
-  assert.strictEqual(ucec[8], "Pre-check expired (0)");
-  assert.strictEqual(ucec[11], "Awaiting literature check");
+  const ucec = summaryRows(nodes)[2].children.map((c) => c.text);
+  const ucecDetails = detailRows(nodes)[2].text;
+  assert.ok(ucecDetails.includes("Pre-check expired (0)"), ucecDetails);
+  assert.strictEqual(ucec[4], "Awaiting literature check");
   const prov = nodes["ec-provenance"].children.map((c) => c.text);
   const at = prov.indexOf("PubMed pre-check expires");
   assert.ok(at >= 0 && prov[at + 1] === "2026-10-01T00:00:00Z");
@@ -396,23 +410,28 @@ test("method m3: enrichment labels, broad markers and subgroup statistics", asyn
   const title = nodes["ec-gene-title"];
   assert.strictEqual(title.textContent, "VIM · Entrez 7431");
   assert.strictEqual(title.text, "VIM · Entrez 7431Broadly expressed");
-  const rows = nodes["ec-tbody"].children;
+  const rows = summaryRows(nodes);
+  const details = detailRows(nodes);
   const cells = (row) => row.children.map((c) => c.text);
   const brca = cells(rows[0]);
   assert.strictEqual(brca[0], "Breast <i>Invasive</i> Carcinoma (BRCA)", "names stay text");
-  assert.ok(brca[7].startsWith("PassSubgroup enriched"), brca[7]);
-  assert.ok(brca[7].includes("Subgroup: high n 120 (11.0%) · ratio 3.20× · p95 Δlog2 1.60 · q 2.0e-8"), brca[7]);
-  assert.ok(!brca[7].includes("Broadly expressed"), "a subgroup pass is not marked blocked");
-  assert.ok(brca[10].startsWith("Supported in Breast Invasive Carcinoma"), brca[10]);
-  assert.ok(brca[10].includes("Tumor-specific: PMID 11111111"), brca[10]);
+  assert.strictEqual(brca[1], "PassSubgroup enriched");
+  assert.ok(!brca[1].includes("Subgroup:"), "subgroup numbers moved out of the summary Statistics cell");
+  assert.ok(
+    details[0].text.includes("Subgroup: high n 120 (11.0%) · ratio 3.20× · p95 Δlog2 1.60 · q 2.0e-8"),
+    details[0].text,
+  );
+  assert.ok(!brca[1].includes("Broadly expressed"), "a subgroup pass is not marked blocked");
+  assert.ok(brca[3].startsWith("Supported in Breast Invasive Carcinoma"), brca[3]);
+  assert.ok(brca[3].includes("Tumor-specific: PMID 11111111"), brca[3]);
   const sarc = cells(rows[1]);
-  assert.ok(sarc[7].startsWith("FailBroadly expressed"), sarc[7]);
-  assert.strictEqual(sarc[10], "—", "never sent to the literature check");
-  assert.strictEqual(sarc[11], "Excluded: statistics");
+  assert.strictEqual(sarc[1], "FailBroadly expressed");
+  assert.strictEqual(sarc[3], "—", "never sent to the literature check");
+  assert.strictEqual(sarc[4], "Excluded: statistics");
   const prad = cells(rows[2]);
-  assert.ok(prad[7].startsWith("PassLineage enriched"), prad[7]);
-  assert.ok(!prad[7].includes("Subgroup:"), "no subgroup line without subgroup stats");
-  assert.ok(prad[10].startsWith("Not supported insufficient evidence"), prad[10]);
+  assert.strictEqual(prad[1], "PassLineage enriched");
+  assert.ok(!details[2].text.includes("Subgroup:"), "no subgroup line without subgroup stats");
+  assert.ok(prad[3].startsWith("Not supported insufficient evidence"), prad[3]);
   assert.deepStrictEqual(rows[2].findAll((n) => n.tagName === "a"), []);
 });
 
@@ -428,9 +447,9 @@ test("tumor-specific verdict without tumor-specific PMIDs explains why", async (
   };
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
   await page.lookup("ERBB2");
-  const rows = nodes["ec-tbody"].children.map((row) => row.children.map((c) => c.text));
-  assert.strictEqual(rows[0][10], "Not supported no tumor-specific PMIDs");
-  assert.strictEqual(rows[1][10], "Not supported evidence against this tumor type");
+  const rows = summaryRows(nodes).map((row) => row.children.map((c) => c.text));
+  assert.strictEqual(rows[0][3], "Not supported no tumor-specific PMIDs");
+  assert.strictEqual(rows[1][3], "Not supported evidence against this tumor type");
   assert.strictEqual(nodes["ec-gene-title"].children.length, 0, "no gene marker for m2 bundles");
 });
 
@@ -541,6 +560,118 @@ test("deep link ?gene= loads the gene on init", async () => {
   assert.strictEqual(nodes["ec-gene"].value, "her2");
   assert.strictEqual(nodes["ec-gene-title"].textContent, "ERBB2 (from her2) · Entrez 2064");
   assert.strictEqual(calls.length, 0);
+});
+
+test("header has only the visible columns and removed columns are gone", () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  const theadMatch = html.match(/<thead>([\s\S]*?)<\/thead>/);
+  assert.ok(theadMatch, "table has a thead");
+  const headers = [...theadMatch[1].matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/g)].map((m) => m[1].trim());
+  assert.deepStrictEqual(headers, [
+    "Cancer type",
+    "Statistics",
+    "Flags",
+    "Literature",
+    "Result",
+    "cBioPortal",
+    "",
+  ]);
+  for (const removed of ["n (rest)", "Median (rest)", "log2FC", "Cliff's δ", "Cliff's delta", "AUC", "q", "PubMed pre-check"]) {
+    assert.ok(!headers.includes(removed), `removed column ${removed} must not be in thead`);
+  }
+});
+
+test("numbers are hidden in the detail row by default and toggle updates aria-expanded", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const summaries = summaryRows(nodes);
+  const details = detailRows(nodes);
+  assert.strictEqual(summaries.length, 4);
+  assert.strictEqual(details.length, 4);
+  for (let i = 0; i < summaries.length; i += 1) {
+    assert.ok(!summaries[i].hidden, "summary row is visible");
+    assert.ok(details[i].hidden, "detail row is hidden by default");
+    assert.strictEqual(details[i].children.length, 1);
+    assert.strictEqual(details[i].children[0].getAttribute("colspan"), "7");
+  }
+  const brcaSummaryText = summaries[0].text;
+  for (const num of ["100 (9000)", "6.20 (3.10)", "2.74", "0.71", "0.85", "1.0e-39", "Pass (12)"]) {
+    assert.ok(!brcaSummaryText.includes(num), `${num} is not in the collapsed summary row`);
+    assert.ok(details[0].text.includes(num), `${num} is in the detail row`);
+  }
+  for (const label of [
+    "n (rest)",
+    "Primary tumors in this type (all other TCGA tumors)",
+    "Median (rest)",
+    "Median log2(RSEM + 1) in this type (all other tumors)",
+    "log2FC",
+    "Floor-clamped median difference, log2",
+    "Cliff's delta",
+    "AUC",
+    "q",
+    "Benjamini–Hochberg q across the cancer types for this gene",
+    "Subgroup statistics",
+    "PubMed pre-check",
+    "PubMed count for the gene and tumor type",
+  ]) {
+    assert.ok(details[0].text.includes(label), `detail row includes ${label}`);
+  }
+  const toggleBtn = summaries[0].children[6].children[0];
+  assert.strictEqual(toggleBtn.tagName, "button");
+  assert.strictEqual(toggleBtn.getAttribute("type"), "button");
+  assert.strictEqual(toggleBtn.textContent, "Details");
+  assert.strictEqual(toggleBtn.getAttribute("aria-expanded"), "false");
+  assert.strictEqual(toggleBtn.getAttribute("aria-controls"), details[0].getAttribute("id"));
+
+  toggleBtn.fire("click");
+  assert.strictEqual(toggleBtn.getAttribute("aria-expanded"), "true");
+  assert.ok(!details[0].hidden, "clicking Details expands the detail row");
+  assert.ok(details[1].hidden, "other detail rows remain hidden");
+
+  toggleBtn.fire("click");
+  assert.strictEqual(toggleBtn.getAttribute("aria-expanded"), "false");
+  assert.ok(details[0].hidden, "clicking Details again collapses the detail row");
+});
+
+test("expanded state survives a re-render during a literature job and resets on a new gene", async () => {
+  let statsCalls = 0;
+  const { nodes, page } = env({
+    "GET /v1/expression-context/stats/ERBB2": () => {
+      statsCalls += 1;
+      return response(statsCalls === 1 ? view() : view({ summary: { surfaced: 2, literature_pending: 0, excluded: 2 } }));
+    },
+    "POST /v1/expression-context/jobs": response(
+      { job_id: "j1", status: "queued", status_url: "/v1/expression-context/jobs/j1" },
+      202,
+    ),
+    "GET /v1/expression-context/jobs/j1": response({
+      status: "succeeded", literature_evaluated: 1, literature_reused: 0, pair_errors: [],
+    }),
+    "GET /v1/expression-context/stats/NKX2-1": response(
+      view({ query: "nkx2-1", hugo_symbol: "NKX2-1", entrez_gene_id: 7080 }),
+    ),
+  });
+  await page.lookup("ERBB2");
+  const initialBtn = summaryRows(nodes)[1].children[6].children[0];
+  initialBtn.fire("click");
+  assert.strictEqual(initialBtn.getAttribute("aria-expanded"), "true");
+  assert.ok(!detailRows(nodes)[1].hidden);
+
+  await nodes["ec-run"].fire("click");
+  assert.strictEqual(statsCalls, 2);
+  const rerenderedBtn = summaryRows(nodes)[1].children[6].children[0];
+  assert.strictEqual(rerenderedBtn.getAttribute("aria-expanded"), "true", "STAD stays expanded after job re-render");
+  assert.ok(!detailRows(nodes)[1].hidden, "STAD detail row stays visible after job re-render");
+  assert.ok(detailRows(nodes)[0].hidden, "BRCA detail row stays hidden");
+
+  await page.lookup("NKX2-1");
+  for (const row of summaryRows(nodes)) {
+    const btn = row.children[6].children[0];
+    assert.strictEqual(btn.getAttribute("aria-expanded"), "false", "new gene resets aria-expanded");
+  }
+  for (const detail of detailRows(nodes)) {
+    assert.ok(detail.hidden, "new gene resets detail rows to hidden");
+  }
 });
 
 (async () => {
