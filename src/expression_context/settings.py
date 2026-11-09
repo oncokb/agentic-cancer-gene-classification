@@ -40,6 +40,11 @@ class ExpressionContextSettings(BaseSettings):
     # Off by default: no routes, no tables, no outbound calls, no startup work.
     enabled: bool = False
 
+    # The page stays reachable by direct link; this only controls whether its
+    # tab is injected into ACGC's main-page nav. Off by default so the page is
+    # link-only until it is deliberately announced.
+    nav_tab_enabled: bool = False
+
     # ---------------------------------------------------------------- bundles
     # GitHub repository whose releases carry the statistics bundles
     # (tags expression-stats-<release_id>-pubmed-<YYYYMMDD>).

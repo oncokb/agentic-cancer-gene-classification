@@ -15,8 +15,10 @@ from fastapi.testclient import TestClient
 
 from src.auth import AuthenticatedUser
 from src.config import settings
+from src.expression_context import register_expression_context
 from src.expression_context.web import NAV_LINK, NAV_LINK_ID, inject_nav_link
 from tests.auth_helpers import session_token_for
+from tests.expression_context_helpers import make_settings
 from tests.test_expression_context_api import Harness
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,8 +27,8 @@ INDEX_HTML = ROOT / "src" / "static" / "index.html"
 pytestmark = pytest.mark.no_real_redis
 
 
-def _harness_with_home() -> Harness:
-    harness = Harness()
+def _harness_with_home(nav_tab_enabled=False) -> Harness:
+    harness = Harness(settings=make_settings(nav_tab_enabled=nav_tab_enabled))
 
     @harness.app.get("/")
     async def index():
@@ -110,8 +112,19 @@ def test_page_js_builds_dom_with_text_nodes_only():
 # ---------------------------------------------------------------- nav entry
 
 
-def test_main_page_gets_the_nav_tab_when_enabled():
+def test_default_settings_hide_the_nav_tab_but_keep_the_page():
     harness = _harness_with_home()
+    with TestClient(harness.app) as client:
+        home = client.get("/")
+        page = client.get("/expression-context")
+    assert home.status_code == 200
+    assert NAV_LINK_ID not in home.text
+    assert 'href="/expression-context"' not in home.text
+    assert page.status_code == 200
+
+
+def test_main_page_gets_the_nav_tab_when_nav_tab_enabled():
+    harness = _harness_with_home(nav_tab_enabled=True)
     original = INDEX_HTML.read_text()
     with TestClient(harness.app) as client:
         response = client.get("/")
@@ -126,8 +139,26 @@ def test_main_page_gets_the_nav_tab_when_enabled():
     assert response.text.replace("\n          " + NAV_LINK, "", 1) == original
 
 
+def test_feature_off_ignores_nav_tab_enabled():
+    app = FastAPI()
+
+    @app.get("/")
+    async def index():
+        return FileResponse(INDEX_HTML)
+
+    assert register_expression_context(
+        app, settings=make_settings(enabled=False, nav_tab_enabled=True)
+    ) is False
+    with TestClient(app) as client:
+        assert client.get("/expression-context").status_code == 404
+        home = client.get("/")
+    assert home.status_code == 200
+    assert NAV_LINK_ID not in home.text
+    assert 'href="/expression-context"' not in home.text
+
+
 def test_nav_injection_touches_only_get_slash_html_200():
-    harness = _harness_with_home()
+    harness = _harness_with_home(nav_tab_enabled=True)
     with TestClient(harness.app) as client:
         assert NAV_LINK_ID not in client.get("/runs").text  # another page
         assert client.get("/broken").text == "nope"  # non-200 passes through
@@ -158,7 +189,7 @@ def test_streamed_and_oversized_bodies():
 
     from src.expression_context.web import NavLinkMiddleware
 
-    app.add_middleware(NavLinkMiddleware)
+    app.add_middleware(NavLinkMiddleware, nav_tab_enabled=True)
     with TestClient(app) as client:
         assert client.get("/").text.count(NAV_LINK_ID) == 1
         chunks[:] = [b'<button id="nav-benchmark">B</button>' + b"x" * (3 * 1024 * 1024)]

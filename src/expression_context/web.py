@@ -6,7 +6,9 @@
   from ``src/expression_context/static/`` (an explicit allow-list).
 - ``NavLinkMiddleware``: adds an "Expression stats" tab to the main page's
   ``<nav class="app-tabs">`` on the way out, so ACGC's own ``index.html`` and
-  ``app.js`` need no edits and the entry disappears with the flag.
+  ``app.js`` need no edits and the entry disappears with the flag. The tab is
+  only injected when ``nav_tab_enabled`` is true; otherwise the page is
+  reachable by direct link only.
 
 All of it is removed with the package; the core UI is untouched.
 """
@@ -105,11 +107,17 @@ Message = MutableMapping[str, Any]
 class NavLinkMiddleware:
     """Pure-ASGI middleware that rewrites only ``GET /`` HTML responses."""
 
-    def __init__(self, app: Callable[..., Awaitable[None]]) -> None:
+    def __init__(self, app: Callable[..., Awaitable[None]], nav_tab_enabled: bool = True) -> None:
         self.app = app
+        self.nav_tab_enabled = nav_tab_enabled
 
     async def __call__(self, scope: Scope, receive: Callable, send: Callable) -> None:
-        if scope.get("type") != "http" or scope.get("method") != "GET" or scope.get("path") != "/":
+        if (
+            not self.nav_tab_enabled
+            or scope.get("type") != "http"
+            or scope.get("method") != "GET"
+            or scope.get("path") != "/"
+        ):
             await self.app(scope, receive, send)
             return
 

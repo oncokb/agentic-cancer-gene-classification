@@ -96,7 +96,7 @@ def register_expression_context(
     factory = service_factory or _default_service_factory
     app.include_router(router)
     app.include_router(page_router)
-    app.add_middleware(NavLinkMiddleware)
+    app.add_middleware(NavLinkMiddleware, nav_tab_enabled=settings.nav_tab_enabled)
 
     inner_lifespan = app.router.lifespan_context
 

@@ -50,7 +50,7 @@ BOB = AuthenticatedUser(email="bob@example.org", name="Bob", domain="example.org
 
 
 class Harness:
-    def __init__(self, gate=None, store=None, bundle=None, seed=True):
+    def __init__(self, gate=None, store=None, bundle=None, seed=True, settings=None):
         self.gate = gate or FakeLiteratureGate()
         self.store = store or InMemoryExpressionContextStore()
         self.bundles = InMemoryBundleStore()
@@ -58,7 +58,7 @@ class Harness:
         self.user = ALICE
         self.redis = LeaseFakeRedis()
         self.app = FastAPI()
-        settings = make_settings()
+        settings = settings or make_settings()
 
         async def factory(app, s):
             if seed:
