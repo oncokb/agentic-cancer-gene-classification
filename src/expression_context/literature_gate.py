@@ -116,17 +116,67 @@ def stored_verdict_surfaced(
 _RECOVERY_VERDICTS = ("supported", "not_supported", "insufficient")
 
 
-def _derive_recovery_verdict(
-    first_verdict: str,
-    first_judged: Dict[str, Dict[str, Any]],
-    recovery_verdict: str,
-    recovery_judged: Dict[str, Dict[str, Any]],
-) -> str:
-    """Combine the two partial judge calls without trusting either overall verdict.
+def _validate_recovery_call(
+    result: Any,
+    verdict: str,
+    judged: Dict[str, Dict[str, Any]],
+    sent_pmids: set[str],
+    *,
+    call: str,
+) -> None:
+    """Reject a judge call that contradicts its own papers.
 
-    A call's ``supported`` counts only when that same call judged one of the
-    papers it saw tumor-specific. If neither call qualifies, ``insufficient``
-    wins when either call said so, otherwise ``not_supported``.
+    ``judged`` contains only papers sent to that call. On the recovery path a
+    call that says ``supported`` while judging none of its own papers specific,
+    or ``not_supported`` while judging one of them specific, is contradictory
+    and must not be merged into a stored verdict. A specific judgement for a
+    PMID that was not sent to this call is also contradictory. ``insufficient``
+    is allowed to carry a specific paper: the prompt permits evidence that is
+    specific but too thin.
+    """
+    if verdict not in _RECOVERY_VERDICTS:
+        raise LiteratureGateError(
+            "tumor-specific judgement could not be reconciled: "
+            f"invalid verdict {verdict!r}"
+        )
+
+    papers = result.get("papers") if isinstance(result, dict) else None
+    if isinstance(papers, list):
+        foreign = []
+        for entry in papers:
+            if not isinstance(entry, dict) or entry.get("tumor_specific") is not True:
+                continue
+            raw_pmid = entry.get("pmid")
+            if isinstance(raw_pmid, bool) or not isinstance(raw_pmid, (str, int)):
+                continue
+            pmid = str(raw_pmid).strip()
+            if pmid not in sent_pmids:
+                foreign.append(pmid)
+        if foreign:
+            raise LiteratureGateError(
+                f"tumor-specific judgement is contradictory: {call} judged "
+                f"{foreign[0]!r} tumor-specific although it was never sent to it"
+            )
+
+    specific = [pmid for pmid, entry in judged.items() if entry["tumor_specific"]]
+    if verdict == "not_supported" and specific:
+        raise LiteratureGateError(
+            f"tumor-specific judgement is contradictory: {call} returned "
+            f"not_supported while judging {specific[0]!r} tumor-specific"
+        )
+    if verdict == "supported" and not specific:
+        raise LiteratureGateError(
+            f"tumor-specific judgement is contradictory: {call} returned "
+            "supported without judging any of its own papers tumor-specific"
+        )
+
+
+def _derive_recovery_verdict(first_verdict: str, recovery_verdict: str) -> str:
+    """Combine two already-validated calls.
+
+    Validation guarantees that any ``supported`` call has a tumor-specific
+    paper of its own, so support from either call wins; otherwise
+    ``insufficient`` wins when either call said so, else ``not_supported``.
     """
     for verdict in (first_verdict, recovery_verdict):
         if verdict not in _RECOVERY_VERDICTS:
@@ -134,15 +184,7 @@ def _derive_recovery_verdict(
                 "tumor-specific judgement could not be reconciled: "
                 f"invalid verdict {verdict!r}"
             )
-
-    def qualifies(verdict: str, judged: Dict[str, Dict[str, Any]]) -> bool:
-        return verdict == "supported" and any(
-            entry["tumor_specific"] for entry in judged.values()
-        )
-
-    if qualifies(first_verdict, first_judged) or qualifies(
-        recovery_verdict, recovery_judged
-    ):
+    if "supported" in (first_verdict, recovery_verdict):
         return "supported"
     if "insufficient" in (first_verdict, recovery_verdict):
         return "insufficient"
@@ -429,6 +471,9 @@ class TumorSpecificGate:
         if not missing:
             return verdict, judged, rationale
         first_judged = dict(judged)
+        _validate_recovery_call(
+            result, verdict, first_judged, set(sent), call="first judgement"
+        )
 
         logger.warning(
             "Tumor-specific judge for %s/%s left %d of %d papers unjudged; retrying them",
@@ -442,6 +487,10 @@ class TumorSpecificGate:
         recovery_judged = {
             pmid: entry for pmid, entry in retried.items() if pmid in missing
         }
+        _validate_recovery_call(
+            retry, recovery_verdict, recovery_judged, set(missing),
+            call="recovery judgement",
+        )
         for pmid, entry in recovery_judged.items():
             judged.setdefault(pmid, entry)
         still_missing = [pmid for pmid in sent if pmid not in judged]
@@ -450,9 +499,7 @@ class TumorSpecificGate:
                 f"tumor-specific judgement is missing {len(still_missing)} of {len(sent)} "
                 "papers after one recovery attempt"
             )
-        derived = _derive_recovery_verdict(
-            verdict, first_judged, recovery_verdict, recovery_judged
-        )
+        derived = _derive_recovery_verdict(verdict, recovery_verdict)
         if derived != verdict:
             note = f"[Verdict derived from the merged per-paper judgements: {derived}.]"
             rationale = (rationale + " " if rationale else "") + note

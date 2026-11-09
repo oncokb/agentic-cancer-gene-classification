@@ -435,7 +435,8 @@ async def test_partial_judgement_recovers_with_one_bounded_retry():
         judged = sent if len(calls) > 1 else [p for p in sent if p != "30000010"]
         return {
             "papers": [{"pmid": p, "tumor_specific": p == "30000020"} for p in judged],
-            "verdict": "supported", "rationale": "KLK3 in KICH.",
+            "verdict": "supported" if len(calls) == 1 else "not_supported",
+            "rationale": "KLK3 in KICH.",
         }
 
     verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
@@ -447,10 +448,12 @@ async def test_partial_judgement_recovers_with_one_bounded_retry():
     assert recovered.tumor_specific is False
 
 
-async def test_recovery_positive_verdict_is_derived_from_merged_judgements():
-    """Call 1 omits the only supporting paper and says not_supported; the
-    recovery judges it tumor_specific. The final verdict must be supported,
-    derived from the merged judgements rather than call 1's verdict."""
+@pytest.mark.parametrize("first_verdict", ["not_supported", "insufficient"])
+async def test_recovery_positive_verdict_is_derived_from_merged_judgements(first_verdict):
+    """Call 1 omits the only supporting paper and says not_supported or
+    insufficient with no specific paper of its own; the recovery judges it
+    tumor_specific. The final verdict must be supported, derived from the
+    merged judgements rather than call 1's verdict."""
     calls = []
 
     async def judge(**kwargs):
@@ -459,7 +462,7 @@ async def test_recovery_positive_verdict_is_derived_from_merged_judgements():
         if len(calls) == 1:
             return {
                 "papers": [{"pmid": p, "tumor_specific": False} for p in sent if p != "30000020"],
-                "verdict": "not_supported", "rationale": "No support in the judged papers.",
+                "verdict": first_verdict, "rationale": "No support in the judged papers.",
             }
         return {
             "papers": [{"pmid": p, "tumor_specific": p == "30000020"} for p in sent],
@@ -473,10 +476,10 @@ async def test_recovery_positive_verdict_is_derived_from_merged_judgements():
     assert "merged per-paper judgements" in verdict.rationale
 
 
-async def test_recovery_negative_verdict_is_derived_from_merged_judgements():
-    """Call 1 says supported while omitting the only paper that could support;
-    the recovery judges it not specific and says not_supported. The final
-    verdict must follow the merged judgements, not call 1's verdict."""
+async def test_recovery_rejects_supported_without_its_own_specific_paper():
+    """Call 1 says supported while omitting the only paper that could support
+    and judging none of its own papers specific. That is contradictory, so the
+    recovery path raises instead of deriving not_supported."""
     calls = []
 
     async def judge(**kwargs):
@@ -492,11 +495,82 @@ async def test_recovery_negative_verdict_is_derived_from_merged_judgements():
             "verdict": "not_supported", "rationale": "r",
         }
 
-    verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    with pytest.raises(LiteratureGateError, match="contradictory"):
+        await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert len(calls) == 1  # rejected before the recovery call
+
+
+async def test_recovery_rejects_not_supported_with_its_own_specific_paper():
+    """Call 1 says not_supported while judging one of its own papers specific:
+    that contradiction must raise, not be stored with the specific citation."""
+    calls = []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [
+                    {"pmid": p, "tumor_specific": p == "30000010"}
+                    for p in sent if p != "30000020"
+                ],
+                "verdict": "not_supported", "rationale": "r",
+            }
+        return {
+            "papers": [{"pmid": p, "tumor_specific": False} for p in sent],
+            "verdict": "not_supported", "rationale": "r",
+        }
+
+    with pytest.raises(LiteratureGateError, match="contradictory"):
+        await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert len(calls) == 1  # rejected before the recovery call
+
+
+async def test_recovery_rejects_recovery_not_supported_with_its_own_specific_paper():
+    """The recovery call can contradict itself too: not_supported while judging
+    the paper it was sent tumor-specific must raise."""
+    calls = []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [{"pmid": p, "tumor_specific": False} for p in sent if p != "30000020"],
+                "verdict": "not_supported", "rationale": "r",
+            }
+        return {
+            "papers": [{"pmid": p, "tumor_specific": True} for p in sent],
+            "verdict": "not_supported", "rationale": "r",
+        }
+
+    with pytest.raises(LiteratureGateError, match="contradictory"):
+        await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
     assert calls[1] == ["30000020"]
-    assert verdict.verdict == "not_supported" and not verdict.supported
-    assert verdict.pmids == []
-    assert "merged per-paper judgements" in verdict.rationale
+
+
+async def test_recovery_rejects_specific_paper_never_sent_to_the_recovery_call():
+    """The recovery call says supported but its only specific paper was never
+    sent to it (it belongs to the first call). That must raise."""
+    calls = []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [{"pmid": p, "tumor_specific": False} for p in sent if p != "30000020"],
+                "verdict": "not_supported", "rationale": "r",
+            }
+        return {
+            "papers": [{"pmid": p, "tumor_specific": False} for p in sent]
+            + [{"pmid": "30000010", "tumor_specific": True}],
+            "verdict": "supported", "rationale": "r",
+        }
+
+    with pytest.raises(LiteratureGateError, match="never sent"):
+        await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert calls[1] == ["30000020"]
 
 
 async def test_both_insufficient_calls_cannot_become_supported():
@@ -560,7 +634,7 @@ async def test_failed_recovery_is_never_stored():
         if attempts[key] == 1:
             return {
                 "papers": [{"pmid": p, "tumor_specific": True} for p in sent[:-1]],
-                "verdict": "supported", "rationale": "r",
+                "verdict": "insufficient", "rationale": "r",
             }
         return {"papers": [], "verdict": "insufficient", "rationale": "r"}
 
