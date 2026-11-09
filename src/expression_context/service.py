@@ -34,7 +34,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set
 
 from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
 from src.expression_context.lease import VerdictLease, lease_key
-from src.expression_context.literature_gate import LiteratureGate, verdict_supported
+from src.expression_context.literature_gate import (
+    TUMOR_SPECIFIC_GATE,
+    LiteratureGate,
+    verdict_supported,
+)
 from src.expression_context.models import (
     SYMBOL_PATTERN,
     BundleStatus,
@@ -283,9 +287,13 @@ class ExpressionContextService:
             prior = existing.get(stats.oncotree_code)
             if prior is not None and prior.evidence is not None:
                 verdict = LiteratureVerdict.model_validate(prior.evidence)
-                rows.append(_verdict_row(row, stats, verdict))
-                reused += 1
-                continue
+                # Never reuse evidence from another gate, even if it is stored
+                # under this gate's key (a legacy row written before the
+                # version bump): recompute it instead.
+                if verdict.literature_gate == gate_name:
+                    rows.append(_verdict_row(row, stats, verdict))
+                    reused += 1
+                    continue
             cancer_type = manifest.cancer_type(stats.oncotree_code)
             if cancer_type is None or not cancer_type.tumor_type_query.strip():
                 errors.append(JobPairError(
@@ -383,7 +391,10 @@ class ExpressionContextService:
         prior = (await self.store.get_pairs(symbol, release_id, gate_name)).get(oncotree_code)
         if prior is None or prior.evidence is None:
             return None
-        return LiteratureVerdict.model_validate(prior.evidence)
+        verdict = LiteratureVerdict.model_validate(prior.evidence)
+        # Evidence from a different gate is not this gate's verdict, even when
+        # it is stored under this gate's key: treat it as absent and evaluate.
+        return verdict if verdict.literature_gate == gate_name else None
 
     async def _resolve_verdict(
         self,
@@ -501,9 +512,17 @@ class ExpressionContextService:
             eligible = passes and effective_precheck(stats, expired) is not False
             verdict = None
             prior = stored.get(stats.oncotree_code)
-            if eligible and prior is not None and prior.evidence is not None:
-                verdict = LiteratureVerdict.model_validate(prior.evidence)
-                verdict = verdict.model_copy(update={"supported": verdict_supported(verdict)})
+            if (
+                eligible
+                and self.gate.name == TUMOR_SPECIFIC_GATE
+                and prior is not None
+                and prior.evidence is not None
+            ):
+                stored_verdict = LiteratureVerdict.model_validate(prior.evidence)
+                if stored_verdict.literature_gate == TUMOR_SPECIFIC_GATE:
+                    verdict = stored_verdict.model_copy(
+                        update={"supported": verdict_supported(stored_verdict)}
+                    )
             if not passes:
                 status, reason = "excluded", "stats"
             elif not eligible:
@@ -627,14 +646,16 @@ def _verdict_row(make_row, stats: CancerTypeStats, verdict: LiteratureVerdict) -
 
 def _pair_result(row: StoredPair) -> PairResult:
     verdict = LiteratureVerdict.model_validate(row.evidence) if row.evidence else None
-    # Fail closed: a row is only surfaced when its stored evidence is a valid
-    # verdict from the row's own gate that satisfies the surfacing rule. A
-    # row without evidence (or with evidence from another gate) is never
-    # served as surfaced, even if the stored boolean says otherwise.
+    # Fail closed: a row is only surfaced when it is a v2 row whose stored
+    # evidence is a valid v2 verdict that satisfies the surfacing rule. A row
+    # without evidence, a legacy v1 row, or evidence from another gate is
+    # never served as surfaced, even if the stored boolean says otherwise.
     surfaced = False
     if verdict is not None:
         surfaced = (
-            verdict.literature_gate == row.literature_gate and verdict_supported(verdict)
+            row.literature_gate == TUMOR_SPECIFIC_GATE
+            and verdict.literature_gate == TUMOR_SPECIFIC_GATE
+            and verdict_supported(verdict)
         )
         verdict = verdict.model_copy(update={"supported": surfaced})
     reason = None if surfaced else (row.exclusion_reason or "literature")

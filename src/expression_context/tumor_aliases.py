@@ -12,7 +12,9 @@ an ambiguous abbreviation costs tokens, not correctness.
   hyphens interchangeable ("clear-cell renal" == "clear cell renal").
 - ``abbreviations`` match case-sensitively as whole words (so "PCa" and
   "ccRCC" don't match ordinary words). Two-letter abbreviations are left out
-  as too ambiguous, and so is "BRCA" (the BRCA1/2 genes).
+  as too ambiguous, and so is "BRCA" (the BRCA1/2 genes). Abbreviations that
+  are also gene symbols or ordinary words are omitted too ("READ", "ACC",
+  "CHOL", "UBC", "STS", "TET"): their spelled-out phrases are authoritative.
 """
 
 from __future__ import annotations
@@ -35,18 +37,20 @@ def _c(phrases: Tuple[str, ...], abbreviations: Tuple[str, ...]) -> CohortNames:
 
 NSCLC_PHRASES = ("non-small cell lung cancer", "non-small cell lung carcinoma")
 
-# Cohort codes that are also a gene symbol or an ordinary word. A bare
-# occurrence ("BRCA mutation", "READ the sequence") is not evidence of the
-# tumor type, so the guard must not accept them from its direct code check;
-# the curated phrases/abbreviations above are authoritative instead.
-AMBIGUOUS_COHORT_CODES = frozenset({"BRCA", "READ"})
+# Cohort codes that are also a gene symbol or a common abbreviation/word. A
+# bare occurrence ("BRCA mutation", "ACC levels", "CHOL metabolism") is not
+# evidence of the tumor type, so the guard must not accept them from its
+# direct code check; the curated phrases above are authoritative instead.
+# READ is not an OncoTree code here (it is part of COADREAD), but it is listed
+# for the same reason: it is an ordinary word.
+AMBIGUOUS_COHORT_CODES = frozenset({"ACC", "BRCA", "CHOL", "READ"})
 
 COHORT_NAMES: Dict[str, CohortNames] = {
     "ACC": _c(("adrenocortical carcinoma", "adrenocortical cancer", "adrenal cortical carcinoma",
-               "adrenal cortical cancer"), ("ACC",)),
+               "adrenal cortical cancer"), ()),
     "BLCA": _c(("bladder cancer", "bladder carcinoma", "urothelial carcinoma", "urothelial cancer",
                 "urothelial bladder cancer", "bladder urothelial carcinoma"),
-               ("BLCA", "UCB", "UBC", "MIBC", "NMIBC")),
+               ("BLCA", "UCB", "MIBC", "NMIBC")),
     "BRCA": _c(("breast cancer", "breast carcinoma", "mammary carcinoma", "invasive ductal carcinoma",
                 "invasive lobular carcinoma", "breast invasive carcinoma"),
                ("IDC", "ILC", "TNBC")),
@@ -54,11 +58,11 @@ COHORT_NAMES: Dict[str, CohortNames] = {
                 "endocervical adenocarcinoma", "uterine cervix cancer"), ("CESC",)),
     "CHOL": _c(("cholangiocarcinoma", "biliary tract cancer", "bile duct cancer",
                 "intrahepatic cholangiocarcinoma", "extrahepatic cholangiocarcinoma"),
-               ("CHOL", "CCA", "iCCA", "eCCA")),
+               ("CCA", "iCCA", "eCCA")),
     "COADREAD": _c(("colorectal cancer", "colorectal carcinoma", "colorectal adenocarcinoma",
                     "colon cancer", "colon carcinoma", "colon adenocarcinoma", "rectal cancer",
                     "rectal carcinoma", "rectal adenocarcinoma"),
-                   ("CRC", "mCRC", "COAD", "READ", "COADREAD")),
+                   ("CRC", "mCRC", "COAD", "COADREAD")),
     "DLBC": _c(("diffuse large B-cell lymphoma", "diffuse large B cell lymphoma"),
                ("DLBCL", "DLBC")),
     "ESCA": _c(("esophageal cancer", "oesophageal cancer", "esophageal carcinoma",
@@ -103,7 +107,7 @@ COHORT_NAMES: Dict[str, CohortNames] = {
     "SARC": _c(("sarcoma", "soft tissue sarcoma", "leiomyosarcoma", "liposarcoma",
                 "dedifferentiated liposarcoma", "undifferentiated pleomorphic sarcoma",
                 "myxofibrosarcoma", "synovial sarcoma", "malignant peripheral nerve sheath tumor"),
-               ("STS", "LMS", "DDLPS", "MPNST", "SARC")),
+               ("LMS", "DDLPS", "MPNST", "SARC")),
     "SKCM": _c(("melanoma", "cutaneous melanoma", "skin cutaneous melanoma"), ("SKCM",)),
     "STAD": _c(("gastric cancer", "gastric carcinoma", "gastric adenocarcinoma", "stomach cancer",
                 "stomach adenocarcinoma"), ("STAD",)),
@@ -114,7 +118,7 @@ COHORT_NAMES: Dict[str, CohortNames] = {
                 "papillary thyroid cancer", "differentiated thyroid cancer"),
                ("PTC", "THCA", "DTC")),
     "THYM": _c(("thymoma", "thymic carcinoma", "thymic epithelial tumor", "thymic epithelial tumour"),
-               ("TET", "TETs", "THYM")),
+               ("THYM",)),
     "UCEC": _c(("endometrial cancer", "endometrial carcinoma", "endometrial adenocarcinoma",
                 "endometrioid carcinoma", "uterine corpus endometrial carcinoma"), ("UCEC",)),
     "UCS": _c(("uterine carcinosarcoma", "carcinosarcoma of the uterus",

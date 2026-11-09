@@ -341,7 +341,10 @@ class TumorSpecificGate:
         A partial answer used to raise, and the identical retry of the whole
         batch would produce the same partial answer, so the pair could never
         resolve. The single recovery call asks only for the missing papers; if
-        the answer is still incomplete or malformed we fail closed.
+        the answer is still incomplete or malformed we fail closed. Because the
+        two calls each saw only part of the papers, their overall verdicts are
+        not comparable: the final verdict is derived from the merged per-paper
+        judgements instead (the same rule ``verdict_supported`` enforces).
         """
         result = await self._call_judge(hugo_symbol, tumor, candidates, matched)
         verdict, judged, rationale, missing = self._collect_judgement(
@@ -367,7 +370,12 @@ class TumorSpecificGate:
                 f"tumor-specific judgement is missing {len(still_missing)} of {len(sent)} "
                 "papers after one recovery attempt"
             )
-        return verdict, judged, rationale
+        has_specific = any(entry["tumor_specific"] for entry in judged.values())
+        derived = "supported" if has_specific else "not_supported"
+        if derived != verdict:
+            note = f"[Verdict derived from the merged per-paper judgements: {derived}.]"
+            rationale = (rationale + " " if rationale else "") + note
+        return derived, judged, rationale
 
     async def _call_judge(
         self,

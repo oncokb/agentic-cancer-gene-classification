@@ -269,12 +269,13 @@ modelled on ACGC's fusion-partner evidence check:
 2. Deterministic guard: only papers whose title/abstract mention the tumor
    type can count — ACGC's `requested_tumor_terms_in_record` alias matcher,
    the literal disease phrase or manifest name, the unambiguous cohort code as
-   a whole word (codes that are also a gene symbol or an ordinary word, such
-   as BRCA and READ, are excluded here), the module's curated names for all 32
-   TCGA cohorts (`tumor_aliases.py`: OncoTree/TCGA codes such as COAD/READ,
-   common abbreviations such as ccRCC, HCC, CRC, PDAC, and histology names;
-   phrases case-insensitive, abbreviations case-sensitive whole words), or
-   (weaker, ranked after those) every distinctive word of the phrase or name.
+   a whole word (codes and abbreviations that are also a gene symbol or an
+   ordinary word, such as BRCA, ACC, CHOL, READ, UBC, STS and TET, are
+   excluded here), the module's curated names for all 32 TCGA cohorts
+   (`tumor_aliases.py`: OncoTree/TCGA codes such as COAD/READ, common
+   abbreviations such as ccRCC, HCC, CRC, PDAC, and histology names; phrases
+   case-insensitive, abbreviations case-sensitive whole words), or (weaker,
+   ranked after those) every distinctive word of the phrase or name.
    If none do, the verdict is `insufficient` without an LLM call and is stored
    with `decided_by: "guard"` and a "[Guard only, no judgement]" rationale. At
    most `EXPRESSION_CONTEXT_JUDGE_MAX_PAPERS` (12) papers go to the judge.
@@ -294,15 +295,21 @@ modelled on ACGC's fusion-partner evidence check:
    dropped (no hallucinated PMIDs). If the answer leaves some sent papers
    unjudged, one bounded recovery call re-judges only those papers; if any
    are still unjudged after it, the pair fails closed (error, nothing stored).
-   There is never more than one recovery call per pair.
+   There is never more than one recovery call per pair. Because each call saw
+   only part of the papers, their overall verdicts are not comparable: when a
+   recovery call was made, the final verdict is derived from the merged
+   per-paper judgements (`supported` iff ≥1 paper is tumor-specific, else
+   `not_supported`), never from either call's summary.
 
 A pair is surfaced only if the verdict is `supported` AND ≥1 PMID is judged
 tumor-specific; only those PMIDs are shown as citations. The rule is
-re-applied to every stored verdict: for `acgc_tumor_specific_v2`, a verdict
-without a `verdict` field or without a tumor-specific judgement for each
-cited PMID is never surfaced. Each verdict is stored with the per-paper
-judgements, the tumor-specific PMIDs, the rationale and `decided_by`
-(`guard` or `judge`).
+re-applied to every stored verdict on every read path: a row is surfaced only
+when both the row and its evidence are `acgc_tumor_specific_v2`, and for that
+gate a verdict without a `verdict` field or without a tumor-specific
+judgement for each cited PMID is never surfaced (a legacy v1 row is never
+surfaced even when its evidence matches its own gate). Each verdict is stored
+with the per-paper judgements, the tumor-specific PMIDs, the rationale and
+`decided_by` (`guard` or `judge`).
 
 ## Tables
 

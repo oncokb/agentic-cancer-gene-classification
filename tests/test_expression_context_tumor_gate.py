@@ -393,6 +393,58 @@ async def test_partial_judgement_recovers_with_one_bounded_retry():
     assert recovered.tumor_specific is False
 
 
+async def test_recovery_positive_verdict_is_derived_from_merged_judgements():
+    """Call 1 omits the only supporting paper and says not_supported; the
+    recovery judges it tumor_specific. The final verdict must be supported,
+    derived from the merged judgements rather than call 1's verdict."""
+    calls = []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [{"pmid": p, "tumor_specific": False} for p in sent if p != "30000020"],
+                "verdict": "not_supported", "rationale": "No support in the judged papers.",
+            }
+        return {
+            "papers": [{"pmid": p, "tumor_specific": p == "30000020"} for p in sent],
+            "verdict": "supported", "rationale": "This paper reports KLK3 in KICH.",
+        }
+
+    verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert calls[1] == ["30000020"]
+    assert verdict.verdict == "supported" and verdict.supported
+    assert verdict.pmids == ["30000020"]
+    assert "merged per-paper judgements" in verdict.rationale
+
+
+async def test_recovery_negative_verdict_is_derived_from_merged_judgements():
+    """Call 1 says supported while omitting the only paper that could support;
+    the recovery judges it not specific and says not_supported. The final
+    verdict must follow the merged judgements, not call 1's verdict."""
+    calls = []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [{"pmid": p, "tumor_specific": False} for p in sent if p != "30000020"],
+                "verdict": "supported", "rationale": "r",
+            }
+        return {
+            "papers": [{"pmid": p, "tumor_specific": False} for p in sent],
+            "verdict": "not_supported", "rationale": "r",
+        }
+
+    verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert calls[1] == ["30000020"]
+    assert verdict.verdict == "not_supported" and not verdict.supported
+    assert verdict.pmids == []
+    assert "merged per-paper judgements" in verdict.rationale
+
+
 async def test_recovery_that_still_misses_fails_closed():
     calls = []
 
@@ -605,6 +657,61 @@ async def test_v1_verdicts_are_not_reused_after_the_version_bump():
     assert not v2.surfaced and v2.evidence["verdict"] == "insufficient"
 
 
+async def test_job_path_never_reuses_v1_evidence_under_the_v2_key():
+    """The job's reuse path must not treat v1 evidence under the v2 key as a
+    v2 verdict; it recomputes the pair instead of serving the legacy result."""
+    calls = []
+    inner = _scripted_gate()
+
+    class Counting:
+        name = TUMOR_SPECIFIC_GATE
+
+        async def evaluate(self, gene, tumor):
+            calls.append(tumor.oncotree_code)
+            return await inner.evaluate(gene, tumor)
+
+    service = await _klk3_service(Counting())
+    stats = next(ct for ct in gene_file("KLK3", M3)["cancer_types"]
+                 if ct["oncotree_code"] == "KICH")
+    await service.store.upsert_pairs([StoredPair(
+        hugo_symbol="KLK3", oncotree_code="KICH", release_id=M3_RELEASE_ID,
+        literature_gate=TUMOR_SPECIFIC_GATE, surfaced=True, stats=stats,
+        evidence={
+            "literature_gate": "acgc_pipeline_v1", "tumor_type_query": "x",
+            "supported": True, "insufficient_evidence": False,
+            "pmids": ["30000001"], "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        computed_at=datetime.now(timezone.utc),
+    )])
+    result, evaluated, reused, _ = await service.evaluate(await service.resolve("KLK3"), None)
+    assert evaluated == 2 and reused == 0 and sorted(calls) == ["KICH", "PRAD"]
+    assert [p.oncotree_code for p in result.surfaced] == ["PRAD"]
+    kich = service.store.rows[("KLK3", "KICH", M3_RELEASE_ID, TUMOR_SPECIFIC_GATE)]
+    assert kich.evidence["literature_gate"] == TUMOR_SPECIFIC_GATE
+    assert not kich.surfaced
+
+
+async def test_stats_view_ignores_v1_evidence_under_the_v2_key():
+    """The stats page must require the evidence itself to be a v2 verdict, not
+    just a v2 row key."""
+    service = await _klk3_service(_scripted_gate())
+    stats = next(ct for ct in gene_file("KLK3", M3)["cancer_types"]
+                 if ct["oncotree_code"] == "KICH")
+    await service.store.upsert_pairs([StoredPair(
+        hugo_symbol="KLK3", oncotree_code="KICH", release_id=M3_RELEASE_ID,
+        literature_gate=TUMOR_SPECIFIC_GATE, surfaced=True, stats=stats,
+        evidence={
+            "literature_gate": "acgc_pipeline_v1", "tumor_type_query": "x",
+            "supported": True, "insufficient_evidence": False,
+            "pmids": ["30000001"], "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        computed_at=datetime.now(timezone.utc),
+    )])
+    view = await service.stats_view("KLK3")
+    kich = next(p for p in view.pairs if p.oncotree_code == "KICH")
+    assert kich.literature is None and kich.status == "literature_pending"
+
+
 async def test_v2_verdicts_are_reused():
     calls = []
     inner = _scripted_gate()
@@ -660,8 +767,11 @@ def test_alias_table_covers_all_32_tcga_cohorts():
     assert len(TCGA_COHORTS) == 32 and set(COHORT_NAMES) == set(TCGA_COHORTS)
     for code, names in COHORT_NAMES.items():
         assert names.phrases, code
-        assert "BRCA" not in names.abbreviations  # the BRCA1/2 genes
         assert all(len(abbr) >= 3 for abbr in names.abbreviations), code
+    # Ambiguous bare tokens: gene symbols / ordinary words.
+    all_abbreviations = {abbr for names in COHORT_NAMES.values()
+                         for abbr in names.abbreviations}
+    assert not all_abbreviations & {"BRCA", "READ", "ACC", "CHOL", "UBC", "STS", "TET", "TETs"}
 
 
 KIRC = TumorContext(oncotree_code="KIRC", name="Kidney Renal Clear Cell Carcinoma",
@@ -678,7 +788,6 @@ COADREAD = TumorContext(oncotree_code="COADREAD", name="Colorectal Adenocarcinom
     (LIHC, "GPC3 in hepatoma", "GPC3 is elevated in human hepatoma tissue.", "hepatoma"),
     (COADREAD, "CDX2 in CRC", "CDX2 loss in CRC predicts outcome.", "CRC"),
     (COADREAD, "CDX2 in COAD", "TCGA COAD samples show high CDX2.", "COAD"),
-    (COADREAD, "CDX2 in READ", "TCGA READ samples show high CDX2.", "READ"),
     (COADREAD, "CDX2 in colon adenocarcinoma", "High CDX2 in colon adenocarcinoma.", "colon adenocarcinoma"),
     (KICH, "KIT in ChRCC", "KIT is expressed in ChRCC.", "ChRCC"),
 ])
@@ -723,6 +832,28 @@ def test_ambiguous_cohort_code_alone_is_not_the_tumor_type():
     assert g._matched_terms(gene_only, brca) == (0, [])
     real = rec("50000003", "Breast cancer risk", "Breast cancer in BRCA carriers.")
     assert g._matched_terms(real, brca)[0] == 2
+
+
+@pytest.mark.parametrize("tumor,text,phrase", [
+    (TumorContext(oncotree_code="ACC", name="Adrenocortical Carcinoma",
+                  tumor_type_query="adrenocortical carcinoma"),
+     "ACC levels", "adrenocortical carcinoma"),
+    (TumorContext(oncotree_code="CHOL", name="Cholangiocarcinoma",
+                  tumor_type_query="cholangiocarcinoma"),
+     "CHOL metabolism", "cholangiocarcinoma"),
+    (COADREAD, "TCGA READ samples", "rectal adenocarcinoma"),
+    (TumorContext(oncotree_code="BLCA", name="Bladder Urothelial Carcinoma",
+                  tumor_type_query="bladder cancer"),
+     "UBC expression", "bladder cancer"),
+    (TumorContext(oncotree_code="SARC", name="Sarcoma", tumor_type_query="sarcoma"),
+     "STS activity", "soft tissue sarcoma"),
+    (TumorContext(oncotree_code="THYM", name="Thymoma", tumor_type_query="thymoma"),
+     "TET activity", "thymoma"),
+])
+def test_ambiguous_abbreviations_do_not_match_but_phrases_do(tumor, text, phrase):
+    g = TumorSpecificGate()
+    assert g._matched_terms(rec("50000004", text, text), tumor) == (0, [])
+    assert g._matched_terms(rec("50000005", phrase, phrase), tumor)[0] == 2
 
 
 # ------------------------------------------------ prompt injection

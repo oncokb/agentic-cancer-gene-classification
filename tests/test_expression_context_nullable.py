@@ -174,6 +174,28 @@ def test_stored_verdict_from_another_gate_is_never_surfaced():
     assert result.excluded[0].literature.supported is False
 
 
+def test_matching_v1_row_and_evidence_is_never_surfaced():
+    """A legacy row whose evidence is from the same legacy gate is still not
+    a v2 row: only acgc_tumor_specific_v2 may surface."""
+    base = gene_file("MYCN")["cancer_types"][1]
+    now = datetime.now(timezone.utc)
+    evidence = {
+        "literature_gate": "acgc_pipeline_v1", "tumor_type_query": "breast cancer",
+        "supported": True, "insufficient_evidence": False, "pmids": ["1"],
+        "evaluated_at": now.isoformat(),
+    }
+    row = StoredPair(
+        hugo_symbol="MYCN", oncotree_code="STAD", release_id=RELEASE_ID,
+        literature_gate="acgc_pipeline_v1", surfaced=True,
+        stats={**base, "oncotree_code": "STAD"}, evidence=evidence, computed_at=now,
+    )
+    result = ExpressionContextService._gene_result("MYCN", [row], include_excluded=True)
+    assert result.surfaced == []
+    assert result.excluded[0].exclusion_reason == "literature"
+    assert result.excluded[0].literature is not None
+    assert result.excluded[0].literature.supported is False
+
+
 FLOOR = math.log2(11)  # method_version 2: RSEM 10
 
 
