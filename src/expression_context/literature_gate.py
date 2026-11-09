@@ -116,7 +116,7 @@ def stored_verdict_surfaced(
 _RECOVERY_VERDICTS = ("supported", "not_supported", "insufficient")
 
 
-def _validate_recovery_call(
+def _validate_judge_call(
     result: Any,
     verdict: str,
     judged: Dict[str, Dict[str, Any]],
@@ -126,13 +126,13 @@ def _validate_recovery_call(
 ) -> None:
     """Reject a judge call that contradicts its own papers.
 
-    ``judged`` contains only papers sent to that call. On the recovery path a
-    call that says ``supported`` while judging none of its own papers specific,
-    or ``not_supported`` while judging one of them specific, is contradictory
-    and must not be merged into a stored verdict. A specific judgement for a
-    PMID that was not sent to this call is also contradictory. ``insufficient``
-    is allowed to carry a specific paper: the prompt permits evidence that is
-    specific but too thin.
+    ``judged`` contains only papers sent to that call. A call that says
+    ``supported`` while judging none of its own papers specific, or
+    ``not_supported`` while judging one of them specific, is contradictory and
+    must not be stored or merged into a stored verdict. A specific judgement
+    for a PMID that was not sent to this call is also contradictory.
+    ``insufficient`` is allowed to carry a specific paper: the prompt permits
+    evidence that is specific but too thin.
     """
     if verdict not in _RECOVERY_VERDICTS:
         raise LiteratureGateError(
@@ -468,12 +468,12 @@ class TumorSpecificGate:
         verdict, judged, rationale, missing = self._collect_judgement(
             result, sent, hugo_symbol, tumor
         )
-        if not missing:
-            return verdict, judged, rationale
         first_judged = dict(judged)
-        _validate_recovery_call(
+        _validate_judge_call(
             result, verdict, first_judged, set(sent), call="first judgement"
         )
+        if not missing:
+            return verdict, judged, rationale
 
         logger.warning(
             "Tumor-specific judge for %s/%s left %d of %d papers unjudged; retrying them",
@@ -487,7 +487,7 @@ class TumorSpecificGate:
         recovery_judged = {
             pmid: entry for pmid, entry in retried.items() if pmid in missing
         }
-        _validate_recovery_call(
+        _validate_judge_call(
             retry, recovery_verdict, recovery_judged, set(missing),
             call="recovery judgement",
         )

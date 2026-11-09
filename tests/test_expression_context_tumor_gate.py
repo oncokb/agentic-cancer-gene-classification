@@ -253,27 +253,68 @@ async def test_klk3_kich_passing_mention_judged_not_specific():
     assert verdict.papers[0].matched_terms  # deterministic tumor-term match recorded
 
 
-async def test_model_saying_supported_without_specific_papers_is_downgraded():
+async def test_model_saying_supported_without_specific_papers_is_rejected():
     judge = Judge(result={
         "papers": [{"pmid": "30000010", "tumor_specific": False}],
         "verdict": "supported", "rationale": "KLK3 is a well known cancer gene.",
     })
-    verdict = await gate([RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    with pytest.raises(LiteratureGateError, match="contradictory"):
+        await gate([RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    service = await _klk3_service(
+        gate([RENAL_DIFFERENTIAL, PROSTATE_PAPERS[0]], EchoJudge("supported", specific=()))
+    )
+    _, evaluated, _, errors = await service.evaluate(await service.resolve("KLK3"), None)
+    assert evaluated == 0 and sorted(e.oncotree_code for e in errors) == ["KICH", "PRAD"]
+    assert all("contradictory" in e.error for e in errors)
+    assert not [
+        k for k, row in service.store.rows.items()
+        if k[3] == TUMOR_SPECIFIC_GATE and k[1] in ("KICH", "PRAD") and row.evidence is not None
+    ]
+
+
+async def test_model_saying_not_supported_with_specific_paper_is_rejected():
+    judge = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "not_supported", "rationale": "KLK3 is not relevant in KICH.",
+    })
+    with pytest.raises(LiteratureGateError, match="contradictory"):
+        await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
+    service = await _klk3_service(
+        gate(
+            [KICH_PAPER, PROSTATE_PAPERS[0]],
+            EchoJudge("not_supported", specific={"30000020", "30000001"}),
+        )
+    )
+    _, evaluated, _, errors = await service.evaluate(await service.resolve("KLK3"), None)
+    assert evaluated == 0 and sorted(e.oncotree_code for e in errors) == ["KICH", "PRAD"]
+    assert all("contradictory" in e.error for e in errors)
+    assert not [
+        k for k, row in service.store.rows.items()
+        if k[3] == TUMOR_SPECIFIC_GATE and k[1] in ("KICH", "PRAD") and row.evidence is not None
+    ]
+
+
+async def test_model_saying_insufficient_with_specific_paper_is_accepted():
+    judge = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "insufficient", "rationale": "Single small series; evidence is too thin.",
+    })
+    verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
     assert verdict.verdict == "insufficient" and not verdict.supported
-    assert "No paper was judged specific" in verdict.rationale
+    assert verdict.insufficient_evidence is True
+    assert verdict.pmids == ["30000020"]
 
 
 async def test_paper_about_another_tumor_never_counts_even_if_model_marks_it():
     """The model calls a prostate-only paper (never sent: it doesn't mention
-    KICH) tumor-specific: it is dropped, so the pair is not supported."""
+    KICH) tumor-specific: that contradicts the sent papers and is rejected."""
     judge = Judge(result={
         "papers": [{"pmid": "30000001", "tumor_specific": True},
                    {"pmid": "30000010", "tumor_specific": False}],
         "verdict": "supported", "rationale": "PSA",
     })
-    verdict = await gate(PROSTATE_PAPERS + [RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
-    assert verdict.pmids == [] and not verdict.supported
-    assert "30000001" not in [p.pmid for p in verdict.papers]
+    with pytest.raises(LiteratureGateError, match="never sent"):
+        await gate(PROSTATE_PAPERS + [RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
 
 
 # ------------------------------------------------------------ genuine case
@@ -357,8 +398,8 @@ async def test_tcga_reanalysis_does_not_count_but_independent_paper_does():
 async def test_hallucinated_pmids_are_dropped():
     judge = Judge(result={
         "papers": [
-            {"pmid": "99999999", "tumor_specific": True},  # never retrieved
-            {"pmid": "PMID:30000020", "tumor_specific": True},  # garbled
+            {"pmid": "99999999", "tumor_specific": False},  # never retrieved
+            {"pmid": "PMID:30000020", "tumor_specific": False},  # garbled
             {"pmid": "30000020", "tumor_specific": True},
             {"pmid": "30000020", "tumor_specific": False},  # duplicate: first wins
         ],
@@ -369,14 +410,14 @@ async def test_hallucinated_pmids_are_dropped():
     assert "99999999" not in {p.pmid for p in verdict.papers}
 
 
-async def test_only_hallucinated_specific_pmid_means_not_supported():
+async def test_only_hallucinated_specific_pmid_is_rejected():
     judge = Judge(result={
         "papers": [{"pmid": "99999999", "tumor_specific": True},
                    {"pmid": "30000010", "tumor_specific": False}],
         "verdict": "supported", "rationale": "see PMID 99999999",
     })
-    verdict = await gate([RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
-    assert verdict.pmids == [] and not verdict.supported
+    with pytest.raises(LiteratureGateError, match="never sent"):
+        await gate([RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
 
 
 @pytest.mark.parametrize("result", [
@@ -420,7 +461,7 @@ async def test_malformed_judgement_is_retried_not_stored():
     assert evaluated == 0 and sorted(e.oncotree_code for e in errors) == ["KICH", "PRAD"]
     assert not [k for k in service.store.rows if k[3] == TUMOR_SPECIFIC_GATE and k[1] in ("KICH", "PRAD")
                 and service.store.rows[k].evidence is not None]
-    flaky.inner._judge = EchoJudge("supported", specific={"30000020"})
+    flaky.inner._judge = EchoJudge("supported", specific={"30000001", "30000020"})
     _, evaluated, reused, errors = await service.evaluate(await service.resolve("KLK3"), None)
     assert errors == [] and evaluated == 2 and reused == 0
 
