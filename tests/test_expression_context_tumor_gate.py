@@ -407,11 +407,120 @@ async def test_hallucinated_pmids_are_dropped():
             {"pmid": "30000020", "tumor_specific": True},
             {"pmid": "30000020", "tumor_specific": False},  # duplicate: first wins
         ],
-        "verdict": "supported", "rationale": "ok",
+        "verdict": "supported",
+        "rationale": "KLK3 is reported in KICH (PMID 30000020 and PMID 99999999).",
     })
     verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
     assert verdict.pmids == ["30000020"] and verdict.supported
     assert "99999999" not in {p.pmid for p in verdict.papers}
+    assert "30000020" in verdict.rationale
+    assert "99999999" not in verdict.rationale
+    assert "[unverified PMID removed]" in verdict.rationale
+
+
+async def test_rationale_mixed_pmid_list_keeps_sent_and_strips_invented():
+    judge = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "supported",
+        "rationale": "Supported by PMIDs 30000020, 99999999 and 88888888.",
+    })
+    verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
+    assert verdict.supported
+    assert "30000020" in verdict.rationale
+    assert "99999999" not in verdict.rationale
+    assert "88888888" not in verdict.rationale
+
+
+async def test_rationale_keeps_sent_paper_judged_not_tumor_specific():
+    judge = Judge(result={
+        "papers": [
+            {"pmid": "30000020", "tumor_specific": True},
+            {"pmid": "30000010", "tumor_specific": False},
+        ],
+        "verdict": "supported",
+        "rationale": (
+            "PMID 30000020 reports KLK3 in KICH, while PMID 30000010 only "
+            "mentions KICH in differential diagnosis."
+        ),
+    })
+    verdict = await gate([KICH_PAPER, RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert verdict.pmids == ["30000020"]
+    assert "30000020" in verdict.rationale
+    assert "30000010" in verdict.rationale
+    assert "[unverified PMID removed]" not in verdict.rationale
+
+
+@pytest.mark.parametrize("mention", [
+    "PMID 99999999",
+    "pmid:99999999",
+    "PMID#99999999",
+    "pmids 99999999, 88888888 and 77777777",
+    "PubMed ID 99999999",
+    "pubmed id: 99999999",
+])
+async def test_rationale_strips_labelled_pmid_forms(mention):
+    judge = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "supported",
+        "rationale": f"KLK3 in KICH (PMID 30000020; see also {mention}).",
+    })
+    verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
+    assert "30000020" in verdict.rationale
+    assert "99999999" not in verdict.rationale
+    assert "88888888" not in verdict.rationale
+    assert "77777777" not in verdict.rationale
+    assert "[unverified PMID removed]" in verdict.rationale
+
+
+async def test_recovery_path_strips_invented_pmid_from_rationale():
+    calls = []
+
+    async def retrieve(gene, query):
+        return [KICH_PAPER, RENAL_DIFFERENTIAL] if "chromophobe" in query else []
+
+    async def judge(**kwargs):
+        sent = sent_pmids(kwargs)
+        calls.append(sent)
+        if len(calls) == 1:
+            return {
+                "papers": [{"pmid": p, "tumor_specific": False} for p in sent if p != "30000020"],
+                "verdict": "not_supported",
+                "rationale": "PMID 30000010 is differential only; PMID 99999999 is unrelated.",
+            }
+        return {
+            "papers": [{"pmid": p, "tumor_specific": p == "30000020"} for p in sent],
+            "verdict": "supported",
+            "rationale": "PMID 30000020 supports KLK3 in KICH.",
+        }
+
+    service = await _klk3_service(
+        TumorSpecificGate(retrieve=retrieve, judge=judge, model="m")
+    )
+    await service.evaluate(await service.resolve("KLK3"), None)
+    kich = service.store.rows[("KLK3", "KICH", M3_RELEASE_ID, TUMOR_SPECIFIC_GATE)]
+    rationale = kich.evidence["rationale"]
+    assert calls == [["30000020", "30000010"], ["30000020"]]
+    assert "30000010" in rationale
+    assert "99999999" not in rationale
+    assert "[unverified PMID removed]" in rationale
+
+
+async def test_rationale_without_pmid_or_none_is_unchanged():
+    judge_text = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "supported",
+        "rationale": "Smith et al. (2024) studied 42 cases of chromophobe RCC.",
+    })
+    verdict_text = await gate([KICH_PAPER], judge_text).evaluate("KLK3", KICH)
+    assert verdict_text.rationale == "Smith et al. (2024) studied 42 cases of chromophobe RCC."
+
+    judge_none = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "supported",
+        "rationale": None,
+    })
+    verdict_none = await gate([KICH_PAPER], judge_none).evaluate("KLK3", KICH)
+    assert verdict_none.rationale is None
 
 
 async def test_only_hallucinated_specific_pmid_is_rejected():
@@ -597,7 +706,7 @@ async def test_recovery_rejects_recovery_not_supported_with_its_own_specific_pap
     assert calls[1] == ["30000020"]
 
 
-async def test_recovery_rejects_specific_paper_never_sent_to_the_recovery_call():
+async def test_recovery_ignores_unsent_pmids_and_requires_own_specific_paper():
     """The recovery call cannot overwrite earlier judgements or add papers: an
     unsent PMID (from the first call or invented) is ignored, so a recovery
     call that says supported with only unsent specific PMIDs raises, and when

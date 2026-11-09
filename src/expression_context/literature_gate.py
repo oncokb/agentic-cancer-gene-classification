@@ -545,7 +545,12 @@ class TumorSpecificGate:
                 hugo_symbol, tumor.oncotree_code, dropped[:10],
             )
         missing = [pmid for pmid in sent if pmid not in judged]
-        return verdict, judged, _clip(rationale, 1000), missing
+        return (
+            verdict,
+            judged,
+            _clip(_strip_unverified_pmids(rationale, set(sent)), 1000),
+            missing,
+        )
 
     def _verdict(
         self,
@@ -624,6 +629,33 @@ def _safe_json(value: Any) -> str:
         json.dumps(value, ensure_ascii=False, indent=1)
         .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
     )
+
+
+_PMID_MENTION = re.compile(
+    r"\b(?:PMIDs?|PubMed\s+IDs?)\s*(?:[:#]\s*|\s+)"
+    r"(\d{1,9}(?:\s*(?:,\s*(?:and\s+|or\s+)?|;\s*|\s+(?:and|or)\s+|/\s*)\d{1,9})*)",
+    re.IGNORECASE,
+)
+
+
+def _strip_unverified_pmids(
+    rationale: Optional[str], sent_pmids: set[str]
+) -> Optional[str]:
+    """Remove labelled PMID mentions that are not in ``sent_pmids``."""
+    if rationale is None:
+        return None
+
+    def replace(match: re.Match[str]) -> str:
+        numbers = re.findall(r"\d{1,9}", match.group(1))
+        kept = [pmid for pmid in numbers if pmid in sent_pmids]
+        if not kept:
+            return "[unverified PMID removed]"
+        if len(kept) == len(numbers):
+            return match.group(0)
+        label = "PMIDs" if len(kept) > 1 else "PMID"
+        return f"{label} {', '.join(kept)}"
+
+    return _PMID_MENTION.sub(replace, rationale)
 
 
 def _clip(value: Any, limit: int) -> Optional[str]:
