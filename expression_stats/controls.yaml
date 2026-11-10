@@ -1,0 +1,719 @@
+{
+  "schema_version": 1,
+  "description": "Curated m3 gate. JSON-compatible YAML, read with the Python standard library. Borderline is reported but not scored.",
+  "source_sha256": "a982d001080f0d592676e92078de938775a5abf05e4412acc98f0064f4dda827",
+  "source_proposal_sha256": "45c2546bfe5537e51d9e3ce6f89162f3c8aed3c1e9895d1092cd48d2e6a2acd6",
+  "controls": [
+    {
+      "id": "A-KLK3-PRAD",
+      "gene": "KLK3",
+      "tcga": "PRAD",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        26544944,
+        18344018
+      ],
+      "note": "prostate luminal epithelium (PSA/KLK3)"
+    },
+    {
+      "id": "A-AR-PRAD",
+      "gene": "AR",
+      "tcga": "PRAD",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        26544944
+      ],
+      "note": "androgen receptor / prostate luminal"
+    },
+    {
+      "id": "A-ALB-LIHC",
+      "gene": "ALB",
+      "tcga": "LIHC",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        28622513
+      ],
+      "note": "hepatocyte"
+    },
+    {
+      "id": "A-ESR1-BRCA",
+      "gene": "ESR1",
+      "tcga": "BRCA",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        23000897
+      ],
+      "note": "luminal breast epithelium"
+    },
+    {
+      "id": "A-NKX2-1-LUAD",
+      "gene": "NKX2-1",
+      "tcga": "LUAD",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        25079552
+      ],
+      "note": "lung/thyroid lineage transcription factor (TTF-1)"
+    },
+    {
+      "id": "A-TG-THCA",
+      "gene": "TG",
+      "tcga": "THCA",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        25417114
+      ],
+      "note": "thyroid follicular epithelium"
+    },
+    {
+      "id": "A-PAX8-KIRC",
+      "gene": "PAX8",
+      "tcga": "KIRC",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        23792563
+      ],
+      "note": "renal (pan-renal/thyroid/Mullerian) lineage"
+    },
+    {
+      "id": "A-PAX8-THCA",
+      "gene": "PAX8",
+      "tcga": "THCA",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        25417114
+      ],
+      "note": "thyroid follicular"
+    },
+    {
+      "id": "A-PAX8-OV",
+      "gene": "PAX8",
+      "tcga": "OV",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        21720365
+      ],
+      "note": "Mullerian epithelium"
+    },
+    {
+      "id": "A-GATA3-BRCA",
+      "gene": "GATA3",
+      "tcga": "BRCA",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        23000897
+      ],
+      "note": "luminal breast"
+    },
+    {
+      "id": "A-GATA3-BLCA",
+      "gene": "GATA3",
+      "tcga": "BLCA",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        24476821
+      ],
+      "note": "urothelial"
+    },
+    {
+      "id": "A-CDX2-COADREAD",
+      "gene": "CDX2",
+      "tcga": "COADREAD",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        22810696
+      ],
+      "note": "intestinal epithelium"
+    },
+    {
+      "id": "A-SOX10-SKCM",
+      "gene": "SOX10",
+      "tcga": "SKCM",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        26091043
+      ],
+      "note": "melanocytic / neural crest"
+    },
+    {
+      "id": "A-PMEL-SKCM",
+      "gene": "PMEL",
+      "tcga": "SKCM",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        26091043
+      ],
+      "note": "melanocytic (gp100)"
+    },
+    {
+      "id": "A-TYR-SKCM",
+      "gene": "TYR",
+      "tcga": "SKCM",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        26091043
+      ],
+      "note": "melanocytic (tyrosinase)"
+    },
+    {
+      "id": "A-MS4A1-DLBC",
+      "gene": "MS4A1",
+      "tcga": "DLBC",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        29713087
+      ],
+      "note": "B-cell (CD20)"
+    },
+    {
+      "id": "A-MPO-LAML",
+      "gene": "MPO",
+      "tcga": "LAML",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        23634996
+      ],
+      "note": "myeloid/granulocytic"
+    },
+    {
+      "id": "A-CALB2-MESO",
+      "gene": "CALB2",
+      "tcga": "MESO",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        26928227
+      ],
+      "note": "mesothelial (calretinin)"
+    },
+    {
+      "id": "A-CYP11B1-ACC",
+      "gene": "CYP11B1",
+      "tcga": "ACC",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        27165744
+      ],
+      "note": "adrenal cortex"
+    },
+    {
+      "id": "A-TH-PCPG",
+      "gene": "TH",
+      "tcga": "PCPG",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        28162975
+      ],
+      "note": "catecholaminergic / neural crest"
+    },
+    {
+      "id": "A-GFAP-LGG",
+      "gene": "GFAP",
+      "tcga": "LGG",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        26061751
+      ],
+      "note": "astroglial"
+    },
+    {
+      "id": "A-KRT5-LUSC",
+      "gene": "KRT5",
+      "tcga": "LUSC",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        22960745
+      ],
+      "note": "basal/squamous epithelium"
+    },
+    {
+      "id": "A-WT1-MESO",
+      "gene": "WT1",
+      "tcga": "MESO",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        26928227
+      ],
+      "note": "mesothelial"
+    },
+    {
+      "id": "A-POU5F1-TGCT",
+      "gene": "POU5F1",
+      "tcga": "TGCT",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        29898407
+      ],
+      "note": "germ cell / pluripotent"
+    },
+    {
+      "id": "A-CD1A-THYM",
+      "gene": "CD1A",
+      "tcga": "THYM",
+      "classification": "A",
+      "expected": true,
+      "citations": [
+        29438696
+      ],
+      "note": "thymic cortex / Langerhans cells"
+    },
+    {
+      "id": "B-ERBB2-BRCA",
+      "gene": "ERBB2",
+      "tcga": "BRCA",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        23000897
+      ],
+      "note": "ERBB2 (HER2) amplification/overexpression"
+    },
+    {
+      "id": "B-ERBB2-STAD",
+      "gene": "ERBB2",
+      "tcga": "STAD",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        25079317
+      ],
+      "note": "ERBB2 amplification/overexpression"
+    },
+    {
+      "id": "B-EGFR-GBM",
+      "gene": "EGFR",
+      "tcga": "GBM",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        24120142
+      ],
+      "note": "EGFR amplification/overexpression"
+    },
+    {
+      "id": "B-MDM2-SARC",
+      "gene": "MDM2",
+      "tcga": "SARC",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        29100075
+      ],
+      "note": "MDM2 amplification (WDLPS/DDLPS)"
+    },
+    {
+      "id": "B-CDK4-SARC",
+      "gene": "CDK4",
+      "tcga": "SARC",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        29100075
+      ],
+      "note": "CDK4 amplification (co-amplified with MDM2)"
+    },
+    {
+      "id": "B-FGFR3-BLCA",
+      "gene": "FGFR3",
+      "tcga": "BLCA",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        24476821
+      ],
+      "note": "FGFR3 activating mutation / moderate overexpression"
+    },
+    {
+      "id": "B-CCNE1-OV",
+      "gene": "CCNE1",
+      "tcga": "OV",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        21720365
+      ],
+      "note": "CCNE1 amplification (HGSOC)"
+    },
+    {
+      "id": "B-CCNE1-UCS",
+      "gene": "CCNE1",
+      "tcga": "UCS",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        28292439
+      ],
+      "note": "CCNE1 amplification"
+    },
+    {
+      "id": "B-SOX2-LUSC",
+      "gene": "SOX2",
+      "tcga": "LUSC",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        22960745
+      ],
+      "note": "SOX2 amplification + squamous lineage"
+    },
+    {
+      "id": "B-MET-KIRP",
+      "gene": "MET",
+      "tcga": "KIRP",
+      "classification": "B",
+      "expected": true,
+      "citations": [
+        26536169
+      ],
+      "note": "MET mutation/copy gain (papillary RCC)"
+    },
+    {
+      "id": "C-GAPDH-BRCA",
+      "gene": "GAPDH",
+      "tcga": "BRCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping/normalization control"
+    },
+    {
+      "id": "C-ACTB-BRCA",
+      "gene": "ACTB",
+      "tcga": "BRCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping/normalization control"
+    },
+    {
+      "id": "C-HPRT1-BRCA",
+      "gene": "HPRT1",
+      "tcga": "BRCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping/normalization control"
+    },
+    {
+      "id": "C-RPLP0-BRCA",
+      "gene": "RPLP0",
+      "tcga": "BRCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping/ribosomal control"
+    },
+    {
+      "id": "C-TUBB-BRCA",
+      "gene": "TUBB",
+      "tcga": "BRCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping/cytoskeletal control"
+    },
+    {
+      "id": "C-PPIA-LUAD",
+      "gene": "PPIA",
+      "tcga": "LUAD",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping control"
+    },
+    {
+      "id": "C-TPT1-BRCA",
+      "gene": "TPT1",
+      "tcga": "BRCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping control"
+    },
+    {
+      "id": "C-EEF1A1-LUAD",
+      "gene": "EEF1A1",
+      "tcga": "LUAD",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping control"
+    },
+    {
+      "id": "C-KLK3-ACC",
+      "gene": "KLK3",
+      "tcga": "ACC",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        27165744,
+        26544944
+      ],
+      "note": "prostate-specific gene in adrenocortical carcinoma"
+    },
+    {
+      "id": "C-KLK3-COADREAD",
+      "gene": "KLK3",
+      "tcga": "COADREAD",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        22810696,
+        26544944
+      ],
+      "note": "prostate-specific gene in colorectal cancer"
+    },
+    {
+      "id": "C-ALB-LGG",
+      "gene": "ALB",
+      "tcga": "LGG",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        26061751,
+        28622513
+      ],
+      "note": "hepatocyte gene in lower-grade glioma"
+    },
+    {
+      "id": "C-ALB-PCPG",
+      "gene": "ALB",
+      "tcga": "PCPG",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        28162975,
+        28622513
+      ],
+      "note": "hepatocyte gene in pheochromocytoma/paraganglioma"
+    },
+    {
+      "id": "C-ALB-KIRC",
+      "gene": "ALB",
+      "tcga": "KIRC",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23792563,
+        28622513
+      ],
+      "note": "hepatocyte gene in renal cell carcinoma"
+    },
+    {
+      "id": "C-ALB-SKCM",
+      "gene": "ALB",
+      "tcga": "SKCM",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        26091043,
+        28622513
+      ],
+      "note": "hepatocyte gene in melanoma"
+    },
+    {
+      "id": "C-ESR1-PRAD",
+      "gene": "ESR1",
+      "tcga": "PRAD",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        26544944,
+        23000897
+      ],
+      "note": "estrogen receptor is not the driver in prostate; AR is"
+    },
+    {
+      "id": "C-ESR1-THCA",
+      "gene": "ESR1",
+      "tcga": "THCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        25417114,
+        23000897
+      ],
+      "note": "estrogen receptor not established in thyroid carcinoma"
+    },
+    {
+      "id": "C-TG-BRCA",
+      "gene": "TG",
+      "tcga": "BRCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23000897,
+        25417114
+      ],
+      "note": "thyroid-specific gene in breast cancer"
+    },
+    {
+      "id": "C-MS4A1-PRAD",
+      "gene": "MS4A1",
+      "tcga": "PRAD",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        26544944,
+        29713087
+      ],
+      "note": "B-cell marker in prostate adenocarcinoma"
+    },
+    {
+      "id": "C-CYP11B1-SKCM",
+      "gene": "CYP11B1",
+      "tcga": "SKCM",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        26091043,
+        27165744
+      ],
+      "note": "adrenal-specific gene in melanoma"
+    },
+    {
+      "id": "C-NKX2-1-COADREAD",
+      "gene": "NKX2-1",
+      "tcga": "COADREAD",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        22810696,
+        25079552
+      ],
+      "note": "lung/thyroid lineage factor in colorectal cancer"
+    },
+    {
+      "id": "C-CDX2-LUAD",
+      "gene": "CDX2",
+      "tcga": "LUAD",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        25079552,
+        22810696
+      ],
+      "note": "intestinal marker in lung adenocarcinoma"
+    },
+    {
+      "id": "C-GFAP-SKCM",
+      "gene": "GFAP",
+      "tcga": "SKCM",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        26091043,
+        26061751
+      ],
+      "note": "astroglial marker in melanoma"
+    },
+    {
+      "id": "C-POU5F1-BRCA",
+      "gene": "POU5F1",
+      "tcga": "BRCA",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        23000897,
+        29898407
+      ],
+      "note": "germ-cell/pluripotency factor in breast carcinoma"
+    },
+    {
+      "id": "C-PMEL-COADREAD",
+      "gene": "PMEL",
+      "tcga": "COADREAD",
+      "classification": "C",
+      "expected": false,
+      "citations": [
+        22810696,
+        26091043
+      ],
+      "note": "melanocytic marker in colorectal cancer"
+    },
+    {
+      "id": "N-GAPDH-TGCT",
+      "gene": "GAPDH",
+      "tcga": "TGCT",
+      "classification": "regression",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping gene; v2 median false positive"
+    },
+    {
+      "id": "N-ACTB-DLBC",
+      "gene": "ACTB",
+      "tcga": "DLBC",
+      "classification": "regression",
+      "expected": false,
+      "citations": [
+        23810203
+      ],
+      "note": "housekeeping gene; v2 median false positive"
+    },
+    {
+      "id": "N-B2M-DLBC",
+      "gene": "B2M",
+      "tcga": "DLBC",
+      "classification": "regression",
+      "expected": false,
+      "citations": [
+        23810203,
+        29713087
+      ],
+      "note": "housekeeping/MHC-I gene; v2 median false positive"
+    },
+    {
+      "id": "B2-ERBB2-ESCA",
+      "gene": "ERBB2",
+      "tcga": "ESCA",
+      "classification": "borderline",
+      "expected": null,
+      "citations": [
+        28052061
+      ],
+      "note": "ERBB2 amplification/overexpression"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gene-expression-relevance"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["numpy>=1.26,<3", "scipy>=1.12,<2", "pandas>=2.2,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1", "jsonschema>=4,<5"]
+
+[tool.setuptools.packages.find]
+include = ["gene_expression_relevance*"]
+
+[tool.setuptools.package-data]
+gene_expression_relevance = ["*.json"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
