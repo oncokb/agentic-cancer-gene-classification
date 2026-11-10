@@ -6,7 +6,7 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const {
-  createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL,
+  createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL,
 } = require("../../src/expression_context/static/expression-context.js");
 
 const HTML_PATH = path.join(__dirname, "../../src/expression_context/static/expression-context.html");
@@ -44,7 +44,8 @@ class Element {
 
 const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-  "ec-summary", "ec-cbio", "ec-run", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
+  "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-toggle-wrap",
+  "ec-export-include-excluded", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
 ];
 
 const response = (body, status = 200) => ({ status, json: async () => body });
@@ -79,6 +80,9 @@ function env(routes, { search = "" } = {}) {
   nodes["ec-error"].classList.toggle("hidden", true);
   nodes["ec-result"].classList.toggle("hidden", true);
   nodes["ec-run"].classList.toggle("hidden", true);
+  nodes["ec-export"].classList.toggle("hidden", true);
+  nodes["ec-export-toggle-wrap"].classList.toggle("hidden", true);
+  nodes["ec-export-include-excluded"].checked = false;
   const document = { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
   const calls = [];
   const replaced = [];
@@ -672,6 +676,60 @@ test("expanded state survives a re-render during a literature job and resets on 
   for (const detail of detailRows(nodes)) {
     assert.ok(detail.hidden, "new gene resets detail rows to hidden");
   }
+});
+
+test("CSV download link appears after a gene loads, encodes the symbol, and toggles include_excluded", async () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  assert.ok(html.includes('id="ec-export"'), "HTML includes Download CSV link");
+  assert.ok(html.includes("Download CSV"), "HTML labels Download CSV link");
+  assert.ok(html.includes('id="ec-export-include-excluded"'), "HTML includes include-excluded checkbox");
+  assert.ok(html.includes("include excluded cancer types"), "HTML labels include-excluded checkbox");
+
+  assert.strictEqual(
+    exportURL("A/B C", false),
+    "/v1/expression-context/genes/A%2FB%20C/export.csv",
+  );
+  assert.strictEqual(
+    exportURL("A/B C", true),
+    "/v1/expression-context/genes/A%2FB%20C/export.csv?include_excluded=true",
+  );
+
+  const { nodes, page } = env({
+    "GET /v1/expression-context/stats/HER2": response(view({ query: "her2", hugo_symbol: "ERBB2" })),
+    "GET /v1/expression-context/stats/NKX2-1": response(
+      view({ query: "nkx2-1", hugo_symbol: "NKX2-1", entrez_gene_id: 7080 }),
+    ),
+  });
+  assert.ok(nodes["ec-export"].hidden, "Download CSV hidden before a gene loads");
+  assert.ok(nodes["ec-export-toggle-wrap"].hidden, "toggle hidden before a gene loads");
+
+  await page.lookup("HER2");
+  assert.ok(!nodes["ec-export"].hidden, "Download CSV visible once a gene loads");
+  assert.ok(!nodes["ec-export-toggle-wrap"].hidden, "toggle visible once a gene loads");
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/ERBB2/export.csv",
+  );
+
+  nodes["ec-export-include-excluded"].checked = true;
+  nodes["ec-export-include-excluded"].fire("change");
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/ERBB2/export.csv?include_excluded=true",
+  );
+
+  await page.lookup("NKX2-1");
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/NKX2-1/export.csv?include_excluded=true",
+  );
+
+  nodes["ec-export-include-excluded"].checked = false;
+  nodes["ec-export-include-excluded"].fire("change");
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/NKX2-1/export.csv",
+  );
 });
 
 (async () => {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import Response, StreamingResponse
 
 from src.auth import AuthenticatedUser, require_auth
 from src.expression_context.catalog import BundleNotLoaded
@@ -138,3 +139,44 @@ async def get_gene(
         ) from exc
     except BundleNotLoaded as exc:
         raise _not_loaded(exc) from exc
+
+
+@router.get("/genes/{gene}/export.csv")
+async def export_gene_csv(
+    gene: str,
+    include_excluded: bool = Query(default=False),
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> Response:
+    try:
+        filename, body = await service.export_gene_csv(gene, include_excluded=include_excluded)
+    except InvalidGene as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except GeneNotFound as exc:
+        raise HTTPException(
+            status_code=404, detail=f"No stored expression-context result for {exc}."
+        ) from exc
+    except BundleNotLoaded as exc:
+        raise _not_loaded(exc) from exc
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/export.csv")
+async def export_all_csv(
+    include_excluded: bool = Query(default=False),
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> StreamingResponse:
+    try:
+        filename, stream = await service.export_bundle_csv(include_excluded=include_excluded)
+    except BundleNotLoaded as exc:
+        raise _not_loaded(exc) from exc
+    return StreamingResponse(
+        stream,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

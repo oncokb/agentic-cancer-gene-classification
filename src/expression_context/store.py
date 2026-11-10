@@ -123,6 +123,14 @@ class ExpressionContextStore(Protocol):
         self, literature_gate: str, limit: int, cursor: Optional[Cursor]
     ) -> List[HistoryEntry]: ...
 
+    async def list_release_genes(
+        self,
+        release_id: str,
+        literature_gate: str,
+        limit: int,
+        after_symbol: Optional[str] = None,
+    ) -> List[str]: ...
+
 
 def _history_sort_key(entry: HistoryEntry) -> Cursor:
     return (entry.computed_at, entry.hugo_symbol, entry.release_id)
@@ -179,7 +187,7 @@ class InMemoryExpressionContextStore:
                 surfaced_count=sum(
                     1
                     for row in rows
-                    if stored_verdict_surfaced(row.literature_gate, row.evidence)
+                    if stored_verdict_surfaced(row.literature_gate, row.evidence, row.stats)
                 ),
             )
             for (symbol, release_id), rows in groups.items()
@@ -188,6 +196,24 @@ class InMemoryExpressionContextStore:
         if cursor is not None:
             entries = [entry for entry in entries if _history_sort_key(entry) < cursor]
         return entries[:limit]
+
+    async def list_release_genes(
+        self,
+        release_id: str,
+        literature_gate: str,
+        limit: int,
+        after_symbol: Optional[str] = None,
+    ) -> List[str]:
+        symbols = sorted(
+            {
+                row.hugo_symbol
+                for row in self.rows.values()
+                if row.release_id == release_id
+                and row.literature_gate == literature_gate
+                and (after_symbol is None or row.hugo_symbol > after_symbol)
+            }
+        )
+        return symbols[:limit]
 
 
 class MySQLExpressionContextStore:
@@ -346,18 +372,23 @@ class MySQLExpressionContextStore:
                     for key in keys:
                         evidence_params.extend(key)
                     await db_cursor.execute(
-                        "SELECT hugo_symbol, release_id, evidence_json "
+                        "SELECT hugo_symbol, release_id, stats_json, evidence_json "
                         f"FROM {TABLE_NAME} WHERE literature_gate = %s "
                         f"AND (hugo_symbol, release_id) IN ({placeholders})",
                         evidence_params,
                     )
-                    for symbol, release_id, evidence_json in await db_cursor.fetchall():
+                    for symbol, release_id, stats_json, evidence_json in await db_cursor.fetchall():
+                        stats = (
+                            json.loads(stats_json)
+                            if isinstance(stats_json, (str, bytes))
+                            else stats_json
+                        )
                         evidence = (
                             json.loads(evidence_json)
                             if isinstance(evidence_json, (str, bytes))
                             else evidence_json
                         )
-                        if stored_verdict_surfaced(literature_gate, evidence):
+                        if stored_verdict_surfaced(literature_gate, evidence, stats):
                             key = (symbol, release_id)
                             surfaced_counts[key] = surfaced_counts.get(key, 0) + 1
         return [
@@ -371,3 +402,27 @@ class MySQLExpressionContextStore:
             )
             for symbol, release_id, computed_at, pair_count in rows
         ]
+
+    async def list_release_genes(
+        self,
+        release_id: str,
+        literature_gate: str,
+        limit: int,
+        after_symbol: Optional[str] = None,
+    ) -> List[str]:
+        where = "WHERE release_id = %s AND literature_gate = %s "
+        params: List[Any] = [release_id, literature_gate]
+        if after_symbol is not None:
+            where += "AND hugo_symbol > %s "
+            params.append(after_symbol)
+        params.append(limit)
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT DISTINCT hugo_symbol FROM {TABLE_NAME} "
+                    f"{where}"
+                    "ORDER BY hugo_symbol ASC LIMIT %s",
+                    params,
+                )
+                rows = await cursor.fetchall()
+        return [row[0] for row in rows]

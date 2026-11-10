@@ -37,7 +37,12 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Sequence, runtime_checkable
 
-from src.expression_context.models import LiteratureVerdict, PaperJudgement, TumorContext
+from src.expression_context.models import (
+    CancerTypeStats,
+    LiteratureVerdict,
+    PaperJudgement,
+    TumorContext,
+)
 from src.expression_context.tumor_aliases import (
     AMBIGUOUS_COHORT_CODES,
     cohort_names,
@@ -106,9 +111,20 @@ def stored_v2_verdict(
 
 
 def stored_verdict_surfaced(
-    literature_gate: str, evidence: Optional[Dict[str, Any]]
+    literature_gate: str,
+    evidence: Optional[Dict[str, Any]],
+    stats: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """The surfacing rule for a stored row (shared by both history stores)."""
+    """The surfacing rule for a stored row (shared by reads, CSV export and history stores)."""
+    if stats is not None:
+        try:
+            parsed_stats = CancerTypeStats.model_validate(stats)
+        except ValueError:
+            return False
+        if not parsed_stats.passes_stats:
+            return False
+        if not stats.get("precheck_expired") and parsed_stats.literature_precheck_pass is False:
+            return False
     verdict = stored_v2_verdict(literature_gate, evidence)
     return verdict is not None and verdict_supported(verdict)
 

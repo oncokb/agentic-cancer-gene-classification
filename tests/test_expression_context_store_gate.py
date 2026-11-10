@@ -112,6 +112,11 @@ async def _exercise_store(store):
     assert {(p.release_id, p.oncotree_code) for p in latest} == {("r2", "BRCA")}
     assert await store.latest_pairs("NOPE", GATE) == []
 
+    assert await store.list_release_genes("r2", GATE, 10) == ["EGFR", "ERBB2"]
+    assert await store.list_release_genes("r2", GATE, 1) == ["EGFR"]
+    assert await store.list_release_genes("r2", GATE, 1, after_symbol="EGFR") == ["ERBB2"]
+    assert await store.list_release_genes("r2", GATE, 1, after_symbol="ERBB2") == []
+
     history = await store.list_history(GATE, 10, None)
     assert [(e.hugo_symbol, e.release_id) for e in history] == [
         ("EGFR", "r2"), ("ERBB2", "r2"), ("ERBB2", "r1"),

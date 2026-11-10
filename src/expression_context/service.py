@@ -30,14 +30,32 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
+from src.expression_context.csv_export import (
+    GeneCsvContext,
+    csv_filename,
+    format_csv_rows,
+    gene_result_csv_rows,
+)
 from src.expression_context.lease import VerdictLease, lease_key
 from src.expression_context.literature_gate import (
     TUMOR_SPECIFIC_GATE,
     LiteratureGate,
     stored_v2_verdict,
+    stored_verdict_surfaced,
     verdict_supported,
 )
 from src.expression_context.models import (
@@ -260,6 +278,9 @@ class ExpressionContextService:
             stored_stats["cancer_type_name"] = cancer_type.name if cancer_type else None
             stored_stats["study_id"] = cancer_type.study_id if cancer_type else None
             stored_stats["bundle_tag"] = resolved.bundle_tag
+            stored_stats["method_version"] = manifest.method_version
+            if resolved.artifact.gene.entrez_gene_id is not None:
+                stored_stats["entrez_gene_id"] = resolved.artifact.gene.entrez_gene_id
             if resolved.artifact.broadly_expressed is not None:
                 stored_stats["gene_broadly_expressed"] = resolved.artifact.broadly_expressed
             if expired:
@@ -463,9 +484,7 @@ class ExpressionContextService:
 
     # ---------------------------------------------------------------- reads
 
-    async def latest_result(
-        self, gene: str, include_excluded: bool
-    ) -> GeneResult:
+    async def _latest_rows(self, gene: str) -> Tuple[str, List[StoredPair]]:
         symbol = normalize_symbol(gene)
         rows = await self.store.latest_pairs(symbol, self.gate.name)
         if not rows:
@@ -474,7 +493,187 @@ class ExpressionContextService:
                 rows = await self.store.latest_pairs(canonical, self.gate.name)
         if not rows:
             raise GeneNotFound(symbol)
+        return symbol, rows
+
+    async def latest_result(
+        self, gene: str, include_excluded: bool
+    ) -> GeneResult:
+        _, rows = await self._latest_rows(gene)
         return self._gene_result(rows[0].hugo_symbol, rows, include_excluded)
+
+    async def export_gene_csv(
+        self, gene: str, *, include_excluded: bool = False
+    ) -> Tuple[str, str]:
+        queried_as, rows = await self._latest_rows(gene)
+        result = self._gene_result(rows[0].hugo_symbol, rows, include_excluded)
+        try:
+            bundle = await self.catalog.active()
+        except BundleNotLoaded:
+            bundle = None
+        context = await self._csv_context_for_gene(
+            result.hugo_symbol,
+            queried_as=queried_as,
+            release_id=result.release_id,
+            rows=rows,
+            bundle=bundle,
+        )
+        csv_rows = gene_result_csv_rows(result, context)
+        return (
+            csv_filename(result.hugo_symbol, result.release_id),
+            format_csv_rows(csv_rows, include_header=True, include_bom=True),
+        )
+
+    async def export_bundle_csv(
+        self, *, include_excluded: bool = False, page_size: int = 50
+    ) -> Tuple[str, AsyncIterator[str]]:
+        bundle = await self.catalog.active()
+        release_id = bundle.release_id
+        gate_name = self.gate.name
+        batch_size = max(1, min(page_size, self.history_max_limit))
+
+        async def stream() -> AsyncIterator[str]:
+            yield format_csv_rows((), include_header=True, include_bom=True)
+            after_symbol: Optional[str] = None
+            while True:
+                symbols = await self.store.list_release_genes(
+                    release_id, gate_name, batch_size, after_symbol
+                )
+                if not symbols:
+                    break
+                for symbol in symbols:
+                    pairs_by_code = await self.store.get_pairs(symbol, release_id, gate_name)
+                    rows = list(pairs_by_code.values())
+                    if not rows:
+                        continue
+                    result = self._gene_result(symbol, rows, include_excluded)
+                    context = await self._csv_context_for_gene(
+                        symbol,
+                        queried_as=symbol,
+                        release_id=release_id,
+                        rows=rows,
+                        bundle=bundle,
+                    )
+                    csv_rows = gene_result_csv_rows(result, context)
+                    if csv_rows:
+                        yield format_csv_rows(csv_rows, include_header=False, include_bom=False)
+                if len(symbols) < batch_size:
+                    break
+                after_symbol = symbols[-1]
+
+        return csv_filename("all", release_id), stream()
+
+    async def _csv_context_for_gene(
+        self,
+        symbol: str,
+        *,
+        queried_as: str,
+        release_id: str,
+        rows: List[StoredPair],
+        bundle: Optional[ActiveBundle],
+    ) -> GeneCsvContext:
+        entrez_gene_id: Optional[int] = next(
+            (
+                int(r.stats["entrez_gene_id"])
+                for r in rows
+                if isinstance(r.stats.get("entrez_gene_id"), int)
+                and not isinstance(r.stats.get("entrez_gene_id"), bool)
+            ),
+            None,
+        )
+        method_version: Optional[str] = next(
+            (
+                str(r.stats["method_version"])
+                for r in rows
+                if r.stats.get("method_version") is not None
+            ),
+            None,
+        )
+        broadly_expressed: Optional[bool] = next(
+            (
+                bool(r.stats["gene_broadly_expressed"])
+                for r in rows
+                if r.stats.get("gene_broadly_expressed") is not None
+            ),
+            None,
+        )
+        study_id_by_code: Dict[str, str] = {
+            r.oncotree_code: str(r.stats["study_id"])
+            for r in rows
+            if r.stats.get("study_id")
+        }
+        cancer_name_by_code: Dict[str, str] = {
+            r.oncotree_code: str(r.stats["cancer_type_name"])
+            for r in rows
+            if r.stats.get("cancer_type_name")
+        }
+        manifest_expired = False
+        ordered_study_ids: List[str] = []
+
+        if bundle is not None and bundle.manifest.release_id == release_id:
+            manifest = bundle.manifest
+            method_version = manifest.method_version or method_version
+            manifest_expired = precheck_expired(manifest, self._clock())
+            for ct in manifest.cancer_types:
+                if ct.study_id:
+                    study_id_by_code.setdefault(ct.oncotree_code, ct.study_id)
+                if ct.name:
+                    cancer_name_by_code.setdefault(ct.oncotree_code, ct.name)
+            try:
+                artifact = await self.catalog.gene(bundle, symbol)
+            except BundleGone:
+                artifact = None
+            if artifact is not None:
+                if artifact.gene.entrez_gene_id is not None:
+                    entrez_gene_id = artifact.gene.entrez_gene_id
+                if artifact.broadly_expressed is not None:
+                    broadly_expressed = artifact.broadly_expressed
+                sorted_stats = sorted(
+                    artifact.cancer_types,
+                    key=lambda s: (
+                        not s.passes_stats,
+                        s.q_value is None,
+                        s.q_value if s.q_value is not None else 0.0,
+                        s.oncotree_code,
+                    ),
+                )
+                seen_studies: Set[str] = set()
+                for s in sorted_stats:
+                    sid = study_id_by_code.get(s.oncotree_code)
+                    if sid and sid not in seen_studies:
+                        seen_studies.add(sid)
+                        ordered_study_ids.append(sid)
+
+        if not ordered_study_ids:
+            sorted_rows = sorted(
+                rows,
+                key=lambda r: (
+                    not CancerTypeStats.model_validate(r.stats).passes_stats,
+                    r.stats.get("q_value") is None,
+                    float(r.stats["q_value"]) if r.stats.get("q_value") is not None else 0.0,
+                    r.oncotree_code,
+                ),
+            )
+            seen_studies = set()
+            for r in sorted_rows:
+                sid = study_id_by_code.get(r.oncotree_code)
+                if sid and sid not in seen_studies:
+                    seen_studies.add(sid)
+                    ordered_study_ids.append(sid)
+
+        expired_by_code = {
+            r.oncotree_code: bool(r.stats.get("precheck_expired") or manifest_expired)
+            for r in rows
+        }
+        return GeneCsvContext(
+            queried_as=queried_as,
+            entrez_gene_id=entrez_gene_id,
+            method_version=method_version,
+            broadly_expressed=broadly_expressed,
+            all_study_ids=tuple(ordered_study_ids),
+            study_id_by_code=study_id_by_code,
+            cancer_name_by_code=cancer_name_by_code,
+            expired_by_code=expired_by_code,
+        )
 
     async def _alias_target(self, symbol: str) -> Optional[str]:
         # BundleNotLoaded propagates (-> 503): "can't resolve yet" is not a 404.
@@ -646,22 +845,30 @@ def _verdict_row(make_row, stats: CancerTypeStats, verdict: LiteratureVerdict) -
 
 
 def _pair_result(row: StoredPair) -> PairResult:
-    # Fail closed: only a v2 row whose stored evidence is a valid v2 verdict is
-    # returned as literature. A row without evidence, a legacy v1 row, or
-    # evidence from another gate is hidden, even if the stored boolean says
-    # otherwise.
+    # Fail closed: only a v2 row whose stored evidence is a valid v2 verdict
+    # AND whose expression statistics pass is surfaced. A row without evidence,
+    # a legacy v1 row, evidence from another gate, or a row that fails stats
+    # is hidden, even if the stored boolean says otherwise.
+    stats = CancerTypeStats.model_validate(row.stats)
     verdict = stored_v2_verdict(row.literature_gate, row.evidence)
-    surfaced = verdict is not None and verdict_supported(verdict)
+    surfaced = stored_verdict_surfaced(row.literature_gate, row.evidence, row.stats)
     if verdict is not None:
         verdict = verdict.model_copy(update={"supported": surfaced})
-    reason = None if surfaced else (row.exclusion_reason or "literature")
+    if surfaced:
+        reason = None
+    elif not stats.passes_stats:
+        reason = "stats"
+    elif not row.stats.get("precheck_expired") and stats.literature_precheck_pass is False:
+        reason = "precheck"
+    else:
+        reason = row.exclusion_reason or "literature"
     return PairResult(
         oncotree_code=row.oncotree_code,
         cancer_type_name=row.stats.get("cancer_type_name"),
         study_id=row.stats.get("study_id"),
         surfaced=surfaced,
         exclusion_reason=reason,
-        stats=CancerTypeStats.model_validate(row.stats),
+        stats=stats,
         literature=verdict,
         computed_at=row.computed_at,
         bundle_tag=row.stats.get("bundle_tag"),
