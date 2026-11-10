@@ -639,13 +639,18 @@ _PMID_CANDIDATE = re.compile(
     r"(?P<url>(?:https?://)?(?:www\.)?"
     r"(?:pubmed\.ncbi\.nlm\.nih\.gov/|ncbi\.nlm\.nih\.gov/pubmed/)"
     r"(?P<url_pmid>\d{1,9})/?(?![A-Za-z0-9]))"
-    r"|(?P<label>(?<![A-Za-z0-9])(?:PMIDs?|PubMed(?:\s*IDs?)?)\s*(?:[:#]\s*)*"
-    r"(?P<first_pmid>\d{1,9})(?![A-Za-z0-9]))"
+    r"|(?P<label>(?<![A-Za-z0-9])"
+    r"(?P<label_word>PMIDs?(?:\s+numbers?)?|PubMeds?(?:\s*(?:IDs?|numbers?))?)"
+    r"\s*(?:[:#]\s*)*(?P<first_pmid>\d{1,9})(?![A-Za-z0-9]))"
     r"|(?P<bare>(?<!\d\.)(?<![A-Za-z0-9])\d{7,9}(?![A-Za-z0-9]))",
     re.IGNORECASE,
 )
 _PMID_CONTINUATION = re.compile(
-    r"\s*(?:,\s*(?:(?:and|or)\s+)?|;\s*|\s+(?:and|or)\s+|/\s*)#?(\d{1,9})(?![A-Za-z0-9])",
+    r"\s*(?P<sep>,\s*(?:(?:and|or)\s+)?|;\s*|\s+(?:and|or)\s+|/\s*)#?(?P<pmid>\d{1,9})(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_DANGLING_PMID_LABEL = re.compile(
+    r"(?<![A-Za-z0-9])(?:PMIDs?(?:\s+numbers?)?|PubMeds?(?:\s*(?:IDs?|numbers?))?)\s*(?:[:#]\s*)*$",
     re.IGNORECASE,
 )
 
@@ -667,11 +672,13 @@ def _strip_unverified_pmids(
             out.append(match.group("url") if pmid in sent_pmids else _UNVERIFIED_PMID)
             pos = match.end()
         elif match.group("label") is not None:
+            plural = match.group("label_word").lower().endswith("s")
             numbers = [match.group("first_pmid")]
             end = match.end()
             while cont := _PMID_CONTINUATION.match(rationale, end):
-                next_pmid = cont.group(1)
-                if next_pmid in sent_pmids or len(next_pmid) >= 6:
+                next_pmid = cont.group("pmid")
+                is_list_sep = not cont.group("sep").startswith(";")
+                if (plural and is_list_sep) or next_pmid in sent_pmids or len(next_pmid) >= 6:
                     numbers.append(next_pmid)
                     end = cont.end()
                 else:
@@ -701,19 +708,30 @@ def _clip(
     full = " ".join(value.split())
     if not full:
         return None
-    cut_number = (
-        len(full) > limit and full[limit - 1].isdigit() and full[limit].isdigit()
-    )
-    text = full[:limit]
+    cut_number = False
+    if len(full) <= limit:
+        text = full
+    else:
+        space = full.rfind(" ", 0, limit + 1)
+        if space != -1:
+            text = full[:space].rstrip()
+            if (
+                re.match(r"\s*(?:(?:IDs?|numbers?)\s*)?(?:[:#]\s*)*\d", full[space:], re.IGNORECASE)
+                and (dangling := _DANGLING_PMID_LABEL.search(text))
+            ):
+                text = text[: dangling.start()].rstrip()
+        else:
+            cut_number = full[limit - 1].isdigit() and full[limit].isdigit()
+            text = full[:limit]
     if allowed_pmids is None:
-        return text
+        return text or None
     if cut_number:
         trail = re.search(r"\d+$", text)
         rest = re.match(r"\d+", full[limit:])
         if trail and rest and len(trail.group(0)) + len(rest.group(0)) >= 6:
             prefix = text[: trail.start()]
             if not re.search(
-                r"(?:PMIDs?|PubMed(?:\s*IDs?)?)\s*(?:[:#]\s*)*$"
+                r"(?:PMIDs?(?:\s+numbers?)?|PubMeds?(?:\s*(?:IDs?|numbers?))?)\s*(?:[:#]\s*)*$"
                 r"|(?:pubmed\.ncbi\.nlm\.nih\.gov/|ncbi\.nlm\.nih\.gov/pubmed/)$",
                 prefix,
                 re.IGNORECASE,
@@ -731,7 +749,7 @@ def _clip(
             and marker_start + len(_UNVERIFIED_PMID) > limit
         ):
             cut = marker_start
-        space = text.rfind(" ", 0, cut)
+        space = text.rfind(" ", 0, cut + 1)
         if space != -1:
             text = text[:space].rstrip()
         else:

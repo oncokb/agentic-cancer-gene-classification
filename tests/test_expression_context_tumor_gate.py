@@ -431,7 +431,7 @@ async def test_rationale_mixed_pmid_list_keeps_sent_and_strips_invented():
     assert "88888888" not in verdict.rationale
 
 
-async def test_rationale_keeps_sent_paper_judged_not_tumor_specific():
+async def test_rationale_strips_sent_paper_judged_not_tumor_specific():
     judge = Judge(result={
         "papers": [
             {"pmid": "30000020", "tumor_specific": True},
@@ -563,6 +563,54 @@ async def test_sanitizer_does_not_consume_adjacent_prose_numbers(rationale, kept
     verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
     assert verdict.rationale == rationale
     assert kept_prose in verdict.rationale
+
+
+@pytest.mark.parametrize("mention", [
+    "PMIDs 1, 2 and 3",
+    "PubMed IDs 1, 2 and 3",
+    "PMID numbers 1, 2 and 3",
+])
+async def test_plural_pmid_list_with_empty_allowlist_strips_short_continuations(mention):
+    judge = Judge(result={
+        "papers": [{"pmid": "30000010", "tumor_specific": False}],
+        "verdict": "insufficient",
+        "rationale": f"No evidence ({mention}).",
+    })
+    verdict = await gate([RENAL_DIFFERENTIAL], judge).evaluate("KLK3", KICH)
+    assert verdict.pmids == []
+    assert "[unverified PMID removed]" in verdict.rationale
+    for short in ("1", "2", "3"):
+        assert short not in verdict.rationale
+
+
+async def test_plural_pmid_list_keeps_allowed_and_strips_short_continuations():
+    judge = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "supported",
+        "rationale": "Supported by PMIDs 30000020, 2 and 3.",
+    })
+    verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
+    assert verdict.pmids == ["30000020"]
+    assert "30000020" in verdict.rationale
+    assert "2" not in verdict.rationale.replace("30000020", "")
+    assert "3" not in verdict.rationale.replace("30000020", "")
+
+
+async def test_over_limit_rationale_clips_at_word_boundary():
+    prefix = "KLK3 in KICH (PMID 30000020). " + ("word " * 193)
+    assert len(prefix) == 995
+    over_limit = prefix + "chromophobe"
+    assert len(over_limit) == 1006
+
+    judge = Judge(result={
+        "papers": [{"pmid": "30000020", "tumor_specific": True}],
+        "verdict": "supported",
+        "rationale": over_limit,
+    })
+    verdict = await gate([KICH_PAPER], judge).evaluate("KLK3", KICH)
+    assert len(verdict.rationale) <= 1000
+    assert verdict.rationale == prefix.rstrip()
+    assert verdict.rationale.endswith("word")
 
 
 async def test_pmid_straddling_clip_limit_is_treated_as_unverified_and_fits_limit():
