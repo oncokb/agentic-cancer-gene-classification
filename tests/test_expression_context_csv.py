@@ -29,6 +29,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import csv
 from dataclasses import replace
 import io
@@ -47,22 +48,21 @@ from fastapi.testclient import TestClient
 from src.auth import AuthenticatedUser, require_auth
 from src.expression_context import register_expression_context
 from src.expression_context.bundle_store import InMemoryBundleStore
-from src.expression_context.catalog import BundleGone, StatsCatalog
+from src.expression_context.catalog import BundleGone, BundleNotLoaded, StatsCatalog
 from src.expression_context.csv_export import (
     CSV_COLUMNS,
     UTF8_BOM,
-    GeneCsvContext,
     cbioportal_expression_url,
     format_csv_rows,
     format_float,
     format_q,
-    gene_result_csv_rows,
+    gene_view_csv_rows,
 )
 from src.expression_context.lease import VerdictLease
 from src.expression_context.literature_gate import TUMOR_SPECIFIC_GATE
 from src.expression_context.models import GeneResult, JobRecord, PairResult, StoredPair
 from src.expression_context.service import ExpressionContextService
-from src.expression_context.store import InMemoryExpressionContextStore
+from src.expression_context.store import InMemoryExpressionContextStore, MySQLExpressionContextStore
 from src.job_store import JobStore
 from tests.expression_context_helpers import (
     M3,
@@ -477,6 +477,23 @@ def test_csv_agrees_row_for_row_with_get_gene_and_history_under_stats_and_old_ru
         assert history["items"][0]["surfaced_count"] == len(json_surfaced_codes) == 1
         assert history["items"][0]["pair_count"] == len(csv_full) == 5
 
+        # Also cover history after a mid-request BundleGone (retries and recovers)
+        orig_gene = harness.service.catalog.gene
+        gone_called = False
+
+        async def gene_with_single_gone(*args, **kwargs):
+            nonlocal gone_called
+            if not gone_called:
+                gone_called = True
+                raise BundleGone("simulated-mid-request-gone")
+            return await orig_gene(*args, **kwargs)
+
+        harness.service.catalog.gene = gene_with_single_gone
+        history_after_gone = client.get(f"{PREFIX}/genes").json()
+        assert gone_called is True
+        assert history_after_gone["items"][0]["surfaced_count"] == 1
+        harness.service.catalog.gene = orig_gene
+
 
 def test_rfc4180_quoting_round_trip_and_csv_injection_guard():
     """Commas, double quotes, and newlines in rationale round-trip cleanly;
@@ -557,23 +574,24 @@ def test_rfc4180_quoting_round_trip_and_csv_injection_guard():
             assert value not in ("None", "null", "NaN", "nan")
 
         # Direct context test for a gene alias starting with '+' (and other formula prefixes).
-        result = harness.service._gene_result(
-            "ERBB2",
-            [harness.store.rows[("ERBB2", "BRCA", RELEASE_ID, TUMOR_SPECIFIC_GATE)]],
-            include_excluded=False,
-        )
-        ctx = GeneCsvContext(queried_as="+HER2", entrez_gene_id=2064, method_version="2")
+        import asyncio
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        view_plus = view.model_copy(update={"query": "+HER2"})
         csv_text = format_csv_rows(
-            gene_result_csv_rows(result, ctx), include_header=True, include_bom=True
+            gene_view_csv_rows(view_plus, include_excluded=False),
+            include_header=True,
+            include_bom=True,
         )
         _, alias_rows = parse_csv_response(csv_text)
         assert alias_rows[0]["queried_as"] == "'+HER2"
 
         for prefix in ("=", "+", "-", "@", "\t", "\r"):
-            ctx_p = GeneCsvContext(queried_as=f"{prefix}ALIAS")
+            view_p = view.model_copy(update={"query": f"{prefix}ALIAS"})
             _, p_rows = parse_csv_response(
                 format_csv_rows(
-                    gene_result_csv_rows(result, ctx_p), include_header=True, include_bom=True
+                    gene_view_csv_rows(view_p, include_excluded=False),
+                    include_header=True,
+                    include_bom=True,
                 )
             )
             assert p_rows[0]["queried_as"] == f"'{prefix}ALIAS"
@@ -1196,6 +1214,40 @@ def test_no_active_bundle_503_for_genes_and_per_gene_csv():
         r3 = client.get(f"{PREFIX}/stats/ERBB2")
         assert r3.status_code == 503
 
+        r4 = client.get(f"{PREFIX}/genes")
+        assert r4.status_code == 503
+        assert r4.headers["retry-after"] == "60"
+
+        job = JobRecord(
+            job_id="job-test-503",
+            status="succeeded",
+            gene="ERBB2",
+            hugo_symbol="ERBB2",
+            release_id=RELEASE_ID,
+            bundle_tag="tag-test",
+            created_at=now,
+            owner=ALICE.email,
+            result=GeneResult(
+                hugo_symbol="ERBB2",
+                release_id=RELEASE_ID,
+                literature_gate=TUMOR_SPECIFIC_GATE,
+                computed_at=now,
+                surfaced=[
+                    PairResult(
+                        oncotree_code="BRCA",
+                        surfaced=True,
+                        stats=gene_file("ERBB2")["cancer_types"][0],
+                        computed_at=now,
+                    )
+                ],
+            ),
+        )
+        import asyncio
+        asyncio.run(harness.service.jobs.put(job))
+        r_job = client.get(f"{PREFIX}/jobs/{job.job_id}")
+        assert r_job.status_code == 503
+        assert r_job.headers["retry-after"] == "60"
+
 
 @pytest.mark.asyncio
 async def test_early_query_failure_in_bulk_export_returns_non_200_and_midstream_bundle_gone():
@@ -1229,4 +1281,221 @@ async def test_early_query_failure_in_bulk_export_returns_non_200_and_midstream_
 
         with pytest.raises(BundleGone):
             async for _ in stream:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_deadlock_concurrent_history_requests_complete_with_bounded_pool():
+    from contextlib import asynccontextmanager
+
+    pool_sem = asyncio.Semaphore(2)
+
+    class FakePoolConn:
+        @asynccontextmanager
+        async def cursor(self):
+            yield FakeDbCursor()
+
+    class FakeDbCursor:
+        def __init__(self):
+            self._query = ""
+
+        async def execute(self, query, params=None):
+            self._query = query
+
+        async def fetchall(self):
+            now = datetime(2026, 11, 6, 12, 0)
+            if "GROUP BY" in self._query:
+                return [("ERBB2", "release-a", now, 1)]
+            return []
+
+    class BoundedPool:
+        @asynccontextmanager
+        async def acquire(self):
+            await pool_sem.acquire()
+            try:
+                yield FakePoolConn()
+            finally:
+                pool_sem.release()
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    pool = BoundedPool()
+    store = MySQLExpressionContextStore(pool)
+    bundle = build_bundle(("ERBB2",), release_id="release-a")
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app):
+        harness.service.store = store
+
+        orig_gene = harness.service.catalog.gene
+
+        async def gene_acquiring_pool(*args, **kwargs):
+            async with pool.acquire():
+                return await orig_gene(*args, **kwargs)
+
+        harness.service.catalog.gene = gene_acquiring_pool
+
+        async def fetch_history():
+            return await harness.service.history(limit=10, cursor=None)
+
+        # 4 concurrent requests (>= pool size 2) must complete without deadlocking
+        results = await asyncio.wait_for(
+            asyncio.gather(*(fetch_history() for _ in range(4))),
+            timeout=2.0,
+        )
+        assert len(results) == 4
+        for r in results:
+            assert len(r.items) == 1
+            assert r.items[0].hugo_symbol == "ERBB2"
+
+
+@pytest.mark.asyncio
+async def test_history_active_stats_bundle_gone_never_surfaces_from_stored_stats():
+    # Stored pair has surfaced=True in stored stats, but active bundle B fails stats.
+    # When active stats lookup raises BundleGone, history must NEVER fall back to stored stats.
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    bundle_a = build_bundle(("ERBB2",), release_id="release-a")
+
+    erbb2_b = dict(gene_file("ERBB2"))
+    brca_failing = dict(erbb2_b["cancer_types"][0])
+    brca_failing["stats_pass"] = False
+    brca_failing["q_value"] = 0.5
+    bundle_b = build_bundle(
+        release_id="release-b",
+        edit_gene=lambda doc: doc.update({"cancer_types": [brca_failing]})
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None,
+    )
+
+    harness = CsvHarness(bundle=bundle_a)
+    with TestClient(harness.app):
+        harness.store.rows[("ERBB2", "BRCA", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id="release-a",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats={"stats_pass": True, "cancer_type_name": "Breast Cancer"},
+            evidence=_v2_supported_evidence("12345678", "breast cancer"),
+            computed_at=now,
+        )
+
+        orig_gene = harness.service.catalog.gene
+        gone_raised = False
+
+        async def gene_gone_then_b(bundle_arg, symbol):
+            nonlocal gone_raised
+            if not gone_raised:
+                gone_raised = True
+                await seed_bundle(harness.bundles, bundle_b)
+                harness.service.catalog.invalidate()
+                raise BundleGone("simulated-gone")
+            return await orig_gene(bundle_arg, symbol)
+
+        harness.service.catalog.gene = gene_gone_then_b
+        hist = await harness.service.history(limit=10, cursor=None)
+        assert gone_raised is True
+        assert hist.items[0].hugo_symbol == "ERBB2"
+        assert hist.items[0].surfaced_count == 0
+
+        harness.bundles.state = replace(harness.bundles.state, active_bundle_tag="nonexistent")
+        harness.service.catalog.invalidate()
+        with pytest.raises(BundleNotLoaded):
+            await harness.service.history(limit=10, cursor=None)
+
+
+@pytest.mark.asyncio
+async def test_job_submitted_on_release_a_and_b_activates_before_completion():
+    bundle_a = build_bundle(("ERBB2",), release_id="release-a")
+    erbb2_b = dict(gene_file("ERBB2"))
+    brca_failing = dict(erbb2_b["cancer_types"][0])
+    brca_failing["stats_pass"] = False
+    brca_failing["q_value"] = 0.5
+    bundle_b = build_bundle(
+        release_id="release-b",
+        edit_gene=lambda doc: doc.update({"cancer_types": [brca_failing]})
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None,
+    )
+
+    harness = CsvHarness(bundle=bundle_a)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    with TestClient(harness.app) as client:
+        resolved = await harness.service.resolve("ERBB2")
+        assert resolved.manifest.release_id == "release-a"
+
+        await seed_bundle(harness.bundles, bundle_b)
+        harness.service.catalog.invalidate()
+
+        result, evaluated, reused, errors = await harness.service.evaluate(resolved, ALICE.email)
+        assert not any(p.oncotree_code == "BRCA" for p in result.surfaced)
+
+        job = JobRecord(
+            job_id="job-ab-test",
+            status="succeeded",
+            gene="ERBB2",
+            hugo_symbol="ERBB2",
+            release_id="release-a",
+            bundle_tag=bundle_a.tag,
+            created_at=now,
+            owner=ALICE.email,
+            result=result,
+        )
+        await harness.service.jobs.put(job)
+        polled = client.get(f"{PREFIX}/jobs/{job.job_id}").json()
+        assert not any(p["oncotree_code"] == "BRCA" for p in polled["result"]["surfaced"])
+
+
+@pytest.mark.asyncio
+async def test_bulk_stream_supersession_single_gene_and_multi_page():
+    bundle_a = build_bundle(("ERBB2",), release_id="release-a")
+    bundle_b = build_bundle(("ERBB2",), release_id="release-b")
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+
+    harness = CsvHarness(bundle=bundle_a)
+    harness.store.rows[("ERBB2", "BRCA", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="ERBB2",
+        oncotree_code="BRCA",
+        release_id="release-a",
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=dict(gene_file("ERBB2")["cancer_types"][0]),
+        evidence=_v2_supported_evidence("12345678", "breast cancer"),
+        computed_at=now,
+    )
+
+    # 1. Single-gene, default page size (25)
+    with TestClient(harness.app):
+        _, stream = await harness.service.export_bundle_csv(include_excluded=True, page_size=25)
+        header = await anext(stream)
+        assert header.startswith(UTF8_BOM)
+
+        await seed_bundle(harness.bundles, bundle_b)
+        harness.service.catalog.invalidate()
+
+        emitted_chunks = []
+        with pytest.raises(BundleGone):
+            async for chunk in stream:
+                emitted_chunks.append(chunk)
+
+        for chunk in emitted_chunks:
+            assert ",yes," not in chunk
+
+    # 2. Multi-page case: page_size=1 with 2 genes
+    harness2 = CsvHarness(bundle=build_bundle(("ERBB2", "MYCN"), release_id="release-a2"))
+    with TestClient(harness2.app):
+        _, stream2 = await harness2.service.export_bundle_csv(include_excluded=True, page_size=1)
+        header2 = await anext(stream2)
+        assert header2.startswith(UTF8_BOM)
+        first_page = await anext(stream2)
+        assert len(first_page) > 0
+
+        await seed_bundle(harness2.bundles, bundle_b)
+        harness2.service.catalog.invalidate()
+
+        with pytest.raises(BundleGone):
+            async for _ in stream2:
                 pass

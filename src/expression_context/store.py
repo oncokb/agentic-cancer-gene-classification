@@ -15,10 +15,8 @@ import binascii
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
-
-from src.expression_context.literature_gate import stored_verdict_surfaced
-from src.expression_context.models import CancerTypeStats, HistoryEntry, StoredPair
+from typing import Any, Dict, List, Optional, Protocol, Tuple
+from src.expression_context.models import HistoryEntry, StoredPair
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +123,6 @@ class ExpressionContextStore(Protocol):
         literature_gate: str,
         limit: int,
         cursor: Optional[Cursor],
-        *,
-        active_release_id: Optional[str] = None,
-        precheck_is_expired: bool = False,
-        active_stats_getter: Optional[
-            Callable[[str], Awaitable[Optional[Mapping[str, CancerTypeStats]]]]
-        ] = None,
     ) -> List[HistoryEntry]: ...
 
     async def list_release_genes(
@@ -187,43 +179,22 @@ class InMemoryExpressionContextStore:
         literature_gate: str,
         limit: int,
         cursor: Optional[Cursor],
-        *,
-        active_release_id: Optional[str] = None,
-        precheck_is_expired: bool = False,
-        active_stats_getter: Optional[
-            Callable[[str], Awaitable[Optional[Mapping[str, CancerTypeStats]]]]
-        ] = None,
     ) -> List[HistoryEntry]:
         groups: Dict[Tuple[str, str], List[StoredPair]] = {}
         for row in self.rows.values():
             if row.literature_gate == literature_gate:
                 groups.setdefault((row.hugo_symbol, row.release_id), []).append(row)
-        entries: List[HistoryEntry] = []
-        for (symbol, release_id), rows in groups.items():
-            surfaced_count = 0
-            if active_release_id and release_id == active_release_id:
-                active_stats_map = await active_stats_getter(symbol) if active_stats_getter else None
-                for row in rows:
-                    stats = active_stats_map.get(row.oncotree_code) if active_stats_map is not None else row.stats
-                    if stored_verdict_surfaced(
-                        row_release_id=row.release_id,
-                        active_release_id=active_release_id,
-                        literature_gate=row.literature_gate,
-                        evidence=row.evidence,
-                        stats=stats,
-                        precheck_is_expired=precheck_is_expired,
-                    ):
-                        surfaced_count += 1
-            entries.append(
-                HistoryEntry(
-                    hugo_symbol=symbol,
-                    release_id=release_id,
-                    literature_gate=literature_gate,
-                    computed_at=max(row.computed_at for row in rows),
-                    pair_count=len(rows),
-                    surfaced_count=surfaced_count,
-                )
+        entries: List[HistoryEntry] = [
+            HistoryEntry(
+                hugo_symbol=symbol,
+                release_id=release_id,
+                literature_gate=literature_gate,
+                computed_at=max(row.computed_at for row in rows),
+                pair_count=len(rows),
+                surfaced_count=0,
             )
+            for (symbol, release_id), rows in groups.items()
+        ]
         entries.sort(key=_history_sort_key, reverse=True)
         if cursor is not None:
             entries = [entry for entry in entries if _history_sort_key(entry) < cursor]
@@ -289,7 +260,13 @@ class MySQLExpressionContextStore:
                             f"ALTER TABLE {TABLE_NAME} ADD INDEX idx_expression_context_release_gene (release_id, literature_gate, hugo_symbol)"
                         )
                     except Exception as exc:
-                        logger.debug("idx_expression_context_release_gene index add skipped: %s", exc)
+                        # Swallow ONLY duplicate-index error (MySQL error 1061)
+                        errno = getattr(exc, "args", [None])[0] if getattr(exc, "args", None) else None
+                        if errno == 1061 or "1061" in str(exc) or "Duplicate key name" in str(exc):
+                            logger.debug("idx_expression_context_release_gene index already exists: %s", exc)
+                        else:
+                            logger.warning("Failed to create idx_expression_context_release_gene index: %s", exc)
+                            raise
 
     @staticmethod
     def _row_to_pair(row: Tuple[Any, ...]) -> StoredPair:
@@ -382,12 +359,6 @@ class MySQLExpressionContextStore:
         literature_gate: str,
         limit: int,
         cursor: Optional[Cursor],
-        *,
-        active_release_id: Optional[str] = None,
-        precheck_is_expired: bool = False,
-        active_stats_getter: Optional[
-            Callable[[str], Awaitable[Optional[Mapping[str, CancerTypeStats]]]]
-        ] = None,
     ) -> List[HistoryEntry]:
         params: List[Any] = [literature_gate]
         having = ""
@@ -414,60 +385,6 @@ class MySQLExpressionContextStore:
                     params,
                 )
                 rows = await db_cursor.fetchall()
-                surfaced_counts: Dict[Tuple[str, str], int] = {}
-                active_keys = [
-                    (symbol, release_id)
-                    for symbol, release_id, *_ in rows
-                    if active_release_id and release_id == active_release_id
-                ]
-                if active_keys:
-                    # Bounded by the page: at most `limit` (API max 100) groups,
-                    # one row per cancer type within each. The v2 evidence rule
-                    # is applied in Python so the stores cannot drift.
-                    placeholders = ", ".join(["(%s, %s)"] * len(active_keys))
-                    evidence_params: List[Any] = [literature_gate]
-                    for key in active_keys:
-                        evidence_params.extend(key)
-                    await db_cursor.execute(
-                        "SELECT hugo_symbol, oncotree_code, release_id, stats_json, evidence_json "
-                        f"FROM {TABLE_NAME} WHERE literature_gate = %s "
-                        f"AND (hugo_symbol, release_id) IN ({placeholders})",
-                        evidence_params,
-                    )
-                    evidence_rows = await db_cursor.fetchall()
-                    distinct_symbols = {symbol for symbol, *_ in active_keys}
-                    active_stats_by_symbol: Dict[str, Optional[Mapping[str, CancerTypeStats]]] = {}
-                    if active_stats_getter:
-                        for sym in distinct_symbols:
-                            active_stats_by_symbol[sym] = await active_stats_getter(sym)
-
-                    for symbol, code, release_id, stats_json, evidence_json in evidence_rows:
-                        stats_from_row = (
-                            json.loads(stats_json)
-                            if isinstance(stats_json, (str, bytes))
-                            else stats_json
-                        )
-                        active_stats_map = active_stats_by_symbol.get(symbol)
-                        stats = (
-                            active_stats_map.get(code)
-                            if active_stats_map is not None
-                            else stats_from_row
-                        )
-                        evidence = (
-                            json.loads(evidence_json)
-                            if isinstance(evidence_json, (str, bytes))
-                            else evidence_json
-                        )
-                        if stored_verdict_surfaced(
-                            row_release_id=release_id,
-                            active_release_id=active_release_id,
-                            literature_gate=literature_gate,
-                            evidence=evidence,
-                            stats=stats,
-                            precheck_is_expired=precheck_is_expired,
-                        ):
-                            key = (symbol, release_id)
-                            surfaced_counts[key] = surfaced_counts.get(key, 0) + 1
         return [
             HistoryEntry(
                 hugo_symbol=symbol,
@@ -475,7 +392,7 @@ class MySQLExpressionContextStore:
                 literature_gate=literature_gate,
                 computed_at=_utc(computed_at),
                 pair_count=int(pair_count),
-                surfaced_count=surfaced_counts.get((symbol, release_id), 0),
+                surfaced_count=0,
             )
             for symbol, release_id, computed_at, pair_count in rows
         ]

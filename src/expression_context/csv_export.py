@@ -13,16 +13,13 @@ import json
 import math
 import re
 import urllib.parse
-from dataclasses import dataclass, field
 from datetime import timezone
 from decimal import Decimal
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from src.expression_context.models import (
     CancerTypeStats,
-    GeneResult,
     GeneStatsView,
-    PairResult,
     PairStatsView,
     PrecheckState,
 )
@@ -70,20 +67,6 @@ CSV_COLUMNS: Tuple[str, ...] = (
     "method_version",
     "literature_checked_at",
 )
-
-
-@dataclass(frozen=True)
-class GeneCsvContext:
-    """Bundle/gene metadata joined onto a ``GeneResult`` when formatting CSV rows."""
-
-    queried_as: str
-    entrez_gene_id: Optional[int] = None
-    method_version: Optional[str] = None
-    broadly_expressed: Optional[bool] = None
-    all_study_ids: Tuple[str, ...] = ()
-    study_id_by_code: Mapping[str, str] = field(default_factory=dict)
-    cancer_name_by_code: Mapping[str, str] = field(default_factory=dict)
-    expired_by_code: Mapping[str, bool] = field(default_factory=dict)
 
 
 def cbioportal_expression_url(
@@ -193,90 +176,6 @@ def csv_filename(gene_or_all: str, release_id: str) -> str:
     return f"expression-context_{safe_gene}_{safe_release}.csv"
 
 
-def pair_to_csv_row(
-    result: GeneResult,
-    pair: PairResult,
-    context: GeneCsvContext,
-) -> List[str]:
-    stats = pair.stats
-    code = pair.oncotree_code
-    cancer_name = pair.cancer_type_name or context.cancer_name_by_code.get(code)
-    study_id = pair.study_id or context.study_id_by_code.get(code)
-    expired = bool(context.expired_by_code.get(code, False))
-    precheck = precheck_state(stats, expired)
-    broadly = (
-        result.broadly_expressed
-        if result.broadly_expressed is not None
-        else context.broadly_expressed
-    )
-    verdict = pair.literature
-    verdict_str = verdict.verdict if verdict is not None and verdict.verdict else None
-    rule_str = (
-        verdict.literature_gate
-        if verdict is not None and verdict.literature_gate
-        else result.literature_gate
-    )
-    pmids_str = ";".join(verdict.pmids) if verdict is not None and verdict.pmids else ""
-    rationale_str = verdict.rationale if verdict is not None and verdict.rationale else ""
-    checked_at = (
-        verdict.evaluated_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        if verdict is not None and verdict.evaluated_at is not None
-        else ""
-    )
-    single_url = (
-        cbioportal_expression_url(result.hugo_symbol, [study_id], "CANCER_STUDY")
-        if study_id
-        else ""
-    )
-    mrna_vs_dx_url = (
-        cbioportal_expression_url(result.hugo_symbol, [study_id], "CANCER_TYPE_DETAILED")
-        if study_id
-        else ""
-    )
-    all_32_url = (
-        cbioportal_expression_url(
-            result.hugo_symbol, list(context.all_study_ids), "CANCER_STUDY"
-        )
-        if context.all_study_ids
-        else ""
-    )
-    return [
-        guard_csv_text(result.hugo_symbol),
-        format_int(context.entrez_gene_id),
-        guard_csv_text(context.queried_as),
-        guard_csv_text(code),
-        guard_csv_text(cancer_name),
-        guard_csv_text(_format_yes_no(pair.surfaced)),
-        guard_csv_text(pair.exclusion_reason),
-        guard_csv_text(_format_yes_no(stats.passes_stats)),
-        guard_csv_text(_enrichment_code(stats)),
-        guard_csv_text(_format_yes_no(broadly)),
-        format_int(stats.n),
-        format_int(stats.n_rest),
-        format_float(stats.median_log2),
-        format_float(stats.rest_median_log2),
-        format_float(stats.log2fc),
-        format_float(stats.cliffs_delta),
-        format_float(stats.auc),
-        format_q(stats.q_value),
-        format_float(stats.subgroup_high_fraction),
-        format_float(stats.subgroup_high_fraction_ratio),
-        format_q(stats.subgroup_q),
-        guard_csv_text(precheck),
-        format_int(stats.pubmed_count),
-        guard_csv_text(verdict_str),
-        guard_csv_text(rule_str),
-        guard_csv_text(pmids_str),
-        guard_csv_text(rationale_str),
-        guard_csv_text(single_url),
-        guard_csv_text(mrna_vs_dx_url),
-        guard_csv_text(all_32_url),
-        guard_csv_text(result.release_id),
-        guard_csv_text(context.method_version),
-        guard_csv_text(checked_at),
-    ]
-
-
 def format_csv_rows(
     rows: Iterable[Sequence[str]], *, include_header: bool = False, include_bom: bool = False
 ) -> str:
@@ -289,15 +188,6 @@ def format_csv_rows(
     for row in rows:
         writer.writerow(row)
     return buf.getvalue()
-
-
-def gene_result_csv_rows(
-    result: GeneResult, context: GeneCsvContext
-) -> List[List[str]]:
-    pairs: List[PairResult] = list(result.surfaced)
-    if result.excluded is not None:
-        pairs.extend(result.excluded)
-    return [pair_to_csv_row(result, pair, context) for pair in pairs]
 
 
 def pair_view_to_csv_row(

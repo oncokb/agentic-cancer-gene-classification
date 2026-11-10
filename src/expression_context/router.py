@@ -78,7 +78,10 @@ async def get_job(
     job = await service.jobs.get(job_id)
     if job is None or not can_read_job(job.owner, user):
         raise HTTPException(status_code=404, detail="Job not found.")
-    return await service.get_job_status(job)
+    try:
+        return await service.get_job_status(job)
+    except BundleNotLoaded as exc:
+        raise _not_loaded(exc) from exc
 
 
 @router.get("/bundle", response_model=BundleStatus)
@@ -120,6 +123,8 @@ async def list_genes(
         return await service.history(limit, cursor)
     except InvalidCursor as exc:
         raise HTTPException(status_code=422, detail="Invalid cursor.") from exc
+    except BundleNotLoaded as exc:
+        raise _not_loaded(exc) from exc
 
 
 @router.get("/genes/{gene}", response_model=GeneResult, response_model_exclude_none=False)

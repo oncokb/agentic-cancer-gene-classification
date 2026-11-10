@@ -118,34 +118,17 @@ async def _exercise_store(store):
     assert await store.list_release_genes("r2", GATE, 1, after_symbol="EGFR") == ["ERBB2"]
     assert await store.list_release_genes("r2", GATE, 1, after_symbol="ERBB2") == []
 
-    history = await store.list_history(GATE, 10, None, active_release_id="r1")
+    history = await store.list_history(GATE, 10, None)
     assert [(e.hugo_symbol, e.release_id) for e in history] == [
         ("EGFR", "r2"), ("ERBB2", "r2"), ("ERBB2", "r1"),
     ]
-    assert history[2].pair_count == 2 and history[2].surfaced_count == 2
-    assert history[0].surfaced_count == 0  # EGFR is r2, not active r1
-    assert history[1].surfaced_count == 0
-
-    history_r2 = await store.list_history(GATE, 10, None, active_release_id="r2")
-    assert history_r2[0].surfaced_count == 1  # EGFR r2
-    assert history_r2[2].surfaced_count == 0  # ERBB2 r1 is not active r2
-
-    history_none = await store.list_history(GATE, 10, None, active_release_id=None)
-    assert all(e.surfaced_count == 0 for e in history_none)
+    assert history[2].pair_count == 2
+    assert history[0].pair_count == 1
+    assert history[1].pair_count == 1
 
     after = (history[0].computed_at, history[0].hugo_symbol, history[0].release_id)
-    page = await store.list_history(GATE, 1, after, active_release_id="r1")
+    page = await store.list_history(GATE, 1, after)
     assert [(e.hugo_symbol, e.release_id) for e in page] == [("ERBB2", "r2")]
-
-    # A v2-key row whose evidence is from an old gate must not be counted,
-    # even though its stored surfaced boolean is True.
-    await store.upsert_pairs([_pair(
-        "ERBB2", "LUAD", release="r3", minutes_ago=0, surfaced=True,
-        evidence={**_v2_evidence("3"), "literature_gate": "acgc_pipeline_v1"},
-    )])
-    refreshed = await store.list_history(GATE, 10, None, active_release_id="r3")
-    assert (refreshed[0].hugo_symbol, refreshed[0].release_id) == ("ERBB2", "r3")
-    assert refreshed[0].pair_count == 1 and refreshed[0].surfaced_count == 0
 
 
 async def test_in_memory_store_contract():
