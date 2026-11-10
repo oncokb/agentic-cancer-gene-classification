@@ -1,0 +1,190 @@
+/* Optional expression-context module (src/expression_context/; see REMOVAL.md).
+   Builds on /static/styles.css; only page-specific rules live here. */
+
+.ec-page {
+  max-width: 1280px;
+}
+
+.ec-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.ec-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.ec-form input {
+  min-width: 12rem;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  text-transform: uppercase;
+}
+
+.ec-result-head h2 {
+  margin-bottom: 4px;
+}
+
+.ec-summary,
+.ec-job-status {
+  color: var(--muted);
+}
+
+.ec-cbio {
+  margin: 4px 0;
+}
+
+.ec-cbio a {
+  margin-right: 12px;
+}
+
+.ec-cbio-note {
+  max-width: 60rem;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.ec-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin: 8px 0 12px;
+}
+
+.ec-table td,
+.ec-table th {
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.ec-table td.ec-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ec-row-surfaced {
+  background: color-mix(in srgb, var(--ok) 8%, transparent);
+}
+
+.ec-badge {
+  display: inline-block;
+  margin: 0 4px 2px 0;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.85em;
+}
+
+.ec-pass {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.ec-fail {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.ec-neutral {
+  color: var(--muted);
+}
+
+.ec-warn {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.ec-pmids a {
+  margin-right: 6px;
+}
+
+.ec-subgroup {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.85em;
+  white-space: nowrap;
+}
+
+.ec-details-toggle {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+.ec-details-toggle:hover,
+.ec-details-toggle:focus-visible {
+  border-color: var(--muted);
+}
+
+.ec-table td.ec-detail-cell {
+  white-space: normal;
+  background: color-mix(in srgb, var(--line) 12%, transparent);
+  padding: 10px 12px;
+}
+
+.ec-details-list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 16px;
+  margin: 0;
+  font-size: 0.9em;
+}
+
+.ec-details-list dt {
+  color: var(--muted);
+}
+
+.ec-details-list dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.ec-detail-hint {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.ec-result-head h2 .ec-badge {
+  margin-left: 8px;
+  font-size: 0.6em;
+  vertical-align: middle;
+}
+
+.ec-rationale {
+  max-width: 28rem;
+  white-space: normal;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.ec-provenance {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 16px;
+  margin: 0;
+}
+
+.ec-provenance dt {
+  color: var(--muted);
+}
+
+.ec-provenance dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
