@@ -111,20 +111,41 @@ def stored_v2_verdict(
 
 
 def stored_verdict_surfaced(
+    *,
+    row_release_id: str,
+    active_release_id: str,
     literature_gate: str,
     evidence: Optional[Dict[str, Any]],
-    stats: Optional[Dict[str, Any]] = None,
+    stats: Optional[CancerTypeStats | Dict[str, Any]],
+    precheck_is_expired: bool,
 ) -> bool:
-    """The surfacing rule for a stored row (shared by reads, CSV export and history stores)."""
-    if stats is not None:
+    """Fail-closed surfacing predicate for a stored row against the active bundle.
+
+    A pair is surfaced iff evaluated against the active bundle and current clock:
+    1. ``row_release_id`` equals the non-empty ``active_release_id``,
+    2. ``stats`` is present and ``CancerTypeStats.passes_stats`` is True,
+    3. the effective PubMed precheck is not a fresh explicit False
+       (``precheck_is_expired`` recomputed from the active manifest and clock),
+    4. ``literature_gate`` and ``evidence`` form a valid supported
+       ``acgc_tumor_specific_v2`` verdict.
+    """
+    if not active_release_id or row_release_id != active_release_id:
+        return False
+    if stats is None:
+        return False
+    if isinstance(stats, CancerTypeStats):
+        parsed_stats = stats
+    elif isinstance(stats, dict):
         try:
             parsed_stats = CancerTypeStats.model_validate(stats)
         except ValueError:
             return False
-        if not parsed_stats.passes_stats:
-            return False
-        if not stats.get("precheck_expired") and parsed_stats.literature_precheck_pass is False:
-            return False
+    else:
+        return False
+    if not parsed_stats.passes_stats:
+        return False
+    if not precheck_is_expired and parsed_stats.literature_precheck_pass is False:
+        return False
     verdict = stored_v2_verdict(literature_gate, evidence)
     return verdict is not None and verdict_supported(verdict)
 

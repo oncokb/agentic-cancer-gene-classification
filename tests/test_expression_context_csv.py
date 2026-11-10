@@ -30,6 +30,7 @@ Covers:
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 import io
 import json
 import shutil
@@ -46,7 +47,7 @@ from fastapi.testclient import TestClient
 from src.auth import AuthenticatedUser, require_auth
 from src.expression_context import register_expression_context
 from src.expression_context.bundle_store import InMemoryBundleStore
-from src.expression_context.catalog import StatsCatalog
+from src.expression_context.catalog import BundleGone, StatsCatalog
 from src.expression_context.csv_export import (
     CSV_COLUMNS,
     UTF8_BOM,
@@ -59,7 +60,7 @@ from src.expression_context.csv_export import (
 )
 from src.expression_context.lease import VerdictLease
 from src.expression_context.literature_gate import TUMOR_SPECIFIC_GATE
-from src.expression_context.models import JobRecord, StoredPair
+from src.expression_context.models import GeneResult, JobRecord, PairResult, StoredPair
 from src.expression_context.service import ExpressionContextService
 from src.expression_context.store import InMemoryExpressionContextStore
 from src.job_store import JobStore
@@ -418,12 +419,22 @@ def test_csv_agrees_row_for_row_with_get_gene_and_history_under_stats_and_old_ru
         ),
     ]
 
+    bundle = build_bundle(
+        edit_gene=lambda doc: doc.update(
+            {"cancer_types": [dict(p.stats) for p in seeded_rows]}
+        )
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None
+    )
+    harness = CsvHarness(bundle=bundle)
+
     with TestClient(harness.app) as client:
         for pair in seeded_rows:
             harness.store.rows[
                 (pair.hugo_symbol, pair.oncotree_code, pair.release_id, pair.literature_gate)
             ] = pair
 
+        stats_resp = client.get(f"{PREFIX}/stats/ERBB2").json()
         json_default = client.get(f"{PREFIX}/genes/ERBB2").json()
         json_full = client.get(
             f"{PREFIX}/genes/ERBB2", params={"include_excluded": "true"}
@@ -438,8 +449,9 @@ def test_csv_agrees_row_for_row_with_get_gene_and_history_under_stats_and_old_ru
         )
         history = client.get(f"{PREFIX}/genes").json()
 
+        stats_surfaced = [p["oncotree_code"] for p in stats_resp["pairs"] if p["status"] == "surfaced"]
         json_surfaced_codes = [p["oncotree_code"] for p in json_default["surfaced"]]
-        assert json_surfaced_codes == ["BRCA"]
+        assert stats_surfaced == json_surfaced_codes == ["BRCA"]
         assert [r["oncotree_code"] for r in csv_default] == json_surfaced_codes
 
         json_excluded_by_code = {
@@ -448,7 +460,7 @@ def test_csv_agrees_row_for_row_with_get_gene_and_history_under_stats_and_old_ru
         assert json_excluded_by_code == {
             "LUAD": "stats",
             "SARC": "stats",
-            "STAD": "literature",
+            "STAD": "pending",
             "UCEC": "precheck",
         }
 
@@ -471,7 +483,6 @@ def test_rfc4180_quoting_round_trip_and_csv_injection_guard():
     text cells starting with = + - @ tab or CR are prefixed with a single quote,
     while negative numeric columns (cliffs_delta, log2_fold_change) remain plain numbers."""
     tricky_rationale = '=SUM(A1:A2), "quoted, phrase",\nand second line'
-    harness = CsvHarness()
     now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
     base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
     base_stats.update(
@@ -487,6 +498,12 @@ def test_rfc4180_quoting_round_trip_and_csv_injection_guard():
         cancer_type_name="Breast Invasive Carcinoma",
         study_id="brca_tcga_pan_can_atlas_2018",
     )
+    bundle = build_bundle(
+        edit_gene=lambda doc: doc.update({"cancer_types": [base_stats]})
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None
+    )
+    harness = CsvHarness(bundle=bundle)
 
     with TestClient(harness.app) as client:
         harness.store.rows[("ERBB2", "BRCA", RELEASE_ID, TUMOR_SPECIFIC_GATE)] = StoredPair(
@@ -718,3 +735,498 @@ def test_python_and_js_cbioportal_urls_are_identical():
     js_urls = json.loads(proc.stdout.strip())
     py_urls = [cbioportal_expression_url(s, ids, h) for s, ids, h in cases]
     assert py_urls == js_urls
+
+
+def test_release_a_surfaces_release_b_fails_it_not_surfaced_anywhere():
+    bundle_a = build_bundle(release_id="release-a")
+    erbb2_b = dict(gene_file("ERBB2"))
+    brca_failing = dict(erbb2_b["cancer_types"][0])
+    brca_failing["stats_pass"] = False
+    brca_failing["q_value"] = 0.5
+    bundle_b = build_bundle(
+        release_id="release-b",
+        edit_gene=lambda doc: doc.update({"cancer_types": [brca_failing]})
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None,
+    )
+
+    harness = CsvHarness(bundle=bundle_a)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    with TestClient(harness.app) as client:
+        # Seed evidence under Release A where it surfaces:
+        harness.store.rows[("ERBB2", "BRCA", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id="release-a",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=erbb2_b["cancer_types"][0],
+            evidence={
+                "literature_gate": TUMOR_SPECIFIC_GATE,
+                "tumor_type_query": "breast cancer",
+                "supported": True,
+                "insufficient_evidence": False,
+                "pmids": ["12345678"],
+                "verdict": "supported",
+                "papers": [{"pmid": "12345678", "tumor_specific": True}],
+                "evaluated_at": now.isoformat(),
+            },
+            computed_at=now,
+        )
+        job_a = JobRecord(
+            job_id="job-release-a",
+            status="succeeded",
+            gene="ERBB2",
+            hugo_symbol="ERBB2",
+            release_id="release-a",
+            bundle_tag=bundle_a.tag,
+            created_at=now,
+            owner=ALICE.email,
+            result=GeneResult(
+                hugo_symbol="ERBB2",
+                release_id="release-a",
+                literature_gate=TUMOR_SPECIFIC_GATE,
+                computed_at=now,
+                surfaced=[
+                    PairResult(
+                        oncotree_code="BRCA",
+                        surfaced=True,
+                        stats=erbb2_b["cancer_types"][0],
+                        computed_at=now,
+                    )
+                ],
+            ),
+        )
+        import asyncio
+        asyncio.run(harness.service.jobs.put(job_a))
+
+        stats_a = client.get(f"{PREFIX}/stats/ERBB2").json()
+        assert any(p["oncotree_code"] == "BRCA" and p["status"] == "surfaced" for p in stats_a["pairs"])
+
+        # Activate Bundle B (where BRCA fails stats)
+        asyncio.run(seed_bundle(harness.bundles, bundle_b))
+        harness.service.catalog.invalidate()
+
+        # Under Release B:
+        # 1. /stats/ERBB2: BRCA is excluded with stats
+        stats_b = client.get(f"{PREFIX}/stats/ERBB2").json()
+        brca_stats = next(p for p in stats_b["pairs"] if p["oncotree_code"] == "BRCA")
+        assert brca_stats["status"] == "excluded"
+        assert brca_stats["exclusion_reason"] == "stats"
+
+        # 2. /genes/ERBB2 (default: surfaced only)
+        genes_def = client.get(f"{PREFIX}/genes/ERBB2").json()
+        assert not any(p["oncotree_code"] == "BRCA" for p in genes_def["surfaced"])
+
+        # 3. /genes/ERBB2?include_excluded=true
+        genes_full = client.get(f"{PREFIX}/genes/ERBB2", params={"include_excluded": "true"}).json()
+        assert not any(p["oncotree_code"] == "BRCA" for p in genes_full["surfaced"])
+        brca_ex = next(p for p in genes_full["excluded"] if p["oncotree_code"] == "BRCA")
+        assert brca_ex["exclusion_reason"] == "stats"
+
+        # 4. per-gene CSV: export.csv
+        _, csv_def = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
+        assert not any(r["oncotree_code"] == "BRCA" for r in csv_def)
+
+        # 5. per-gene CSV with include_excluded=true
+        _, csv_full = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text)
+        brca_csv = next(r for r in csv_full if r["oncotree_code"] == "BRCA")
+        assert brca_csv["surfaced"] == "no"
+        assert brca_csv["exclusion_reason"] == "stats"
+
+        # 6. Bulk CSV (export.csv)
+        _, bulk_def = parse_csv_response(client.get(f"{PREFIX}/export.csv").text)
+        assert not any(r["gene_symbol"] == "ERBB2" and r["oncotree_code"] == "BRCA" for r in bulk_def)
+
+        # 7. History (/genes)
+        hist = client.get(f"{PREFIX}/genes").json()
+        erbb2_hist = [h for h in hist["items"] if h["hugo_symbol"] == "ERBB2"]
+        assert all(h["surfaced_count"] == 0 for h in erbb2_hist)
+
+        # 8. Polled job (/jobs/{job_id})
+        poll_job = client.get(f"{PREFIX}/jobs/{job_a.job_id}").json()
+        assert poll_job["status"] == "succeeded"
+        assert not any(p["oncotree_code"] == "BRCA" for p in poll_job["result"]["surfaced"])
+
+
+def test_active_release_passes_evidence_only_older_release_pending_everywhere():
+    harness = CsvHarness()
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    with TestClient(harness.app) as client:
+        # Seed evidence only under an older release
+        harness.store.rows[("ERBB2", "BRCA", "older-release", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id="older-release",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=gene_file("ERBB2")["cancer_types"][0],
+            evidence={
+                "literature_gate": TUMOR_SPECIFIC_GATE,
+                "tumor_type_query": "breast cancer",
+                "supported": True,
+                "insufficient_evidence": False,
+                "pmids": ["12345678"],
+                "verdict": "supported",
+                "papers": [{"pmid": "12345678", "tumor_specific": True}],
+                "evaluated_at": now.isoformat(),
+            },
+            computed_at=now,
+        )
+
+        stats = client.get(f"{PREFIX}/stats/ERBB2").json()
+        brca = next(p for p in stats["pairs"] if p["oncotree_code"] == "BRCA")
+        assert brca["status"] == "literature_pending"
+        assert brca["literature"] is None
+
+        genes_def = client.get(f"{PREFIX}/genes/ERBB2").json()
+        assert len(genes_def["surfaced"]) == 0
+
+        genes_full = client.get(f"{PREFIX}/genes/ERBB2", params={"include_excluded": "true"}).json()
+        assert len(genes_full["surfaced"]) == 0
+        brca_ex = next(p for p in genes_full["excluded"] if p["oncotree_code"] == "BRCA")
+        assert brca_ex["exclusion_reason"] == "pending"
+
+        _, csv_def = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
+        assert len(csv_def) == 0
+
+        _, csv_full = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text)
+        brca_csv = next(r for r in csv_full if r["oncotree_code"] == "BRCA")
+        assert brca_csv["surfaced"] == "no"
+        assert brca_csv["exclusion_reason"] == "pending"
+
+        _, bulk_def = parse_csv_response(client.get(f"{PREFIX}/export.csv").text)
+        assert len(bulk_def) == 0
+
+        hist = client.get(f"{PREFIX}/genes").json()
+        erbb2_hist = next(h for h in hist["items"] if h["hugo_symbol"] == "ERBB2")
+        assert erbb2_hist["surfaced_count"] == 0
+
+
+def test_stored_false_precheck_expired_no_longer_excludes_and_csv_columns_agree():
+    now = datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+    base_stats["literature_precheck_pass"] = False
+    base_stats["precheck_expired"] = False
+
+    manifest_overrides = {
+        "source": {
+            "precheck_expires_at": "2026-11-01T00:00:00Z"
+        }
+    }
+    bundle = build_bundle(
+        manifest_overrides=manifest_overrides,
+        edit_gene=lambda doc: doc.update({"cancer_types": [base_stats]})
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None,
+    )
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app) as client:
+        harness.service._clock = lambda: now
+
+        # Case A: with supported literature evidence stored under active release
+        harness.store.rows[("ERBB2", "BRCA", bundle.manifest["release_id"], TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id=bundle.manifest["release_id"],
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=base_stats,
+            evidence={
+                "literature_gate": TUMOR_SPECIFIC_GATE,
+                "tumor_type_query": "breast cancer",
+                "supported": True,
+                "insufficient_evidence": False,
+                "pmids": ["12345678"],
+                "verdict": "supported",
+                "papers": [{"pmid": "12345678", "tumor_specific": True}],
+                "evaluated_at": now.isoformat(),
+            },
+            computed_at=now,
+        )
+
+        stats = client.get(f"{PREFIX}/stats/ERBB2").json()
+        brca_stats = next(p for p in stats["pairs"] if p["oncotree_code"] == "BRCA")
+        assert brca_stats["precheck"] == "expired"
+        assert brca_stats["status"] == "surfaced"
+
+        genes = client.get(f"{PREFIX}/genes/ERBB2").json()
+        assert any(p["oncotree_code"] == "BRCA" for p in genes["surfaced"])
+
+        _, csv_full = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text)
+        brca_csv = next(r for r in csv_full if r["oncotree_code"] == "BRCA")
+        assert brca_csv["pubmed_precheck"] == "expired"
+        assert brca_csv["surfaced"] == "yes"
+        assert brca_csv["exclusion_reason"] == ""
+
+        history = client.get(f"{PREFIX}/genes").json()
+        assert history["items"][0]["surfaced_count"] == 1
+
+        # Case B: when literature rejected:
+        harness.store.rows[("ERBB2", "BRCA", bundle.manifest["release_id"], TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id=bundle.manifest["release_id"],
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=False,
+            exclusion_reason="literature",
+            stats=base_stats,
+            evidence={
+                "literature_gate": TUMOR_SPECIFIC_GATE,
+                "tumor_type_query": "breast cancer",
+                "supported": False,
+                "insufficient_evidence": False,
+                "pmids": ["12345678"],
+                "verdict": "not_supported",
+                "papers": [{"pmid": "12345678", "tumor_specific": False}],
+                "evaluated_at": now.isoformat(),
+            },
+            computed_at=now,
+        )
+
+        _, csv_full_rej = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text)
+        brca_rej = next(r for r in csv_full_rej if r["oncotree_code"] == "BRCA")
+        assert brca_rej["pubmed_precheck"] == "expired"
+        assert brca_rej["surfaced"] == "no"
+        assert brca_rej["exclusion_reason"] == "literature"
+
+
+def test_fresh_false_precheck_with_supported_evidence_excluded_everywhere():
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+    base_stats["literature_precheck_pass"] = False
+
+    manifest_overrides = {
+        "source": {
+            "precheck_expires_at": "2026-11-15T00:00:00Z"
+        }
+    }
+    bundle = build_bundle(
+        manifest_overrides=manifest_overrides,
+        edit_gene=lambda doc: doc.update({"cancer_types": [base_stats]})
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None,
+    )
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app) as client:
+        harness.service._clock = lambda: now
+        harness.store.rows[("ERBB2", "BRCA", bundle.manifest["release_id"], TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id=bundle.manifest["release_id"],
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=base_stats,
+            evidence={
+                "literature_gate": TUMOR_SPECIFIC_GATE,
+                "tumor_type_query": "breast cancer",
+                "supported": True,
+                "insufficient_evidence": False,
+                "pmids": ["12345678"],
+                "verdict": "supported",
+                "papers": [{"pmid": "12345678", "tumor_specific": True}],
+                "evaluated_at": now.isoformat(),
+            },
+            computed_at=now,
+        )
+
+        stats = client.get(f"{PREFIX}/stats/ERBB2").json()
+        brca_stats = next(p for p in stats["pairs"] if p["oncotree_code"] == "BRCA")
+        assert brca_stats["status"] == "excluded"
+        assert brca_stats["exclusion_reason"] == "precheck"
+
+        genes = client.get(f"{PREFIX}/genes/ERBB2").json()
+        assert not any(p["oncotree_code"] == "BRCA" for p in genes["surfaced"])
+
+        genes_full = client.get(f"{PREFIX}/genes/ERBB2", params={"include_excluded": "true"}).json()
+        brca_ex = next(p for p in genes_full["excluded"] if p["oncotree_code"] == "BRCA")
+        assert brca_ex["exclusion_reason"] == "precheck"
+
+        _, csv_full = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text)
+        brca_csv = next(r for r in csv_full if r["oncotree_code"] == "BRCA")
+        assert brca_csv["surfaced"] == "no"
+        assert brca_csv["exclusion_reason"] == "precheck"
+        assert brca_csv["pubmed_precheck"] == "fail"
+
+
+def test_stats_failing_and_broad_blocked_lineage_excluded_broad_subgroup_pass_surfaced():
+    bundle = build_bundle(
+        ("KLK3", "VIM"),
+        release_id=M3_RELEASE_ID,
+        subdir=M3,
+        published_at="2026-11-07T06:00:00Z",
+    )
+    harness = CsvHarness(bundle=bundle)
+    now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+    with TestClient(harness.app) as client:
+        vim_doc = gene_file("VIM", subdir=M3)
+        brca_stats = next(ct for ct in vim_doc["cancer_types"] if ct["oncotree_code"] == "BRCA")
+        sarc_stats = next(ct for ct in vim_doc["cancer_types"] if ct["oncotree_code"] == "SARC")
+
+        supported_ev = {
+            "literature_gate": TUMOR_SPECIFIC_GATE,
+            "tumor_type_query": "cancer",
+            "supported": True,
+            "insufficient_evidence": False,
+            "pmids": ["12345678"],
+            "verdict": "supported",
+            "papers": [{"pmid": "12345678", "tumor_specific": True}],
+            "evaluated_at": now.isoformat(),
+        }
+
+        harness.store.rows[("VIM", "BRCA", M3_RELEASE_ID, TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="VIM",
+            oncotree_code="BRCA",
+            release_id=M3_RELEASE_ID,
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=brca_stats,
+            evidence=supported_ev,
+            computed_at=now,
+        )
+        harness.store.rows[("VIM", "SARC", M3_RELEASE_ID, TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="VIM",
+            oncotree_code="SARC",
+            release_id=M3_RELEASE_ID,
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=sarc_stats,
+            evidence=supported_ev,
+            computed_at=now,
+        )
+
+        stats = client.get(f"{PREFIX}/stats/VIM").json()
+        brca = next(p for p in stats["pairs"] if p["oncotree_code"] == "BRCA")
+        sarc = next(p for p in stats["pairs"] if p["oncotree_code"] == "SARC")
+        assert brca["status"] == "surfaced"
+        assert sarc["status"] == "excluded"
+        assert sarc["exclusion_reason"] == "stats"
+
+        genes = client.get(f"{PREFIX}/genes/VIM", params={"include_excluded": "true"}).json()
+        assert any(p["oncotree_code"] == "BRCA" for p in genes["surfaced"])
+        assert not any(p["oncotree_code"] == "SARC" for p in genes["surfaced"])
+        sarc_ex = next(p for p in genes["excluded"] if p["oncotree_code"] == "SARC")
+        assert sarc_ex["exclusion_reason"] == "stats"
+
+
+def test_agreement_across_all_read_paths():
+    gate = FakeLiteratureGate(
+        verdicts={
+            "breast cancer": (True, ["12345678"]),
+            "stomach cancer": (False, ["23456789"]),
+        }
+    )
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    harness = CsvHarness(gate=gate, bundle=bundle)
+    with TestClient(harness.app) as client:
+        job = run_job(client, "ERBB2")
+
+        stats_resp = client.get(f"{PREFIX}/stats/ERBB2").json()
+        stats_surfaced = {p["oncotree_code"] for p in stats_resp["pairs"] if p["status"] == "surfaced"}
+
+        genes_resp = client.get(f"{PREFIX}/genes/ERBB2").json()
+        genes_surfaced = {p["oncotree_code"] for p in genes_resp["surfaced"]}
+
+        genes_full_resp = client.get(f"{PREFIX}/genes/ERBB2", params={"include_excluded": "true"}).json()
+        genes_full_surfaced = {p["oncotree_code"] for p in genes_full_resp["surfaced"]}
+
+        _, csv_rows = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
+        csv_surfaced = {r["oncotree_code"] for r in csv_rows}
+
+        _, csv_full_rows = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text)
+        csv_full_surfaced = {r["oncotree_code"] for r in csv_full_rows if r["surfaced"] == "yes"}
+
+        _, bulk_rows = parse_csv_response(client.get(f"{PREFIX}/export.csv").text)
+        bulk_surfaced = {r["oncotree_code"] for r in bulk_rows if r["gene_symbol"] == "ERBB2"}
+
+        history = client.get(f"{PREFIX}/genes").json()
+        hist_entry = next(h for h in history["items"] if h["hugo_symbol"] == "ERBB2")
+        assert hist_entry["surfaced_count"] == len(stats_surfaced)
+
+        polled = client.get(f"{PREFIX}/jobs/{job['job_id']}").json()
+        polled_surfaced = {p["oncotree_code"] for p in polled["result"]["surfaced"]}
+
+        assert stats_surfaced == genes_surfaced == genes_full_surfaced == csv_surfaced == csv_full_surfaced == bulk_surfaced == polled_surfaced
+
+
+def test_bulk_include_excluded_exports_bundle_gene_without_literature_job():
+    gate = FakeLiteratureGate(verdicts={"breast cancer": (True, ["12345678"])})
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    harness = CsvHarness(gate=gate, bundle=bundle)
+    with TestClient(harness.app) as client:
+        run_job(client, "ERBB2")
+
+        resp = client.get(f"{PREFIX}/export.csv", params={"include_excluded": "true"})
+        assert resp.status_code == 200
+        _, rows = parse_csv_response(resp.text)
+
+        genes_in_csv = {r["gene_symbol"] for r in rows}
+        assert "ERBB2" in genes_in_csv
+        assert "MYCN" in genes_in_csv
+
+        mycn_rows = [r for r in rows if r["gene_symbol"] == "MYCN"]
+        assert len(mycn_rows) > 0
+        for r in mycn_rows:
+            assert r["surfaced"] == "no"
+            assert r["exclusion_reason"] in ("pending", "stats", "precheck")
+
+
+def test_no_active_bundle_503_for_genes_and_per_gene_csv():
+    harness = CsvHarness(seed=False)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    harness.store.rows[("ERBB2", "BRCA", RELEASE_ID, TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="ERBB2",
+        oncotree_code="BRCA",
+        release_id=RELEASE_ID,
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=gene_file("ERBB2")["cancer_types"][0],
+        evidence=_v2_supported_evidence("12345678", "breast cancer"),
+        computed_at=now,
+    )
+    with TestClient(harness.app) as client:
+        r1 = client.get(f"{PREFIX}/genes/ERBB2")
+        assert r1.status_code == 503
+        assert r1.headers["retry-after"] == "60"
+
+        r2 = client.get(f"{PREFIX}/genes/ERBB2/export.csv")
+        assert r2.status_code == 503
+        assert r2.headers["retry-after"] == "60"
+
+        r3 = client.get(f"{PREFIX}/stats/ERBB2")
+        assert r3.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_early_query_failure_in_bulk_export_returns_non_200_and_midstream_bundle_gone():
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app) as client:
+        run_job(client, "ERBB2")
+
+        # 1. Early query failure: simulate store query failure on initial page
+        async def failing_list_release_genes(*args, **kwargs):
+            raise RuntimeError("Database connection refused during initial page query")
+
+        orig_method = harness.store.list_release_genes
+        harness.store.list_release_genes = failing_list_release_genes
+
+        with TestClient(harness.app, raise_server_exceptions=False) as client_no_raise:
+            resp = client_no_raise.get(f"{PREFIX}/export.csv")
+            assert resp.status_code == 500, "Early failure must return non-200"
+
+        harness.store.list_release_genes = orig_method
+
+        # 2. Mid-stream bundle gone: active bundle superseded mid-stream
+        assert harness.service is not None
+        _, stream = await harness.service.export_bundle_csv(include_excluded=True, page_size=1)
+        first_chunk = await anext(stream)
+        assert first_chunk.startswith(UTF8_BOM)
+
+        # Supersede active bundle pointer mid-stream
+        harness.bundles.state = replace(harness.bundles.state, active_bundle_tag="another-tag")
+        harness.service.catalog.invalidate()
+
+        with pytest.raises(BundleGone):
+            async for _ in stream:
+                pass

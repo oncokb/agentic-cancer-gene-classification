@@ -21,7 +21,9 @@ from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 from src.expression_context.models import (
     CancerTypeStats,
     GeneResult,
+    GeneStatsView,
     PairResult,
+    PairStatsView,
     PrecheckState,
 )
 
@@ -296,3 +298,118 @@ def gene_result_csv_rows(
     if result.excluded is not None:
         pairs.extend(result.excluded)
     return [pair_to_csv_row(result, pair, context) for pair in pairs]
+
+
+def pair_view_to_csv_row(
+    view: GeneStatsView,
+    pair: PairStatsView,
+    *,
+    all_study_ids: Sequence[str] = (),
+) -> List[str]:
+    stats = pair.stats
+    code = pair.oncotree_code
+    cancer_name = pair.cancer_type_name
+    study_id = pair.study_id
+    surfaced = pair.status == "surfaced"
+    if surfaced:
+        reason = ""
+    elif pair.status == "literature_pending":
+        reason = "pending"
+    else:
+        reason = pair.exclusion_reason or ""
+
+    verdict = pair.literature
+    verdict_str = verdict.verdict if verdict is not None and verdict.verdict else None
+    rule_str = (
+        verdict.literature_gate
+        if verdict is not None and verdict.literature_gate
+        else view.literature_gate
+    )
+    pmids_str = ";".join(verdict.pmids) if verdict is not None and verdict.pmids else ""
+    rationale_str = verdict.rationale if verdict is not None and verdict.rationale else ""
+    checked_at = (
+        verdict.evaluated_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        if verdict is not None and verdict.evaluated_at is not None
+        else ""
+    )
+    single_url = (
+        cbioportal_expression_url(view.hugo_symbol, [study_id], "CANCER_STUDY")
+        if study_id
+        else ""
+    )
+    mrna_vs_dx_url = (
+        cbioportal_expression_url(view.hugo_symbol, [study_id], "CANCER_TYPE_DETAILED")
+        if study_id
+        else ""
+    )
+    all_32_url = (
+        cbioportal_expression_url(view.hugo_symbol, list(all_study_ids), "CANCER_STUDY")
+        if all_study_ids
+        else ""
+    )
+    return [
+        guard_csv_text(view.hugo_symbol),
+        format_int(view.entrez_gene_id),
+        guard_csv_text(view.query),
+        guard_csv_text(code),
+        guard_csv_text(cancer_name),
+        guard_csv_text(_format_yes_no(surfaced)),
+        guard_csv_text(reason),
+        guard_csv_text(_format_yes_no(stats.passes_stats)),
+        guard_csv_text(_enrichment_code(stats)),
+        guard_csv_text(_format_yes_no(view.broadly_expressed)),
+        format_int(stats.n),
+        format_int(stats.n_rest),
+        format_float(stats.median_log2),
+        format_float(stats.rest_median_log2),
+        format_float(stats.log2fc),
+        format_float(stats.cliffs_delta),
+        format_float(stats.auc),
+        format_q(stats.q_value),
+        format_float(stats.subgroup_high_fraction),
+        format_float(stats.subgroup_high_fraction_ratio),
+        format_q(stats.subgroup_q),
+        guard_csv_text(pair.precheck),
+        format_int(stats.pubmed_count),
+        guard_csv_text(verdict_str),
+        guard_csv_text(rule_str),
+        guard_csv_text(pmids_str),
+        guard_csv_text(rationale_str),
+        guard_csv_text(single_url),
+        guard_csv_text(mrna_vs_dx_url),
+        guard_csv_text(all_32_url),
+        guard_csv_text(view.bundle.release_id),
+        guard_csv_text(view.bundle.method_version),
+        guard_csv_text(checked_at),
+    ]
+
+
+def gene_view_csv_rows(
+    view: GeneStatsView,
+    *,
+    include_excluded: bool = False,
+    all_study_ids: Sequence[str] = (),
+) -> List[List[str]]:
+    study_ids = list(all_study_ids)
+    if not study_ids:
+        seen = set()
+        for p in view.pairs:
+            if p.study_id and p.study_id not in seen:
+                seen.add(p.study_id)
+                study_ids.append(p.study_id)
+    surfaced = sorted(
+        (p for p in view.pairs if p.status == "surfaced"),
+        key=lambda p: (
+            p.stats.q_value is None,
+            p.stats.q_value if p.stats.q_value is not None else 0.0,
+            p.oncotree_code,
+        ),
+    )
+    pairs: List[PairStatsView] = list(surfaced)
+    if include_excluded:
+        excluded = sorted(
+            (p for p in view.pairs if p.status != "surfaced"),
+            key=lambda p: p.oncotree_code,
+        )
+        pairs.extend(excluded)
+    return [pair_view_to_csv_row(view, p, all_study_ids=study_ids) for p in pairs]

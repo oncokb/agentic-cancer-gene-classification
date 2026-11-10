@@ -373,13 +373,20 @@
       }
     }
 
+    function hasStoredResult(view) {
+      if (!view) return false;
+      if (typeof view.has_stored_result === "boolean") return view.has_stored_result;
+      const pairs = view.pairs || [];
+      return pairs.some((p) => p.literature != null || (p.status !== "literature_pending" && p.exclusion_reason !== "pending"));
+    }
+
     function updateExportLink() {
       const view = state.view;
       const link = el["ec-export"];
       const toggleWrap = el["ec-export-toggle-wrap"];
       const toggle = el["ec-export-include-excluded"];
       const symbol = view && (view.hugo_symbol || view.query) ? String(view.hugo_symbol || view.query).trim() : "";
-      if (!symbol) {
+      if (!symbol || !hasStoredResult(view)) {
         show(link, false);
         show(toggleWrap, false);
         return;

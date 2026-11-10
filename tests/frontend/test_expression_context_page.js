@@ -732,6 +732,43 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
   );
 });
 
+test("CSV download link hidden when gene has no stored results for the active release", async () => {
+  const pendingView = view({
+    query: "pending_gene",
+    hugo_symbol: "PEND1",
+    has_stored_result: false,
+    pairs: [
+      {
+        oncotree_code: "BRCA",
+        stats: stats("BRCA"),
+        stats_pass: true,
+        precheck: "pass",
+        literature_eligible: true,
+        status: "literature_pending",
+        exclusion_reason: null,
+        literature: null,
+      },
+    ],
+  });
+  const storedView = view({
+    query: "stored_gene",
+    hugo_symbol: "STORED1",
+    has_stored_result: true,
+  });
+  const { nodes, page } = env({
+    "GET /v1/expression-context/stats/PEND1": response(pendingView),
+    "GET /v1/expression-context/stats/STORED1": response(storedView),
+  });
+
+  await page.lookup("PEND1");
+  assert.ok(nodes["ec-export"].hidden, "Download CSV hidden while results are pending / no stored results");
+  assert.ok(nodes["ec-export-toggle-wrap"].hidden, "toggle hidden while results are pending");
+
+  await page.lookup("STORED1");
+  assert.ok(!nodes["ec-export"].hidden, "Download CSV visible once stored results exist");
+  assert.ok(!nodes["ec-export-toggle-wrap"].hidden, "toggle visible once stored results exist");
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of tests) {

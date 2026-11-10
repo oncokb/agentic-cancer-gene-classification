@@ -119,6 +119,22 @@ class StatsCatalog:
             await self._check_still_there(bundle)
         return target
 
+    async def verify_active(self, bundle: ActiveBundle) -> None:
+        """Verify that bundle is still the active bundle in the cluster.
+        Raises BundleGone if the bundle is no longer active or no longer ready.
+        """
+        state = await self._bundles.get_state()
+        if state.active_bundle_tag != bundle.tag:
+            self.invalidate()
+            raise BundleGone(bundle.tag)
+        await self._check_still_there(bundle)
+
+    async def list_genes(
+        self, bundle: ActiveBundle, limit: int, after_symbol: Optional[str] = None
+    ) -> list[str]:
+        await self._check_still_there(bundle)
+        return await self._bundles.list_bundle_genes(bundle.tag, limit, after_symbol=after_symbol)
+
     async def status(self, *, releases_repo: str, pinned_bundle_tag: Optional[str]) -> BundleStatus:
         state = await self._bundles.get_state()
         active = None

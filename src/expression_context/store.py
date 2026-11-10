@@ -15,10 +15,10 @@ import binascii
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
 
 from src.expression_context.literature_gate import stored_verdict_surfaced
-from src.expression_context.models import HistoryEntry, StoredPair
+from src.expression_context.models import CancerTypeStats, HistoryEntry, StoredPair
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     requested_by VARCHAR(255) NULL,
     UNIQUE KEY uq_expression_context_pair (hugo_symbol, oncotree_code, release_id, literature_gate),
     INDEX idx_expression_context_gene (hugo_symbol, literature_gate, computed_at),
-    INDEX idx_expression_context_computed (literature_gate, computed_at)
+    INDEX idx_expression_context_computed (literature_gate, computed_at),
+    INDEX idx_expression_context_release_gene (release_id, literature_gate, hugo_symbol)
 )
 """
 
@@ -120,7 +121,16 @@ class ExpressionContextStore(Protocol):
     async def latest_pairs(self, hugo_symbol: str, literature_gate: str) -> List[StoredPair]: ...
 
     async def list_history(
-        self, literature_gate: str, limit: int, cursor: Optional[Cursor]
+        self,
+        literature_gate: str,
+        limit: int,
+        cursor: Optional[Cursor],
+        *,
+        active_release_id: Optional[str] = None,
+        precheck_is_expired: bool = False,
+        active_stats_getter: Optional[
+            Callable[[str], Awaitable[Optional[Mapping[str, CancerTypeStats]]]]
+        ] = None,
     ) -> List[HistoryEntry]: ...
 
     async def list_release_genes(
@@ -172,26 +182,48 @@ class InMemoryExpressionContextStore:
         latest_release = max(rows, key=lambda row: row.computed_at).release_id
         return [row for row in rows if row.release_id == latest_release]
 
-    async def list_history(self, literature_gate, limit, cursor):
+    async def list_history(
+        self,
+        literature_gate: str,
+        limit: int,
+        cursor: Optional[Cursor],
+        *,
+        active_release_id: Optional[str] = None,
+        precheck_is_expired: bool = False,
+        active_stats_getter: Optional[
+            Callable[[str], Awaitable[Optional[Mapping[str, CancerTypeStats]]]]
+        ] = None,
+    ) -> List[HistoryEntry]:
         groups: Dict[Tuple[str, str], List[StoredPair]] = {}
         for row in self.rows.values():
             if row.literature_gate == literature_gate:
                 groups.setdefault((row.hugo_symbol, row.release_id), []).append(row)
-        entries = [
-            HistoryEntry(
-                hugo_symbol=symbol,
-                release_id=release_id,
-                literature_gate=literature_gate,
-                computed_at=max(row.computed_at for row in rows),
-                pair_count=len(rows),
-                surfaced_count=sum(
-                    1
-                    for row in rows
-                    if stored_verdict_surfaced(row.literature_gate, row.evidence, row.stats)
-                ),
+        entries: List[HistoryEntry] = []
+        for (symbol, release_id), rows in groups.items():
+            surfaced_count = 0
+            if active_release_id and release_id == active_release_id:
+                active_stats_map = await active_stats_getter(symbol) if active_stats_getter else None
+                for row in rows:
+                    stats = active_stats_map.get(row.oncotree_code) if active_stats_map is not None else row.stats
+                    if stored_verdict_surfaced(
+                        row_release_id=row.release_id,
+                        active_release_id=active_release_id,
+                        literature_gate=row.literature_gate,
+                        evidence=row.evidence,
+                        stats=stats,
+                        precheck_is_expired=precheck_is_expired,
+                    ):
+                        surfaced_count += 1
+            entries.append(
+                HistoryEntry(
+                    hugo_symbol=symbol,
+                    release_id=release_id,
+                    literature_gate=literature_gate,
+                    computed_at=max(row.computed_at for row in rows),
+                    pair_count=len(rows),
+                    surfaced_count=surfaced_count,
+                )
             )
-            for (symbol, release_id), rows in groups.items()
-        ]
         entries.sort(key=_history_sort_key, reverse=True)
         if cursor is not None:
             entries = [entry for entry in entries if _history_sort_key(entry) < cursor]
@@ -248,6 +280,16 @@ class MySQLExpressionContextStore:
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(CREATE_TABLE_SQL)
+                await cursor.execute(
+                    f"SHOW INDEX FROM {TABLE_NAME} WHERE Key_name = 'idx_expression_context_release_gene'"
+                )
+                if not await cursor.fetchone():
+                    try:
+                        await cursor.execute(
+                            f"ALTER TABLE {TABLE_NAME} ADD INDEX idx_expression_context_release_gene (release_id, literature_gate, hugo_symbol)"
+                        )
+                    except Exception as exc:
+                        logger.debug("idx_expression_context_release_gene index add skipped: %s", exc)
 
     @staticmethod
     def _row_to_pair(row: Tuple[Any, ...]) -> StoredPair:
@@ -335,7 +377,18 @@ class MySQLExpressionContextStore:
                 rows = await cursor.fetchall()
         return [self._row_to_pair(row) for row in rows]
 
-    async def list_history(self, literature_gate, limit, cursor):
+    async def list_history(
+        self,
+        literature_gate: str,
+        limit: int,
+        cursor: Optional[Cursor],
+        *,
+        active_release_id: Optional[str] = None,
+        precheck_is_expired: bool = False,
+        active_stats_getter: Optional[
+            Callable[[str], Awaitable[Optional[Mapping[str, CancerTypeStats]]]]
+        ] = None,
+    ) -> List[HistoryEntry]:
         params: List[Any] = [literature_gate]
         having = ""
         if cursor is not None:
@@ -362,33 +415,57 @@ class MySQLExpressionContextStore:
                 )
                 rows = await db_cursor.fetchall()
                 surfaced_counts: Dict[Tuple[str, str], int] = {}
-                if rows:
+                active_keys = [
+                    (symbol, release_id)
+                    for symbol, release_id, *_ in rows
+                    if active_release_id and release_id == active_release_id
+                ]
+                if active_keys:
                     # Bounded by the page: at most `limit` (API max 100) groups,
                     # one row per cancer type within each. The v2 evidence rule
                     # is applied in Python so the stores cannot drift.
-                    keys = [(symbol, release_id) for symbol, release_id, *_ in rows]
-                    placeholders = ", ".join(["(%s, %s)"] * len(keys))
+                    placeholders = ", ".join(["(%s, %s)"] * len(active_keys))
                     evidence_params: List[Any] = [literature_gate]
-                    for key in keys:
+                    for key in active_keys:
                         evidence_params.extend(key)
                     await db_cursor.execute(
-                        "SELECT hugo_symbol, release_id, stats_json, evidence_json "
+                        "SELECT hugo_symbol, oncotree_code, release_id, stats_json, evidence_json "
                         f"FROM {TABLE_NAME} WHERE literature_gate = %s "
                         f"AND (hugo_symbol, release_id) IN ({placeholders})",
                         evidence_params,
                     )
-                    for symbol, release_id, stats_json, evidence_json in await db_cursor.fetchall():
-                        stats = (
+                    evidence_rows = await db_cursor.fetchall()
+                    distinct_symbols = {symbol for symbol, *_ in active_keys}
+                    active_stats_by_symbol: Dict[str, Optional[Mapping[str, CancerTypeStats]]] = {}
+                    if active_stats_getter:
+                        for sym in distinct_symbols:
+                            active_stats_by_symbol[sym] = await active_stats_getter(sym)
+
+                    for symbol, code, release_id, stats_json, evidence_json in evidence_rows:
+                        stats_from_row = (
                             json.loads(stats_json)
                             if isinstance(stats_json, (str, bytes))
                             else stats_json
+                        )
+                        active_stats_map = active_stats_by_symbol.get(symbol)
+                        stats = (
+                            active_stats_map.get(code)
+                            if active_stats_map is not None
+                            else stats_from_row
                         )
                         evidence = (
                             json.loads(evidence_json)
                             if isinstance(evidence_json, (str, bytes))
                             else evidence_json
                         )
-                        if stored_verdict_surfaced(literature_gate, evidence, stats):
+                        if stored_verdict_surfaced(
+                            row_release_id=release_id,
+                            active_release_id=active_release_id,
+                            literature_gate=literature_gate,
+                            evidence=evidence,
+                            stats=stats,
+                            precheck_is_expired=precheck_is_expired,
+                        ):
                             key = (symbol, release_id)
                             surfaced_counts[key] = surfaced_counts.get(key, 0) + 1
         return [

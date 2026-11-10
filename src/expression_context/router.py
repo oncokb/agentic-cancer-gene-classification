@@ -78,7 +78,7 @@ async def get_job(
     job = await service.jobs.get(job_id)
     if job is None or not can_read_job(job.owner, user):
         raise HTTPException(status_code=404, detail="Job not found.")
-    return job.public()
+    return await service.get_job_status(job)
 
 
 @router.get("/bundle", response_model=BundleStatus)

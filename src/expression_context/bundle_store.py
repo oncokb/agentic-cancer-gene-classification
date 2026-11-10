@@ -222,6 +222,10 @@ class BundleStore(Protocol):
 
     async def get_alias(self, bundle_tag: str, alias: str) -> Optional[str]: ...
 
+    async def list_bundle_genes(
+        self, bundle_tag: str, limit: int, after_symbol: Optional[str] = None
+    ) -> List[str]: ...
+
 
 # --------------------------------------------------------------------------
 # In-memory (tests and local runs)
@@ -376,6 +380,16 @@ class InMemoryBundleStore:
 
     async def get_alias(self, bundle_tag, alias):
         return self.aliases.get((bundle_tag, alias))
+
+    async def list_bundle_genes(
+        self, bundle_tag: str, limit: int, after_symbol: Optional[str] = None
+    ) -> List[str]:
+        matching = sorted(
+            sym
+            for (tag, sym) in self.genes
+            if tag == bundle_tag and (after_symbol is None or sym > after_symbol)
+        )
+        return matching[:limit]
 
 
 # --------------------------------------------------------------------------
@@ -687,3 +701,19 @@ class MySQLBundleStore:
                 )
                 row = await cursor.fetchone()
         return None if row is None else row[0]
+
+    async def list_bundle_genes(
+        self, bundle_tag: str, limit: int, after_symbol: Optional[str] = None
+    ) -> List[str]:
+        sql = f"SELECT hugo_symbol FROM {STATS_TABLE} WHERE bundle_tag = %s "
+        params: List[Any] = [bundle_tag]
+        if after_symbol is not None:
+            sql += "AND hugo_symbol > %s "
+            params.append(after_symbol)
+        sql += "ORDER BY hugo_symbol ASC LIMIT %s"
+        params.append(limit)
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(sql, tuple(params))
+                rows = await cursor.fetchall()
+        return [row[0] for row in rows]
