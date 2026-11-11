@@ -2308,14 +2308,4 @@ def test_bulk_export_pins_single_bundle_no_mix_on_race():
         harness.service.catalog.active = switching_active
 
         resp = client.get(f"{PREFIX}/export.csv")
-        if resp.status_code == 200:
-            _, rows = parse_csv_response(resp.text)
-            for row in rows:
-                if row["release_id"] == "release-b":
-                    assert "study_a_brca" not in row["cbioportal_all_32_url"]
-                    assert "study_b_brca" in row["cbioportal_all_32_url"]
-                elif row["release_id"] == "release-a":
-                    assert "study_b_brca" not in row["cbioportal_all_32_url"]
-                    assert "study_a_brca" in row["cbioportal_all_32_url"]
-        else:
-            assert resp.status_code == 503
+        assert resp.status_code == 503

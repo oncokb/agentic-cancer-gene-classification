@@ -756,16 +756,7 @@ class ExpressionContextService:
         self, *, include_excluded: bool = False, page_size: int = 50
     ) -> Tuple[str, AsyncIterator[str]]:
         bundle = await self.catalog.active()
-        manifest_cts = (
-            bundle.manifest.cancer_types
-            if hasattr(bundle.manifest, "cancer_types")
-            else (bundle.manifest.get("cancer_types", []) if isinstance(bundle.manifest, dict) else [])
-        )
-        all_study_ids = [
-            getattr(ct, "study_id", None) if not isinstance(ct, dict) else ct.get("study_id")
-            for ct in manifest_cts
-        ]
-        all_study_ids = [sid for sid in all_study_ids if sid]
+        all_study_ids = [ct.study_id for ct in bundle.manifest.cancer_types if ct.study_id]
 
         def view_to_rows(view: GeneStatsView) -> List[List[str]]:
             return gene_view_csv_rows(

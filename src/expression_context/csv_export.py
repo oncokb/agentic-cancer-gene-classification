@@ -16,8 +16,9 @@ import urllib.parse
 from datetime import timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
+from src.expression_context.catalog import ActiveBundle
 from src.expression_context.models import (
     CancerTypeStats,
     GeneStatsView,
@@ -218,21 +219,15 @@ class UnmappedCancerTypeError(RuntimeError):
     pass
 
 
-def check_sheet_cancer_names(bundle: Any, name_map: Mapping[str, str]) -> None:
+def check_sheet_cancer_names(bundle: ActiveBundle, name_map: Mapping[str, str]) -> None:
     """Verify that every cohort code in the bundle manifest is present in name_map."""
-    manifest = getattr(bundle, "manifest", bundle)
-    cancer_types = getattr(manifest, "cancer_types", None)
-    if cancer_types is None and isinstance(manifest, dict):
-        cancer_types = manifest.get("cancer_types", [])
-    if not cancer_types:
-        return
-    unmapped = []
-    for ct in cancer_types:
-        code = getattr(ct, "oncotree_code", None)
-        if code is None and isinstance(ct, dict):
-            code = ct.get("oncotree_code")
-        if code and str(code) not in name_map:
-            unmapped.append(str(code))
+    if not bundle.manifest.cancer_types:
+        raise UnmappedCancerTypeError("Active bundle manifest contains no cancer types")
+    unmapped = [
+        ct.oncotree_code
+        for ct in bundle.manifest.cancer_types
+        if ct.oncotree_code not in name_map
+    ]
     if unmapped:
         raise UnmappedCancerTypeError(
             f"Missing golden-set sheet cancer name mapping for cohort code(s): {', '.join(sorted(set(unmapped)))}"
