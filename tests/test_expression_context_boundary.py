@@ -320,6 +320,7 @@ def test_flag_off_app_boots_routes_404_no_ddl_no_outbound(monkeypatch, ddl_recor
         assert client.get(f"{PREFIX}/genes/ERBB2").status_code == 404
         assert client.get(f"{PREFIX}/genes/ERBB2/export.csv").status_code == 404
         assert client.get(f"{PREFIX}/export.csv").status_code == 404
+        assert client.get(f"{PREFIX}/golden-set.csv").status_code == 404
         assert client.get(f"{PREFIX}/genes").status_code == 404
         assert client.get(f"{PREFIX}/stats/ERBB2").status_code == 404
         assert client.get(f"{PREFIX}/bundle").status_code == 404
@@ -345,6 +346,7 @@ def test_flag_on_default_factory_creates_tables_and_checks_github(ddl_recorder, 
     assert sorted(_module_paths(app)) == [
         f"{PREFIX}/bundle", f"{PREFIX}/export.csv", f"{PREFIX}/genes",
         f"{PREFIX}/genes/{{gene}}", f"{PREFIX}/genes/{{gene}}/export.csv",
+        f"{PREFIX}/golden-set.csv",
         f"{PREFIX}/jobs", f"{PREFIX}/jobs/{{job_id}}", f"{PREFIX}/stats/{{gene}}",
     ]
     with TestClient(app) as client:
@@ -403,6 +405,7 @@ with TestClient(main.app) as client:
         client.get(prefix + "/genes/ERBB2").status_code,
         client.get(prefix + "/genes/ERBB2/export.csv").status_code,
         client.get(prefix + "/export.csv").status_code,
+        client.get(prefix + "/golden-set.csv").status_code,
         client.get(prefix + "/genes").status_code,
         client.get(prefix + "/stats/ERBB2").status_code,
         client.get(prefix + "/bundle").status_code,
@@ -429,7 +432,7 @@ def test_real_main_flag_off_boots_404_no_ddl_no_outbound_no_internals():
     )
     assert out.returncode == 0, out.stderr[-3000:]
     report = json.loads(out.stdout.strip().splitlines()[-1])
-    assert report["codes"] == [404] * 10
+    assert report["codes"] == [404] * 11
     assert report["nav"] == {"status": 200, "has_link": False, "has_tabs": True}
     assert report["ddl"] == []
     assert report["outbound"] == []

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 
 from src.auth import AuthenticatedUser, require_auth
-from src.expression_context.catalog import BundleNotLoaded
+from src.expression_context.catalog import BundleGone, BundleNotLoaded
 from src.expression_context.models import (
     BundleStatus,
     GeneResult,
@@ -185,3 +187,29 @@ async def export_all_csv(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/golden-set.csv")
+async def export_golden_set_csv(
+    genes: Optional[str] = Query(default=None),
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> Response:
+    try:
+        if genes is not None:
+            filename, body = await service.export_golden_set_genes_csv(genes)
+            return Response(
+                content=body,
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+        filename, stream = await service.export_golden_set_bundle_csv()
+        return StreamingResponse(
+            stream,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except (InvalidGene, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc

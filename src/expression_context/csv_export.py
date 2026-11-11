@@ -15,7 +15,8 @@ import re
 import urllib.parse
 from datetime import timezone
 from decimal import Decimal
-from typing import Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from src.expression_context.models import (
     CancerTypeStats,
@@ -66,6 +67,23 @@ CSV_COLUMNS: Tuple[str, ...] = (
     "release_id",
     "method_version",
     "literature_checked_at",
+)
+
+GOLDEN_SET_COLUMNS: Tuple[str, ...] = (
+    "Genes",
+    "Relevant expression-based cancer type(s)",
+    "Clinically associated cancer type(s)",
+    "Relevant alteration type(s)",
+    "OG or TSG",
+    "Biologic Tags",
+    "Drug Target Tags",
+    "Other Clinically relevant tags",
+    "Category",
+    "Obscured no-O category information",
+    "Associated drugs",
+    "Drug status",
+    "Evidence type",
+    "Evidence-associated PMIDs",
 )
 
 
@@ -188,6 +206,93 @@ def format_csv_rows(
     for row in rows:
         writer.writerow(row)
     return buf.getvalue()
+
+
+def golden_set_filename(release_id: str) -> str:
+    safe_release = _SAFE_FILENAME.sub("_", (release_id or "unknown").strip()) or "unknown"
+    return f"expression-context_golden-set_{safe_release}.csv"
+
+
+def load_sheet_cancer_names(path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
+    target = (
+        Path(path)
+        if path is not None
+        else Path(__file__).resolve().parent / "sheet_cancer_names.json"
+    )
+    with open(target, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if "names" in data:
+        return dict(data["names"])
+    if "cancer_types" in data:
+        return dict(data["cancer_types"])
+    return {k: str(v) for k, v in data.items() if k != "version"}
+
+
+def format_golden_set_rows(
+    rows: Iterable[Sequence[str]], *, include_header: bool = False, include_bom: bool = False
+) -> str:
+    buf = io.StringIO()
+    if include_bom:
+        buf.write(UTF8_BOM)
+    writer = csv.writer(buf, lineterminator="\r\n")
+    if include_header:
+        writer.writerow(GOLDEN_SET_COLUMNS)
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+def golden_set_row_from_view(
+    view: GeneStatsView,
+    *,
+    name_map: Optional[Mapping[str, str]] = None,
+) -> List[str]:
+    if name_map is None:
+        name_map = load_sheet_cancer_names()
+
+    surfaced = [p for p in view.pairs if p.status == "surfaced"]
+    if surfaced:
+        surfaced_codes = sorted({p.oncotree_code for p in surfaced})
+        names: List[str] = []
+        for code in surfaced_codes:
+            if code not in name_map:
+                raise KeyError(f"No sheet cancer name for surfaced cohort code {code!r}")
+            name = name_map[code]
+            if name not in names:
+                names.append(name)
+        cancer_types_str = "; ".join(names)
+        alteration_str = "Expression"
+
+        pmid_set = set()
+        for p in surfaced:
+            if p.literature and p.literature.pmids:
+                for pmid in p.literature.pmids:
+                    s = str(pmid).strip()
+                    if s:
+                        pmid_set.add(s)
+        sorted_pmids = sorted(pmid_set, key=lambda x: (int(x) if x.isdigit() else float("inf"), x))
+        pmids_str = "; ".join(sorted_pmids)
+    else:
+        cancer_types_str = ""
+        alteration_str = ""
+        pmids_str = ""
+
+    return [
+        guard_csv_text(view.hugo_symbol),
+        guard_csv_text(cancer_types_str),
+        "",
+        guard_csv_text(alteration_str),
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        guard_csv_text(pmids_str),
+    ]
 
 
 def pair_view_to_csv_row(

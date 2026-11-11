@@ -58,6 +58,11 @@
       : `${API}/genes/${encoded}/export.csv`;
   }
 
+  function goldenSetExportURL(gene) {
+    const encoded = encodeURIComponent(String(gene || "").trim());
+    return `${API}/golden-set.csv?genes=${encoded}`;
+  }
+
   function friendlyError(status, gene) {
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
     if (status === 403) return "Your account isn't active yet. Please contact your AGCG administrator.";
@@ -72,7 +77,7 @@
     const el = {};
     for (const id of [
       "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-      "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-toggle-wrap",
+      "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-export-toggle-wrap",
       "ec-export-include-excluded", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
     ]) {
       el[id] = doc.getElementById(id);
@@ -383,11 +388,13 @@
     function updateExportLink() {
       const view = state.view;
       const link = el["ec-export"];
+      const goldenLink = el["ec-export-golden"];
       const toggleWrap = el["ec-export-toggle-wrap"];
       const toggle = el["ec-export-include-excluded"];
       const symbol = view && (view.hugo_symbol || view.query) ? String(view.hugo_symbol || view.query).trim() : "";
       if (!symbol || !hasStoredResult(view)) {
         show(link, false);
+        show(goldenLink, false);
         show(toggleWrap, false);
         return;
       }
@@ -395,6 +402,10 @@
       if (link) {
         link.setAttribute("href", exportURL(symbol, includeExcluded));
         show(link, true);
+      }
+      if (goldenLink) {
+        goldenLink.setAttribute("href", goldenSetExportURL(symbol));
+        show(goldenLink, true);
       }
       show(toggleWrap, true);
     }
@@ -567,7 +578,7 @@
   }
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL };
+    module.exports = { createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL, goldenSetExportURL };
   } else {
     createExpressionContextPage({ document: root.document, window: root, fetch: root.fetch.bind(root) }).init();
   }
