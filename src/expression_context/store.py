@@ -261,8 +261,10 @@ class MySQLExpressionContextStore:
                         )
                     except Exception as exc:
                         # Swallow ONLY duplicate-index error (MySQL error 1061)
-                        errno = getattr(exc, "args", [None])[0] if getattr(exc, "args", None) else None
-                        if errno == 1061 or "1061" in str(exc) or "Duplicate key name" in str(exc):
+                        errno = getattr(exc, "errno", None)
+                        if errno is None and getattr(exc, "args", None):
+                            errno = exc.args[0]
+                        if errno == 1061:
                             logger.debug("idx_expression_context_release_gene index already exists: %s", exc)
                         else:
                             logger.warning("Failed to create idx_expression_context_release_gene index: %s", exc)

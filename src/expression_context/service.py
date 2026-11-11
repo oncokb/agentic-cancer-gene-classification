@@ -28,7 +28,7 @@ import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import (
     Any,
@@ -507,6 +507,11 @@ class ExpressionContextService:
     ) -> GeneStatsView:
         bundle = resolved.bundle
         if bundle is not None:
+            if resolved.manifest.release_id != bundle.release_id:
+                raise ValueError(
+                    f"ResolvedGene manifest release_id ({resolved.manifest.release_id}) "
+                    f"does not match bundle release_id ({bundle.release_id})"
+                )
             bundle_provenance = bundle.provenance()
         else:
             bundle_provenance = BundleProvenance(
@@ -609,20 +614,13 @@ class ExpressionContextService:
     ) -> Tuple[GeneStatsView, Dict[str, StoredPair]]:
         """The active bundle's statistics for every cancer type of a gene, joined
         with any stored literature verdicts for this release only (the reference view)."""
-        if resolved is None:
+        if resolved is None or resolved.bundle is None:
             resolved = await self.resolve(gene)
         else:
-            if resolved.bundle is not None:
-                try:
-                    await self.catalog.verify_active(resolved.bundle)
-                except BundleGone:
-                    resolved = await self.resolve(gene)
-            else:
-                try:
-                    bundle = await self.catalog.active()
-                    resolved = replace(resolved, bundle=bundle)
-                except Exception:
-                    pass
+            try:
+                await self.catalog.verify_active(resolved.bundle)
+            except BundleGone:
+                resolved = await self.resolve(gene)
         stored = await self.store.get_pairs(
             resolved.hugo_symbol, resolved.manifest.release_id, self.gate.name
         )

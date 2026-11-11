@@ -221,7 +221,11 @@ async def test_concurrency_bound_is_shared_across_jobs():
     pod = _pod(gate, InMemoryExpressionContextStore(), LeaseFakeRedis(), concurrency=1)
     resolved = await pod.resolve("ERBB2")
     other = resolved.__class__(
-        query="x", hugo_symbol="OTHER1", manifest=resolved.manifest, artifact=resolved.artifact
+        query="x",
+        hugo_symbol="OTHER1",
+        manifest=resolved.manifest,
+        artifact=resolved.artifact,
+        bundle=resolved.bundle,
     )
     await asyncio.gather(pod.evaluate(resolved, None), pod.evaluate(other, None))
     assert len(gate.calls) == 6  # distinct keys: no dedupe

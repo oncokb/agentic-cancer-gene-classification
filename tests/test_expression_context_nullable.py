@@ -11,6 +11,7 @@ Fixture genes/MYCN.json mirrors what the producer emits:
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from datetime import datetime, timezone
@@ -169,8 +170,17 @@ def test_stored_row_without_evidence_is_never_surfaced():
             stats={**base, "oncotree_code": code}, computed_at=now,
         )
     with TestClient(harness.app) as client:
-        res = client.get(f"{PREFIX}/genes/MYCN", params={"include_excluded": "true"}).json()
-        assert res["surfaced"] == []
+        service = client.app.state.expression_context
+        view, _ = asyncio.run(service.gene_view("MYCN"))
+        pairs = {p.oncotree_code: p for p in view.pairs}
+        assert view.summary.surfaced == 0
+        for code in ("STAD", "LUAD"):
+            assert pairs[code].status == "literature_pending"
+            assert pairs[code].exclusion_reason is None
+            assert pairs[code].literature is None
+        assert pairs["BRCA"].status == "excluded" and pairs["BRCA"].exclusion_reason == "stats"
+        assert pairs["ESCA"].status == "excluded" and pairs["ESCA"].exclusion_reason == "precheck"
+        assert pairs["UCEC"].status == "excluded" and pairs["UCEC"].exclusion_reason == "stats"
 
 
 def test_stored_verdict_from_another_gate_is_never_surfaced():
@@ -189,8 +199,13 @@ def test_stored_verdict_from_another_gate_is_never_surfaced():
         stats={**base, "oncotree_code": "STAD"}, evidence=evidence, computed_at=now,
     )
     with TestClient(harness.app) as client:
-        res = client.get(f"{PREFIX}/genes/MYCN", params={"include_excluded": "true"}).json()
-        assert res["surfaced"] == []
+        service = client.app.state.expression_context
+        view, _ = asyncio.run(service.gene_view("MYCN"))
+        pairs = {p.oncotree_code: p for p in view.pairs}
+        assert view.summary.surfaced == 0
+        assert pairs["STAD"].status == "literature_pending"
+        assert pairs["STAD"].exclusion_reason is None
+        assert pairs["STAD"].literature is None
 
 
 def test_matching_v1_row_and_evidence_is_never_surfaced():
@@ -210,8 +225,13 @@ def test_matching_v1_row_and_evidence_is_never_surfaced():
         stats={**base, "oncotree_code": "STAD"}, evidence=evidence, computed_at=now,
     )
     with TestClient(harness.app) as client:
-        res = client.get(f"{PREFIX}/genes/MYCN", params={"include_excluded": "true"})
-        assert res.status_code == 404
+        service = client.app.state.expression_context
+        view, _ = asyncio.run(service.gene_view("MYCN"))
+        pairs = {p.oncotree_code: p for p in view.pairs}
+        assert view.summary.surfaced == 0
+        assert pairs["STAD"].status == "literature_pending"
+        assert pairs["STAD"].exclusion_reason is None
+        assert pairs["STAD"].literature is None
 
 
 FLOOR = math.log2(11)  # method_version 2: RSEM 10

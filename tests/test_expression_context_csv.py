@@ -1130,8 +1130,8 @@ def test_stats_failing_and_broad_blocked_lineage_excluded_broad_subgroup_pass_su
 def test_agreement_across_all_read_paths():
     gate = FakeLiteratureGate(
         verdicts={
-            "breast cancer": (True, ["12345678"]),
-            "stomach cancer": (False, ["23456789"]),
+            "breast cancer": (False, ["12345678"]),
+            "gastric cancer": (False, ["23456789"]),
         }
     )
     bundle = build_bundle(("ERBB2", "MYCN"))
@@ -1164,7 +1164,17 @@ def test_agreement_across_all_read_paths():
         polled = client.get(f"{PREFIX}/jobs/{job['job_id']}").json()
         polled_surfaced = {p["oncotree_code"] for p in polled["result"]["surfaced"]}
 
-        assert stats_surfaced == genes_surfaced == genes_full_surfaced == csv_surfaced == csv_full_surfaced == bulk_surfaced == polled_surfaced
+        assert len(stats_surfaced) > 0
+        assert stats_surfaced == {"BRCA", "STAD"}
+        assert (
+            stats_surfaced
+            == genes_surfaced
+            == genes_full_surfaced
+            == csv_surfaced
+            == csv_full_surfaced
+            == bulk_surfaced
+            == polled_surfaced
+        )
 
 
 def test_bulk_include_excluded_exports_bundle_gene_without_literature_job():
@@ -1288,7 +1298,9 @@ async def test_early_query_failure_in_bulk_export_returns_non_200_and_midstream_
 async def test_deadlock_concurrent_history_requests_complete_with_bounded_pool():
     from contextlib import asynccontextmanager
 
-    pool_sem = asyncio.Semaphore(2)
+    N = 2
+    pool_sem = asyncio.Semaphore(N)
+    barrier = asyncio.Barrier(N)
 
     class FakePoolConn:
         @asynccontextmanager
@@ -1303,6 +1315,10 @@ async def test_deadlock_concurrent_history_requests_complete_with_bounded_pool()
             self._query = query
 
         async def fetchall(self):
+            # Await the barrier while holding this connection.
+            # Guarantees that all N concurrent history requests hold every connection
+            # in the pool simultaneously before any evaluation runs.
+            await barrier.wait()
             now = datetime(2026, 11, 6, 12, 0)
             if "GROUP BY" in self._query:
                 return [("ERBB2", "release-a", now, 1)]
@@ -1341,12 +1357,13 @@ async def test_deadlock_concurrent_history_requests_complete_with_bounded_pool()
         async def fetch_history():
             return await harness.service.history(limit=10, cursor=None)
 
-        # 4 concurrent requests (>= pool size 2) must complete without deadlocking
+        # N concurrent requests (= pool size N) hold every connection at once at the barrier,
+        # then release them before evaluating gene_view, completing without deadlocking.
         results = await asyncio.wait_for(
-            asyncio.gather(*(fetch_history() for _ in range(4))),
+            asyncio.gather(*(fetch_history() for _ in range(N))),
             timeout=2.0,
         )
-        assert len(results) == 4
+        assert len(results) == N
         for r in results:
             assert len(r.items) == 1
             assert r.items[0].hugo_symbol == "ERBB2"
@@ -1447,6 +1464,65 @@ async def test_job_submitted_on_release_a_and_b_activates_before_completion():
         await harness.service.jobs.put(job)
         polled = client.get(f"{PREFIX}/jobs/{job.job_id}").json()
         assert not any(p["oncotree_code"] == "BRCA" for p in polled["result"]["surfaced"])
+
+
+@pytest.mark.asyncio
+async def test_gene_view_bundle_none_re_resolves_against_active_bundle():
+    # Resolve under passing release A, activate stats-failing B.
+    # Calling gene_view with resolved=replace(resolved_a, bundle=None) must re-resolve
+    # against active bundle B, returning release B with no surfaced pair (not one).
+    # And bundle=None with no active bundle must raise BundleNotLoaded.
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    bundle_a = build_bundle(("ERBB2",), release_id="release-a")
+
+    erbb2_b = dict(gene_file("ERBB2"))
+    brca_failing = dict(erbb2_b["cancer_types"][0])
+    brca_failing["stats_pass"] = False
+    brca_failing["q_value"] = 0.5
+    bundle_b = build_bundle(
+        release_id="release-b",
+        edit_gene=lambda doc: doc.update({"cancer_types": [brca_failing]})
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None,
+    )
+
+    harness = CsvHarness(bundle=bundle_a)
+    with TestClient(harness.app):
+        # Stored pair under release-a with valid tumor-specific evidence
+        harness.store.rows[("ERBB2", "BRCA", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id="release-a",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=dict(gene_file("ERBB2")["cancer_types"][0]),
+            evidence=_v2_supported_evidence("12345678", "breast cancer"),
+            computed_at=now,
+        )
+
+        resolved_a = await harness.service.resolve("ERBB2")
+        assert resolved_a.bundle.release_id == "release-a"
+
+        # Activate stats-failing release B
+        await seed_bundle(harness.bundles, bundle_b)
+        harness.service.catalog.invalidate()
+
+        resolved_no_bundle = replace(resolved_a, bundle=None)
+        view, _ = await harness.service.gene_view("ERBB2", resolved=resolved_no_bundle)
+        assert view.bundle.release_id == "release-b"
+        assert view.summary.surfaced == 0
+        assert not any(p.status == "surfaced" for p in view.pairs)
+
+        # Disagreement guard: if a ResolvedGene has mismatched bundle and manifest, raise ValueError
+        mismatched = replace(resolved_a, bundle=await harness.service.catalog.active())
+        with pytest.raises(ValueError, match="manifest release_id"):
+            harness.service._evaluate_gene_view(mismatched, {})
+
+        # bundle=None with no active bundle raises BundleNotLoaded
+        harness.bundles.state = replace(harness.bundles.state, active_bundle_tag="nonexistent")
+        harness.service.catalog.invalidate()
+        with pytest.raises(BundleNotLoaded):
+            await harness.service.gene_view("ERBB2", resolved=resolved_no_bundle)
 
 
 @pytest.mark.asyncio
