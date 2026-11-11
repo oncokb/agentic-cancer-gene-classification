@@ -46,6 +46,7 @@ from typing import (
 
 from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
 from src.expression_context.csv_export import (
+    check_sheet_cancer_names,
     csv_filename,
     format_csv_rows,
     format_golden_set_rows,
@@ -99,6 +100,12 @@ class InvalidGene(ValueError):
 
 class GeneNotFound(LookupError):
     pass
+
+
+class GenesNotChecked(Exception):
+    def __init__(self, genes: List[str]):
+        super().__init__(f"Genes not yet checked: {', '.join(genes)}")
+        self.genes = genes
 
 
 @dataclass
@@ -659,13 +666,13 @@ class ExpressionContextService:
 
     async def _stream_bundle_views_to_csv(
         self,
+        bundle: ActiveBundle,
         *,
         view_to_rows: Callable[[GeneStatsView], List[List[str]]],
         format_rows: Callable[..., str],
         include_excluded: bool = False,
         page_size: int = 50,
     ) -> Tuple[ActiveBundle, AsyncIterator[str]]:
-        bundle = await self.catalog.active()
         release_id = bundle.release_id
         gate_name = self.gate.name
         batch_size = max(1, min(page_size, self.history_max_limit))
@@ -749,7 +756,16 @@ class ExpressionContextService:
         self, *, include_excluded: bool = False, page_size: int = 50
     ) -> Tuple[str, AsyncIterator[str]]:
         bundle = await self.catalog.active()
-        all_study_ids = [ct.study_id for ct in bundle.manifest.cancer_types if ct.study_id]
+        manifest_cts = (
+            bundle.manifest.cancer_types
+            if hasattr(bundle.manifest, "cancer_types")
+            else (bundle.manifest.get("cancer_types", []) if isinstance(bundle.manifest, dict) else [])
+        )
+        all_study_ids = [
+            getattr(ct, "study_id", None) if not isinstance(ct, dict) else ct.get("study_id")
+            for ct in manifest_cts
+        ]
+        all_study_ids = [sid for sid in all_study_ids if sid]
 
         def view_to_rows(view: GeneStatsView) -> List[List[str]]:
             return gene_view_csv_rows(
@@ -757,6 +773,7 @@ class ExpressionContextService:
             )
 
         active_bundle, stream = await self._stream_bundle_views_to_csv(
+            bundle,
             view_to_rows=view_to_rows,
             format_rows=format_csv_rows,
             include_excluded=include_excluded,
@@ -767,12 +784,15 @@ class ExpressionContextService:
     async def export_golden_set_bundle_csv(
         self, *, page_size: int = 50
     ) -> Tuple[str, AsyncIterator[str]]:
+        bundle = await self.catalog.active()
         name_map = load_sheet_cancer_names()
+        check_sheet_cancer_names(bundle, name_map)
 
         def view_to_rows(view: GeneStatsView) -> List[List[str]]:
             return [golden_set_row_from_view(view, name_map=name_map)]
 
         active_bundle, stream = await self._stream_bundle_views_to_csv(
+            bundle,
             view_to_rows=view_to_rows,
             format_rows=format_golden_set_rows,
             include_excluded=False,
@@ -787,11 +807,15 @@ class ExpressionContextService:
         if not raw_genes:
             raise InvalidGene("No genes specified.")
         if len(raw_genes) > 500:
-            raise InvalidGene(f"Maximum 500 genes allowed per request; received {len(raw_genes)}.")
+            raise InvalidGene(f"Maximum 500 raw genes allowed per request; received {len(raw_genes)}.")
 
         bundle = await self.catalog.active()
         await self.catalog.verify_active(bundle)
 
+        name_map = load_sheet_cancer_names()
+        check_sheet_cancer_names(bundle, name_map)
+
+        seen_symbols: set[str] = set()
         resolved_genes: List[ResolvedGene] = []
         bad_names: List[str] = []
 
@@ -811,27 +835,36 @@ class ExpressionContextService:
             if artifact is None:
                 bad_names.append(raw_gene)
             else:
-                resolved_genes.append(
-                    ResolvedGene(
-                        query=raw_gene,
-                        hugo_symbol=artifact.gene.hugo_symbol.upper(),
-                        manifest=bundle.manifest,
-                        artifact=artifact,
-                        bundle=bundle,
+                hugo = artifact.gene.hugo_symbol.upper()
+                if hugo not in seen_symbols:
+                    seen_symbols.add(hugo)
+                    resolved_genes.append(
+                        ResolvedGene(
+                            query=raw_gene,
+                            hugo_symbol=hugo,
+                            manifest=bundle.manifest,
+                            artifact=artifact,
+                            bundle=bundle,
+                        )
                     )
-                )
 
         if bad_names:
             raise InvalidGene(f"Unknown genes: {', '.join(bad_names)}")
 
-        name_map = load_sheet_cancer_names()
         rows: List[List[str]] = []
+        not_yet_checked: List[str] = []
         for resolved in resolved_genes:
-            await self.catalog.verify_active(bundle)
-            view, _ = await self.gene_view(resolved.hugo_symbol, resolved=resolved)
-            rows.append(golden_set_row_from_view(view, name_map=name_map))
+            view, stored = await self.gene_view(resolved.hugo_symbol, resolved=resolved)
+            if not stored:
+                not_yet_checked.append(resolved.hugo_symbol)
+            else:
+                rows.append(golden_set_row_from_view(view, name_map=name_map))
 
         await self.catalog.verify_active(bundle)
+
+        if not_yet_checked:
+            raise GenesNotChecked(not_yet_checked)
+
         filename = golden_set_filename(bundle.release_id)
         content = format_golden_set_rows(rows, include_header=True, include_bom=True)
         return filename, content

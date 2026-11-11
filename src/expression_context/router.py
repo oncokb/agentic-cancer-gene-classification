@@ -18,7 +18,13 @@ from src.expression_context.models import (
     JobCreateRequest,
     JobStatus,
 )
-from src.expression_context.service import ExpressionContextService, GeneNotFound, InvalidGene
+from src.expression_context.csv_export import UnmappedCancerTypeError
+from src.expression_context.service import (
+    ExpressionContextService,
+    GeneNotFound,
+    GenesNotChecked,
+    InvalidGene,
+)
 from src.expression_context.store import InvalidCursor
 from src.job_store import can_read_job, job_owner
 
@@ -64,7 +70,7 @@ async def create_job(
         raise HTTPException(
             status_code=404, detail=f"Gene {exc} is not in the expression statistics bundle."
         ) from exc
-    except BundleNotLoaded as exc:
+    except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc
     return JobAccepted(
         job_id=job.job_id, status=job.status, status_url=f"{PREFIX}/jobs/{job.job_id}"
@@ -82,7 +88,7 @@ async def get_job(
         raise HTTPException(status_code=404, detail="Job not found.")
     try:
         return await service.get_job_status(job)
-    except BundleNotLoaded as exc:
+    except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc
 
 
@@ -110,7 +116,7 @@ async def get_gene_stats(
         raise HTTPException(
             status_code=404, detail=f"Gene {exc} is not in the expression statistics bundle."
         ) from exc
-    except BundleNotLoaded as exc:
+    except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc
 
 
@@ -125,7 +131,7 @@ async def list_genes(
         return await service.history(limit, cursor)
     except InvalidCursor as exc:
         raise HTTPException(status_code=422, detail="Invalid cursor.") from exc
-    except BundleNotLoaded as exc:
+    except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc
 
 
@@ -144,7 +150,7 @@ async def get_gene(
         raise HTTPException(
             status_code=404, detail=f"No stored expression-context result for {exc}."
         ) from exc
-    except BundleNotLoaded as exc:
+    except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc
 
 
@@ -163,7 +169,7 @@ async def export_gene_csv(
         raise HTTPException(
             status_code=404, detail=f"No stored expression-context result for {exc}."
         ) from exc
-    except BundleNotLoaded as exc:
+    except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc
     return Response(
         content=body,
@@ -180,7 +186,7 @@ async def export_all_csv(
 ) -> StreamingResponse:
     try:
         filename, stream = await service.export_bundle_csv(include_excluded=include_excluded)
-    except BundleNotLoaded as exc:
+    except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc
     return StreamingResponse(
         stream,
@@ -209,7 +215,17 @@ async def export_golden_set_csv(
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+    except GenesNotChecked as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"not_yet_checked": exc.genes},
+        ) from exc
     except (InvalidGene, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except UnmappedCancerTypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
     except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc

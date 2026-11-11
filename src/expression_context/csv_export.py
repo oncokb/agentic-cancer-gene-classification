@@ -16,7 +16,7 @@ import urllib.parse
 from datetime import timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from src.expression_context.models import (
     CancerTypeStats,
@@ -213,6 +213,32 @@ def golden_set_filename(release_id: str) -> str:
     return f"expression-context_golden-set_{safe_release}.csv"
 
 
+class UnmappedCancerTypeError(RuntimeError):
+    """Raised when the active bundle contains a cohort code missing from sheet_cancer_names.json."""
+    pass
+
+
+def check_sheet_cancer_names(bundle: Any, name_map: Mapping[str, str]) -> None:
+    """Verify that every cohort code in the bundle manifest is present in name_map."""
+    manifest = getattr(bundle, "manifest", bundle)
+    cancer_types = getattr(manifest, "cancer_types", None)
+    if cancer_types is None and isinstance(manifest, dict):
+        cancer_types = manifest.get("cancer_types", [])
+    if not cancer_types:
+        return
+    unmapped = []
+    for ct in cancer_types:
+        code = getattr(ct, "oncotree_code", None)
+        if code is None and isinstance(ct, dict):
+            code = ct.get("oncotree_code")
+        if code and str(code) not in name_map:
+            unmapped.append(str(code))
+    if unmapped:
+        raise UnmappedCancerTypeError(
+            f"Missing golden-set sheet cancer name mapping for cohort code(s): {', '.join(sorted(set(unmapped)))}"
+        )
+
+
 def load_sheet_cancer_names(path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
     target = (
         Path(path)
@@ -221,10 +247,6 @@ def load_sheet_cancer_names(path: Optional[Union[str, Path]] = None) -> Dict[str
     )
     with open(target, "r", encoding="utf-8") as f:
         data = json.load(f)
-    if "names" in data:
-        return dict(data["names"])
-    if "cancer_types" in data:
-        return dict(data["cancer_types"])
     return {k: str(v) for k, v in data.items() if k != "version"}
 
 
