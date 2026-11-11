@@ -73,19 +73,27 @@ CSV_COLUMNS: Tuple[str, ...] = (
 GOLDEN_SET_COLUMNS: Tuple[str, ...] = (
     "Genes",
     "Relevant expression-based cancer type(s)",
-    "Clinically associated cancer type(s)",
     "Relevant alteration type(s)",
-    "OG or TSG",
-    "Biologic Tags",
-    "Drug Target Tags",
-    "Other Clinically relevant tags",
-    "Category",
-    "Obscured no-O category information",
-    "Associated drugs",
-    "Drug status",
-    "Evidence type",
     "Evidence-associated PMIDs",
 )
+
+ALLOWED_ALTERATION_TYPES: Tuple[str, ...] = (
+    "Point Mutation",
+    "Structural Variant",
+    "Expression",
+    "Copy Number Alteration",
+)
+ALLOWED_ALTERATION_CATEGORIES: Tuple[str, ...] = ALLOWED_ALTERATION_TYPES
+
+
+def alteration_types_for_pair(view_pair: PairStatsView) -> List[str]:
+    """Return alteration categories contributed by this pair.
+
+    Today the only source is expression, so every surfaced pair contributes
+    'Expression'. Later alteration statistics can add categories without
+    touching the row builder.
+    """
+    return ["Expression"]
 
 
 def cbioportal_expression_url(
@@ -278,7 +286,17 @@ def golden_set_row_from_view(
             if name not in names:
                 names.append(name)
         cancer_types_str = "; ".join(names)
-        alteration_str = "Expression"
+
+        categories: set[str] = set()
+        for p in surfaced:
+            for cat in alteration_types_for_pair(p):
+                if cat not in ALLOWED_ALTERATION_TYPES:
+                    raise ValueError(
+                        f"Unknown alteration type {cat!r}; allowed values are {ALLOWED_ALTERATION_TYPES}"
+                    )
+                categories.add(cat)
+        ordered_categories = [cat for cat in ALLOWED_ALTERATION_TYPES if cat in categories]
+        alteration_str = ", ".join(ordered_categories)
 
         pmid_set = set()
         for p in surfaced:
@@ -297,17 +315,7 @@ def golden_set_row_from_view(
     return [
         guard_csv_text(view.hugo_symbol),
         guard_csv_text(cancer_types_str),
-        "",
         guard_csv_text(alteration_str),
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
         guard_csv_text(pmids_str),
     ]
 

@@ -50,9 +50,11 @@ from src.expression_context import register_expression_context
 from src.expression_context.bundle_store import InMemoryBundleStore
 from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
 from src.expression_context.csv_export import (
+    ALLOWED_ALTERATION_TYPES,
     CSV_COLUMNS,
     GOLDEN_SET_COLUMNS,
     UTF8_BOM,
+    alteration_types_for_pair,
     cbioportal_expression_url,
     format_csv_rows,
     format_float,
@@ -71,6 +73,7 @@ from src.expression_context.models import (
     JobRecord,
     LiteratureVerdict,
     PairResult,
+    PairStatsView,
     StoredPair,
 )
 from src.expression_context.service import ExpressionContextService
@@ -1592,7 +1595,14 @@ async def test_bulk_stream_supersession_single_gene_and_multi_page():
 # ----------------------------------------------------------- Golden Set CSV Export
 
 
-def test_golden_set_headers_exact_14_and_non_filled_columns_empty():
+def test_golden_set_headers_exact_4_and_filled_columns():
+    assert ALLOWED_ALTERATION_TYPES == (
+        "Point Mutation",
+        "Structural Variant",
+        "Expression",
+        "Copy Number Alteration",
+    )
+
     bundle = build_bundle(("ERBB2",), release_id="rel-123")
     harness = CsvHarness(bundle=bundle)
     now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
@@ -1615,10 +1625,17 @@ def test_golden_set_headers_exact_14_and_non_filled_columns_empty():
         assert golden_set_filename("rel-123") == "expression-context_golden-set_rel-123.csv"
         assert resp.headers["Content-Disposition"] == f'attachment; filename="{golden_set_filename("rel-123")}"'
         header, rows = parse_csv_response(resp.text)
-        assert len(header) == 14
+        assert len(header) == 4
         assert header == list(GOLDEN_SET_COLUMNS)
+        assert header == [
+            "Genes",
+            "Relevant expression-based cancer type(s)",
+            "Relevant alteration type(s)",
+            "Evidence-associated PMIDs",
+        ]
         assert len(rows) == 1
         row = rows[0]
+        assert len(row) == 4
 
         # Verify format_golden_set_rows direct output
         direct_csv = format_golden_set_rows([list(row.values())], include_header=True, include_bom=True)
@@ -1632,25 +1649,84 @@ def test_golden_set_headers_exact_14_and_non_filled_columns_empty():
         assert row["Relevant alteration type(s)"] == "Expression"
         assert row["Evidence-associated PMIDs"] == "12345678"
 
-        # Non-filled columns must be empty string
-        non_filled = [
-            "Clinically associated cancer type(s)",
-            "OG or TSG",
-            "Biologic Tags",
-            "Drug Target Tags",
-            "Other Clinically relevant tags",
-            "Category",
-            "Obscured no-O category information",
-            "Associated drugs",
-            "Drug status",
-            "Evidence type",
-        ]
-        for col in non_filled:
-            assert row[col] == "", f"Column {col!r} should be empty string, got {row[col]!r}"
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        assert alteration_types_for_pair(view.pairs[0]) == ["Expression"]
 
         # Never null, None, [], Unknown, FALSE or "No identified alterations"
         for k, v in row.items():
             assert v not in ("None", "null", "NaN", "nan", "[]", "Unknown", "FALSE", "No identified alterations")
+
+
+def test_golden_set_alteration_types_stub_ordering_dedup_and_unknown_raises(monkeypatch):
+    from src.expression_context import csv_export
+
+    bundle = build_bundle(("ERBB2",))
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        pair_brca = view.pairs[0].model_copy(update={"status": "surfaced", "oncotree_code": "BRCA"})
+        pair_stad = view.pairs[1].model_copy(update={"status": "surfaced", "oncotree_code": "STAD"})
+        two_pair_view = view.model_copy(update={"pairs": [pair_brca, pair_stad]})
+
+        # Test that stubs alteration_types_for_pair to return
+        # ["Copy Number Alteration", "Expression", "Expression"] for one pair and
+        # ["Point Mutation"] for another gives "Point Mutation, Expression, Copy Number Alteration"
+        def stub_categories(pair: PairStatsView) -> List[str]:
+            if pair.oncotree_code == "BRCA":
+                return ["Copy Number Alteration", "Expression", "Expression"]
+            if pair.oncotree_code == "STAD":
+                return ["Point Mutation"]
+            return ["Expression"]
+
+        monkeypatch.setattr(csv_export, "alteration_types_for_pair", stub_categories)
+        row = csv_export.golden_set_row_from_view(two_pair_view)
+        assert len(row) == 4
+        assert row[2] == "Point Mutation, Expression, Copy Number Alteration"
+
+        # An unknown category raises
+        def stub_unknown(pair: PairStatsView) -> List[str]:
+            return ["Unknown Category"]
+
+        monkeypatch.setattr(csv_export, "alteration_types_for_pair", stub_unknown)
+        with pytest.raises(ValueError, match="Unknown alteration type"):
+            csv_export.golden_set_row_from_view(two_pair_view)
+
+
+def test_golden_set_alteration_types_detail_only_never_gating_on_unsurfaced_pairs(monkeypatch):
+    from src.expression_context import csv_export
+
+    bundle = build_bundle(("ERBB2",))
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        pair_surfaced = view.pairs[0].model_copy(update={"status": "surfaced", "oncotree_code": "BRCA"})
+        pair_unsurfaced = view.pairs[1].model_copy(update={"status": "stats_excluded", "oncotree_code": "LUAD"})
+        mixed_view = view.model_copy(update={"pairs": [pair_surfaced, pair_unsurfaced]})
+
+        def stub_categories(pair: PairStatsView) -> List[str]:
+            if pair.oncotree_code == "BRCA":
+                return ["Expression"]
+            # Non-surfaced pair returns alteration categories that must NOT affect the row
+            return ["Point Mutation", "Copy Number Alteration"]
+
+        monkeypatch.setattr(csv_export, "alteration_types_for_pair", stub_categories)
+        row = csv_export.golden_set_row_from_view(mixed_view)
+        assert len(row) == 4
+        assert row[2] == "Expression"
+        assert "Point Mutation" not in row[2]
+        assert "Copy Number Alteration" not in row[2]
+
+        # Cancer types and PMIDs must also not be affected
+        name_map = load_sheet_cancer_names()
+        assert row[1] == name_map["BRCA"]
+
+        # If zero surfaced pairs exist, alteration cell is empty even if unsurfaced pair returns categories
+        zero_surfaced_view = view.model_copy(update={"pairs": [pair_unsurfaced]})
+        row_zero = csv_export.golden_set_row_from_view(zero_surfaced_view)
+        assert len(row_zero) == 4
+        assert row_zero[1] == ""
+        assert row_zero[2] == ""
+        assert row_zero[3] == ""
 
 
 def test_golden_set_manifest_32_cohort_codes_and_missing_code_raises():
@@ -2105,9 +2181,13 @@ async def test_golden_set_bulk_stream_and_supersession():
         assert resp.status_code == 200
         assert resp.headers["Content-Disposition"] == 'attachment; filename="expression-context_golden-set_release-a.csv"'
         header, rows = parse_csv_response(resp.text)
+        assert len(header) == 4
+        assert header == list(GOLDEN_SET_COLUMNS)
         assert len(rows) == 1
         assert rows[0]["Genes"] == "ERBB2"
         assert rows[0]["Relevant expression-based cancer type(s)"] == "Breast cancer"
+        assert rows[0]["Relevant alteration type(s)"] == "Expression"
+        assert rows[0]["Evidence-associated PMIDs"] == "12345678"
 
         # Supersession before first page
         _, stream = await harness.service.export_golden_set_bundle_csv(page_size=25)
@@ -2172,10 +2252,12 @@ def test_golden_set_injection_guard():
         # Test dangerous prefixes in hugo_symbol
         view_dangerous = view.model_copy(update={"hugo_symbol": "=HER2"})
         row = golden_set_row_from_view(view_dangerous)
+        assert len(row) == 4
         assert row[0] == "'=HER2"
 
         view_plus = view.model_copy(update={"hugo_symbol": "+HER2"})
         row_plus = golden_set_row_from_view(view_plus)
+        assert len(row_plus) == 4
         assert row_plus[0] == "'+HER2"
 
         # Injection guard on cancer-name cell
@@ -2183,14 +2265,21 @@ def test_golden_set_injection_guard():
         view_surfaced = view.model_copy(update={"pairs": [surfaced_pair]})
         name_map_injected = {"BRCA": "=Breast cancer"}
         row_cancer = golden_set_row_from_view(view_surfaced, name_map=name_map_injected)
+        assert len(row_cancer) == 4
         assert row_cancer[1] == "'=Breast cancer"
+
+        # Injection guard on alteration-type cell
+        row_alteration = golden_set_row_from_view(view_surfaced)
+        assert len(row_alteration) == 4
+        assert row_alteration[2] == "Expression"
 
         # Injection guard on PMID cell
         ev_injected = LiteratureVerdict.model_validate(_v2_supported_evidence("=12345678", "breast cancer"))
         pair_injected_pmid = view.pairs[0].model_copy(update={"status": "surfaced", "oncotree_code": "BRCA", "literature": ev_injected})
         view_injected_pmid = view.model_copy(update={"pairs": [pair_injected_pmid]})
         row_pmid = golden_set_row_from_view(view_injected_pmid)
-        assert row_pmid[13] == "'=12345678"
+        assert len(row_pmid) == 4
+        assert row_pmid[3] == "'=12345678"
 
 
 def test_golden_set_genes_supersession_between_genes_returns_503():
