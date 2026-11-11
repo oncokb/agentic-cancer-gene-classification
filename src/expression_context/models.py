@@ -23,7 +23,7 @@ PASS_MODE_LABELS = {"lineage": "Lineage enriched", "subgroup": "Subgroup enriche
 # Canonical/alias gene symbols as accepted from users and from bundles.
 SYMBOL_PATTERN = r"[A-Z0-9][A-Z0-9._-]{0,63}\Z"
 
-ExclusionReason = Literal["stats", "precheck", "literature"]
+ExclusionReason = Literal["stats", "precheck", "literature", "pending"]
 JobState = Literal["queued", "running", "succeeded", "failed"]
 
 
@@ -375,3 +375,4 @@ class GeneStatsView(BaseModel):
     bundle: BundleProvenance
     summary: GeneStatsSummary
     pairs: List[PairStatsView]
+    has_stored_result: bool = False

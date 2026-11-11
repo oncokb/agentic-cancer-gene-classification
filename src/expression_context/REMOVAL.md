@@ -5,8 +5,10 @@ The feature is self-contained by design (see `docs/expression-context.md`,
 producer (`expression_stats/`, its workflows and its release bundles) has its
 own removal notes in that directory.
 
-1. **Delete the package**, which includes the "Expression stats" page and its
-   static files (`src/expression_context/static/`):
+1. **Delete the package**, which includes the "Expression stats" page, its
+   static files (`src/expression_context/static/`), and the CSV export helper
+   and endpoints (`/v1/expression-context/genes/{gene}/export.csv`,
+   `/v1/expression-context/export.csv`):
    `git rm -r src/expression_context/`
 2. **Delete the registration** in `src/main.py` — exactly two lines:
    - `from src.expression_context import register_expression_context`
@@ -18,8 +20,8 @@ own removal notes in that directory.
    git rm -r tests/fixtures/expression_context/
    ```
    (`test_expression_context_api.py`, `..._boundary.py`, `..._bundle.py`,
-   `..._fencing.py`, `..._hardening.py`, `..._lease.py`, `..._m3.py`,
-   `..._nullable.py`, `..._releases.py`, `..._store_gate.py`,
+   `..._csv.py`, `..._fencing.py`, `..._hardening.py`, `..._lease.py`,
+   `..._m3.py`, `..._nullable.py`, `..._releases.py`, `..._store_gate.py`,
    `..._tumor_gate.py`, `..._web.py`; the fixtures folder includes the
    method-m3 set in `tests/fixtures/expression_context/m3/`.)
 4. **Delete the design doc** (optional): `git rm docs/expression-context.md`

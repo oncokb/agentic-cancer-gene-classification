@@ -30,27 +30,47 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
+from src.expression_context.csv_export import (
+    csv_filename,
+    format_csv_rows,
+    gene_view_csv_rows,
+)
 from src.expression_context.lease import VerdictLease, lease_key
 from src.expression_context.literature_gate import (
     TUMOR_SPECIFIC_GATE,
     LiteratureGate,
-    stored_v2_verdict,
+    stored_verdict_surfaced,
     verdict_supported,
 )
 from src.expression_context.models import (
     SYMBOL_PATTERN,
+    BundleProvenance,
     BundleStatus,
     CancerTypeStats,
     GeneArtifact,
     GeneResult,
     GeneStatsSummary,
     GeneStatsView,
+    HistoryEntry,
     HistoryPage,
     JobPairError,
     JobRecord,
+    JobStatus,
     LiteratureVerdict,
     Manifest,
     PairResult,
@@ -238,6 +258,19 @@ class ExpressionContextService:
         job.finished_at = _utcnow()
         await self.jobs.put(job)
 
+    async def get_job_status(self, job: JobRecord) -> JobStatus:
+        if job.status == "succeeded" and job.result is not None:
+            try:
+                view, stored = await self.gene_view(job.hugo_symbol)
+                revalidated = self._gene_result_from_view(
+                    view, stored, include_excluded=True
+                )
+                job = job.model_copy(update={"result": revalidated})
+            except GeneNotFound:
+                revalidated = job.result.model_copy(update={"surfaced": []})
+                job = job.model_copy(update={"result": revalidated})
+        return job.public()
+
     async def evaluate(
         self, resolved: ResolvedGene, requested_by: Optional[str]
     ) -> Tuple[GeneResult, int, int, List[JobPairError]]:
@@ -260,6 +293,9 @@ class ExpressionContextService:
             stored_stats["cancer_type_name"] = cancer_type.name if cancer_type else None
             stored_stats["study_id"] = cancer_type.study_id if cancer_type else None
             stored_stats["bundle_tag"] = resolved.bundle_tag
+            stored_stats["method_version"] = manifest.method_version
+            if resolved.artifact.gene.entrez_gene_id is not None:
+                stored_stats["entrez_gene_id"] = resolved.artifact.gene.entrez_gene_id
             if resolved.artifact.broadly_expressed is not None:
                 stored_stats["gene_broadly_expressed"] = resolved.artifact.broadly_expressed
             if expired:
@@ -335,7 +371,8 @@ class ExpressionContextService:
             rows.append(_verdict_row(row, stats, verdict))
 
         await self.store.upsert_pairs(rows)
-        result = self._gene_result(symbol, rows, include_excluded=True)
+        view, stored = await self.gene_view(symbol, resolved=resolved)
+        result = self._gene_result_from_view(view, stored, include_excluded=True)
         return result, evaluated, reused, errors
 
     # ------------------------------------------------- literature single-flight
@@ -463,18 +500,244 @@ class ExpressionContextService:
 
     # ---------------------------------------------------------------- reads
 
+    def _evaluate_gene_view(
+        self,
+        resolved: ResolvedGene,
+        stored: Mapping[str, StoredPair],
+    ) -> GeneStatsView:
+        bundle = resolved.bundle
+        if bundle is not None:
+            if resolved.manifest.release_id != bundle.release_id:
+                raise ValueError(
+                    f"ResolvedGene manifest release_id ({resolved.manifest.release_id}) "
+                    f"does not match bundle release_id ({bundle.release_id})"
+                )
+            bundle_provenance = bundle.provenance()
+        else:
+            bundle_provenance = BundleProvenance(
+                bundle_tag=resolved.manifest.release_id,
+                release_id=resolved.manifest.release_id,
+                schema_version=resolved.manifest.schema_version,
+                method_version=resolved.manifest.method_version,
+                pubmed_snapshot_date=resolved.manifest.pubmed_snapshot_date,
+                gene_count=0,
+                source=resolved.manifest.source,
+                params=resolved.manifest.params,
+            )
+        active_release_id = resolved.manifest.release_id
+        pairs: List[PairStatsView] = []
+        summary = GeneStatsSummary()
+        expired = precheck_expired(resolved.manifest, self._clock())
+        has_stored_result = bool(stored)
+        for stats in resolved.artifact.cancer_types:
+            cancer_type = resolved.manifest.cancer_type(stats.oncotree_code)
+            precheck = {True: "pass", False: "fail", None: "not_run"}[stats.literature_precheck_pass]
+            if expired and stats.literature_precheck_pass is not None:
+                precheck = "expired"
+            passes = stats.passes_stats
+            eligible = passes and effective_precheck(stats, expired) is not False
+            verdict = None
+            prior = stored.get(stats.oncotree_code)
+            if (
+                eligible
+                and self.gate.name == TUMOR_SPECIFIC_GATE
+                and prior is not None
+                and prior.evidence is not None
+                and prior.release_id == active_release_id
+            ):
+                stored_verdict = LiteratureVerdict.model_validate(prior.evidence)
+                if stored_verdict.literature_gate == TUMOR_SPECIFIC_GATE:
+                    is_surfaced = stored_verdict_surfaced(
+                        row_release_id=prior.release_id,
+                        active_release_id=active_release_id,
+                        literature_gate=prior.literature_gate,
+                        evidence=prior.evidence,
+                        stats=stats,
+                        precheck_is_expired=expired,
+                    )
+                    verdict = stored_verdict.model_copy(
+                        update={"supported": is_surfaced}
+                    )
+            if not passes:
+                status, reason = "excluded", "stats"
+            elif not eligible:
+                status, reason = "excluded", "precheck"
+            elif verdict is None:
+                status, reason = "literature_pending", None
+            elif verdict.supported:
+                status, reason = "surfaced", None
+            else:
+                status, reason = "excluded", "literature"
+            setattr(summary, status, getattr(summary, status) + 1)
+            pairs.append(
+                PairStatsView(
+                    oncotree_code=stats.oncotree_code,
+                    cancer_type_name=cancer_type.name if cancer_type else None,
+                    study_id=cancer_type.study_id if cancer_type else None,
+                    tumor_type_query=cancer_type.tumor_type_query if cancer_type else None,
+                    stats=stats,
+                    stats_pass=passes,
+                    enrichment=stats.enrichment_label,
+                    broad_blocked=stats.broad_blocked,
+                    precheck=precheck,
+                    literature_eligible=eligible,
+                    status=status,
+                    exclusion_reason=reason,
+                    literature=verdict,
+                )
+            )
+        pairs.sort(
+            key=lambda pair: (
+                not pair.stats_pass,
+                pair.stats.q_value is None,
+                pair.stats.q_value if pair.stats.q_value is not None else 0.0,
+                pair.oncotree_code,
+            )
+        )
+        return GeneStatsView(
+            query=resolved.query,
+            hugo_symbol=resolved.hugo_symbol,
+            entrez_gene_id=resolved.artifact.gene.entrez_gene_id,
+            broadly_expressed=resolved.artifact.broadly_expressed,
+            literature_gate=self.gate.name,
+            bundle=bundle_provenance,
+            summary=summary,
+            pairs=pairs,
+            has_stored_result=has_stored_result,
+        )
+
+    async def gene_view(
+        self,
+        gene: str,
+        *,
+        resolved: Optional[ResolvedGene] = None,
+    ) -> Tuple[GeneStatsView, Dict[str, StoredPair]]:
+        """The active bundle's statistics for every cancer type of a gene, joined
+        with any stored literature verdicts for this release only (the reference view)."""
+        if resolved is None or resolved.bundle is None:
+            resolved = await self.resolve(gene)
+        else:
+            try:
+                await self.catalog.verify_active(resolved.bundle)
+            except BundleGone:
+                resolved = await self.resolve(gene)
+        stored = await self.store.get_pairs(
+            resolved.hugo_symbol, resolved.manifest.release_id, self.gate.name
+        )
+        return self._evaluate_gene_view(resolved, stored), stored
+
     async def latest_result(
         self, gene: str, include_excluded: bool
     ) -> GeneResult:
-        symbol = normalize_symbol(gene)
-        rows = await self.store.latest_pairs(symbol, self.gate.name)
-        if not rows:
-            canonical = await self._alias_target(symbol)
-            if canonical:
-                rows = await self.store.latest_pairs(canonical, self.gate.name)
-        if not rows:
-            raise GeneNotFound(symbol)
-        return self._gene_result(rows[0].hugo_symbol, rows, include_excluded)
+        view, stored = await self.gene_view(gene)
+        historical: List[StoredPair] = []
+        if not stored:
+            historical = await self.store.latest_pairs(view.hugo_symbol, self.gate.name)
+            if not historical:
+                raise GeneNotFound(view.hugo_symbol)
+        return self._gene_result_from_view(
+            view, stored, historical, include_excluded=include_excluded
+        )
+
+    async def export_gene_csv(
+        self, gene: str, *, include_excluded: bool = False
+    ) -> Tuple[str, str]:
+        view, stored = await self.gene_view(gene)
+        if not stored:
+            historical = await self.store.latest_pairs(view.hugo_symbol, self.gate.name)
+            if not historical:
+                raise GeneNotFound(view.hugo_symbol)
+        csv_rows = gene_view_csv_rows(view, include_excluded=include_excluded)
+        return (
+            csv_filename(view.hugo_symbol, view.bundle.release_id),
+            format_csv_rows(csv_rows, include_header=True, include_bom=True),
+        )
+
+    async def export_bundle_csv(
+        self, *, include_excluded: bool = False, page_size: int = 50
+    ) -> Tuple[str, AsyncIterator[str]]:
+        bundle = await self.catalog.active()
+        release_id = bundle.release_id
+        gate_name = self.gate.name
+        batch_size = max(1, min(page_size, self.history_max_limit))
+        all_study_ids = [ct.study_id for ct in bundle.manifest.cancer_types if ct.study_id]
+
+        async def fetch_page(after: Optional[str]) -> Tuple[List[str], List[List[str]]]:
+            await self.catalog.verify_active(bundle)
+            if include_excluded:
+                symbols = await self.catalog.list_genes(bundle, batch_size, after_symbol=after)
+            else:
+                symbols = await self.store.list_release_genes(
+                    release_id, gate_name, batch_size, after_symbol=after
+                )
+            if not symbols:
+                return symbols, []
+
+            page_rows: List[List[str]] = []
+            for symbol in symbols:
+                await self.catalog.verify_active(bundle)
+                artifact = await self.catalog.gene(bundle, symbol)
+                if artifact is None:
+                    continue
+                resolved = ResolvedGene(
+                    query=symbol,
+                    hugo_symbol=artifact.gene.hugo_symbol.upper(),
+                    manifest=bundle.manifest,
+                    artifact=artifact,
+                    bundle=bundle,
+                )
+                stored = await self.store.get_pairs(
+                    resolved.hugo_symbol, release_id, gate_name
+                )
+                view = self._evaluate_gene_view(resolved, stored)
+                rows = gene_view_csv_rows(
+                    view, include_excluded=include_excluded, all_study_ids=all_study_ids
+                )
+                page_rows.extend(rows)
+            return symbols, page_rows
+
+        first_symbols, first_page_rows = await fetch_page(None)
+
+        async def stream() -> AsyncIterator[str]:
+            yield format_csv_rows((), include_header=True, include_bom=True)
+            try:
+                await self.catalog.verify_active(bundle)
+            except BundleGone as exc:
+                logger.error("Active bundle superseded during bulk export stream: %s", exc)
+                raise
+
+            if first_page_rows:
+                yield format_csv_rows(first_page_rows, include_header=False, include_bom=False)
+            if len(first_symbols) < batch_size:
+                try:
+                    await self.catalog.verify_active(bundle)
+                except BundleGone as exc:
+                    logger.error("Active bundle superseded before ending bulk export stream: %s", exc)
+                    raise
+                return
+            after_symbol = first_symbols[-1]
+            while True:
+                symbols, page_rows = await fetch_page(after_symbol)
+                if not symbols:
+                    break
+                try:
+                    await self.catalog.verify_active(bundle)
+                except BundleGone as exc:
+                    logger.error("Active bundle superseded during bulk export stream: %s", exc)
+                    raise
+                if page_rows:
+                    yield format_csv_rows(page_rows, include_header=False, include_bom=False)
+                if len(symbols) < batch_size:
+                    break
+                after_symbol = symbols[-1]
+
+            try:
+                await self.catalog.verify_active(bundle)
+            except BundleGone as exc:
+                logger.error("Active bundle superseded before ending bulk export stream: %s", exc)
+                raise
+
+        return csv_filename("all", release_id), stream()
 
     async def _alias_target(self, symbol: str) -> Optional[str]:
         # BundleNotLoaded propagates (-> 503): "can't resolve yet" is not a 404.
@@ -495,85 +758,37 @@ class ExpressionContextService:
     async def stats_view(self, gene: str) -> GeneStatsView:
         """The active bundle's statistics for every cancer type of a gene, joined
         with any stored literature verdicts for this release (the stats page)."""
-        resolved = await self.resolve(gene)
-        bundle = resolved.bundle
-        assert bundle is not None
-        stored = await self.store.get_pairs(
-            resolved.hugo_symbol, resolved.manifest.release_id, self.gate.name
-        )
-        pairs: List[PairStatsView] = []
-        summary = GeneStatsSummary()
-        expired = precheck_expired(resolved.manifest, self._clock())
-        for stats in resolved.artifact.cancer_types:
-            cancer_type = resolved.manifest.cancer_type(stats.oncotree_code)
-            precheck = {True: "pass", False: "fail", None: "not_run"}[stats.literature_precheck_pass]
-            if expired and stats.literature_precheck_pass is not None:
-                precheck = "expired"
-            passes = stats.passes_stats
-            eligible = passes and effective_precheck(stats, expired) is not False
-            verdict = None
-            prior = stored.get(stats.oncotree_code)
-            if (
-                eligible
-                and self.gate.name == TUMOR_SPECIFIC_GATE
-                and prior is not None
-                and prior.evidence is not None
-            ):
-                stored_verdict = LiteratureVerdict.model_validate(prior.evidence)
-                if stored_verdict.literature_gate == TUMOR_SPECIFIC_GATE:
-                    verdict = stored_verdict.model_copy(
-                        update={"supported": verdict_supported(stored_verdict)}
-                    )
-            if not passes:
-                status, reason = "excluded", "stats"
-            elif not eligible:
-                status, reason = "excluded", "precheck"
-            elif verdict is None:
-                status, reason = "literature_pending", None
-            elif verdict.supported:
-                status, reason = "surfaced", None
-            else:
-                status, reason = "excluded", "literature"
-            setattr(summary, status, getattr(summary, status) + 1)
-            pairs.append(PairStatsView(
-                oncotree_code=stats.oncotree_code,
-                cancer_type_name=cancer_type.name if cancer_type else None,
-                study_id=cancer_type.study_id if cancer_type else None,
-                tumor_type_query=cancer_type.tumor_type_query if cancer_type else None,
-                stats=stats,
-                stats_pass=passes,
-                enrichment=stats.enrichment_label,
-                broad_blocked=stats.broad_blocked,
-                precheck=precheck,
-                literature_eligible=eligible,
-                status=status,
-                exclusion_reason=reason,
-                literature=verdict,
-            ))
-        pairs.sort(key=lambda pair: (
-            not pair.stats_pass,
-            pair.stats.q_value is None,
-            pair.stats.q_value if pair.stats.q_value is not None else 0.0,
-            pair.oncotree_code,
-        ))
-        return GeneStatsView(
-            query=gene,
-            hugo_symbol=resolved.hugo_symbol,
-            entrez_gene_id=resolved.artifact.gene.entrez_gene_id,
-            broadly_expressed=resolved.artifact.broadly_expressed,
-            literature_gate=self.gate.name,
-            bundle=bundle.provenance(),
-            summary=summary,
-            pairs=pairs,
-        )
+        view, _ = await self.gene_view(gene)
+        return view
 
     async def history(self, limit: int, cursor: Optional[str]) -> HistoryPage:
         decoded = decode_cursor(cursor) if cursor else None
         limit = max(1, min(limit, self.history_max_limit))
-        entries = await self.store.list_history(self.gate.name, limit + 1, decoded)
-        page = entries[:limit]
-        next_cursor = encode_cursor(page[-1]) if len(entries) > limit and page else None
-        return HistoryPage(items=page, next_cursor=next_cursor)
+        for attempt in range(2):
+            bundle = await self.catalog.active()
+            raw_entries = await self.store.list_history(self.gate.name, limit + 1, decoded)
+            page = raw_entries[:limit]
+            try:
+                evaluated_page: List[HistoryEntry] = []
+                for entry in page:
+                    if entry.release_id != bundle.release_id:
+                        evaluated_page.append(entry.model_copy(update={"surfaced_count": 0}))
+                    else:
+                        try:
+                            view, _ = await self.gene_view(entry.hugo_symbol)
+                            await self.catalog.verify_active(bundle)
+                            surfaced_count = view.summary.surfaced
+                        except GeneNotFound:
+                            surfaced_count = 0
+                        evaluated_page.append(
+                            entry.model_copy(update={"surfaced_count": surfaced_count})
+                        )
+                break
+            except BundleGone:
+                if attempt:
+                    raise BundleNotLoaded("the active bundle changed while reading history")
+        next_cursor = encode_cursor(page[-1]) if len(raw_entries) > limit and page else None
+        return HistoryPage(items=evaluated_page, next_cursor=next_cursor)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -602,33 +817,69 @@ class ExpressionContextService:
     # -------------------------------------------------------------- helpers
 
     @staticmethod
-    def _gene_result(
-        symbol: str,
-        rows: List[StoredPair],
+    def _gene_result_from_view(
+        view: GeneStatsView,
+        stored: Mapping[str, StoredPair],
+        historical: Sequence[StoredPair] = (),
+        *,
         include_excluded: bool,
     ) -> GeneResult:
-        pairs = [_pair_result(row) for row in rows]
+        pair_results: List[PairResult] = []
+        all_rows = list(stored.values()) if stored else list(historical)
+        default_computed_at = max((r.computed_at for r in all_rows), default=_utcnow())
+        for pair in view.pairs:
+            is_surfaced = (pair.status == "surfaced")
+            if is_surfaced:
+                reason = None
+            elif pair.status == "literature_pending":
+                reason = "pending"
+            else:
+                reason = pair.exclusion_reason or "literature"
+
+            stored_row = stored.get(pair.oncotree_code)
+            computed_at = (
+                stored_row.computed_at
+                if stored_row and stored_row.computed_at is not None
+                else default_computed_at
+            )
+            pair_results.append(
+                PairResult(
+                    oncotree_code=pair.oncotree_code,
+                    cancer_type_name=pair.cancer_type_name,
+                    study_id=pair.study_id,
+                    surfaced=is_surfaced,
+                    exclusion_reason=reason,
+                    stats=pair.stats,
+                    literature=pair.literature,
+                    computed_at=computed_at,
+                    bundle_tag=view.bundle.bundle_tag,
+                )
+            )
+
         surfaced = sorted(
-            (pair for pair in pairs if pair.surfaced),
-            # Undefined q-values (null) sort last.
-            key=lambda pair: (
-                pair.stats.q_value is None,
-                pair.stats.q_value if pair.stats.q_value is not None else 0.0,
-                pair.oncotree_code,
+            (p for p in pair_results if p.surfaced),
+            key=lambda p: (
+                p.stats.q_value is None,
+                p.stats.q_value if p.stats.q_value is not None else 0.0,
+                p.oncotree_code,
             ),
         )
-        excluded = sorted(
-            (pair for pair in pairs if not pair.surfaced), key=lambda pair: pair.oncotree_code
+        excluded = (
+            sorted((p for p in pair_results if not p.surfaced), key=lambda p: p.oncotree_code)
+            if include_excluded
+            else None
         )
-        broad = [row.stats.get("gene_broadly_expressed") for row in rows]
+
+        all_rows = list(stored.values()) if stored else list(historical)
+        computed_at = max((r.computed_at for r in all_rows), default=_utcnow())
         return GeneResult(
-            hugo_symbol=symbol,
-            broadly_expressed=next((value for value in broad if value is not None), None),
-            release_id=rows[0].release_id if rows else "",
-            literature_gate=rows[0].literature_gate if rows else "",
-            computed_at=max((row.computed_at for row in rows), default=_utcnow()),
+            hugo_symbol=view.hugo_symbol,
+            broadly_expressed=view.broadly_expressed,
+            release_id=view.bundle.release_id,
+            literature_gate=view.literature_gate,
+            computed_at=computed_at,
             surfaced=surfaced,
-            excluded=excluded if include_excluded else None,
+            excluded=excluded,
         )
 
 
@@ -642,28 +893,5 @@ def _verdict_row(make_row, stats: CancerTypeStats, verdict: LiteratureVerdict) -
         supported,
         None if supported else "literature",
         verdict.model_dump(mode="json"),
-    )
-
-
-def _pair_result(row: StoredPair) -> PairResult:
-    # Fail closed: only a v2 row whose stored evidence is a valid v2 verdict is
-    # returned as literature. A row without evidence, a legacy v1 row, or
-    # evidence from another gate is hidden, even if the stored boolean says
-    # otherwise.
-    verdict = stored_v2_verdict(row.literature_gate, row.evidence)
-    surfaced = verdict is not None and verdict_supported(verdict)
-    if verdict is not None:
-        verdict = verdict.model_copy(update={"supported": surfaced})
-    reason = None if surfaced else (row.exclusion_reason or "literature")
-    return PairResult(
-        oncotree_code=row.oncotree_code,
-        cancer_type_name=row.stats.get("cancer_type_name"),
-        study_id=row.stats.get("study_id"),
-        surfaced=surfaced,
-        exclusion_reason=reason,
-        stats=CancerTypeStats.model_validate(row.stats),
-        literature=verdict,
-        computed_at=row.computed_at,
-        bundle_tag=row.stats.get("bundle_tag"),
     )
 

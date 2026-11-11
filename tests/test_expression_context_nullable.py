@@ -11,6 +11,7 @@ Fixture genes/MYCN.json mirrors what the producer emits:
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from datetime import datetime, timezone
@@ -20,7 +21,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.expression_context.catalog import StatsCatalog
-from src.expression_context.models import CancerTypeStats, GeneArtifact, StoredPair
+from src.expression_context.models import (
+    BundleProvenance,
+    CancerTypeStats,
+    GeneArtifact,
+    GeneStatsView,
+    PairStatsView,
+    StoredPair,
+)
 from src.expression_context.service import ExpressionContextService
 from tests.expression_context_helpers import (
     RELEASE_ID,
@@ -115,42 +123,64 @@ def test_gating_semantics_with_nulls():
 
 def test_surfaced_sorting_tolerates_null_q_values():
     base = gene_file("MYCN")["cancer_types"][1]
-    now = datetime.now(timezone.utc)
-    evidence = {
-        "literature_gate": "acgc_tumor_specific_v2", "tumor_type_query": "breast cancer",
-        "supported": True, "insufficient_evidence": False, "pmids": ["1"],
-        "verdict": "supported", "papers": [{"pmid": "1", "tumor_specific": True}],
-        "evaluated_at": now.isoformat(),
-    }
-    rows = [
-        StoredPair(
-            hugo_symbol="MYCN", oncotree_code=code, release_id=RELEASE_ID,
-            literature_gate="acgc_tumor_specific_v2", surfaced=True,
-            stats={**base, "oncotree_code": code, "q_value": q}, evidence=evidence,
-            computed_at=now,
+    pairs = [
+        PairStatsView(
+            oncotree_code=code,
+            cancer_type_name=code,
+            study_id=f"study_{code}",
+            stats_pass=True,
+            literature_eligible=True,
+            status="surfaced",
+            precheck="pass",
+            stats=CancerTypeStats.model_validate({**base, "oncotree_code": code, "q_value": q}),
         )
         for code, q in (("STAD", None), ("LUAD", 1e-3), ("BRCA", 1e-9), ("GBM", None))
     ]
-    result = ExpressionContextService._gene_result("MYCN", rows, include_excluded=True)
+    bundle = BundleProvenance(
+        bundle_tag="test-tag",
+        release_id=RELEASE_ID,
+        schema_version="1",
+        method_version="2",
+        pubmed_snapshot_date="2026-11-02",
+        gene_count=1,
+        source={"datahub_commit": "abc"},
+        release_url="https://example.org",
+    )
+    view = GeneStatsView(
+        hugo_symbol="MYCN",
+        query="MYCN",
+        entrez_gene_id=4613,
+        literature_gate="acgc_tumor_specific_v2",
+        bundle=bundle,
+        pairs=pairs,
+        summary={"surfaced": 4, "literature_pending": 0, "excluded": 0},
+    )
+    result = ExpressionContextService._gene_result_from_view(view, stored={}, include_excluded=True)
     assert [p.oncotree_code for p in result.surfaced] == ["BRCA", "LUAD", "GBM", "STAD"]
 
 
 def test_stored_row_without_evidence_is_never_surfaced():
     base = gene_file("MYCN")["cancer_types"][1]
     now = datetime.now(timezone.utc)
-    rows = [
-        StoredPair(
+    harness = Harness()
+    for code in ("STAD", "LUAD"):
+        harness.store.rows[("MYCN", code, RELEASE_ID, "acgc_tumor_specific_v2")] = StoredPair(
             hugo_symbol="MYCN", oncotree_code=code, release_id=RELEASE_ID,
             literature_gate="acgc_tumor_specific_v2", surfaced=True,
             stats={**base, "oncotree_code": code}, computed_at=now,
         )
-        for code in ("STAD", "LUAD")
-    ]
-    result = ExpressionContextService._gene_result("MYCN", rows, include_excluded=True)
-    assert result.surfaced == []
-    assert {p.oncotree_code for p in result.excluded} == {"STAD", "LUAD"}
-    assert all(p.exclusion_reason == "literature" for p in result.excluded)
-    assert all(p.literature is None for p in result.excluded)
+    with TestClient(harness.app) as client:
+        service = client.app.state.expression_context
+        view, _ = asyncio.run(service.gene_view("MYCN"))
+        pairs = {p.oncotree_code: p for p in view.pairs}
+        assert view.summary.surfaced == 0
+        for code in ("STAD", "LUAD"):
+            assert pairs[code].status == "literature_pending"
+            assert pairs[code].exclusion_reason is None
+            assert pairs[code].literature is None
+        assert pairs["BRCA"].status == "excluded" and pairs["BRCA"].exclusion_reason == "stats"
+        assert pairs["ESCA"].status == "excluded" and pairs["ESCA"].exclusion_reason == "precheck"
+        assert pairs["UCEC"].status == "excluded" and pairs["UCEC"].exclusion_reason == "stats"
 
 
 def test_stored_verdict_from_another_gate_is_never_surfaced():
@@ -162,15 +192,20 @@ def test_stored_verdict_from_another_gate_is_never_surfaced():
         "verdict": "supported", "papers": [{"pmid": "1", "tumor_specific": True}],
         "evaluated_at": now.isoformat(),
     }
-    row = StoredPair(
+    harness = Harness()
+    harness.store.rows[("MYCN", "STAD", RELEASE_ID, "acgc_tumor_specific_v2")] = StoredPair(
         hugo_symbol="MYCN", oncotree_code="STAD", release_id=RELEASE_ID,
         literature_gate="acgc_tumor_specific_v2", surfaced=True,
         stats={**base, "oncotree_code": "STAD"}, evidence=evidence, computed_at=now,
     )
-    result = ExpressionContextService._gene_result("MYCN", [row], include_excluded=True)
-    assert result.surfaced == []
-    assert result.excluded[0].exclusion_reason == "literature"
-    assert result.excluded[0].literature is None
+    with TestClient(harness.app) as client:
+        service = client.app.state.expression_context
+        view, _ = asyncio.run(service.gene_view("MYCN"))
+        pairs = {p.oncotree_code: p for p in view.pairs}
+        assert view.summary.surfaced == 0
+        assert pairs["STAD"].status == "literature_pending"
+        assert pairs["STAD"].exclusion_reason is None
+        assert pairs["STAD"].literature is None
 
 
 def test_matching_v1_row_and_evidence_is_never_surfaced():
@@ -183,15 +218,20 @@ def test_matching_v1_row_and_evidence_is_never_surfaced():
         "supported": True, "insufficient_evidence": False, "pmids": ["1"],
         "evaluated_at": now.isoformat(),
     }
-    row = StoredPair(
+    harness = Harness()
+    harness.store.rows[("MYCN", "STAD", RELEASE_ID, "acgc_pipeline_v1")] = StoredPair(
         hugo_symbol="MYCN", oncotree_code="STAD", release_id=RELEASE_ID,
         literature_gate="acgc_pipeline_v1", surfaced=True,
         stats={**base, "oncotree_code": "STAD"}, evidence=evidence, computed_at=now,
     )
-    result = ExpressionContextService._gene_result("MYCN", [row], include_excluded=True)
-    assert result.surfaced == []
-    assert result.excluded[0].exclusion_reason == "literature"
-    assert result.excluded[0].literature is None
+    with TestClient(harness.app) as client:
+        service = client.app.state.expression_context
+        view, _ = asyncio.run(service.gene_view("MYCN"))
+        pairs = {p.oncotree_code: p for p in view.pairs}
+        assert view.summary.surfaced == 0
+        assert pairs["STAD"].status == "literature_pending"
+        assert pairs["STAD"].exclusion_reason is None
+        assert pairs["STAD"].literature is None
 
 
 FLOOR = math.log2(11)  # method_version 2: RSEM 10

@@ -267,12 +267,11 @@ def test_no_bundle_loaded_is_503_with_retry_after():
             client.get(f"{PREFIX}/stats/ERBB2"),
             # Nothing stored, and aliases can't be resolved without a bundle.
             client.get(f"{PREFIX}/genes/HER2"),
+            client.get(f"{PREFIX}/genes"),
         ):
             assert response.status_code == 503, response.text
             assert response.headers["retry-after"] == "60"
             assert "not loaded yet" in response.json()["detail"]
-        # Endpoints that don't need statistics keep working.
-        assert client.get(f"{PREFIX}/genes").json() == {"items": [], "next_cursor": None}
         status = client.get(f"{PREFIX}/bundle").json()
         assert status["active"] is None and status["refresh"]["releases_repo"] == REPO
     assert harness.gate.calls == []

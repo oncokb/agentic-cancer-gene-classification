@@ -22,7 +22,6 @@ from fastapi.testclient import TestClient
 
 from src.expression_context.bundle_store import InMemoryBundleStore
 from src.expression_context.models import CancerTypeStats, GeneArtifact
-from src.expression_context.service import ExpressionContextService
 from tests.expression_context_helpers import (
     M3,
     M3_RELEASE_ID,
@@ -322,8 +321,8 @@ async def test_stored_rows_keep_the_m3_snapshot_and_gene_marker():
     assert row.stats["subgroup_q"] == pytest.approx(0.2)
     latest = await service.latest_result("VIM", include_excluded=True)
     assert latest.broadly_expressed is True
-    rows = list(service.store.rows.values())
-    assert ExpressionContextService._gene_result("VIM", rows, True).broadly_expressed is True
+    view, stored = await service.gene_view("VIM")
+    assert service._gene_result_from_view(view, stored, include_excluded=True).broadly_expressed is True
 
 
 def test_api_exposes_m3_fields():

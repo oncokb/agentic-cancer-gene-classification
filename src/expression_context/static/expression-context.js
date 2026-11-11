@@ -51,6 +51,13 @@
     return `https://www.cbioportal.org/results/plots?${query}`;
   }
 
+  function exportURL(gene, includeExcluded = false) {
+    const encoded = encodeURIComponent(String(gene || "").trim());
+    return includeExcluded
+      ? `${API}/genes/${encoded}/export.csv?include_excluded=true`
+      : `${API}/genes/${encoded}/export.csv`;
+  }
+
   function friendlyError(status, gene) {
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
     if (status === 403) return "Your account isn't active yet. Please contact your AGCG administrator.";
@@ -65,7 +72,8 @@
     const el = {};
     for (const id of [
       "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-      "ec-summary", "ec-cbio", "ec-run", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
+      "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-toggle-wrap",
+      "ec-export-include-excluded", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
     ]) {
       el[id] = doc.getElementById(id);
     }
@@ -365,6 +373,32 @@
       }
     }
 
+    function hasStoredResult(view) {
+      if (!view) return false;
+      if (typeof view.has_stored_result === "boolean") return view.has_stored_result;
+      const pairs = view.pairs || [];
+      return pairs.some((p) => p.literature != null || (p.status !== "literature_pending" && p.exclusion_reason !== "pending"));
+    }
+
+    function updateExportLink() {
+      const view = state.view;
+      const link = el["ec-export"];
+      const toggleWrap = el["ec-export-toggle-wrap"];
+      const toggle = el["ec-export-include-excluded"];
+      const symbol = view && (view.hugo_symbol || view.query) ? String(view.hugo_symbol || view.query).trim() : "";
+      if (!symbol || !hasStoredResult(view)) {
+        show(link, false);
+        show(toggleWrap, false);
+        return;
+      }
+      const includeExcluded = Boolean(toggle && toggle.checked);
+      if (link) {
+        link.setAttribute("href", exportURL(symbol, includeExcluded));
+        show(link, true);
+      }
+      show(toggleWrap, true);
+    }
+
     function render(view) {
       if (!state.view || state.view.hugo_symbol !== view.hugo_symbol) {
         state.expanded.clear();
@@ -383,6 +417,7 @@
         `${summary.surfaced || 0} surfaced · ${summary.literature_pending || 0} awaiting literature check · ` +
         `${summary.excluded || 0} excluded`;
       show(el["ec-run"], (summary.literature_pending || 0) > 0 && !state.jobRunning);
+      updateExportLink();
       renderCbioCompare(view);
       el["ec-tbody"].replaceChildren();
       for (const pair of view.pairs || []) {
@@ -513,6 +548,9 @@
       return lookup(el["ec-gene"].value);
     });
     el["ec-run"].addEventListener("click", () => runLiteratureCheck());
+    if (el["ec-export-include-excluded"]) {
+      el["ec-export-include-excluded"].addEventListener("change", () => updateExportLink());
+    }
 
     async function init() {
       const params = new URLSearchParams(win.location.search || "");
@@ -529,7 +567,7 @@
   }
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL };
+    module.exports = { createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL };
   } else {
     createExpressionContextPage({ document: root.document, window: root, fetch: root.fetch.bind(root) }).init();
   }
