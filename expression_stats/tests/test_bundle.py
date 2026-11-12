@@ -5,6 +5,23 @@ from pathlib import Path
 
 import pytest
 
+from gene_expression_relevance.controls import expected_alteration_counts
+
+CODES = [f"T{i:02d}" for i in range(32)]
+
+
+def alteration_report(panel_path=Path("controls.yaml"), codes=CODES):
+    positives, negatives = expected_alteration_counts(json.loads(panel_path.read_text()), codes)
+    return dict(
+        status="passed",
+        positive_passed=positives,
+        positive_total=positives,
+        negative_passed=0,
+        negative_total=negatives,
+        missing=0,
+        failures=[],
+    )
+
 
 def load(name):
     spec = importlib.util.spec_from_file_location(name, Path("scripts") / f"{name}.py")
@@ -21,7 +38,8 @@ def bundled(tmp_path):
     manifest = dict(
         release_id="datahub-aaaaaaaaaaaa-m3-bbbbbbbbbbbb",
         source=dict(generated_at="2026-11-06T12:00:00+00:00", precheck_expires_at="later"),
-        build=dict(genes=None, skip_precheck=False),
+        build=dict(genes=None, skip_precheck=False, skip_alterations=False),
+        cancer_types=[dict(oncotree_code=code) for code in CODES],
     )
     control_hash = module.sha256(Path("controls.yaml"))
     report = dict(
@@ -33,6 +51,7 @@ def bundled(tmp_path):
         negative_total=27,
         missing=0,
         failures=[],
+        alterations=alteration_report(),
     )
     manifest["controls"] = report.copy()
     (source / "controls-report.json").write_text(json.dumps(report))
@@ -81,6 +100,7 @@ def test_refresh_changes_tag_without_changing_release_id(bundled):
         "stale",
         "subset",
         "skip",
+        "skip_alterations",
     ],
 )
 def test_atomic_release_policy(bundled, monkeypatch, failure):
@@ -88,9 +108,11 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
     monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
     publisher = load("publish")
     monkeypatch.setenv("GITHUB_SHA", "a" * 40)
-    if failure in {"subset", "skip"}:
+    if failure in {"subset", "skip", "skip_alterations"}:
         manifest["build"] = dict(
-            genes=["TP53"] if failure == "subset" else None, skip_precheck=failure == "skip"
+            genes=["TP53"] if failure == "subset" else None,
+            skip_precheck=failure == "skip",
+            skip_alterations=failure == "skip_alterations",
         )
         (directory / "manifest.json").write_text(json.dumps(manifest))
     calls = []
@@ -116,7 +138,7 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
         return '{"id":42}'
 
     monkeypatch.setattr(publisher, "gh", gh)
-    if failure in {"upload", "corrupt", "cleanup", "stale", "subset", "skip"}:
+    if failure in {"upload", "corrupt", "cleanup", "stale", "subset", "skip", "skip_alterations"}:
         match = "stale draft 7; delete it" if failure == "stale" else None
         if failure == "cleanup":
             match = "upload failed"
@@ -216,6 +238,7 @@ def test_publisher_derives_required_counts_from_panel(bundled, monkeypatch, tmp_
         negative_total=1,
         missing=0,
         failures=[],
+        alterations=alteration_report(panel),
     )
     if invalid is not None:
         key = {

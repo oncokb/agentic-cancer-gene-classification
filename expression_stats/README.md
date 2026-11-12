@@ -4,7 +4,12 @@ Isolated TCGA producer ported from `gene-expression-relevance` at `a7c7cc6`,
 now method m3: the original lineage arm is blocked for broadly expressed genes,
 and a pooled-P99 subgroup arm rescues supported tails. Dependency constraints,
 HGNC checksum, sample selection, and date-free identity semantics remain.
-Full builds require 35/35 curated positives and 0/27 negative passes; a failed
+Each (gene, cohort) also carries alteration-type detail (Point Mutation, Structural
+Variant, Copy Number Alteration) from the same pinned mutation/GISTIC/SV files; it never
+changes expression results. Full builds also require the alteration controls (13
+enriched, 66 not enriched). `--delete-alteration-downloads` removes each ~0.1–0.9 GB raw
+file once its compact summary is cached (the workflow uses it); `--skip-alterations` is
+review-only. Full builds require 35/35 curated positives and 0/27 negative passes; a failed
 control gate stops before PubMed and writes `<out>-failed/controls-report.json`.
 Each successful bundle includes `controls-report.json`. Subsets skip the gate
 and are review-only. The panel in `controls.yaml` uses JSON-compatible YAML.

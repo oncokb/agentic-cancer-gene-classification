@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Curated m3 gate. JSON-compatible YAML, read with the Python standard library. Borderline is reported but not scored.",
+  "description": "Curated m3 gate. JSON-compatible YAML, read with the Python standard library. Borderline is reported but not scored. alteration_controls gate category statuses (detail-only alteration statistics); tcga \"*\" expands to every cohort; expected null is recorded but not gated.",
   "source_sha256": "a982d001080f0d592676e92078de938775a5abf05e4412acc98f0064f4dda827",
   "source_proposal_sha256": "45c2546bfe5537e51d9e3ce6f89162f3c8aed3c1e9895d1092cd48d2e6a2acd6",
   "controls": [
@@ -714,6 +714,156 @@
         28052061
       ],
       "note": "ERBB2 amplification/overexpression"
+    }
+  ],
+  "alteration_controls": [
+    {
+      "id": "PM-KRAS-COADREAD",
+      "gene": "KRAS",
+      "tcga": "COADREAD",
+      "category": "Point Mutation",
+      "expected": true,
+      "note": "KRAS G12/G13/Q61 hotspots"
+    },
+    {
+      "id": "PM-KRAS-PAAD",
+      "gene": "KRAS",
+      "tcga": "PAAD",
+      "category": "Point Mutation",
+      "expected": true,
+      "note": "KRAS hotspots in pancreatic adenocarcinoma"
+    },
+    {
+      "id": "PM-NRAS-COADREAD",
+      "gene": "NRAS",
+      "tcga": "COADREAD",
+      "category": "Point Mutation",
+      "expected": true,
+      "note": "NRAS hotspots"
+    },
+    {
+      "id": "PM-BRAF-SKCM",
+      "gene": "BRAF",
+      "tcga": "SKCM",
+      "category": "Point Mutation",
+      "expected": true,
+      "note": "BRAF V600 (primary SKCM only)"
+    },
+    {
+      "id": "PM-BRAF-THCA",
+      "gene": "BRAF",
+      "tcga": "THCA",
+      "category": "Point Mutation",
+      "expected": true,
+      "note": "BRAF V600E papillary thyroid"
+    },
+    {
+      "id": "PM-IDH1-LGG",
+      "gene": "IDH1",
+      "tcga": "LGG",
+      "category": "Point Mutation",
+      "expected": true,
+      "note": "IDH1 R132"
+    },
+    {
+      "id": "PM-PIK3CA-BRCA",
+      "gene": "PIK3CA",
+      "tcga": "BRCA",
+      "category": "Point Mutation",
+      "expected": true,
+      "note": "PIK3CA helical/kinase hotspots"
+    },
+    {
+      "id": "PM-EGFR-LUAD",
+      "gene": "EGFR",
+      "tcga": "LUAD",
+      "category": "Point Mutation",
+      "expected": true,
+      "note": "EGFR L858R and recurrent exon 19 in-frame deletions"
+    },
+    {
+      "id": "CNA-ERBB2-BRCA",
+      "gene": "ERBB2",
+      "tcga": "BRCA",
+      "category": "Copy Number Alteration",
+      "expected": true,
+      "direction": "amp",
+      "note": "ERBB2 amplification"
+    },
+    {
+      "id": "CNA-ERBB2-STAD",
+      "gene": "ERBB2",
+      "tcga": "STAD",
+      "category": "Copy Number Alteration",
+      "expected": true,
+      "direction": "amp",
+      "note": "ERBB2 amplification"
+    },
+    {
+      "id": "CNA-MDM2-SARC",
+      "gene": "MDM2",
+      "tcga": "SARC",
+      "category": "Copy Number Alteration",
+      "expected": true,
+      "direction": "amp",
+      "note": "12q15 amplification (liposarcoma)"
+    },
+    {
+      "id": "CNA-CDK4-SARC",
+      "gene": "CDK4",
+      "tcga": "SARC",
+      "category": "Copy Number Alteration",
+      "expected": true,
+      "direction": "amp",
+      "note": "12q14 amplification (liposarcoma)"
+    },
+    {
+      "id": "SV-ROS1-LUAD",
+      "gene": "ROS1",
+      "tcga": "LUAD",
+      "category": "Structural Variant",
+      "expected": true,
+      "note": "ROS1 fusions"
+    },
+    {
+      "id": "PM-TTN-ALL",
+      "gene": "TTN",
+      "tcga": "*",
+      "category": "Point Mutation",
+      "expected": false,
+      "note": "long passenger gene; must not be enriched in any cohort"
+    },
+    {
+      "id": "PM-MUC16-ALL",
+      "gene": "MUC16",
+      "tcga": "*",
+      "category": "Point Mutation",
+      "expected": false,
+      "note": "long passenger gene; must not be enriched in any cohort"
+    },
+    {
+      "id": "CNA-ERBB2-COADREAD",
+      "gene": "ERBB2",
+      "tcga": "COADREAD",
+      "category": "Copy Number Alteration",
+      "expected": false,
+      "note": "3% amplified but not above the TCGA mixture"
+    },
+    {
+      "id": "CNA-MET-LUAD",
+      "gene": "MET",
+      "tcga": "LUAD",
+      "category": "Copy Number Alteration",
+      "expected": false,
+      "note": "2% amplified; not enriched versus rest (q~0.15 in audit)"
+    },
+    {
+      "id": "SV-ALK-LUAD",
+      "gene": "ALK",
+      "tcga": "LUAD",
+      "category": "Structural Variant",
+      "expected": null,
+      "note": "borderline (5/510, q32~0.05 in audit): recorded, not gated"
     }
   ]
 }

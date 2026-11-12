@@ -1,0 +1,14 @@
+{
+  "source": "bailey2018",
+  "file": "bailey2018_drivers.tsv",
+  "sha256": "224972434dff51f44cfb4cd32eec4b2580cd23dff74203dc72e2dea2d10a3bd1",
+  "derived_from": {
+    "url": "https://ars.els-cdn.com/content/image/1-s2.0-S009286741830237X-mmc1.xlsx",
+    "sha256": "806a39951ab8c7caa6965ab7029b99498c9630e7508fe054b299168f16618790",
+    "sheet": "Table S1: Final gene consensus list",
+    "columns": ["Gene", "Cancer", "Tumor suppressor or oncogene prediction (by 20/20+)", "Decision"],
+    "rows": "every row with a non-empty Gene (739 rows, 299 genes); values copied verbatim"
+  },
+  "citation": "Bailey MH, Tokheim C, Porta-Pardo E, et al. Comprehensive Characterization of Cancer Driver Genes and Mutations. Cell. 2018;173(2):371-385.e18. doi:10.1016/j.cell.2018.02.060. PMID 29625053.",
+  "licence": "No explicit data licence: publisher supplementary material, used here as a factual gene list with attribution. Replaceable by OncoKB labels through the mutation driver-source interface."
+}

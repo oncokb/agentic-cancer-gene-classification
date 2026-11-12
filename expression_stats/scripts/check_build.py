@@ -21,7 +21,10 @@ def unchanged(manifest, commit, method, genes, skip, code_sha, hgnc_sha, now=Non
         and source.get("code_sha256") == code_sha
         and source.get("hgnc_sha256") == hgnc_sha
         and manifest.get("params") == SETTINGS["PARAMS"]
-        and manifest.get("build") == {"genes": genes, "skip_precheck": skip}
+        and manifest.get("alteration_method_version") == SETTINGS["ALTERATION_METHOD_VERSION"]
+        and manifest.get("alteration_params") == SETTINGS["ALTERATION_PARAMS"]
+        and manifest.get("build")
+        == {"genes": genes, "skip_precheck": skip, "skip_alterations": False}
     ):
         return False
     if not skip:

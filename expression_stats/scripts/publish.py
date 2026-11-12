@@ -13,9 +13,9 @@ from bundle import sha256
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PANEL_PATH = PROJECT_ROOT / "controls.yaml"
 # This helper is stdlib-only; the publisher installs no stats dependencies.
-expected_counts = runpy.run_path(str(PROJECT_ROOT / "gene_expression_relevance/controls.py"))[
-    "expected_counts"
-]
+CONTROLS = runpy.run_path(str(PROJECT_ROOT / "gene_expression_relevance/controls.py"))
+expected_counts = CONTROLS["expected_counts"]
+expected_alteration_counts = CONTROLS["expected_alteration_counts"]
 
 
 def gh(*args):
@@ -25,8 +25,10 @@ def gh(*args):
 def publish(directory):
     directory = Path(directory)
     manifest = json.loads((directory / "manifest.json").read_text())
-    if manifest["build"] != {"genes": None, "skip_precheck": False}:
-        raise ValueError("Only full builds with PubMed precheck can be published")
+    if manifest["build"] != {"genes": None, "skip_precheck": False, "skip_alterations": False}:
+        raise ValueError(
+            "Only full builds with PubMed precheck and alteration statistics can be published"
+        )
     if "precheck_expires_at" not in manifest["source"] or manifest["source"].get(
         "precheck_incomplete"
     ):
@@ -35,7 +37,11 @@ def publish(directory):
     report = json.loads(report_path.read_text())
     controls = manifest.get("controls", {})
     panel_hash = sha256(PANEL_PATH)
-    positive_total, negative_total = expected_counts(json.loads(PANEL_PATH.read_text()))
+    panel = json.loads(PANEL_PATH.read_text())
+    positive_total, negative_total = expected_counts(panel)
+    codes = [item["oncotree_code"] for item in manifest["cancer_types"]]
+    alteration_positives, alteration_negatives = expected_alteration_counts(panel, codes)
+    alterations = report.get("alterations", {})
     if (
         controls.get("status") != "passed"
         or report.get("status") != "passed"
@@ -47,6 +53,14 @@ def publish(directory):
         or report.get("negative_total") != negative_total
         or report.get("missing") != 0
         or report.get("failures") != []
+        or alterations.get("status") != "passed"
+        or controls.get("alterations", {}).get("status") != "passed"
+        or alterations.get("positive_passed") != alteration_positives
+        or alterations.get("positive_total") != alteration_positives
+        or alterations.get("negative_passed") != 0
+        or alterations.get("negative_total") != alteration_negatives
+        or alterations.get("missing") != 0
+        or alterations.get("failures") != []
     ):
         raise ValueError("A complete passing controls report is required for publication")
     tag = manifest["bundle_tag"]

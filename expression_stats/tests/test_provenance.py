@@ -128,7 +128,12 @@ def test_live_mapping_changes_invalidate_early_exit(tmp_path, monkeypatch, mappi
     import importlib.util
     from datetime import UTC, datetime
 
-    from gene_expression_relevance import METHOD_VERSION, PARAMS
+    from gene_expression_relevance import (
+        ALTERATION_METHOD_VERSION,
+        ALTERATION_PARAMS,
+        METHOD_VERSION,
+        PARAMS,
+    )
 
     spec = importlib.util.spec_from_file_location("mapping_check_test", "scripts/check_build.py")
     module = importlib.util.module_from_spec(spec)
@@ -137,6 +142,8 @@ def test_live_mapping_changes_invalidate_early_exit(tmp_path, monkeypatch, mappi
         schema_version="1",
         method_version=METHOD_VERSION,
         params=PARAMS,
+        alteration_method_version=ALTERATION_METHOD_VERSION,
+        alteration_params=ALTERATION_PARAMS,
         source=dict(
             datahub_commit="a" * 40,
             code_sha256=provenance.code_fingerprint(),
@@ -144,7 +151,7 @@ def test_live_mapping_changes_invalidate_early_exit(tmp_path, monkeypatch, mappi
             generated_at=datetime.now(UTC).isoformat(),
             cohort_mapping_sha256="old-mapping",
         ),
-        build=dict(genes=None, skip_precheck=False),
+        build=dict(genes=None, skip_precheck=False, skip_alterations=False),
     )
     monkeypatch.setattr(module, "published_manifest", lambda: manifest)
     monkeypatch.setattr(module, "current_mapping_sha", lambda commit: mapping_sha)

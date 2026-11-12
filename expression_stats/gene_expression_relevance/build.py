@@ -11,7 +11,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import METHOD_VERSION, PARAMS
+from . import (
+    ALTERATION_METHOD_VERSION,
+    ALTERATION_PARAMS,
+    CONTRACT_VERSION,
+    METHOD_VERSION,
+    PARAMS,
+    drivers,
+)
+from . import alterations as alteration_stats
 from .controls import evaluate as evaluate_controls
 from .controls import require_passed
 from .fetch import digest, fetch_all
@@ -32,15 +40,26 @@ def write_json(path, value):
     path.write_text(json.dumps(value, allow_nan=False, separators=(",", ":")) + "\n")
 
 
-def matrix(paths, mapping, catalog, target):
-    """Join by Entrez, retain missing values, choose samples once across studies."""
-    selection, labels, seen = {}, [], set()
+def select_samples(paths, mapping):
+    """One primary sample per patient, chosen once across studies in mapping order.
+
+    The single source of the patient population: expression and alteration statistics
+    both use exactly these samples.
+    """
+    selection, seen = {}, set()
     for item in mapping:
         study, code = item["study_id"], item["oncotree_code"]
         header = pd.read_csv(paths[study], sep="\t", nrows=0).columns.tolist()[2:]
-        indices = primary_indices(header, code, seen)
-        selection[study] = [header[i] for i in indices]
-        labels.extend([code] * len(indices))
+        selection[study] = [header[i] for i in primary_indices(header, code, seen)]
+    return selection
+
+
+def matrix(paths, mapping, catalog, target, selection=None):
+    """Join by Entrez, retain missing values, choose samples once across studies."""
+    selection = select_samples(paths, mapping) if selection is None else selection
+    labels = []
+    for item in mapping:
+        labels.extend([item["oncotree_code"]] * len(selection[item["study_id"]]))
     ids = sorted(catalog)
     index = {entrez: i for i, entrez in enumerate(ids)}
     x = np.memmap(target, mode="w+", dtype="float64", shape=(len(ids), len(labels)))
@@ -63,13 +82,34 @@ def matrix(paths, mapping, catalog, target):
     return x, np.asarray(labels), ids
 
 
-def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
+def load_alterations(commit, cache, mapping, selection, ids, catalog, aliases, delete_downloads):
+    """Alteration statistics for the build's gene rows (detail only; see alterations.py)."""
+    driver = drivers.load(ALTERATION_PARAMS["mutation_driver_source"])
+    inputs, provenance, inputs_sha = alteration_stats.load_inputs(
+        commit, cache, [item["study_id"] for item in mapping], delete_downloads=delete_downloads
+    )
+    result = alteration_stats.compute(inputs, mapping, selection, ids, catalog, aliases, driver)
+    return result, driver, provenance, inputs_sha
+
+
+def build(
+    commit,
+    out,
+    cache,
+    genes=None,
+    skip_precheck=False,
+    batch_size=256,
+    *,
+    skip_alterations=False,
+    delete_downloads=False,
+):
     started = time.monotonic()
     out, cache = Path(out), Path(cache)
     paths = fetch_all(commit, cache)
     mapping = cancer_mapping(paths)
     canonical, aliases = hgnc(cache)
     catalog = gene_catalog(paths.values(), canonical)
+    full_catalog = dict(catalog)
     if isinstance(genes, str):
         genes = genes.split(",")
     requested_genes = (
@@ -84,23 +124,53 @@ def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
             raise ValueError(f"Genes absent or ambiguous: {sorted(missing)}")
     if not catalog:
         raise ValueError("No genes to build")
+    ids = sorted(catalog)
+    selection = select_samples(paths, mapping)
+    alteration = None
+    alteration_identity = dict(skipped=True)
+    if not skip_alterations:
+        alteration, driver, alteration_inputs, inputs_sha = load_alterations(
+            commit, cache, mapping, selection, ids, full_catalog, aliases, delete_downloads
+        )
+        alteration_identity = dict(
+            method_version=ALTERATION_METHOD_VERSION,
+            params=ALTERATION_PARAMS,
+            inputs_sha256=inputs_sha,
+            **driver.pin(),
+        )
     now = datetime.now(UTC)
     hgnc_sha = digest(hgnc_path(cache))
     code_sha = code_fingerprint()
     mapping_sha = mapping_fingerprint(mapping)
     build_sha = build_fingerprint(
-        PARAMS, requested_genes, skip_precheck, hgnc_sha, code_sha, mapping_sha
+        PARAMS,
+        requested_genes,
+        skip_precheck,
+        hgnc_sha,
+        code_sha,
+        mapping_sha,
+        alterations=alteration_identity,
     )
     release = f"datahub-{commit[:12]}-m{METHOD_VERSION}-{build_sha[:12]}"
     manifest = dict(
         schema_version="1",
+        contract_version=CONTRACT_VERSION,
         release_id=release,
         method_version=METHOD_VERSION,
         params=PARAMS,
+        alteration_method_version=ALTERATION_METHOD_VERSION,
+        alteration_params=ALTERATION_PARAMS,
         source=dict(datahub_commit=commit, generated_at=now.isoformat()),
         cancer_types=mapping,
-        build=dict(genes=requested_genes, skip_precheck=skip_precheck),
+        build=dict(
+            genes=requested_genes, skip_precheck=skip_precheck, skip_alterations=skip_alterations
+        ),
     )
+    if alteration is not None:
+        manifest["source"].update(
+            alteration_inputs_sha256=alteration_identity["inputs_sha256"], **driver.pin()
+        )
+        manifest["alterations"] = dict(alteration.summary, inputs=alteration_inputs)
     # Record the HGNC snapshot hash to make symbol resolution auditable.
     manifest["source"].update(
         hgnc_sha256=hgnc_sha,
@@ -121,7 +191,9 @@ def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
     passed = {}
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".build-") as temporary:
         staging = Path(temporary) / "site"
-        data, labels, ids = matrix(paths, mapping, catalog, Path(temporary) / "expression.bin")
+        data, labels, ids = matrix(
+            paths, mapping, catalog, Path(temporary) / "expression.bin", selection
+        )
         for start in range(0, len(ids), batch_size):
             batch = ids[start : start + batch_size]
             arrays = compute(data[start : start + batch_size], labels, codes)
@@ -157,6 +229,10 @@ def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
                         ),
                         flags=(["small_n"] if record["n"] < PARAMS["min_n"] else [])
                         + (["tissue_of_origin_risk"] if symbol in LINEAGE.get(code, set()) else []),
+                        # Detail only: added after every expression field is final.
+                        alterations=(
+                            alteration.record(start + i, j) if alteration is not None else None
+                        ),
                     )
                     records.append(record)
                 write_json(
@@ -171,8 +247,17 @@ def build(commit, out, cache, genes=None, skip_precheck=False, batch_size=256):
                 )
             print(f"Computed {min(start + batch_size, len(ids))}/{len(ids)} genes", flush=True)
         del data
-        report = evaluate_controls(staging / "v1" / "genes", subset=requested_genes is not None)
+        report = evaluate_controls(
+            staging / "v1" / "genes",
+            subset=requested_genes is not None,
+            codes=codes,
+            alterations=alteration is not None,
+        )
         manifest["controls"] = {key: value for key, value in report.items() if key != "controls"}
+        if "alterations" in report:
+            manifest["controls"]["alterations"] = {
+                key: value for key, value in report["alterations"].items() if key != "controls"
+            }
         write_json(staging / "v1" / "controls-report.json", report)
         if requested_genes is None and report["status"] != "passed":
             failed = out.with_name(out.name + "-failed")

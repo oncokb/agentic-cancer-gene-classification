@@ -68,6 +68,16 @@ jobs:
           path: expression_stats/.cache/objects
           key: expression-objects-${{ runner.os }}-${{ steps.check.outputs.commit }}
           restore-keys: expression-objects-${{ runner.os }}-
+      # Parsed mutation/CNA/SV summaries (~30 MB) keyed by input commit and parser code.
+      # Raw alteration files (~4 GB) are deleted as soon as each is parsed, so they are
+      # never cached and never held on the runner disk all at once.
+      - uses: actions/cache@v4
+        if: steps.check.outputs.changed == 'true'
+        with:
+          path: |
+            expression_stats/.cache/alterations
+            expression_stats/.cache/case_lists
+          key: expression-alterations-${{ steps.check.outputs.commit }}-${{ hashFiles('expression_stats/gene_expression_relevance/alterations.py', 'expression_stats/gene_expression_relevance/fetch.py') }}
       - uses: actions/cache@v4
         if: steps.check.outputs.changed == 'true'
         with:
@@ -89,11 +99,12 @@ jobs:
           NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
         shell: bash
         run: |
-          args=(--datahub-commit "$DATAHUB_COMMIT" --out artifacts)
+          args=(--datahub-commit "$DATAHUB_COMMIT" --out artifacts --delete-alteration-downloads)
           if [[ -n "${INPUT_GENES//[[:space:],]/}" ]]; then args+=(--genes "$INPUT_GENES"); fi
           if [[ "$INPUT_SKIP" == 'true' ]]; then args+=(--skip-precheck); fi
           python -m gene_expression_relevance build "${args[@]}"
           python scripts/bundle.py artifacts bundle
+          df -h . | tail -1
       - uses: actions/cache/save@v4
         if: always() && steps.check.outputs.changed == 'true' && inputs.skip_precheck != true && hashFiles('expression_stats/.cache/pubmed.sqlite3') != ''
         with:

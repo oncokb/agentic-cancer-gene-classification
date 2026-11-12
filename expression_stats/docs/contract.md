@@ -1,6 +1,7 @@
 # Expression context (optional, removable module)
 
-Status: artifact v1 (additive fields), statistical method v3 — 2026-11-07
+Status: artifact schema_version 1, contract 1.1 (additive alteration detail), expression
+method v3, alteration method v1 — 2026-11-12
 
 ## Goal
 
@@ -20,8 +21,10 @@ Each surfaced pair shows the statistics and the supporting citations side by sid
  │ GitHub Action (cron weekly + manual)                       │
  │  1. download 32 *_tcga_pan_can_atlas_2018                  │
  │     data_mrna_seq_v2_rsem.txt from cBioPortal datahub      │
- │     (pinned commit)                                        │
- │  2. stats gate for every gene (one-vs-rest, see below)     │
+ │     (pinned commit), plus mutation/GISTIC/SV files and     │
+ │     case lists for alteration detail                       │
+ │  2. stats gate for every gene (one-vs-rest, see below);    │
+ │     alteration-type enrichment as detail only              │
  │  3. cheap PubMed-count pre-check for stats-passing pairs   │
  │  4. publish verified GitHub release bundles                 │
  └───────────────────────┬────────────────────────────────────┘
@@ -146,6 +149,140 @@ opposite group is empty. Existing nullable fields retain their semantics.
 `p90_log2`/`rest_p90_log2` remain informational. `tissue_of_origin_risk` and
 `small_n` remain informational flags. Do not interpret a null as measured zero.
 
+## Alteration-type statistics (detail only; alteration method "1", contract 1.1)
+
+Alongside expression, every (gene, cohort) pair carries per-category genomic-alteration
+enrichment for the curators' categories, spelled exactly **"Point Mutation"**,
+**"Structural Variant"** and **"Copy Number Alteration"** (expression remains
+"Expression"). These results are **detail only**: they never feed `stats_pass`,
+`pass_mode`, `lineage_blocked_by_broad`, `broadly_expressed`, flags, PubMed prechecks,
+the expression controls, or which pairs surface. For identical inputs every expression
+field is byte-for-byte identical with or without alterations (tested), and the 35/27
+expression controls are unchanged. The expression `method_version` stays `"3"` and the
+release ID keeps its `m3` token; alterations are versioned separately as
+`alteration_method_version`.
+
+**Inputs.** The same pinned datahub commit and the same 32 `*_tcga_pan_can_atlas_2018`
+studies: `data_mutations.txt` (MAF), `data_cna.txt` (GISTIC discrete) and
+`data_sv.txt`, plus the case lists `case_lists/cases_sequenced.txt`, `cases_cna.txt`
+and `cases_sv.txt`. Each raw file is parsed once into a compact, selection-independent
+summary cached by LFS object id (`.cache/alterations/p<parser>/`); CI deletes each raw
+file right after parsing.
+
+**Population and denominators.** Exactly the expression sample selection (one primary
+tumour per patient, `01`, or `03` for LAML, chosen once across studies). For each
+category the denominator is the selected patients that are **profiled** for that data
+type: in the category's case list (and, for CNA, a column of the GISTIC matrix with a
+measured value for the gene). Unprofiled patients never enter a target or rest
+denominator as wild type. Point Mutation additionally excludes hypermutated tumours
+(below) from both target and rest.
+
+**Event definitions (patient level; a patient counts once per gene and category).**
+
+- *Point Mutation* — putative drivers under the TCGA-derived rule of
+  `point-mutation-options.md` (rule C), using the swappable driver source
+  `mutation_driver_source` (today `"bailey2018"`): the gene must be in the driver list;
+  a missense call counts when the same (gene, `Transcript_ID`, protein position) is
+  mutated in ≥`missense_min_recurrence` (10) retained tumours pan-cancer; a truncating
+  call (nonsense, frameshift indel, splice site) counts only in genes labelled TSG or
+  possible TSG in any Bailey row; an in-frame insertion/deletion counts when the exact
+  (gene, transcript, `HGVSp_Short`) recurs in ≥`inframe_min_recurrence` (5) retained
+  tumours. Tumours with more than `hypermutator_max_nonsynonymous` (500) nonsynonymous
+  MAF rows (missense, nonsense, nonstop, splice site, translation start, frameshift and
+  in-frame indels, all genes) are excluded from events, recurrence and denominators.
+  Genes outside the driver list are `not_testable` (reason names the source); this is
+  "no supported driver annotation", not evidence of neutrality.
+- *Copy Number Alteration* — GISTIC exactly **+2** (amplification, `amp`) and exactly
+  **−2** (deep deletion, `del`), tested separately; +1/−1 are comparators. Duplicate
+  source rows for one gene combine per sample. The category is enriched if either
+  direction passes; `enriched_directions` lists which. **SKCM** GISTIC data cover only
+  metastatic (type `06`) samples, so no selected primary is profiled and SKCM CNA is
+  `not_testable` with that reason; SKCM primaries are absent from every CNA rest
+  denominator.
+- *Structural Variant* — any non-germline `data_sv.txt` record with the gene as Site1
+  or Site2 (fusion partner either side). Counts are observed curated fusion calls, not
+  assay sensitivity; fewer than the SV `min_events` (3) gives `insufficient_data`, never
+  `not_enriched`.
+
+**Test.** For each gene, category (and CNA direction) and cohort: one-sided Fisher exact
+test (hypergeometric upper tail) of `[[events, profiled − events], [rest_events,
+rest_profiled − rest_events]]`, the cohort versus the other 31 cohorts' profiled
+patients. BH runs across the 32 cohorts per gene per category; for CNA the family is
+the 64 amp+del comparisons of that gene. Undefined comparisons enter BH as p=1 and
+serialize as null. `ratio = frequency / rest_frequency` (null when rest frequency is 0;
+a zero rest with ≥1 target event passes the ratio gate as unbounded). Enriched requires
+**all** of the category gates:
+
+| Category | q < | ratio ≥ | events ≥ | frequency ≥ |
+| --- | --- | --- | --- | --- |
+| Point Mutation | 0.05 | 2 | 5 | 2% |
+| Copy Number Alteration (each direction) | 0.05 | 2 | 5 | 2% |
+| Structural Variant | 0.05 | 3 | 3 | 0.5% |
+
+The SV gates are the alterations report's rare-event proposal; PM/CNA use the requested
+defaults. A cohort with fewer than `min_profiled` (20) profiled patients is
+`insufficient_data`. All values are `alteration_params` in the manifest. These are
+per-gene, per-category screening q-values, not genome-wide FDR.
+
+**Statuses (every gene × cohort × category, never omitted).**
+`enriched` (all gates pass); `not_enriched` (tested; `reason` lists failed gates);
+`insufficient_data` (too few profiled patients, or too few fusion events); `not_testable`
+(`reason` says why: no profiled primaries / metastatic-only data, gene not in GISTIC
+data or unmeasured in that cohort, gene not in the driver list). Every non-enriched
+status has a non-null `reason`.
+
+**Bailey driver list (licence caveat).** `gene_expression_relevance/bailey2018_drivers.tsv`
+is Table S1 of Bailey et al., *Comprehensive Characterization of Cancer Driver Genes and
+Mutations*, Cell 173:371–385 (2018), doi:10.1016/j.cell.2018.02.060 (supplement
+`1-s2.0-S009286741830237X-mmc1.xlsx`, SHA-256
+`806a39951ab8c7caa6965ab7029b99498c9630e7508fe054b299168f16618790`), reduced to gene,
+cancer, 20/20+ role and decision columns. `drivers-pin.json` pins the TSV SHA-256, which
+is verified at load and recorded as `source.mutation_driver_sha256`. The publisher
+supplement carries **no explicit data licence**; it is used here as a research gene
+list. OncoKB oncogenic/TSG labels can replace it by registering another source in
+`drivers.py` and changing `mutation_driver_source`, which changes the release identity.
+
+**Wire format.** Each per-type record gains a nullable `alterations` object (null only
+when a review build used `--skip-alterations`; published bundles always populate it):
+
+```json
+"alterations": {
+  "alteration_types_enriched": ["Copy Number Alteration"],
+  "categories": {
+    "Point Mutation": {"status": "not_enriched", "reason": "q=0.31 >= 0.05",
+      "n_events": 30, "n_profiled": 1048, "frequency": 0.0286,
+      "rest_n_events": 98, "rest_n_profiled": 8647, "rest_frequency": 0.0113,
+      "ratio": 2.53, "p_value": 0.01, "q_value": 0.31, "direction": null},
+    "Structural Variant": {"status": "insufficient_data", "reason": "...", "...": "..."},
+    "Copy Number Alteration": {"status": "enriched", "reason": null,
+      "n_events": 122, "n_profiled": 1068, "frequency": 0.114, "...": "...",
+      "direction": "amp", "enriched_directions": ["amp"],
+      "amp": {"n_events": 122, "...": "...", "enriched": true},
+      "del": {"n_events": 0, "...": "...", "enriched": false}}
+  }
+}
+```
+
+`alteration_types_enriched` lists enriched categories in the fixed order Point Mutation,
+Structural Variant, Copy Number Alteration. Category keys are always all three. Numeric
+fields are null when undefined or `not_testable`; never read null as zero. For CNA the
+top-level statistics describe `direction` (the first enriched direction, else the one
+with the smaller p); `amp`/`del` hold both. `n_profiled` is the category denominator
+(CNA: patients with a measured call for the gene). The manifest adds `contract_version`
+("1.1"), `alteration_method_version`, `alteration_params`, `build.skip_alterations`,
+`source.alteration_inputs_sha256`, `source.mutation_driver_source`,
+`source.mutation_driver_sha256`, and an `alterations` summary (per-cohort selected /
+profiled / hypermutator counts and the SHA-256 of every input file and case list).
+
+**Backward compatibility.** `schema_version` stays `"1"`; all additions are new keys.
+Consumers ignoring unknown fields (the current `src/expression_context` loader) keep
+working unchanged; documents without `alterations` (contract 1.0) remain valid.
+
+**Identity.** The build fingerprint (release ID suffix) also hashes
+`alteration_method_version`, `alteration_params`, the driver source name and SHA-256, and
+the SHA-256 of every alteration input file and case list; the Bailey TSV is part of the
+code fingerprint. Changing any of them yields a new release ID.
+
 ### Curated controls and PubMed
 
 `expression_stats/controls.yaml` is JSON-compatible YAML, read with stdlib
@@ -169,6 +306,22 @@ summary records status, panel SHA-256, counts, missing count and failures.
 Publication independently requires the complete passing report for the current
 panel, 35/35 positives and 0/27 negatives, in addition to full precheck coverage.
 `controls-report.json` is a separate release asset with its existing bytes.
+
+**Alteration controls.** `alteration_controls` in the same panel gate category statuses
+(`gene`, `tcga`, `category`, optional CNA `direction`, `expected`). `tcga: "*"` expands
+to one row per build cohort with id `<id>:<code>`. Must be enriched (13): Point
+Mutation KRAS/COADREAD, KRAS/PAAD, NRAS/COADREAD, BRAF/SKCM, BRAF/THCA, IDH1/LGG,
+PIK3CA/BRCA, EGFR/LUAD; Copy Number Alteration with `amp` enriched ERBB2/BRCA,
+ERBB2/STAD, MDM2/SARC, CDK4/SARC; Structural Variant ROS1/LUAD. Must not be enriched
+(66): TTN and MUC16 Point Mutation in every cohort (64), ERBB2/COADREAD and MET/LUAD
+Copy Number Alteration. ALK/LUAD Structural Variant is recorded with `expected: null`
+(borderline, not gated). Duplicate ids or (gene, cohort, category) after expansion are
+rejected; a missing gene/record fails closed. The report gains an `alterations`
+sub-report (and the manifest `controls.alterations` summary) with the same counters;
+any alteration failure fails the whole gate before PubMed. Publication additionally
+requires `build.skip_alterations == false`, a passing alteration sub-report,
+13/13 positives, 0/66 negative passes and zero missing. `--skip-alterations` and subset
+builds are review-only.
 
 PubMed runs only for final stats-passing pairs, using
 `"GENE"[tiab] AND (<tumor_type_query>)`. Precheck passes for count>=1. Cached
@@ -211,6 +364,7 @@ is maintained separately (PR #167). No shared Python imports are permitted.
 ```json
 {
   "schema_version": "1",
+  "contract_version": "1.1",
   "release_id": "datahub-<12hex>-m3-<build_sha12>",
   "bundle_tag": "expression-stats-datahub-<12hex>-m3-<build_sha12>-pubmed-<YYYYMMDD>",
   "pubmed_snapshot_date": "<YYYY-MM-DD>",
@@ -253,7 +407,8 @@ is maintained separately (PR #167). No shared Python imports are permitted.
   },
   "build": {
     "genes": null,
-    "skip_precheck": false
+    "skip_precheck": false,
+    "skip_alterations": false
   },
   "cancer_types": [
     {
@@ -332,13 +487,14 @@ consumer repositories should link here rather than duplicate these semantics.
 Release IDs have the exact form `datahub-<12hex>-m3-<build_sha12>`. They are
 input identities, not build dates. The suffix hashes method parameters,
 override contents, HGNC snapshot hash, code fingerprint (including the curated controls panel), gene subset,
-precheck mode, and the cohort mapping fingerprint. The latter hashes the sorted
+precheck mode, the alteration identity (method, params, driver source and every
+alteration input hash; see Alteration-type statistics), and the cohort mapping fingerprint. The latter hashes the sorted
 list of (`study_id`, `oncotree_code`, `name`, `tumor_type_query`), excluding
 `import_date`, and is recorded as `source.cohort_mapping_sha256`. Neither the build date, precheck freshness nor fetch timestamps
 participate. A forced rebuild due to PubMed TTL expiry with identical inputs
 keeps the same release_id, allowing ACGC to reuse its literature verdicts.
 `source.generated_at` and `source.precheck_expires_at` record freshness separately.
-The code fingerprint hashes package source, override JSONs, pin,
+The code fingerprint hashes package source (including the vendored Bailey TSV), override JSONs, pin,
 `pyproject.toml`, `constraints.txt`, and the resolved numpy/scipy/pandas versions.
 Build and CI dependencies use the committed exact constraints. CI installs
 dependencies before computing that fingerprint and deciding early exit.
