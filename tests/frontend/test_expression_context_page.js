@@ -44,8 +44,9 @@ class Element {
 
 const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-  "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-export-toggle-wrap",
-  "ec-export-include-excluded", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
+  "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
+  "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
+  "ec-provenance", "ec-provenance-status",
 ];
 
 const response = (body, status = 200) => ({ status, json: async () => body });
@@ -82,8 +83,10 @@ function env(routes, { search = "" } = {}) {
   nodes["ec-run"].classList.toggle("hidden", true);
   nodes["ec-export"].classList.toggle("hidden", true);
   nodes["ec-export-golden"].classList.toggle("hidden", true);
-  nodes["ec-export-toggle-wrap"].classList.toggle("hidden", true);
-  nodes["ec-export-include-excluded"].checked = false;
+  nodes["ec-table-empty"].classList.toggle("hidden", true);
+  nodes["ec-view-shown"].classList.toggle("active", true);
+  nodes["ec-view-shown"].setAttribute("aria-pressed", "true");
+  nodes["ec-view-all"].setAttribute("aria-pressed", "false");
   const document = { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
   const calls = [];
   const replaced = [];
@@ -589,6 +592,7 @@ test("header has only the visible columns and removed columns are gone", () => {
 test("numbers are hidden in the detail row by default and toggle updates aria-expanded", async () => {
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
   await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
   const summaries = summaryRows(nodes);
   const details = detailRows(nodes);
   assert.strictEqual(summaries.length, 4);
@@ -679,14 +683,15 @@ test("expanded state survives a re-render during a literature job and resets on 
   }
 });
 
-test("CSV download link appears after a gene loads, encodes the symbol, and toggles include_excluded", async () => {
+test("CSV download link appears after a gene loads, encodes the symbol, and follows the view toggle", async () => {
   const html = fs.readFileSync(HTML_PATH, "utf8");
   assert.ok(html.includes('id="ec-export"'), "HTML includes Download CSV link");
   assert.ok(html.includes("Download CSV"), "HTML labels Download CSV link");
   assert.ok(html.includes('id="ec-export-golden"'), "HTML includes Download golden-set row link");
   assert.ok(html.includes("Download golden-set row"), "HTML labels Download golden-set row link");
-  assert.ok(html.includes('id="ec-export-include-excluded"'), "HTML includes include-excluded checkbox");
-  assert.ok(html.includes("include excluded cancer types"), "HTML labels include-excluded checkbox");
+  assert.ok(!html.includes('type="checkbox"'), "the include-excluded checkbox is gone");
+  assert.ok(html.includes('id="ec-view-shown"') && html.includes("Shown only"), "HTML includes the Shown only view");
+  assert.ok(html.includes('id="ec-view-all"') && html.includes("All cancer types"), "HTML includes the All view");
 
   assert.strictEqual(
     exportURL("A/B C", false),
@@ -709,12 +714,10 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
   });
   assert.ok(nodes["ec-export"].hidden, "Download CSV hidden before a gene loads");
   assert.ok(nodes["ec-export-golden"].hidden, "Download golden-set row hidden before a gene loads");
-  assert.ok(nodes["ec-export-toggle-wrap"].hidden, "toggle hidden before a gene loads");
 
   await page.lookup("HER2");
   assert.ok(!nodes["ec-export"].hidden, "Download CSV visible once a gene loads");
   assert.ok(!nodes["ec-export-golden"].hidden, "Download golden-set row visible once a gene loads");
-  assert.ok(!nodes["ec-export-toggle-wrap"].hidden, "toggle visible once a gene loads");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/ERBB2/export.csv",
@@ -724,8 +727,7 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
     "/v1/expression-context/golden-set.csv?genes=ERBB2",
   );
 
-  nodes["ec-export-include-excluded"].checked = true;
-  nodes["ec-export-include-excluded"].fire("change");
+  nodes["ec-view-all"].fire("click");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/ERBB2/export.csv?include_excluded=true",
@@ -745,8 +747,7 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
     "/v1/expression-context/golden-set.csv?genes=NKX2-1",
   );
 
-  nodes["ec-export-include-excluded"].checked = false;
-  nodes["ec-export-include-excluded"].fire("change");
+  nodes["ec-view-shown"].fire("click");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/NKX2-1/export.csv",
@@ -788,12 +789,125 @@ test("CSV download link hidden when gene has no stored results for the active re
   await page.lookup("PEND1");
   assert.ok(nodes["ec-export"].hidden, "Download CSV hidden while results are pending / no stored results");
   assert.ok(nodes["ec-export-golden"].hidden, "Download golden-set row hidden while results are pending");
-  assert.ok(nodes["ec-export-toggle-wrap"].hidden, "toggle hidden while results are pending");
 
   await page.lookup("STORED1");
   assert.ok(!nodes["ec-export"].hidden, "Download CSV visible once stored results exist");
   assert.ok(!nodes["ec-export-golden"].hidden, "Download golden-set row visible once stored results exist");
-  assert.ok(!nodes["ec-export-toggle-wrap"].hidden, "toggle visible once stored results exist");
+});
+
+function visibleSummaryRows(nodes) {
+  return summaryRows(nodes).filter((r) => !r.hidden);
+}
+
+test("view toggle switches the table rows and the count", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const code = (row) => row.children[0].text;
+  // Default: only the pairs that are shown (surfaced + awaiting literature).
+  assert.deepStrictEqual(visibleSummaryRows(nodes).map(code), ["Breast Invasive Carcinoma (BRCA)", "Stomach Adenocarcinoma (STAD)"]);
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded (hidden)");
+  assert.ok(nodes["ec-table-empty"].hidden);
+
+  nodes["ec-view-all"].fire("click");
+  const all = visibleSummaryRows(nodes);
+  assert.strictEqual(all.length, 4);
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded");
+  // Excluded rows are de-emphasised and labelled with their reason.
+  const excluded = all.filter((r) => r.getAttribute("class") === "ec-row-excluded");
+  assert.deepStrictEqual(excluded.map((r) => r.children[4].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
+
+  nodes["ec-view-shown"].fire("click");
+  assert.strictEqual(visibleSummaryRows(nodes).length, 2);
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded (hidden)");
+});
+
+test("an expanded excluded row hides with its details and comes back expanded", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  summaryRows(nodes)[3].children[6].children[0].fire("click");
+  assert.ok(!detailRows(nodes)[3].hidden);
+  nodes["ec-view-shown"].fire("click");
+  assert.ok(summaryRows(nodes)[3].hidden && detailRows(nodes)[3].hidden, "GBM row and details hidden");
+  nodes["ec-view-all"].fire("click");
+  assert.ok(!summaryRows(nodes)[3].hidden && !detailRows(nodes)[3].hidden, "GBM details still expanded");
+});
+
+test("view toggle updates aria-pressed, the active state and the CSV URL", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const pressed = () => [nodes["ec-view-shown"], nodes["ec-view-all"]].map((b) => b.getAttribute("aria-pressed"));
+  const active = () => [nodes["ec-view-shown"], nodes["ec-view-all"]].map((b) => b.classList.contains("active"));
+  assert.deepStrictEqual(pressed(), ["true", "false"]);
+  assert.deepStrictEqual(active(), [true, false]);
+  assert.strictEqual(nodes["ec-export"].getAttribute("href"), "/v1/expression-context/genes/ERBB2/export.csv");
+
+  nodes["ec-view-all"].fire("click");
+  assert.deepStrictEqual(pressed(), ["false", "true"]);
+  assert.deepStrictEqual(active(), [false, true]);
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/ERBB2/export.csv?include_excluded=true",
+  );
+  assert.strictEqual(nodes["ec-export-golden"].getAttribute("href"), "/v1/expression-context/golden-set.csv?genes=ERBB2");
+
+  nodes["ec-view-shown"].fire("click");
+  assert.deepStrictEqual(pressed(), ["true", "false"]);
+  assert.strictEqual(nodes["ec-export"].getAttribute("href"), "/v1/expression-context/genes/ERBB2/export.csv");
+});
+
+test("a gene with no shown cancer types gets an empty state pointing at the All view", async () => {
+  const v = view();
+  v.pairs = v.pairs.slice(2);
+  v.summary = { surfaced: 0, literature_pending: 0, excluded: 2 };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  assert.ok(!nodes["ec-table-empty"].hidden);
+  assert.ok(nodes["ec-table-empty"].textContent.includes("All cancer types"));
+  assert.ok(nodes["ec-table-empty"].textContent.includes("2 excluded"));
+  assert.ok(nodes["ec-table"].hidden);
+  nodes["ec-view-all"].fire("click");
+  assert.ok(nodes["ec-table-empty"].hidden);
+  assert.ok(!nodes["ec-table"].hidden);
+  assert.strictEqual(visibleSummaryRows(nodes).length, 2);
+});
+
+test("toolbar holds the view toggle and both downloads; release shows in the summary", async () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  const toolbar = html.match(/<div class="ec-toolbar" id="ec-toolbar">([\s\S]*?)<p class="api-keys-empty ec-table-empty/);
+  assert.ok(toolbar, "page has a toolbar above the table");
+  for (const id of ["ec-view-shown", "ec-view-all", "ec-view-count", "ec-export", "ec-export-golden"]) {
+    assert.ok(toolbar[1].includes(`id="${id}"`), `${id} lives in the toolbar`);
+  }
+  assert.ok(toolbar[1].indexOf('id="ec-view-shown"') < toolbar[1].indexOf('id="ec-export"'), "toggle is left of downloads");
+  assert.ok(/role="group"/.test(toolbar[1]) && /aria-pressed="true"/.test(toolbar[1]), "toggle is an aria-pressed group");
+
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  assert.ok(!nodes["ec-export"].hidden && !nodes["ec-export-golden"].hidden, "both downloads render");
+  assert.ok(nodes["ec-release"].textContent.includes(BUNDLE.release_id));
+});
+
+test("the cBioPortal reading guide is collapsed by default and keeps its content", () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  const help = html.match(/<details class="ec-help" id="ec-cbio-help"([^>]*)>([\s\S]*?)<\/details>/);
+  assert.ok(help, "reading guide is a <details> disclosure");
+  assert.ok(!/\bopen\b/.test(help[1]), "collapsed by default");
+  assert.ok(/<summary>[\s\S]*How to read these plots[\s\S]*<\/summary>/.test(help[2]));
+  const text = help[2].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  for (const phrase of [
+    "single-cancer plots auto-scale their y-axis",
+    "detailed diagnosis categories",
+    "only part of BRCA, not the whole cohort",
+    "cluster of high dots rather than the median",
+    "metastatic or recurrent samples and repeat patients",
+    "not a reproduction of our test",
+    "genomic alteration, not this expression result",
+    "can differ from the release shown here",
+  ]) {
+    assert.ok(text.includes(phrase), `guide keeps: ${phrase}`);
+  }
+  assert.ok(!html.includes("ec-cbio-note"), "the old always-visible note is gone");
 });
 
 (async () => {
