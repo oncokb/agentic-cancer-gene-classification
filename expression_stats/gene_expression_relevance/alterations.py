@@ -556,6 +556,10 @@ def compute(inputs, mapping, selection, ids, catalog, aliases, driver, params=AL
     n_genes, n_codes = len(ids), len(codes)
     reasons = {category: {} for category in ALTERATION_CATEGORIES}
     cohorts = {}
+    # Patient-level counts rely on one selected sample per patient across all cohorts.
+    patients = [sample_id[:12] for study in studies for sample_id in selection[study]]
+    if len(patients) != len(set(patients)):
+        raise ValueError("Sample selection must contain at most one sample per patient")
 
     # Point Mutation ------------------------------------------------------------------
     resolved_drivers = {symbol: genes.entrez(symbol) for symbol in sorted(driver.genes)}
@@ -621,7 +625,14 @@ def compute(inputs, mapping, selection, ids, catalog, aliases, driver, params=AL
         data, cases = inputs[study]["cna"]["data"], inputs[study]["cna"]["cases"]
         columns = list(data["samples"])
         listed = cases & set(columns)
-        profiled = [k for k, s in enumerate(columns) if s in listed and s in set(selection[study])]
+        # Exactly one GISTIC column per selected patient: the column whose sample ID equals
+        # the patient's selected expression sample; if the file repeats that ID, the first
+        # such column in file order. Other samples of the patient never count.
+        selected, profiled = set(selection[study]), []
+        for k, sample_id in enumerate(columns):
+            if sample_id in listed and sample_id in selected:
+                selected.discard(sample_id)
+                profiled.append(k)
         reasons[COPY_NUMBER_ALTERATION][j] = _cohort_reason(
             "Copy Number Alteration", listed, profiled
         )
@@ -633,12 +644,9 @@ def compute(inputs, mapping, selection, ids, catalog, aliases, driver, params=AL
         a, d, m = cna_counts(data["calls"][:, profiled], rows, n_genes)
         amp[:, j], deletion[:, j], measured[:, j] = a, d, m
     cna = {"amp": fisher(amp, measured), "del": fisher(deletion, measured)}
-    joint = bh(np.concatenate([cna["amp"]["p_value"], cna["del"]["p_value"]], axis=1))
-    for k, direction in enumerate(("amp", "del")):
-        part = cna[direction]
-        part["q_value"] = np.where(
-            np.isfinite(part["p_value"]), joint[:, k * n_codes : (k + 1) * n_codes], np.nan
-        )
+    # One BH family per gene x direction across the 32 cohorts (as for PM and SV).
+    for part in cna.values():
+        part["q_value"] = np.where(np.isfinite(part["p_value"]), bh(part["p_value"]), np.nan)
 
     def cna_gene_reason(i, j):
         if not present[i]:

@@ -189,10 +189,11 @@ def test_early_exit_checks_method_commit_options_hashes_and_ttl():
         assert not unchanged({**manifest, key: value}, *args, now=now)
 
 
-def test_cli_dispatch(monkeypatch):
+@pytest.mark.parametrize("flags", [[], ["--skip-alterations"], ["--delete-alteration-downloads"]])
+def test_cli_dispatch(monkeypatch, flags):
     cli = importlib.import_module("gene_expression_relevance.__main__")
     calls = []
-    monkeypatch.setattr(cli, "build", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(cli, "build", lambda *args, **kwargs: calls.append((args, kwargs)))
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -205,11 +206,17 @@ def test_cli_dispatch(monkeypatch):
             "--genes",
             "ALB,TP53",
             "--skip-precheck",
+            *flags,
         ],
     )
     cli.main()
-    assert calls[0][0] == "a" * 40
-    assert calls[0][-2:] == (["ALB", "TP53"], True)
+    args, kwargs = calls[0]
+    assert args[0] == "a" * 40
+    assert args[-2:] == (["ALB", "TP53"], True)
+    assert kwargs == dict(
+        skip_alterations="--skip-alterations" in flags,
+        delete_downloads="--delete-alteration-downloads" in flags,
+    )
 
 
 def test_matrix_duplicate_entrez_averages_linear_values(tmp_path):

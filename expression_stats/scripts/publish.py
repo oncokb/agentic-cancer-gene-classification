@@ -1,6 +1,7 @@
 """Publish only complete builds, as verified draft-first GitHub releases."""
 
 import argparse
+import gzip
 import json
 import os
 import runpy
@@ -16,6 +17,24 @@ PANEL_PATH = PROJECT_ROOT / "controls.yaml"
 CONTROLS = runpy.run_path(str(PROJECT_ROOT / "gene_expression_relevance/controls.py"))
 expected_counts = CONTROLS["expected_counts"]
 expected_alteration_counts = CONTROLS["expected_alteration_counts"]
+control_genes = CONTROLS["control_genes"]
+recheck_controls = CONTROLS["recheck"]
+
+
+def bundled_documents(payload, genes):
+    """Per-gene documents for `genes` from genes.jsonl.gz (absent genes are omitted)."""
+    documents = {}
+    with gzip.open(payload, "rt", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            document = json.loads(line)
+            symbol = document["gene"]["hugo_symbol"]
+            if symbol in genes:
+                if symbol in documents:
+                    raise ValueError(f"Duplicate gene in bundle: {symbol}")
+                documents[symbol] = document
+    return documents
 
 
 def gh(*args):
@@ -63,6 +82,14 @@ def publish(directory):
         or alterations.get("failures") != []
     ):
         raise ValueError("A complete passing controls report is required for publication")
+    payload = directory / "genes.jsonl.gz"
+    if sha256(payload) != manifest["sha256"] or payload.stat().st_size != manifest["size_bytes"]:
+        raise ValueError("Bundle integrity mismatch")
+    # Never trust copied counters: re-derive every control from the bundled gene results.
+    documents = bundled_documents(payload, control_genes(panel))
+    problems = recheck_controls(report, lambda gene: documents.get(gene), codes, panel)
+    if problems:
+        raise ValueError("Bundled gene results fail the control recheck: " + "; ".join(problems))
     tag = manifest["bundle_tag"]
     # Paginate: application releases and old bundles may exceed one API page.
     releases = json.loads(gh("api", "--paginate", "--slurp", "repos/{owner}/{repo}/releases"))
@@ -73,9 +100,6 @@ def publish(directory):
                     raise ValueError(f"stale draft {release['id']}; delete it")
                 print(f"Release {tag} already exists; skipping")
                 return
-    payload = directory / "genes.jsonl.gz"
-    if sha256(payload) != manifest["sha256"] or payload.stat().st_size != manifest["size_bytes"]:
-        raise ValueError("Bundle integrity mismatch")
     name = f"Expression stats {manifest['release_id']} (PubMed {manifest['pubmed_snapshot_date']})"
     created = json.loads(
         gh(

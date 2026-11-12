@@ -281,6 +281,41 @@ def test_cna_amplification_and_deletion_are_tested_separately(result):
     assert category(result, "TP53", "AA", COPY_NUMBER_ALTERATION)["status"] == "not_enriched"
 
 
+def test_duplicate_gistic_columns_count_one_patient_once(tmp_path):
+    inputs, mapping, selection = synthetic(tmp_path)
+    data = inputs["AA"]["cna"]["data"]
+    first = selection["AA"][0]
+    # Repeat patient AA-0000's amplified column, plus a column for another sample (-06)
+    # of the same patient: still one patient in numerator and denominator.
+    extra = np.array([[2, 2], [0, 0]], dtype=np.int8)
+    data["calls"] = np.concatenate([data["calls"], extra], axis=1)
+    data["samples"] = np.concatenate([data["samples"], [first, first[:13] + "06"]])
+    inputs["AA"]["cna"]["cases"] |= {first[:13] + "06"}
+    result = alterations.compute(inputs, mapping, selection, IDS, CATALOG, {}, DRIVER)
+    erbb2 = category(result, "ERBB2", "AA", COPY_NUMBER_ALTERATION)
+    assert (erbb2["n_events"], erbb2["n_profiled"]) == (10, 30)
+    assert result.summary["cohorts"]["AA"][COPY_NUMBER_ALTERATION]["n_profiled"] == 30
+
+
+def test_selection_with_two_samples_of_one_patient_is_rejected(tmp_path):
+    inputs, mapping, selection = synthetic(tmp_path)
+    selection["BB"].append(selection["AA"][0][:13] + "06")
+    with pytest.raises(ValueError, match="one sample per patient"):
+        alterations.compute(inputs, mapping, selection, IDS, CATALOG, {}, DRIVER)
+
+
+def test_cna_bh_is_per_direction(result):
+    amp = result.results[COPY_NUMBER_ALTERATION]["amp"]
+    deletion = result.results[COPY_NUMBER_ALTERATION]["del"]
+    for part in (amp, deletion):
+        expected = np.where(np.isfinite(part["p_value"]), bh(part["p_value"]), np.nan)
+        np.testing.assert_array_equal(part["q_value"], expected)
+    erbb2 = category(result, "ERBB2", "AA", COPY_NUMBER_ALTERATION)
+    assert erbb2["amp"]["q_value"] == pytest.approx(
+        bh(amp["p_value"][ROW["ERBB2"] : ROW["ERBB2"] + 1])[0, 0]
+    )
+
+
 def test_metastatic_only_cna_is_not_testable(result):
     for gene in ("ERBB2", "TP53", "KRAS"):
         entry = category(result, gene, "SKCM", COPY_NUMBER_ALTERATION)

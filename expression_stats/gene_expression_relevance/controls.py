@@ -31,6 +31,23 @@ def expected_counts(panel):
 ALL_COHORTS = "*"
 
 
+def document_loader(source):
+    """`source` is a directory of <GENE>.json files or a callable gene -> document."""
+    if callable(source):
+        return source
+
+    def load(gene):
+        path = Path(source) / f"{gene}.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    return load
+
+
+def control_genes(panel):
+    rows = panel["controls"] + panel.get("alteration_controls", [])
+    return {row["gene"] for row in rows}
+
+
 def expand_alteration_controls(panel, codes):
     """Explicit alteration control rows; tcga "*" means one row per build cohort."""
     rows, ids, keys = [], set(), set()
@@ -60,12 +77,12 @@ def expected_alteration_counts(panel, codes):
 def evaluate_alterations(genes_dir, codes, *, subset=False, panel=None, skipped=False):
     """Category statuses for alteration controls; missing pairs fail closed."""
     panel = json.loads(PANEL_PATH.read_text()) if panel is None else panel
+    load = document_loader(genes_dir)
     rows, failures, documents = [], [], {}
     for control in expand_alteration_controls(panel, codes):
         gene = control["gene"]
         if gene not in documents:
-            path = Path(genes_dir) / f"{gene}.json"
-            documents[gene] = json.loads(path.read_text()) if path.exists() else {}
+            documents[gene] = load(gene) or {}
         record = next(
             (
                 r
@@ -124,10 +141,10 @@ def evaluate(genes_dir, *, subset=False, panel=None, codes=None, alterations=Non
     """
     panel = json.loads(PANEL_PATH.read_text()) if panel is None else panel
     expected_counts(panel)
+    load = document_loader(genes_dir)
     rows, failures = [], []
     for control in panel["controls"]:
-        path = Path(genes_dir) / f"{control['gene']}.json"
-        document = json.loads(path.read_text()) if path.exists() else {}
+        document = load(control["gene"]) or {}
         record = next(
             (r for r in document.get("cancer_types", []) if r["oncotree_code"] == control["tcga"]),
             {},
@@ -172,3 +189,55 @@ def evaluate(genes_dir, *, subset=False, panel=None, codes=None, alterations=Non
 def require_passed(report):
     if report["status"] != "passed":
         raise ValueError(f"Controls gate {report['status']}: {report['failures']}")
+
+
+SUMMARY_KEYS = (
+    "status",
+    "positive_passed",
+    "positive_total",
+    "negative_passed",
+    "negative_total",
+    "missing",
+    "failures",
+)
+
+
+def summary(report):
+    """The decision-relevant view of a report: counters plus every control's call."""
+    view = {key: report.get(key) for key in SUMMARY_KEYS}
+    view["controls"] = [
+        (row.get("id"), row.get("observed"), row.get("matched"))
+        for row in report.get("controls", [])
+    ]
+    alterations = report.get("alterations") or {}
+    view["alterations"] = {key: alterations.get(key) for key in SUMMARY_KEYS}
+    view["alterations"]["controls"] = [
+        (
+            row.get("id"),
+            row.get("observed"),
+            list(row.get("enriched_directions") or []),
+            row.get("n_events"),
+            row.get("n_profiled"),
+            row.get("matched"),
+        )
+        for row in alterations.get("controls", [])
+    ]
+    return view
+
+
+def recheck(report, source, codes, panel=None):
+    """Re-derive every control from bundled gene documents; return a list of problems.
+
+    Used by the publisher, which must not trust counters copied into the report.
+    """
+    derived = evaluate(source, panel=panel, codes=codes, alterations=True)
+    problems = []
+    if derived["status"] != "passed":
+        problems.append(f"re-derived controls {derived['status']}: {derived['failures']}")
+    if derived["alterations"]["status"] != "passed":
+        problems.append(
+            f"re-derived alteration controls failed: {derived['alterations']['failures']}"
+        )
+    if summary(derived) != summary(report):
+        problems.append("controls report disagrees with the bundled gene results")
+    return problems

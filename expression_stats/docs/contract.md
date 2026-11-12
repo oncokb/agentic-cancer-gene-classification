@@ -177,6 +177,16 @@ measured value for the gene). Unprofiled patients never enter a target or rest
 denominator as wild type. Point Mutation additionally excludes hypermutated tumours
 (below) from both target and rest.
 
+Matching is by the patient's **selected sample ID** only (15-character
+`TCGA-XX-XXXX-NN`; longer aliquot barcodes are truncated to it). Other samples of the
+same patient (for example a `06` metastasis) never count. Each patient contributes at
+most one sample to numerator and denominator: for CNA exactly one GISTIC column is
+used, the column whose ID equals the selected sample (if a file repeated that ID, the
+first such column in file order); mutation and fusion events are de-duplicated per
+(gene, selected sample). The build refuses a selection with two samples of one patient.
+In the pinned data every GISTIC column, MAF `Tumor_Sample_Barcode` and SV `Sample_Id` is
+already a unique 15-character sample ID, so these rules are safeguards.
+
 **Event definitions (patient level; a patient counts once per gene and category).**
 
 - *Point Mutation* — putative drivers under the TCGA-derived rule of
@@ -207,8 +217,9 @@ denominator as wild type. Point Mutation additionally excludes hypermutated tumo
 **Test.** For each gene, category (and CNA direction) and cohort: one-sided Fisher exact
 test (hypergeometric upper tail) of `[[events, profiled − events], [rest_events,
 rest_profiled − rest_events]]`, the cohort versus the other 31 cohorts' profiled
-patients. BH runs across the 32 cohorts per gene per category; for CNA the family is
-the 64 amp+del comparisons of that gene. Undefined comparisons enter BH as p=1 and
+patients. BH runs across the 32 cohorts separately for each gene × category, and for
+CNA separately for each direction (one 32-comparison family for `amp`, another for
+`del`), matching Point Mutation and Structural Variant. Undefined comparisons enter BH as p=1 and
 serialize as null. `ratio = frequency / rest_frequency` (null when rest frequency is 0;
 a zero rest with ≥1 target event passes the ratio gate as unbounded). Enriched requires
 **all** of the category gates:
@@ -322,6 +333,16 @@ any alteration failure fails the whole gate before PubMed. Publication additiona
 requires `build.skip_alterations == false`, a passing alteration sub-report,
 13/13 positives, 0/66 negative passes and zero missing. `--skip-alterations` and subset
 builds are review-only.
+
+**Publish-time recheck.** The publisher does not trust counters or statuses copied into
+`controls-report.json` or the manifest. After verifying `genes.jsonl.gz` size and
+SHA-256, it reads every expression and alteration control gene's document from the
+bundle and re-derives each control with the same stdlib evaluator: the expression
+`stats_pass` for the cohort, and the alteration category status (and required CNA
+direction) for the cohort. It refuses to publish if a control gene or record is
+missing, a positive is not enriched/passing, a negative is enriched/passing, or the
+re-derived counters or per-control calls (id, observed, directions, events, profiled,
+matched) disagree with the bundled report.
 
 PubMed runs only for final stats-passing pairs, using
 `"GENE"[tiab] AND (<tumor_type_query>)`. Precheck passes for count>=1. Cached
