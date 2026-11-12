@@ -46,7 +46,6 @@ const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
   "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
   "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
-  "ec-provenance", "ec-provenance-status",
 ];
 
 const response = (body, status = 200) => ({ status, json: async () => body });
@@ -237,12 +236,7 @@ test("renders statistics, calls, flags and the literature verdict", async () => 
   assert.strictEqual(gbm[4], "Excluded: statistics");
   assert.ok(details[3].text.includes("— (3.10)"));
   assert.deepStrictEqual(replaced, ["?gene=ERBB2"]);
-  // Provenance from the stats view.
-  const prov = nodes["ec-provenance"].children.map((c) => c.text);
-  assert.ok(prov.includes("Release ID") && prov.includes(BUNDLE.release_id));
-  assert.ok(prov.includes("PubMed snapshot") && prov.includes("2026-11-02"));
-  const bundleLink = nodes["ec-provenance"].findAll((n) => n.tagName === "a")[0];
-  assert.strictEqual(bundleLink.getAttribute("href"), BUNDLE.release_url);
+  assert.strictEqual(nodes["ec-release"].textContent, `Data release ${BUNDLE.release_id}`);
   assert.strictEqual(page.state.view.hugo_symbol, "ERBB2");
 });
 
@@ -364,9 +358,6 @@ test("an expired PubMed pre-check is labelled, not shown as a failure", async ()
   const ucecDetails = detailRows(nodes)[2].text;
   assert.ok(ucecDetails.includes("Pre-check expired (0)"), ucecDetails);
   assert.strictEqual(ucec[4], "Awaiting literature check");
-  const prov = nodes["ec-provenance"].children.map((c) => c.text);
-  const at = prov.indexOf("PubMed pre-check expires");
-  assert.ok(at >= 0 && prov[at + 1] === "2026-10-01T00:00:00Z");
 });
 
 test("method m3: enrichment labels, broad markers and subgroup statistics", async () => {
@@ -470,7 +461,11 @@ test("invalid input is rejected without a request", async () => {
   assert.match(nodes["ec-error"].textContent, /gene symbol/);
 });
 
-for (const [status, pattern] of [[503, /not loaded yet/], [404, /NOPE1 is not in/], [500, /couldn't load/]]) {
+for (const [status, pattern] of [
+  [503, /^Expression data hasn't loaded yet\. Try again in a few minutes\.$/],
+  [404, /^NOPE1 is not in the current expression data\.$/],
+  [500, /couldn't load/],
+]) {
   test(`HTTP ${status} shows a clear message`, async () => {
     const { nodes, page } = env({ "GET /v1/expression-context/stats/NOPE1": response({ detail: "x" }, status) });
     await page.lookup("nope1");
@@ -527,42 +522,52 @@ test("a failed job or a foreign status URL is reported, not followed", async () 
   }
 });
 
-test("bundle status: provenance, pinned tag, and only a current refresh error", async () => {
-  const refresh = {
-    last_checked_at: "2026-11-06T12:00:00Z", last_error: "GitHub rate limit", last_error_at: "2026-11-06T13:00:00Z",
-    pinned_bundle_tag: "expression-stats-x-pubmed-20261102", releases_repo: "oncokb/agentic-cancer-gene-classification",
-  };
-  const { nodes, page } = env({ "GET /v1/expression-context/bundle": response({ active: BUNDLE, refresh }) });
-  await page.init();
-  const text = nodes["ec-provenance"].children.map((c) => c.text);
-  assert.ok(text.includes("Pinned to") && text.includes("Last refresh error") && text.includes("GitHub rate limit"));
-  assert.strictEqual(nodes["ec-provenance-status"].textContent, "");
+test("the page no longer shows the statistics bundle or calls /bundle", async () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  assert.ok(!html.includes("ec-provenance"), "provenance card is gone");
+  assert.ok(!/statistics bundle/i.test(html), "no bundle wording in the page");
+  const js = fs.readFileSync(path.join(__dirname, "../../src/expression_context/static/expression-context.js"), "utf8");
+  assert.ok(!js.includes("/bundle"), "page code never requests /bundle");
+  for (const wording of ["statistics bundle", "bundle status", "Bundle"]) {
+    assert.ok(!js.includes(wording), `no user-facing "${wording}" wording`);
+  }
 
-  const stale = { ...refresh, last_error_at: "2026-11-06T11:00:00Z" };
-  const second = env({ "GET /v1/expression-context/bundle": response({ active: { ...BUNDLE, release_url: "https://evil.example/x" }, refresh: stale }) });
-  await second.page.init();
-  const staleText = second.nodes["ec-provenance"].children.map((c) => c.text);
-  assert.ok(!staleText.includes("Last refresh error"), "an error older than the last good check is history");
-  assert.strictEqual(second.nodes["ec-provenance"].findAll((n) => n.tagName === "a").length, 0, "non-GitHub release links are not linked");
+  // Init without ?gene= makes no requests at all; with ?gene= only the stats lookup.
+  const empty = env({});
+  await empty.page.init();
+  assert.deepStrictEqual(empty.calls, []);
+  const deep = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) }, { search: "?gene=erbb2" });
+  await deep.page.init();
+  assert.deepStrictEqual(deep.calls.map((c) => c.url), ["/v1/expression-context/stats/ERBB2"]);
 });
 
-test("no bundle loaded yet", async () => {
-  const { nodes, page } = env({ "GET /v1/expression-context/bundle": response({ active: null, refresh: { releases_repo: "r" } }) });
-  await page.init();
-  assert.strictEqual(nodes["ec-provenance-status"].textContent, "No statistics bundle is loaded yet.");
+test("the summary shows only the data release, not bundle internals", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const text = nodes["ec-release"].textContent;
+  assert.strictEqual(text, `Data release ${BUNDLE.release_id}`);
+  assert.ok(!/method|PubMed snapshot/.test(text));
+});
+
+test("the table empty state is a polite live status region", () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  const tag = html.match(/<p\b[^>]*id="ec-table-empty"[^>]*>/);
+  assert.ok(tag, "#ec-table-empty exists");
+  assert.ok(tag[0].includes('role="status"'), tag[0]);
+  assert.ok(tag[0].includes('aria-live="polite"'), tag[0]);
 });
 
 test("deep link ?gene= loads the gene on init", async () => {
   const { nodes, calls } = env({
-    "GET /v1/expression-context/bundle": response({ active: BUNDLE, refresh: { releases_repo: "r" } }),
     "GET /v1/expression-context/stats/HER2": response(view({ query: "her2" })),
   }, { search: "?gene=her2" });
   const page = createExpressionContextPage({
     document: { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) },
     window: { location: { search: "?gene=her2", pathname: "/expression-context" }, history: null, setTimeout: (fn) => fn() },
-    fetch: async (url) => (url.endsWith("/bundle")
-      ? response({ active: BUNDLE, refresh: { releases_repo: "r" } })
-      : response(view({ query: "her2" }))),
+    fetch: async (url) => {
+      assert.ok(!url.endsWith("/bundle"), "init must not request /bundle");
+      return response(view({ query: "her2" }));
+    },
   });
   await page.init();
   assert.strictEqual(nodes["ec-gene"].value, "her2");
