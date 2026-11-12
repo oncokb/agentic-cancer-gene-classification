@@ -31,41 +31,80 @@
       <section class="api-keys-card" aria-labelledby="ec-search-heading">
         <h2 id="ec-search-heading" class="ec-visually-hidden">Look up a gene</h2>
         <form class="ec-form" id="ec-form" autocomplete="off">
-          <label for="ec-gene">Gene</label>
-          <input id="ec-gene" name="gene" type="text" placeholder="e.g. ERBB2" maxlength="64" spellcheck="false" />
+          <label class="field ec-gene-field" for="ec-gene">
+            <span>Gene</span>
+            <input id="ec-gene" name="gene" type="text" placeholder="e.g. ERBB2" maxlength="64" spellcheck="false" />
+          </label>
           <button class="primary-action" id="ec-submit" type="submit">Show statistics</button>
         </form>
-        <div class="api-keys-alert hidden" id="ec-error" role="alert"></div>
-        <p class="api-keys-empty hidden" id="ec-loading">Loading…</p>
+        <div class="api-keys-alert ec-state hidden" id="ec-error" role="alert"></div>
+        <p class="api-keys-empty ec-state hidden" id="ec-loading" role="status">Loading…</p>
       </section>
 
-      <section class="api-keys-card hidden" id="ec-result" aria-labelledby="ec-gene-title">
+      <section class="api-keys-card ec-result hidden" id="ec-result" aria-labelledby="ec-gene-title">
         <div class="ec-result-head">
-          <h2 id="ec-gene-title"></h2>
-          <p class="ec-summary" id="ec-summary"></p>
-          <p class="ec-cbio" id="ec-cbio"></p>
-          <p class="ec-cbio-note">
-            Use the "Compare across all 32 cancer types" link for cross-cancer comparison;
-            single-cancer plots auto-scale their y-axis. The "mRNA vs Dx" links use detailed
-            diagnosis categories, which are subdivisions of a cancer type and can be very small: a
-            label such as "Breast Invasive Carcinoma (NOS)" is only part of BRCA, not the whole
-            cohort. For "Subgroup enriched" results, look at the cluster of high dots rather than
-            the median. cBioPortal can include metastatic or recurrent samples and repeat patients,
-            so its sample counts differ from ours. The plot is a visual check, not a reproduction of
-            our test. The header's "altered in X%" is genomic alteration, not this expression result.
-            cBioPortal shows live data, which can differ from the release shown here.
-          </p>
+          <div class="ec-result-title">
+            <h2 id="ec-gene-title"></h2>
+            <p class="ec-summary" id="ec-summary"></p>
+            <p class="ec-release" id="ec-release"></p>
+          </div>
+          <div class="ec-run-wrap">
+            <button class="primary-action hidden" id="ec-run" type="button">Run literature check</button>
+            <span class="ec-job-status" id="ec-job-status" role="status" aria-live="polite"></span>
+          </div>
         </div>
-        <div class="ec-actions">
-          <button class="primary-action hidden" id="ec-run" type="button">Run literature check</button>
-          <a class="ec-export-link hidden" id="ec-export" href="#">Download CSV</a>
-          <a class="ec-export-link hidden" id="ec-export-golden" href="#">Download golden-set row</a>
-          <label class="ec-export-toggle hidden" id="ec-export-toggle-wrap">
-            <input id="ec-export-include-excluded" type="checkbox" />
-            include excluded cancer types
-          </label>
-          <span class="ec-job-status" id="ec-job-status" role="status" aria-live="polite"></span>
+
+        <div class="ec-cbio-block">
+          <div class="ec-cbio-row">
+            <span class="field-label">cBioPortal</span>
+            <span class="ec-cbio" id="ec-cbio"></span>
+          </div>
+          <details class="ec-help" id="ec-cbio-help">
+            <summary>
+              <span class="ec-help-icon" aria-hidden="true">i</span>
+              How to read these plots
+              <span class="ec-help-hint">— a visual check on live cBioPortal data, not a reproduction of our test</span>
+            </summary>
+            <ul class="ec-help-body">
+              <li>
+                Use the "Compare across all 32 cancer types" link for cross-cancer comparison;
+                single-cancer plots auto-scale their y-axis.
+              </li>
+              <li>
+                The "mRNA vs Dx" links use detailed diagnosis categories, which are subdivisions of
+                a cancer type and can be very small: a label such as "Breast Invasive Carcinoma
+                (NOS)" is only part of BRCA, not the whole cohort.
+              </li>
+              <li>
+                For "Subgroup enriched" results, look at the cluster of high dots rather than the
+                median.
+              </li>
+              <li>
+                cBioPortal can include metastatic or recurrent samples and repeat patients, so its
+                sample counts differ from ours. The plot is a visual check, not a reproduction of
+                our test.
+              </li>
+              <li>The header's "altered in X%" is genomic alteration, not this expression result.</li>
+              <li>cBioPortal shows live data, which can differ from the release shown here.</li>
+            </ul>
+          </details>
         </div>
+
+        <div class="ec-toolbar" id="ec-toolbar">
+          <div class="ec-toolbar-group">
+            <div class="input-mode-tabs ec-view-toggle" role="group" aria-label="Cancer types in the table">
+              <button class="mode-tab active" id="ec-view-shown" type="button" aria-pressed="true" aria-controls="ec-table">Shown only</button>
+              <button class="mode-tab" id="ec-view-all" type="button" aria-pressed="false" aria-controls="ec-table">All cancer types</button>
+            </div>
+            <span class="ec-view-count" id="ec-view-count" aria-live="polite"></span>
+          </div>
+          <div class="ec-toolbar-group ec-downloads">
+            <a class="ec-button primary-action hidden" id="ec-export" href="#">Download CSV</a>
+            <a class="ec-button hidden" id="ec-export-golden" href="#">Download golden-set row</a>
+          </div>
+        </div>
+
+        <p class="api-keys-empty ec-table-empty hidden" id="ec-table-empty" role="status" aria-live="polite"></p>
         <div class="api-keys-table-wrap">
           <table class="api-keys-table ec-table" id="ec-table">
             <thead>
@@ -82,12 +121,6 @@
             <tbody id="ec-tbody"></tbody>
           </table>
         </div>
-      </section>
-
-      <section class="api-keys-card" id="ec-provenance-card" aria-labelledby="ec-provenance-heading">
-        <h2 id="ec-provenance-heading">Statistics bundle</h2>
-        <p class="api-keys-empty" id="ec-provenance-status">Loading…</p>
-        <dl class="ec-provenance" id="ec-provenance"></dl>
       </section>
     </main>
 
