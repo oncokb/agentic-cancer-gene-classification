@@ -1,5 +1,7 @@
 /* Optional expression-context module (src/expression_context/; see REMOVAL.md).
-   Builds on /static/styles.css; only page-specific rules live here. */
+   Builds on /static/styles.css (api-keys page/card/table, .field, .primary-action,
+   .input-mode-tabs/.mode-tab, .review-badge, .field-label); only page-specific
+   layout lives here. */
 
 .ec-page {
   max-width: 1280px;
@@ -14,164 +16,367 @@
   white-space: nowrap;
 }
 
+/* Search */
+
 .ec-form {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
+  align-items: flex-end;
+  gap: 12px;
 }
 
-.ec-form input {
-  min-width: 12rem;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  font: inherit;
+.ec-gene-field {
+  flex: 0 1 18rem;
+}
+
+.ec-gene-field input {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
   text-transform: uppercase;
 }
 
-.ec-result-head h2 {
-  margin-bottom: 4px;
+.ec-state {
+  margin-top: 12px;
+}
+
+/* Result summary */
+
+.ec-result {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ec-result-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px 20px;
+}
+
+.api-keys-card .ec-result-title h2 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-size: 20px;
 }
 
 .ec-summary,
+.ec-release {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.ec-summary {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.ec-release {
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.ec-run-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px 12px;
+}
+
 .ec-job-status {
   color: var(--muted);
+  font-size: 13px;
+}
+
+/* cBioPortal links + collapsed reading guide */
+
+.ec-cbio-block {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.ec-cbio-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
 }
 
 .ec-cbio {
-  margin: 4px 0;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  font-size: 14px;
 }
 
-.ec-cbio a {
-  margin-right: 12px;
+.ec-cbio a,
+.ec-table a {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
 }
 
-.ec-cbio-note {
-  max-width: 60rem;
-  margin: 4px 0 0;
+.ec-cbio a:hover,
+.ec-table a:hover {
+  text-decoration: underline;
+}
+
+.ec-help {
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+.ec-help summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: 0 -4px;
+  color: var(--accent-strong);
+  font-weight: 700;
+  cursor: pointer;
+  list-style: none;
+}
+
+.ec-help summary::-webkit-details-marker {
+  display: none;
+}
+
+.ec-help summary:hover,
+.ec-help summary:focus-visible {
+  background: var(--surface-strong);
+}
+
+.ec-help-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  font-size: 10px;
+  font-style: italic;
+  font-family: Georgia, serif;
+}
+
+.ec-help-hint {
   color: var(--muted);
-  font-size: 0.85em;
+  font-weight: 400;
 }
 
-.ec-actions {
+.ec-help[open] .ec-help-hint {
+  display: none;
+}
+
+.ec-help-body {
+  max-width: 70ch;
+  margin: 8px 0 0;
+  border-left: 3px solid #b9d9d5;
+  border-radius: 0 6px 6px 0;
+  background: #eef9f7;
+  padding: 10px 14px 10px 30px;
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.ec-help-body li + li {
+  margin-top: 4px;
+}
+
+/* Toolbar: view toggle left, downloads right, one baseline */
+
+.ec-toolbar {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
   align-items: center;
-  margin: 8px 0 12px;
+  justify-content: space-between;
+  gap: 10px 16px;
 }
 
-.ec-export-link {
-  display: inline-block;
-  padding: 6px 12px;
+.ec-toolbar-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.ec-view-toggle .mode-tab {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 4px 14px;
+  font-size: 13px;
+}
+
+.ec-view-toggle .mode-tab:not(.active):hover {
+  color: var(--text);
+}
+
+.ec-view-toggle .mode-tab.active {
+  color: var(--accent-strong);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), inset 0 0 0 1px #b9d9d5;
+}
+
+.ec-view-count {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Link styled as ACGC's button (secondary by default, .primary-action for primary). */
+.ec-button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  color: inherit;
+  background: var(--surface);
+  color: var(--text);
+  padding: 8px 12px;
+  font-size: 14px;
+  font-weight: 700;
   text-decoration: none;
-  font-size: 0.9em;
+  white-space: nowrap;
 }
 
-.ec-export-link:hover,
-.ec-export-link:focus-visible {
-  border-color: var(--muted);
+.ec-button:not(.primary-action):hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
 }
 
-.ec-export-toggle {
-  display: inline-flex;
-  gap: 6px;
-  align-items: center;
-  color: var(--muted);
-  font-size: 0.9em;
-  cursor: pointer;
+.ec-button.primary-action {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.ec-button.primary-action:hover {
+  background: var(--accent-strong);
+}
+
+.ec-button:focus-visible,
+.ec-view-toggle .mode-tab:focus-visible,
+.ec-details-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Results table */
+
+.ec-table-empty {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
 }
 
 .ec-table td,
 .ec-table th {
-  white-space: nowrap;
   vertical-align: top;
 }
 
-.ec-table td.ec-num {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
+.ec-table td {
+  font-size: 13px;
+  white-space: normal;
 }
 
-.ec-row-surfaced {
-  background: color-mix(in srgb, var(--ok) 8%, transparent);
+.ec-table td:first-child {
+  min-width: 12rem;
+  font-weight: 600;
 }
 
-.ec-badge {
-  display: inline-block;
-  margin: 0 4px 2px 0;
-  padding: 1px 6px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  font-size: 0.85em;
+.ec-table td:nth-child(4) {
+  min-width: 16rem;
 }
 
-.ec-pass {
-  border-color: var(--ok);
-  color: var(--ok);
+.ec-table td .review-badge {
+  margin: 0 4px 3px 0;
 }
 
-.ec-fail {
-  border-color: var(--danger);
-  color: var(--danger);
+/* Long tumor-specific verdicts ("Supported in …") may wrap; other pills stay on one line. */
+.ec-table td:nth-child(4) .review-badge {
+  white-space: normal;
+  text-align: left;
+}
+
+.ec-row-surfaced > td {
+  background: #f1f9f4;
+}
+
+.ec-row-surfaced > td:first-child {
+  box-shadow: inset 3px 0 0 var(--ok);
+}
+
+.ec-row-excluded > td {
+  color: var(--muted);
+}
+
+.ec-row-excluded > td:not(:last-child) {
+  opacity: 0.7;
 }
 
 .ec-neutral {
   color: var(--muted);
 }
 
-.ec-warn {
-  border-color: var(--warning);
-  color: var(--warning);
-}
-
-.ec-pmids a {
-  margin-right: 6px;
+.ec-pmids {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
 }
 
 .ec-subgroup {
-  margin-top: 2px;
   color: var(--muted);
-  font-size: 0.85em;
-  white-space: nowrap;
+  font-size: 0.9em;
+}
+
+.ec-rationale {
+  max-width: 26rem;
+  margin-top: 4px;
+  white-space: normal;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .ec-details-toggle {
-  padding: 2px 8px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  font-size: 0.85em;
-  cursor: pointer;
+  min-height: 28px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-strong);
 }
 
-.ec-details-toggle:hover,
-.ec-details-toggle:focus-visible {
-  border-color: var(--muted);
+.ec-details-toggle[aria-expanded="true"] {
+  border-color: var(--accent);
+  background: #eef9f7;
 }
 
 .ec-table td.ec-detail-cell {
   white-space: normal;
-  background: color-mix(in srgb, var(--line) 12%, transparent);
-  padding: 10px 12px;
+  background: var(--bg);
+  padding: 12px 16px;
 }
 
 .ec-details-list {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
-  gap: 4px 16px;
+  gap: 6px 16px;
   margin: 0;
-  font-size: 0.9em;
 }
 
 .ec-details-list dt {
   color: var(--muted);
+  font-weight: 600;
 }
 
 .ec-details-list dd {
@@ -180,35 +385,48 @@
 }
 
 .ec-detail-hint {
-  color: var(--muted);
-  font-size: 0.85em;
+  font-weight: 400;
+  font-size: 12px;
 }
 
-.ec-result-head h2 .ec-badge {
-  margin-left: 8px;
-  font-size: 0.6em;
-  vertical-align: middle;
-}
-
-.ec-rationale {
-  max-width: 28rem;
-  white-space: normal;
-  color: var(--muted);
-  font-size: 0.85em;
-}
+/* Provenance */
 
 .ec-provenance {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
-  gap: 4px 16px;
+  gap: 6px 16px;
   margin: 0;
+  font-size: 13px;
 }
 
 .ec-provenance dt {
   color: var(--muted);
+  font-weight: 600;
 }
 
 .ec-provenance dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .ec-gene-field {
+    flex: 1 1 100%;
+  }
+
+  .ec-run-wrap,
+  .ec-downloads {
+    justify-content: flex-start;
+  }
+
+  .ec-details-list,
+  .ec-provenance {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .ec-details-list dd,
+  .ec-provenance dd {
+    margin-bottom: 6px;
+  }
 }
