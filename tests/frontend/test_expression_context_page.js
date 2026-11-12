@@ -742,14 +742,21 @@ test("CSV download link appears after a gene loads, encodes the symbol, and foll
     "/v1/expression-context/golden-set.csv?genes=ERBB2",
   );
 
+  // A different gene starts back on "Shown only".
   await page.lookup("NKX2-1");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
-    "/v1/expression-context/genes/NKX2-1/export.csv?include_excluded=true",
+    "/v1/expression-context/genes/NKX2-1/export.csv",
   );
   assert.strictEqual(
     nodes["ec-export-golden"].getAttribute("href"),
     "/v1/expression-context/golden-set.csv?genes=NKX2-1",
+  );
+
+  nodes["ec-view-all"].fire("click");
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/NKX2-1/export.csv?include_excluded=true",
   );
 
   nodes["ec-view-shown"].fire("click");
@@ -913,6 +920,58 @@ test("the cBioPortal reading guide is collapsed by default and keeps its content
     assert.ok(text.includes(phrase), `guide keeps: ${phrase}`);
   }
   assert.ok(!html.includes("ec-cbio-note"), "the old always-visible note is gone");
+});
+
+test("looking up a different gene resets the view toggle to Shown only", async () => {
+  const { nodes, page } = env({
+    "GET /v1/expression-context/stats/ERBB2": response(view()),
+    "GET /v1/expression-context/stats/NKX2-1": response(
+      view({ query: "nkx2-1", hugo_symbol: "NKX2-1", entrez_gene_id: 7080 }),
+    ),
+  });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  assert.strictEqual(page.state.showAll, true);
+  assert.strictEqual(nodes["ec-view-all"].getAttribute("aria-pressed"), "true");
+
+  await page.lookup("NKX2-1");
+  assert.strictEqual(page.state.showAll, false);
+  assert.strictEqual(nodes["ec-view-shown"].getAttribute("aria-pressed"), "true");
+  assert.strictEqual(nodes["ec-view-all"].getAttribute("aria-pressed"), "false");
+  assert.ok(nodes["ec-view-shown"].classList.contains("active"));
+  assert.ok(!nodes["ec-view-all"].classList.contains("active"));
+  assert.strictEqual(nodes["ec-export"].getAttribute("href"), "/v1/expression-context/genes/NKX2-1/export.csv");
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded (hidden)");
+  assert.strictEqual(summaryRows(nodes).filter((r) => !r.hidden).length, 2);
+});
+
+test("re-rendering the same gene (literature job refresh) keeps the All view", async () => {
+  let statsCalls = 0;
+  const { nodes, page } = env({
+    "GET /v1/expression-context/stats/ERBB2": () => {
+      statsCalls += 1;
+      return response(statsCalls === 1 ? view() : view({ summary: { surfaced: 2, literature_pending: 0, excluded: 2 } }));
+    },
+    "POST /v1/expression-context/jobs": response(
+      { job_id: "j1", status: "queued", status_url: "/v1/expression-context/jobs/j1" },
+      202,
+    ),
+    "GET /v1/expression-context/jobs/j1": response({
+      status: "succeeded", literature_evaluated: 1, literature_reused: 0, pair_errors: [],
+    }),
+  });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  await nodes["ec-run"].fire("click");
+  assert.strictEqual(statsCalls, 2, "the job re-rendered the same gene");
+  assert.strictEqual(page.state.showAll, true);
+  assert.strictEqual(nodes["ec-view-all"].getAttribute("aria-pressed"), "true");
+  assert.strictEqual(nodes["ec-view-shown"].getAttribute("aria-pressed"), "false");
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/ERBB2/export.csv?include_excluded=true",
+  );
+  assert.strictEqual(summaryRows(nodes).filter((r) => !r.hidden).length, 4);
 });
 
 (async () => {

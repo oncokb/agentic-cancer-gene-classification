@@ -426,6 +426,8 @@
     function render(view) {
       if (!state.view || state.view.hugo_symbol !== view.hugo_symbol) {
         state.expanded.clear();
+        // A new gene starts on "Shown only"; same-gene re-renders keep the view.
+        state.showAll = false;
       }
       state.view = view;
       const title = view.query && view.query.trim().toUpperCase() !== view.hugo_symbol
