@@ -10,6 +10,14 @@
     tissue_of_origin_risk: "Tissue of origin",
     small_n: "Small n",
   };
+  // ACGC's shared .review-badge tones (src/static/styles.css).
+  const BADGE_TONES = {
+    pass: "high",
+    info: "context",
+    fail: "quality-critical",
+    warn: "medium",
+    neutral: "low",
+  };
   const REASON_LABELS = {
     stats: "statistics",
     precheck: "PubMed pre-check",
@@ -66,9 +74,9 @@
   function friendlyError(status, gene) {
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
     if (status === 403) return "Your account isn't active yet. Please contact your AGCG administrator.";
-    if (status === 404) return `${gene} is not in the expression statistics bundle.`;
+    if (status === 404) return `${gene} is not in the current expression data.`;
     if (status === 422) return "Enter a gene symbol (letters, digits, '.', '_' or '-').";
-    if (status === 503) return "Expression statistics are not loaded yet. Please try again in a few minutes.";
+    if (status === 503) return "Expression data hasn't loaded yet. Try again in a few minutes.";
     if (status >= 500) return "The server couldn't load expression statistics right now. Please try again later.";
     return "Couldn't load expression statistics. Check your connection and try again.";
   }
@@ -77,13 +85,14 @@
     const el = {};
     for (const id of [
       "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-      "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-export-toggle-wrap",
-      "ec-export-include-excluded", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
+      "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
+      "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
     ]) {
       el[id] = doc.getElementById(id);
     }
     const sleep = wait || ((ms) => new Promise((done) => win.setTimeout(done, ms)));
-    const state = { view: null, loading: false, jobRunning: false, expanded: new Set() };
+    // showAll: the "All cancer types" view (excluded pairs listed, CSV include_excluded=true).
+    const state = { view: null, loading: false, jobRunning: false, expanded: new Set(), showAll: false, rows: [] };
 
     function show(node, visible) { if (node) node.classList.toggle("hidden", !visible); }
 
@@ -99,7 +108,9 @@
       return element;
     }
 
-    function badge(text, kind) { return node("span", text, `ec-badge ec-${kind}`); }
+    function badge(text, kind) {
+      return node("span", text, `review-badge ec-badge ec-${kind} ${BADGE_TONES[kind] || "low"}`);
+    }
 
     function cell(row, content, className) {
       const td = doc.createElement("td");
@@ -173,7 +184,7 @@
 
     function statsCell(pair) {
       const parts = [pair.stats_pass ? badge("Pass", "pass") : badge("Fail", "fail")];
-      if (pair.stats_pass && pair.enrichment) parts.push(badge(pair.enrichment, "pass"));
+      if (pair.stats_pass && pair.enrichment) parts.push(badge(pair.enrichment, "info"));
       // Lineage enrichment blocked by broad expression (method m3): shown, never passing.
       if (pair.broad_blocked) parts.push(badge("Broadly expressed", "warn"));
       return parts;
@@ -185,6 +196,8 @@
       const reason = REASON_LABELS[pair.exclusion_reason] || pair.exclusion_reason || "unknown";
       return [badge(`Excluded: ${reason}`, "neutral")];
     }
+
+    function isExcluded(pair) { return pair.status === "excluded"; }
 
     function precheckCell(pair) {
       const count = pair.stats.pubmed_count;
@@ -305,6 +318,7 @@
     function renderRows(pair, symbol) {
       const row = doc.createElement("tr");
       if (pair.status === "surfaced") row.setAttribute("class", "ec-row-surfaced");
+      else if (isExcluded(pair)) row.setAttribute("class", "ec-row-excluded");
       const s = pair.stats;
       const code = pair.oncotree_code;
       const name = pair.cancer_type_name ? `${pair.cancer_type_name} (${code})` : code;
@@ -329,53 +343,8 @@
       cell(row, resultCell(pair));
       cell(row, cbioportalCell(pair, symbol));
       cell(row, toggleBtn, "ec-toggle-cell");
+      state.rows.push({ pair, code, row, detailRow });
       return [row, detailRow];
-    }
-
-    function renderProvenance(bundle, refresh) {
-      const dl = el["ec-provenance"];
-      dl.replaceChildren();
-      if (!bundle) {
-        el["ec-provenance-status"].textContent = "No statistics bundle is loaded yet.";
-      } else {
-        el["ec-provenance-status"].textContent = "";
-      }
-      const add = (label, value, href) => {
-        if (value === null || value === undefined || value === "") return;
-        dl.appendChild(node("dt", label));
-        const dd = node("dd");
-        if (href) {
-          const link = node("a", value);
-          link.setAttribute("href", href);
-          link.setAttribute("target", "_blank");
-          link.setAttribute("rel", "noopener noreferrer");
-          dd.appendChild(link);
-        } else {
-          dd.textContent = String(value);
-        }
-        dl.appendChild(dd);
-      };
-      if (bundle) {
-        const source = bundle.source || {};
-        const releaseUrl = typeof bundle.release_url === "string" && bundle.release_url.startsWith("https://github.com/")
-          ? bundle.release_url : null;
-        add("Bundle", bundle.bundle_tag, releaseUrl);
-        add("Release ID", bundle.release_id);
-        add("Method version", bundle.method_version);
-        add("PubMed snapshot", bundle.pubmed_snapshot_date);
-        add("Genes", bundle.gene_count);
-        add("Datahub commit", source.datahub_commit);
-        add("Generated", source.generated_at);
-        add("PubMed pre-check expires", source.precheck_expires_at);
-        add("Published", bundle.published_at);
-        add("Loaded", bundle.loaded_at);
-      }
-      if (refresh) {
-        add("Last checked", refresh.last_checked_at);
-        if (refresh.pinned_bundle_tag) add("Pinned to", refresh.pinned_bundle_tag);
-        const errorIsCurrent = refresh.last_error && (!refresh.last_checked_at || refresh.last_error_at > refresh.last_checked_at);
-        if (errorIsCurrent) add("Last refresh error", refresh.last_error);
-      }
     }
 
     function hasStoredResult(view) {
@@ -389,30 +358,76 @@
       const view = state.view;
       const link = el["ec-export"];
       const goldenLink = el["ec-export-golden"];
-      const toggleWrap = el["ec-export-toggle-wrap"];
-      const toggle = el["ec-export-include-excluded"];
       const symbol = view && (view.hugo_symbol || view.query) ? String(view.hugo_symbol || view.query).trim() : "";
       if (!symbol || !hasStoredResult(view)) {
         show(link, false);
         show(goldenLink, false);
-        show(toggleWrap, false);
         return;
       }
-      const includeExcluded = Boolean(toggle && toggle.checked);
+      const includeExcluded = state.showAll;
       if (link) {
         link.setAttribute("href", exportURL(symbol, includeExcluded));
+        link.setAttribute(
+          "title",
+          includeExcluded ? "CSV of every cancer type, including excluded ones" : "CSV of the cancer types shown",
+        );
         show(link, true);
       }
       if (goldenLink) {
         goldenLink.setAttribute("href", goldenSetExportURL(symbol));
         show(goldenLink, true);
       }
-      show(toggleWrap, true);
+    }
+
+    // Applies the "Shown only" / "All cancer types" view to the toggle, the
+    // table rows, the count and the CSV link.
+    function applyView() {
+      const showAll = state.showAll;
+      for (const [id, pressed] of [["ec-view-shown", !showAll], ["ec-view-all", showAll]]) {
+        const button = el[id];
+        if (!button) continue;
+        button.setAttribute("aria-pressed", pressed ? "true" : "false");
+        button.classList.toggle("active", pressed);
+      }
+      for (const { pair, code, row, detailRow } of state.rows) {
+        const visible = showAll || !isExcluded(pair);
+        show(row, visible);
+        show(detailRow, visible && state.expanded.has(code));
+      }
+      const pairs = (state.view && state.view.pairs) || [];
+      const excluded = pairs.filter(isExcluded).length;
+      const shown = pairs.length - excluded;
+      if (el["ec-view-count"]) {
+        el["ec-view-count"].textContent = showAll
+          ? `${shown} shown · ${excluded} excluded`
+          : `${shown} shown · ${excluded} excluded (hidden)`;
+      }
+      const empty = !showAll && shown === 0 && pairs.length > 0;
+      if (el["ec-table-empty"]) {
+        el["ec-table-empty"].textContent = empty
+          ? `No cancer types pass for ${state.view.hugo_symbol} in this release. ` +
+            `Choose "All cancer types" to review the ${excluded} excluded.`
+          : "";
+        show(el["ec-table-empty"], empty);
+      }
+      show(el["ec-table"], !empty);
+      updateExportLink();
+    }
+
+    function setView(showAll) {
+      state.showAll = Boolean(showAll);
+      applyView();
+    }
+
+    function releaseText(bundle) {
+      return bundle && bundle.release_id ? `Data release ${bundle.release_id}` : "";
     }
 
     function render(view) {
       if (!state.view || state.view.hugo_symbol !== view.hugo_symbol) {
         state.expanded.clear();
+        // A new gene starts on "Shown only"; same-gene re-renders keep the view.
+        state.showAll = false;
       }
       state.view = view;
       const title = view.query && view.query.trim().toUpperCase() !== view.hugo_symbol
@@ -427,17 +442,18 @@
       el["ec-summary"].textContent =
         `${summary.surfaced || 0} surfaced · ${summary.literature_pending || 0} awaiting literature check · ` +
         `${summary.excluded || 0} excluded`;
+      if (el["ec-release"]) el["ec-release"].textContent = releaseText(view.bundle);
       show(el["ec-run"], (summary.literature_pending || 0) > 0 && !state.jobRunning);
-      updateExportLink();
       renderCbioCompare(view);
       el["ec-tbody"].replaceChildren();
+      state.rows = [];
       for (const pair of view.pairs || []) {
         for (const row of renderRows(pair, view.hugo_symbol)) {
           el["ec-tbody"].appendChild(row);
         }
       }
+      applyView();
       show(el["ec-result"], true);
-      renderProvenance(view.bundle, null);
     }
 
     async function getJson(url, options) {
@@ -457,18 +473,6 @@
       win.location.href = `/login?redirect_to=${encodeURIComponent(target)}`;
     }
 
-    async function loadBundleStatus() {
-      const { status, body } = await getJson(`${API}/bundle`);
-      if (status === 200 && body) {
-        if (!state.view) renderProvenance(body.active, body.refresh);
-        else renderProvenance(state.view.bundle, body.refresh);
-      } else if (status === 401) {
-        redirectToLogin();
-      } else {
-        el["ec-provenance-status"].textContent = "Couldn't load the bundle status.";
-      }
-    }
-
     async function lookup(rawGene) {
       const gene = String(rawGene || "").trim().toUpperCase();
       setError("");
@@ -484,6 +488,7 @@
         state.expanded.clear();
       }
       state.loading = true;
+      el["ec-loading"].textContent = `Loading ${gene}…`;
       show(el["ec-loading"], true);
       el["ec-submit"].disabled = true;
       try {
@@ -559,22 +564,19 @@
       return lookup(el["ec-gene"].value);
     });
     el["ec-run"].addEventListener("click", () => runLiteratureCheck());
-    if (el["ec-export-include-excluded"]) {
-      el["ec-export-include-excluded"].addEventListener("change", () => updateExportLink());
-    }
+    if (el["ec-view-shown"]) el["ec-view-shown"].addEventListener("click", () => setView(false));
+    if (el["ec-view-all"]) el["ec-view-all"].addEventListener("click", () => setView(true));
 
     async function init() {
       const params = new URLSearchParams(win.location.search || "");
       const gene = params.get("gene");
-      const tasks = [loadBundleStatus()];
       if (gene) {
         el["ec-gene"].value = gene;
-        tasks.push(lookup(gene));
+        await lookup(gene);
       }
-      await Promise.all(tasks);
     }
 
-    return { init, lookup, runLiteratureCheck, state };
+    return { init, lookup, runLiteratureCheck, setView, state };
   }
 
   if (typeof module !== "undefined" && module.exports) {

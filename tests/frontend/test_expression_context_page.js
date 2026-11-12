@@ -44,8 +44,8 @@ class Element {
 
 const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-  "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-export-toggle-wrap",
-  "ec-export-include-excluded", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
+  "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
+  "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
 ];
 
 const response = (body, status = 200) => ({ status, json: async () => body });
@@ -82,8 +82,10 @@ function env(routes, { search = "" } = {}) {
   nodes["ec-run"].classList.toggle("hidden", true);
   nodes["ec-export"].classList.toggle("hidden", true);
   nodes["ec-export-golden"].classList.toggle("hidden", true);
-  nodes["ec-export-toggle-wrap"].classList.toggle("hidden", true);
-  nodes["ec-export-include-excluded"].checked = false;
+  nodes["ec-table-empty"].classList.toggle("hidden", true);
+  nodes["ec-view-shown"].classList.toggle("active", true);
+  nodes["ec-view-shown"].setAttribute("aria-pressed", "true");
+  nodes["ec-view-all"].setAttribute("aria-pressed", "false");
   const document = { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
   const calls = [];
   const replaced = [];
@@ -234,12 +236,7 @@ test("renders statistics, calls, flags and the literature verdict", async () => 
   assert.strictEqual(gbm[4], "Excluded: statistics");
   assert.ok(details[3].text.includes("— (3.10)"));
   assert.deepStrictEqual(replaced, ["?gene=ERBB2"]);
-  // Provenance from the stats view.
-  const prov = nodes["ec-provenance"].children.map((c) => c.text);
-  assert.ok(prov.includes("Release ID") && prov.includes(BUNDLE.release_id));
-  assert.ok(prov.includes("PubMed snapshot") && prov.includes("2026-11-02"));
-  const bundleLink = nodes["ec-provenance"].findAll((n) => n.tagName === "a")[0];
-  assert.strictEqual(bundleLink.getAttribute("href"), BUNDLE.release_url);
+  assert.strictEqual(nodes["ec-release"].textContent, `Data release ${BUNDLE.release_id}`);
   assert.strictEqual(page.state.view.hugo_symbol, "ERBB2");
 });
 
@@ -361,9 +358,6 @@ test("an expired PubMed pre-check is labelled, not shown as a failure", async ()
   const ucecDetails = detailRows(nodes)[2].text;
   assert.ok(ucecDetails.includes("Pre-check expired (0)"), ucecDetails);
   assert.strictEqual(ucec[4], "Awaiting literature check");
-  const prov = nodes["ec-provenance"].children.map((c) => c.text);
-  const at = prov.indexOf("PubMed pre-check expires");
-  assert.ok(at >= 0 && prov[at + 1] === "2026-10-01T00:00:00Z");
 });
 
 test("method m3: enrichment labels, broad markers and subgroup statistics", async () => {
@@ -467,7 +461,11 @@ test("invalid input is rejected without a request", async () => {
   assert.match(nodes["ec-error"].textContent, /gene symbol/);
 });
 
-for (const [status, pattern] of [[503, /not loaded yet/], [404, /NOPE1 is not in/], [500, /couldn't load/]]) {
+for (const [status, pattern] of [
+  [503, /^Expression data hasn't loaded yet\. Try again in a few minutes\.$/],
+  [404, /^NOPE1 is not in the current expression data\.$/],
+  [500, /couldn't load/],
+]) {
   test(`HTTP ${status} shows a clear message`, async () => {
     const { nodes, page } = env({ "GET /v1/expression-context/stats/NOPE1": response({ detail: "x" }, status) });
     await page.lookup("nope1");
@@ -524,42 +522,52 @@ test("a failed job or a foreign status URL is reported, not followed", async () 
   }
 });
 
-test("bundle status: provenance, pinned tag, and only a current refresh error", async () => {
-  const refresh = {
-    last_checked_at: "2026-11-06T12:00:00Z", last_error: "GitHub rate limit", last_error_at: "2026-11-06T13:00:00Z",
-    pinned_bundle_tag: "expression-stats-x-pubmed-20261102", releases_repo: "oncokb/agentic-cancer-gene-classification",
-  };
-  const { nodes, page } = env({ "GET /v1/expression-context/bundle": response({ active: BUNDLE, refresh }) });
-  await page.init();
-  const text = nodes["ec-provenance"].children.map((c) => c.text);
-  assert.ok(text.includes("Pinned to") && text.includes("Last refresh error") && text.includes("GitHub rate limit"));
-  assert.strictEqual(nodes["ec-provenance-status"].textContent, "");
+test("the page no longer shows the statistics bundle or calls /bundle", async () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  assert.ok(!html.includes("ec-provenance"), "provenance card is gone");
+  assert.ok(!/statistics bundle/i.test(html), "no bundle wording in the page");
+  const js = fs.readFileSync(path.join(__dirname, "../../src/expression_context/static/expression-context.js"), "utf8");
+  assert.ok(!js.includes("/bundle"), "page code never requests /bundle");
+  for (const wording of ["statistics bundle", "bundle status", "Bundle"]) {
+    assert.ok(!js.includes(wording), `no user-facing "${wording}" wording`);
+  }
 
-  const stale = { ...refresh, last_error_at: "2026-11-06T11:00:00Z" };
-  const second = env({ "GET /v1/expression-context/bundle": response({ active: { ...BUNDLE, release_url: "https://evil.example/x" }, refresh: stale }) });
-  await second.page.init();
-  const staleText = second.nodes["ec-provenance"].children.map((c) => c.text);
-  assert.ok(!staleText.includes("Last refresh error"), "an error older than the last good check is history");
-  assert.strictEqual(second.nodes["ec-provenance"].findAll((n) => n.tagName === "a").length, 0, "non-GitHub release links are not linked");
+  // Init without ?gene= makes no requests at all; with ?gene= only the stats lookup.
+  const empty = env({});
+  await empty.page.init();
+  assert.deepStrictEqual(empty.calls, []);
+  const deep = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) }, { search: "?gene=erbb2" });
+  await deep.page.init();
+  assert.deepStrictEqual(deep.calls.map((c) => c.url), ["/v1/expression-context/stats/ERBB2"]);
 });
 
-test("no bundle loaded yet", async () => {
-  const { nodes, page } = env({ "GET /v1/expression-context/bundle": response({ active: null, refresh: { releases_repo: "r" } }) });
-  await page.init();
-  assert.strictEqual(nodes["ec-provenance-status"].textContent, "No statistics bundle is loaded yet.");
+test("the summary shows only the data release, not bundle internals", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const text = nodes["ec-release"].textContent;
+  assert.strictEqual(text, `Data release ${BUNDLE.release_id}`);
+  assert.ok(!/method|PubMed snapshot/.test(text));
+});
+
+test("the table empty state is a polite live status region", () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  const tag = html.match(/<p\b[^>]*id="ec-table-empty"[^>]*>/);
+  assert.ok(tag, "#ec-table-empty exists");
+  assert.ok(tag[0].includes('role="status"'), tag[0]);
+  assert.ok(tag[0].includes('aria-live="polite"'), tag[0]);
 });
 
 test("deep link ?gene= loads the gene on init", async () => {
   const { nodes, calls } = env({
-    "GET /v1/expression-context/bundle": response({ active: BUNDLE, refresh: { releases_repo: "r" } }),
     "GET /v1/expression-context/stats/HER2": response(view({ query: "her2" })),
   }, { search: "?gene=her2" });
   const page = createExpressionContextPage({
     document: { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) },
     window: { location: { search: "?gene=her2", pathname: "/expression-context" }, history: null, setTimeout: (fn) => fn() },
-    fetch: async (url) => (url.endsWith("/bundle")
-      ? response({ active: BUNDLE, refresh: { releases_repo: "r" } })
-      : response(view({ query: "her2" }))),
+    fetch: async (url) => {
+      assert.ok(!url.endsWith("/bundle"), "init must not request /bundle");
+      return response(view({ query: "her2" }));
+    },
   });
   await page.init();
   assert.strictEqual(nodes["ec-gene"].value, "her2");
@@ -589,6 +597,7 @@ test("header has only the visible columns and removed columns are gone", () => {
 test("numbers are hidden in the detail row by default and toggle updates aria-expanded", async () => {
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
   await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
   const summaries = summaryRows(nodes);
   const details = detailRows(nodes);
   assert.strictEqual(summaries.length, 4);
@@ -679,14 +688,15 @@ test("expanded state survives a re-render during a literature job and resets on 
   }
 });
 
-test("CSV download link appears after a gene loads, encodes the symbol, and toggles include_excluded", async () => {
+test("CSV download link appears after a gene loads, encodes the symbol, and follows the view toggle", async () => {
   const html = fs.readFileSync(HTML_PATH, "utf8");
   assert.ok(html.includes('id="ec-export"'), "HTML includes Download CSV link");
   assert.ok(html.includes("Download CSV"), "HTML labels Download CSV link");
   assert.ok(html.includes('id="ec-export-golden"'), "HTML includes Download golden-set row link");
   assert.ok(html.includes("Download golden-set row"), "HTML labels Download golden-set row link");
-  assert.ok(html.includes('id="ec-export-include-excluded"'), "HTML includes include-excluded checkbox");
-  assert.ok(html.includes("include excluded cancer types"), "HTML labels include-excluded checkbox");
+  assert.ok(!html.includes('type="checkbox"'), "the include-excluded checkbox is gone");
+  assert.ok(html.includes('id="ec-view-shown"') && html.includes("Shown only"), "HTML includes the Shown only view");
+  assert.ok(html.includes('id="ec-view-all"') && html.includes("All cancer types"), "HTML includes the All view");
 
   assert.strictEqual(
     exportURL("A/B C", false),
@@ -709,12 +719,10 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
   });
   assert.ok(nodes["ec-export"].hidden, "Download CSV hidden before a gene loads");
   assert.ok(nodes["ec-export-golden"].hidden, "Download golden-set row hidden before a gene loads");
-  assert.ok(nodes["ec-export-toggle-wrap"].hidden, "toggle hidden before a gene loads");
 
   await page.lookup("HER2");
   assert.ok(!nodes["ec-export"].hidden, "Download CSV visible once a gene loads");
   assert.ok(!nodes["ec-export-golden"].hidden, "Download golden-set row visible once a gene loads");
-  assert.ok(!nodes["ec-export-toggle-wrap"].hidden, "toggle visible once a gene loads");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/ERBB2/export.csv",
@@ -724,8 +732,7 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
     "/v1/expression-context/golden-set.csv?genes=ERBB2",
   );
 
-  nodes["ec-export-include-excluded"].checked = true;
-  nodes["ec-export-include-excluded"].fire("change");
+  nodes["ec-view-all"].fire("click");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/ERBB2/export.csv?include_excluded=true",
@@ -735,18 +742,24 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
     "/v1/expression-context/golden-set.csv?genes=ERBB2",
   );
 
+  // A different gene starts back on "Shown only".
   await page.lookup("NKX2-1");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
-    "/v1/expression-context/genes/NKX2-1/export.csv?include_excluded=true",
+    "/v1/expression-context/genes/NKX2-1/export.csv",
   );
   assert.strictEqual(
     nodes["ec-export-golden"].getAttribute("href"),
     "/v1/expression-context/golden-set.csv?genes=NKX2-1",
   );
 
-  nodes["ec-export-include-excluded"].checked = false;
-  nodes["ec-export-include-excluded"].fire("change");
+  nodes["ec-view-all"].fire("click");
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/NKX2-1/export.csv?include_excluded=true",
+  );
+
+  nodes["ec-view-shown"].fire("click");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/NKX2-1/export.csv",
@@ -788,12 +801,177 @@ test("CSV download link hidden when gene has no stored results for the active re
   await page.lookup("PEND1");
   assert.ok(nodes["ec-export"].hidden, "Download CSV hidden while results are pending / no stored results");
   assert.ok(nodes["ec-export-golden"].hidden, "Download golden-set row hidden while results are pending");
-  assert.ok(nodes["ec-export-toggle-wrap"].hidden, "toggle hidden while results are pending");
 
   await page.lookup("STORED1");
   assert.ok(!nodes["ec-export"].hidden, "Download CSV visible once stored results exist");
   assert.ok(!nodes["ec-export-golden"].hidden, "Download golden-set row visible once stored results exist");
-  assert.ok(!nodes["ec-export-toggle-wrap"].hidden, "toggle visible once stored results exist");
+});
+
+function visibleSummaryRows(nodes) {
+  return summaryRows(nodes).filter((r) => !r.hidden);
+}
+
+test("view toggle switches the table rows and the count", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const code = (row) => row.children[0].text;
+  // Default: only the pairs that are shown (surfaced + awaiting literature).
+  assert.deepStrictEqual(visibleSummaryRows(nodes).map(code), ["Breast Invasive Carcinoma (BRCA)", "Stomach Adenocarcinoma (STAD)"]);
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded (hidden)");
+  assert.ok(nodes["ec-table-empty"].hidden);
+
+  nodes["ec-view-all"].fire("click");
+  const all = visibleSummaryRows(nodes);
+  assert.strictEqual(all.length, 4);
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded");
+  // Excluded rows are de-emphasised and labelled with their reason.
+  const excluded = all.filter((r) => r.getAttribute("class") === "ec-row-excluded");
+  assert.deepStrictEqual(excluded.map((r) => r.children[4].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
+
+  nodes["ec-view-shown"].fire("click");
+  assert.strictEqual(visibleSummaryRows(nodes).length, 2);
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded (hidden)");
+});
+
+test("an expanded excluded row hides with its details and comes back expanded", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  summaryRows(nodes)[3].children[6].children[0].fire("click");
+  assert.ok(!detailRows(nodes)[3].hidden);
+  nodes["ec-view-shown"].fire("click");
+  assert.ok(summaryRows(nodes)[3].hidden && detailRows(nodes)[3].hidden, "GBM row and details hidden");
+  nodes["ec-view-all"].fire("click");
+  assert.ok(!summaryRows(nodes)[3].hidden && !detailRows(nodes)[3].hidden, "GBM details still expanded");
+});
+
+test("view toggle updates aria-pressed, the active state and the CSV URL", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  const pressed = () => [nodes["ec-view-shown"], nodes["ec-view-all"]].map((b) => b.getAttribute("aria-pressed"));
+  const active = () => [nodes["ec-view-shown"], nodes["ec-view-all"]].map((b) => b.classList.contains("active"));
+  assert.deepStrictEqual(pressed(), ["true", "false"]);
+  assert.deepStrictEqual(active(), [true, false]);
+  assert.strictEqual(nodes["ec-export"].getAttribute("href"), "/v1/expression-context/genes/ERBB2/export.csv");
+
+  nodes["ec-view-all"].fire("click");
+  assert.deepStrictEqual(pressed(), ["false", "true"]);
+  assert.deepStrictEqual(active(), [false, true]);
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/ERBB2/export.csv?include_excluded=true",
+  );
+  assert.strictEqual(nodes["ec-export-golden"].getAttribute("href"), "/v1/expression-context/golden-set.csv?genes=ERBB2");
+
+  nodes["ec-view-shown"].fire("click");
+  assert.deepStrictEqual(pressed(), ["true", "false"]);
+  assert.strictEqual(nodes["ec-export"].getAttribute("href"), "/v1/expression-context/genes/ERBB2/export.csv");
+});
+
+test("a gene with no shown cancer types gets an empty state pointing at the All view", async () => {
+  const v = view();
+  v.pairs = v.pairs.slice(2);
+  v.summary = { surfaced: 0, literature_pending: 0, excluded: 2 };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  assert.ok(!nodes["ec-table-empty"].hidden);
+  assert.ok(nodes["ec-table-empty"].textContent.includes("All cancer types"));
+  assert.ok(nodes["ec-table-empty"].textContent.includes("2 excluded"));
+  assert.ok(nodes["ec-table"].hidden);
+  nodes["ec-view-all"].fire("click");
+  assert.ok(nodes["ec-table-empty"].hidden);
+  assert.ok(!nodes["ec-table"].hidden);
+  assert.strictEqual(visibleSummaryRows(nodes).length, 2);
+});
+
+test("toolbar holds the view toggle and both downloads; release shows in the summary", async () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  const toolbar = html.match(/<div class="ec-toolbar" id="ec-toolbar">([\s\S]*?)<p class="api-keys-empty ec-table-empty/);
+  assert.ok(toolbar, "page has a toolbar above the table");
+  for (const id of ["ec-view-shown", "ec-view-all", "ec-view-count", "ec-export", "ec-export-golden"]) {
+    assert.ok(toolbar[1].includes(`id="${id}"`), `${id} lives in the toolbar`);
+  }
+  assert.ok(toolbar[1].indexOf('id="ec-view-shown"') < toolbar[1].indexOf('id="ec-export"'), "toggle is left of downloads");
+  assert.ok(/role="group"/.test(toolbar[1]) && /aria-pressed="true"/.test(toolbar[1]), "toggle is an aria-pressed group");
+
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
+  await page.lookup("ERBB2");
+  assert.ok(!nodes["ec-export"].hidden && !nodes["ec-export-golden"].hidden, "both downloads render");
+  assert.ok(nodes["ec-release"].textContent.includes(BUNDLE.release_id));
+});
+
+test("the cBioPortal reading guide is collapsed by default and keeps its content", () => {
+  const html = fs.readFileSync(HTML_PATH, "utf8");
+  const help = html.match(/<details class="ec-help" id="ec-cbio-help"([^>]*)>([\s\S]*?)<\/details>/);
+  assert.ok(help, "reading guide is a <details> disclosure");
+  assert.ok(!/\bopen\b/.test(help[1]), "collapsed by default");
+  assert.ok(/<summary>[\s\S]*How to read these plots[\s\S]*<\/summary>/.test(help[2]));
+  const text = help[2].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  for (const phrase of [
+    "single-cancer plots auto-scale their y-axis",
+    "detailed diagnosis categories",
+    "only part of BRCA, not the whole cohort",
+    "cluster of high dots rather than the median",
+    "metastatic or recurrent samples and repeat patients",
+    "not a reproduction of our test",
+    "genomic alteration, not this expression result",
+    "can differ from the release shown here",
+  ]) {
+    assert.ok(text.includes(phrase), `guide keeps: ${phrase}`);
+  }
+  assert.ok(!html.includes("ec-cbio-note"), "the old always-visible note is gone");
+});
+
+test("looking up a different gene resets the view toggle to Shown only", async () => {
+  const { nodes, page } = env({
+    "GET /v1/expression-context/stats/ERBB2": response(view()),
+    "GET /v1/expression-context/stats/NKX2-1": response(
+      view({ query: "nkx2-1", hugo_symbol: "NKX2-1", entrez_gene_id: 7080 }),
+    ),
+  });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  assert.strictEqual(page.state.showAll, true);
+  assert.strictEqual(nodes["ec-view-all"].getAttribute("aria-pressed"), "true");
+
+  await page.lookup("NKX2-1");
+  assert.strictEqual(page.state.showAll, false);
+  assert.strictEqual(nodes["ec-view-shown"].getAttribute("aria-pressed"), "true");
+  assert.strictEqual(nodes["ec-view-all"].getAttribute("aria-pressed"), "false");
+  assert.ok(nodes["ec-view-shown"].classList.contains("active"));
+  assert.ok(!nodes["ec-view-all"].classList.contains("active"));
+  assert.strictEqual(nodes["ec-export"].getAttribute("href"), "/v1/expression-context/genes/NKX2-1/export.csv");
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded (hidden)");
+  assert.strictEqual(summaryRows(nodes).filter((r) => !r.hidden).length, 2);
+});
+
+test("re-rendering the same gene (literature job refresh) keeps the All view", async () => {
+  let statsCalls = 0;
+  const { nodes, page } = env({
+    "GET /v1/expression-context/stats/ERBB2": () => {
+      statsCalls += 1;
+      return response(statsCalls === 1 ? view() : view({ summary: { surfaced: 2, literature_pending: 0, excluded: 2 } }));
+    },
+    "POST /v1/expression-context/jobs": response(
+      { job_id: "j1", status: "queued", status_url: "/v1/expression-context/jobs/j1" },
+      202,
+    ),
+    "GET /v1/expression-context/jobs/j1": response({
+      status: "succeeded", literature_evaluated: 1, literature_reused: 0, pair_errors: [],
+    }),
+  });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  await nodes["ec-run"].fire("click");
+  assert.strictEqual(statsCalls, 2, "the job re-rendered the same gene");
+  assert.strictEqual(page.state.showAll, true);
+  assert.strictEqual(nodes["ec-view-all"].getAttribute("aria-pressed"), "true");
+  assert.strictEqual(nodes["ec-view-shown"].getAttribute("aria-pressed"), "false");
+  assert.strictEqual(
+    nodes["ec-export"].getAttribute("href"),
+    "/v1/expression-context/genes/ERBB2/export.csv?include_excluded=true",
+  );
+  assert.strictEqual(summaryRows(nodes).filter((r) => !r.hidden).length, 4);
 });
 
 (async () => {
