@@ -389,26 +389,6 @@
   font-size: 12px;
 }
 
-/* Provenance */
-
-.ec-provenance {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  gap: 6px 16px;
-  margin: 0;
-  font-size: 13px;
-}
-
-.ec-provenance dt {
-  color: var(--muted);
-  font-weight: 600;
-}
-
-.ec-provenance dd {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
 @media (max-width: 640px) {
   .ec-gene-field {
     flex: 1 1 100%;
@@ -419,14 +399,12 @@
     justify-content: flex-start;
   }
 
-  .ec-details-list,
-  .ec-provenance {
+  .ec-details-list {
     grid-template-columns: minmax(0, 1fr);
     gap: 2px;
   }
 
-  .ec-details-list dd,
-  .ec-provenance dd {
+  .ec-details-list dd {
     margin-bottom: 6px;
   }
 }

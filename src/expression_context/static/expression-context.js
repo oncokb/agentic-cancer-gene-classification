@@ -74,9 +74,9 @@
   function friendlyError(status, gene) {
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
     if (status === 403) return "Your account isn't active yet. Please contact your AGCG administrator.";
-    if (status === 404) return `${gene} is not in the expression statistics bundle.`;
+    if (status === 404) return `${gene} is not in the current expression data.`;
     if (status === 422) return "Enter a gene symbol (letters, digits, '.', '_' or '-').";
-    if (status === 503) return "Expression statistics are not loaded yet. Please try again in a few minutes.";
+    if (status === 503) return "Expression data hasn't loaded yet. Try again in a few minutes.";
     if (status >= 500) return "The server couldn't load expression statistics right now. Please try again later.";
     return "Couldn't load expression statistics. Check your connection and try again.";
   }
@@ -87,7 +87,6 @@
       "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
       "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
       "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
-      "ec-provenance", "ec-provenance-status",
     ]) {
       el[id] = doc.getElementById(id);
     }
@@ -348,52 +347,6 @@
       return [row, detailRow];
     }
 
-    function renderProvenance(bundle, refresh) {
-      const dl = el["ec-provenance"];
-      dl.replaceChildren();
-      if (!bundle) {
-        el["ec-provenance-status"].textContent = "No statistics bundle is loaded yet.";
-      } else {
-        el["ec-provenance-status"].textContent = "";
-      }
-      const add = (label, value, href) => {
-        if (value === null || value === undefined || value === "") return;
-        dl.appendChild(node("dt", label));
-        const dd = node("dd");
-        if (href) {
-          const link = node("a", value);
-          link.setAttribute("href", href);
-          link.setAttribute("target", "_blank");
-          link.setAttribute("rel", "noopener noreferrer");
-          dd.appendChild(link);
-        } else {
-          dd.textContent = String(value);
-        }
-        dl.appendChild(dd);
-      };
-      if (bundle) {
-        const source = bundle.source || {};
-        const releaseUrl = typeof bundle.release_url === "string" && bundle.release_url.startsWith("https://github.com/")
-          ? bundle.release_url : null;
-        add("Bundle", bundle.bundle_tag, releaseUrl);
-        add("Release ID", bundle.release_id);
-        add("Method version", bundle.method_version);
-        add("PubMed snapshot", bundle.pubmed_snapshot_date);
-        add("Genes", bundle.gene_count);
-        add("Datahub commit", source.datahub_commit);
-        add("Generated", source.generated_at);
-        add("PubMed pre-check expires", source.precheck_expires_at);
-        add("Published", bundle.published_at);
-        add("Loaded", bundle.loaded_at);
-      }
-      if (refresh) {
-        add("Last checked", refresh.last_checked_at);
-        if (refresh.pinned_bundle_tag) add("Pinned to", refresh.pinned_bundle_tag);
-        const errorIsCurrent = refresh.last_error && (!refresh.last_checked_at || refresh.last_error_at > refresh.last_checked_at);
-        if (errorIsCurrent) add("Last refresh error", refresh.last_error);
-      }
-    }
-
     function hasStoredResult(view) {
       if (!view) return false;
       if (typeof view.has_stored_result === "boolean") return view.has_stored_result;
@@ -467,12 +420,7 @@
     }
 
     function releaseText(bundle) {
-      if (!bundle) return "";
-      const parts = [];
-      if (bundle.release_id) parts.push(`Release ${bundle.release_id}`);
-      if (bundle.method_version) parts.push(`method m${bundle.method_version}`);
-      if (bundle.pubmed_snapshot_date) parts.push(`PubMed snapshot ${bundle.pubmed_snapshot_date}`);
-      return parts.join(" · ");
+      return bundle && bundle.release_id ? `Data release ${bundle.release_id}` : "";
     }
 
     function render(view) {
@@ -504,7 +452,6 @@
       }
       applyView();
       show(el["ec-result"], true);
-      renderProvenance(view.bundle, null);
     }
 
     async function getJson(url, options) {
@@ -522,18 +469,6 @@
     function redirectToLogin() {
       const target = `${win.location.pathname || "/expression-context"}${win.location.search || ""}`;
       win.location.href = `/login?redirect_to=${encodeURIComponent(target)}`;
-    }
-
-    async function loadBundleStatus() {
-      const { status, body } = await getJson(`${API}/bundle`);
-      if (status === 200 && body) {
-        if (!state.view) renderProvenance(body.active, body.refresh);
-        else renderProvenance(state.view.bundle, body.refresh);
-      } else if (status === 401) {
-        redirectToLogin();
-      } else {
-        el["ec-provenance-status"].textContent = "Couldn't load the bundle status.";
-      }
     }
 
     async function lookup(rawGene) {
@@ -633,12 +568,10 @@
     async function init() {
       const params = new URLSearchParams(win.location.search || "");
       const gene = params.get("gene");
-      const tasks = [loadBundleStatus()];
       if (gene) {
         el["ec-gene"].value = gene;
-        tasks.push(lookup(gene));
+        await lookup(gene);
       }
-      await Promise.all(tasks);
     }
 
     return { init, lookup, runLiteratureCheck, setView, state };
