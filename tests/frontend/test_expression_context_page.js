@@ -6,7 +6,7 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const {
-  createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL,
+  createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL, goldenSetExportURL,
 } = require("../../src/expression_context/static/expression-context.js");
 
 const HTML_PATH = path.join(__dirname, "../../src/expression_context/static/expression-context.html");
@@ -44,7 +44,7 @@ class Element {
 
 const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-  "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-toggle-wrap",
+  "ec-summary", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-export-toggle-wrap",
   "ec-export-include-excluded", "ec-job-status", "ec-tbody", "ec-provenance", "ec-provenance-status",
 ];
 
@@ -81,6 +81,7 @@ function env(routes, { search = "" } = {}) {
   nodes["ec-result"].classList.toggle("hidden", true);
   nodes["ec-run"].classList.toggle("hidden", true);
   nodes["ec-export"].classList.toggle("hidden", true);
+  nodes["ec-export-golden"].classList.toggle("hidden", true);
   nodes["ec-export-toggle-wrap"].classList.toggle("hidden", true);
   nodes["ec-export-include-excluded"].checked = false;
   const document = { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
@@ -682,6 +683,8 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
   const html = fs.readFileSync(HTML_PATH, "utf8");
   assert.ok(html.includes('id="ec-export"'), "HTML includes Download CSV link");
   assert.ok(html.includes("Download CSV"), "HTML labels Download CSV link");
+  assert.ok(html.includes('id="ec-export-golden"'), "HTML includes Download golden-set row link");
+  assert.ok(html.includes("Download golden-set row"), "HTML labels Download golden-set row link");
   assert.ok(html.includes('id="ec-export-include-excluded"'), "HTML includes include-excluded checkbox");
   assert.ok(html.includes("include excluded cancer types"), "HTML labels include-excluded checkbox");
 
@@ -693,6 +696,10 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
     exportURL("A/B C", true),
     "/v1/expression-context/genes/A%2FB%20C/export.csv?include_excluded=true",
   );
+  assert.strictEqual(
+    goldenSetExportURL("A/B C"),
+    "/v1/expression-context/golden-set.csv?genes=A%2FB%20C",
+  );
 
   const { nodes, page } = env({
     "GET /v1/expression-context/stats/HER2": response(view({ query: "her2", hugo_symbol: "ERBB2" })),
@@ -701,14 +708,20 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
     ),
   });
   assert.ok(nodes["ec-export"].hidden, "Download CSV hidden before a gene loads");
+  assert.ok(nodes["ec-export-golden"].hidden, "Download golden-set row hidden before a gene loads");
   assert.ok(nodes["ec-export-toggle-wrap"].hidden, "toggle hidden before a gene loads");
 
   await page.lookup("HER2");
   assert.ok(!nodes["ec-export"].hidden, "Download CSV visible once a gene loads");
+  assert.ok(!nodes["ec-export-golden"].hidden, "Download golden-set row visible once a gene loads");
   assert.ok(!nodes["ec-export-toggle-wrap"].hidden, "toggle visible once a gene loads");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/ERBB2/export.csv",
+  );
+  assert.strictEqual(
+    nodes["ec-export-golden"].getAttribute("href"),
+    "/v1/expression-context/golden-set.csv?genes=ERBB2",
   );
 
   nodes["ec-export-include-excluded"].checked = true;
@@ -717,11 +730,19 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/ERBB2/export.csv?include_excluded=true",
   );
+  assert.strictEqual(
+    nodes["ec-export-golden"].getAttribute("href"),
+    "/v1/expression-context/golden-set.csv?genes=ERBB2",
+  );
 
   await page.lookup("NKX2-1");
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/NKX2-1/export.csv?include_excluded=true",
+  );
+  assert.strictEqual(
+    nodes["ec-export-golden"].getAttribute("href"),
+    "/v1/expression-context/golden-set.csv?genes=NKX2-1",
   );
 
   nodes["ec-export-include-excluded"].checked = false;
@@ -729,6 +750,10 @@ test("CSV download link appears after a gene loads, encodes the symbol, and togg
   assert.strictEqual(
     nodes["ec-export"].getAttribute("href"),
     "/v1/expression-context/genes/NKX2-1/export.csv",
+  );
+  assert.strictEqual(
+    nodes["ec-export-golden"].getAttribute("href"),
+    "/v1/expression-context/golden-set.csv?genes=NKX2-1",
   );
 });
 
@@ -762,10 +787,12 @@ test("CSV download link hidden when gene has no stored results for the active re
 
   await page.lookup("PEND1");
   assert.ok(nodes["ec-export"].hidden, "Download CSV hidden while results are pending / no stored results");
+  assert.ok(nodes["ec-export-golden"].hidden, "Download golden-set row hidden while results are pending");
   assert.ok(nodes["ec-export-toggle-wrap"].hidden, "toggle hidden while results are pending");
 
   await page.lookup("STORED1");
   assert.ok(!nodes["ec-export"].hidden, "Download CSV visible once stored results exist");
+  assert.ok(!nodes["ec-export-golden"].hidden, "Download golden-set row visible once stored results exist");
   assert.ok(!nodes["ec-export-toggle-wrap"].hidden, "toggle visible once stored results exist");
 });
 

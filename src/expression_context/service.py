@@ -46,9 +46,14 @@ from typing import (
 
 from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
 from src.expression_context.csv_export import (
+    check_sheet_cancer_names,
     csv_filename,
     format_csv_rows,
+    format_golden_set_rows,
     gene_view_csv_rows,
+    golden_set_filename,
+    golden_set_row_from_view,
+    load_sheet_cancer_names,
 )
 from src.expression_context.lease import VerdictLease, lease_key
 from src.expression_context.literature_gate import (
@@ -95,6 +100,12 @@ class InvalidGene(ValueError):
 
 class GeneNotFound(LookupError):
     pass
+
+
+class GenesNotChecked(Exception):
+    def __init__(self, genes: List[str]):
+        super().__init__(f"Genes not yet checked: {', '.join(genes)}")
+        self.genes = genes
 
 
 @dataclass
@@ -653,14 +664,18 @@ class ExpressionContextService:
             format_csv_rows(csv_rows, include_header=True, include_bom=True),
         )
 
-    async def export_bundle_csv(
-        self, *, include_excluded: bool = False, page_size: int = 50
-    ) -> Tuple[str, AsyncIterator[str]]:
-        bundle = await self.catalog.active()
+    async def _stream_bundle_views_to_csv(
+        self,
+        bundle: ActiveBundle,
+        *,
+        view_to_rows: Callable[[GeneStatsView], List[List[str]]],
+        format_rows: Callable[..., str],
+        include_excluded: bool = False,
+        page_size: int = 50,
+    ) -> Tuple[ActiveBundle, AsyncIterator[str]]:
         release_id = bundle.release_id
         gate_name = self.gate.name
         batch_size = max(1, min(page_size, self.history_max_limit))
-        all_study_ids = [ct.study_id for ct in bundle.manifest.cancer_types if ct.study_id]
 
         async def fetch_page(after: Optional[str]) -> Tuple[List[str], List[List[str]]]:
             await self.catalog.verify_active(bundle)
@@ -690,16 +705,14 @@ class ExpressionContextService:
                     resolved.hugo_symbol, release_id, gate_name
                 )
                 view = self._evaluate_gene_view(resolved, stored)
-                rows = gene_view_csv_rows(
-                    view, include_excluded=include_excluded, all_study_ids=all_study_ids
-                )
+                rows = view_to_rows(view)
                 page_rows.extend(rows)
             return symbols, page_rows
 
         first_symbols, first_page_rows = await fetch_page(None)
 
         async def stream() -> AsyncIterator[str]:
-            yield format_csv_rows((), include_header=True, include_bom=True)
+            yield format_rows((), include_header=True, include_bom=True)
             try:
                 await self.catalog.verify_active(bundle)
             except BundleGone as exc:
@@ -707,7 +720,7 @@ class ExpressionContextService:
                 raise
 
             if first_page_rows:
-                yield format_csv_rows(first_page_rows, include_header=False, include_bom=False)
+                yield format_rows(first_page_rows, include_header=False, include_bom=False)
             if len(first_symbols) < batch_size:
                 try:
                     await self.catalog.verify_active(bundle)
@@ -726,7 +739,7 @@ class ExpressionContextService:
                     logger.error("Active bundle superseded during bulk export stream: %s", exc)
                     raise
                 if page_rows:
-                    yield format_csv_rows(page_rows, include_header=False, include_bom=False)
+                    yield format_rows(page_rows, include_header=False, include_bom=False)
                 if len(symbols) < batch_size:
                     break
                 after_symbol = symbols[-1]
@@ -737,7 +750,115 @@ class ExpressionContextService:
                 logger.error("Active bundle superseded before ending bulk export stream: %s", exc)
                 raise
 
-        return csv_filename("all", release_id), stream()
+        return bundle, stream()
+
+    async def export_bundle_csv(
+        self, *, include_excluded: bool = False, page_size: int = 50
+    ) -> Tuple[str, AsyncIterator[str]]:
+        bundle = await self.catalog.active()
+        all_study_ids = [ct.study_id for ct in bundle.manifest.cancer_types if ct.study_id]
+
+        def view_to_rows(view: GeneStatsView) -> List[List[str]]:
+            return gene_view_csv_rows(
+                view, include_excluded=include_excluded, all_study_ids=all_study_ids
+            )
+
+        active_bundle, stream = await self._stream_bundle_views_to_csv(
+            bundle,
+            view_to_rows=view_to_rows,
+            format_rows=format_csv_rows,
+            include_excluded=include_excluded,
+            page_size=page_size,
+        )
+        return csv_filename("all", active_bundle.release_id), stream
+
+    async def export_golden_set_bundle_csv(
+        self, *, page_size: int = 50
+    ) -> Tuple[str, AsyncIterator[str]]:
+        bundle = await self.catalog.active()
+        name_map = load_sheet_cancer_names()
+        check_sheet_cancer_names(bundle, name_map)
+
+        def view_to_rows(view: GeneStatsView) -> List[List[str]]:
+            return [golden_set_row_from_view(view, name_map=name_map)]
+
+        active_bundle, stream = await self._stream_bundle_views_to_csv(
+            bundle,
+            view_to_rows=view_to_rows,
+            format_rows=format_golden_set_rows,
+            include_excluded=False,
+            page_size=page_size,
+        )
+        return golden_set_filename(active_bundle.release_id), stream
+
+    async def export_golden_set_genes_csv(
+        self, genes_query: str
+    ) -> Tuple[str, str]:
+        raw_genes = [g.strip() for g in genes_query.split(",") if g.strip()]
+        if not raw_genes:
+            raise InvalidGene("No genes specified.")
+        if len(raw_genes) > 500:
+            raise InvalidGene(f"Maximum 500 raw genes allowed per request; received {len(raw_genes)}.")
+
+        bundle = await self.catalog.active()
+        await self.catalog.verify_active(bundle)
+
+        name_map = load_sheet_cancer_names()
+        check_sheet_cancer_names(bundle, name_map)
+
+        seen_symbols: set[str] = set()
+        resolved_genes: List[ResolvedGene] = []
+        bad_names: List[str] = []
+
+        for raw_gene in raw_genes:
+            try:
+                symbol = normalize_symbol(raw_gene)
+            except InvalidGene:
+                bad_names.append(raw_gene)
+                continue
+
+            artifact = await self.catalog.gene(bundle, symbol)
+            if artifact is None:
+                target = await self.catalog.alias(bundle, symbol)
+                if target and target != symbol:
+                    artifact = await self.catalog.gene(bundle, target)
+
+            if artifact is None:
+                bad_names.append(raw_gene)
+            else:
+                hugo = artifact.gene.hugo_symbol.upper()
+                if hugo not in seen_symbols:
+                    seen_symbols.add(hugo)
+                    resolved_genes.append(
+                        ResolvedGene(
+                            query=raw_gene,
+                            hugo_symbol=hugo,
+                            manifest=bundle.manifest,
+                            artifact=artifact,
+                            bundle=bundle,
+                        )
+                    )
+
+        if bad_names:
+            raise InvalidGene(f"Unknown genes: {', '.join(bad_names)}")
+
+        rows: List[List[str]] = []
+        not_yet_checked: List[str] = []
+        for resolved in resolved_genes:
+            view, stored = await self.gene_view(resolved.hugo_symbol, resolved=resolved)
+            if not stored:
+                not_yet_checked.append(resolved.hugo_symbol)
+            else:
+                rows.append(golden_set_row_from_view(view, name_map=name_map))
+
+        await self.catalog.verify_active(bundle)
+
+        if not_yet_checked:
+            raise GenesNotChecked(not_yet_checked)
+
+        filename = golden_set_filename(bundle.release_id)
+        content = format_golden_set_rows(rows, include_header=True, include_bom=True)
+        return filename, content
 
     async def _alias_target(self, symbol: str) -> Optional[str]:
         # BundleNotLoaded propagates (-> 503): "can't resolve yet" is not a 404.

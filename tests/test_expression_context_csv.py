@@ -48,19 +48,34 @@ from fastapi.testclient import TestClient
 from src.auth import AuthenticatedUser, require_auth
 from src.expression_context import register_expression_context
 from src.expression_context.bundle_store import InMemoryBundleStore
-from src.expression_context.catalog import BundleGone, BundleNotLoaded, StatsCatalog
+from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
 from src.expression_context.csv_export import (
+    ALLOWED_ALTERATION_TYPES,
     CSV_COLUMNS,
+    GOLDEN_SET_COLUMNS,
     UTF8_BOM,
+    alteration_types_for_pair,
     cbioportal_expression_url,
     format_csv_rows,
     format_float,
+    format_golden_set_rows,
     format_q,
     gene_view_csv_rows,
+    golden_set_filename,
+    golden_set_row_from_view,
+    load_sheet_cancer_names,
 )
 from src.expression_context.lease import VerdictLease
 from src.expression_context.literature_gate import TUMOR_SPECIFIC_GATE
-from src.expression_context.models import GeneResult, JobRecord, PairResult, StoredPair
+from src.expression_context.models import (
+    BundleManifest,
+    GeneResult,
+    JobRecord,
+    LiteratureVerdict,
+    PairResult,
+    PairStatsView,
+    StoredPair,
+)
 from src.expression_context.service import ExpressionContextService
 from src.expression_context.store import InMemoryExpressionContextStore, MySQLExpressionContextStore
 from src.job_store import JobStore
@@ -1575,3 +1590,811 @@ async def test_bulk_stream_supersession_single_gene_and_multi_page():
         with pytest.raises(BundleGone):
             async for _ in stream2:
                 pass
+
+
+# ----------------------------------------------------------- Golden Set CSV Export
+
+
+def test_golden_set_headers_exact_4_and_filled_columns():
+    assert ALLOWED_ALTERATION_TYPES == (
+        "Point Mutation",
+        "Structural Variant",
+        "Expression",
+        "Copy Number Alteration",
+    )
+
+    bundle = build_bundle(("ERBB2",), release_id="rel-123")
+    harness = CsvHarness(bundle=bundle)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+
+    with TestClient(harness.app) as client:
+        harness.store.rows[("ERBB2", "BRCA", "rel-123", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id="rel-123",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=base_stats,
+            evidence=_v2_supported_evidence("12345678", "breast cancer"),
+            computed_at=now,
+        )
+
+        resp = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2")
+        assert resp.status_code == 200
+        assert golden_set_filename("rel-123") == "expression-context_golden-set_rel-123.csv"
+        assert resp.headers["Content-Disposition"] == f'attachment; filename="{golden_set_filename("rel-123")}"'
+        header, rows = parse_csv_response(resp.text)
+        assert len(header) == 4
+        assert header == list(GOLDEN_SET_COLUMNS)
+        assert header == [
+            "Genes",
+            "Relevant expression-based cancer type(s)",
+            "Relevant alteration type(s)",
+            "Evidence-associated PMIDs",
+        ]
+        assert len(rows) == 1
+        row = rows[0]
+        assert len(row) == 4
+
+        # Verify format_golden_set_rows direct output
+        direct_csv = format_golden_set_rows([list(row.values())], include_header=True, include_bom=True)
+        assert direct_csv.startswith(UTF8_BOM)
+        d_header, d_rows = parse_csv_response(direct_csv)
+        assert d_header == header and len(d_rows) == 1
+
+        # Filled columns
+        assert row["Genes"] == "ERBB2"
+        assert row["Relevant expression-based cancer type(s)"] == "Breast cancer"
+        assert row["Relevant alteration type(s)"] == "Expression"
+        assert row["Evidence-associated PMIDs"] == "12345678"
+
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        assert alteration_types_for_pair(view.pairs[0]) == ["Expression"]
+
+        # Never null, None, [], Unknown, FALSE or "No identified alterations"
+        for k, v in row.items():
+            assert v not in ("None", "null", "NaN", "nan", "[]", "Unknown", "FALSE", "No identified alterations")
+
+
+def test_golden_set_alteration_types_stub_ordering_dedup_and_unknown_raises(monkeypatch):
+    from src.expression_context import csv_export
+
+    bundle = build_bundle(("ERBB2",))
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        pair_brca = view.pairs[0].model_copy(update={"status": "surfaced", "oncotree_code": "BRCA"})
+        pair_stad = view.pairs[1].model_copy(update={"status": "surfaced", "oncotree_code": "STAD"})
+        two_pair_view = view.model_copy(update={"pairs": [pair_brca, pair_stad]})
+
+        # Test that stubs alteration_types_for_pair to return
+        # ["Copy Number Alteration", "Expression", "Expression"] for one pair and
+        # ["Point Mutation"] for another gives "Point Mutation, Expression, Copy Number Alteration"
+        def stub_categories(pair: PairStatsView) -> List[str]:
+            if pair.oncotree_code == "BRCA":
+                return ["Copy Number Alteration", "Expression", "Expression"]
+            if pair.oncotree_code == "STAD":
+                return ["Point Mutation"]
+            return ["Expression"]
+
+        monkeypatch.setattr(csv_export, "alteration_types_for_pair", stub_categories)
+        row = csv_export.golden_set_row_from_view(two_pair_view)
+        assert len(row) == 4
+        assert row[2] == "Point Mutation, Expression, Copy Number Alteration"
+
+        # An unknown category raises
+        def stub_unknown(pair: PairStatsView) -> List[str]:
+            return ["Unknown Category"]
+
+        monkeypatch.setattr(csv_export, "alteration_types_for_pair", stub_unknown)
+        with pytest.raises(ValueError, match="Unknown alteration type"):
+            csv_export.golden_set_row_from_view(two_pair_view)
+
+
+def test_golden_set_alteration_types_detail_only_never_gating_on_unsurfaced_pairs(monkeypatch):
+    from src.expression_context import csv_export
+
+    bundle = build_bundle(("ERBB2",))
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        pair_surfaced = view.pairs[0].model_copy(update={"status": "surfaced", "oncotree_code": "BRCA"})
+        pair_unsurfaced = view.pairs[1].model_copy(update={"status": "stats_excluded", "oncotree_code": "LUAD"})
+        mixed_view = view.model_copy(update={"pairs": [pair_surfaced, pair_unsurfaced]})
+
+        def stub_categories(pair: PairStatsView) -> List[str]:
+            if pair.oncotree_code == "BRCA":
+                return ["Expression"]
+            # Non-surfaced pair returns alteration categories that must NOT affect the row
+            return ["Point Mutation", "Copy Number Alteration"]
+
+        monkeypatch.setattr(csv_export, "alteration_types_for_pair", stub_categories)
+        row = csv_export.golden_set_row_from_view(mixed_view)
+        assert len(row) == 4
+        assert row[2] == "Expression"
+        assert "Point Mutation" not in row[2]
+        assert "Copy Number Alteration" not in row[2]
+
+        # Cancer types and PMIDs must also not be affected
+        name_map = load_sheet_cancer_names()
+        assert row[1] == name_map["BRCA"]
+
+        # If zero surfaced pairs exist, alteration cell is empty even if unsurfaced pair returns categories
+        zero_surfaced_view = view.model_copy(update={"pairs": [pair_unsurfaced]})
+        row_zero = csv_export.golden_set_row_from_view(zero_surfaced_view)
+        assert len(row_zero) == 4
+        assert row_zero[1] == ""
+        assert row_zero[2] == ""
+        assert row_zero[3] == ""
+
+
+def test_golden_set_manifest_32_cohort_codes_and_missing_code_raises():
+    from src.expression_context.tumor_aliases import COHORT_NAMES
+
+    name_map = load_sheet_cancer_names()
+    assert len(COHORT_NAMES) == 32
+    assert len(name_map) == 32
+    for code in COHORT_NAMES:
+        assert code in name_map, f"Cohort code {code!r} missing in sheet_cancer_names.json"
+
+    # Runtime raise in golden_set_row_from_view as a backstop
+    bundle = build_bundle(("ERBB2",))
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        surfaced_pair = view.pairs[0].model_copy(update={"status": "surfaced", "oncotree_code": "UNKNOWN_CODE"})
+        modified_view = view.model_copy(update={"pairs": [surfaced_pair]})
+        with pytest.raises(KeyError, match="UNKNOWN_CODE"):
+            golden_set_row_from_view(modified_view)
+
+    # Missing code in bundle manifest cancer_types fails requests with 500 clean error
+    bundle_unmapped = build_bundle(
+        ("ERBB2",),
+        manifest_overrides={
+            "cancer_types": [
+                {
+                    "oncotree_code": "UNKNOWN_CODE",
+                    "study_id": "unknown_tcga",
+                    "cancer_type_name": "Unknown Cancer",
+                    "name": "Unknown Cancer",
+                    "tumor_type_query": "unknown cancer",
+                }
+            ]
+        },
+    )
+    harness_unmapped = CsvHarness(bundle=bundle_unmapped)
+    with TestClient(harness_unmapped.app) as client:
+        resp_bulk = client.get(f"{PREFIX}/golden-set.csv")
+        assert resp_bulk.status_code == 500
+        assert "UNKNOWN_CODE" in resp_bulk.json()["detail"]
+
+        resp_genes = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2")
+        assert resp_genes.status_code == 500
+        assert "UNKNOWN_CODE" in resp_genes.json()["detail"]
+
+
+def test_golden_set_zero_surfaced_gene_only_genes_filled():
+    bundle = build_bundle(("MYCN",), release_id="rel-zero")
+    harness = CsvHarness(bundle=bundle)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("MYCN")["cancer_types"][0])
+    # Store a checked-but-zero-surfaced pair for rel-zero
+    harness.store.rows[("MYCN", base_stats["oncotree_code"], "rel-zero", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="MYCN",
+        oncotree_code=base_stats["oncotree_code"],
+        release_id="rel-zero",
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=False,
+        exclusion_reason="literature",
+        stats=base_stats,
+        evidence={
+            "literature_gate": TUMOR_SPECIFIC_GATE,
+            "tumor_type_query": "neuroblastoma",
+            "supported": False,
+            "insufficient_evidence": False,
+            "pmids": [],
+            "rationale": "No evidence.",
+            "evaluated_at": "2026-11-05T12:00:00Z",
+            "verdict": "insufficient_evidence",
+            "papers": [],
+            "decided_by": "judge",
+        },
+        computed_at=now,
+    )
+    with TestClient(harness.app) as client:
+        resp = client.get(f"{PREFIX}/golden-set.csv?genes=MYCN")
+        assert resp.status_code == 200
+        header, rows = parse_csv_response(resp.text)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["Genes"] == "MYCN"
+        for col in header:
+            if col != "Genes":
+                assert row[col] == "", f"Zero-surfaced gene column {col!r} should be empty string, got {row[col]!r}"
+
+
+def test_golden_set_unchecked_gene_returns_422():
+    bundle = build_bundle(("ERBB2", "MYCN"), release_id="rel-a")
+    harness = CsvHarness(bundle=bundle)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+    # Only ERBB2 has stored result
+    harness.store.rows[("ERBB2", "BRCA", "rel-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="ERBB2",
+        oncotree_code="BRCA",
+        release_id="rel-a",
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=base_stats,
+        evidence=_v2_supported_evidence("12345678", "breast cancer"),
+        computed_at=now,
+    )
+    with TestClient(harness.app) as client:
+        # MYCN is not yet checked
+        resp = client.get(f"{PREFIX}/golden-set.csv?genes=MYCN")
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {"not_yet_checked": ["MYCN"]}
+
+        # Both ERBB2 and MYCN: fails with 422, emitting no file
+        resp_both = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2,MYCN")
+        assert resp_both.status_code == 422
+        assert resp_both.json()["detail"] == {"not_yet_checked": ["MYCN"]}
+
+
+def test_golden_set_unsurfaced_pairs_never_appear_in_cancer_types_or_pmids():
+    def _edit_esca(doc):
+        if doc["gene"]["hugo_symbol"] == "ERBB2":
+            for ct in doc["cancer_types"]:
+                if ct["oncotree_code"] == "ESCA":
+                    ct["literature_precheck_pass"] = False
+
+    bundle_a = build_bundle(("ERBB2",), release_id="release-a", edit_gene=_edit_esca)
+    erbb2_doc = dict(gene_file("ERBB2"))
+    # Edit BRCA to fail stats in bundle B
+    brca_failing = dict(erbb2_doc["cancer_types"][0])
+    brca_failing["stats_pass"] = False
+    brca_failing["q_value"] = 0.5
+    bundle_b = build_bundle(
+        release_id="release-b",
+        edit_gene=lambda doc: doc.update({"cancer_types": [brca_failing]})
+        if doc["gene"]["hugo_symbol"] == "ERBB2"
+        else None,
+    )
+    harness = CsvHarness(bundle=bundle_a)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+
+    with TestClient(harness.app) as client:
+        # 1. Stored supported evidence for release-a
+        harness.store.rows[("ERBB2", "BRCA", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id="release-a",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=base_stats,
+            evidence=_v2_supported_evidence("12345678", "breast cancer"),
+            computed_at=now,
+        )
+
+        # 2. Broad-blocked lineage pair with stored supported evidence
+        harness.store.rows[("ERBB2", "LUAD", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="LUAD",
+            release_id="release-a",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=False,
+            exclusion_reason="stats",
+            stats={**base_stats, "oncotree_code": "LUAD"},
+            evidence=_v2_supported_evidence("22222222", "lung cancer"),
+            computed_at=now,
+        )
+
+        # 3. Old-rule (acgc_pipeline_v1) verdict
+        harness.store.rows[("ERBB2", "STAD", "release-a", "acgc_pipeline_v1")] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="STAD",
+            release_id="release-a",
+            literature_gate="acgc_pipeline_v1",
+            surfaced=True,
+            stats={**base_stats, "oncotree_code": "STAD"},
+            evidence={"literature_gate": "acgc_pipeline_v1", "pmids": ["33333333"], "supported": True},
+            computed_at=now,
+        )
+
+        # 4. Fresh false precheck pair with stored supported evidence
+        harness.store.rows[("ERBB2", "ESCA", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="ESCA",
+            release_id="release-a",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=False,
+            exclusion_reason="precheck",
+            stats={**base_stats, "oncotree_code": "ESCA", "literature_precheck_pass": False},
+            evidence=_v2_supported_evidence("44444444", "esophageal cancer"),
+            computed_at=now,
+        )
+
+        # On release-a: only BRCA is surfaced
+        resp = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2")
+        assert resp.status_code == 200
+        _, rows = parse_csv_response(resp.text)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["Relevant expression-based cancer type(s)"] == "Breast cancer"
+        assert row["Relevant alteration type(s)"] == "Expression"
+        assert row["Evidence-associated PMIDs"] == "12345678"
+        for bad in ("LUAD", "Lung", "22222222", "STAD", "Stomach", "33333333", "ESCA", "Esophageal", "44444444"):
+            assert bad not in row["Relevant expression-based cancer type(s)"]
+            assert bad not in row["Evidence-associated PMIDs"]
+
+        # Now activate stats-failing release B: release A evidence must NEVER surface under B
+        harness.store.rows[("ERBB2", "BRCA", "release-b", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id="release-b",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=False,
+            exclusion_reason="stats",
+            stats=brca_failing,
+            evidence=_v2_supported_evidence("12345678", "breast cancer"),
+            computed_at=now,
+        )
+        asyncio.run(seed_bundle(harness.bundles, bundle_b))
+        harness.service.catalog.invalidate()
+
+        resp_b = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2")
+        assert resp_b.status_code == 200
+        _, rows_b = parse_csv_response(resp_b.text)
+        assert len(rows_b) == 1
+        row_b = rows_b[0]
+        assert row_b["Genes"] == "ERBB2"
+        assert row_b["Relevant expression-based cancer type(s)"] == ""
+        assert row_b["Relevant alteration type(s)"] == ""
+        assert row_b["Evidence-associated PMIDs"] == ""
+
+
+def test_golden_set_agreement_with_all_read_paths():
+    gate = FakeLiteratureGate(
+        verdicts={
+            "breast cancer": (False, ["12345678"]),
+            "gastric cancer": (False, ["23456789"]),
+        }
+    )
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    harness = CsvHarness(gate=gate, bundle=bundle)
+    with TestClient(harness.app) as client:
+        # Run job to evaluate ERBB2
+        run_job(client, "ERBB2")
+
+        # Per-pair CSV surfaced set
+        _, pair_rows = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
+        pair_surfaced_codes = {r["oncotree_code"] for r in pair_rows if r["surfaced"] == "yes"}
+        pair_pmids = set()
+        for r in pair_rows:
+            if r["surfaced"] == "yes" and r["tumor_specific_pmids"]:
+                for p in r["tumor_specific_pmids"].split(";"):
+                    if p.strip():
+                        pair_pmids.add(p.strip())
+
+        assert pair_surfaced_codes == {"BRCA", "STAD"}
+
+        # Golden set row
+        resp = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2")
+        assert resp.status_code == 200
+        _, golden_rows = parse_csv_response(resp.text)
+        assert len(golden_rows) == 1
+        golden_row = golden_rows[0]
+
+        name_map = load_sheet_cancer_names()
+        # Mapped names in order of cohort code
+        expected_cancer_names = f"{name_map['BRCA']}; {name_map['STAD']}"
+        assert golden_row["Relevant expression-based cancer type(s)"] == expected_cancer_names
+        assert golden_row["Relevant alteration type(s)"] == "Expression"
+        assert golden_row["Evidence-associated PMIDs"] == "12345678; 23456789"
+        assert set(golden_row["Evidence-associated PMIDs"].split("; ")) == pair_pmids
+
+
+def test_golden_set_multi_cohort_coadread_pmid_numeric_sorting_and_dedupe():
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+    coadread_stats = dict(base_stats)
+    coadread_stats["oncotree_code"] = "COADREAD"
+    bundle = build_bundle(
+        ("ERBB2",),
+        edit_gene=lambda doc: doc.update({
+            "cancer_types": doc["cancer_types"] + [coadread_stats]
+        }) if doc["gene"]["hugo_symbol"] == "ERBB2" else None,
+    )
+    harness = CsvHarness(bundle=bundle)
+
+    with TestClient(harness.app) as client:
+        # Surface BRCA with PMIDs 30000002 and 12345678
+        ev_brca = _v2_supported_evidence("30000002", "breast cancer")
+        ev_brca["pmids"] = ["30000002", "12345678"]
+        ev_brca["papers"] = [
+            {"pmid": "30000002", "tumor_specific": True, "reason": "Confirmed in cohort."},
+            {"pmid": "12345678", "tumor_specific": True, "reason": "Confirmed in cohort."},
+        ]
+        harness.store.rows[("ERBB2", "BRCA", harness.bundle.release_id, TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="BRCA",
+            release_id=harness.bundle.release_id,
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats={**base_stats, "oncotree_code": "BRCA"},
+            evidence=ev_brca,
+            computed_at=now,
+        )
+        # Surface COADREAD with PMID 2 and duplicate 12345678
+        ev_coad = _v2_supported_evidence("2", "colorectal cancer")
+        ev_coad["pmids"] = ["2", "12345678"]
+        ev_coad["papers"] = [
+            {"pmid": "2", "tumor_specific": True, "reason": "Confirmed in cohort."},
+            {"pmid": "12345678", "tumor_specific": True, "reason": "Confirmed in cohort."},
+        ]
+        harness.store.rows[("ERBB2", "COADREAD", harness.bundle.release_id, TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="COADREAD",
+            release_id=harness.bundle.release_id,
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats={**base_stats, "oncotree_code": "COADREAD"},
+            evidence=ev_coad,
+            computed_at=now,
+        )
+        # Surface STAD with PMID 30000001
+        harness.store.rows[("ERBB2", "STAD", harness.bundle.release_id, TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol="ERBB2",
+            oncotree_code="STAD",
+            release_id=harness.bundle.release_id,
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats={**base_stats, "oncotree_code": "STAD"},
+            evidence=_v2_supported_evidence("30000001", "stomach cancer"),
+            computed_at=now,
+        )
+
+        resp = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2")
+        assert resp.status_code == 200
+        _, rows = parse_csv_response(resp.text)
+        assert len(rows) == 1
+        row = rows[0]
+
+        # COADREAD must map to "Colorectal cancer" and be ordered by cohort code (BRCA -> COADREAD -> STAD)
+        assert row["Relevant expression-based cancer type(s)"] == "Breast cancer; Colorectal cancer; Stomach adenocarcinoma"
+        # PMIDs must be deduped (12345678 appears once) and numerically sorted: 2, 12345678, 30000001, 30000002
+        assert row["Evidence-associated PMIDs"] == "2; 12345678; 30000001; 30000002"
+
+
+def test_golden_set_alias_resolution_and_validation_errors():
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    harness = CsvHarness(bundle=bundle)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+    # Store results for ERBB2 and MYCN
+    harness.store.rows[("ERBB2", "BRCA", harness.bundle.release_id, TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="ERBB2",
+        oncotree_code="BRCA",
+        release_id=harness.bundle.release_id,
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=base_stats,
+        evidence=_v2_supported_evidence("12345678", "breast cancer"),
+        computed_at=now,
+    )
+    harness.store.rows[("MYCN", base_stats["oncotree_code"], harness.bundle.release_id, TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="MYCN",
+        oncotree_code=base_stats["oncotree_code"],
+        release_id=harness.bundle.release_id,
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=False,
+        exclusion_reason="literature",
+        stats=base_stats,
+        evidence={"literature_gate": TUMOR_SPECIFIC_GATE, "pmids": [], "supported": False, "verdict": "insufficient_evidence", "papers": []},
+        computed_at=now,
+    )
+    with TestClient(harness.app) as client:
+        # HER2 resolves to ERBB2
+        resp = client.get(f"{PREFIX}/golden-set.csv?genes=HER2")
+        assert resp.status_code == 200
+        _, rows = parse_csv_response(resp.text)
+        assert len(rows) == 1
+        assert rows[0]["Genes"] == "ERBB2"
+
+        # Deduplication case 1: HER2,ERBB2 (alias duplicate) -> 1 row
+        resp_dedupe_alias = client.get(f"{PREFIX}/golden-set.csv?genes=HER2,ERBB2")
+        assert resp_dedupe_alias.status_code == 200
+        _, rows_alias = parse_csv_response(resp_dedupe_alias.text)
+        assert len(rows_alias) == 1
+        assert rows_alias[0]["Genes"] == "ERBB2"
+
+        # Deduplication case 2: ERBB2,ERBB2 (exact symbol duplicate) -> 1 row
+        resp_dedupe_exact = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2,ERBB2")
+        assert resp_dedupe_exact.status_code == 200
+        _, rows_exact = parse_csv_response(resp_dedupe_exact.text)
+        assert len(rows_exact) == 1
+        assert rows_exact[0]["Genes"] == "ERBB2"
+
+        # Deduplication preserves first-seen order: MYCN,HER2,ERBB2 -> MYCN, ERBB2
+        resp_order = client.get(f"{PREFIX}/golden-set.csv?genes=MYCN,HER2,ERBB2")
+        assert resp_order.status_code == 200
+        _, rows_order = parse_csv_response(resp_order.text)
+        assert [r["Genes"] for r in rows_order] == ["MYCN", "ERBB2"]
+
+        # Unknown gene -> 422 listing the bad name
+        resp_unk = client.get(f"{PREFIX}/golden-set.csv?genes=HER2,UNKNOWN1")
+        assert resp_unk.status_code == 422
+        assert "UNKNOWN1" in resp_unk.json()["detail"]
+
+        # Multiple unknown genes -> 422 listing all bad names
+        resp_multi_unk = client.get(f"{PREFIX}/golden-set.csv?genes=FOO1,BAR2")
+        assert resp_multi_unk.status_code == 422
+        detail = resp_multi_unk.json()["detail"]
+        assert "FOO1" in detail and "BAR2" in detail
+
+        # More than 500 genes -> 422 with raw genes count message
+        many_genes = ",".join([f"GENE{i}" for i in range(501)])
+        resp_too_many = client.get(f"{PREFIX}/golden-set.csv?genes={many_genes}")
+        assert resp_too_many.status_code == 422
+        assert "500" in resp_too_many.json()["detail"]
+        assert "raw" in resp_too_many.json()["detail"].lower()
+
+        # Empty genes string -> 422
+        resp_empty = client.get(f"{PREFIX}/golden-set.csv?genes=   ")
+        assert resp_empty.status_code == 422
+
+        # No active bundle -> 503 with Retry-After: 60
+        harness.bundles.state = replace(harness.bundles.state, active_bundle_tag="nonexistent")
+        harness.service.catalog.invalidate()
+        resp_503 = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2")
+        assert resp_503.status_code == 503
+        assert resp_503.headers.get("Retry-After") == "60"
+
+        resp_503_bulk = client.get(f"{PREFIX}/golden-set.csv")
+        assert resp_503_bulk.status_code == 503
+        assert resp_503_bulk.headers.get("Retry-After") == "60"
+
+
+@pytest.mark.asyncio
+async def test_golden_set_bulk_stream_and_supersession():
+    bundle_a = build_bundle(("ERBB2",), release_id="release-a")
+    bundle_b = build_bundle(("ERBB2",), release_id="release-b")
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+
+    harness = CsvHarness(bundle=bundle_a)
+    harness.store.rows[("ERBB2", "BRCA", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="ERBB2",
+        oncotree_code="BRCA",
+        release_id="release-a",
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=dict(gene_file("ERBB2")["cancer_types"][0]),
+        evidence=_v2_supported_evidence("12345678", "breast cancer"),
+        computed_at=now,
+    )
+
+    with TestClient(harness.app) as client:
+        # Normal bulk export
+        resp = client.get(f"{PREFIX}/golden-set.csv")
+        assert resp.status_code == 200
+        assert resp.headers["Content-Disposition"] == 'attachment; filename="expression-context_golden-set_release-a.csv"'
+        header, rows = parse_csv_response(resp.text)
+        assert len(header) == 4
+        assert header == list(GOLDEN_SET_COLUMNS)
+        assert len(rows) == 1
+        assert rows[0]["Genes"] == "ERBB2"
+        assert rows[0]["Relevant expression-based cancer type(s)"] == "Breast cancer"
+        assert rows[0]["Relevant alteration type(s)"] == "Expression"
+        assert rows[0]["Evidence-associated PMIDs"] == "12345678"
+
+        # Supersession before first page
+        _, stream = await harness.service.export_golden_set_bundle_csv(page_size=25)
+        header_chunk = await anext(stream)
+        assert header_chunk.startswith(UTF8_BOM)
+
+        await seed_bundle(harness.bundles, bundle_b)
+        harness.service.catalog.invalidate()
+
+        emitted = []
+        with pytest.raises(BundleGone):
+            async for chunk in stream:
+                emitted.append(chunk)
+        for chunk in emitted:
+            assert "Breast cancer" not in chunk
+
+    # Supersession before final page (multi-page case: page_size=1 with 2 genes)
+    harness2 = CsvHarness(bundle=build_bundle(("ERBB2", "MYCN"), release_id="release-a2"))
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+    harness2.store.rows[("ERBB2", "BRCA", "release-a2", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="ERBB2",
+        oncotree_code="BRCA",
+        release_id="release-a2",
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=base_stats,
+        evidence=_v2_supported_evidence("12345678", "breast cancer"),
+        computed_at=now,
+    )
+    harness2.store.rows[("MYCN", "BRCA", "release-a2", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="MYCN",
+        oncotree_code="BRCA",
+        release_id="release-a2",
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=base_stats,
+        evidence=_v2_supported_evidence("87654321", "breast cancer"),
+        computed_at=now,
+    )
+    with TestClient(harness2.app):
+        _, stream2 = await harness2.service.export_golden_set_bundle_csv(page_size=1)
+        header2 = await anext(stream2)
+        assert header2.startswith(UTF8_BOM)
+        first_page = await anext(stream2)
+        assert len(first_page) > 0
+
+        # Supersede before the final page
+        await seed_bundle(harness2.bundles, bundle_b)
+        harness2.service.catalog.invalidate()
+
+        with pytest.raises(BundleGone):
+            async for _ in stream2:
+                pass
+
+
+def test_golden_set_injection_guard():
+    bundle = build_bundle(("ERBB2",))
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        # Test dangerous prefixes in hugo_symbol
+        view_dangerous = view.model_copy(update={"hugo_symbol": "=HER2"})
+        row = golden_set_row_from_view(view_dangerous)
+        assert len(row) == 4
+        assert row[0] == "'=HER2"
+
+        view_plus = view.model_copy(update={"hugo_symbol": "+HER2"})
+        row_plus = golden_set_row_from_view(view_plus)
+        assert len(row_plus) == 4
+        assert row_plus[0] == "'+HER2"
+
+        # Injection guard on cancer-name cell
+        surfaced_pair = view.pairs[0].model_copy(update={"status": "surfaced", "oncotree_code": "BRCA"})
+        view_surfaced = view.model_copy(update={"pairs": [surfaced_pair]})
+        name_map_injected = {"BRCA": "=Breast cancer"}
+        row_cancer = golden_set_row_from_view(view_surfaced, name_map=name_map_injected)
+        assert len(row_cancer) == 4
+        assert row_cancer[1] == "'=Breast cancer"
+
+        # Injection guard on alteration-type cell
+        row_alteration = golden_set_row_from_view(view_surfaced)
+        assert len(row_alteration) == 4
+        assert row_alteration[2] == "Expression"
+
+        # Injection guard on PMID cell
+        ev_injected = LiteratureVerdict.model_validate(_v2_supported_evidence("=12345678", "breast cancer"))
+        pair_injected_pmid = view.pairs[0].model_copy(update={"status": "surfaced", "oncotree_code": "BRCA", "literature": ev_injected})
+        view_injected_pmid = view.model_copy(update={"pairs": [pair_injected_pmid]})
+        row_pmid = golden_set_row_from_view(view_injected_pmid)
+        assert len(row_pmid) == 4
+        assert row_pmid[3] == "'=12345678"
+
+
+def test_golden_set_genes_supersession_between_genes_returns_503():
+    bundle_a = build_bundle(("ERBB2", "MYCN"), release_id="rel-a")
+    bundle_b = build_bundle(("ERBB2", "MYCN"), release_id="rel-b")
+    harness = CsvHarness(bundle=bundle_a)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+    for g in ("ERBB2", "MYCN"):
+        harness.store.rows[(g, "BRCA", "rel-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+            hugo_symbol=g,
+            oncotree_code="BRCA",
+            release_id="rel-a",
+            literature_gate=TUMOR_SPECIFIC_GATE,
+            surfaced=True,
+            stats=base_stats,
+            evidence=_v2_supported_evidence("12345678", "breast cancer"),
+            computed_at=now,
+        )
+
+    with TestClient(harness.app) as client:
+        orig_gene_view = harness.service.gene_view
+        first_call = True
+
+        async def side_effect_gene_view(gene, *, resolved=None):
+            nonlocal first_call
+            result = await orig_gene_view(gene, resolved=resolved)
+            if first_call:
+                first_call = False
+                # Supersede bundle between genes
+                await seed_bundle(harness.bundles, bundle_b)
+                harness.service.catalog.invalidate()
+            return result
+
+        harness.service.gene_view = side_effect_gene_view
+
+        resp = client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2,MYCN")
+        assert resp.status_code == 503
+        assert resp.headers.get("Retry-After") == "60"
+        # No mixed or partial output emitted
+        assert "text/csv" not in resp.headers.get("Content-Type", "")
+
+
+def test_bulk_export_pins_single_bundle_no_mix_on_race():
+    bundle_a = build_bundle(
+        ("ERBB2",),
+        release_id="release-a",
+        manifest_overrides={
+            "cancer_types": [
+                {
+                    "oncotree_code": "BRCA",
+                    "study_id": "study_a_brca",
+                    "cancer_type_name": "Breast Cancer",
+                    "name": "Breast Cancer",
+                    "tumor_type_query": "breast cancer",
+                },
+            ]
+        },
+    )
+    bundle_b = build_bundle(
+        ("ERBB2",),
+        release_id="release-b",
+        manifest_overrides={
+            "cancer_types": [
+                {
+                    "oncotree_code": "BRCA",
+                    "study_id": "study_b_brca",
+                    "cancer_type_name": "Breast Cancer",
+                    "name": "Breast Cancer",
+                    "tumor_type_query": "breast cancer",
+                },
+            ]
+        },
+    )
+    harness = CsvHarness(bundle=bundle_a)
+    now = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
+    base_stats = dict(gene_file("ERBB2")["cancer_types"][0])
+    harness.store.rows[("ERBB2", "BRCA", "release-a", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="ERBB2",
+        oncotree_code="BRCA",
+        release_id="release-a",
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=base_stats,
+        evidence=_v2_supported_evidence("12345678", "breast cancer"),
+        computed_at=now,
+    )
+    harness.store.rows[("ERBB2", "BRCA", "release-b", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="ERBB2",
+        oncotree_code="BRCA",
+        release_id="release-b",
+        literature_gate=TUMOR_SPECIFIC_GATE,
+        surfaced=True,
+        stats=base_stats,
+        evidence=_v2_supported_evidence("12345678", "breast cancer"),
+        computed_at=now,
+    )
+
+    with TestClient(harness.app) as client:
+        asyncio.run(seed_bundle(harness.bundles, bundle_b))
+        record_a = asyncio.run(harness.bundles.get_bundle(bundle_a.tag))
+        record_b = asyncio.run(harness.bundles.get_bundle(bundle_b.tag))
+        active_a = ActiveBundle(record_a, BundleManifest.model_validate(bundle_a.manifest))
+        active_b = ActiveBundle(record_b, BundleManifest.model_validate(bundle_b.manifest))
+
+        calls = 0
+
+        async def switching_active():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return active_a
+            return active_b
+
+        harness.service.catalog.active = switching_active
+
+        resp = client.get(f"{PREFIX}/export.csv")
+        assert resp.status_code == 503

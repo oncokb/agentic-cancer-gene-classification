@@ -15,8 +15,10 @@ import re
 import urllib.parse
 from datetime import timezone
 from decimal import Decimal
-from typing import Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
+from src.expression_context.catalog import ActiveBundle
 from src.expression_context.models import (
     CancerTypeStats,
     GeneStatsView,
@@ -67,6 +69,31 @@ CSV_COLUMNS: Tuple[str, ...] = (
     "method_version",
     "literature_checked_at",
 )
+
+GOLDEN_SET_COLUMNS: Tuple[str, ...] = (
+    "Genes",
+    "Relevant expression-based cancer type(s)",
+    "Relevant alteration type(s)",
+    "Evidence-associated PMIDs",
+)
+
+ALLOWED_ALTERATION_TYPES: Tuple[str, ...] = (
+    "Point Mutation",
+    "Structural Variant",
+    "Expression",
+    "Copy Number Alteration",
+)
+ALLOWED_ALTERATION_CATEGORIES: Tuple[str, ...] = ALLOWED_ALTERATION_TYPES
+
+
+def alteration_types_for_pair(view_pair: PairStatsView) -> List[str]:
+    """Return alteration categories contributed by this pair.
+
+    Today the only source is expression, so every surfaced pair contributes
+    'Expression'. Later alteration statistics can add categories without
+    touching the row builder.
+    """
+    return ["Expression"]
 
 
 def cbioportal_expression_url(
@@ -188,6 +215,109 @@ def format_csv_rows(
     for row in rows:
         writer.writerow(row)
     return buf.getvalue()
+
+
+def golden_set_filename(release_id: str) -> str:
+    safe_release = _SAFE_FILENAME.sub("_", (release_id or "unknown").strip()) or "unknown"
+    return f"expression-context_golden-set_{safe_release}.csv"
+
+
+class UnmappedCancerTypeError(RuntimeError):
+    """Raised when the active bundle contains a cohort code missing from sheet_cancer_names.json."""
+    pass
+
+
+def check_sheet_cancer_names(bundle: ActiveBundle, name_map: Mapping[str, str]) -> None:
+    """Verify that every cohort code in the bundle manifest is present in name_map."""
+    if not bundle.manifest.cancer_types:
+        raise UnmappedCancerTypeError("Active bundle manifest contains no cancer types")
+    unmapped = [
+        ct.oncotree_code
+        for ct in bundle.manifest.cancer_types
+        if ct.oncotree_code not in name_map
+    ]
+    if unmapped:
+        raise UnmappedCancerTypeError(
+            f"Missing golden-set sheet cancer name mapping for cohort code(s): {', '.join(sorted(set(unmapped)))}"
+        )
+
+
+def load_sheet_cancer_names(path: Optional[Union[str, Path]] = None) -> Dict[str, str]:
+    target = (
+        Path(path)
+        if path is not None
+        else Path(__file__).resolve().parent / "sheet_cancer_names.json"
+    )
+    with open(target, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {k: str(v) for k, v in data.items() if k != "version"}
+
+
+def format_golden_set_rows(
+    rows: Iterable[Sequence[str]], *, include_header: bool = False, include_bom: bool = False
+) -> str:
+    buf = io.StringIO()
+    if include_bom:
+        buf.write(UTF8_BOM)
+    writer = csv.writer(buf, lineterminator="\r\n")
+    if include_header:
+        writer.writerow(GOLDEN_SET_COLUMNS)
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+def golden_set_row_from_view(
+    view: GeneStatsView,
+    *,
+    name_map: Optional[Mapping[str, str]] = None,
+) -> List[str]:
+    if name_map is None:
+        name_map = load_sheet_cancer_names()
+
+    surfaced = [p for p in view.pairs if p.status == "surfaced"]
+    if surfaced:
+        surfaced_codes = sorted({p.oncotree_code for p in surfaced})
+        names: List[str] = []
+        for code in surfaced_codes:
+            if code not in name_map:
+                raise KeyError(f"No sheet cancer name for surfaced cohort code {code!r}")
+            name = name_map[code]
+            if name not in names:
+                names.append(name)
+        cancer_types_str = "; ".join(names)
+
+        categories: set[str] = set()
+        for p in surfaced:
+            for cat in alteration_types_for_pair(p):
+                if cat not in ALLOWED_ALTERATION_TYPES:
+                    raise ValueError(
+                        f"Unknown alteration type {cat!r}; allowed values are {ALLOWED_ALTERATION_TYPES}"
+                    )
+                categories.add(cat)
+        ordered_categories = [cat for cat in ALLOWED_ALTERATION_TYPES if cat in categories]
+        alteration_str = ", ".join(ordered_categories)
+
+        pmid_set = set()
+        for p in surfaced:
+            if p.literature and p.literature.pmids:
+                for pmid in p.literature.pmids:
+                    s = str(pmid).strip()
+                    if s:
+                        pmid_set.add(s)
+        sorted_pmids = sorted(pmid_set, key=lambda x: (int(x) if x.isdigit() else float("inf"), x))
+        pmids_str = "; ".join(sorted_pmids)
+    else:
+        cancer_types_str = ""
+        alteration_str = ""
+        pmids_str = ""
+
+    return [
+        guard_csv_text(view.hugo_symbol),
+        guard_csv_text(cancer_types_str),
+        guard_csv_text(alteration_str),
+        guard_csv_text(pmids_str),
+    ]
 
 
 def pair_view_to_csv_row(

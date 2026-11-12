@@ -6,9 +6,11 @@ producer (`expression_stats/`, its workflows and its release bundles) has its
 own removal notes in that directory.
 
 1. **Delete the package**, which includes the "Expression stats" page, its
-   static files (`src/expression_context/static/`), and the CSV export helper
-   and endpoints (`/v1/expression-context/genes/{gene}/export.csv`,
-   `/v1/expression-context/export.csv`):
+   static files (`src/expression_context/static/`, including the "Download CSV"
+   and "Download golden-set row" controls), the cancer names mapping
+   (`src/expression_context/sheet_cancer_names.json`), and the CSV export
+   helpers and endpoints (`/v1/expression-context/genes/{gene}/export.csv`,
+   `/v1/expression-context/export.csv`, `/v1/expression-context/golden-set.csv`):
    `git rm -r src/expression_context/`
 2. **Delete the registration** in `src/main.py` — exactly two lines:
    - `from src.expression_context import register_expression_context`
