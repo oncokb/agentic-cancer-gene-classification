@@ -1,0 +1,27 @@
+{
+  "source": "new_framework",
+  "derived_from": {
+    "file": "New_Framework.csv",
+    "description": "OncoKB curators' human-gene reference workbook, New_Framework tab (738 genes) exported to CSV; read as untrusted data by scripts/derive_curated_lists.py",
+    "sha256": "ffe37fc1cfece6e113a8771ab11e47d4acb1286c3b2b39116f5b0fcf3f5b5691",
+    "columns": [
+      "Genes",
+      "Relevant alteration type(s)",
+      "OG or TSG"
+    ],
+    "rule": "cna: every gene whose 'Relevant alteration type(s)' contains 'Copy Number Alteration'. mutation: every gene whose 'Relevant alteration type(s)' contains 'Point Mutation' and whose upper-cased symbol is not in bailey2018_drivers.tsv. 'OG or TSG' copied verbatim; role = OG (Oncogene), TSG (TSG), OG/TSG (OG/TSG), otherwise unknown (blank, Neither, Insufficient Evidence). source_record is the logical CSV record number, header = 1."
+  },
+  "lists": {
+    "cna": {
+      "file": "new_framework_cna_genes.tsv",
+      "sha256": "83b929c4f0343152f01f1fd3093c976127a1fe1da31661a6c86d1be283a57650",
+      "genes": 38
+    },
+    "mutation": {
+      "file": "new_framework_mutation_genes.tsv",
+      "sha256": "f7916a953bdca1133bb96b744de37aa2532669e27cb53d474c78e058df141f42",
+      "genes": 46
+    }
+  },
+  "licence": "Internal OncoKB curation (Memorial Sloan Kettering), no public data licence. Only gene symbols, the curators' one-word OG/TSG label and a record number are copied; no evidence text, PMIDs, drugs or cancer types. Replace with an OncoKB API export before any external redistribution of the list itself."
+}

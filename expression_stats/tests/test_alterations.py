@@ -29,6 +29,14 @@ DRIVER = drivers.DriverSource(
     genes=frozenset({"KRAS", "TP53", "EGFR", "ROS1", "ERBB2"}),
     tumor_suppressors=frozenset({"TP53"}),
 )
+# Every fixture gene is a copy-number driver with no role: both directions callable.
+CNA_DRIVER = drivers.CnaDriverSource(
+    name="test-cna",
+    sha256="1" * 64,
+    genes=frozenset({"KRAS", "TP53", "EGFR", "ROS1", "ERBB2", "TTN"}),
+    oncogenes=frozenset(),
+    tumor_suppressors=frozenset(),
+)
 CATALOG = {3845: "KRAS", 7157: "TP53", 1956: "EGFR", 6098: "ROS1", 2064: "ERBB2", 7273: "TTN"}
 IDS = sorted(CATALOG)
 ROW = {symbol: IDS.index(entrez) for entrez, symbol in CATALOG.items()}
@@ -240,7 +248,9 @@ def low_threshold_params():
 @pytest.fixture
 def result(tmp_path):
     inputs, mapping, selection = synthetic(tmp_path)
-    return alterations.compute(inputs, mapping, selection, IDS, CATALOG, {}, DRIVER)
+    return alterations.compute(
+        inputs, mapping, selection, IDS, CATALOG, {}, DRIVER, cna_driver=CNA_DRIVER
+    )
 
 
 def category(result, gene, code, name):
@@ -291,7 +301,9 @@ def test_duplicate_gistic_columns_count_one_patient_once(tmp_path):
     data["calls"] = np.concatenate([data["calls"], extra], axis=1)
     data["samples"] = np.concatenate([data["samples"], [first, first[:13] + "06"]])
     inputs["AA"]["cna"]["cases"] |= {first[:13] + "06"}
-    result = alterations.compute(inputs, mapping, selection, IDS, CATALOG, {}, DRIVER)
+    result = alterations.compute(
+        inputs, mapping, selection, IDS, CATALOG, {}, DRIVER, cna_driver=CNA_DRIVER
+    )
     erbb2 = category(result, "ERBB2", "AA", COPY_NUMBER_ALTERATION)
     assert (erbb2["n_events"], erbb2["n_profiled"]) == (10, 30)
     assert result.summary["cohorts"]["AA"][COPY_NUMBER_ALTERATION]["n_profiled"] == 30
@@ -301,7 +313,9 @@ def test_selection_with_two_samples_of_one_patient_is_rejected(tmp_path):
     inputs, mapping, selection = synthetic(tmp_path)
     selection["BB"].append(selection["AA"][0][:13] + "06")
     with pytest.raises(ValueError, match="one sample per patient"):
-        alterations.compute(inputs, mapping, selection, IDS, CATALOG, {}, DRIVER)
+        alterations.compute(
+            inputs, mapping, selection, IDS, CATALOG, {}, DRIVER, cna_driver=CNA_DRIVER
+        )
 
 
 def test_cna_bh_is_per_direction(result):
@@ -363,7 +377,9 @@ def test_enriched_types_follow_sheet_order(tmp_path):
         site1=np.array(["ERBB2"] * 8),
         site2=np.array(["GRB7"] * 8),
     )
-    result = alterations.compute(inputs, mapping, selection, IDS, CATALOG, {}, DRIVER)
+    result = alterations.compute(
+        inputs, mapping, selection, IDS, CATALOG, {}, DRIVER, cna_driver=CNA_DRIVER
+    )
     record = result.record(ROW["ERBB2"], 0)
     assert record["alteration_types_enriched"] == [STRUCTURAL_VARIANT, COPY_NUMBER_ALTERATION]
 
@@ -371,7 +387,9 @@ def test_enriched_types_follow_sheet_order(tmp_path):
 def test_too_few_profiled_patients_is_insufficient_data(tmp_path):
     inputs, mapping, selection = synthetic(tmp_path)
     inputs["AA"]["mutation"]["cases"] = set(selection["AA"][1:12])
-    result = alterations.compute(inputs, mapping, selection, IDS, CATALOG, {}, DRIVER)
+    result = alterations.compute(
+        inputs, mapping, selection, IDS, CATALOG, {}, DRIVER, cna_driver=CNA_DRIVER
+    )
     entry = category(result, "KRAS", "AA", POINT_MUTATION)
     assert entry["status"] == "insufficient_data" and entry["n_profiled"] == 11
 
@@ -432,6 +450,7 @@ def build_fixture(tmp_path, monkeypatch, alteration_inputs):
     monkeypatch.setattr(builder, "hgnc", lambda *a: ({7157: "TP53", 213: "ALB"}, {}))
     monkeypatch.setattr(alterations, "load_inputs", alteration_inputs)
     monkeypatch.setattr(builder.drivers, "load", lambda name: DRIVER)
+    monkeypatch.setattr(builder.drivers, "load_cna", lambda name: CNA_DRIVER)
     panel = {"controls": [dict(id="c", gene="ALB", tcga="LIHC", expected=True)]}
     evaluate = controls.evaluate
     monkeypatch.setattr(
@@ -503,8 +522,12 @@ def test_alterations_are_detail_only(tmp_path, monkeypatch):
     assert all(record["alterations"] is None for record in skipped["cancer_types"])
     manifest = json.loads((with_alterations / "v1/manifest.json").read_text())
     jsonschema.validate(manifest, SCHEMAS["manifest"])
-    assert manifest["contract_version"] == "1.1" and manifest["method_version"] == "3"
+    assert manifest["contract_version"] == "1.2" and manifest["method_version"] == "3"
     assert manifest["source"]["mutation_driver_source"] == "test"
+    assert manifest["source"]["cna_driver_source"] == "test-cna"
+    assert manifest["source"]["cna_driver_sha256"] == "1" * 64
+    cna = lihc["alterations"]["categories"][COPY_NUMBER_ALTERATION]
+    assert cna["allowed_directions"] == ["amp", "del"]
     other = json.loads((without / "v1/manifest.json").read_text())
     assert other["release_id"] != manifest["release_id"]
     assert manifest["build"]["skip_alterations"] is False

@@ -14,14 +14,24 @@ def panel_sha256():
     return hashlib.sha256(PANEL_PATH.read_bytes()).hexdigest()
 
 
+CANDIDATE_MISSES = "expression_candidate_misses"
+
+
 def expected_counts(panel):
+    """(positives, negatives) of the gated expression panel.
+
+    Ids and (gene, tcga) pairs must be unique across gated controls and the non-gating
+    candidate misses: a pair cannot be both gated and documented as a known miss.
+    """
     ids, pairs = set(), set()
-    for row in panel["controls"]:
+    for row in panel["controls"] + panel.get(CANDIDATE_MISSES, []):
         pair = (row["gene"], row["tcga"])
         if row["id"] in ids or pair in pairs:
             raise ValueError(f"Duplicate control id or (gene, tcga): {row['id']} {pair}")
         ids.add(row["id"])
         pairs.add(pair)
+    if any("expected" in row for row in panel.get(CANDIDATE_MISSES, [])):
+        raise ValueError("Candidate misses are never gated; remove their 'expected' field")
     return (
         sum(row["expected"] is True for row in panel["controls"]),
         sum(row["expected"] is False for row in panel["controls"]),
@@ -44,7 +54,9 @@ def document_loader(source):
 
 
 def control_genes(panel):
-    rows = panel["controls"] + panel.get("alteration_controls", [])
+    rows = (
+        panel["controls"] + panel.get("alteration_controls", []) + panel.get(CANDIDATE_MISSES, [])
+    )
     return {row["gene"] for row in rows}
 
 
@@ -133,6 +145,43 @@ def evaluate_alterations(genes_dir, codes, *, subset=False, panel=None, skipped=
     )
 
 
+CANDIDATE_FIELDS = (
+    "pass_mode",
+    "log2fc",
+    "cliffs_delta",
+    "q_value",
+    "subgroup_high_count",
+    "p95_log2_diff",
+    "subgroup_q",
+)
+
+
+def evaluate_candidate_misses(load, panel):
+    """Documented candidate method misses: measured and reported, never gated or counted."""
+    rows = []
+    for control in panel.get(CANDIDATE_MISSES, []):
+        document = load(control["gene"]) or {}
+        record = next(
+            (r for r in document.get("cancer_types", []) if r["oncotree_code"] == control["tcga"]),
+            {},
+        )
+        rows.append(
+            dict(
+                **control,
+                observed=record.get("stats_pass"),
+                **{key: record.get(key) for key in CANDIDATE_FIELDS},
+                scored=False,
+            )
+        )
+    return dict(
+        gating=False,
+        total=len(rows),
+        recovered=sum(r["observed"] is True for r in rows),
+        missing=sum(r["observed"] is None for r in rows),
+        controls=rows,
+    )
+
+
 def evaluate(genes_dir, *, subset=False, panel=None, codes=None, alterations=None):
     """Missing scored pairs fail closed, including missing negative controls.
 
@@ -182,6 +231,7 @@ def evaluate(genes_dir, *, subset=False, panel=None, codes=None, alterations=Non
         missing=sum(r["observed"] is None for r in positives + negatives),
         failures=failures,
         controls=rows,
+        candidate_misses=evaluate_candidate_misses(load, panel),
         **extra,
     )
 
@@ -208,6 +258,10 @@ def summary(report):
     view["controls"] = [
         (row.get("id"), row.get("observed"), row.get("matched"))
         for row in report.get("controls", [])
+    ]
+    candidates = report.get("candidate_misses") or {}
+    view["candidate_misses"] = [
+        (row.get("id"), row.get("observed")) for row in candidates.get("controls", [])
     ]
     alterations = report.get("alterations") or {}
     view["alterations"] = {key: alterations.get(key) for key in SUMMARY_KEYS}

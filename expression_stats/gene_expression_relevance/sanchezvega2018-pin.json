@@ -1,0 +1,15 @@
+{
+  "source": "sanchezvega2018",
+  "file": "sanchezvega2018_pathway_genes.tsv",
+  "sha256": "de36b3a31f45f91275617248729e6133862283380c3c7658dae3d66e6867926a",
+  "derived_from": {
+    "url": "https://ars.els-cdn.com/content/image/1-s2.0-S0092867418303593-mmc3.xlsx",
+    "sha256": "df722435b7c069b9225c9e4bbef7ab812385bd5e8ab7c415837cde5f2838c640",
+    "sheets": ["Cell Cycle", "HIPPO", "MYC", "NOTCH", "NRF2", "PI3K", "TGF-Beta", "RTK RAS", "TP53", "WNT"],
+    "columns": ["Gene", "OG/TSG", "GISTIC amp", "GISTIC del"],
+    "rows": "every row with a non-empty Gene after each sheet's 'Gene' header (335 rows, 334 genes); values copied verbatim (stripped); the MutSig genes and OncoKB-CNA sheets are not used"
+  },
+  "copy_number_rule": "A gene is a copy-number driver from this source when the paper lists it as a recurrent GISTIC target in a direction consistent with its role: OG with a non-empty 'GISTIC amp', TSG with a non-empty 'GISTIC del', any other label (NA, Unknown, blank) with either. Pathway membership alone is not a copy-number claim.",
+  "citation": "Sanchez-Vega F, Mina M, Armenia J, et al. Oncogenic Signaling Pathways in The Cancer Genome Atlas. Cell. 2018;173(2):321-337.e10. doi:10.1016/j.cell.2018.03.035. PMID 29625050. Table S3: Curated pathway templates.",
+  "licence": "No explicit data licence: publisher supplementary material (TCGA PanCanAtlas), used here as a factual gene/role list with attribution, as for the Bailey list. Replaceable by OncoKB labels through the copy-number driver-source interface."
+}

@@ -1,7 +1,7 @@
 # Expression context (optional, removable module)
 
-Status: artifact schema_version 1, contract 1.1 (additive alteration detail), expression
-method v3, alteration method v1 — 2026-11-12
+Status: artifact schema_version 1, contract 1.2 (additive alteration detail and scope),
+expression method v3, alteration method v2 — 2026-11-12
 
 ## Goal
 
@@ -149,7 +149,7 @@ opposite group is empty. Existing nullable fields retain their semantics.
 `p90_log2`/`rest_p90_log2` remain informational. `tissue_of_origin_risk` and
 `small_n` remain informational flags. Do not interpret a null as measured zero.
 
-## Alteration-type statistics (detail only; alteration method "1", contract 1.1)
+## Alteration-type statistics (detail only; alteration method "2", contract 1.2)
 
 Alongside expression, every (gene, cohort) pair carries per-category genomic-alteration
 enrichment for the curators' categories, spelled exactly **"Point Mutation"**,
@@ -157,8 +157,8 @@ enrichment for the curators' categories, spelled exactly **"Point Mutation"**,
 "Expression"). These results are **detail only**: they never feed `stats_pass`,
 `pass_mode`, `lineage_blocked_by_broad`, `broadly_expressed`, flags, PubMed prechecks,
 the expression controls, or which pairs surface. For identical inputs every expression
-field is byte-for-byte identical with or without alterations (tested), and the 35/27
-expression controls are unchanged. The expression `method_version` stays `"3"` and the
+field is byte-for-byte identical with or without alterations (tested), and every
+expression pass, label and flag is identical to the alteration method 1 build. The expression `method_version` stays `"3"` and the
 release ID keeps its `m3` token; alterations are versioned separately as
 `alteration_method_version`.
 
@@ -191,21 +191,36 @@ already a unique 15-character sample ID, so these rules are safeguards.
 
 - *Point Mutation* — putative drivers under the TCGA-derived rule of
   `point-mutation-options.md` (rule C), using the swappable driver source
-  `mutation_driver_source` (today `"bailey2018"`): the gene must be in the driver list;
+  `mutation_driver_source` (today `"bailey2018+new_framework"`, 345 genes: Bailey's 299
+  plus the 46 genes curators annotate Point Mutation in New_Framework that Bailey lacks;
+  see *Pinned gene lists*): the gene must be in the eligibility list;
   a missense call counts when the same (gene, `Transcript_ID`, protein position) is
   mutated in ≥`missense_min_recurrence` (10) retained tumours pan-cancer; a truncating
   call (nonsense, frameshift indel, splice site) counts only in genes labelled TSG or
-  possible TSG in any Bailey row; an in-frame insertion/deletion counts when the exact
+  possible TSG in any Bailey row, or, for the 46 added genes, whose curated "OG or TSG"
+  label is TSG or OG/TSG (added genes labelled Oncogene or with no label count only
+  recurrent missense and in-frame changes); an in-frame insertion/deletion counts when the exact
   (gene, transcript, `HGVSp_Short`) recurs in ≥`inframe_min_recurrence` (5) retained
   tumours. Tumours with more than `hypermutator_max_nonsynonymous` (500) nonsynonymous
   MAF rows (missense, nonsense, nonstop, splice site, translation start, frameshift and
   in-frame indels, all genes) are excluded from events, recurrence and denominators.
-  Genes outside the driver list are `not_testable` (reason names the source); this is
+  Genes outside the eligibility list are `not_testable` with reason
+  `gene not in mutation driver list (bailey2018+new_framework)`; this is
   "no supported driver annotation", not evidence of neutrality.
 - *Copy Number Alteration* — GISTIC exactly **+2** (amplification, `amp`) and exactly
   **−2** (deep deletion, `del`), tested separately; +1/−1 are comparators. Duplicate
-  source rows for one gene combine per sample. The category is enriched if either
-  direction passes; `enriched_directions` lists which. **SKCM** GISTIC data cover only
+  source rows for one gene combine per sample. **Scope:** only genes on the pinned
+  copy-number driver list `cna_driver_source` (`"bailey2018+new_framework+sanchezvega2018"`,
+  378 genes) can be called; every other gene is `not_testable` with reason exactly
+  `not a copy-number driver` (co-amplified / co-deleted passengers are not reported as
+  "not enriched"). **Direction by role** (`cna_direction_by_role`): a gene whose known
+  roles are oncogene only may be called for `amp` only, tumour suppressor only for `del`
+  only; both roles or no known role allow both. The other direction's statistics remain
+  in `amp`/`del` with `enriched: false`, and the `reason` of a non-enriched record
+  explains it (`del: not called: oncogene role allows amplification only`). Both
+  directions keep their own 32-cohort BH family whatever the role. `allowed_directions`
+  lists the callable directions (`[]` when not testable). The category is enriched if an
+  allowed direction passes; `enriched_directions` lists which. **SKCM** GISTIC data cover only
   metastatic (type `06`) samples, so no selected primary is profiled and SKCM CNA is
   `not_testable` with that reason; SKCM primaries are absent from every CNA rest
   denominator.
@@ -238,9 +253,10 @@ per-gene, per-category screening q-values, not genome-wide FDR.
 **Statuses (every gene × cohort × category, never omitted).**
 `enriched` (all gates pass); `not_enriched` (tested; `reason` lists failed gates);
 `insufficient_data` (too few profiled patients, or too few fusion events); `not_testable`
-(`reason` says why: no profiled primaries / metastatic-only data, gene not in GISTIC
-data or unmeasured in that cohort, gene not in the driver list). Every non-enriched
-status has a non-null `reason`.
+(`reason` says why: no profiled primaries / metastatic-only data, gene not in the
+mutation eligibility list, `not a copy-number driver`, gene not in GISTIC data or
+unmeasured in that cohort). Cohort-level reasons (e.g. SKCM metastatic-only CNA) take
+precedence over gene-level ones. Every non-enriched status has a non-null `reason`.
 
 **Bailey driver list (licence caveat).** `gene_expression_relevance/bailey2018_drivers.tsv`
 is Table S1 of Bailey et al., *Comprehensive Characterization of Cancer Driver Genes and
@@ -252,6 +268,25 @@ is verified at load and recorded as `source.mutation_driver_sha256`. The publish
 supplement carries **no explicit data licence**; it is used here as a research gene
 list. OncoKB oncogenic/TSG labels can replace it by registering another source in
 `drivers.py` and changing `mutation_driver_source`, which changes the release identity.
+
+**Pinned gene lists (alteration method 2).** Every list is a committed file whose
+SHA-256 is verified at load; source names, a combined SHA-256 and per-file SHA-256s are
+recorded (`source.mutation_driver_*`, `source.cna_driver_*`) and hashed into the release
+identity, and all files are part of the code fingerprint. Roles from several sources are
+unioned per gene.
+
+| List | File / pin | Used for | Licence note |
+| --- | --- | --- | --- |
+| Bailey 2018 Table S1 (299 genes, 20/20+ roles) | `bailey2018_drivers.tsv` / `drivers-pin.json` | PM eligibility and TSG rule; CNA scope and role | publisher supplement, no explicit licence (above) |
+| New_Framework curated Copy Number Alteration genes (38) | `new_framework_cna_genes.tsv` / `curated-lists-pin.json` | CNA scope; curated OG/TSG role | internal OncoKB curation, no public licence; symbols and one-word role only |
+| New_Framework curated Point Mutation genes not in Bailey (46) | `new_framework_mutation_genes.tsv` / `curated-lists-pin.json` | PM eligibility; truncating counted only for TSG or OG/TSG | as above |
+| Sanchez-Vega et al. 2018 Table S3 pathway templates (334 genes; 109 qualify) | `sanchezvega2018_pathway_genes.tsv` / `sanchezvega2018-pin.json` | CNA scope and role, only genes the paper lists as recurrent GISTIC targets in a role-consistent direction (OG with GISTIC amp, TSG with GISTIC del, other labels either) | publisher supplement, no explicit licence; attribution as Bailey |
+
+The curator lists are derived from the New_Framework CSV export, read as data, by
+`scripts/derive_curated_lists.py` (source CSV SHA-256 in the pin). Curator roles map
+"Oncogene" → OG, "TSG" → TSG, "OG/TSG" → both; blank, "Neither" and "Insufficient
+Evidence" are no known role. Sanchez-Vega is needed because MDM2 (a gated SARC
+amplification control) is in neither Bailey nor New_Framework.
 
 **Wire format.** Each per-type record gains a nullable `alterations` object (null only
 when a review build used `--skip-alterations`; published bundles always populate it):
@@ -282,31 +317,53 @@ with the smaller p); `amp`/`del` hold both. `n_profiled` is the category denomin
 (CNA: patients with a measured call for the gene). The manifest adds `contract_version`
 ("1.1"), `alteration_method_version`, `alteration_params`, `build.skip_alterations`,
 `source.alteration_inputs_sha256`, `source.mutation_driver_source`,
-`source.mutation_driver_sha256`, and an `alterations` summary (per-cohort selected /
-profiled / hypermutator counts and the SHA-256 of every input file and case list).
+`source.mutation_driver_sha256`, `source.mutation_driver_files`, `source.cna_driver_source`,
+`source.cna_driver_sha256`, `source.cna_driver_files` (contract 1.2), and an `alterations`
+summary (per-cohort selected / profiled / hypermutator counts, the SHA-256 of every input
+file and case list, and `cna_driver_genes*` / `cna_driver_directions` counts).
 
 **Backward compatibility.** `schema_version` stays `"1"`; all additions are new keys.
 Consumers ignoring unknown fields (the current `src/expression_context` loader) keep
-working unchanged; documents without `alterations` (contract 1.0) remain valid.
+working unchanged; documents without `alterations` (contract 1.0) remain valid. Contract
+1.2 changes no field type or status vocabulary: it adds `allowed_directions`, the
+manifest `*_driver_*` keys and new `not_testable` reason strings, and alteration method 2
+changes which genes / directions can be enriched. Expression fields are untouched.
 
 **Identity.** The build fingerprint (release ID suffix) also hashes
-`alteration_method_version`, `alteration_params`, the driver source name and SHA-256, and
-the SHA-256 of every alteration input file and case list; the Bailey TSV is part of the
-code fingerprint. Changing any of them yields a new release ID.
+`alteration_method_version`, `alteration_params` (including `mutation_driver_source`,
+`cna_driver_source` and `cna_direction_by_role`), the mutation and copy-number driver
+source names with combined and per-file SHA-256s, and the SHA-256 of every alteration
+input file and case list; every pinned list TSV and pin JSON is part of the code
+fingerprint. Changing any of them yields a new release ID.
 
 ### Curated controls and PubMed
 
 `expression_stats/controls.yaml` is JSON-compatible YAML, read with stdlib
 JSON, with original source SHA-256, PMIDs, class and expected outcomes. It
-contains 25 lineage positives, 10 subgroup positives, 24 negatives and three
-regression negatives. ERBB2/ESCA is reported but excluded from scoring.
+contains 25 lineage positives, 10 subgroup positives, 16 ADC/I-O abundance positives
+(classification `D`), 24 negatives and three regression negatives. ERBB2/ESCA is reported
+but excluded from scoring.
+
+The 16 `D` pairs are the curator workbook's recommended must-pass additions (each passed
+the unchanged m3 rule when proposed; a descriptive, not held-out, panel): biomarker-free
+ADC anchors NECTIN4/BLCA, CD19/DLBC, CD79B/DLBC, TNFRSF8/DLBC; clinical/trial abundance
+targets CEACAM5/COADREAD, MSLN/MESO, MSLN/OV, MSLN/PAAD, GPC3/LIHC, CA9/KIRC,
+CLDN6/TGCT, CLDN6/OV, KLK2/PRAD, STEAP1/PRAD, SLC34A2/OV, SLC34A2/LUAD. Each row's
+`note` names the agent(s), biomarker-free status and histology scope and `source` the
+workbook provenance.
+
+`expression_candidate_misses` documents clinically supported pairs the RNA rule does not
+recover (F3/CESC, MET/LUAD). They carry no `expected` field, are evaluated and reported
+under the report's `candidate_misses` (`gating: false`, observed `stats_pass` and deciding
+statistics), never counted in positive/negative totals and never fail the gate or
+publication. Their ids and pairs must not duplicate any gated control.
 The panel is included in the code fingerprint so changing it changes identity.
 Control IDs and (gene, tcga) pairs must both be unique; evaluation and publication
 reject duplicates. Publisher positive/negative totals are derived from this panel,
 not hard-coded, while requiring all positives pass, zero negative passes and
 zero missing scored pairs.
 
-Every build writes `v1/controls-report.json`. Full builds must pass all 35
+Every build writes `v1/controls-report.json`. Full builds must pass all 51
 positives and pass none of the 27 negatives; missing scored genes/types fail
 closed, including missing negatives. The gate runs before PubMed. Failure
 raises, preserves the report and manifest under `<out>-failed/`, retains any
@@ -315,7 +372,7 @@ failed control artifacts for review. Subset builds report `skipped_subset`,
 do not enforce the gate, and remain unpublishable. The manifest's `controls`
 summary records status, panel SHA-256, counts, missing count and failures.
 Publication independently requires the complete passing report for the current
-panel, 35/35 positives and 0/27 negatives, in addition to full precheck coverage.
+panel, 51/51 positives and 0/27 negatives, in addition to full precheck coverage.
 `controls-report.json` is a separate release asset with its existing bytes.
 
 **Alteration controls.** `alteration_controls` in the same panel gate category statuses
@@ -385,7 +442,7 @@ is maintained separately (PR #167). No shared Python imports are permitted.
 ```json
 {
   "schema_version": "1",
-  "contract_version": "1.1",
+  "contract_version": "1.2",
   "release_id": "datahub-<12hex>-m3-<build_sha12>",
   "bundle_tag": "expression-stats-datahub-<12hex>-m3-<build_sha12>-pubmed-<YYYYMMDD>",
   "pubmed_snapshot_date": "<YYYY-MM-DD>",
@@ -443,8 +500,8 @@ is maintained separately (PR #167). No shared Python imports are permitted.
   "controls": {
     "status": "passed",
     "controls_sha256": "<sha256 of controls.yaml>",
-    "positive_passed": 35,
-    "positive_total": 35,
+    "positive_passed": 51,
+    "positive_total": 51,
     "negative_passed": 0,
     "negative_total": 27,
     "missing": 0,

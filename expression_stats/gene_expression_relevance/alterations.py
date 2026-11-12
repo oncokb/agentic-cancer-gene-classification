@@ -66,6 +66,12 @@ MUTATION_COLUMNS = [
 POSITION = re.compile(r"p\.[A-Z*](\d+)[A-Z*]")
 PRIMARY_TYPES = ("01", "03")
 STATUSES = ("enriched", "not_enriched", "insufficient_data", "not_testable")
+DIRECTIONS = ("amp", "del")
+NOT_CNA_DRIVER = "not a copy-number driver"
+ROLE_NOTE = {
+    ("amp",): "not called: oncogene role allows amplification only",
+    ("del",): "not called: tumor suppressor role allows deep deletion only",
+}
 
 
 # ---------------------------------------------------------------- parsing (per file)
@@ -436,7 +442,7 @@ def untestable(reason, n_profiled=None, cna=False):
     entry = dict(status="not_testable", reason=reason, n_profiled=n_profiled, **EMPTY)
     entry["direction"] = None
     if cna:
-        entry.update(enriched_directions=[], amp=None, **{"del": None})
+        entry.update(enriched_directions=[], allowed_directions=[], amp=None, **{"del": None})
     return entry
 
 
@@ -446,13 +452,29 @@ def untestable(reason, n_profiled=None, cna=False):
 class Alterations:
     """All alteration results for one build, addressable by (gene row, cohort index)."""
 
-    def __init__(self, codes, results, reasons, gene_reasons, summary, params=ALTERATION_PARAMS):
+    def __init__(
+        self,
+        codes,
+        results,
+        reasons,
+        gene_reasons,
+        summary,
+        params=ALTERATION_PARAMS,
+        cna_allowed=None,
+    ):
         self.codes = codes
         self.results = results  # category -> fisher dict (CNA: {"amp": ..., "del": ...})
         self.reasons = reasons  # category -> {cohort index: not_testable reason}
         self.gene_reasons = gene_reasons  # category -> callable(i, j) -> reason or None
         self.summary = summary
         self.params = params
+        # (genes, 2) booleans: may amp / del be called enriched for this gene row.
+        self.cna_allowed = cna_allowed
+
+    def _cna_directions(self, i):
+        if self.cna_allowed is None:
+            return DIRECTIONS
+        return tuple(d for d, ok in zip(DIRECTIONS, self.cna_allowed[i], strict=True) if ok)
 
     def _category(self, category, i, j):
         reason = self.reasons[category].get(j) or self.gene_reasons[category](i, j)
@@ -483,15 +505,21 @@ class Alterations:
             else:
                 entry.update(status="not_enriched", reason="; ".join(failed))
             return entry
+        allowed = self._cna_directions(i)
         components, outcomes = {}, {}
-        for direction in ("amp", "del"):
+        for direction in DIRECTIONS:
             part = self.results[category][direction]
             passed, failed = gate(part, i, j, category, self.params)
+            if direction not in allowed:
+                # Statistics stay visible; the role forbids calling this direction.
+                passed, failed = False, [ROLE_NOTE[allowed]]
             components[direction] = dict(**_stats(part, i, j), enriched=passed)
             outcomes[direction] = failed
-        enriched = [d for d in ("amp", "del") if components[d]["enriched"]]
+        enriched = [d for d in DIRECTIONS if components[d]["enriched"]]
         if enriched:
             lead = enriched[0]
+        elif len(allowed) == 1:
+            lead = allowed[0]
         else:
             p_amp = components["amp"]["p_value"]
             p_del = components["del"]["p_value"]
@@ -500,6 +528,7 @@ class Alterations:
         entry = dict(status=None, reason=None, n_profiled=n_profiled, **top)
         entry.update(direction=lead, enriched_directions=enriched, amp=components["amp"])
         entry["del"] = components["del"]
+        entry["allowed_directions"] = list(allowed)
         if n_profiled < minimum:
             entry.update(
                 status="insufficient_data",
@@ -548,8 +577,23 @@ def _cohort_reason(label, listed, selected_profiled):
     return f"no selected primary tumor is in the {label} case list"
 
 
-def compute(inputs, mapping, selection, ids, catalog, aliases, driver, params=ALTERATION_PARAMS):
-    """Build Alterations for gene rows `ids` (Entrez) over the cohorts in `mapping` order."""
+def compute(
+    inputs,
+    mapping,
+    selection,
+    ids,
+    catalog,
+    aliases,
+    driver,
+    params=ALTERATION_PARAMS,
+    *,
+    cna_driver,
+):
+    """Build Alterations for gene rows `ids` (Entrez) over the cohorts in `mapping` order.
+
+    driver: mutation DriverSource; cna_driver: CnaDriverSource (genes off its list are
+    CNA not_testable; on-list genes may be called only in their role's direction(s)).
+    """
     codes = [item["oncotree_code"] for item in mapping]
     studies = [item["study_id"] for item in mapping]
     genes = Genes(ids, catalog, aliases)
@@ -644,11 +688,29 @@ def compute(inputs, mapping, selection, ids, catalog, aliases, driver, params=AL
         a, d, m = cna_counts(data["calls"][:, profiled], rows, n_genes)
         amp[:, j], deletion[:, j], measured[:, j] = a, d, m
     cna = {"amp": fisher(amp, measured), "del": fisher(deletion, measured)}
+    # Copy-number driver scope: rows on the list and the direction(s) their role allows.
+    # Symbols resolving to one row combine (an OG label and a TSG label allow both).
+    resolved_cna = {symbol: genes.entrez(symbol) for symbol in sorted(cna_driver.genes)}
+    cna_roles = np.zeros((n_genes, 2), dtype=bool)  # oncogene, tumor suppressor
+    cna_driver_rows = np.zeros(n_genes, dtype=bool)
+    for symbol, entrez in resolved_cna.items():
+        if entrez in genes.row:
+            row = genes.row[entrez]
+            cna_driver_rows[row] = True
+            cna_roles[row, 0] |= symbol in cna_driver.oncogenes
+            cna_roles[row, 1] |= symbol in cna_driver.tumor_suppressors
+    if params.get("cna_direction_by_role", True):
+        only_og, only_tsg = cna_roles[:, 0] & ~cna_roles[:, 1], cna_roles[:, 1] & ~cna_roles[:, 0]
+        cna_allowed = np.stack([cna_driver_rows & ~only_tsg, cna_driver_rows & ~only_og], axis=1)
+    else:
+        cna_allowed = np.stack([cna_driver_rows, cna_driver_rows], axis=1)
     # One BH family per gene x direction across the 32 cohorts (as for PM and SV).
     for part in cna.values():
         part["q_value"] = np.where(np.isfinite(part["p_value"]), bh(part["p_value"]), np.nan)
 
     def cna_gene_reason(i, j):
+        if not cna_driver_rows[i]:
+            return NOT_CNA_DRIVER
         if not present[i]:
             return "gene not present in GISTIC copy-number data"
         if measured[i, j] == 0:
@@ -687,6 +749,14 @@ def compute(inputs, mapping, selection, ids, catalog, aliases, driver, params=AL
             s for s, e in resolved_drivers.items() if e is None
         ),
         point_mutation_events=int(pm_events.sum()),
+        cna_driver_genes=len(cna_driver.genes),
+        cna_driver_genes_resolved=int(cna_driver_rows.sum()),
+        cna_driver_genes_unresolved=sorted(s for s, e in resolved_cna.items() if e is None),
+        cna_driver_directions=dict(
+            amp_only=int((cna_allowed[:, 0] & ~cna_allowed[:, 1]).sum()),
+            del_only=int((cna_allowed[:, 1] & ~cna_allowed[:, 0]).sum()),
+            both=int((cna_allowed[:, 0] & cna_allowed[:, 1]).sum()),
+        ),
     )
     return Alterations(
         codes,
@@ -699,4 +769,5 @@ def compute(inputs, mapping, selection, ids, catalog, aliases, driver, params=AL
         },
         summary,
         params,
+        cna_allowed=cna_allowed,
     )

@@ -313,5 +313,95 @@
     "gene": "ERBB2",
     "tcga": "ESCA",
     "stats_pass": false
+  },
+  {
+    "gene": "NECTIN4",
+    "tcga": "BLCA",
+    "stats_pass": true
+  },
+  {
+    "gene": "CD19",
+    "tcga": "DLBC",
+    "stats_pass": true
+  },
+  {
+    "gene": "CD79B",
+    "tcga": "DLBC",
+    "stats_pass": true
+  },
+  {
+    "gene": "TNFRSF8",
+    "tcga": "DLBC",
+    "stats_pass": true
+  },
+  {
+    "gene": "CEACAM5",
+    "tcga": "COADREAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "MSLN",
+    "tcga": "MESO",
+    "stats_pass": true
+  },
+  {
+    "gene": "MSLN",
+    "tcga": "OV",
+    "stats_pass": true
+  },
+  {
+    "gene": "MSLN",
+    "tcga": "PAAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "GPC3",
+    "tcga": "LIHC",
+    "stats_pass": true
+  },
+  {
+    "gene": "CA9",
+    "tcga": "KIRC",
+    "stats_pass": true
+  },
+  {
+    "gene": "CLDN6",
+    "tcga": "TGCT",
+    "stats_pass": true
+  },
+  {
+    "gene": "CLDN6",
+    "tcga": "OV",
+    "stats_pass": true
+  },
+  {
+    "gene": "KLK2",
+    "tcga": "PRAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "STEAP1",
+    "tcga": "PRAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "SLC34A2",
+    "tcga": "OV",
+    "stats_pass": true
+  },
+  {
+    "gene": "SLC34A2",
+    "tcga": "LUAD",
+    "stats_pass": true
+  },
+  {
+    "gene": "F3",
+    "tcga": "CESC",
+    "stats_pass": false
+  },
+  {
+    "gene": "MET",
+    "tcga": "LUAD",
+    "stats_pass": false
   }
 ]

@@ -723,6 +723,16 @@
                             ]
                           }
                         },
+                        "allowed_directions": {
+                          "type": "array",
+                          "uniqueItems": true,
+                          "items": {
+                            "enum": [
+                              "amp",
+                              "del"
+                            ]
+                          }
+                        },
                         "amp": {
                           "type": [
                             "object",
