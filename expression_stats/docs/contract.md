@@ -315,7 +315,7 @@ fields are null when undefined or `not_testable`; never read null as zero. For C
 top-level statistics describe `direction` (the first enriched direction, else the one
 with the smaller p); `amp`/`del` hold both. `n_profiled` is the category denominator
 (CNA: patients with a measured call for the gene). The manifest adds `contract_version`
-("1.1"), `alteration_method_version`, `alteration_params`, `build.skip_alterations`,
+("1.2"; "1.1" before the CNA driver lists), `alteration_method_version`, `alteration_params`, `build.skip_alterations`,
 `source.alteration_inputs_sha256`, `source.mutation_driver_source`,
 `source.mutation_driver_sha256`, `source.mutation_driver_files`, `source.cna_driver_source`,
 `source.cna_driver_sha256`, `source.cna_driver_files` (contract 1.2), and an `alterations`
