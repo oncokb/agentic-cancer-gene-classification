@@ -1,0 +1,740 @@
+gene	cancer	predicted_role_20_20_plus	decision
+ABL1	PANCAN		rescued
+ACVR1	UCEC	oncogene	official
+ACVR1B	PANCAN	possible tsg	official
+ACVR2A	COADREAD	tsg	official
+ACVR2A	LIHC	possible tsg	official
+ACVR2A	PANCAN	possible tsg	official
+AJUBA	PANCAN	tsg	official
+AJUBA	HNSC	tsg	official
+AKT1	CESC	oncogene	official
+AKT1	PRAD	oncogene	official
+AKT1	PANCAN	oncogene	official
+AKT1	THCA	oncogene	official
+AKT1	UCEC	oncogene	official
+AKT1	BRCA	oncogene	official
+ALB	LIHC	possible tsg	official
+ALK	PANCAN		rescued
+AMER1	PANCAN	possible tsg	official
+AMER1	COADREAD	possible tsg	official
+APC	PRAD	tsg	official
+APC	PANCAN	tsg	official
+APC	STAD	tsg	official
+APC	COADREAD	tsg	official
+APOB	LIHC	possible tsg	official
+AR	PANCAN		rescued
+ARAF	PANCAN		rescued
+ARHGAP35	LUSC	tsg	official
+ARHGAP35	PANCAN	tsg	official
+ARHGAP35	UCEC	tsg	official
+ARID1A	ESCA	tsg	official
+ARID1A	LUAD	tsg	official
+ARID1A	LUSC	tsg	official
+ARID1A	UCS	tsg	official
+ARID1A	CHOL		official
+ARID1A	COADREAD	possible oncogene	official
+ARID1A	CESC	tsg	official
+ARID1A	LGG	possible tsg	official
+ARID1A	PAAD	tsg	official
+ARID1A	BLCA	tsg	official
+ARID1A	BRCA	tsg	official
+ARID1A	LIHC	tsg	official
+ARID1A	PANCAN	tsg	official
+ARID1A	UCEC	tsg	official
+ARID1A	STAD	tsg	official
+ARID2	HNSC	possible tsg	official
+ARID2	LGG	possible tsg	official
+ARID2	STAD	possible tsg	official
+ARID2	LIHC	tsg	official
+ARID2	PANCAN	tsg	official
+ARID2	SKCM	tsg	official
+ARID5B	UCEC	possible tsg	official
+ASXL1	PANCAN	possible tsg	official
+ASXL1	LAML	tsg	official
+ASXL2	PANCAN	possible tsg	official
+ASXL2	BLCA	possible tsg	official
+ATF7IP	UCEC	possible tsg	official
+ATF7IP	PANCAN	tsg	official
+ATM	UCEC	tsg	official
+ATM	BLCA	possible tsg	official
+ATM	PANCAN	tsg	official
+ATM	LUAD	tsg	official
+ATM	KIRC	tsg	official
+ATR	PANCAN	possible tsg	official
+ATR	UCEC	possible tsg	official
+ATRX	ACC	possible tsg	official
+ATRX	GBM	tsg	official
+ATRX	PANCAN	tsg	official
+ATRX	SARC	tsg	official
+ATRX	LGG	tsg	official
+ATXN3	PANCAN	possible tsg	official
+AXIN1	PANCAN	tsg	official
+AXIN1	LIHC	tsg	official
+AXIN2	PANCAN	possible tsg	rescued
+B2M	PANCAN	possible tsg	official
+B2M	DLBC	possible tsg	official
+BAP1	KIRP	possible tsg	official
+BAP1	PANCAN	tsg	official
+BAP1	CHOL	tsg	official
+BAP1	LIHC	tsg	official
+BAP1	UVM	tsg	official
+BAP1	MESO	tsg	official
+BAP1	KIRC	tsg	official
+BCL2	PANCAN		rescued
+BCL2L11	UCS		official
+BCOR	UCEC	possible oncogene	official
+BCOR	STAD	tsg	official
+BCOR	PANCAN	tsg	official
+BRAF	PRAD	possible oncogene	official
+BRAF	GBM	oncogene	official
+BRAF	COADREAD	oncogene	official
+BRAF	PANCAN	oncogene	official
+BRAF	LUAD	oncogene	official
+BRAF	SKCM	oncogene	official
+BRAF	THCA	oncogene	official
+BRCA1	OV	possible tsg	official
+BRCA1	PANCAN	tsg	official
+BRCA1	BRCA	tsg	official
+BRCA2	PANCAN	possible tsg	official
+BRD7	LIHC	tsg	official
+BRD7	PANCAN	tsg	official
+BRD7	SKCM	tsg	official
+BTG2	DLBC	possible tsg	official
+CACNA1A	PANCAN	possible oncogene	official
+CARD11	DLBC	possible oncogene	official
+CASP8	CESC	tsg	official
+CASP8	STAD	possible tsg	official
+CASP8	PANCAN	tsg	official
+CASP8	BRCA	possible tsg	official
+CASP8	HNSC	tsg	official
+CBFB	PANCAN	possible tsg	official
+CBFB	BRCA	possible tsg	official
+CBWD3	PANCAN		official
+CCND1	PANCAN	possible oncogene	official
+CCND1	UCEC	possible oncogene	official
+CD70	DLBC	possible tsg	official
+CD79B	DLBC	oncogene	official
+CDH1	PANCAN	tsg	official
+CDH1	STAD	oncogene	official
+CDH1	BRCA	tsg	official
+CDK12	OV	tsg	official
+CDK12	PANCAN	tsg	official
+CDK4	PANCAN	oncogene	official
+CDK4	SKCM	oncogene	official
+CDKN1A	LIHC	possible oncogene	official
+CDKN1A	BLCA	tsg	official
+CDKN1A	PANCAN	tsg	official
+CDKN1B	BRCA	possible tsg	official
+CDKN1B	PANCAN	possible tsg	official
+CDKN2A	LIHC	possible tsg	official
+CDKN2A	LUAD	possible tsg	official
+CDKN2A	STAD	possible tsg	official
+CDKN2A	BLCA	tsg	official
+CDKN2A	ESCA	possible tsg	official
+CDKN2A	PANCAN	tsg	official
+CDKN2A	LUSC	tsg	official
+CDKN2A	SKCM	tsg	official
+CDKN2A	HNSC	tsg	official
+CDKN2A	PAAD	tsg	official
+CDKN2C	PANCAN	possible tsg	rescued
+CEBPA	LAML	possible oncogene	rescued
+CHD3	PANCAN	possible tsg	official
+CHD3	UCEC	possible tsg	official
+CHD4	BRCA	oncogene	official
+CHD4	UCS	possible tsg	official
+CHD4	UCEC	possible oncogene	official
+CHD4	PANCAN	possible oncogene	official
+CHD8	PANCAN	tsg	official
+CHEK2	PANCAN	possible tsg	official
+CIC	PANCAN	possible tsg	official
+CIC	LGG	possible tsg	official
+CNBD1	STAD	oncogene	official
+COL5A1	SKCM	oncogene	official
+CREB3L3	LIHC	possible tsg	official
+CREBBP	BLCA	tsg	official
+CREBBP	PANCAN	tsg	official
+CSDE1	PCPG	tsg	official
+CTCF	BRCA	possible tsg	official
+CTCF	PANCAN	tsg	official
+CTCF	UCEC	tsg	official
+CTNNB1	BLCA	oncogene	official
+CTNNB1	COADREAD	oncogene	official
+CTNNB1	SKCM	oncogene	official
+CTNNB1	PRAD	oncogene	official
+CTNNB1	STAD	oncogene	official
+CTNNB1	LUAD	oncogene	official
+CTNNB1	PANCAN	oncogene	official
+CTNNB1	UCEC	oncogene	official
+CTNNB1	ACC	oncogene	official
+CTNNB1	LIHC	oncogene	official
+CTNND1	UCEC	tsg	official
+CTNND1	PANCAN	tsg	official
+CUL1	BLCA	oncogene	official
+CUL1	PANCAN	oncogene	official
+CUL3	HNSC	possible tsg	official
+CUL3	LUSC	tsg	official
+CUL3	PANCAN	tsg	official
+CUL3	KIRP	tsg	official
+CYLD	HNSC	possible tsg	official
+CYSLTR2	UVM	oncogene	official
+DACH1	SKCM	oncogene	official
+DAZAP1	PANCAN	possible tsg	official
+DDX3X	SKCM	tsg	official
+DDX3X	PANCAN	tsg	official
+DHX9	LIHC	possible oncogene	official
+DIAPH2	BLCA	possible oncogene	official
+DICER1	UCEC	possible oncogene	official
+DMD	STAD	oncogene	official
+DNMT3A	PANCAN	tsg	official
+DNMT3A	THCA	tsg	official
+DNMT3A	LAML	tsg	official
+EEF1A1	PANCAN	possible oncogene	official
+EEF1A1	LIHC	oncogene	official
+EEF2	PAAD	tsg	official
+EGFR	PANCAN	oncogene	official
+EGFR	GBM	oncogene	official
+EGFR	LUAD	oncogene	official
+EGFR	LGG	oncogene	official
+EGR3	PANCAN		rescued
+EIF1AX	PANCAN	possible oncogene	official
+EIF1AX	THCA	oncogene	official
+EIF1AX	UVM	oncogene	official
+ELF3	PANCAN	possible tsg	official
+ELF3	BLCA	possible tsg	official
+EP300	UCEC	tsg	official
+EP300	LUSC	oncogene	official
+EP300	PANCAN	tsg	official
+EP300	BLCA	tsg	official
+EP300	HNSC	possible tsg	official
+EP300	CESC	tsg	official
+EPAS1	PCPG	oncogene	official
+EPHA2	CHOL	tsg	official
+EPHA2	PANCAN	tsg	official
+EPHA2	HNSC	tsg	official
+EPHA3	PANCAN		rescued
+ERBB2	ESCA	possible oncogene	official
+ERBB2	STAD	oncogene	official
+ERBB2	UCEC	oncogene	official
+ERBB2	CESC	oncogene	official
+ERBB2	BLCA	oncogene	official
+ERBB2	PANCAN	oncogene	official
+ERBB2	BRCA	oncogene	official
+ERBB3	CESC	oncogene	official
+ERBB3	BLCA	oncogene	official
+ERBB3	PANCAN	possible oncogene	official
+ERBB3	UCEC	oncogene	official
+ERBB4	STAD	oncogene	official
+ERCC2	PANCAN	possible oncogene	official
+ERCC2	BLCA	oncogene	official
+ESR1	PANCAN		rescued
+EZH2	LAML		rescued
+FAM46D	STAD	oncogene	official
+FAT1	CESC	possible tsg	official
+FAT1	UCEC	tsg	official
+FAT1	BLCA	tsg	official
+FAT1	PANCAN	tsg	official
+FAT1	LUSC	tsg	official
+FAT1	HNSC	tsg	official
+FBXW7	BRCA	possible oncogene	official
+FBXW7	ESCA	tsg	official
+FBXW7	STAD	tsg	official
+FBXW7	LUSC	possible tsg	official
+FBXW7	UCEC	possible oncogene	official
+FBXW7	BLCA	tsg	official
+FBXW7	COADREAD	tsg	official
+FBXW7	PANCAN	tsg	official
+FBXW7	CESC	possible tsg	official
+FBXW7	UCS	oncogene	official
+FBXW7	HNSC	possible tsg	official
+FGFR1	PANCAN		rescued
+FGFR2	LUSC	oncogene	official
+FGFR2	PANCAN	oncogene	official
+FGFR2	UCEC	oncogene	official
+FGFR3	PANCAN	oncogene	official
+FGFR3	HNSC	oncogene	official
+FGFR3	BLCA	oncogene	official
+FLNA	HNSC	tsg	official
+FLT3	LAML	oncogene	official
+FOXA1	BLCA	possible tsg	official
+FOXA1	PANCAN	possible oncogene	official
+FOXA1	PRAD	possible oncogene	official
+FOXA1	BRCA	oncogene	official
+FOXA2	UCEC	possible tsg	official
+FOXA2	PANCAN	possible tsg	official
+FOXQ1	BLCA	possible tsg	official
+FUBP1	PANCAN	tsg	official
+FUBP1	LGG	possible tsg	official
+GABRA6	GBM		official
+GATA3	PANCAN	possible tsg	official
+GATA3	BRCA	possible tsg	official
+GNA11	SKCM	oncogene	official
+GNA11	PANCAN	oncogene	official
+GNA11	UVM	oncogene	official
+GNA13	BLCA	oncogene	official
+GNAQ	PANCAN	oncogene	official
+GNAQ	UVM	oncogene	official
+GNAS	COADREAD	oncogene	official
+GNAS	LIHC	oncogene	official
+GNAS	PAAD	oncogene	official
+GPS2	BRCA	possible tsg	official
+GPS2	PANCAN	tsg	official
+GRIN2D	PANCAN	possible oncogene	official
+GTF2I	PANCAN	oncogene	official
+GTF2I	THYM	oncogene	official
+H3F3A	PANCAN	possible oncogene	official
+H3F3C	PANCAN		official
+HGF	PANCAN		rescued
+HIST1H1C	PANCAN		rescued
+HIST1H1E	DLBC	possible oncogene	official
+HIST1H1E	LIHC	possible tsg	official
+HLA-A	LUSC	possible tsg	official
+HLA-A	HNSC	possible tsg	official
+HLA-A	PANCAN	tsg	official
+HLA-B	DLBC	tsg	official
+HLA-B	HNSC	tsg	official
+HLA-B	PANCAN	tsg	official
+HLA-B	CESC	tsg	official
+HRAS	SKCM	oncogene	official
+HRAS	LUSC	oncogene	official
+HRAS	PRAD	oncogene	official
+HRAS	BLCA	oncogene	official
+HRAS	HNSC	oncogene	official
+HRAS	PANCAN	oncogene	official
+HRAS	THYM	oncogene	official
+HRAS	THCA	oncogene	official
+HRAS	PCPG	oncogene	official
+HUWE1	HNSC	possible tsg	official
+IDH1	LIHC	oncogene	official
+IDH1	PRAD	oncogene	official
+IDH1	LAML	oncogene	official
+IDH1	CHOL	oncogene	official
+IDH1	GBM	oncogene	official
+IDH1	SKCM	oncogene	official
+IDH1	PANCAN	oncogene	official
+IDH1	LGG	oncogene	official
+IDH2	PANCAN	possible oncogene	official
+IDH2	LAML	oncogene	official
+IDH2	LGG	oncogene	official
+IL6ST	LIHC	possible tsg	official
+IL7R	PANCAN		rescued
+INPPL1	PANCAN	possible tsg	official
+INPPL1	UCEC	possible tsg	official
+IRF2	PANCAN	tsg	official
+IRF6	PANCAN	possible tsg	official
+JAK1	PANCAN	tsg	official
+JAK2	PANCAN		rescued
+JAK3	PANCAN		rescued
+KANSL1	BLCA	tsg	official
+KANSL1	UCEC	tsg	official
+KANSL1	PANCAN	tsg	official
+KDM5C	PANCAN	possible tsg	official
+KDM5C	KIRC	tsg	official
+KDM6A	HNSC	tsg	official
+KDM6A	PAAD	tsg	official
+KDM6A	PRAD	possible tsg	official
+KDM6A	LUSC	tsg	official
+KDM6A	BLCA	tsg	official
+KDM6A	KIRP	tsg	official
+KDM6A	PANCAN	tsg	official
+KEAP1	LIHC	possible tsg	official
+KEAP1	HNSC	possible oncogene	official
+KEAP1	PANCAN	possible tsg	official
+KEAP1	LUAD	possible tsg	official
+KEAP1	LUSC	oncogene	official
+KEL	GBM		official
+KIF1A	KIRC	tsg	official
+KIT	LAML	oncogene	official
+KIT	PANCAN	possible oncogene	official
+KIT	SKCM	oncogene	official
+KIT	TGCT	oncogene	official
+KLF5	PANCAN	possible oncogene	official
+KLF5	BLCA	possible oncogene	official
+KLF5	LUSC	oncogene	official
+KLF5	CESC	possible oncogene	official
+KMT2A	PANCAN	tsg	official
+KMT2B	PANCAN	tsg	official
+KMT2B	UCEC	tsg	official
+KMT2C	UCEC	tsg	official
+KMT2C	BLCA	tsg	official
+KMT2C	PANCAN	tsg	official
+KMT2C	BRCA	tsg	official
+KMT2C	CESC	tsg	official
+KMT2D	ESCA	tsg	official
+KMT2D	BLCA	tsg	official
+KMT2D	PRAD	tsg	official
+KMT2D	CESC	tsg	official
+KMT2D	PANCAN	tsg	official
+KMT2D	HNSC	tsg	official
+KMT2D	LUSC	tsg	official
+KMT2D	DLBC	tsg	official
+KRAS	SKCM	oncogene	official
+KRAS	THCA	oncogene	official
+KRAS	BRCA	oncogene	official
+KRAS	KIRP	oncogene	official
+KRAS	LIHC	oncogene	official
+KRAS	OV	oncogene	official
+KRAS	STAD	oncogene	official
+KRAS	BLCA	oncogene	official
+KRAS	CESC	oncogene	official
+KRAS	LAML	oncogene	official
+KRAS	TGCT	oncogene	official
+KRAS	UCEC	oncogene	official
+KRAS	UCS	oncogene	official
+KRAS	PANCAN	oncogene	official
+KRAS	COADREAD	oncogene	official
+KRAS	LUAD	oncogene	official
+KRAS	PAAD	oncogene	official
+KRT222	PANCAN	possible tsg	official
+LATS1	CESC	tsg	official
+LATS2	MESO	tsg	official
+LEMD2	PANCAN		official
+LZTR1	GBM	possible oncogene	official
+LZTR1	LIHC	possible tsg	official
+MACF1	PANCAN	possible oncogene	rescued
+MAP2K1	PANCAN	oncogene	official
+MAP2K1	SKCM	oncogene	official
+MAP2K4	PANCAN	tsg	official
+MAP2K4	BRCA	tsg	official
+MAP3K1	CESC	tsg	official
+MAP3K1	PANCAN	tsg	official
+MAP3K1	UCEC	tsg	official
+MAP3K1	BRCA	tsg	official
+MAP3K4	UCS	possible tsg	official
+MAPK1	PANCAN	oncogene	official
+MAPK1	HNSC	oncogene	official
+MAPK1	CESC	oncogene	official
+MAX	UCEC	oncogene	official
+MAX	LGG	oncogene	official
+MECOM	SKCM	possible oncogene	official
+MED12	PRAD	oncogene	official
+MEN1	ACC	tsg	official
+MET	LUAD	possible tsg	official
+MET	KIRP	oncogene	official
+MGA	LUAD	tsg	official
+MGA	PANCAN	tsg	official
+MGMT	PANCAN		rescued
+MLH1	PANCAN		rescued
+MSH2	PANCAN		rescued
+MSH3	PANCAN	possible oncogene	rescued
+MSH6	UCEC	tsg	official
+MTOR	PANCAN	possible oncogene	official
+MTOR	KIRC	oncogene	official
+MUC6	STAD	possible tsg	official
+MYC	PANCAN	oncogene	official
+MYCN	UCEC	oncogene	official
+MYD88	DLBC	oncogene	official
+MYH9	HNSC	oncogene	official
+NCOR1	PANCAN	tsg	official
+NCOR1	BRCA	tsg	official
+NF1	LUSC	tsg	official
+NF1	BRCA	tsg	official
+NF1	PANCAN	tsg	official
+NF1	PCPG	tsg	official
+NF1	SKCM	tsg	official
+NF1	LUAD	tsg	official
+NF1	GBM	tsg	official
+NF1	OV	tsg	official
+NF1	LGG	tsg	official
+NF2	KIRP	tsg	official
+NF2	PANCAN	tsg	official
+NF2	MESO	tsg	official
+NFE2L2	BLCA	oncogene	official
+NFE2L2	PANCAN	oncogene	official
+NFE2L2	UCEC	oncogene	official
+NFE2L2	HNSC	oncogene	official
+NFE2L2	CESC	oncogene	official
+NFE2L2	LIHC	oncogene	official
+NFE2L2	ESCA	oncogene	official
+NFE2L2	LUSC	oncogene	official
+NIPBL	PANCAN	tsg	official
+NIPBL	LGG	tsg	official
+NOTCH1	ESCA	tsg	official
+NOTCH1	CESC	possible tsg	official
+NOTCH1	LUSC	tsg	official
+NOTCH1	PANCAN	tsg	official
+NOTCH1	LGG	possible tsg	official
+NOTCH1	HNSC	tsg	official
+NOTCH2	PANCAN		rescued
+NPM1	LAML	oncogene	official
+NRAS	LIHC	possible tsg	official
+NRAS	BLCA	oncogene	official
+NRAS	UCEC	oncogene	official
+NRAS	LGG	oncogene	official
+NRAS	OV	oncogene	official
+NRAS	COADREAD	oncogene	official
+NRAS	THYM	possible oncogene	official
+NRAS	TGCT	oncogene	official
+NRAS	PANCAN	oncogene	official
+NRAS	SKCM	oncogene	official
+NRAS	THCA	oncogene	official
+NSD1	ESCA	tsg	official
+NSD1	PANCAN	tsg	official
+NSD1	HNSC	tsg	official
+NUP133	LIHC	possible tsg	official
+NUP93	THCA	possible tsg	official
+PAX5	PANCAN		rescued
+PBRM1	UCEC	tsg	official
+PBRM1	PANCAN	tsg	official
+PBRM1	CHOL	tsg	official
+PBRM1	KIRC	tsg	official
+PCBP1	PANCAN	oncogene	official
+PCBP1	COADREAD	oncogene	official
+PDGFRA	GBM	possible oncogene	official
+PDS5B	UCEC	tsg	official
+PGR	PANCAN	possible tsg	official
+PHF6	LAML	possible tsg	rescued
+PIK3CA	KIRC	possible oncogene	official
+PIK3CA	KIRP	oncogene	official
+PIK3CA	TGCT	oncogene	official
+PIK3CA	GBM	oncogene	official
+PIK3CA	LIHC	oncogene	official
+PIK3CA	PRAD	oncogene	official
+PIK3CA	ESCA	oncogene	official
+PIK3CA	BLCA	oncogene	official
+PIK3CA	LGG	oncogene	official
+PIK3CA	LUAD	oncogene	official
+PIK3CA	UCEC	oncogene	official
+PIK3CA	UCS	oncogene	official
+PIK3CA	COADREAD	oncogene	official
+PIK3CA	PANCAN	oncogene	official
+PIK3CA	STAD	oncogene	official
+PIK3CA	HNSC	oncogene	official
+PIK3CA	LUSC	oncogene	official
+PIK3CA	CESC	oncogene	official
+PIK3CA	BRCA	oncogene	official
+PIK3CB	PANCAN		rescued
+PIK3CG	PANCAN	possible oncogene	rescued
+PIK3R1	BRCA	possible oncogene	official
+PIK3R1	LGG	possible oncogene	official
+PIK3R1	UCS	possible tsg	official
+PIK3R1	PANCAN	tsg	official
+PIK3R1	UCEC	tsg	official
+PIK3R1	GBM	possible tsg	official
+PIK3R2	PANCAN	oncogene	official
+PIK3R2	UCEC	oncogene	official
+PIM1	DLBC	oncogene	official
+PLCB4	UVM	oncogene	official
+PLCG1	LGG	oncogene	official
+PLXNB2	PANCAN	possible oncogene	official
+PMS1	PANCAN	possible oncogene	rescued
+PMS2	PANCAN	possible tsg	rescued
+POLE	PANCAN		rescued
+POLQ	PANCAN		official
+POLRMT	CESC	oncogene	official
+PPM1D	THCA		official
+PPP2R1A	PANCAN	oncogene	official
+PPP2R1A	UCEC	oncogene	official
+PPP2R1A	UCS	oncogene	official
+PPP6C	SKCM	oncogene	official
+PRKAR1A	ACC	tsg	official
+PSIP1	BLCA	tsg	official
+PSIP1	PANCAN	tsg	official
+PTCH1	PANCAN	possible tsg	official
+PTCH1	ESCA	tsg	official
+PTEN	BLCA	tsg	official
+PTEN	STAD	possible tsg	official
+PTEN	COADREAD	tsg	official
+PTEN	KICH	tsg	official
+PTEN	CESC	tsg	official
+PTEN	HNSC	tsg	official
+PTEN	LUSC	tsg	official
+PTEN	PRAD	possible tsg	official
+PTEN	SKCM	tsg	official
+PTEN	UCEC	tsg	official
+PTEN	UCS	tsg	official
+PTEN	BRCA	tsg	official
+PTEN	GBM	tsg	official
+PTEN	KIRC	possible tsg	official
+PTEN	LGG	possible tsg	official
+PTEN	PANCAN	tsg	official
+PTMA	PANCAN	possible tsg	official
+PTMA	TGCT	possible tsg	official
+PTPDC1	LAML	oncogene	official
+PTPN11	LAML	possible oncogene	official
+PTPN11	LGG	possible oncogene	official
+PTPN11	PANCAN	oncogene	official
+PTPRC	PANCAN	possible oncogene	rescued
+PTPRD	BRCA		official
+RAC1	HNSC	oncogene	official
+RAC1	PANCAN	oncogene	official
+RAC1	SKCM	oncogene	official
+RAD21	LAML		rescued
+RAF1	PANCAN		rescued
+RARA	PANCAN		rescued
+RASA1	STAD	tsg	official
+RASA1	HNSC	possible tsg	official
+RASA1	LUSC	tsg	official
+RASA1	PANCAN	tsg	official
+RB1	UCS	tsg	official
+RB1	SKCM	tsg	official
+RB1	UCEC	tsg	official
+RB1	LIHC	possible tsg	official
+RB1	HNSC	possible tsg	official
+RB1	BLCA	tsg	official
+RB1	LUAD	tsg	official
+RB1	PANCAN	tsg	official
+RB1	CESC	tsg	official
+RB1	LUSC	tsg	official
+RB1	OV	tsg	official
+RB1	BRCA	tsg	official
+RB1	GBM	tsg	official
+RB1	SARC	tsg	official
+RBM10	BLCA	tsg	official
+RBM10	PANCAN	tsg	official
+RBM10	LUAD	tsg	official
+RET	PCPG	oncogene	official
+RFC1	UCS	possible tsg	official
+RHEB	PANCAN		rescued
+RHOA	BLCA	oncogene	official
+RHOA	HNSC	oncogene	official
+RHOA	STAD	oncogene	official
+RHOA	PANCAN	oncogene	official
+RHOB	BLCA	oncogene	official
+RIT1	LUAD		official
+RNF111	PANCAN	tsg	official
+RNF43	PANCAN	tsg	official
+RNF43	STAD	possible tsg	official
+RNF43	PAAD	tsg	official
+RPL22	PANCAN	possible tsg	official
+RPL22	UCEC		official
+RPL5	PANCAN	tsg	official
+RPS6KA3	LIHC	tsg	official
+RQCD1	PANCAN	possible oncogene	official
+RQCD1	SKCM	oncogene	official
+RRAS2	UCEC	oncogene	official
+RUNX1	PANCAN	tsg	official
+RUNX1	BRCA	tsg	official
+RUNX1	LAML	tsg	official
+RXRA	BLCA	oncogene	official
+SCAF4	UCEC	tsg	official
+SCAF4	PANCAN	tsg	official
+SETBP1	PANCAN	possible oncogene	rescued
+SETD2	KIRP	tsg	official
+SETD2	LGG	possible tsg	official
+SETD2	LUAD	tsg	official
+SETD2	MESO	tsg	official
+SETD2	PANCAN	tsg	official
+SETD2	KIRC	tsg	official
+SF1	BLCA	oncogene	official
+SF1	PANCAN	possible oncogene	official
+SF3B1	BLCA	oncogene	official
+SF3B1	LAML	oncogene	official
+SF3B1	PANCAN	oncogene	official
+SF3B1	BRCA	oncogene	official
+SF3B1	UVM	oncogene	official
+SIN3A	PANCAN	possible tsg	official
+SIN3A	UCEC	tsg	official
+SMAD2	STAD	possible tsg	official
+SMAD2	COADREAD	possible tsg	official
+SMAD2	PANCAN	possible tsg	official
+SMAD4	CESC	possible tsg	official
+SMAD4	ESCA	possible tsg	official
+SMAD4	COADREAD	tsg	official
+SMAD4	PANCAN	tsg	official
+SMAD4	PAAD	tsg	official
+SMAD4	STAD	oncogene	official
+SMARCA1	PANCAN	tsg	official
+SMARCA4	LIHC	possible oncogene	official
+SMARCA4	PANCAN	possible oncogene	official
+SMARCA4	LGG	possible oncogene	official
+SMARCA4	LUAD	possible tsg	official
+SMARCB1	KIRP	possible oncogene	official
+SMC1A	UCEC	oncogene	official
+SMC1A	LAML	oncogene	official
+SMC3	LAML	possible oncogene	rescued
+SOS1	PANCAN	oncogene	official
+SOS1	UCEC	oncogene	official
+SOX17	PANCAN	possible oncogene	official
+SOX17	UCEC	possible oncogene	official
+SOX9	PANCAN	possible tsg	official
+SOX9	COADREAD	tsg	official
+SPOP	PANCAN	oncogene	official
+SPOP	UCEC	oncogene	official
+SPOP	PRAD	oncogene	official
+SPTA1	GBM	possible tsg	official
+SPTAN1	BLCA	tsg	official
+SRSF2	UVM		official
+STAG2	PANCAN	tsg	official
+STAG2	BLCA	tsg	official
+STAG2	GBM	tsg	official
+STK11	CESC	tsg	official
+STK11	PANCAN	tsg	official
+STK11	LUAD	tsg	official
+TAF1	UCEC	oncogene	official
+TBL1XR1	PANCAN	possible tsg	rescued
+TBX3	PANCAN	possible tsg	official
+TBX3	BRCA	possible tsg	official
+TCEB1	KIRC	possible tsg	official
+TCF12	GBM	possible tsg	official
+TCF12	PANCAN	tsg	official
+TCF12	LGG	possible tsg	official
+TCF7L2	COADREAD	tsg	official
+TET2	LAML		rescued
+TGFBR2	CESC	possible tsg	official
+TGFBR2	PAAD	tsg	official
+TGFBR2	HNSC	possible tsg	official
+TGFBR2	PANCAN	tsg	official
+TGIF1	COADREAD	possible tsg	official
+THRAP3	PANCAN	tsg	official
+TLR4	PANCAN		rescued
+TMSB4X	DLBC	possible tsg	official
+TNFAIP3	DLBC	tsg	official
+TP53	THYM	possible tsg	official
+TP53	DLBC	tsg	official
+TP53	LAML	possible tsg	official
+TP53	KIRC	possible tsg	official
+TP53	UCEC	possible tsg	official
+TP53	ACC	tsg	official
+TP53	BLCA	possible tsg	official
+TP53	MESO	tsg	official
+TP53	PANCAN	tsg	official
+TP53	CESC	possible tsg	official
+TP53	KICH	tsg	official
+TP53	SKCM	tsg	official
+TP53	LUAD	possible tsg	official
+TP53	LUSC	tsg	official
+TP53	STAD	tsg	official
+TP53	BRCA	tsg	official
+TP53	COADREAD	tsg	official
+TP53	ESCA	tsg	official
+TP53	GBM	possible oncogene	official
+TP53	HNSC	tsg	official
+TP53	LIHC	tsg	official
+TP53	OV	tsg	official
+TP53	PRAD	possible oncogene	official
+TP53	LGG	possible oncogene	official
+TP53	PAAD	tsg	official
+TP53	SARC	tsg	official
+TP53	UCS	tsg	official
+TRAF3	PANCAN	tsg	official
+TSC1	PANCAN	tsg	official
+TSC1	BLCA	tsg	official
+TSC2	LIHC	tsg	official
+TXNIP	BLCA	possible tsg	official
+U2AF1	UCEC	oncogene	official
+U2AF1	LAML	oncogene	official
+U2AF1	PAAD	oncogene	official
+U2AF1	PANCAN	oncogene	official
+U2AF1	LUAD	oncogene	official
+UNCX	PANCAN	possible oncogene	official
+USP9X	PANCAN	tsg	official
+VHL	PANCAN	tsg	official
+VHL	KIRC	tsg	official
+WHSC1	LIHC	oncogene	official
+WT1	PANCAN	possible oncogene	official
+WT1	LAML	possible tsg	official
+XPO1	LIHC	oncogene	official
+ZBTB20	LGG	possible tsg	official
+ZBTB7B	UCS	tsg	official
+ZC3H12A	PANCAN		official
+ZCCHC12	LGG	oncogene	official
+ZFHX3	UCEC	possible tsg	official
+ZFP36L1	BLCA	possible tsg	official
+ZFP36L2	COADREAD	possible tsg	official
+ZFP36L2	PANCAN	possible tsg	official
+ZMYM2	UCEC	tsg	official
+ZMYM3	PRAD	tsg	official
+ZNF133	OV	oncogene	official
+ZNF750	PANCAN	possible tsg	official
+ZNF750	ESCA	possible tsg	official
+ZNF750	HNSC	possible tsg	official

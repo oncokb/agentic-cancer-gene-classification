@@ -21,7 +21,7 @@ def fingerprint(paths):
 
 
 def code_fingerprint():
-    paths = [p for p in ROOT.iterdir() if p.suffix in {".py", ".json", ".html"}]
+    paths = [p for p in ROOT.iterdir() if p.suffix in {".py", ".json", ".html", ".tsv"}]
     paths.extend(
         PROJECT_ROOT / name for name in ("pyproject.toml", "constraints.txt", "controls.yaml")
     )
@@ -44,7 +44,7 @@ def mapping_fingerprint(mapping):
     ).hexdigest()
 
 
-def build_fingerprint(params, genes, skip, hgnc_sha, code_sha, mapping_sha):
+def build_fingerprint(params, genes, skip, hgnc_sha, code_sha, mapping_sha, alterations=None):
     payload = dict(
         params=params,
         genes=genes,
@@ -54,6 +54,9 @@ def build_fingerprint(params, genes, skip, hgnc_sha, code_sha, mapping_sha):
         cohort_mapping_sha256=mapping_sha,
         overrides_sha256=overrides_fingerprint(),
     )
+    if alterations is not None:
+        # Alteration method, params, driver list hash and every input object id.
+        payload["alterations"] = alterations
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

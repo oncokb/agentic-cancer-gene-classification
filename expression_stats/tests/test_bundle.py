@@ -5,6 +5,68 @@ from pathlib import Path
 
 import pytest
 
+from gene_expression_relevance import controls
+from gene_expression_relevance.controls import expected_alteration_counts
+
+CATEGORIES = ("Point Mutation", "Structural Variant", "Copy Number Alteration")
+PANEL = json.loads(Path("controls.yaml").read_text())
+
+
+def panel_codes(panel):
+    rows = panel["controls"] + panel.get("alteration_controls", [])
+    codes = sorted({row["tcga"] for row in rows} - {controls.ALL_COHORTS})
+    return codes + [f"T{i:02d}" for i in range(32 - len(codes))]
+
+
+CODES = panel_codes(PANEL)
+
+
+def synthesize(panel, codes, genes_dir, release_id):
+    """One gene document per control gene whose calls exactly satisfy the panel."""
+    expression = {(r["gene"], r["tcga"]) for r in panel["controls"] if r["expected"] is True}
+    enriched = {
+        (r["gene"], r["tcga"], r["category"]): [r["direction"]] if r.get("direction") else []
+        for r in controls.expand_alteration_controls(panel, codes)
+        if r["expected"] is True
+    }
+    genes_dir.mkdir(parents=True, exist_ok=True)
+    for gene in sorted(controls.control_genes(panel)):
+        records = []
+        for code in codes:
+            categories = {}
+            for category in CATEGORIES:
+                hit = (gene, code, category) in enriched
+                categories[category] = dict(
+                    status="enriched" if hit else "not_enriched",
+                    enriched_directions=enriched.get((gene, code, category), []),
+                    n_events=10 if hit else 0,
+                    n_profiled=100,
+                )
+            records.append(
+                dict(
+                    oncotree_code=code,
+                    stats_pass=(gene, code) in expression,
+                    pass_mode="lineage" if (gene, code) in expression else None,
+                    alterations=dict(categories=categories),
+                )
+            )
+        document = dict(release_id=release_id, gene={"hugo_symbol": gene}, cancer_types=records)
+        (genes_dir / f"{gene}.json").write_text(json.dumps(document) + "\n")
+    return controls.evaluate(genes_dir, panel=panel, codes=codes, alterations=True)
+
+
+def alteration_report(panel_path=Path("controls.yaml"), codes=CODES):
+    positives, negatives = expected_alteration_counts(json.loads(panel_path.read_text()), codes)
+    return dict(
+        status="passed",
+        positive_passed=positives,
+        positive_total=positives,
+        negative_passed=0,
+        negative_total=negatives,
+        missing=0,
+        failures=[],
+    )
+
 
 def load(name):
     spec = importlib.util.spec_from_file_location(name, Path("scripts") / f"{name}.py")
@@ -21,25 +83,16 @@ def bundled(tmp_path):
     manifest = dict(
         release_id="datahub-aaaaaaaaaaaa-m3-bbbbbbbbbbbb",
         source=dict(generated_at="2026-11-06T12:00:00+00:00", precheck_expires_at="later"),
-        build=dict(genes=None, skip_precheck=False),
+        build=dict(genes=None, skip_precheck=False, skip_alterations=False),
+        cancer_types=[dict(oncotree_code=code) for code in CODES],
     )
-    control_hash = module.sha256(Path("controls.yaml"))
-    report = dict(
-        status="passed",
-        controls_sha256=control_hash,
-        positive_passed=35,
-        positive_total=35,
-        negative_passed=0,
-        negative_total=27,
-        missing=0,
-        failures=[],
-    )
-    manifest["controls"] = report.copy()
+    report = synthesize(PANEL, CODES, source / "genes", manifest["release_id"])
+    assert report["status"] == "passed" and report["alterations"]["status"] == "passed"
+    manifest["controls"] = {key: value for key, value in report.items() if key != "controls"}
     (source / "controls-report.json").write_text(json.dumps(report))
     (source / "manifest.json").write_text(json.dumps(manifest))
     (source / "aliases.json").write_text('{"P53":"TP53"}\n')
-    gene = dict(release_id=manifest["release_id"], gene={"hugo_symbol": "TP53"})
-    (source / "genes/TP53.json").write_text(json.dumps(gene) + "\n")
+    gene = json.loads((source / "genes/ERBB2.json").read_text())
     destination = tmp_path / "bundle"
     result = module.bundle(source.parent, destination)
     return module, source, destination, result, gene
@@ -49,14 +102,15 @@ def test_bundle_preserves_wire_documents_and_aliases(bundled):
     module, source, destination, manifest, gene = bundled
     assert manifest["bundle_tag"].endswith("-pubmed-20261106")
     assert manifest["pubmed_snapshot_date"] == "2026-11-06"
-    assert manifest["gene_count"] == 1
+    paths = sorted((source / "genes").glob("*.json"))
+    assert manifest["gene_count"] == len(paths)
     payload = destination / "genes.jsonl.gz"
     assert manifest["sha256"] == module.sha256(payload)
     assert manifest["size_bytes"] == payload.stat().st_size
     with gzip.open(payload, "rb") as stream:
         data = stream.read()
-    assert data == (source / "genes/TP53.json").read_bytes()
-    assert [json.loads(line) for line in data.splitlines()] == [gene]
+    assert data == b"".join(path.read_bytes() for path in paths)
+    assert gene in [json.loads(line) for line in data.splitlines()]
     assert (source / "aliases.json").read_bytes() == (destination / "aliases.json").read_bytes()
 
 
@@ -81,6 +135,7 @@ def test_refresh_changes_tag_without_changing_release_id(bundled):
         "stale",
         "subset",
         "skip",
+        "skip_alterations",
     ],
 )
 def test_atomic_release_policy(bundled, monkeypatch, failure):
@@ -88,9 +143,11 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
     monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
     publisher = load("publish")
     monkeypatch.setenv("GITHUB_SHA", "a" * 40)
-    if failure in {"subset", "skip"}:
+    if failure in {"subset", "skip", "skip_alterations"}:
         manifest["build"] = dict(
-            genes=["TP53"] if failure == "subset" else None, skip_precheck=failure == "skip"
+            genes=["TP53"] if failure == "subset" else None,
+            skip_precheck=failure == "skip",
+            skip_alterations=failure == "skip_alterations",
         )
         (directory / "manifest.json").write_text(json.dumps(manifest))
     calls = []
@@ -116,7 +173,7 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
         return '{"id":42}'
 
     monkeypatch.setattr(publisher, "gh", gh)
-    if failure in {"upload", "corrupt", "cleanup", "stale", "subset", "skip"}:
+    if failure in {"upload", "corrupt", "cleanup", "stale", "subset", "skip", "skip_alterations"}:
         match = "stale draft 7; delete it" if failure == "stale" else None
         if failure == "cleanup":
             match = "upload failed"
@@ -188,35 +245,42 @@ def test_publisher_rejects_unpassed_controls_before_any_github_call(bundled, mon
         publisher.publish(directory)
 
 
+def rebundle(module, tmp_path, panel, manifest, edit=None):
+    """Bundle synthetic gene documents for `panel`; `edit(genes_dir)` may tamper after the gate."""
+    source = tmp_path / "custom" / "v1"
+    codes = panel_codes(panel)
+    report = synthesize(panel, codes, source / "genes", manifest["release_id"])
+    if edit is not None:
+        edit(source / "genes")
+    manifest = dict(manifest, cancer_types=[dict(oncotree_code=code) for code in codes])
+    for key in ("bundle_tag", "pubmed_snapshot_date", "gene_count", "sha256", "size_bytes"):
+        manifest.pop(key, None)
+    manifest["controls"] = {key: value for key, value in report.items() if key != "controls"}
+    (source / "controls-report.json").write_text(json.dumps(report))
+    (source / "manifest.json").write_text(json.dumps(manifest))
+    (source / "aliases.json").write_text("{}\n")
+    destination = tmp_path / "custom-bundle"
+    return destination, module.bundle(source.parent, destination), report
+
+
 @pytest.mark.parametrize("invalid", [None, "positive", "negative", "missing", "total"])
 def test_publisher_derives_required_counts_from_panel(bundled, monkeypatch, tmp_path, invalid):
-    module, _, directory, manifest, _ = bundled
+    module, _, _, manifest, _ = bundled
     monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
     publisher = load("publish")
-    panel = tmp_path / "panel.yaml"
-    panel.write_text(
-        json.dumps(
-            {
-                "controls": [
-                    dict(id="p1", gene="A", tcga="T", expected=True),
-                    dict(id="p2", gene="B", tcga="T", expected=True),
-                    dict(id="n1", gene="C", tcga="T", expected=False),
-                    dict(id="borderline", gene="D", tcga="T", expected=None),
-                ]
-            }
-        )
-    )
-    monkeypatch.setattr(publisher, "PANEL_PATH", panel)
-    report = dict(
-        status="passed",
-        controls_sha256=module.sha256(panel),
-        positive_passed=2,
-        positive_total=2,
-        negative_passed=0,
-        negative_total=1,
-        missing=0,
-        failures=[],
-    )
+    panel = {
+        "controls": [
+            dict(id="p1", gene="A", tcga="TA", expected=True),
+            dict(id="p2", gene="B", tcga="TA", expected=True),
+            dict(id="n1", gene="C", tcga="TA", expected=False),
+            dict(id="borderline", gene="D", tcga="TA", expected=None),
+        ]
+    }
+    panel_path = tmp_path / "panel.yaml"
+    panel_path.write_text(json.dumps(panel))
+    monkeypatch.setattr(publisher, "PANEL_PATH", panel_path)
+    directory, manifest, report = rebundle(module, tmp_path, panel, manifest)
+    report["controls_sha256"] = module.sha256(panel_path)
     if invalid is not None:
         key = {
             "positive": "positive_passed",
@@ -225,7 +289,7 @@ def test_publisher_derives_required_counts_from_panel(bundled, monkeypatch, tmp_
             "total": "negative_total",
         }[invalid]
         report[key] += 1
-    manifest["controls"] = report
+    manifest["controls"] = {key: value for key, value in report.items() if key != "controls"}
     (directory / "manifest.json").write_text(json.dumps(manifest))
     (directory / "controls-report.json").write_text(json.dumps(report))
     calls = []
@@ -242,6 +306,69 @@ def test_publisher_derives_required_counts_from_panel(bundled, monkeypatch, tmp_
     else:
         publisher.publish(directory)
         assert len(calls) == 1  # A valid differently sized panel reaches published-tag discovery.
+
+
+def tamper_alteration(genes_dir):
+    """Flip ERBB2/BRCA Copy Number Alteration to not enriched after the gate ran."""
+    path = genes_dir / "ERBB2.json"
+    document = json.loads(path.read_text())
+    for record in document["cancer_types"]:
+        if record["oncotree_code"] == "BRCA":
+            entry = record["alterations"]["categories"]["Copy Number Alteration"]
+            entry.update(status="not_enriched", enriched_directions=[])
+    path.write_text(json.dumps(document) + "\n")
+
+
+def tamper_expression(genes_dir):
+    path = genes_dir / "ALB.json"
+    document = json.loads(path.read_text())
+    for record in document["cancer_types"]:
+        if record["oncotree_code"] == "LIHC":
+            record["stats_pass"] = False
+    path.write_text(json.dumps(document) + "\n")
+
+
+def tamper_negative(genes_dir):
+    """Make a TTN Point Mutation negative control enriched."""
+    path = genes_dir / "TTN.json"
+    document = json.loads(path.read_text())
+    entry = document["cancer_types"][3]["alterations"]["categories"]["Point Mutation"]
+    entry.update(status="enriched")
+    path.write_text(json.dumps(document) + "\n")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [None, "tampered_alteration", "tampered_expression", "tampered_negative", "missing_gene"],
+)
+def test_publisher_rederives_controls_from_bundled_genes(bundled, monkeypatch, tmp_path, case):
+    """A passing-looking report never vouches for a bundle whose gene results disagree."""
+    module, _, _, manifest, _ = bundled
+    monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
+    publisher = load("publish")
+    edit = {
+        None: None,
+        "tampered_alteration": tamper_alteration,
+        "tampered_expression": tamper_expression,
+        "tampered_negative": tamper_negative,
+        "missing_gene": lambda genes_dir: (genes_dir / "MDM2.json").unlink(),
+    }[case]
+    directory, manifest, report = rebundle(module, tmp_path, PANEL, manifest, edit)
+    assert report["status"] == "passed"  # the copied report and counters still look clean
+    calls = []
+
+    def gh(*args):
+        calls.append(args)
+        return json.dumps([[dict(tag_name=manifest["bundle_tag"], draft=False)]])
+
+    monkeypatch.setattr(publisher, "gh", gh)
+    if case is None:
+        publisher.publish(directory)
+        assert len(calls) == 1
+    else:
+        with pytest.raises(ValueError, match="control recheck"):
+            publisher.publish(directory)
+        assert calls == []
 
 
 def test_incomplete_precheck_cannot_publish_even_with_expiry(bundled, monkeypatch):

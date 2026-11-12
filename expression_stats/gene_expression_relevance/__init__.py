@@ -1,6 +1,8 @@
 """Tumor-type expression enrichment; not tumor versus normal."""
 
 METHOD_VERSION = "3"
+# Release-bundle contract minor version (schema_version stays "1"; changes are additive).
+CONTRACT_VERSION = "1.1"
 PARAMS = dict(
     fdr=0.05,
     log2fc=1.0,
@@ -24,3 +26,28 @@ PARAMS = dict(
 
 # Recorded for consumers, derived from the single configurable expression floor.
 PARAMS["detection_log2"] = PARAMS["expression_floor_log2"]
+
+# Alteration-type statistics are detail only: they never feed stats_pass, pass_mode,
+# broadly_expressed or any expression gate. Versioned and parameterized separately so
+# the expression method (and its release_id "m3" token) is unchanged.
+ALTERATION_METHOD_VERSION = "1"
+POINT_MUTATION = "Point Mutation"
+STRUCTURAL_VARIANT = "Structural Variant"
+COPY_NUMBER_ALTERATION = "Copy Number Alteration"
+# Curator-sheet wording; also the order of alteration_types_enriched.
+ALTERATION_CATEGORIES = (POINT_MUTATION, STRUCTURAL_VARIANT, COPY_NUMBER_ALTERATION)
+ALTERATION_PARAMS = dict(
+    fdr=0.05,
+    min_profiled=20,
+    mutation_driver_source="bailey2018",
+    hypermutator_max_nonsynonymous=500,
+    missense_min_recurrence=10,
+    inframe_min_recurrence=5,
+    gates={
+        POINT_MUTATION: dict(min_events=5, min_frequency=0.02, min_ratio=2.0),
+        COPY_NUMBER_ALTERATION: dict(min_events=5, min_frequency=0.02, min_ratio=2.0),
+        # Rare-event track (alterations report proposal): fusions are sparse and
+        # assay-limited, so fewer events than min_events is insufficient_data.
+        STRUCTURAL_VARIANT: dict(min_events=3, min_frequency=0.005, min_ratio=3.0),
+    },
+)

@@ -7,7 +7,7 @@ import jsonschema
 import numpy as np
 import pytest
 
-from gene_expression_relevance import PARAMS
+from gene_expression_relevance import ALTERATION_METHOD_VERSION, ALTERATION_PARAMS, PARAMS
 from gene_expression_relevance import build as builder
 
 SCHEMAS = json.loads((Path(__file__).parent.parent / "docs/artifact-schema.json").read_text())
@@ -150,13 +150,15 @@ def test_early_exit_checks_method_commit_options_hashes_and_ttl():
         schema_version="1",
         method_version="3",
         params=PARAMS.copy(),
+        alteration_method_version=ALTERATION_METHOD_VERSION,
+        alteration_params=json.loads(json.dumps(ALTERATION_PARAMS)),
         source=dict(
             datahub_commit="a" * 40,
             code_sha256="code",
             hgnc_sha256="hgnc",
             generated_at=now.isoformat(),
         ),
-        build=dict(genes=None, skip_precheck=False),
+        build=dict(genes=None, skip_precheck=False, skip_alterations=False),
     )
     args = ["a" * 40, "3", None, False, "code", "hgnc"]
     assert unchanged(manifest, *args, now=now)
@@ -176,12 +178,22 @@ def test_early_exit_checks_method_commit_options_hashes_and_ttl():
     assert not unchanged(manifest, *args, now=now + timedelta(days=2))
     manifest["params"] = {**PARAMS, "log2fc": 2}
     assert not unchanged(manifest, *args, now=now)
+    manifest["params"] = PARAMS.copy()
+    manifest["source"].pop("precheck_expires_at")
+    assert unchanged(manifest, *args, now=now)
+    for key, value in [
+        ("alteration_method_version", "0"),
+        ("alteration_params", {**ALTERATION_PARAMS, "fdr": 0.1}),
+        ("build", dict(genes=None, skip_precheck=False, skip_alterations=True)),
+    ]:
+        assert not unchanged({**manifest, key: value}, *args, now=now)
 
 
-def test_cli_dispatch(monkeypatch):
+@pytest.mark.parametrize("flags", [[], ["--skip-alterations"], ["--delete-alteration-downloads"]])
+def test_cli_dispatch(monkeypatch, flags):
     cli = importlib.import_module("gene_expression_relevance.__main__")
     calls = []
-    monkeypatch.setattr(cli, "build", lambda *args: calls.append(args))
+    monkeypatch.setattr(cli, "build", lambda *args, **kwargs: calls.append((args, kwargs)))
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -194,11 +206,17 @@ def test_cli_dispatch(monkeypatch):
             "--genes",
             "ALB,TP53",
             "--skip-precheck",
+            *flags,
         ],
     )
     cli.main()
-    assert calls[0][0] == "a" * 40
-    assert calls[0][-2:] == (["ALB", "TP53"], True)
+    args, kwargs = calls[0]
+    assert args[0] == "a" * 40
+    assert args[-2:] == (["ALB", "TP53"], True)
+    assert kwargs == dict(
+        skip_alterations="--skip-alterations" in flags,
+        delete_downloads="--delete-alteration-downloads" in flags,
+    )
 
 
 def test_matrix_duplicate_entrez_averages_linear_values(tmp_path):
@@ -473,6 +491,7 @@ def test_budget_expiry_after_request_saves_count_and_next_build_resumes(tmp_path
         "matrix",
         lambda *args: (np.array([[31] * 10 + [0] * 310]), np.repeat(codes, 10), [213]),
     )
+    monkeypatch.setattr(builder, "select_samples", lambda *args: {c: [] for c in codes})
     monkeypatch.setattr(
         builder,
         "Precheck",

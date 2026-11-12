@@ -14,6 +14,16 @@ def main():
     command.add_argument("--genes", help="Comma-separated canonical symbols or unambiguous aliases")
     command.add_argument("--skip-precheck", action="store_true")
     command.add_argument("--cache", type=Path, default=Path(".cache"))
+    command.add_argument(
+        "--skip-alterations",
+        action="store_true",
+        help="Omit alteration statistics (review-only, never publishable)",
+    )
+    command.add_argument(
+        "--delete-alteration-downloads",
+        action="store_true",
+        help="Delete each raw mutation/CNA/SV download once its summary is cached (CI disk)",
+    )
     args = parser.parse_args()
     validate_commit(args.datahub_commit)
     build(
@@ -22,6 +32,8 @@ def main():
         args.cache,
         args.genes.split(",") if args.genes else None,
         args.skip_precheck,
+        skip_alterations=args.skip_alterations,
+        delete_downloads=args.delete_alteration_downloads,
     )
 
 
