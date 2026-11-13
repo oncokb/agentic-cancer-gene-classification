@@ -19,11 +19,14 @@ SUPPORTED_SCHEMA_VERSION = "1"
 # Method versions this module understands. m3 only adds optional fields, so
 # m2 bundles still load; method_version is informational, never enforced.
 SUPPORTED_METHOD_VERSIONS = ("2", "3")
+HIGH_CONFIDENCE = "high"
 PASS_MODE_LABELS = {"lineage": "Lineage enriched", "subgroup": "Subgroup enriched"}
 # Canonical/alias gene symbols as accepted from users and from bundles.
 SYMBOL_PATTERN = r"[A-Z0-9][A-Z0-9._-]{0,63}\Z"
 
-ExclusionReason = Literal["stats", "precheck", "literature", "pending"]
+# "candidate": passes the v3 statistics but not the high-confidence tier
+# (contract 1.3); never surfaced, never sent to the literature gate.
+ExclusionReason = Literal["stats", "precheck", "literature", "pending", "candidate"]
 JobState = Literal["queued", "running", "succeeded", "failed"]
 
 
@@ -117,6 +120,11 @@ class CancerTypeStats(_Artifact):
     p95_log2_diff: Optional[float] = None
     subgroup_q: Optional[float] = None
 
+    # ---- contract 1.3 (optional; absent in older bundles) ----
+    # "high" | "candidate" | null (null when the v3 pass fails). A string so an
+    # unknown future value can't reject a bundle; only "high" counts as high.
+    confidence_tier: Optional[str] = None
+
     @property
     def broad_blocked(self) -> bool:
         """Lineage enrichment blocked by broad expression and no subgroup pass:
@@ -127,6 +135,24 @@ class CancerTypeStats(_Artifact):
     def passes_stats(self) -> bool:
         """The statistics call ACGC acts on (stats_pass, minus broad-blocked pairs)."""
         return self.stats_pass and not self.broad_blocked
+
+    @property
+    def effective_confidence_tier(self) -> Optional[str]:
+        """The tier ACGC acts on, None unless ``passes_stats``.
+
+        Bundles before contract 1.3 omit ``confidence_tier``: a missing field on a
+        passing pair counts as "high", so old data behaves exactly as before. An
+        explicit null or an unknown value on a passing pair is not high.
+        """
+        if not self.passes_stats:
+            return None
+        if "confidence_tier" not in self.model_fields_set:
+            return HIGH_CONFIDENCE
+        return self.confidence_tier
+
+    @property
+    def high_confidence(self) -> bool:
+        return self.effective_confidence_tier == HIGH_CONFIDENCE
 
     @property
     def enrichment_label(self) -> Optional[str]:
@@ -309,7 +335,8 @@ class HistoryPage(BaseModel):
 # "expired": the bundle's pre-check counts are past source.precheck_expires_at,
 # so the pre-check doesn't exclude (the literature gate decides).
 PrecheckState = Literal["pass", "fail", "not_run", "expired"]
-PairStatus = Literal["surfaced", "excluded", "literature_pending"]
+# "candidate": v3 stats pass below the high-confidence tier; never surfaced.
+PairStatus = Literal["surfaced", "excluded", "literature_pending", "candidate"]
 
 
 class BundleProvenance(BaseModel):
@@ -353,7 +380,10 @@ class PairStatsView(BaseModel):
     enrichment: Optional[str] = None  # "Lineage enriched" / "Subgroup enriched"
     broad_blocked: bool = False
     precheck: PrecheckState
-    # Sent to the literature gate: stats_pass AND precheck is not "fail".
+    # "high" | "candidate" | None as acted on (missing field in an older bundle
+    # on a passing pair = "high"); None when the statistics fail.
+    confidence_tier: Optional[str] = None
+    # Sent to the literature gate: stats_pass AND high tier AND precheck is not "fail".
     literature_eligible: bool
     status: PairStatus
     exclusion_reason: Optional[ExclusionReason] = None
@@ -364,6 +394,7 @@ class GeneStatsSummary(BaseModel):
     surfaced: int = 0
     literature_pending: int = 0
     excluded: int = 0
+    candidate: int = 0
 
 
 class GeneStatsView(BaseModel):

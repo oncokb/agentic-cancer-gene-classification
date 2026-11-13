@@ -210,7 +210,7 @@ def build(
                         if key == "broadly_expressed":
                             continue
                         value = array[i, j]
-                        if key == "pass_mode":
+                        if key in ("pass_mode", "confidence_tier"):
                             record[key] = value
                             continue
                         record[key] = (

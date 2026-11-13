@@ -182,6 +182,30 @@ def evaluate_candidate_misses(load, panel):
     )
 
 
+HIGH = "high"
+CANDIDATE = "candidate"
+
+
+def tier_breakdown(positives, negatives):
+    """Reported, never gating for positives: which v3 passes are high vs candidate."""
+    return dict(
+        positive_high=sum(
+            r["observed"] is True and r["confidence_tier"] == HIGH for r in positives
+        ),
+        positive_candidate=sum(
+            r["observed"] is True and r["confidence_tier"] == CANDIDATE for r in positives
+        ),
+        positive_total=len(positives),
+        negative_high=sum(r["confidence_tier"] == HIGH for r in negatives),
+        negative_total=len(negatives),
+        positive_candidate_ids=[
+            r["id"]
+            for r in positives
+            if r["observed"] is True and r["confidence_tier"] == CANDIDATE
+        ],
+    )
+
+
 def evaluate(genes_dir, *, subset=False, panel=None, codes=None, alterations=None):
     """Missing scored pairs fail closed, including missing negative controls.
 
@@ -191,7 +215,7 @@ def evaluate(genes_dir, *, subset=False, panel=None, codes=None, alterations=Non
     panel = json.loads(PANEL_PATH.read_text()) if panel is None else panel
     expected_counts(panel)
     load = document_loader(genes_dir)
-    rows, failures = [], []
+    rows, failures, extra = [], [], {}
     for control in panel["controls"]:
         document = load(control["gene"]) or {}
         record = next(
@@ -199,23 +223,26 @@ def evaluate(genes_dir, *, subset=False, panel=None, codes=None, alterations=Non
             {},
         )
         observed = record.get("stats_pass")
+        tier = record.get("confidence_tier")
         expected = control["expected"]
         scored = expected is not None and not subset
         matched = isinstance(observed, bool) and observed == expected
-        if scored and not matched:
+        # The tier never gates a positive, but a negative must never be high.
+        if scored and (not matched or (expected is False and tier == HIGH)):
             failures.append(control["id"])
         rows.append(
             dict(
                 **control,
                 observed=observed,
                 pass_mode=record.get("pass_mode"),
+                confidence_tier=tier,
                 scored=scored,
                 matched=matched if scored else None,
             )
         )
     positives = [r for r in rows if r["expected"] is True]
     negatives = [r for r in rows if r["expected"] is False]
-    extra = {}
+    extra["tiers"] = tier_breakdown(positives, negatives)
     if codes is not None:
         extra["alterations"] = evaluate_alterations(
             genes_dir, codes, subset=subset, panel=panel, skipped=alterations is False
@@ -256,9 +283,10 @@ def summary(report):
     """The decision-relevant view of a report: counters plus every control's call."""
     view = {key: report.get(key) for key in SUMMARY_KEYS}
     view["controls"] = [
-        (row.get("id"), row.get("observed"), row.get("matched"))
+        (row.get("id"), row.get("observed"), row.get("matched"), row.get("confidence_tier"))
         for row in report.get("controls", [])
     ]
+    view["tiers"] = report.get("tiers")
     candidates = report.get("candidate_misses") or {}
     view["candidate_misses"] = [
         (row.get("id"), row.get("observed")) for row in candidates.get("controls", [])

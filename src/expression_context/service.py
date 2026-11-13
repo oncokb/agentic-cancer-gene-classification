@@ -8,16 +8,20 @@ A (gene, cancer type) pair is *surfaced* iff:
 1. it passes the statistics: ``stats_pass``, and not a method-m3 pair whose
    lineage enrichment was blocked by broad expression without a subgroup
    pass (``CancerTypeStats.passes_stats``), and
-2. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
+2. its ``confidence_tier`` is "high" (contract 1.3; a bundle without the field
+   counts every stats pass as high, ``CancerTypeStats.high_confidence``).
+   Weaker passes are *candidates*: listed, never surfaced, and
+3. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
    pre-check; null means it was not run, and the literature gate itself is
    authoritative), and
-3. the literature gate confirms the SPECIFIC tumor type
+4. the literature gate confirms the SPECIFIC tumor type
    (``literature_gate.verdict_supported``: verdict "supported" AND >=1 PMID
    judged to describe the gene in that tumor type; only those are cited).
 
-Only pairs passing 1 and 2 reach the literature gate; exclusion reason
-``precheck`` is recorded only for an explicit ``literature_precheck_pass:
-false``. Verdicts are stored per
+This rule lives only in ``_evaluate_gene_view``; /stats, /genes, both CSVs,
+history and job polling all read that view. Only pairs passing 1-3 reach the
+(paid) literature gate; exclusion reason ``precheck`` is recorded only for an
+explicit ``literature_precheck_pass: false``. Verdicts are stored per
 (hugo_symbol, oncotree_code, release_id, literature_gate) and reused.
 """
 
@@ -63,6 +67,7 @@ from src.expression_context.literature_gate import (
     verdict_supported,
 )
 from src.expression_context.models import (
+    HIGH_CONFIDENCE,
     SYMBOL_PATTERN,
     BundleProvenance,
     BundleStatus,
@@ -300,6 +305,9 @@ class ExpressionContextService:
         def row(stats: CancerTypeStats, surfaced: bool, reason, evidence=None) -> StoredPair:
             cancer_type = manifest.cancer_type(stats.oncotree_code)
             stored_stats = stats.model_dump()
+            if "confidence_tier" not in stats.model_fields_set:
+                # Keep "absent" (older bundle) distinguishable from an explicit null.
+                stored_stats.pop("confidence_tier", None)
             # Denormalized display fields, so reads never need the artifact.
             stored_stats["cancer_type_name"] = cancer_type.name if cancer_type else None
             stored_stats["study_id"] = cancer_type.study_id if cancer_type else None
@@ -328,6 +336,10 @@ class ExpressionContextService:
             if not stats.passes_stats:
                 # Includes broad-blocked m3 pairs: visible, never sent on.
                 rows.append(row(stats, False, "stats"))
+                continue
+            if not stats.high_confidence:
+                # Candidate: never sent to the paid literature gate.
+                rows.append(row(stats, False, "candidate"))
                 continue
             if effective_precheck(stats, expired) is False:
                 rows.append(row(stats, False, "precheck"))
@@ -546,7 +558,9 @@ class ExpressionContextService:
             if expired and stats.literature_precheck_pass is not None:
                 precheck = "expired"
             passes = stats.passes_stats
-            eligible = passes and effective_precheck(stats, expired) is not False
+            tier = stats.effective_confidence_tier
+            high = passes and tier == HIGH_CONFIDENCE
+            eligible = high and effective_precheck(stats, expired) is not False
             verdict = None
             prior = stored.get(stats.oncotree_code)
             if (
@@ -571,6 +585,9 @@ class ExpressionContextService:
                     )
             if not passes:
                 status, reason = "excluded", "stats"
+            elif not high:
+                # Below the high-confidence tier: never surfaced, whatever is stored.
+                status, reason = "candidate", "candidate"
             elif not eligible:
                 status, reason = "excluded", "precheck"
             elif verdict is None:
@@ -590,6 +607,7 @@ class ExpressionContextService:
                     stats_pass=passes,
                     enrichment=stats.enrichment_label,
                     broad_blocked=stats.broad_blocked,
+                    confidence_tier=tier,
                     precheck=precheck,
                     literature_eligible=eligible,
                     status=status,

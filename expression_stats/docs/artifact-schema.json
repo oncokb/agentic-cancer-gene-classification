@@ -71,6 +71,18 @@
           },
           "subgroup_fdr": {
             "type": "number"
+          },
+          "strong_log2fc": {
+            "type": "number"
+          },
+          "strong_cliffs_delta": {
+            "type": "number"
+          },
+          "strong_subgroup_min_fraction": {
+            "type": "number"
+          },
+          "strong_subgroup_min_fraction_ratio": {
+            "type": "number"
           }
         },
         "required": [
@@ -359,6 +371,13 @@
               "enum": [
                 "lineage",
                 "subgroup",
+                null
+              ]
+            },
+            "confidence_tier": {
+              "enum": [
+                "high",
+                "candidate",
                 null
               ]
             },

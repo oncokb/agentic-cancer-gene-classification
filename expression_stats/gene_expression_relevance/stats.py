@@ -213,4 +213,31 @@ def compute(linear, labels, codes, params=PARAMS):
     )
     result["stats_pass"] = lineage | subgroup
     result["pass_mode"] = np.where(lineage, "lineage", np.where(subgroup, "subgroup", None))
+    result["confidence_tier"] = confidence_tier(result, lineage, subgroup, params)
     return result
+
+
+def confidence_tier(result, lineage, subgroup, params=PARAMS):
+    """ "high" | "candidate" | None per pair; None exactly when the v3 pass fails.
+
+    Read-only over the v3 arrays: a v3 pass is "high" if the arm it passes by (its
+    pass_mode; lineage wins when both arms pass) also meets that arm's strong cutoffs
+    (both inclusive), otherwise "candidate".
+    """
+    with np.errstate(invalid="ignore"):
+        strong_lineage = (
+            lineage
+            & (result["log2fc"] >= params["strong_log2fc"])
+            & (result["cliffs_delta"] >= params["strong_cliffs_delta"])
+        )
+        strong_subgroup = (
+            subgroup
+            & ~lineage
+            & (result["subgroup_high_fraction"] >= params["strong_subgroup_min_fraction"])
+            & (
+                result["subgroup_high_fraction_ratio"]
+                >= params["strong_subgroup_min_fraction_ratio"]
+            )
+        )
+    passed = lineage | subgroup
+    return np.where(strong_lineage | strong_subgroup, "high", np.where(passed, "candidate", None))
