@@ -17,8 +17,8 @@ on:
 permissions:
   contents: read
 env:
-  # Use the same numeric runtime for release builds and expression stats CI.
-  NPY_DISABLE_CPU_FEATURES: AVX AVX2 FMA3 AVX512F AVX512_SKX AVX512_CLX AVX512_CNL AVX512_ICL AVX512_SPR
+  # Use the same NumPy x86 baseline as expression stats CI for release builds.
+  NPY_DISABLE_CPU_FEATURES: X86_V3 X86_V4 AVX512_ICL AVX512_SPR
   OPENBLAS_NUM_THREADS: '1'
   OMP_NUM_THREADS: '1'
   MKL_NUM_THREADS: '1'
