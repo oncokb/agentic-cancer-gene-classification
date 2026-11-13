@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Curated m3 gate. JSON-compatible YAML, read with the Python standard library. Borderline is reported but not scored. alteration_controls gate category statuses (detail-only alteration statistics); tcga \"*\" expands to every cohort; expected null is recorded but not gated.",
+  "description": "Curated m3 gate. JSON-compatible YAML, read with the Python standard library. Borderline is reported but not scored. alteration_controls gate category statuses (detail-only alteration statistics); tcga \"*\" expands to every cohort; expected null is recorded but not gated. Classification D: ADC/I-O tumour-cell abundance targets from the curator workbook (gated like A/B). expression_candidate_misses are clinically supported pairs the RNA rule does not recover: evaluated and reported under candidate_misses, never gated or counted.",
   "source_sha256": "a982d001080f0d592676e92078de938775a5abf05e4412acc98f0064f4dda827",
   "source_proposal_sha256": "45c2546bfe5537e51d9e3ce6f89162f3c8aed3c1e9895d1092cd48d2e6a2acd6",
   "controls": [
@@ -389,6 +389,166 @@
         26536169
       ],
       "note": "MET mutation/copy gain (papillary RCC)"
+    },
+    {
+      "id": "D-NECTIN4-BLCA",
+      "gene": "NECTIN4",
+      "tcga": "BLCA",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: enfortumab vedotin (ADC); biomarker-free approval; urothelial carcinoma; NMIBC is not represented by TCGA BLCA",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology + DMT_ADC_Compiled_List"
+    },
+    {
+      "id": "D-CD19-DLBC",
+      "gene": "CD19",
+      "tcga": "DLBC",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: loncastuximab tesirine (ADC); biomarker-free approval; DLBCL B-cell antigen",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-CD79B-DLBC",
+      "gene": "CD79B",
+      "tcga": "DLBC",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: polatuzumab vedotin (ADC); biomarker-free approval; DLBCL B-cell antigen",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-TNFRSF8-DLBC",
+      "gene": "TNFRSF8",
+      "tcga": "DLBC",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: brentuximab vedotin (ADC); biomarker-free approval; CD30, scoped to the indicated DLBCL context, not all T-cell/Hodgkin lymphomas",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-CEACAM5-COADREAD",
+      "gene": "CEACAM5",
+      "tcga": "COADREAD",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: precemtabart tocentecan (ADC); cibisatamab (bispecific); clinical/trial abundance target; colorectal CEA",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology + DMT_ADC_Compiled_List"
+    },
+    {
+      "id": "D-MSLN-MESO",
+      "gene": "MSLN",
+      "tcga": "MESO",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: anetumab ravtansine (ADC); amatuximab; gavo-cel (TCR-T); clinical/trial abundance target; mesothelin, mesothelioma",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-MSLN-OV",
+      "gene": "MSLN",
+      "tcga": "OV",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: anetumab ravtansine (ADC); amatuximab; gavo-cel (TCR-T); clinical/trial abundance target; mesothelin, serous ovarian",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-MSLN-PAAD",
+      "gene": "MSLN",
+      "tcga": "PAAD",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: anetumab ravtansine (ADC); amatuximab; gavo-cel (TCR-T); clinical/trial abundance target; mesothelin, pancreatic adenocarcinoma",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology + DMT_ADC_Compiled_List"
+    },
+    {
+      "id": "D-GPC3-LIHC",
+      "gene": "GPC3",
+      "tcga": "LIHC",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: C-CAR031 (GPC3 CAR-T); clinical/trial abundance target; glypican-3, hepatocellular carcinoma",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology + DMT_ADC_Compiled_List"
+    },
+    {
+      "id": "D-CA9-KIRC",
+      "gene": "CA9",
+      "tcga": "KIRC",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: 177Lu-girentuximab (radioconjugate); clinical/trial abundance target; carbonic anhydrase IX, clear-cell RCC",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-CLDN6-TGCT",
+      "gene": "CLDN6",
+      "tcga": "TGCT",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: BNT211 (CLDN6 CAR-T); clinical/trial abundance target; testicular germ-cell tumours only",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-CLDN6-OV",
+      "gene": "CLDN6",
+      "tcga": "OV",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: BNT211 (CLDN6 CAR-T); clinical/trial abundance target; serous ovarian only",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-KLK2-PRAD",
+      "gene": "KLK2",
+      "tcga": "PRAD",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: pasritamig (bispecific); clinical/trial abundance target; hK2 (KLK2, not HK2), primary prostate adenocarcinoma",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology + DMT_ADC_Compiled_List"
+    },
+    {
+      "id": "D-STEAP1-PRAD",
+      "gene": "STEAP1",
+      "tcga": "PRAD",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: xaluritamig (bispecific); clinical/trial abundance target; primary prostate adenocarcinoma",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology + DMT_ADC_Compiled_List"
+    },
+    {
+      "id": "D-SLC34A2-OV",
+      "gene": "SLC34A2",
+      "tcga": "OV",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: upifitamab rilsodotin (ADC); lifastuzumab vedotin (ADC); clinical/trial abundance target; NaPi2b, serous ovarian",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
+    },
+    {
+      "id": "D-SLC34A2-LUAD",
+      "gene": "SLC34A2",
+      "tcga": "LUAD",
+      "classification": "D",
+      "expected": true,
+      "citations": [],
+      "note": "ADC/I-O tumour-cell abundance target: upifitamab rilsodotin (ADC); lifastuzumab vedotin (ADC); clinical/trial abundance target; NaPi2b, lung adenocarcinoma only (LUSC fails; not all NSCLC)",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): must-pass addition; source tabs Immuno-oncology"
     },
     {
       "id": "C-GAPDH-BRCA",
@@ -864,6 +1024,24 @@
       "category": "Structural Variant",
       "expected": null,
       "note": "borderline (5/510, q32~0.05 in audit): recorded, not gated"
+    }
+  ],
+  "expression_candidate_misses": [
+    {
+      "id": "M-F3-CESC",
+      "gene": "F3",
+      "tcga": "CESC",
+      "classification": "candidate_miss",
+      "note": "tissue factor; tisotumab vedotin (ADC), biomarker-free approval in cervical cancer. Fails the m3 rule: lineage delta 0.386 < 0.5; subgroup P95 shift 1.470 < 1.5 (19/294 high, q 7.0e-10). Candidate RNA-method miss, not a demonstrated error; do not lower a threshold for it.",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): documented non-must-pass; candidate miss"
+    },
+    {
+      "id": "M-MET-LUAD",
+      "gene": "MET",
+      "tcga": "LUAD",
+      "classification": "candidate_miss",
+      "note": "c-Met protein over-expression; telisotuzumab vedotin (ADC), c-Met-selected non-squamous NSCLC. Fails the m3 rule: lineage delta 0.394 < 0.5; subgroup P95 shift 0.99 < 1.5 (26/510 high, q 4.0e-11). Candidate RNA-method miss scoped to non-squamous NSCLC.",
+      "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): documented non-must-pass; candidate miss"
     }
   ]
 }

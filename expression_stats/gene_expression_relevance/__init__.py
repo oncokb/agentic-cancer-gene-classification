@@ -2,7 +2,7 @@
 
 METHOD_VERSION = "3"
 # Release-bundle contract minor version (schema_version stays "1"; changes are additive).
-CONTRACT_VERSION = "1.1"
+CONTRACT_VERSION = "1.2"
 PARAMS = dict(
     fdr=0.05,
     log2fc=1.0,
@@ -30,7 +30,9 @@ PARAMS["detection_log2"] = PARAMS["expression_floor_log2"]
 # Alteration-type statistics are detail only: they never feed stats_pass, pass_mode,
 # broadly_expressed or any expression gate. Versioned and parameterized separately so
 # the expression method (and its release_id "m3" token) is unchanged.
-ALTERATION_METHOD_VERSION = "1"
+# "2": CNA restricted to pinned copy-number drivers with role-matched direction; Point
+# Mutation eligibility widened with pinned curator-annotated genes.
+ALTERATION_METHOD_VERSION = "2"
 POINT_MUTATION = "Point Mutation"
 STRUCTURAL_VARIANT = "Structural Variant"
 COPY_NUMBER_ALTERATION = "Copy Number Alteration"
@@ -39,7 +41,11 @@ ALTERATION_CATEGORIES = (POINT_MUTATION, STRUCTURAL_VARIANT, COPY_NUMBER_ALTERAT
 ALTERATION_PARAMS = dict(
     fdr=0.05,
     min_profiled=20,
-    mutation_driver_source="bailey2018",
+    mutation_driver_source="bailey2018+new_framework",
+    # Copy Number Alteration is callable only for these genes; others are not_testable.
+    cna_driver_source="bailey2018+new_framework+sanchezvega2018",
+    # Oncogene-only: amplification only; TSG-only: deep deletion only; else both.
+    cna_direction_by_role=True,
     hypermutator_max_nonsynonymous=500,
     missense_min_recurrence=10,
     inframe_min_recurrence=5,

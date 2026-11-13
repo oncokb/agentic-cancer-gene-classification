@@ -1,0 +1,39 @@
+gene	new_framework_og_or_tsg	role	source_record
+ABL1	Oncogene	OG	4
+AKT1	Oncogene	OG	20
+AKT2	Oncogene	OG	21
+ALK	Oncogene	OG	24
+ATM	TSG	TSG	38
+AURKA	Oncogene	OG	40
+BRAF	Oncogene	OG	57
+CAMK1D		unknown	73
+CDK12	TSG	TSG	119
+CDK13		unknown	120
+CDK4	Oncogene	OG	130
+CDKL2		unknown	137
+DYRK1A		unknown	196
+EGFR	Oncogene	OG	205
+ERBB2	Oncogene	OG	231
+FGFR1	Oncogene	OG	244
+FGFR2	Oncogene	OG	245
+FGFR4	Oncogene	OG	247
+FLT4	Oncogene	OG	251
+IKBKE	Oncogene	OG	301
+KDR	Oncogene	OG	324
+KIT	Oncogene	OG	325
+MAP2K4	TSG	TSG	356
+MAP3K3		unknown	371
+MAPK1	Oncogene	OG	383
+MELK		unknown	411
+MET	Oncogene	OG	414
+NTRK1	Oncogene	OG	466
+NTRK2	Oncogene	OG	467
+NTRK3	Oncogene	OG	468
+PAK1	Oncogene	OG	475
+PRKCI	Oncogene	OG	529
+RAF1	Oncogene	OG	556
+RPS6KB1	Oncogene	OG	579
+STK11	TSG	TSG	629
+TLK2		unknown	676
+TSSK1B		unknown	703
+YES1	Oncogene	OG	738

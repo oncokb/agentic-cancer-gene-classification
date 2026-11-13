@@ -9,7 +9,7 @@ Variant, Copy Number Alteration) from the same pinned mutation/GISTIC/SV files; 
 changes expression results. Full builds also require the alteration controls (13
 enriched, 66 not enriched). `--delete-alteration-downloads` removes each ~0.1–0.9 GB raw
 file once its compact summary is cached (the workflow uses it); `--skip-alterations` is
-review-only. Full builds require 35/35 curated positives and 0/27 negative passes; a failed
+review-only. Full builds require 51/51 curated positives and 0/27 negative passes; a failed
 control gate stops before PubMed and writes `<out>-failed/controls-report.json`.
 Each successful bundle includes `controls-report.json`. Subsets skip the gate
 and are review-only. The panel in `controls.yaml` uses JSON-compatible YAML.

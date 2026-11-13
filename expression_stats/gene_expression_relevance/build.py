@@ -85,11 +85,15 @@ def matrix(paths, mapping, catalog, target, selection=None):
 def load_alterations(commit, cache, mapping, selection, ids, catalog, aliases, delete_downloads):
     """Alteration statistics for the build's gene rows (detail only; see alterations.py)."""
     driver = drivers.load(ALTERATION_PARAMS["mutation_driver_source"])
+    cna_driver = drivers.load_cna(ALTERATION_PARAMS["cna_driver_source"])
     inputs, provenance, inputs_sha = alteration_stats.load_inputs(
         commit, cache, [item["study_id"] for item in mapping], delete_downloads=delete_downloads
     )
-    result = alteration_stats.compute(inputs, mapping, selection, ids, catalog, aliases, driver)
-    return result, driver, provenance, inputs_sha
+    result = alteration_stats.compute(
+        inputs, mapping, selection, ids, catalog, aliases, driver, cna_driver=cna_driver
+    )
+    pins = dict(**driver.pin(), **cna_driver.pin())
+    return result, pins, provenance, inputs_sha
 
 
 def build(
@@ -129,14 +133,14 @@ def build(
     alteration = None
     alteration_identity = dict(skipped=True)
     if not skip_alterations:
-        alteration, driver, alteration_inputs, inputs_sha = load_alterations(
+        alteration, driver_pins, alteration_inputs, inputs_sha = load_alterations(
             commit, cache, mapping, selection, ids, full_catalog, aliases, delete_downloads
         )
         alteration_identity = dict(
             method_version=ALTERATION_METHOD_VERSION,
             params=ALTERATION_PARAMS,
             inputs_sha256=inputs_sha,
-            **driver.pin(),
+            **driver_pins,
         )
     now = datetime.now(UTC)
     hgnc_sha = digest(hgnc_path(cache))
@@ -168,7 +172,7 @@ def build(
     )
     if alteration is not None:
         manifest["source"].update(
-            alteration_inputs_sha256=alteration_identity["inputs_sha256"], **driver.pin()
+            alteration_inputs_sha256=alteration_identity["inputs_sha256"], **driver_pins
         )
         manifest["alterations"] = dict(alteration.summary, inputs=alteration_inputs)
     # Record the HGNC snapshot hash to make symbol resolution auditable.
