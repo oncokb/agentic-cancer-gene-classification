@@ -9,9 +9,10 @@ A (gene, cancer type) pair is *surfaced* iff:
    lineage enrichment was blocked by broad expression without a subgroup
    pass (``CancerTypeStats.passes_stats``), and
 2. its ``confidence_tier`` is "high" (contract 1.3). Only a bundle whose manifest
-   ``contract_version`` is below 1.3 (or absent) counts a missing field as high;
-   in a 1.3+ bundle a missing tier is not high (fail closed, warned once per
-   bundle; the loader also rejects such bundles). Weaker passes are
+   ``contract_version`` is well-formed and below 1.3 counts a missing field as
+   high; in any other bundle (1.3+, or a missing/malformed version) a missing
+   tier is not high (fail closed, warned once per bundle; the loader also
+   rejects such bundles). Weaker passes are
    *candidates*: listed, never surfaced, and
 3. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
    pre-check; null means it was not run, and the literature gate itself is

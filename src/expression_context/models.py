@@ -8,6 +8,7 @@ requires; ``schema_version`` is checked by the bundle loader before parsing.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
@@ -24,23 +25,25 @@ HIGH_CONFIDENCE = "high"
 CONFIDENCE_TIER_CONTRACT = (1, 3)
 
 
-def confidence_tier_required(contract_version: Any) -> bool:
-    """Whether a bundle's pairs must carry ``confidence_tier``.
+_CONTRACT_VERSION = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
 
-    Absent (contracts before 1.1) or a parseable ``"<major>.<minor>"`` below 1.3:
-    False, the legacy "missing => high" fallback applies. 1.3 or later, or any
-    value that can't be parsed: True (fail closed; a missing tier is not high).
+
+def confidence_tier_required(contract_version: Any) -> bool:
+    """Whether a bundle's pairs must carry ``confidence_tier`` (fail closed).
+
+    Only a well-formed version string (``<major>.<minor>[.<patch>]``, ASCII
+    digits, nothing else: no sign, no whitespace) below 1.3 keeps the legacy
+    "missing => high" fallback. Everything else requires tiers: 1.3 or later, a
+    missing/None/empty version, a non-string, or any malformed value.
     """
-    if contract_version is None:
-        return False
-    parts = str(contract_version).strip().split(".")
-    try:
-        version = tuple(int(part) for part in parts)
-    except ValueError:
+    if not isinstance(contract_version, str) or not _CONTRACT_VERSION.fullmatch(
+        contract_version
+    ):
         return True
-    if len(version) != 2:
-        return True
+    version = tuple(int(part) for part in contract_version.split("."))
     return version >= CONFIDENCE_TIER_CONTRACT
+
+
 PASS_MODE_LABELS = {"lineage": "Lineage enriched", "subgroup": "Subgroup enriched"}
 # Canonical/alias gene symbols as accepted from users and from bundles.
 SYMBOL_PATTERN = r"[A-Z0-9][A-Z0-9._-]{0,63}\Z"
@@ -73,8 +76,8 @@ class Manifest(_Artifact):
     schema_version: str
     release_id: str
     method_version: str
-    # Additive contract minor version ("1.1", "1.2", "1.3", ...); absent before 1.1.
-    # Kept loose so an unexpected type can't reject a bundle; parsed fail-closed.
+    # Additive contract minor version ("1.1", "1.2", "1.3", ...). Absent, empty or
+    # malformed means tiers are required (fail closed; see confidence_tier_required).
     contract_version: Optional[Any] = None
     params: Dict[str, Any] = Field(default_factory=dict)
     source: Dict[str, Any] = Field(default_factory=dict)
@@ -82,8 +85,8 @@ class Manifest(_Artifact):
 
     @property
     def confidence_tier_required(self) -> bool:
-        """True for contract >= 1.3, where every stats pass must carry
-        ``confidence_tier`` (see ``confidence_tier_required``)."""
+        """True unless the version is well-formed and below 1.3: every stats pass
+        must then carry ``confidence_tier`` (see ``confidence_tier_required``)."""
         return confidence_tier_required(self.contract_version)
 
     def cancer_type(self, oncotree_code: str) -> Optional[ManifestCancerType]:
@@ -174,10 +177,10 @@ class CancerTypeStats(_Artifact):
     def effective_confidence_tier(self, *, tier_required: bool) -> Optional[str]:
         """The tier ACGC acts on, None unless ``passes_stats``.
 
-        ``tier_required`` is ``Manifest.confidence_tier_required``. Bundles before
-        contract 1.3 omit ``confidence_tier``: there (and only there) a missing
-        field on a passing pair counts as "high", so old data behaves exactly as
-        before. In a 1.3+ bundle a missing field fails closed (None: not high).
+        ``tier_required`` is ``Manifest.confidence_tier_required``. Bundles with a
+        well-formed contract_version below 1.3 omit ``confidence_tier``: there (and
+        only there) a missing field on a passing pair counts as "high", so old data
+        behaves exactly as before. Otherwise a missing field fails closed (None).
         An explicit null or an unknown value on a passing pair is never high.
         """
         if not self.passes_stats:

@@ -6,7 +6,8 @@ effective PubMed pre-check is not a fresh false and a valid tumor-specific v2
 verdict for the active release supports it. Candidates (v3 passes below the
 high tier) are listed with status "candidate", never surfaced on any read
 path, never sent to the literature gate and never exported as golden-set rows.
-Bundles without the field (contract <= 1.2) treat every stats pass as high.
+Only bundles with a well-formed contract_version below 1.3 treat a missing
+field as high; a missing, empty or malformed version requires tiers.
 """
 
 from __future__ import annotations
@@ -294,29 +295,48 @@ def test_missing_tier_fails_closed_when_the_contract_requires_it():
     assert not stats_row(stats_pass=False).confidence_tier_missing
 
 
+ABSENT = object()
+
+
 @pytest.mark.parametrize(
     "version,required",
     [
-        (None, False),  # contract < 1.1 (field absent)
-        ("1.1", False),
+        # Legacy fallback only for a well-formed version below 1.3.
         ("1.2", False),
+        ("1.1", False),
+        ("1.2.0", False),
+        # Tiers required from 1.3.
         ("1.3", True),
         ("1.10", True),
+        ("1.3.1", True),
         ("2.0", True),
-        (" 1.3 ", True),
-        ("1.3.1", True),  # unexpected shape: fail closed
-        ("one.three", True),
-        (1.2, False),  # loose types still parse by their text
-        (1.3, True),
+        # Missing / empty: fail closed.
+        (ABSENT, True),
+        (None, True),
+        ("", True),
+        # Signed, padded or malformed components: fail closed.
+        ("1.-1", True),
+        ("-1.3", True),
+        ("+1.2", True),
+        ("1.2.x", True),
+        (" 1.2", True),
+        ("1.2 ", True),
+        ("1.2\n", True),
+        ("1", True),
+        ("1.2.3.4", True),
+        ("one.two", True),
+        ("\uff11.\uff12", True),  # full-width digits are not ASCII digits
+        (1.2, True),  # non-strings
+        (12, True),
     ],
 )
 def test_contract_version_gates_the_legacy_fallback(version, required):
-    assert confidence_tier_required(version) is required
-    data = dict(gene_file("ERBB2") and build_bundle(("ERBB2",)).manifest)
-    if version is None:
+    data = dict(build_bundle(("ERBB2",)).manifest)
+    if version is ABSENT:
         data.pop("contract_version", None)
     else:
         data["contract_version"] = version
+        assert confidence_tier_required(version) is required
     assert BundleManifest.model_validate(data).confidence_tier_required is required
 
 
@@ -336,14 +356,17 @@ def test_explicit_null_or_unknown_tier_on_a_pass_is_not_surfaced():
 # --------------------------------------------------------------------------
 
 
-def with_contract(version: str, tiers: Dict[str, str]):
-    """ERBB2-only bundle declaring ``contract_version``; only ``tiers`` are set
-    (every other pair omits confidence_tier entirely)."""
-    return build_bundle(
+def with_contract(version, tiers: Dict[str, str]):
+    """ERBB2-only bundle declaring ``contract_version`` (ABSENT: no such key);
+    only ``tiers`` are set (every other pair omits confidence_tier entirely)."""
+    bundle = build_bundle(
         ("ERBB2",),
         manifest_overrides={"contract_version": version},
         edit_gene=tiered(tiers, explicit_null_for_failures=False),
     )
+    if version is ABSENT:
+        bundle.manifest.pop("contract_version")
+    return bundle
 
 
 @pytest.mark.parametrize(
@@ -356,11 +379,14 @@ def with_contract(version: str, tiers: Dict[str, str]):
     ],
     ids=["all_omitted", "some_omitted"],
 )
-def test_contract_1_3_bundle_with_omitted_tiers_fails_closed_everywhere(
-    tiers, expected_calls, expected_surfaced, caplog
+@pytest.mark.parametrize(
+    "version", ["1.3", ABSENT, "", "+1.2", " 1.2"], ids=["1.3", "absent", "empty", "signed", "padded"]
+)
+def test_tier_requiring_bundle_with_omitted_tiers_fails_closed_everywhere(
+    version, tiers, expected_calls, expected_surfaced, caplog
 ):
     gate = FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE))
-    bundle = with_contract("1.3", tiers)
+    bundle = with_contract(version, tiers)
     harness = CsvHarness(gate=gate, bundle=bundle)
     with caplog.at_level(logging.WARNING, logger="src.expression_context.service"):
         with TestClient(harness.app) as client:
@@ -406,16 +432,19 @@ def test_contract_1_2_bundle_without_the_field_keeps_legacy_behaviour(caplog):
         ("1.3", {"BRCA": "high"}, True),  # one untiered pass is enough
         ("1.3", {"BRCA": "high", "STAD": "candidate", "ESCA": "high", "UCEC": "high"}, False),
         ("1.2", {}, False),
-        (None, {}, False),
+        # No version, or a malformed one: tiers required, so untiered passes reject.
+        (None, {}, True),
+        (" 1.2", {}, True),
     ],
 )
-def test_loader_rejects_a_1_3_bundle_with_untiered_passes(version, tiers, rejected):
-    overrides = {} if version is None else {"contract_version": version}
+def test_loader_rejects_untiered_passes_unless_the_version_is_legacy(version, tiers, rejected):
     bundle = build_bundle(
         ("ERBB2",),
-        manifest_overrides=overrides,
+        manifest_overrides={"contract_version": version},
         edit_gene=tiered(tiers, explicit_null_for_failures=False),
     )
+    if version is None:
+        bundle.manifest.pop("contract_version")
     manifest = BundleManifest.model_validate(bundle.manifest)
     line = json.dumps(bundle.genes[0]).encode()
     if rejected:

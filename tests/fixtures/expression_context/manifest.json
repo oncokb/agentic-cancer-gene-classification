@@ -1,5 +1,6 @@
 {
   "schema_version": "1",
+  "contract_version": "1.2",
   "release_id": "datahub-abc1234def56-m2-b7e9f01a2c3d",
   "method_version": "2",
   "params": {"fdr": 0.05, "log2fc": 1.0, "cliffs_delta": 0.5,
