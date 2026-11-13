@@ -147,3 +147,106 @@ def test_purity_source_pin_changes_release_identity(monkeypatch, key):
     before = build_fingerprint(PARAMS, None, True, "hgnc", "code", "mapping")
     monkeypatch.setitem(purity.SOURCE, key, purity.SOURCE[key] + "changed")
     assert build_fingerprint(PARAMS, None, True, "hgnc", "code", "mapping") != before
+
+
+def test_measure_real_statistics_and_global_bh(tmp_path):
+    from scipy.stats import spearmanr
+
+    from gene_expression_relevance.stats import compute
+
+    codes = ["A", "B"]
+    labels = np.repeat(codes, 80)
+    values = np.concatenate([np.linspace(0.2, 0.9, 80), np.full(80, 0.8)])
+    log_expression = np.array(
+        [
+            [12] * 40 + [5] * 40 + [4] * 80,
+            [10] * 80 + [4] * 80,  # constant expression in each cohort
+            [4] * 80 + list(np.linspace(9, 11, 80)),  # constant purity in cohort B
+            [5.5] * 80 + [4] * 80,  # v3 candidate still belongs in the BH family
+        ],
+        dtype=float,
+    )
+    raw = np.exp2(log_expression) - 1
+    raw[0, [0, 79]] = np.nan
+    values[1] = np.nan
+    original = compute(raw, labels, codes)
+    assert original["stats_pass"].tolist() == [
+        [True, False],
+        [True, False],
+        [False, True],
+        [True, False],
+    ]
+    assert original["confidence_tier"][:, 0].tolist() == ["high", "high", None, "candidate"]
+    measured = purity.measure(raw, labels, codes, original, values)
+    assert set(measured) == {(0, 0), (1, 0), (2, 1), (3, 0)}
+    matched = (labels == "A") & np.isfinite(values) & np.isfinite(raw[0])
+    expected_rho, expected_p = spearmanr(np.log2(raw[0, matched] + 1), values[matched])
+    falling = measured[0, 0]
+    assert falling["n"] == 77
+    assert falling["rho"] == pytest.approx(expected_rho)
+    assert falling["rho"] < -0.8
+    assert falling["p"] == pytest.approx(expected_p, abs=0, rel=1e-12)
+    assert falling["hp_n"] == 33 and falling["hp_strong"] is False
+    for key in [(1, 0), (2, 1), (3, 0)]:
+        assert measured[key]["rho"] is None and measured[key]["p"] is None
+    assert measured[1, 0]["n"] == 79  # missing purity, finite expression
+    assert measured[2, 1]["n"] == 80  # constant purity still counts matched samples
+
+    tests = {}
+    for i in range(len(raw)):
+        rows = []
+        for j, code in enumerate(codes):
+            rows.append(dict(oncotree_code=code, confidence_tier=original["confidence_tier"][i, j]))
+            if (i, j) in measured:
+                tests[str(i), code] = measured[i, j]
+        (tmp_path / f"{i}.json").write_text(
+            json.dumps(dict(gene=dict(hugo_symbol=str(i)), cancer_types=rows))
+        )
+    assert purity.finalize(tmp_path, tests) == dict(high_before=3, high_after=2, demoted=1)
+    result = json.loads((tmp_path / "0.json").read_text())["cancer_types"][0]
+    assert result["purity_check"] == "demoted" and result["confidence_tier"] == "candidate"
+    # One testable p, two untestable highs, and an untestable candidate: q = p * 4.
+    assert result["purity_q"] == pytest.approx(expected_p * 4, abs=0, rel=1e-12)
+    assert all(test["q"] == 1 for key, test in tests.items() if key != ("0", "A"))
+
+
+def test_purity_alignment_matches_selected_matrix_order(tmp_path, monkeypatch):
+    from gene_expression_relevance.build import matrix, select_samples
+
+    # Both study insertion order and sample columns disagree with cohort/primary order.
+    mapping = [dict(study_id="a", oncotree_code="A"), dict(study_id="b", oncotree_code="B")]
+    paths = {}
+    for study, samples, expression in [
+        ("b", ["TCGA-BB-0002-01A", "TCGA-BB-0001-01A"], [42, 41]),
+        (
+            "a",
+            ["TCGA-AA-0002-01B", "TCGA-AA-0001-01A", "TCGA-AA-0002-01A", "TCGA-AA-0003-02A"],
+            [999, 11, 12, 999],
+        ),
+    ]:
+        path = tmp_path / f"{study}.tsv"
+        path.write_text(
+            "Hugo_Symbol\tEntrez_Gene_Id\t"
+            + "\t".join(samples)
+            + "\nG\t1\t"
+            + "\t".join(map(str, expression))
+            + "\n"
+        )
+        paths[study] = path
+    table = tmp_path / "purity.tsv"
+    table.write_text(
+        "sample\tcall status\tpurity\n"
+        "TCGA-BB-0002-01A\tcalled\t0.42\n"
+        "TCGA-AA-0002-01A\tcalled\t0.12\n"
+        "TCGA-AA-0003-02A\tcalled\t0.99\n"
+        "TCGA-BB-0001-01A\tcalled\t0.41\n"
+        "TCGA-AA-0001-01A\tcalled\t0.11\n"
+    )
+    monkeypatch.setattr(purity, "fetch", lambda cache: table)
+    selection = select_samples(paths, mapping)
+    assert selection["a"] == ["TCGA-AA-0001-01A", "TCGA-AA-0002-01A"]
+    expression, labels, ids = matrix(paths, mapping, {1: "G"}, tmp_path / "matrix", selection)
+    aligned = purity.load_selected(tmp_path, mapping, selection)
+    assert ids == [1] and labels.tolist() == ["A", "A", "B", "B"]
+    assert expression[0].tolist() == [11, 12, 41, 42]
+    np.testing.assert_allclose(aligned, expression[0] / 100)

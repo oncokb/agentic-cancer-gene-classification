@@ -66,7 +66,7 @@ jobs:
         if: steps.check.outputs.changed == 'true'
         with:
           path: expression_stats/.cache/objects
-          key: expression-objects-${{ runner.os }}-${{ steps.check.outputs.commit }}
+          key: expression-objects-${{ runner.os }}-${{ steps.check.outputs.commit }}-purity-f430a975433d82e0098d7405619d4f12a0c765fcd97e7d63cc9b1de7f2d763cd
           restore-keys: expression-objects-${{ runner.os }}-
       # Parsed mutation/CNA/SV summaries (~30 MB) keyed by input commit and parser code.
       # Raw alteration files (~4 GB) are deleted as soon as each is parsed, so they are

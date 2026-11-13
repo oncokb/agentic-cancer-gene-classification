@@ -43,7 +43,9 @@ def confidence_tier_required(contract_version: Any) -> bool:
     "missing => high" fallback. Everything else requires tiers: 1.3 or later, a
     missing/None/empty version, a non-string, or any malformed value.
     """
-    if not isinstance(contract_version, str) or not _CONTRACT_VERSION.fullmatch(contract_version):
+    if not isinstance(contract_version, str) or not _CONTRACT_VERSION.fullmatch(
+        contract_version
+    ):
         return True
     version = tuple(int(part) for part in contract_version.split("."))
     return version >= CONFIDENCE_TIER_CONTRACT

@@ -12,9 +12,9 @@ Commands from the repository root, except the two pipeline commands run inside
 | Command | File set | Result |
 | --- | --- | --- |
 | `.venv/bin/ruff check .` | `expression_stats/` | passed |
-| `OPENBLAS_NUM_THREADS=1 .venv/bin/python -m pytest -q tests` | `expression_stats/tests/` | 281 collected test cases passed |
+| `OPENBLAS_NUM_THREADS=1 .venv/bin/python -m pytest -q tests` | `expression_stats/tests/` | 284 collected test cases passed |
 | `uv run --frozen ruff check .` | repository configured lint scope | passed |
-| `uv run --frozen pytest -q tests/test_expression_context*.py` | expression-context Python tests | 428 passed, 9 skipped (437 collected test cases) |
+| `uv run --frozen pytest -q tests/test_expression_context*.py` | expression-context Python tests | 434 passed, 9 skipped (443 collected test cases) |
 | `node tests/frontend/test_expression_context_page.js` | expression-context page frontend | 42 test functions passed |
 
 Python counts are collected parameterized test cases, not test function counts.
@@ -83,8 +83,8 @@ The build fingerprint matches the final pipeline source.
 Alteration controls also pass: 13/13 positives, 0/66 negatives enriched.
 The full-build publish-time `controls.recheck` returns no problems.
 
-The demoted `(gene, tcga)` set equals all 334 rows of
-`/Users/foriskuang/Projects/agcg-control-eval/purity/demoted_R2.csv` exactly:
+The demoted `(gene, tcga)` set equals all 334 rows of `demoted_R2.csv`
+from the read-only R2 analysis exactly:
 **0 extra, 0 missing**, so no discrepancy requires explanation.
 
 For every gene and all 32 cohorts, compared the b2baa17 build against the purity
@@ -97,3 +97,7 @@ and provenance necessarily change. No baseline scientific-field differences
 were found. Build outputs, downloaded caches and local verification outputs are
 excluded from the commit.
 
+Review follow-ups add real-compute demotion/BH and shuffled-sample alignment
+coverage, pin the CI object cache key to the purity hash, and warn once per bundle
+about high pairs missing the required purity field. Pipeline source and its
+fingerprint are unchanged from the full build above; no rebuild was needed.
