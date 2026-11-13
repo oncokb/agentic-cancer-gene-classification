@@ -18,6 +18,7 @@ from . import (
     METHOD_VERSION,
     PARAMS,
     drivers,
+    purity,
 )
 from . import alterations as alteration_stats
 from .controls import evaluate as evaluate_controls
@@ -32,6 +33,7 @@ from .provenance import (
     mapping_fingerprint,
     overrides_fingerprint,
 )
+from .purity import load_selected
 from .stats import LINEAGE, compute, primary_indices
 
 
@@ -130,6 +132,7 @@ def build(
         raise ValueError("No genes to build")
     ids = sorted(catalog)
     selection = select_samples(paths, mapping)
+    purity_values = load_selected(cache, mapping, selection)
     alteration = None
     alteration_identity = dict(skipped=True)
     if not skip_alterations:
@@ -164,7 +167,7 @@ def build(
         params=PARAMS,
         alteration_method_version=ALTERATION_METHOD_VERSION,
         alteration_params=ALTERATION_PARAMS,
-        source=dict(datahub_commit=commit, generated_at=now.isoformat()),
+        source=dict(datahub_commit=commit, generated_at=now.isoformat(), purity=purity.SOURCE),
         cancer_types=mapping,
         build=dict(
             genes=requested_genes, skip_precheck=skip_precheck, skip_alterations=skip_alterations
@@ -193,6 +196,7 @@ def build(
     )
     codes = [item["oncotree_code"] for item in mapping]
     passed = {}
+    purity_tests = {}
     with tempfile.TemporaryDirectory(dir=out.parent, prefix=".build-") as temporary:
         staging = Path(temporary) / "site"
         data, labels, ids = matrix(
@@ -201,6 +205,12 @@ def build(
         for start in range(0, len(ids), batch_size):
             batch = ids[start : start + batch_size]
             arrays = compute(data[start : start + batch_size], labels, codes)
+            measured = purity.measure(
+                data[start : start + batch_size], labels, codes, arrays, purity_values
+            )
+            purity_tests.update(
+                ((catalog[batch[i]], codes[j]), test) for (i, j), test in measured.items()
+            )
             for i, entrez in enumerate(batch):
                 symbol = catalog[entrez]
                 records = []
@@ -251,6 +261,7 @@ def build(
                 )
             print(f"Computed {min(start + batch_size, len(ids))}/{len(ids)} genes", flush=True)
         del data
+        manifest["purity"] = purity.finalize(staging / "v1" / "genes", purity_tests)
         report = evaluate_controls(
             staging / "v1" / "genes",
             subset=requested_genes is not None,

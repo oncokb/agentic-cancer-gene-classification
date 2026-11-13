@@ -64,3 +64,9 @@ failures best-effort delete their own draft; surviving stale drafts fail loudly
 and require explicit deletion. Only a separate main-only publish job receives
 write permission, and GH_TOKEN is scoped to its publication step. See the
 contract for concurrency and freshness semantics.
+
+Contract 1.4 adds the pinned GDC ABSOLUTE tumor-purity R2 gate: high pairs can
+be demoted to candidate, preserving every v3 statistical call and alteration
+result. Exempt or insufficient-coverage pairs retain high with an explicit
+unassessed note. Source acknowledgement, thresholds, coverage semantics and
+consumer fail-closed behavior are in [the contract](docs/contract.md#contract-14-supplementary-tumor-purity-gate).

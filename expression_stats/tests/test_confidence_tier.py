@@ -40,7 +40,7 @@ def test_cutoff_values_and_contract_version():
     # v3 thresholds are untouched; only the contract version moves.
     assert (PARAMS["log2fc"], PARAMS["cliffs_delta"]) == (1.0, 0.5)
     assert (PARAMS["subgroup_min_fraction"], PARAMS["subgroup_min_fraction_ratio"]) == (0.03, 3.0)
-    assert METHOD_VERSION == "3" and CONTRACT_VERSION == "1.3"
+    assert METHOD_VERSION == "3" and CONTRACT_VERSION == "1.4"
 
 
 @pytest.mark.parametrize(

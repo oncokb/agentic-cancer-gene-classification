@@ -3,7 +3,7 @@
 METHOD_VERSION = "3"
 # Release-bundle contract minor version (schema_version stays "1"; changes are additive).
 # 1.3: per-pair confidence_tier ("high" | "candidate" | null) from the strong_* params.
-CONTRACT_VERSION = "1.3"
+CONTRACT_VERSION = "1.4"
 PARAMS = dict(
     fdr=0.05,
     log2fc=1.0,
@@ -28,6 +28,13 @@ PARAMS = dict(
     strong_cliffs_delta=0.70,
     strong_subgroup_min_fraction=0.05,
     strong_subgroup_min_fraction_ratio=5.0,
+    purity_min=0.6,
+    purity_rho_max=-0.30,
+    purity_fdr=0.05,
+    purity_min_matched=30,
+    purity_min_target=30,
+    purity_correlation_min_n=10,
+    purity_exempt_cohorts=["DLBC", "LAML", "THYM"],
     precheck_min_pmids=1,
     precheck_cache_ttl_days=30,
 )

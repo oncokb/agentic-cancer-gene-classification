@@ -12,7 +12,9 @@ A (gene, cancer type) pair is *surfaced* iff:
    ``contract_version`` is well-formed and below 1.3 counts a missing field as
    high; in any other bundle (1.3+, or a missing/malformed version) a missing
    tier is not high (fail closed, warned once per bundle; the loader also
-   rejects such bundles). Weaker passes are
+   rejects such bundles). Contract 1.4+ also requires a known retaining
+   ``purity_check``; ``demoted`` is never high, even with a stored high tier.
+   Weaker passes are
    *candidates*: listed, never surfaced, and
 3. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
    pre-check; null means it was not run, and the literature gate itself is
@@ -359,7 +361,9 @@ class ExpressionContextService:
                 # Includes broad-blocked m3 pairs: visible, never sent on.
                 rows.append(row(stats, False, "stats"))
                 continue
-            if not stats.high_confidence(tier_required=tier_required):
+            if not stats.high_confidence(
+                tier_required=tier_required, purity_required=manifest.purity_check_required
+            ):
                 # Candidate: never sent to the paid literature gate.
                 rows.append(row(stats, False, "candidate"))
                 continue
@@ -581,7 +585,9 @@ class ExpressionContextService:
             if expired and stats.literature_precheck_pass is not None:
                 precheck = "expired"
             passes = stats.passes_stats
-            tier = stats.effective_confidence_tier(tier_required=tier_required)
+            tier = stats.effective_confidence_tier(
+                tier_required=tier_required, purity_required=resolved.manifest.purity_check_required
+            )
             high = passes and tier == HIGH_CONFIDENCE
             eligible = high and effective_precheck(stats, expired) is not False
             verdict = None

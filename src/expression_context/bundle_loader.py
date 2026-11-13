@@ -377,6 +377,16 @@ class BundleLoader:
                     f"{where}: contract_version {manifest.contract_version!r} requires "
                     f"confidence_tier on every stats pass; missing for {', '.join(missing)}"
                 )
+        if manifest.purity_check_required:
+            missing = [
+                ct.oncotree_code for ct in artifact.cancer_types
+                if ct.confidence_tier == "high" and "purity_check" not in ct.model_fields_set
+            ]
+            if missing:
+                raise BundleContractError(
+                    f"{where}: contract_version {manifest.contract_version!r} requires "
+                    f"purity_check on high pairs; missing for {', '.join(missing)}"
+                )
         if artifact.release_id != manifest.release_id:
             raise BundleContractError(
                 f"{where}: release_id {artifact.release_id!r} != manifest {manifest.release_id!r}"

@@ -28,6 +28,13 @@ CONFIDENCE_TIER_CONTRACT = (1, 3)
 _CONTRACT_VERSION = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
 
 
+def purity_check_required(contract_version: Any) -> bool:
+    """Only a well-formed pre-1.4 contract may omit the purity gate."""
+    if not isinstance(contract_version, str) or not _CONTRACT_VERSION.fullmatch(contract_version):
+        return True
+    return tuple(int(part) for part in contract_version.split(".")) >= (1, 4)
+
+
 def confidence_tier_required(contract_version: Any) -> bool:
     """Whether a bundle's pairs must carry ``confidence_tier`` (fail closed).
 
@@ -36,9 +43,7 @@ def confidence_tier_required(contract_version: Any) -> bool:
     "missing => high" fallback. Everything else requires tiers: 1.3 or later, a
     missing/None/empty version, a non-string, or any malformed value.
     """
-    if not isinstance(contract_version, str) or not _CONTRACT_VERSION.fullmatch(
-        contract_version
-    ):
+    if not isinstance(contract_version, str) or not _CONTRACT_VERSION.fullmatch(contract_version):
         return True
     version = tuple(int(part) for part in contract_version.split("."))
     return version >= CONFIDENCE_TIER_CONTRACT
@@ -88,6 +93,10 @@ class Manifest(_Artifact):
         """True unless the version is well-formed and below 1.3: every stats pass
         must then carry ``confidence_tier`` (see ``confidence_tier_required``)."""
         return confidence_tier_required(self.contract_version)
+
+    @property
+    def purity_check_required(self) -> bool:
+        return purity_check_required(self.contract_version)
 
     def cancer_type(self, oncotree_code: str) -> Optional[ManifestCancerType]:
         for cancer_type in self.cancer_types:
@@ -157,6 +166,10 @@ class CancerTypeStats(_Artifact):
     # "high" | "candidate" | null (null when the v3 pass fails). A string so an
     # unknown future value can't reject a bundle; only "high" counts as high.
     confidence_tier: Optional[str] = None
+    # Contract 1.4: optional for old bundles; only known retaining states allow high.
+    purity_check: Optional[str] = None
+    purity_rho: Optional[float] = None
+    purity_q: Optional[float] = None
 
     @property
     def broad_blocked(self) -> bool:
@@ -174,7 +187,9 @@ class CancerTypeStats(_Artifact):
         """A passing pair whose document omits ``confidence_tier`` entirely."""
         return self.passes_stats and "confidence_tier" not in self.model_fields_set
 
-    def effective_confidence_tier(self, *, tier_required: bool) -> Optional[str]:
+    def effective_confidence_tier(
+        self, *, tier_required: bool, purity_required: bool = False
+    ) -> Optional[str]:
         """The tier ACGC acts on, None unless ``passes_stats``.
 
         ``tier_required`` is ``Manifest.confidence_tier_required``. Bundles with a
@@ -185,12 +200,26 @@ class CancerTypeStats(_Artifact):
         """
         if not self.passes_stats:
             return None
+        if self.purity_check == "demoted":
+            return "candidate"
+        tier = self.confidence_tier
         if "confidence_tier" not in self.model_fields_set:
-            return None if tier_required else HIGH_CONFIDENCE
-        return self.confidence_tier
+            tier = None if tier_required else HIGH_CONFIDENCE
+        if (
+            tier == HIGH_CONFIDENCE
+            and purity_required
+            and self.purity_check not in {"pass", "not_applicable", "unassessed"}
+        ):
+            return None
+        return tier
 
-    def high_confidence(self, *, tier_required: bool) -> bool:
-        return self.effective_confidence_tier(tier_required=tier_required) == HIGH_CONFIDENCE
+    def high_confidence(self, *, tier_required: bool, purity_required: bool = False) -> bool:
+        return (
+            self.effective_confidence_tier(
+                tier_required=tier_required, purity_required=purity_required
+            )
+            == HIGH_CONFIDENCE
+        )
 
     @property
     def enrichment_label(self) -> Optional[str]:
