@@ -30,7 +30,7 @@ def tier(lineage=False, subgroup=False, **values):
     ]
 
 
-def test_cutoffs_are_hashed_params_and_contract_bumped():
+def test_cutoff_values_and_contract_version():
     assert (
         PARAMS["strong_log2fc"],
         PARAMS["strong_cliffs_delta"],
@@ -41,6 +41,44 @@ def test_cutoffs_are_hashed_params_and_contract_bumped():
     assert (PARAMS["log2fc"], PARAMS["cliffs_delta"]) == (1.0, 0.5)
     assert (PARAMS["subgroup_min_fraction"], PARAMS["subgroup_min_fraction_ratio"]) == (0.03, 3.0)
     assert METHOD_VERSION == "3" and CONTRACT_VERSION == "1.3"
+
+
+@pytest.mark.parametrize(
+    "cutoff",
+    [
+        "strong_log2fc",
+        "strong_cliffs_delta",
+        "strong_subgroup_min_fraction",
+        "strong_subgroup_min_fraction_ratio",
+    ],
+)
+def test_changing_a_strong_cutoff_changes_the_release_id(tmp_path, monkeypatch, cutoff):
+    """End to end through build(): the cutoffs are hashed method params."""
+    from test_contract import test_build_contract_and_precheck_gating
+
+    from gene_expression_relevance import build as builder
+    from gene_expression_relevance.controls import evaluate
+
+    panel = {"controls": [dict(id="ALB", gene="ALB", tcga="LIHC", expected=True)]}
+    monkeypatch.setattr(
+        builder, "evaluate_controls", lambda directory, **kw: evaluate(directory, panel=panel, **kw)
+    )
+    # Runs the fixture build; it finishes with an ALB-only subset build into site/.
+    test_build_contract_and_precheck_gating(tmp_path, monkeypatch, True, None)
+    out, cache = tmp_path / "site", tmp_path / "cache"
+
+    def release_id():
+        builder.build("a" * 40, out, cache, genes=["ALB"], skip_precheck=True)
+        return json.loads((out / "v1/manifest.json").read_text())["release_id"]
+
+    baseline = release_id()
+    assert release_id() == baseline  # deterministic for identical inputs
+    monkeypatch.setitem(PARAMS, cutoff, PARAMS[cutoff] * 1.1)
+    changed = release_id()
+    assert changed != baseline
+    assert changed.rsplit("-", 1)[0] == baseline.rsplit("-", 1)[0]  # same commit and m3
+    manifest = json.loads((out / "v1/manifest.json").read_text())
+    assert manifest["params"][cutoff] == PARAMS[cutoff]
 
 
 @pytest.mark.parametrize(

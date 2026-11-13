@@ -14,16 +14,29 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, Set
 
+import asyncio
+import json
+import logging
+import time
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
 from src.expression_context.literature_gate import TUMOR_SPECIFIC_GATE
-from src.expression_context.models import CancerTypeStats, StoredPair
+from src.expression_context.bundle_loader import BundleContractError, BundleLoader
+from src.expression_context.models import (
+    BundleManifest,
+    CancerTypeStats,
+    StoredPair,
+    confidence_tier_required,
+)
 from tests.expression_context_helpers import (
     RELEASE_ID,
     FakeLiteratureGate,
     build_bundle,
     gene_file,
+    seed_bundle,
 )
 from tests.test_expression_context_csv import (
     PREFIX,
@@ -264,10 +277,47 @@ def stats_row(**fields) -> CancerTypeStats:
         ({"lineage_blocked_by_broad": True, "pass_mode": None, "confidence_tier": "high"}, None),
     ],
 )
-def test_effective_tier(fields, tier):
+def test_effective_tier_before_contract_1_3(fields, tier):
     stats = stats_row(**fields)
-    assert stats.effective_confidence_tier == tier
-    assert stats.high_confidence is (tier == "high")
+    assert stats.effective_confidence_tier(tier_required=False) == tier
+    assert stats.high_confidence(tier_required=False) is (tier == "high")
+
+
+def test_missing_tier_fails_closed_when_the_contract_requires_it():
+    missing = stats_row()
+    assert missing.confidence_tier_missing
+    assert missing.effective_confidence_tier(tier_required=True) is None
+    assert missing.high_confidence(tier_required=True) is False
+    present = stats_row(confidence_tier="high")
+    assert not present.confidence_tier_missing
+    assert present.high_confidence(tier_required=True) is True
+    assert not stats_row(stats_pass=False).confidence_tier_missing
+
+
+@pytest.mark.parametrize(
+    "version,required",
+    [
+        (None, False),  # contract < 1.1 (field absent)
+        ("1.1", False),
+        ("1.2", False),
+        ("1.3", True),
+        ("1.10", True),
+        ("2.0", True),
+        (" 1.3 ", True),
+        ("1.3.1", True),  # unexpected shape: fail closed
+        ("one.three", True),
+        (1.2, False),  # loose types still parse by their text
+        (1.3, True),
+    ],
+)
+def test_contract_version_gates_the_legacy_fallback(version, required):
+    assert confidence_tier_required(version) is required
+    data = dict(gene_file("ERBB2") and build_bundle(("ERBB2",)).manifest)
+    if version is None:
+        data.pop("contract_version", None)
+    else:
+        data["contract_version"] = version
+    assert BundleManifest.model_validate(data).confidence_tier_required is required
 
 
 def test_explicit_null_or_unknown_tier_on_a_pass_is_not_surfaced():
@@ -278,4 +328,166 @@ def test_explicit_null_or_unknown_tier_on_a_pass_is_not_surfaced():
         job = run_job(client)
         assert ("ERBB2", "breast cancer") not in gate.calls
         assert ("ERBB2", "gastric cancer") not in gate.calls
+        assert_agreement(surfaced_everywhere(client, job["job_id"]), set())
+
+
+# --------------------------------------------------------------------------
+# Contract version gates the "missing => high" fallback
+# --------------------------------------------------------------------------
+
+
+def with_contract(version: str, tiers: Dict[str, str]):
+    """ERBB2-only bundle declaring ``contract_version``; only ``tiers`` are set
+    (every other pair omits confidence_tier entirely)."""
+    return build_bundle(
+        ("ERBB2",),
+        manifest_overrides={"contract_version": version},
+        edit_gene=tiered(tiers, explicit_null_for_failures=False),
+    )
+
+
+@pytest.mark.parametrize(
+    "tiers,expected_calls,expected_surfaced",
+    [
+        # ALL tiers omitted: nothing is high, so no paid call and nothing surfaces.
+        ({}, [], set()),
+        # SOME omitted: only the explicit high pair is checked (and surfaces).
+        ({"BRCA": "high"}, [("ERBB2", "breast cancer")], {"BRCA"}),
+    ],
+    ids=["all_omitted", "some_omitted"],
+)
+def test_contract_1_3_bundle_with_omitted_tiers_fails_closed_everywhere(
+    tiers, expected_calls, expected_surfaced, caplog
+):
+    gate = FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE))
+    bundle = with_contract("1.3", tiers)
+    harness = CsvHarness(gate=gate, bundle=bundle)
+    with caplog.at_level(logging.WARNING, logger="src.expression_context.service"):
+        with TestClient(harness.app) as client:
+            harness.service._clock = lambda: NOW
+            # Even stored, valid, supported evidence for an untiered pass never surfaces.
+            store_supported(harness, "STAD", "gastric cancer", "99999999")
+            assert_agreement(surfaced_everywhere(client), set())  # BRCA not checked yet
+            job = run_job(client)
+            assert gate.calls == expected_calls
+            assert_agreement(surfaced_everywhere(client, job["job_id"]), expected_surfaced)
+            for row in golden_rows(client):
+                assert "99999999" not in row["Evidence-associated PMIDs"]
+                assert "Stomach" not in row["Relevant expression-based cancer type(s)"]
+            pairs = {
+                p["oncotree_code"]: p for p in client.get(f"{PREFIX}/stats/ERBB2").json()["pairs"]
+            }
+            for code in ("STAD", "ESCA"):  # untiered passes
+                assert pairs[code]["status"] == "candidate"
+                assert pairs[code]["confidence_tier"] is None
+                assert pairs[code]["literature_eligible"] is False
+    warnings = [r for r in caplog.records if "without confidence_tier" in r.getMessage()]
+    assert len(warnings) == 1, "warned once per bundle, not per request"
+    assert bundle.release_id in warnings[0].getMessage()
+
+
+def test_contract_1_2_bundle_without_the_field_keeps_legacy_behaviour(caplog):
+    passing = {
+        ct["oncotree_code"] for ct in gene_file("ERBB2")["cancer_types"] if ct["stats_pass"]
+    }
+    explicit = build_bundle(("ERBB2",), edit_gene=tiered(dict.fromkeys(passing, "high")))
+    with caplog.at_level(logging.WARNING, logger="src.expression_context.service"):
+        legacy = snapshot(with_contract("1.2", {}))
+    assert legacy == snapshot(explicit)
+    assert legacy["surfaced"]["stats"] == {"BRCA"}
+    assert len(legacy["calls"]) == 3
+    assert not [r for r in caplog.records if "without confidence_tier" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "version,tiers,rejected",
+    [
+        ("1.3", {}, True),
+        ("1.3", {"BRCA": "high"}, True),  # one untiered pass is enough
+        ("1.3", {"BRCA": "high", "STAD": "candidate", "ESCA": "high", "UCEC": "high"}, False),
+        ("1.2", {}, False),
+        (None, {}, False),
+    ],
+)
+def test_loader_rejects_a_1_3_bundle_with_untiered_passes(version, tiers, rejected):
+    overrides = {} if version is None else {"contract_version": version}
+    bundle = build_bundle(
+        ("ERBB2",),
+        manifest_overrides=overrides,
+        edit_gene=tiered(tiers, explicit_null_for_failures=False),
+    )
+    manifest = BundleManifest.model_validate(bundle.manifest)
+    line = json.dumps(bundle.genes[0]).encode()
+    if rejected:
+        with pytest.raises(BundleContractError, match="requires confidence_tier"):
+            BundleLoader._gene_row(line, manifest, set(), 1)
+    else:
+        assert BundleLoader._gene_row(line, manifest, set(), 1)[0] == "ERBB2"
+
+
+# --------------------------------------------------------------------------
+# Every literature scheduling path skips candidates
+# --------------------------------------------------------------------------
+
+
+def test_the_gate_is_reachable_only_through_evaluate():
+    """Structural guard: the paid gate has one call site, behind evaluate()'s
+    candidate filter, so the paths below cover every scheduling route."""
+    source = (Path(__file__).parent.parent / "src/expression_context/service.py").read_text()
+    assert source.count("self.gate.evaluate(") == 1
+    assert source.count("self._evaluate_and_store(") == 2  # both inside _resolve_verdict
+    assert source.count("self._single_flight_verdict(") == 1  # only evaluate()'s check()
+    assert source.count("self.evaluate(") == 1  # only _run_job
+
+
+def test_reevaluation_concurrent_direct_and_post_refresh_runs_skip_candidates():
+    gate = FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE))
+    tiers = {"BRCA": "high", "STAD": "candidate", "ESCA": "candidate"}
+    bundle = build_bundle(("ERBB2",), edit_gene=tiered(tiers))
+    harness = CsvHarness(gate=gate, bundle=bundle)
+    gastric = ("ERBB2", "gastric cancer")
+    with TestClient(harness.app) as client:
+        # 1. First job, then a re-evaluation (second job) of the same gene.
+        run_job(client)
+        run_job(client)
+        # 2. Concurrent jobs for the same gene.
+        urls = [
+            client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2"}).json()["status_url"]
+            for _ in range(3)
+        ]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(
+            client.get(u).json()["status"] not in ("succeeded", "failed") for u in urls
+        ):
+            time.sleep(0.01)
+        assert all(client.get(u).json()["status"] == "succeeded" for u in urls)
+        # 3. Direct service.evaluate (no job wrapper), with stored rows cleared.
+        harness.store.rows.clear()
+        service = harness.service
+
+        async def direct():
+            resolved = await service.resolve("ERBB2")
+            return await service.evaluate(resolved, None)
+
+        result, evaluated, _, errors = client.portal.call(direct)
+        assert errors == [] and evaluated == 1  # BRCA only
+        assert {p.oncotree_code for p in result.surfaced} == {"BRCA"}
+        assert gate.calls.count(("ERBB2", "breast cancer")) == 2  # first job + direct
+        assert gastric not in gate.calls
+        assert ("ERBB2", "esophageal cancer") not in gate.calls
+
+        # 4. Bundle refresh: release B demotes BRCA to a candidate. Its release-A
+        # verdict is never reused and BRCA is never re-checked under B.
+        release_b = build_bundle(
+            ("ERBB2",),
+            release_id="datahub-abc1234def56-m2-b7e9f01a2c3e",
+            edit_gene=tiered({"BRCA": "candidate", "STAD": "candidate", "ESCA": "candidate"}),
+        )
+        asyncio.run(seed_bundle(harness.bundles, release_b))
+        service.catalog.invalidate()
+        before = list(gate.calls)
+        job = run_job(client)
+        assert gate.calls == before, "no literature call for candidates after a refresh"
+        assert job["release_id"] == release_b.release_id
+        assert job["result"]["surfaced"] == []
         assert_agreement(surfaced_everywhere(client, job["job_id"]), set())

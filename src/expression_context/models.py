@@ -20,6 +20,27 @@ SUPPORTED_SCHEMA_VERSION = "1"
 # m2 bundles still load; method_version is informational, never enforced.
 SUPPORTED_METHOD_VERSIONS = ("2", "3")
 HIGH_CONFIDENCE = "high"
+# expression_stats contract version that introduced per-pair confidence_tier.
+CONFIDENCE_TIER_CONTRACT = (1, 3)
+
+
+def confidence_tier_required(contract_version: Any) -> bool:
+    """Whether a bundle's pairs must carry ``confidence_tier``.
+
+    Absent (contracts before 1.1) or a parseable ``"<major>.<minor>"`` below 1.3:
+    False, the legacy "missing => high" fallback applies. 1.3 or later, or any
+    value that can't be parsed: True (fail closed; a missing tier is not high).
+    """
+    if contract_version is None:
+        return False
+    parts = str(contract_version).strip().split(".")
+    try:
+        version = tuple(int(part) for part in parts)
+    except ValueError:
+        return True
+    if len(version) != 2:
+        return True
+    return version >= CONFIDENCE_TIER_CONTRACT
 PASS_MODE_LABELS = {"lineage": "Lineage enriched", "subgroup": "Subgroup enriched"}
 # Canonical/alias gene symbols as accepted from users and from bundles.
 SYMBOL_PATTERN = r"[A-Z0-9][A-Z0-9._-]{0,63}\Z"
@@ -52,9 +73,18 @@ class Manifest(_Artifact):
     schema_version: str
     release_id: str
     method_version: str
+    # Additive contract minor version ("1.1", "1.2", "1.3", ...); absent before 1.1.
+    # Kept loose so an unexpected type can't reject a bundle; parsed fail-closed.
+    contract_version: Optional[Any] = None
     params: Dict[str, Any] = Field(default_factory=dict)
     source: Dict[str, Any] = Field(default_factory=dict)
     cancer_types: List[ManifestCancerType] = Field(default_factory=list)
+
+    @property
+    def confidence_tier_required(self) -> bool:
+        """True for contract >= 1.3, where every stats pass must carry
+        ``confidence_tier`` (see ``confidence_tier_required``)."""
+        return confidence_tier_required(self.contract_version)
 
     def cancer_type(self, oncotree_code: str) -> Optional[ManifestCancerType]:
         for cancer_type in self.cancer_types:
@@ -137,22 +167,27 @@ class CancerTypeStats(_Artifact):
         return self.stats_pass and not self.broad_blocked
 
     @property
-    def effective_confidence_tier(self) -> Optional[str]:
+    def confidence_tier_missing(self) -> bool:
+        """A passing pair whose document omits ``confidence_tier`` entirely."""
+        return self.passes_stats and "confidence_tier" not in self.model_fields_set
+
+    def effective_confidence_tier(self, *, tier_required: bool) -> Optional[str]:
         """The tier ACGC acts on, None unless ``passes_stats``.
 
-        Bundles before contract 1.3 omit ``confidence_tier``: a missing field on a
-        passing pair counts as "high", so old data behaves exactly as before. An
-        explicit null or an unknown value on a passing pair is not high.
+        ``tier_required`` is ``Manifest.confidence_tier_required``. Bundles before
+        contract 1.3 omit ``confidence_tier``: there (and only there) a missing
+        field on a passing pair counts as "high", so old data behaves exactly as
+        before. In a 1.3+ bundle a missing field fails closed (None: not high).
+        An explicit null or an unknown value on a passing pair is never high.
         """
         if not self.passes_stats:
             return None
         if "confidence_tier" not in self.model_fields_set:
-            return HIGH_CONFIDENCE
+            return None if tier_required else HIGH_CONFIDENCE
         return self.confidence_tier
 
-    @property
-    def high_confidence(self) -> bool:
-        return self.effective_confidence_tier == HIGH_CONFIDENCE
+    def high_confidence(self, *, tier_required: bool) -> bool:
+        return self.effective_confidence_tier(tier_required=tier_required) == HIGH_CONFIDENCE
 
     @property
     def enrichment_label(self) -> Optional[str]:

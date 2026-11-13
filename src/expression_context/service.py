@@ -8,9 +8,11 @@ A (gene, cancer type) pair is *surfaced* iff:
 1. it passes the statistics: ``stats_pass``, and not a method-m3 pair whose
    lineage enrichment was blocked by broad expression without a subgroup
    pass (``CancerTypeStats.passes_stats``), and
-2. its ``confidence_tier`` is "high" (contract 1.3; a bundle without the field
-   counts every stats pass as high, ``CancerTypeStats.high_confidence``).
-   Weaker passes are *candidates*: listed, never surfaced, and
+2. its ``confidence_tier`` is "high" (contract 1.3). Only a bundle whose manifest
+   ``contract_version`` is below 1.3 (or absent) counts a missing field as high;
+   in a 1.3+ bundle a missing tier is not high (fail closed, warned once per
+   bundle; the loader also rejects such bundles). Weaker passes are
+   *candidates*: listed, never surfaced, and
 3. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
    pre-check; null means it was not run, and the literature gate itself is
    authoritative), and
@@ -206,6 +208,24 @@ class ExpressionContextService:
         self._lease_poll_seconds = lease_poll_seconds
         self._inflight: Dict[Tuple[str, str, str, str], asyncio.Future] = {}
         self._tasks: Set[asyncio.Task] = set()
+        self._tier_warned: Set[str] = set()
+
+    def _tier_required(self, manifest: Manifest, artifact: GeneArtifact) -> bool:
+        """``manifest.confidence_tier_required``; warns once per bundle when a 1.3+
+        bundle has a stats pass without ``confidence_tier`` (treated as not high)."""
+        required = manifest.confidence_tier_required
+        if (
+            required
+            and manifest.release_id not in self._tier_warned
+            and any(ct.confidence_tier_missing for ct in artifact.cancer_types)
+        ):
+            self._tier_warned.add(manifest.release_id)
+            logger.warning(
+                "Bundle %s (contract_version %r) has stats passes without confidence_tier "
+                "(first seen in %s); treating them as not high-confidence",
+                manifest.release_id, manifest.contract_version, artifact.gene.hugo_symbol,
+            )
+        return required
 
     # ------------------------------------------------------------------ gene
 
@@ -296,6 +316,7 @@ class ExpressionContextService:
         existing = await self.store.get_pairs(symbol, manifest.release_id, gate_name)
         now = self._clock()
         expired = precheck_expired(manifest, now)
+        tier_required = self._tier_required(manifest, resolved.artifact)
 
         rows: List[StoredPair] = []
         to_check: List[Tuple[CancerTypeStats, TumorContext]] = []
@@ -337,7 +358,7 @@ class ExpressionContextService:
                 # Includes broad-blocked m3 pairs: visible, never sent on.
                 rows.append(row(stats, False, "stats"))
                 continue
-            if not stats.high_confidence:
+            if not stats.high_confidence(tier_required=tier_required):
                 # Candidate: never sent to the paid literature gate.
                 rows.append(row(stats, False, "candidate"))
                 continue
@@ -552,13 +573,14 @@ class ExpressionContextService:
         summary = GeneStatsSummary()
         expired = precheck_expired(resolved.manifest, self._clock())
         has_stored_result = bool(stored)
+        tier_required = self._tier_required(resolved.manifest, resolved.artifact)
         for stats in resolved.artifact.cancer_types:
             cancer_type = resolved.manifest.cancer_type(stats.oncotree_code)
             precheck = {True: "pass", False: "fail", None: "not_run"}[stats.literature_precheck_pass]
             if expired and stats.literature_precheck_pass is not None:
                 precheck = "expired"
             passes = stats.passes_stats
-            tier = stats.effective_confidence_tier
+            tier = stats.effective_confidence_tier(tier_required=tier_required)
             high = passes and tier == HIGH_CONFIDENCE
             eligible = high and effective_precheck(stats, expired) is not False
             verdict = None

@@ -177,9 +177,13 @@ read-only confidence-tier evaluation (45/51 positives high, 0/27 negatives); the
 selective statistical screen, not a calibrated precision.
 
 **Optional field.** `confidence_tier` is optional in the schema: bundles before contract
-1.3 omit it and still load. Consumers must treat a **missing** field on a v3 pass as
-`"high"` (the pre-1.3 behaviour); an explicit null or any unknown value on a v3 pass is
-not high.
+1.3 omit it and still load. Only for a bundle whose manifest `contract_version` is absent
+or below `"1.3"` must consumers treat a **missing** field on a v3 pass as `"high"` (the
+pre-1.3 behaviour). From contract 1.3 the producer always writes the field, so a missing
+tier on a v3 pass is a malformed bundle: it is never high (ACGC rejects such a bundle at
+load, and any pair that still reaches it fails closed, logged once per bundle). An
+unparseable `contract_version` is treated as 1.3+. An explicit null or any unknown value
+on a v3 pass is never high.
 
 **Consumer rule (ACGC).** A pair is surfaced only if its statistics pass (v3, minus
 broad-blocked pairs), `confidence_tier` is (effectively) `"high"`, the effective PubMed
