@@ -13,9 +13,10 @@ env:
   OMP_NUM_THREADS: '1'
   MKL_NUM_THREADS: '1'
   NUMEXPR_NUM_THREADS: '1'
+  PYTHONHASHSEED: '0'
 jobs:
   pipeline:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: expression_stats

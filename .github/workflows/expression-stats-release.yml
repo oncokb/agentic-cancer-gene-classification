@@ -23,6 +23,7 @@ env:
   OMP_NUM_THREADS: '1'
   MKL_NUM_THREADS: '1'
   NUMEXPR_NUM_THREADS: '1'
+  PYTHONHASHSEED: '0'
 concurrency:
   group: expression-stats-release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
@@ -32,7 +33,7 @@ jobs:
     concurrency:
       group: ${{ inputs.skip_precheck && format('expression-stats-review-{0}', github.run_id) || 'expression-stats-pubmed' }}
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     defaults:
       run:
