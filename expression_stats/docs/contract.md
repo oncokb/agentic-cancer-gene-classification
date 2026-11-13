@@ -177,7 +177,7 @@ read-only confidence-tier evaluation (45/51 positives high, 0/27 negatives); the
 selective statistical screen, not a calibrated precision.
 
 **Optional field.** `confidence_tier` is optional in the schema: bundles before contract
-1.2 omit it and still load. Only for a bundle whose manifest `contract_version` is a
+1.3 omit it and still load. Only for a bundle whose manifest `contract_version` is a
 well-formed version string (exactly `^[0-9]+\.[0-9]+(\.[0-9]+)?$`: no sign, no
 whitespace) **below** `"1.3"` may consumers treat a **missing** field on a v3 pass as
 `"high"` (the pre-1.3 behaviour). Every other manifest requires the field: 1.3 or later,
