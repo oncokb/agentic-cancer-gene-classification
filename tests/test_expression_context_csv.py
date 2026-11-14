@@ -119,6 +119,7 @@ EXPECTED_COLUMNS: Tuple[str, ...] = (
     "stats_pass",
     "enrichment_label",
     "confidence_tier",
+    "purity_check",
     "broadly_expressed",
     "n_tumor",
     "n_rest",

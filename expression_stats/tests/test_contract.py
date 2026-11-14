@@ -491,7 +491,13 @@ def test_budget_expiry_after_request_saves_count_and_next_build_resumes(tmp_path
         "matrix",
         lambda *args: (np.array([[31] * 10 + [0] * 310]), np.repeat(codes, 10), [213]),
     )
-    monkeypatch.setattr(builder, "select_samples", lambda *args: {c: [] for c in codes})
+    monkeypatch.setattr(
+        builder, "select_samples",
+        lambda *args: {
+            c: [f"TCGA-{j:02d}-{i:04d}-01" for i in range(10)]
+            for j, c in enumerate(codes)
+        },
+    )
     monkeypatch.setattr(
         builder,
         "Precheck",

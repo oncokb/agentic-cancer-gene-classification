@@ -5,7 +5,7 @@ follow-up gates are in [runtime-followup-validation.md](runtime-followup-validat
 
 Implements the **recommended branch-aware hybrid**, not the alternative
 curator/strict-median rule. Inputs were read-only from
-`/Users/foriskuang/Projects/agcg-control-eval`: `methods/followup_report.md`,
+the read-only control-evaluation workspace: `methods/followup_report.md`,
 `controls-proposal.md`, `controls.yaml`, and the `followup_*` scripts. The
 proposal's older P95-tail rule is superseded by the follow-up recommendation.
 The repo's single authoritative contract remains [contract.md](contract.md);

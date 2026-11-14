@@ -20,3 +20,17 @@ def offline_alteration_inputs(monkeypatch):
     from gene_expression_relevance import alterations
 
     monkeypatch.setattr(alterations, "load_inputs", empty_inputs)
+
+
+@pytest.fixture(autouse=True)
+def offline_purity_inputs(monkeypatch):
+    import numpy as np
+
+    from gene_expression_relevance import build
+
+    monkeypatch.setattr(
+        build, "load_selected",
+        lambda cache, mapping, selection: np.full(
+            sum(len(selection[item["study_id"]]) for item in mapping), np.nan
+        ),
+    )

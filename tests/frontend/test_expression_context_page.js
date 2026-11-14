@@ -1038,6 +1038,25 @@ test("the page never assigns innerHTML", () => {
   assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML/.test(source));
 });
 
+test("purity demotion has a distinct tooltip and coverage states have detail notes", async () => {
+  const v = viewWithCandidate();
+  v.pairs.find(p => p.status === "candidate").stats.purity_check = "demoted";
+  v.pairs[0].stats.purity_check = "not_applicable";
+  v.pairs[1].stats.purity_check = "unassessed";
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  const row = summaryRows(nodes).find(r => r.text.includes("(KIRC)"));
+  const badges = row.findAll(n => n.textContent === "Needs verification");
+  assert.ok(badges.some(n => n.getAttribute("title") ===
+    "Expression may come from non-tumor cells (falls with tumor purity)"));
+  const details = detailRows(nodes);
+  assert.ok(details[0].text.includes("Not applicable to this cohort"));
+  assert.ok(details[1].text.includes("Insufficient purity coverage"));
+  assert.ok(details[0].text.includes("unassessed by this gate, not validated"));
+  assert.ok(details[1].text.includes("unassessed by this gate, not validated"));
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of tests) {

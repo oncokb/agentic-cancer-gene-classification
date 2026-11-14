@@ -943,6 +943,27 @@
                 "alteration_types_enriched",
                 "categories"
               ]
+            },
+            "purity_check": {
+              "enum": [
+                "pass",
+                "demoted",
+                "not_applicable",
+                "unassessed",
+                null
+              ]
+            },
+            "purity_rho": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "purity_q": {
+              "type": [
+                "number",
+                "null"
+              ]
             }
           },
           "required": [
