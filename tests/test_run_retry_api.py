@@ -970,3 +970,11 @@ def test_fallback_outcome_only_for_rows_left_waiting():
         "KRAS now resolves to LTK, not KRAS; KRAS was not updated",
         "BRAF: no usable result was returned; not updated",
     ]
+
+
+@pytest.mark.parametrize("placeholder", [".", "NA", "intergenic", ".::."])
+def test_retry_rejects_historical_placeholder_rows(monkeypatch, fresh_jobs, placeholder):
+    stored = _stored_run(annotations=[_annotation(placeholder, error="temporary failure").model_dump()])
+    response = _rejected(monkeypatch, stored, {"kind": "errors", "inputs": [placeholder]})
+    assert response.status_code == 422
+    assert "intergenic placeholder" in response.text

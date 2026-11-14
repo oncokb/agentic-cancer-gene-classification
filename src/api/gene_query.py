@@ -25,7 +25,7 @@ from src.api.run_persistence import GENERIC_FAILURE, save_run_or_raise
 from src.config import settings
 from src.models.schema import AnnotateRequest, AnnotationResult, CacheStatus, FusionInput, GeneAnnotation
 from src.observability import record_user_action, record_user_seen, tag_current_span
-from src.pipeline.normalization import FUSION_SEPARATORS, has_accession_identifier
+from src.pipeline.normalization import FUSION_SEPARATORS, has_accession_identifier, reject_intergenic_gene_input
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -259,7 +259,7 @@ class GeneQueryJobStatusResponse(BaseModel):
 
 
 def _validate_symbol(value: str) -> str:
-    symbol = value.strip()
+    symbol = reject_intergenic_gene_input(value.strip())
     if not symbol:
         raise ValueError("Gene symbol must not be empty")
     if len(symbol) > _MAX_SYMBOL_LENGTH:

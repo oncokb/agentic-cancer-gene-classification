@@ -85,7 +85,13 @@ NORMALIZATION_CONCURRENCY = 6
 
 
 # Separators used in fusion notation.
-FUSION_SEPARATORS = re.compile(r"[:]{2}|--|/")
+FUSION_SEPARATORS = re.compile(r"(?<![A-Za-z0-9])N/A(?![A-Za-z0-9])|[:]{2}|--|/", re.IGNORECASE)
+INTERGENIC_PLACEHOLDERS = frozenset({".", "-", "NA", "N/A", "INTERGENIC", "?"})
+
+
+def is_intergenic_partner(value: str) -> bool:
+    """Whether a partner names an intergenic breakpoint rather than a gene."""
+    return value.strip().upper() in INTERGENIC_PLACEHOLDERS or bool(re.fullmatch(r"-+", value.strip()))
 
 
 def split_fusion(fusion: str) -> Tuple[str, Optional[str]]:
@@ -93,10 +99,43 @@ def split_fusion(fusion: str) -> Tuple[str, Optional[str]]:
     Split 'GENE1::GENE2' (or '--' / '/' delimited) into partner symbols.
     Returns (gene1, gene2). If no separator found, returns (fusion, None).
     """
-    parts = FUSION_SEPARATORS.split(fusion.strip(), maxsplit=1)
-    if len(parts) == 2:
-        return parts[0].strip(), parts[1].strip()
-    return parts[0].strip(), None
+    def after_separator_run(value: str, index: int) -> int:
+        while index < len(value) and value[index] in ":-/":
+            # A trailing dash run is a partner, not more separators.
+            if is_intergenic_partner(value[index:]):
+                break
+            index += 1
+        return index
+
+    # Consume a leading dash placeholder before the separator, including
+    # degenerate dash runs such as '---::ALK'; never manufacture '-ALK'.
+    text = fusion.strip()
+    leading = re.match(r"^(-{3,})(::|/)?", text)
+    if leading:
+        dashes, separator = leading.groups()
+        if leading.end() == len(text) and not separator:
+            return text, None
+        end = after_separator_run(text, leading.end())
+        return (dashes if separator else dashes[:-2]), text[end:].strip()
+    # Consume N/A as one token before considering slash separators.
+    for match in FUSION_SEPARATORS.finditer(fusion):
+        if match.group().upper() != "N/A":
+            end = after_separator_run(fusion, match.end())
+            first, second = fusion[:match.start()].strip(), fusion[end:].strip()
+            if end != match.end():
+                # Consecutive separators describe a missing breakpoint side,
+                # never a gene such as '::ALK'. Keep ordinary dangling forms.
+                return first or ".", second or "."
+            return first, second
+    return fusion.strip(), None
+
+
+def reject_intergenic_gene_input(value: str) -> str:
+    """Reject no-gene submissions where an endpoint requires a gene."""
+    partners = [part for part in split_fusion(value) if part]
+    if partners and all(is_intergenic_partner(part) for part in partners):
+        raise ValueError(f'{value!r} is an intergenic placeholder, not a gene')
+    return value
 
 
 def split_input_tumor_types(
@@ -278,8 +317,8 @@ def unparsed_fusion_warning(
     real hyphenated gene, or one whose lookup failed, never warns; nor does one
     listed in `known_aliases` (alias/previous symbols of genes already resolved).
     The whitespace form must name a fusion explicitly and ignores `resolved`:
-    symbols never contain spaces, and HGNC's fuzzy search fallback "resolves"
-    'EML4 ALK fusion' to EML4.
+    symbols never contain spaces. Unrelated fuzzy HGNC hits are rejected
+    during resolution.
     Its keyword already marks the partners, so unlike the hyphen form it
     is not case-checked ('fus erg fusion' warns).
     """
@@ -989,6 +1028,8 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
     Ensembl IDs are resolved through Ensembl and RefSeq accessions through NCBI
     before falling back to insufficient evidence.
     """
+    if is_intergenic_partner(symbol) or not re.search(r"[A-Za-z]", symbol):
+        return _unresolvable_gene(symbol)
     if _is_ensembl_id(symbol):
         return (await _resolve_ensembl_ids([symbol], client))[symbol]
     if _is_refseq_id(symbol):
@@ -1025,7 +1066,8 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
         logger.warning("HGNC fetch lookup failed for %s: %s", symbol, exc)
         lookup_failed = True
 
-    # Try search as fallback (handles minor capitalisation differences)
+    # Search is a candidate list, not proof of identity: require an exact
+    # case-insensitive symbol, alias or previous-symbol match.
     try:
         search_url = HGNC_SEARCH_URL.format(symbol=symbol)
 
@@ -1035,8 +1077,18 @@ async def resolve_gene(symbol: str, client: httpx.AsyncClient) -> ResolvedGene:
             return resp.json().get("response", {}).get("docs", [])
 
         docs = await cached_call(f"hgnc:search:{symbol}", _fetch_search)
-        if docs:
-            doc = docs[0]
+        doc = next(
+            (candidate for candidate in docs if symbol.casefold() in {
+                name.casefold()
+                for name in [
+                    candidate.get("symbol", ""),
+                    *(candidate.get("alias_symbol") or []),
+                    *(candidate.get("prev_symbol") or []),
+                ]
+            }),
+            None,
+        )
+        if doc is not None:
             return ResolvedGene(
                 input_symbol=symbol,
                 canonical_symbol=doc.get("symbol", symbol),
@@ -1215,7 +1267,10 @@ async def normalize_fusions(
     accession_tokens = [token for tokens in tokens_by_input.values() for _, token in tokens if token]
     ensembl_ids = sorted({token.accession for token in accession_tokens if token.accession and not token.refseq})
     refseq_ids = sorted({token.accession for token in accession_tokens if token.accession and token.refseq})
-    plain_symbols = {g for tokens in tokens_by_input.values() for g, token in tokens if token is None}
+    plain_symbols = {
+        g for tokens in tokens_by_input.values() for g, token in tokens
+        if token is None and not is_intergenic_partner(g)
+    }
 
     async with httpx.AsyncClient() as client:
         ensembl, refseq = await asyncio.gather(
@@ -1242,6 +1297,18 @@ async def normalize_fusions(
     keys_by_input: Dict[str, list[str]] = {}
     for fusion, tokens in tokens_by_input.items():
         info = CanonicalInput(submitted=fusion, canonical=fusion)
+        placeholders = [raw for raw, _ in tokens if is_intergenic_partner(raw)]
+        if placeholders or not tokens:
+            if len(placeholders) == len(tokens):
+                info.warnings.append(
+                    f"'{fusion}' has no gene partners (intergenic breakpoints); nothing to annotate."
+                )
+            else:
+                side = "5′" if is_intergenic_partner(tokens[0][0]) else "3′"
+                info.warnings.append(
+                    f"'{fusion}': the {side} partner is intergenic; "
+                    "only the named gene partner is annotated."
+                )
         symbols: list[str] = []
         transcripts: list[Optional[str]] = []
         keys: list[str] = []
@@ -1253,7 +1320,8 @@ async def normalize_fusions(
             if reading is None:
                 symbols.append(raw)
                 transcripts.append(None)
-                keys.append(raw)
+                if not is_intergenic_partner(raw):
+                    keys.append(raw)
                 continue
             symbol, resolved, transcript, warning = reading
             if warning:

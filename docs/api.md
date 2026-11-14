@@ -177,6 +177,21 @@ endpoints return full annotations, including evidence cards.)
 
 ### Gene identifiers
 
+Fusion partners may be intergenic/no-gene placeholders: `.`, `-`, `NA`, `N/A`,
+`intergenic`, or `?` (case-insensitive, surrounding spaces ignored). Their position
+is preserved. `NA` is reserved as a placeholder here; HGNC lists it only as a
+previous symbol of XK, and it did not resolve through the former symbol search.
+`/v1/genes/query` rejects the whole batch with 422 if any entry is a placeholder such as `NA`.
+Single-gene endpoints reject placeholder-only input with 422 before annotation
+or run persistence; batch annotation accepts it and returns warnings with zero
+annotations. `N/A` is a single partner even with slash fusion notation. For
+`.::OR4N2` or `OR4N2::.`, only OR4N2 is annotated. All-placeholder inputs
+(including a bare `.`) produce no gene annotations. The existing `warnings` list
+explains intergenic inputs alongside other input caveats. Exact-pair fusion
+evidence has `retrieval_status: "skipped"` with an explanatory interpretation,
+because there is no two-gene pair to search; named-gene partner precedent remains
+available.
+
 Every endpoint that takes genes or fusions (`/v1/genes/...`, `/v1/annotate`,
 `/v1/annotate/jobs`, `/v1/annotate/gene`, `/v1/fusion-evidence/jobs`) accepts,
 alone or as either fusion partner:
@@ -516,7 +531,7 @@ Each `fusion_evidence` entry (the same shape is returned inline by
 | `literature_scope` | Computed over all `pmids`, not just the cards. `requested_tumor`: at least one paper **mentions** the requested tumor type; this does not mean the fusion was shown in that tumor. `other_or_unspecified`: a tumor type was sent but no paper mentions it. `any_tumor`: no tumor type was sent and papers were found. `no_literature`: all searches succeeded and no paper was retained. `null` when retrieval failed, a partial result has no retained papers or its tumor-scoped search failed, the input is not a two-partner fusion, or the result predates this field. |
 | `requested_tumor_pmids` | The `pmids` that mention the requested tumor type, in ranked order. These can include papers without a card. |
 | `partial` | Boolean, default `false`. One exact-pair search failed; evidence from successful searches is retained and the interpretation describes the failure. Partial results are never cached. Scope is unknown (`null`) when no papers were retained or the tumor-scoped query failed; otherwise scope reflects retained papers. The UI labels partial lookups, groups unknown-scope partial results under Lookup failed, and suppresses the no-literature partner prompt. |
-| `retrieval_status` | `ok` when at least one search succeeded (including partial results), or for non-pair inputs where no lookup applies; `failed` when retrieval raised an error. A failed entry is empty because the lookup failed, not because no literature exists; retry it. |
+| `retrieval_status` | `skipped` for an intergenic breakpoint (no exact pair exists and no search runs); `ok` when at least one search succeeded (including partial results), or for non-pair inputs where no lookup applies; `failed` when retrieval raised an error. A failed entry is empty because the lookup failed, not because no literature exists; retry it. |
 
 Tumor mentions are matched deterministically on word boundaries against the
 same expanded terms as the tumor-scoped query (for example `LUAD` also matches

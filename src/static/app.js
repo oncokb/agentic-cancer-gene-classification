@@ -2377,10 +2377,12 @@ function renderEmptyState(title, body) {
   cancelOpenEvidenceCardLoads({ abort: false });
   const empty = document.createElement("div");
   empty.className = "empty-state";
-  empty.innerHTML = `
-    <h3>${escapeHtml(title)}</h3>
-    <p>${escapeHtml(body)}</p>
-  `;
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  const message = document.createElement("p");
+  message.textContent = body;
+  empty.appendChild(heading);
+  empty.appendChild(message);
   elements.resultsWindow.replaceChildren(empty);
   rebuildGeneIndex([]);
 }
@@ -2547,7 +2549,7 @@ function renderAnnotationResult(result) {
   if (!allAnnotations.length) {
     renderEmptyState(
       result.run_error ? "Run stopped" : "No results",
-      result.run_error || "No gene annotations were returned.",
+      [result.run_error || "No gene annotations were returned.", ...(result.warnings || [])].join(" "),
     );
     return;
   }
@@ -2911,7 +2913,11 @@ function fusionEvidenceSections(items) {
     let label;
     let order;
     let key; // stable tracking id; the label can carry the tumor type
-    if (item.retrieval_status === "failed" || (item.partial && (!item.literature_scope || item.literature_scope === "no_literature"))) {
+    if (item.retrieval_status === "skipped") {
+      label = "Exact-pair search skipped";
+      order = 3.5;
+      key = "skipped";
+    } else if (item.retrieval_status === "failed" || (item.partial && (!item.literature_scope || item.literature_scope === "no_literature"))) {
       label = "Lookup failed";
       order = 4;
       key = "failed";
@@ -2968,7 +2974,7 @@ function renderFusionEvidenceCard(item) {
   if (inputNote) heading.appendChild(inputNote);
   const meta = appendFusionText(header, "div", "annotation-card-meta");
   const key = fusionEvidenceKey(item);
-  if (state.canModifyRun) {
+  if (state.canModifyRun && item.retrieval_status !== "skipped") {
     const rerunning = state.fusionEvidenceStatus === "running" && state.rerunningFusionEvidenceKey === key;
     const rerun = appendFusionText(meta, "button", "rerun-fusion-evidence", rerunning ? "Re-running..." : "Re-run");
     rerun.type = "button";
@@ -2983,7 +2989,7 @@ function renderFusionEvidenceCard(item) {
     error.setAttribute("role", "alert");
   }
   appendFusionText(meta, "span", `review-badge ${item.well_supported ? "high" : "low"}`,
-    item.well_supported ? "Well supported" : "Exploratory");
+    item.retrieval_status === "skipped" ? "Search skipped" : item.well_supported ? "Well supported" : "Exploratory");
   if (item.partial) appendFusionText(meta, "span", "status-pill", "Partial lookup");
   const count = fusionEvidencePmidCount(item);
   appendFusionText(meta, "span", "status-pill", `${count} PMID${count === 1 ? "" : "s"}`);
@@ -4002,13 +4008,34 @@ function renderOpenEvidenceCard(annotation, displayPosition = null) {
 // gene with insufficient_evidence; never fired automatically)
 // ---------------------------------------------------------------------------
 
+function isIntergenicPartner(gene) {
+  return [".", "-", "NA", "N/A", "INTERGENIC", "?"].includes(gene.trim().toUpperCase()) || /^-+$/.test(gene.trim());
+}
+
 function splitFusionGenes(fusion) {
-  for (const sep of ["::", "--", "/"]) {
-    if (fusion.includes(sep)) {
-      return fusion.split(sep).map((g) => g.trim()).filter(Boolean);
-    }
+  const parts = [];
+  let start = 0;
+  const leading = fusion.match(/^\s*(-{3,})(::|\/)?/);
+  if (leading) {
+    parts.push(leading[2] ? leading[1] : leading[1].slice(0, -2));
+    start = leading[0].length;
   }
-  return [];
+  // Keep the existing multi-part UI behavior, consuming N/A before slashes.
+  const separators = /(?<![A-Za-z0-9])N\/A(?![A-Za-z0-9])|::|--|\//gi;
+  const offset = start;
+  for (const match of fusion.slice(offset).matchAll(separators)) {
+    if (match[0].toUpperCase() === "N/A") continue;
+    const index = offset + match.index;
+    if (index < start) continue;
+    if (isIntergenicPartner(fusion.slice(start))) break;
+    // match.index is relative to the original slice, not the growing cursor.
+    parts.push(fusion.slice(start, index).trim());
+    start = index + match[0].length;
+    while (start < fusion.length && ":-/".includes(fusion[start]) && !isIntergenicPartner(fusion.slice(start))) start += 1;
+  }
+  if (!parts.length) return [];
+  parts.push(fusion.slice(start).trim());
+  return parts.filter(Boolean);
 }
 
 function fusionPartnerGenes(annotation) {
@@ -4017,7 +4044,7 @@ function fusionPartnerGenes(annotation) {
   (annotation.fusions || []).forEach((fusion) => {
     splitFusionGenes(fusion).forEach((gene) => {
       const normalized = gene.trim().toUpperCase();
-      if (!normalized || normalized === annotation.gene || seen.has(normalized)) return;
+      if (!normalized || isIntergenicPartner(normalized) || normalized === annotation.gene || seen.has(normalized)) return;
       seen.add(normalized);
       partners.push(normalized);
     });
@@ -4249,18 +4276,20 @@ function renderFusionPartnerPrecedentForFusionEvidence(item) {
   const seen = new Set();
   splitFusionGenes(item.fusion || "").forEach((gene) => {
     const normalized = gene.trim().toUpperCase();
-    if (!normalized || seen.has(normalized)) return;
+    if (!normalized || isIntergenicPartner(normalized) || seen.has(normalized)) return;
     seen.add(normalized);
     partners.push(normalized);
   });
-  if (partners.length < 2) return null;
+  if (!partners.length || (partners.length < 2 && item.retrieval_status !== "skipped")) return null;
 
   const wrapper = document.createElement("div");
   wrapper.className = "fusion-partner-precedent fusion-partner-precedent-inline";
 
   const note = document.createElement("div");
   note.className = "subtle";
-  note.textContent = item.tumor_type
+  note.textContent = item.retrieval_status === "skipped"
+    ? "Exact-pair search was skipped for an intergenic breakpoint. Select the named gene to query fusion partner precedent."
+    : item.tumor_type
     ? `No exact fusion-pair literature was found. Select a partner gene to query fusion precedent in ${item.tumor_type}; after that, the search can be broadened across all tumor types.`
     : "No exact fusion-pair literature was found. Select a partner gene to query fusion precedent across reported fusions.";
   wrapper.appendChild(note);

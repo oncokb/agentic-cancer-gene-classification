@@ -47,6 +47,7 @@ from src.pipeline.normalization import (
     has_accession_identifier,
     read_gene_input,
     resolve_gene,
+    is_intergenic_partner,
     split_fusion,
 )
 from src.pipeline.cache import cached_call
@@ -1023,6 +1024,17 @@ async def retrieve_fusion_evidence(
     force_refresh: bool = False,
 ) -> FusionEvidenceResult:
     """Return deterministic fusion-level PubMed evidence for exact gene-pair queries."""
+    five_prime, three_prime = split_fusion(fusion)
+    if any(is_intergenic_partner(partner) for partner in (five_prime, three_prime) if partner):
+        return FusionEvidenceResult(
+            fusion=fusion,
+            tumor_type=tumor_type,
+            retrieval_status="skipped",
+            interpretation=(
+                "Exact-pair evidence was skipped: an intergenic breakpoint has no gene partner, "
+                "so no two-gene pair exists."
+            ),
+        )
     submitted = fusion
     if has_accession_identifier(fusion):
         # PubMed knows symbols, not Ensembl IDs or RefSeq accessions: query the resolved pair.
@@ -1840,13 +1852,12 @@ def _fusion_partners(gene: str, fusions: List[str]) -> List[str]:
     """Extract partner symbols from fusion strings, excluding the gene itself."""
     partners: List[str] = []
     for fusion in fusions:
-        for sep in ("::", "--", "/"):
-            if sep in fusion:
-                for part in fusion.split(sep):
-                    part = part.strip()
-                    if part and part != gene:
-                        partners.append(part)
-                break
+        first, second = split_fusion(fusion)
+        if second is None:
+            continue
+        for part in (first, second):
+            if part and part.casefold() != gene.casefold() and not is_intergenic_partner(part):
+                partners.append(part)
     return list(dict.fromkeys(partners))
 
 

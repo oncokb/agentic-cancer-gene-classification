@@ -101,7 +101,7 @@ async def test_resolve_ensembl_ids_falls_back_when_ensembl_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_gene_uses_hgnc_search_after_fetch_miss():
+async def test_resolve_gene_accepts_synthetic_search_document_with_previous_symbol():
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url).startswith(HGNC_SEARCH_URL.format(symbol="OLD")):
             return httpx.Response(
@@ -111,6 +111,9 @@ async def test_resolve_gene_uses_hgnc_search_after_fetch_miss():
                         "docs": [
                             {
                                 "symbol": "NEW",
+                                # Synthetic metadata: real search docs omit prev_symbol.
+                                # This tests the guard, not real renamed-symbol resolution.
+                                "prev_symbol": ["OLD"],
                                 "hgnc_id": "HGNC:1",
                             }
                         ]

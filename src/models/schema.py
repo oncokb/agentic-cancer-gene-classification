@@ -192,9 +192,10 @@ class FusionEvidenceResult(BaseModel):
             "A subset of pmids; may include papers without an evidence card."
         ),
     )
-    retrieval_status: Literal["ok", "failed"] = Field(
+    retrieval_status: Literal["ok", "failed", "skipped"] = Field(
         default="ok",
         description=(
+            "skipped for intergenic breakpoints with no two-gene pair; "
             "failed when exact-pair retrieval raised an error. An empty failed result is not "
             "evidence of missing literature, and its literature_scope is null."
         ),
@@ -213,6 +214,13 @@ class FusionPartnerEvidenceRequest(BaseModel):
     """On-demand lookup: does `gene` have precedent as an oncogenic fusion partner
     elsewhere? Not the same question as FusionEvidenceResult, which checks an exact
     fusion pair — this checks a single partner gene against any reported fusion."""
+
+    @field_validator("gene")
+    @classmethod
+    def reject_intergenic(cls, value: str) -> str:
+        from src.pipeline.normalization import reject_intergenic_gene_input
+
+        return reject_intergenic_gene_input(value)
 
     gene: str = Field(..., description="Partner gene symbol to check for oncogenic fusion precedent")
     tumor_type: Optional[str] = Field(
@@ -807,6 +815,13 @@ class AnnotateRequest(BaseModel):
 
 
 class GeneAnnotateRequest(BaseModel):
+    @field_validator("gene")
+    @classmethod
+    def reject_intergenic(cls, value: str) -> str:
+        from src.pipeline.normalization import reject_intergenic_gene_input
+
+        return reject_intergenic_gene_input(value)
+
     gene: str = Field(..., description="Single gene symbol to annotate")
     tumor_type: Optional[str] = Field(default=None, description="Tumor type for literature retrieval")
     local_backend: Optional[LocalBackend] = Field(

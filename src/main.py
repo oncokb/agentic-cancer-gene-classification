@@ -132,7 +132,7 @@ from src.pipeline.literature import (
 )
 from src.pipeline.llm_client import complete_with_tool
 from src.pipeline import openevidence_metrics as oe_metrics
-from src.pipeline.normalization import has_accession_identifier, is_fusion_input, read_gene_input
+from src.pipeline.normalization import has_accession_identifier, is_fusion_input, read_gene_input, reject_intergenic_gene_input
 from src.pipeline.openevidence import (
     OpenEvidenceClient,
     claim_lookup,
@@ -1207,6 +1207,11 @@ def _validate_retry_inputs(
     accepted: List[FusionInput] = []
     targets: Dict[str, str] = {}
     for item in inputs:
+        try:
+            reject_intergenic_gene_input(item.fusion)
+        except ValueError as exc:
+            problems.append(str(exc))
+            continue
         token = _normalized_retry_token(item.fusion)
         matched = eligible_rows.get(token, set())
         if is_fusion_input(item.fusion):
@@ -2287,6 +2292,10 @@ def _rerun_request(stored: Dict[str, Any], force_refresh: bool) -> AnnotateReque
     else (older or malformed requests)."""
     payload = {key: value for key, value in stored.items() if key != "rerun_of"}
     if "fusions" not in payload and isinstance(payload.get("gene"), str) and payload["gene"].strip():
+        try:
+            reject_intergenic_gene_input(payload["gene"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         gene = {"fusion": payload.pop("gene"), "tumor_type": payload.pop("tumor_type", None)}
         payload["fusions"] = [gene]
     if not payload.get("fusions"):
@@ -2728,10 +2737,10 @@ async def annotate_gene(
         logger.exception("Gene annotation pipeline error")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    await save_run_or_raise(http_request, request.model_dump(), result, current_user)
-
     if not result.annotations:
-        raise HTTPException(status_code=500, detail="No gene annotation was returned")
+        raise HTTPException(status_code=422, detail="The input has no gene partners to annotate")
+
+    await save_run_or_raise(http_request, request.model_dump(), result, current_user)
 
     if current_user and current_user.email:
         await record_user_annotation_activity(current_user.email, count=1)
