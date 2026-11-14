@@ -37,9 +37,9 @@ def purity_check_required(contract_version: Any) -> bool:
 
 
 def confidence_tier_required(contract_version: Any) -> bool:
-    """Whether a bundle's pairs must carry ``confidence_tier`` (fail closed).
+    """Whether missing tiers forgo the legacy Strong-label fallback.
 
-    Only a well-formed version string (``<major>.<minor>[.<patch>]``, ASCII
+    This selects labeling, not literature eligibility. Only a well-formed version string (``<major>.<minor>[.<patch>]``, ASCII
     digits, nothing else: no sign, no whitespace) below 1.3 keeps the legacy
     "missing => high" fallback. Everything else requires tiers: 1.3 or later, a
     missing/None/empty version, a non-string, or any malformed value.
@@ -56,8 +56,7 @@ PASS_MODE_LABELS = {"lineage": "Lineage enriched", "subgroup": "Subgroup enriche
 # Canonical/alias gene symbols as accepted from users and from bundles.
 SYMBOL_PATTERN = r"[A-Z0-9][A-Z0-9._-]{0,63}\Z"
 
-# "candidate": passes the v3 statistics but not the high-confidence tier
-# (contract 1.3); never surfaced, never sent to the literature gate.
+# "candidate" exclusion/status is retained for purity-demoted pairs only.
 ExclusionReason = Literal["stats", "precheck", "literature", "pending", "candidate"]
 JobState = Literal["queued", "running", "succeeded", "failed"]
 
@@ -85,7 +84,7 @@ class Manifest(_Artifact):
     release_id: str
     method_version: str
     # Additive contract minor version ("1.1", "1.2", "1.3", ...). Absent, empty or
-    # malformed means tiers are required (fail closed; see confidence_tier_required).
+    # malformed means missing tiers get Moderate (see confidence_tier_required).
     contract_version: Optional[Any] = None
     params: Dict[str, Any] = Field(default_factory=dict)
     source: Dict[str, Any] = Field(default_factory=dict)
@@ -93,8 +92,7 @@ class Manifest(_Artifact):
 
     @property
     def confidence_tier_required(self) -> bool:
-        """True unless the version is well-formed and below 1.3: every stats pass
-        must then carry ``confidence_tier`` (see ``confidence_tier_required``)."""
+        """True unless a missing tier gets the pre-1.3 legacy Strong fallback."""
         return confidence_tier_required(self.contract_version)
 
     @property
@@ -376,6 +374,7 @@ class StoredPair(BaseModel):
 
 
 class PairResult(BaseModel):
+    confidence_label: Optional[Literal["Strong", "Moderate"]] = None
     oncotree_code: str
     cancer_type_name: Optional[str] = None
     study_id: Optional[str] = None
@@ -459,7 +458,7 @@ class HistoryPage(BaseModel):
 # "expired": the bundle's pre-check counts are past source.precheck_expires_at,
 # so the pre-check doesn't exclude (the literature gate decides).
 PrecheckState = Literal["pass", "fail", "not_run", "expired"]
-# "candidate": v3 stats pass below the high-confidence tier; never surfaced.
+# "candidate": purity-demoted statistical pass; never surfaced.
 PairStatus = Literal["surfaced", "excluded", "literature_pending", "candidate"]
 
 
@@ -508,7 +507,8 @@ class PairStatsView(BaseModel):
     # "high" | "candidate" | None as acted on (missing field in an older bundle
     # on a passing pair = "high"); None when the statistics fail.
     confidence_tier: Optional[str] = None
-    # Sent to the literature gate: stats_pass AND high tier AND precheck is not "fail".
+    confidence_label: Optional[Literal["Strong", "Moderate"]] = None
+    # Statistics pass, no purity demotion, and no fresh explicit precheck failure.
     literature_eligible: bool
     status: PairStatus
     exclusion_reason: Optional[ExclusionReason] = None

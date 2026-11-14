@@ -28,7 +28,7 @@ The page's Alterations column shows enriched Point Mutation, Structural Variant,
 and Copy Number Alteration badges, including CNA amplification (`amp`) / deep
 deletion (`del`) directions. Details lists each category's status, events/profiled,
 frequency and reason, plus both CNA directions where available. This applies to
-candidate and excluded rows in All cancer types too. Missing older-release data
+purity-demoted and excluded rows in All cancer types too. Missing older-release data
 shows no detail; undefined counts stay undefined. Unknown category names are
 ignored and logged when loading, so they cannot enter exports.
 
@@ -38,6 +38,39 @@ gene in `Relevant alteration type(s)`: the deduplicated union of Expression and
 enriched categories over **surfaced pairs only**, ordered Point Mutation,
 Structural Variant, Expression, Copy Number Alteration. Zero surfaced pairs gives
 an empty cell. Neither export changes which pairs or citations are included.
+
+## Literature eligibility and surfaced confidence labels
+
+Every statistical pass (`passes_stats`: `stats_pass` and no lineage broad block)
+is eligible for literature checking unless `purity_check == "demoted"` or the
+effective precheck is a fresh explicit false. Confidence tier never gates this
+eligibility. A supported, valid tumor-specific verdict for the active release
+surfaces the pair. Pending pairs say “Not checked yet”; unsupported checked pairs
+are excluded for no literature support. Job concurrency and cost limits are unchanged.
+
+Surfaced pairs expose `confidence_label` on `/stats`, `/genes`, and polled job
+results: **Strong** for effective tier `high`, **Moderate** otherwise (including
+`candidate`, null or unknown tiers). A missing tier gets the legacy Strong fallback
+only with a well-formed contract version below 1.3. Newer, missing or malformed
+versions give Moderate and retain the existing once-per-bundle missing-tier warning.
+The loader accepts missing tiers so this fallback can be used. Its separate
+contract 1.4 validation for missing purity on explicit high pairs is unchanged;
+reads of stored data block only explicit purity demotion, rather than using the
+old high-confidence predicate as an eligibility gate.
+
+The page adds Strong / Moderate badges to surfaced rows. Moderate means
+“Statistically significant and literature-supported, but below the strong
+effect-size bar; worth a closer look.” Strong meets strong effect-size criteria.
+The former “Needs verification” badge is replaced by **Purity concern**, reserved
+for demoted pairs, to explain why they cannot be shown. Their API status and
+exclusion reason remain `candidate`; they never reach literature checking or
+surface, even with stored supported evidence. Summary candidate counts now count
+only these purity concerns.
+
+Per-pair CSV adds `confidence_label` immediately after `confidence_tier`, filled
+for surfaced rows only. Golden-set columns are unchanged and include both Strong
+and Moderate surfaced pairs. All read paths and literature scheduling use the
+same `gene_view` eligibility and surfaced decisions.
 
 ## Architecture
 

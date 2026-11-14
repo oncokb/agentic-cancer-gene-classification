@@ -18,20 +18,15 @@
     warn: "medium",
     neutral: "low",
     candidate: "medium",
+    strong: "high",
+    moderate: "medium",
     alteration: "context",
   };
   const REASON_LABELS = {
     stats: "statistics",
     precheck: "PubMed pre-check",
-    literature: "literature",
+    literature: "no literature support",
   };
-  // Candidates (contract 1.3): pass the screening statistics but not the stricter
-  // high-confidence bar, so they are never surfaced or literature-checked.
-  const CANDIDATE_TOOLTIP =
-    "Passes the screening statistics but not the stricter high-confidence bar " +
-    "(lineage: log2 fold change ≥ 2 and Cliff's delta ≥ 0.70; subgroup: ≥ 5% high " +
-    "cases and ≥ 5× enrichment over other cancer types). Not surfaced and not " +
-    "literature-checked; verify independently before use.";
 
   function formatNumber(value, digits = 2) {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
@@ -200,13 +195,21 @@
     }
 
     function resultCell(pair) {
-      if (pair.status === "surfaced") return [badge("Surfaced", "pass")];
+      if (pair.status === "surfaced") {
+        const parts = [badge("Surfaced", "pass")];
+        if (["Strong", "Moderate"].includes(pair.confidence_label)) {
+          const label = badge(pair.confidence_label, pair.confidence_label.toLowerCase());
+          label.setAttribute("title", pair.confidence_label === "Moderate"
+            ? "Statistically significant and literature-supported, but below the strong effect-size bar; worth a closer look."
+            : "Meets strong effect-size criteria.");
+          parts.push(label);
+        }
+        return parts;
+      }
       if (pair.status === "candidate") {
-        const needs = badge("Needs verification", "candidate");
-        needs.setAttribute("title", pair.stats.purity_check === "demoted"
-          ? "Expression may come from non-tumor cells (falls with tumor purity)"
-          : CANDIDATE_TOOLTIP);
-        return [needs];
+        const concern = badge("Purity concern", "candidate");
+        concern.setAttribute("title", "Expression may come from non-tumor cells (falls with tumor purity)");
+        return [concern];
       }
       if (pair.status === "literature_pending") return [badge("Awaiting literature check", "warn")];
       const reason = REASON_LABELS[pair.exclusion_reason] || pair.exclusion_reason || "unknown";
@@ -472,7 +475,7 @@
       const candidates = pairs.filter(isCandidate).length;
       const hidden = excluded + candidates;
       const shown = pairs.length - hidden;
-      const needs = candidates ? ` · ${candidates} need verification` : "";
+      const needs = candidates ? ` · ${candidates} purity ${candidates === 1 ? "concern" : "concerns"}` : "";
       if (el["ec-view-count"]) {
         el["ec-view-count"].textContent = showAll
           ? `${shown} shown · ${excluded} excluded${needs}`
@@ -519,7 +522,7 @@
       el["ec-summary"].textContent =
         `${summary.surfaced || 0} surfaced · ${summary.literature_pending || 0} awaiting literature check · ` +
         `${summary.excluded || 0} excluded` +
-        (summary.candidate ? ` · ${summary.candidate} need verification` : "");
+        (summary.candidate ? ` · ${summary.candidate} purity ${summary.candidate === 1 ? "concern" : "concerns"}` : "");
       if (el["ec-release"]) el["ec-release"].textContent = releaseText(view.bundle);
       show(el["ec-run"], (summary.literature_pending || 0) > 0 && !state.jobRunning);
       renderCbioCompare(view);

@@ -55,6 +55,10 @@ def test_demoted_never_surfaces_or_calls_literature(tier):
         job = run_job(client)
         assert_agreement(surfaced_everywhere(client, job["job_id"]), set())
         assert gate.calls == []
+        view = client.get(f"{PREFIX}/stats/ERBB2").json()
+        demoted = [p for p in view["pairs"] if p["stats_pass"]]
+        assert all(p["status"] == "candidate" and p["exclusion_reason"] == "candidate" for p in demoted)
+        assert all(not p["literature_eligible"] and p["confidence_label"] is None for p in demoted)
         _, rows = parse_csv_response(
             client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text
         )
@@ -63,8 +67,8 @@ def test_demoted_never_surfaces_or_calls_literature(tier):
         assert all(r["confidence_tier"] == "candidate" for r in passing)
 
 
-@pytest.mark.parametrize("version,expected", [("1.3", {"BRCA"}), ("1.4", set())])
-def test_missing_purity_versioned_fail_closed(version, expected, caplog):
+@pytest.mark.parametrize("version", ["1.3", "1.4"])
+def test_missing_purity_does_not_act_as_a_tier_gate_on_stored_data(version, caplog):
     caplog.set_level(logging.WARNING, logger="src.expression_context.service")
 
     def edit(doc):
@@ -79,14 +83,14 @@ def test_missing_purity_versioned_fail_closed(version, expected, caplog):
     with TestClient(harness.app) as client:
         harness.service._clock = lambda: NOW
         store_supported(harness, "BRCA", "breast cancer", "12345678")
-        assert_agreement(surfaced_everywhere(client), expected)
+        assert_agreement(surfaced_everywhere(client), {"BRCA"})
         job = run_job(client)
         assert_agreement(
             surfaced_everywhere(client, job["job_id"]),
-            expected | ({"STAD"} if version == "1.3" else set()),
+            {"BRCA", "STAD"},
         )
-        if version == "1.4":
-            assert gate.calls == []
+        assert sorted(gate.calls) == [("ERBB2", "esophageal cancer"), ("ERBB2", "gastric cancer")]
+        assert {p["confidence_label"] for p in job["result"]["surfaced"]} == {"Strong"}
     warnings = [r for r in caplog.records if "without purity_check" in r.getMessage()]
     assert len(warnings) == (1 if version == "1.4" else 0)
 
@@ -184,7 +188,7 @@ def test_purity_warning_once_per_bundle(version, tier, state, warn, caplog):
         if warn:
             assert manifest.release_id in warnings[0].getMessage()
             assert "ERBB2" in warnings[0].getMessage()
-            assert "treating them as not high-confidence" in warnings[0].getMessage()
+            assert "purity status unavailable" in warnings[0].getMessage()
         # A different bundle gets its own warning; repeats still log only once.
         other = manifest.model_copy(update={"release_id": manifest.release_id + "-other"})
         for _ in range(2):

@@ -212,6 +212,36 @@ test("alterations render badges and safe category details on surfaced, candidate
   assert.strictEqual(summaryRows(nodes)[3].children[3].text, "—", "old rows need no alteration data");
 });
 
+test("surfaced rows show distinct Strong and Moderate badges with effect-size tooltips", async () => {
+  const v = view();
+  v.pairs[0].confidence_label = "Strong";
+  v.pairs[1] = { ...v.pairs[1], status: "surfaced", confidence_label: "Moderate", confidence_tier: "candidate" };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  const rows = visibleSummaryRows(nodes);
+  const strong = rows[0].findAll(n => n.textContent === "Strong")[0];
+  const moderate = rows[1].findAll(n => n.textContent === "Moderate")[0];
+  assert.ok(strong.getAttribute("class").includes("ec-strong"));
+  assert.ok(moderate.getAttribute("class").includes("ec-moderate"));
+  assert.notStrictEqual(strong.getAttribute("class"), moderate.getAttribute("class"));
+  assert.strictEqual(strong.getAttribute("title"), "Meets strong effect-size criteria.");
+  assert.strictEqual(moderate.getAttribute("title"), "Statistically significant and literature-supported, but below the strong effect-size bar; worth a closer look.");
+  assert.ok(!rows[1].text.includes("Purity concern"));
+});
+
+test("candidate-tier pending and unsupported rows use the usual literature labels", async () => {
+  const v = view();
+  v.pairs[1].confidence_tier = "candidate";
+  v.pairs[0] = { ...v.pairs[0], status: "excluded", exclusion_reason: "literature", confidence_tier: "candidate" };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  const rows = summaryRows(nodes);
+  assert.strictEqual(rows[0].children[5].text, "Excluded: no literature support");
+  assert.strictEqual(rows[1].children[4].text, "Not checked yet");
+  assert.strictEqual(rows[1].children[5].text, "Awaiting literature check");
+});
+
 test("formatters never show null statistics as zero", () => {
   assert.strictEqual(formatNumber(null), "—");
   assert.strictEqual(formatNumber(undefined), "—");
@@ -1014,24 +1044,24 @@ function viewWithCandidate() {
   v.summary = { surfaced: 1, literature_pending: 1, excluded: 2, candidate: 1 };
   v.pairs.push({
     oncotree_code: "KIRC", cancer_type_name: "Kidney <b>Renal</b> Clear Cell Carcinoma",
-    study_id: "kirc_tcga_pan_can_atlas_2018", stats: stats("KIRC", { confidence_tier: "candidate" }),
+    study_id: "kirc_tcga_pan_can_atlas_2018", stats: stats("KIRC", { confidence_tier: "candidate", purity_check: "demoted" }),
     stats_pass: true, enrichment: "Lineage enriched", confidence_tier: "candidate", precheck: "pass",
     literature_eligible: false, status: "candidate", exclusion_reason: "candidate", literature: null,
   });
   return v;
 }
 
-test("candidates show a distinct Needs verification badge only in All cancer types", async () => {
+test("purity-demoted pairs show a distinct Purity concern badge only in All cancer types", async () => {
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(viewWithCandidate()) });
   await page.lookup("ERBB2");
   const code = (row) => row.children[0].text;
   assert.strictEqual(
     nodes["ec-summary"].textContent,
-    "1 surfaced · 1 awaiting literature check · 2 excluded · 1 need verification",
+    "1 surfaced · 1 awaiting literature check · 2 excluded · 1 purity concern",
   );
   // "Shown only" never shows a candidate.
   assert.deepStrictEqual(visibleSummaryRows(nodes).map(code), ["Breast Invasive Carcinoma (BRCA)", "Stomach Adenocarcinoma (STAD)"]);
-  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 need verification (hidden)");
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 purity concern (hidden)");
 
   nodes["ec-view-all"].fire("click");
   const rows = visibleSummaryRows(nodes);
@@ -1040,15 +1070,14 @@ test("candidates show a distinct Needs verification badge only in All cancer typ
   assert.strictEqual(code(kirc), "Kidney <b>Renal</b> Clear Cell Carcinoma (KIRC)", "names stay text");
   assert.strictEqual(kirc.getAttribute("class"), "ec-row-excluded ec-row-candidate");
   const [result] = kirc.children[5].children;
-  assert.strictEqual(result.textContent, "Needs verification");
+  assert.strictEqual(result.textContent, "Purity concern");
   assert.ok(!result.textContent.startsWith("Excluded"), "separate from other exclusion reasons");
   assert.ok(result.getAttribute("class").includes("ec-candidate"));
   const tooltip = result.getAttribute("title");
-  assert.ok(tooltip.includes("stricter high-confidence bar"), tooltip);
-  assert.ok(tooltip.includes("log2 fold change ≥ 2") && tooltip.includes("≥ 5×"), tooltip);
+  assert.strictEqual(tooltip, "Expression may come from non-tumor cells (falls with tumor purity)");
   // Not sent to the literature check, so no "Not checked yet" prompt and no citations.
   assert.strictEqual(kirc.children[4].text, "—");
-  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 need verification");
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 purity concern");
   // Other exclusion reasons keep their own badges.
   const others = rows.filter((r) => r.getAttribute("class") === "ec-row-excluded");
   assert.deepStrictEqual(others.map((r) => r.children[5].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
@@ -1082,7 +1111,7 @@ test("purity demotion has a distinct tooltip and coverage states have detail not
   await page.lookup("ERBB2");
   nodes["ec-view-all"].fire("click");
   const row = summaryRows(nodes).find(r => r.text.includes("(KIRC)"));
-  const badges = row.findAll(n => n.textContent === "Needs verification");
+  const badges = row.findAll(n => n.textContent === "Purity concern");
   assert.ok(badges.some(n => n.getAttribute("title") ===
     "Expression may come from non-tumor cells (falls with tumor purity)"));
   const details = detailRows(nodes);

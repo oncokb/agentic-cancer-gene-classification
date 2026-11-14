@@ -1,14 +1,4 @@
-"""Confidence tier (expression_stats contract 1.3): only high-tier pairs surface.
-
-Rule (service._evaluate_gene_view, the single predicate): a pair is surfaced
-only if its statistics pass, its effective ``confidence_tier`` is "high", the
-effective PubMed pre-check is not a fresh false and a valid tumor-specific v2
-verdict for the active release supports it. Candidates (v3 passes below the
-high tier) are listed with status "candidate", never surfaced on any read
-path, never sent to the literature gate and never exported as golden-set rows.
-Only bundles with a well-formed contract_version below 1.3 treat a missing
-field as high; a missing, empty or malformed version requires tiers.
-"""
+"""Confidence tiers label surfaced passes; only purity demotion blocks candidates."""
 
 from __future__ import annotations
 
@@ -25,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.expression_context.literature_gate import TUMOR_SPECIFIC_GATE
-from src.expression_context.bundle_loader import BundleContractError, BundleLoader
+from src.expression_context.bundle_loader import BundleLoader
 from src.expression_context.models import (
     BundleManifest,
     CancerTypeStats,
@@ -136,7 +126,7 @@ def store_supported(harness: CsvHarness, code: str, query: str, pmid: str) -> No
     )
 
 
-def test_candidate_with_stored_supported_evidence_is_never_surfaced_on_any_path():
+def test_candidate_with_stored_supported_evidence_surfaces_on_every_path():
     gate = FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE))
     bundle = build_bundle(
         ("ERBB2",), edit_gene=tiered({"BRCA": "high", "STAD": "candidate", "ESCA": "high"})
@@ -144,55 +134,54 @@ def test_candidate_with_stored_supported_evidence_is_never_surfaced_on_any_path(
     harness = CsvHarness(gate=gate, bundle=bundle)
     with TestClient(harness.app) as client:
         harness.service._clock = lambda: NOW
-        # Stored, valid, tumor-specific v2 "supported" evidence for both pairs.
         store_supported(harness, "BRCA", "breast cancer", "12345678")
         store_supported(harness, "STAD", "gastric cancer", "99999999")
-
-        assert_agreement(surfaced_everywhere(client), {"BRCA"})
-        for row in golden_rows(client):
-            assert row["Evidence-associated PMIDs"] == "12345678"
-            assert "Stomach" not in row["Relevant expression-based cancer type(s)"]
-
+        assert_agreement(surfaced_everywhere(client), {"BRCA", "STAD"})
+        for golden in golden_rows(client):
+            assert golden["Evidence-associated PMIDs"] == "12345678; 99999999"
+            assert "Stomach" in golden["Relevant expression-based cancer type(s)"]
         job = run_job(client)
-        # Stored BRCA is reused, ESCA (high) is checked, the STAD candidate never is.
         assert gate.calls == [("ERBB2", "esophageal cancer")]
-        assert_agreement(surfaced_everywhere(client, job["job_id"]), {"BRCA"})
+        assert job["literature_reused"] == 2
+        assert_agreement(surfaced_everywhere(client, job["job_id"]), {"BRCA", "STAD"})
         for row in golden_rows(client):
-            assert "99999999" not in row["Evidence-associated PMIDs"]
-            assert "Stomach" not in row["Relevant expression-based cancer type(s)"]
-
+            assert row["Evidence-associated PMIDs"] == "12345678; 99999999"
+            assert row["Relevant expression-based cancer type(s)"] == "Breast cancer; Stomach adenocarcinoma"
         stats = client.get(f"{PREFIX}/stats/ERBB2").json()
         stad = next(p for p in stats["pairs"] if p["oncotree_code"] == "STAD")
-        assert (stad["status"], stad["exclusion_reason"]) == ("candidate", "candidate")
+        assert (stad["status"], stad["exclusion_reason"]) == ("surfaced", None)
         assert stad["confidence_tier"] == "candidate" and stad["stats_pass"] is True
-        assert stad["literature_eligible"] is False and stad["literature"] is None
-        assert stats["summary"]["candidate"] == 1 and stats["summary"]["surfaced"] == 1
-        genes_all = client.get(f"{PREFIX}/genes/ERBB2", params={"include_excluded": "true"}).json()
-        excluded = {p["oncotree_code"]: p for p in genes_all["excluded"]}
-        assert excluded["STAD"]["exclusion_reason"] == "candidate"
-
-        # Per-pair CSV: candidates only with include_excluded, tier column filled.
+        assert stad["literature_eligible"] and stad["literature"]["supported"]
+        assert stad["confidence_label"] == "Moderate"
+        assert stats["summary"]["candidate"] == 0 and stats["summary"]["surfaced"] == 2
+        genes = client.get(f"{PREFIX}/genes/ERBB2?include_excluded=true").json()
+        polled = client.get(f"{PREFIX}/jobs/{job['job_id']}").json()["result"]
+        for result in (genes, polled):
+            assert {p["oncotree_code"]: p["confidence_label"] for p in result["surfaced"]} == {
+                "BRCA": "Strong", "STAD": "Moderate",
+            }
+            assert "STAD" not in {p["oncotree_code"] for p in result["excluded"]}
         _, shown = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
-        assert [r["oncotree_code"] for r in shown] == ["BRCA"]
-        assert shown[0]["confidence_tier"] == "high"
+        by_code = {r["oncotree_code"]: r for r in shown}
+        assert set(by_code) == {"BRCA", "STAD"}
+        assert by_code["BRCA"]["confidence_tier"] == "high"
+        assert by_code["BRCA"]["confidence_label"] == "Strong"
+        assert by_code["STAD"]["confidence_label"] == "Moderate"
+        assert by_code["STAD"]["confidence_tier"] == "candidate"
+        assert by_code["STAD"]["tumor_specific_pmids"] == "99999999"
         _, every = parse_csv_response(
             client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text
         )
-        by_code = {r["oncotree_code"]: r for r in every}
-        assert (by_code["STAD"]["surfaced"], by_code["STAD"]["exclusion_reason"]) == (
-            "no",
-            "candidate",
-        )
-        assert by_code["STAD"]["confidence_tier"] == "candidate"
-        assert by_code["STAD"]["tumor_specific_pmids"] == ""
-        assert by_code["LUAD"]["confidence_tier"] == ""  # stats fail: null tier
+        all_codes = {r["oncotree_code"]: r for r in every}
+        assert (all_codes["STAD"]["surfaced"], all_codes["STAD"]["exclusion_reason"]) == ("yes", "")
+        assert all_codes["STAD"]["confidence_tier"] == "candidate"
+        assert all_codes["LUAD"]["confidence_tier"] == ""  # stats fail: null tier
 
-        # The job stored the candidate as such, without evidence.
         row = harness.store.rows[("ERBB2", "STAD", RELEASE_ID, TUMOR_SPECIFIC_GATE)]
-        assert (row.surfaced, row.exclusion_reason, row.evidence) == (False, "candidate", None)
+        assert row.surfaced and row.exclusion_reason is None and row.evidence
 
 
-def test_candidates_never_trigger_a_literature_call():
+def test_candidates_trigger_literature_calls_and_surface_when_supported():
     gate = FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE))
     bundle = build_bundle(
         ("ERBB2",),
@@ -200,20 +189,20 @@ def test_candidates_never_trigger_a_literature_call():
     )
     harness = CsvHarness(gate=gate, bundle=bundle)
     with TestClient(harness.app) as client:
+        pending = client.get(f"{PREFIX}/stats/ERBB2").json()
         job = run_job(client)
-        assert gate.calls == []
-        assert job["literature_evaluated"] == 0 and job["literature_reused"] == 0
-        assert job["result"]["surfaced"] == []
+        assert sorted(gate.calls) == [("ERBB2", "breast cancer"), ("ERBB2", "esophageal cancer"), ("ERBB2", "gastric cancer")]
+        for p in pending["pairs"]:
+            if p["oncotree_code"] in {"BRCA", "STAD", "ESCA"}:
+                assert p["status"] == "literature_pending" and p["literature_eligible"]
+                assert p["confidence_label"] is None
+        assert job["literature_evaluated"] == 3 and job["literature_reused"] == 0
+        assert {p["confidence_label"] for p in job["result"]["surfaced"]} == {"Moderate"}
         reasons = {p["oncotree_code"]: p["exclusion_reason"] for p in job["result"]["excluded"]}
-        assert reasons == {
-            "BRCA": "candidate",
-            "STAD": "candidate",
-            "ESCA": "candidate",
-            # UCEC passes v3 (missing tier there = high) but its fresh pre-check fails.
-            "UCEC": "precheck",
-            "LUAD": "stats",
-        }
-        assert_agreement(surfaced_everywhere(client, job["job_id"]), set())
+        assert reasons == {"ESCA": "literature", "UCEC": "precheck", "LUAD": "stats"}
+        assert_agreement(surfaced_everywhere(client, job["job_id"]), {"BRCA", "STAD"})
+        for row in golden_rows(client):
+            assert row["Relevant expression-based cancer type(s)"] == "Breast cancer; Stomach adenocarcinoma"
 
 
 def snapshot(bundle):
@@ -256,6 +245,7 @@ def test_old_bundle_without_the_field_behaves_exactly_as_before():
                                ("ERBB2", "gastric cancer")]  # fmt: skip
     assert before["summary"]["candidate"] == 0
     assert {r["confidence_tier"] for r in before["csv"] if r["stats_pass"] == "yes"} == {"high"}
+    assert {r["confidence_label"] for r in before["csv"] if r["surfaced"] == "yes"} == {"Strong"}
 
 
 def stats_row(**fields) -> CancerTypeStats:
@@ -340,15 +330,17 @@ def test_contract_version_gates_the_legacy_fallback(version, required):
     assert BundleManifest.model_validate(data).confidence_tier_required is required
 
 
-def test_explicit_null_or_unknown_tier_on_a_pass_is_not_surfaced():
+@pytest.mark.parametrize("tier", [None, "medium", "garbled"])
+def test_explicit_null_or_unknown_tier_on_a_pass_surfaces_as_moderate(tier):
     gate = FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE))
-    bundle = build_bundle(("ERBB2",), edit_gene=tiered({"BRCA": None, "STAD": "medium"}))
+    bundle = build_bundle(("ERBB2",), edit_gene=tiered({"BRCA": tier, "STAD": tier}))
     harness = CsvHarness(gate=gate, bundle=bundle)
     with TestClient(harness.app) as client:
         job = run_job(client)
-        assert ("ERBB2", "breast cancer") not in gate.calls
-        assert ("ERBB2", "gastric cancer") not in gate.calls
-        assert_agreement(surfaced_everywhere(client, job["job_id"]), set())
+        assert ("ERBB2", "breast cancer") in gate.calls
+        assert ("ERBB2", "gastric cancer") in gate.calls
+        assert {p["confidence_label"] for p in job["result"]["surfaced"]} == {"Moderate"}
+        assert_agreement(surfaced_everywhere(client, job["job_id"]), {"BRCA", "STAD"})
 
 
 # --------------------------------------------------------------------------
@@ -375,44 +367,36 @@ def with_contract(version, tiers: Dict[str, str]):
     return bundle
 
 
-@pytest.mark.parametrize(
-    "tiers,expected_calls,expected_surfaced",
-    [
-        # ALL tiers omitted: nothing is high, so no paid call and nothing surfaces.
-        ({}, [], set()),
-        # SOME omitted: only the explicit high pair is checked (and surfaces).
-        ({"BRCA": "high"}, [("ERBB2", "breast cancer")], {"BRCA"}),
-    ],
-    ids=["all_omitted", "some_omitted"],
-)
+@pytest.mark.parametrize("tiers", [{}, {"BRCA": "high"}], ids=["all_omitted", "some_omitted"])
 @pytest.mark.parametrize(
     "version", ["1.3", ABSENT, "", "+1.2", " 1.2"], ids=["1.3", "absent", "empty", "signed", "padded"]
 )
-def test_tier_requiring_bundle_with_omitted_tiers_fails_closed_everywhere(
-    version, tiers, expected_calls, expected_surfaced, caplog
-):
+def test_tier_requiring_bundle_with_omitted_tiers_is_eligible_and_warns(version, tiers, caplog):
     gate = FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE))
     bundle = with_contract(version, tiers)
     harness = CsvHarness(gate=gate, bundle=bundle)
     with caplog.at_level(logging.WARNING, logger="src.expression_context.service"):
         with TestClient(harness.app) as client:
             harness.service._clock = lambda: NOW
-            # Even stored, valid, supported evidence for an untiered pass never surfaces.
             store_supported(harness, "STAD", "gastric cancer", "99999999")
-            assert_agreement(surfaced_everywhere(client), set())  # BRCA not checked yet
+            assert_agreement(surfaced_everywhere(client), {"STAD"})
             job = run_job(client)
-            assert gate.calls == expected_calls
-            assert_agreement(surfaced_everywhere(client, job["job_id"]), expected_surfaced)
+            assert sorted(gate.calls) == [("ERBB2", "breast cancer"), ("ERBB2", "esophageal cancer")]
+            assert_agreement(surfaced_everywhere(client, job["job_id"]), {"BRCA", "STAD"})
             for row in golden_rows(client):
-                assert "99999999" not in row["Evidence-associated PMIDs"]
-                assert "Stomach" not in row["Relevant expression-based cancer type(s)"]
+                assert "99999999" in row["Evidence-associated PMIDs"]
+                assert "Stomach" in row["Relevant expression-based cancer type(s)"]
             pairs = {
                 p["oncotree_code"]: p for p in client.get(f"{PREFIX}/stats/ERBB2").json()["pairs"]
             }
-            for code in ("STAD", "ESCA"):  # untiered passes
-                assert pairs[code]["status"] == "candidate"
+            assert pairs["STAD"]["status"] == "surfaced"
+            assert pairs["STAD"]["confidence_label"] == "Moderate"
+            assert pairs["ESCA"]["status"] == "excluded"
+            assert pairs["ESCA"]["exclusion_reason"] == "literature"
+            for code in ("STAD", "ESCA"):
                 assert pairs[code]["confidence_tier"] is None
-                assert pairs[code]["literature_eligible"] is False
+                assert pairs[code]["literature_eligible"] is True
+            assert pairs["BRCA"]["confidence_label"] == ("Strong" if tiers else "Moderate")
     warnings = [r for r in caplog.records if "without confidence_tier" in r.getMessage()]
     assert len(warnings) == 1, "warned once per bundle, not per request"
     assert bundle.release_id in warnings[0].getMessage()
@@ -432,18 +416,18 @@ def test_contract_1_2_bundle_without_the_field_keeps_legacy_behaviour(caplog):
 
 
 @pytest.mark.parametrize(
-    "version,tiers,rejected",
+    "version,tiers",
     [
-        ("1.3", {}, True),
-        ("1.3", {"BRCA": "high"}, True),  # one untiered pass is enough
-        ("1.3", {"BRCA": "high", "STAD": "candidate", "ESCA": "high", "UCEC": "high"}, False),
-        ("1.2", {}, False),
-        # No version, or a malformed one: tiers required, so untiered passes reject.
-        (None, {}, True),
-        (" 1.2", {}, True),
+        ("1.3", {}),
+        ("1.3", {"BRCA": "high"}),
+        ("1.3", {"BRCA": "high", "STAD": "candidate", "ESCA": "high", "UCEC": "high"}),
+        ("1.2", {}),
+        # Missing or malformed versions do not get the legacy Strong fallback.
+        (None, {}),
+        (" 1.2", {}),
     ],
 )
-def test_loader_rejects_untiered_passes_unless_the_version_is_legacy(version, tiers, rejected):
+def test_loader_accepts_untiered_passes_for_moderate_fallback(version, tiers):
     def edit(doc):
         tiered(tiers, explicit_null_for_failures=False)(doc)
         for row in doc["cancer_types"]:
@@ -459,21 +443,17 @@ def test_loader_rejects_untiered_passes_unless_the_version_is_legacy(version, ti
         bundle.manifest.pop("contract_version")
     manifest = BundleManifest.model_validate(bundle.manifest)
     line = json.dumps(bundle.genes[0]).encode()
-    if rejected:
-        with pytest.raises(BundleContractError, match="requires confidence_tier"):
-            BundleLoader._gene_row(line, manifest, set(), 1)
-    else:
-        assert BundleLoader._gene_row(line, manifest, set(), 1)[0] == "ERBB2"
+    assert BundleLoader._gene_row(line, manifest, set(), 1)[0] == "ERBB2"
 
 
 # --------------------------------------------------------------------------
-# Every literature scheduling path skips candidates
+# Every literature scheduling path checks candidates
 # --------------------------------------------------------------------------
 
 
 def test_the_gate_is_reachable_only_through_evaluate():
     """Structural guard: the paid gate has one call site, behind evaluate()'s
-    candidate filter, so the paths below cover every scheduling route."""
+    view eligibility filter, so the paths below cover every scheduling route."""
     source = (Path(__file__).parent.parent / "src/expression_context/service.py").read_text()
     assert source.count("self.gate.evaluate(") == 1
     assert source.count("self._evaluate_and_store(") == 2  # both inside _resolve_verdict
@@ -481,7 +461,7 @@ def test_the_gate_is_reachable_only_through_evaluate():
     assert source.count("self.evaluate(") == 1  # only _run_job
 
 
-def test_reevaluation_concurrent_direct_and_post_refresh_runs_skip_candidates():
+def test_reevaluation_concurrent_direct_and_post_refresh_runs_check_candidates():
     gate = FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE))
     tiers = {"BRCA": "high", "STAD": "candidate", "ESCA": "candidate"}
     bundle = build_bundle(("ERBB2",), edit_gene=tiered(tiers))
@@ -511,14 +491,14 @@ def test_reevaluation_concurrent_direct_and_post_refresh_runs_skip_candidates():
             return await service.evaluate(resolved, None)
 
         result, evaluated, _, errors = client.portal.call(direct)
-        assert errors == [] and evaluated == 1  # BRCA only
-        assert {p.oncotree_code for p in result.surfaced} == {"BRCA"}
+        assert errors == [] and evaluated == 3  # all eligible tiers
+        assert {p.oncotree_code for p in result.surfaced} == {"BRCA", "STAD"}
         assert gate.calls.count(("ERBB2", "breast cancer")) == 2  # first job + direct
-        assert gastric not in gate.calls
-        assert ("ERBB2", "esophageal cancer") not in gate.calls
+        assert gate.calls.count(gastric) == 2
+        assert gate.calls.count(("ERBB2", "esophageal cancer")) == 2
 
         # 4. Bundle refresh: release B demotes BRCA to a candidate. Its release-A
-        # verdict is never reused and BRCA is never re-checked under B.
+        # verdict is never reused; all eligible pairs are checked under B.
         release_b = build_bundle(
             ("ERBB2",),
             release_id="datahub-abc1234def56-m2-b7e9f01a2c3e",
@@ -528,7 +508,7 @@ def test_reevaluation_concurrent_direct_and_post_refresh_runs_skip_candidates():
         service.catalog.invalidate()
         before = list(gate.calls)
         job = run_job(client)
-        assert gate.calls == before, "no literature call for candidates after a refresh"
+        assert len(gate.calls) == len(before) + 3, "fresh release needs fresh literature for every tier"
         assert job["release_id"] == release_b.release_id
-        assert job["result"]["surfaced"] == []
-        assert_agreement(surfaced_everywhere(client, job["job_id"]), set())
+        assert {p["confidence_label"] for p in job["result"]["surfaced"]} == {"Moderate"}
+        assert_agreement(surfaced_everywhere(client, job["job_id"]), {"BRCA", "STAD"})

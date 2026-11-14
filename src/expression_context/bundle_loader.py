@@ -369,14 +369,8 @@ class BundleLoader:
             artifact = GeneArtifact.model_validate(payload)
         except ValidationError as exc:
             raise BundleContractError(f"{where}: {exc.error_count()} invalid field(s)") from exc
-        if manifest.confidence_tier_required:
-            missing = [ct.oncotree_code for ct in artifact.cancer_types if ct.confidence_tier_missing]
-            if missing:
-                # Contract 1.3+: a stats pass without a tier must never default to high.
-                raise BundleContractError(
-                    f"{where}: contract_version {manifest.contract_version!r} requires "
-                    f"confidence_tier on every stats pass; missing for {', '.join(missing)}"
-                )
+        # Missing tiers are valid input: the view labels supported passes Moderate
+        # (Strong only for the pre-1.3 legacy fallback) and warns once per bundle.
         if manifest.purity_check_required:
             missing = [
                 ct.oncotree_code for ct in artifact.cancer_types
