@@ -892,31 +892,71 @@ def _fusion_cooccurrence_query(
 # review). Its bridges are tight on purpose: "ALK fusion and MYC amplification",
 # "fusion events involving ALK, RET, ROS1" and "ALK rearrangements and RET
 # rearrangements" name both genes near a fusion word but not as one fusion.
-_STRICT_PAIR_SEPARATOR = r"\s*(?:::+|--|[-/\u2010-\u2015\u2212\uFE58\uFE63\uFF0D])\s*"
+_STRICT_COLON_SEPARATOR = r"\s*::+\s*"
+_STRICT_PAIR_SEPARATOR = r"\s*(?:--|[-/‐-―−﹘﹣－])\s*"
 _STRICT_FUSION_NOUN = r"(?:FUSION|REARRANGEMENT|TRANSLOCATION|CHIMERA)(?:\s+(?:GENE|TRANSCRIPT|PROTEIN))?"
 _STRICT_SINGULAR_FUSION_NOUN = r"(?:FUSION|REARRANGEMENT|TRANSLOCATION|CHIMERA)(?![A-Z0-9\-])"
-# A "/" chain like "ALK/ROS1/RET" lists genes rather than naming one pair.
-_SLASH_CHAIN_BEFORE = r"(?<![A-Z0-9]/)(?<![A-Z0-9] /)"
-_SLASH_CHAIN_AFTER = r"(?!\s*/\s*[A-Z0-9])"
+# List/alternative connectors, plus fusion-notation separators: a pair span
+# glued to another gene-like token by any of these is one member of a list
+# ("ROS1, ALK and RET", "ALK and RET or ROS1", "ALK/ROS1/RET") or of another
+# notation ("ETV6::NTRK3 and ALK fusion"), not one named fusion.
+_LIST_CONNECTOR = (
+    r"(?:,|;|&|\+|::+|--|[-/‐-―−﹘﹣－]"
+    r"|\bAND\s*/\s*OR\b|\bAND\b|\bOR\b|\bNOR\b|\bPLUS\b|\bVERSUS\b|\bVS\b\.?|\bAS\s+WELL\s+AS\b)"
+)
+_LIST_FOLLOWING = re.compile(
+    rf"\s*(?:GENES?\s*)?{_LIST_CONNECTOR}\s*(?:THE\s+)?([A-Za-z0-9][A-Za-z0-9\-]*)", re.I
+)
+_LIST_PRECEDING = re.compile(rf"([A-Za-z0-9][A-Za-z0-9\-]*)\s*{_LIST_CONNECTOR}\s*(?:THE\s+)?$", re.I)
 
 
-def _strict_pair_text_match(text: str, first: str, second: str) -> bool:
-    """True when `text` (upper-cased) names first/second as one explicit pair."""
+def _gene_like_token(token: str, known: Set[str]) -> bool:
+    """Original-case token that reads as a gene symbol: a requested symbol or
+    alias, or a token with an uppercase letter and either no lowercase letters
+    (ROS1, MYC, NTRK1) or a digit (PEBP2aA1). Ordinary words never qualify."""
+    token = token.strip("-")
+    if len(token) < 2:
+        return False
+    if token.upper() in known:
+        return True
+    if not any(ch.isupper() for ch in token):
+        return False
+    return not any(ch.islower() for ch in token) or any(ch.isdigit() for ch in token)
+
+
+def _pair_in_list_context(text: str, match: "re.Match[str]", known: Set[str]) -> bool:
+    before = _LIST_PRECEDING.search(text[: match.start("g1")])
+    if before and _gene_like_token(before.group(1), known):
+        return True
+    after = _LIST_FOLLOWING.match(text, match.end("g2"))
+    return bool(after and _gene_like_token(after.group(1), known))
+
+
+def _strict_pair_text_match(text: str, first: str, second: str, known: Set[str]) -> bool:
+    """True when `text` (original case) names first/second as one explicit pair.
+
+    "G1::G2" is unambiguous fusion notation and is accepted wherever it
+    appears. Every other form is accepted only when the pair is not part of a
+    list or alternative (see _pair_in_list_context)."""
     a = _gene_boundary_pattern(first)
     b = _gene_boundary_pattern(second)
     for left, right in ((a, b), (b, a)):
-        patterns = (
-            # G1::G2, G1-G2, G1--G2, G1/G2, G1–G2 (t(...) G1/G2 included).
-            rf"{_SLASH_CHAIN_BEFORE}{left}{_STRICT_PAIR_SEPARATOR}{right}{_SLASH_CHAIN_AFTER}",
-            # fusion of / between / involving (the) G1 (gene) and / with / to (the) G2
-            rf"{_STRICT_FUSION_NOUN}\s+(?:OF|BETWEEN|INVOLVING)\s+(?:THE\s+)?{left}"
-            rf"(?:\s+GENES?)?\s+(?:AND|WITH|TO)\s+(?:THE\s+)?{right}(?!\s*,)",
-            # G1 and / with G2 (gene(s)) fusion — singular noun only.
-            rf"(?<![A-Z0-9],\s)(?<![A-Z0-9],){left}\s+(?:AND|WITH)\s+{right}"
-            rf"(?:\s+GENES?)?\s+{_STRICT_SINGULAR_FUSION_NOUN}",
-        )
-        if any(re.search(pattern, text) for pattern in patterns):
+        g1, g2 = rf"(?P<g1>{left})", rf"(?P<g2>{right})"
+        if re.search(rf"{g1}{_STRICT_COLON_SEPARATOR}{g2}", text, re.I):
             return True
+        patterns = (
+            # G1-G2, G1--G2, G1/G2, G1–G2 (t(...) G1/G2 included).
+            rf"{g1}{_STRICT_PAIR_SEPARATOR}{g2}",
+            # fusion of / between / involving (the) G1 (gene) and / with / to (the) G2
+            rf"{_STRICT_FUSION_NOUN}\s+(?:OF|BETWEEN|INVOLVING)\s+(?:THE\s+)?{g1}"
+            rf"(?:\s+GENES?)?\s+(?:AND|WITH|TO)\s+(?:THE\s+)?{g2}",
+            # G1 and / with G2 (gene(s)) fusion — singular noun only.
+            rf"{g1}\s+(?:AND|WITH)\s+{g2}(?:\s+GENES?)?\s+{_STRICT_SINGULAR_FUSION_NOUN}",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.I):
+                if not _pair_in_list_context(text, match, known):
+                    return True
     return False
 
 
@@ -930,12 +970,14 @@ def strict_fusion_pair_match(
     five_prime, three_prime = split_fusion(fusion)
     if not five_prime or not three_prime:
         return False
-    text = f"{record.title} {record.abstract}".upper()
+    five_options = [o for o in _partner_symbol_options(five_prime, five_aliases) if o.strip()]
+    three_options = [o for o in _partner_symbol_options(three_prime, three_aliases) if o.strip()]
+    known = {o.strip().upper() for o in [*five_options, *three_options]}
+    text = f"{record.title} {record.abstract}"
     return any(
-        _strict_pair_text_match(text, five, three)
-        for five in _partner_symbol_options(five_prime, five_aliases)
-        for three in _partner_symbol_options(three_prime, three_aliases)
-        if five.strip() and three.strip()
+        _strict_pair_text_match(text, five, three, known)
+        for five in five_options
+        for three in three_options
     )
 
 
@@ -1141,7 +1183,8 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             # 1: gene co-occurrence [tiab] search alongside exact-pair phrases
             # (#166); also recomputes pre-b16374b "no records" entries.
             # 2: co-occurrence-only records must pass the strict pair check.
-            "cooccurrence_search_version": 2,
+            # 3: strict pair check rejects pairs inside a gene list/alternative.
+            "cooccurrence_search_version": 3,
             # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
             # 2: hyphen-aware word edges; case-independent free-text abbreviations.
             # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.

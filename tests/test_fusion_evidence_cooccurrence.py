@@ -283,7 +283,7 @@ async def test_several_failures_with_no_records_is_incomplete_not_no_records(mon
 
 def test_cache_key_includes_cooccurrence_version():
     key = _fusion_evidence_cache_key(_FUSION, None, 20)
-    assert '"cooccurrence_search_version": 2' in key
+    assert '"cooccurrence_search_version": 3' in key
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +305,18 @@ _STRICT_NEGATIVES = [
     ("ALK::RET", "ALK and RET fusions were mutually exclusive in lung cancer."),
     ("ALK::RET", "ALK and RET fusion-positive tumors were compared."),
     ("IRF2BP2::RUNX2", "The IRF2BP2-KLF2 axis regulates RUNX2; no fusion was found."),
+    # Round 2: a pair that is one member of a list or alternative.
+    ("ALK::RET", "The panel detects fusion involving ALK and RET or ROS1 in lung cancer."),
+    ("ALK::RET", "The panel detects fusion involving ALK and RET and ROS1 in lung cancer."),
+    ("ALK::RET", "The panel detects fusion involving ALK and RET and/or ROS1 in lung cancer."),
+    ("ALK::RET", "The panel detects fusion involving ALK and RET, ROS1 in lung cancer."),
+    ("ALK::RET", "The panel detects fusion involving ALK and the RET gene or NTRK1."),
+    ("ALK::RET", "ROS1, ALK and RET fusion testing was performed in lung cancer."),
+    ("ALK::RET", "ROS1 or ALK and RET fusion testing was performed in lung cancer."),
+    ("ALK::RET", "Screening for ROS1/ALK-RET rearrangement in lung cancer."),
+    ("ALK::RET", "Screening for ALK/RET/ROS1 rearrangement in lung cancer."),
+    ("ALK::RET", "Screening for ALK-RET or ROS1 rearrangement in lung cancer."),
+    ("NTRK3::ALK", "ETV6::NTRK3 and ALK fusion were found in separate tumors."),
 ]
 
 _STRICT_POSITIVES = [
@@ -318,6 +330,13 @@ _STRICT_POSITIVES = [
     ("IRF2BP2::RUNX2", "We describe a fusion between the IRF2BP2 gene and the RUNX2 gene."),
     ("IRF2BP2::RUNX2", "An IRF2BP2 and RUNX2 fusion was detected."),
     ("BCR::ABL1", "The t(9;22) BCR/ABL1 translocation was found in leukemia."),
+    # Ordinary words after the pair are not list members.
+    ("ALK::RET", "We describe a fusion involving ALK and RET in lung cancer."),
+    ("ALK::RET", "An ALK-RET fusion and a second event were found."),
+    ("ALK::RET", "An ALK-RET fusion, which was in-frame, was found."),
+    # "::" notation is explicit even when other fusions are listed beside it.
+    ("ALK::RET", "ETV6::NTRK3, ALK::RET and CIC::DUX4 were detected."),
+    ("ALK::RET", "Sequencing found ALK::RET or ROS1 fusions."),
 ]
 
 
@@ -335,6 +354,13 @@ def test_strict_pair_check_accepts_alias_pair():
     record = _rec("1", "A PEBP2A1-IRF2BP2 chimera was detected.")
     assert not literature.strict_fusion_pair_match(record, _FUSION)
     assert literature.strict_fusion_pair_match(record, _FUSION, [], ["PEBP2A1"])
+
+
+def test_strict_pair_check_known_alias_is_a_list_member():
+    # "Lrir" alone reads as an ordinary word; as a requested alias it is a gene.
+    record = _rec("1", "A fusion involving RUNX2 and IRF2BP2 or Lrir was assayed.")
+    assert literature.strict_fusion_pair_match(record, _FUSION)
+    assert not literature.strict_fusion_pair_match(record, _FUSION, ["LRIR"], [])
 
 
 def test_strict_pair_check_accepts_real_irf2bp2_runx2_titles():
