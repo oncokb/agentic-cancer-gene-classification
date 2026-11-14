@@ -20,6 +20,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Uni
 
 from src.expression_context.catalog import ActiveBundle
 from src.expression_context.models import (
+    ALLOWED_ALTERATION_TYPES,
     CancerTypeStats,
     GeneStatsView,
     PairStatsView,
@@ -44,6 +45,7 @@ CSV_COLUMNS: Tuple[str, ...] = (
     "exclusion_reason",
     "stats_pass",
     "enrichment_label",
+    "alteration_types_enriched",
     "confidence_tier",
     "purity_check",
     "broadly_expressed",
@@ -79,23 +81,20 @@ GOLDEN_SET_COLUMNS: Tuple[str, ...] = (
     "Evidence-associated PMIDs",
 )
 
-ALLOWED_ALTERATION_TYPES: Tuple[str, ...] = (
-    "Point Mutation",
-    "Structural Variant",
-    "Expression",
-    "Copy Number Alteration",
-)
 ALLOWED_ALTERATION_CATEGORIES: Tuple[str, ...] = ALLOWED_ALTERATION_TYPES
 
 
 def alteration_types_for_pair(view_pair: PairStatsView) -> List[str]:
-    """Return alteration categories contributed by this pair.
+    """Detail contributed by a surfaced pair; never decide which pairs surface."""
+    enriched = enriched_alteration_types(view_pair)
+    return [cat for cat in ALLOWED_ALTERATION_TYPES if cat == "Expression" or cat in enriched]
 
-    Today the only source is expression, so every surfaced pair contributes
-    'Expression'. Later alteration statistics can add categories without
-    touching the row builder.
-    """
-    return ["Expression"]
+
+def enriched_alteration_types(pair: PairStatsView) -> List[str]:
+    alterations = pair.stats.alterations
+    if alterations is None:
+        return []
+    return [cat for cat in ALLOWED_ALTERATION_TYPES if cat in alterations.alteration_types_enriched]
 
 
 def cbioportal_expression_url(
@@ -379,6 +378,7 @@ def pair_view_to_csv_row(
         guard_csv_text(reason),
         guard_csv_text(_format_yes_no(stats.passes_stats)),
         guard_csv_text(_enrichment_code(stats)),
+        ", ".join(enriched_alteration_types(pair)),
         guard_csv_text(pair.confidence_tier),
         guard_csv_text(stats.purity_check),
         guard_csv_text(_format_yes_no(view.broadly_expressed)),

@@ -178,6 +178,40 @@ function viewWithStudyIds() {
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
+test("alterations render badges and safe category details on surfaced, candidate and excluded rows", async () => {
+  const v = view();
+  const alterations = {
+    alteration_types_enriched: ["Point Mutation", "Copy Number Alteration", "<script>unknown</script>"],
+    categories: {
+      "Point Mutation": { status: "enriched", n_events: 24, n_profiled: 149, frequency: 0.16 },
+      "Copy Number Alteration": { status: "enriched", direction: "amp", enriched_directions: ["amp", "del"],
+        n_events: 74, n_profiled: 148, frequency: 0.5,
+        amp: { n_events: 74, frequency: 0.5 }, del: { n_events: 3, frequency: 0.02 } },
+      "Structural Variant": { status: "not_testable", reason: "<img src=x onerror=alert(1)>" },
+    },
+  };
+  v.pairs[0].stats.alterations = alterations;
+  v.pairs[1].status = "candidate";
+  v.pairs[1].stats.alterations = alterations;
+  v.pairs[2].stats.alterations = alterations;
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  nodes["ec-view-all"].fire("click");
+  for (let i = 0; i < 3; i++) {
+    const badges = summaryRows(nodes)[i].children[3];
+    assert.strictEqual(badges.text, "Point MutationCopy Number Alteration (amp, del)");
+    assert.strictEqual(badges.children.length, 2);
+    const detail = detailRows(nodes)[i];
+    assert.ok(detail.text.includes("Alterations"));
+    assert.ok(detail.text.includes("24/149 events/profiled; frequency 16.00%"));
+    assert.ok(detail.text.includes("amp: 74/148"));
+    assert.ok(detail.text.includes("del: 3/148"));
+    assert.ok(detail.text.includes("not testable; —/— events/profiled; frequency —; <img src=x onerror=alert(1)>"));
+    assert.strictEqual(detail.findAll((n) => n.tagName === "img").length, 0);
+  }
+  assert.strictEqual(summaryRows(nodes)[3].children[3].text, "—", "old rows need no alteration data");
+});
+
 test("formatters never show null statistics as zero", () => {
   assert.strictEqual(formatNumber(null), "—");
   assert.strictEqual(formatNumber(undefined), "—");
@@ -210,30 +244,30 @@ test("renders statistics, calls, flags and the literature verdict", async () => 
   assert.strictEqual(details.length, 4);
   const cells = (row) => row.children.map((c) => c.text);
   const brca = cells(rows[0]);
-  assert.strictEqual(brca.length, 7);
+  assert.strictEqual(brca.length, 8);
   assert.strictEqual(brca[0], "Breast Invasive Carcinoma (BRCA)");
   assert.strictEqual(brca[1], "Pass");
   assert.strictEqual(brca[2], "Tissue of origin");
-  assert.ok(brca[3].startsWith("Supported"));
-  assert.ok(brca[3].includes("<b>amplified</b>"), "rationale stays text");
-  assert.strictEqual(brca[4], "Surfaced");
-  assert.strictEqual(brca[5], "mRNA vs Dx");
-  assert.strictEqual(brca[6], "Details");
+  assert.ok(brca[4].startsWith("Supported"));
+  assert.ok(brca[4].includes("<b>amplified</b>"), "rationale stays text");
+  assert.strictEqual(brca[5], "Surfaced");
+  assert.strictEqual(brca[6], "mRNA vs Dx");
+  assert.strictEqual(brca[7], "Details");
   assert.strictEqual(rows[0].getAttribute("class"), "ec-row-surfaced");
   const links = rows[0].findAll((n) => n.tagName === "a");
   const pubmedLinks = links.filter((a) => a.getAttribute("href").startsWith("https://pubmed.ncbi.nlm.nih.gov/"));
   assert.deepStrictEqual(pubmedLinks.map((a) => a.getAttribute("href")), ["https://pubmed.ncbi.nlm.nih.gov/12345678/"]);
   assert.strictEqual(pubmedLinks[0].getAttribute("rel"), "noopener noreferrer");
-  assert.strictEqual(cells(rows[1])[3], "Not checked yet");
-  assert.strictEqual(cells(rows[1])[4], "Awaiting literature check");
+  assert.strictEqual(cells(rows[1])[4], "Not checked yet");
+  assert.strictEqual(cells(rows[1])[5], "Awaiting literature check");
   assert.ok(details[1].text.includes("Not run"));
   assert.strictEqual(cells(rows[2])[0], "UCEC");
-  assert.strictEqual(cells(rows[2])[4], "Excluded: PubMed pre-check");
+  assert.strictEqual(cells(rows[2])[5], "Excluded: PubMed pre-check");
   assert.ok(details[2].text.includes("Fail (0)"));
   const gbm = cells(rows[3]);
   assert.strictEqual(gbm[1], "Fail");
   assert.strictEqual(gbm[2], "Small n");
-  assert.strictEqual(gbm[4], "Excluded: statistics");
+  assert.strictEqual(gbm[5], "Excluded: statistics");
   assert.ok(details[3].text.includes("— (3.10)"));
   assert.deepStrictEqual(replaced, ["?gene=ERBB2"]);
   assert.strictEqual(nodes["ec-release"].textContent, `Data release ${BUNDLE.release_id}`);
@@ -357,7 +391,7 @@ test("an expired PubMed pre-check is labelled, not shown as a failure", async ()
   const ucec = summaryRows(nodes)[2].children.map((c) => c.text);
   const ucecDetails = detailRows(nodes)[2].text;
   assert.ok(ucecDetails.includes("Pre-check expired (0)"), ucecDetails);
-  assert.strictEqual(ucec[4], "Awaiting literature check");
+  assert.strictEqual(ucec[5], "Awaiting literature check");
 });
 
 test("method m3: enrichment labels, broad markers and subgroup statistics", async () => {
@@ -421,16 +455,16 @@ test("method m3: enrichment labels, broad markers and subgroup statistics", asyn
     details[0].text,
   );
   assert.ok(!brca[1].includes("Broadly expressed"), "a subgroup pass is not marked blocked");
-  assert.ok(brca[3].startsWith("Supported in Breast Invasive Carcinoma"), brca[3]);
-  assert.ok(brca[3].includes("Tumor-specific: PMID 11111111"), brca[3]);
+  assert.ok(brca[4].startsWith("Supported in Breast Invasive Carcinoma"), brca[4]);
+  assert.ok(brca[4].includes("Tumor-specific: PMID 11111111"), brca[4]);
   const sarc = cells(rows[1]);
   assert.strictEqual(sarc[1], "FailBroadly expressed");
-  assert.strictEqual(sarc[3], "—", "never sent to the literature check");
-  assert.strictEqual(sarc[4], "Excluded: statistics");
+  assert.strictEqual(sarc[4], "—", "never sent to the literature check");
+  assert.strictEqual(sarc[5], "Excluded: statistics");
   const prad = cells(rows[2]);
   assert.strictEqual(prad[1], "PassLineage enriched");
   assert.ok(!details[2].text.includes("Subgroup:"), "no subgroup line without subgroup stats");
-  assert.ok(prad[3].startsWith("Not supported insufficient evidence"), prad[3]);
+  assert.ok(prad[4].startsWith("Not supported insufficient evidence"), prad[4]);
   assert.deepStrictEqual(rows[2].findAll((n) => n.tagName === "a"), []);
 });
 
@@ -447,8 +481,8 @@ test("tumor-specific verdict without tumor-specific PMIDs explains why", async (
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
   await page.lookup("ERBB2");
   const rows = summaryRows(nodes).map((row) => row.children.map((c) => c.text));
-  assert.strictEqual(rows[0][3], "Not supported no tumor-specific PMIDs");
-  assert.strictEqual(rows[1][3], "Not supported evidence against this tumor type");
+  assert.strictEqual(rows[0][4], "Not supported no tumor-specific PMIDs");
+  assert.strictEqual(rows[1][4], "Not supported evidence against this tumor type");
   assert.strictEqual(nodes["ec-gene-title"].children.length, 0, "no gene marker for m2 bundles");
 });
 
@@ -584,6 +618,7 @@ test("header has only the visible columns and removed columns are gone", () => {
     "Cancer type",
     "Statistics",
     "Flags",
+    "Alterations",
     "Literature",
     "Result",
     "cBioPortal",
@@ -606,7 +641,7 @@ test("numbers are hidden in the detail row by default and toggle updates aria-ex
     assert.ok(!summaries[i].hidden, "summary row is visible");
     assert.ok(details[i].hidden, "detail row is hidden by default");
     assert.strictEqual(details[i].children.length, 1);
-    assert.strictEqual(details[i].children[0].getAttribute("colspan"), "7");
+    assert.strictEqual(details[i].children[0].getAttribute("colspan"), "8");
   }
   const brcaSummaryText = summaries[0].text;
   for (const num of ["100 (9000)", "6.20 (3.10)", "2.74", "0.71", "0.85", "1.0e-39", "Pass (12)"]) {
@@ -630,7 +665,7 @@ test("numbers are hidden in the detail row by default and toggle updates aria-ex
   ]) {
     assert.ok(details[0].text.includes(label), `detail row includes ${label}`);
   }
-  const toggleBtn = summaries[0].children[6].children[0];
+  const toggleBtn = summaries[0].children[7].children[0];
   assert.strictEqual(toggleBtn.tagName, "button");
   assert.strictEqual(toggleBtn.getAttribute("type"), "button");
   assert.strictEqual(toggleBtn.textContent, "Details");
@@ -666,21 +701,21 @@ test("expanded state survives a re-render during a literature job and resets on 
     ),
   });
   await page.lookup("ERBB2");
-  const initialBtn = summaryRows(nodes)[1].children[6].children[0];
+  const initialBtn = summaryRows(nodes)[1].children[7].children[0];
   initialBtn.fire("click");
   assert.strictEqual(initialBtn.getAttribute("aria-expanded"), "true");
   assert.ok(!detailRows(nodes)[1].hidden);
 
   await nodes["ec-run"].fire("click");
   assert.strictEqual(statsCalls, 2);
-  const rerenderedBtn = summaryRows(nodes)[1].children[6].children[0];
+  const rerenderedBtn = summaryRows(nodes)[1].children[7].children[0];
   assert.strictEqual(rerenderedBtn.getAttribute("aria-expanded"), "true", "STAD stays expanded after job re-render");
   assert.ok(!detailRows(nodes)[1].hidden, "STAD detail row stays visible after job re-render");
   assert.ok(detailRows(nodes)[0].hidden, "BRCA detail row stays hidden");
 
   await page.lookup("NKX2-1");
   for (const row of summaryRows(nodes)) {
-    const btn = row.children[6].children[0];
+    const btn = row.children[7].children[0];
     assert.strictEqual(btn.getAttribute("aria-expanded"), "false", "new gene resets aria-expanded");
   }
   for (const detail of detailRows(nodes)) {
@@ -826,7 +861,7 @@ test("view toggle switches the table rows and the count", async () => {
   assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded");
   // Excluded rows are de-emphasised and labelled with their reason.
   const excluded = all.filter((r) => r.getAttribute("class") === "ec-row-excluded");
-  assert.deepStrictEqual(excluded.map((r) => r.children[4].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
+  assert.deepStrictEqual(excluded.map((r) => r.children[5].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
 
   nodes["ec-view-shown"].fire("click");
   assert.strictEqual(visibleSummaryRows(nodes).length, 2);
@@ -837,7 +872,7 @@ test("an expanded excluded row hides with its details and comes back expanded", 
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(view()) });
   await page.lookup("ERBB2");
   nodes["ec-view-all"].fire("click");
-  summaryRows(nodes)[3].children[6].children[0].fire("click");
+  summaryRows(nodes)[3].children[7].children[0].fire("click");
   assert.ok(!detailRows(nodes)[3].hidden);
   nodes["ec-view-shown"].fire("click");
   assert.ok(summaryRows(nodes)[3].hidden && detailRows(nodes)[3].hidden, "GBM row and details hidden");
@@ -1004,7 +1039,7 @@ test("candidates show a distinct Needs verification badge only in All cancer typ
   const kirc = rows.find((r) => code(r).includes("(KIRC)"));
   assert.strictEqual(code(kirc), "Kidney <b>Renal</b> Clear Cell Carcinoma (KIRC)", "names stay text");
   assert.strictEqual(kirc.getAttribute("class"), "ec-row-excluded ec-row-candidate");
-  const [result] = kirc.children[4].children;
+  const [result] = kirc.children[5].children;
   assert.strictEqual(result.textContent, "Needs verification");
   assert.ok(!result.textContent.startsWith("Excluded"), "separate from other exclusion reasons");
   assert.ok(result.getAttribute("class").includes("ec-candidate"));
@@ -1012,11 +1047,11 @@ test("candidates show a distinct Needs verification badge only in All cancer typ
   assert.ok(tooltip.includes("stricter high-confidence bar"), tooltip);
   assert.ok(tooltip.includes("log2 fold change ≥ 2") && tooltip.includes("≥ 5×"), tooltip);
   // Not sent to the literature check, so no "Not checked yet" prompt and no citations.
-  assert.strictEqual(kirc.children[3].text, "—");
+  assert.strictEqual(kirc.children[4].text, "—");
   assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 need verification");
   // Other exclusion reasons keep their own badges.
   const others = rows.filter((r) => r.getAttribute("class") === "ec-row-excluded");
-  assert.deepStrictEqual(others.map((r) => r.children[4].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
+  assert.deepStrictEqual(others.map((r) => r.children[5].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
 
   nodes["ec-view-shown"].fire("click");
   assert.ok(kirc.hidden, "candidate hidden again in Shown only");

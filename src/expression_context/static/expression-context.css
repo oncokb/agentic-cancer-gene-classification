@@ -294,7 +294,7 @@
   font-weight: 600;
 }
 
-.ec-table td:nth-child(4) {
+.ec-table td:nth-child(5) {
   min-width: 16rem;
 }
 
@@ -303,7 +303,7 @@
 }
 
 /* Long tumor-specific verdicts ("Supported in …") may wrap; other pills stay on one line. */
-.ec-table td:nth-child(4) .review-badge {
+.ec-table td:nth-child(5) .review-badge {
   white-space: normal;
   text-align: left;
 }
@@ -408,3 +408,6 @@
     margin-bottom: 6px;
   }
 }
+
+.ec-alterations .ec-badge { margin: 2px 4px 2px 0; }
+.ec-alterations-heading { margin: 12px 0 6px; }
