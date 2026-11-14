@@ -522,7 +522,7 @@ def test_alterations_are_detail_only(tmp_path, monkeypatch):
     assert all(record["alterations"] is None for record in skipped["cancer_types"])
     manifest = json.loads((with_alterations / "v1/manifest.json").read_text())
     jsonschema.validate(manifest, SCHEMAS["manifest"])
-    assert manifest["contract_version"] == "1.4" and manifest["method_version"] == "3"
+    assert manifest["contract_version"] == "1.5" and manifest["method_version"] == "3"
     assert manifest["source"]["mutation_driver_source"] == "test"
     assert manifest["source"]["cna_driver_source"] == "test-cna"
     assert manifest["source"]["cna_driver_sha256"] == "1" * 64

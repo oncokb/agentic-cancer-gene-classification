@@ -39,7 +39,7 @@ def test_cutoff_values_and_contract_version():
     # v3 thresholds are untouched; only the contract version moves.
     assert (PARAMS["log2fc"], PARAMS["cliffs_delta"]) == (1.0, 0.5)
     assert (PARAMS["subgroup_min_fraction"], PARAMS["subgroup_min_fraction_ratio"]) == (0.03, 3.0)
-    assert METHOD_VERSION == "3" and CONTRACT_VERSION == "1.4"
+    assert METHOD_VERSION == "3" and CONTRACT_VERSION == "1.5"
 
 
 @pytest.mark.parametrize(
@@ -92,11 +92,11 @@ def test_changing_a_strong_cutoff_changes_the_release_id(tmp_path, monkeypatch, 
 )
 def test_lineage_arm_boundaries(fc, delta, expected):
     assert tier(lineage=True, log2fc=fc, cliffs_delta=delta) == expected
-    # The subgroup cutoffs never rescue a lineage-only pass.
+    # Strong subgroup statistics also promote a lineage-first pass (either-arm rule).
     assert (
         tier(lineage=True, log2fc=fc, cliffs_delta=delta, subgroup_high_fraction=0.5,
              subgroup_high_fraction_ratio=50.0)
-        == expected
+        == "high"
     )  # fmt: skip
 
 
@@ -113,18 +113,44 @@ def test_lineage_arm_boundaries(fc, delta, expected):
 def test_subgroup_arm_boundaries(fraction, ratio, expected):
     values = dict(subgroup_high_fraction=fraction, subgroup_high_fraction_ratio=ratio)
     assert tier(subgroup=True, **values) == expected
-    # Strong lineage statistics never promote a subgroup-only pass (e.g. broad-blocked).
+    # The lineage strong mask is gated on the lineage arm itself (incl. its broad block),
+    # so lineage statistics alone cannot promote a subgroup-only pass.
     assert tier(subgroup=True, log2fc=4.0, cliffs_delta=0.9, **values) == expected
 
 
-def test_the_pass_mode_arm_decides_when_both_arms_pass():
-    # Lineage wins pass_mode, so a strong subgroup tail never promotes a weak lineage call
-    # (EGFR/GBM in the full build: log2FC 2.73, delta 0.58, 16% high, 21.7x).
+def test_either_arm_can_make_a_pass_high():
+    # EGFR/GBM in the full build: log2FC 2.73, delta 0.58, 16% high, 21.7x. Lineage
+    # passes but misses its strong delta; the strong subgroup tail now promotes it.
     weak_lineage = dict(log2fc=2.73, cliffs_delta=0.58)
     strong_subgroup = dict(subgroup_high_fraction=0.16, subgroup_high_fraction_ratio=21.7)
-    assert tier(lineage=True, subgroup=True, **weak_lineage, **strong_subgroup) == "candidate"
+    assert tier(lineage=True, **weak_lineage, **strong_subgroup) == "high"
+    # pass_mode stays lineage even when subgroup also passes: the subgroup arm still counts.
+    assert tier(lineage=True, subgroup=True, **weak_lineage, **strong_subgroup) == "high"
+    assert tier(lineage=True, **weak_lineage) == "candidate"
     strong_lineage = dict(log2fc=2.0, cliffs_delta=0.70)
     assert tier(lineage=True, subgroup=True, **strong_lineage) == "high"
+
+
+def test_strong_arm_records_the_promoting_arm():
+    from gene_expression_relevance.stats import strong_arm
+
+    weak_lineage = dict(log2fc=2.73, cliffs_delta=0.58)
+    strong_subgroup = dict(subgroup_high_fraction=0.16, subgroup_high_fraction_ratio=21.7)
+    strong_lineage = dict(log2fc=2.0, cliffs_delta=0.70)
+    weak_subgroup = dict(subgroup_high_fraction=0.03, subgroup_high_fraction_ratio=3.0)
+
+    def arm(lineage=False, subgroup=False, **values):
+        return strong_arm(
+            arrays(**values), np.array([[lineage]]), np.array([[subgroup]]), PARAMS
+        )[0, 0]
+
+    assert arm(lineage=True, **weak_lineage, **strong_subgroup) == "subgroup"
+    # A broad-blocked lineage arm leaves only the subgroup strong mask.
+    assert arm(subgroup=True, **weak_lineage, **strong_subgroup) == "subgroup"
+    assert arm(lineage=True, **strong_lineage) == "lineage"
+    assert arm(lineage=True, subgroup=True, **strong_lineage, **strong_subgroup) == "both"
+    assert arm(lineage=True, **weak_lineage, **weak_subgroup) is None
+    assert arm(**strong_lineage, **strong_subgroup) is None  # no v3 pass, no high
 
 
 def test_failing_v3_is_null_whatever_the_statistics():
@@ -162,7 +188,7 @@ def test_v3_fields_match_contract_1_2():
     expected = json.loads((Path(__file__).parent / "fixtures/contract-1.2-stats.json").read_text())
     x, labels = fixture()
     result = compute(x, labels, CODES)
-    assert set(result) - {"confidence_tier"} == set(expected)
+    assert set(result) - {"confidence_tier", "strong_arm"} == set(expected)
     exact = {
         "n",
         "n_rest",
@@ -191,6 +217,9 @@ def test_v3_fields_match_contract_1_2():
     assert set(tiers[result["stats_pass"]]) <= {"high", "candidate"}
     # The fixture exercises both tiers.
     assert {"high", "candidate"} <= set(tiers[result["stats_pass"]])
+    # strong_arm is populated exactly for high pairs.
+    np.testing.assert_array_equal(result["strong_arm"] != None, tiers == "high")  # noqa: E711
+    assert set(result["strong_arm"][tiers == "high"]) <= {"lineage", "subgroup", "both"}
 
 
 def control_documents(tmp_path, tiers):

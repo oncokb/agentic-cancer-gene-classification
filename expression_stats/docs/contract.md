@@ -1,7 +1,8 @@
 # Expression context (optional, removable module)
 
-Status: artifact schema_version 1, contract 1.3 (additive alteration detail and scope;
-per-pair `confidence_tier`), expression method v3, alteration method v2 — 2026-11-13
+Status: artifact schema_version 1, contract 1.5 (either-arm confidence tier and the
+additive `strong_arm` field; additive alteration detail and scope; per-pair
+`confidence_tier`), expression method v3, alteration method v2 — 2026-11-13
 
 ## Goal
 
@@ -149,7 +150,7 @@ opposite group is empty. Existing nullable fields retain their semantics.
 `p90_log2`/`rest_p90_log2` remain informational. `tissue_of_origin_risk` and
 `small_n` remain informational flags. Do not interpret a null as measured zero.
 
-### Confidence tier (contract 1.3)
+### Confidence tier (contract 1.3; either-arm criteria since 1.5)
 
 Product rule: only high-confidence pairs may be surfaced to curators; every weaker v3
 pass is an unsurfaced **candidate** that curators can still find. On top of the
@@ -158,26 +159,35 @@ unchanged v3 pass (every rule above still required), each pair carries
 | Field | Type / meaning |
 | --- | --- |
 | `confidence_tier` | `"high"`, `"candidate"`, or null; null exactly when `stats_pass` is false |
+| `strong_arm` | `"lineage"`, `"subgroup"`, `"both"`, or null; which arm(s) met their strong cutoffs. Non-null exactly when `confidence_tier` is `"high"` (purity demotion clears it) |
 
-A v3 pass is `"high"` if the arm it passes by (its `pass_mode`) also meets that arm's
-strong cutoffs (inclusive), otherwise `"candidate"`:
+A v3 pass is `"high"` if **either** arm meets its strong cutoffs (inclusive), otherwise
+`"candidate"`:
 
 | Arm | Strong cutoffs (manifest `params`) |
 | --- | --- |
-| lineage | `log2fc >= strong_log2fc` (2.0) **and** `cliffs_delta >= strong_cliffs_delta` (0.70) |
+| lineage | `log2fc >= strong_log2fc` (2.0) **and** `cliffs_delta >= strong_cliffs_delta` (0.70); retains the broad-expression block |
 | subgroup | `subgroup_high_fraction >= strong_subgroup_min_fraction` (0.05) **and** `subgroup_high_fraction_ratio >= strong_subgroup_min_fraction_ratio` (5.0) |
 
-The arm is the pair's `pass_mode`: when both arms pass, lineage wins (as for
-`pass_mode`), so only the lineage cutoffs apply; a strong subgroup tail never promotes a
-weak lineage call. The tier is derived
-read-only from the v3 arrays: no v3 threshold, pass/fail call, `pass_mode` or label
-changes, and every v3 field is byte-identical to the contract 1.2 build (tested). The
-four `strong_*` params are hashed into the release ID. The cutoffs come from the
-read-only confidence-tier evaluation (45/51 positives high, 0/27 negatives); they are a
-selective statistical screen, not a calibrated precision.
+The subgroup strong criteria are evaluated from the subgroup statistics whenever they
+exist, regardless of `pass_mode`: a pair that passes by lineage first (including one in
+which lineage wins `pass_mode`) is still promoted when its subgroup tail clears the
+strong bar. A broadly expressed gene whose lineage arm is blocked can therefore be high
+via `strong_arm: "subgroup"` only. `strong_arm` is `"both"` only when both strong masks
+hold.
+
+The tier is derived read-only from the v3 arrays: no v3 threshold, pass/fail call,
+`pass_mode` or label changes, and every v3 statistics field is byte-identical to the
+contract 1.2 build (tested). The four `strong_*` params are hashed into the release
+ID. The cutoffs come from the read-only confidence-tier evaluation; they are a selective
+statistical screen, not a calibrated precision. Purity demotion (contract 1.4) always
+applies after the tier is assigned, including to pairs newly promoted by the subgroup
+arm; the purity re-test evaluates the filtered strong statistics of both arms.
 
 **Optional field.** `confidence_tier` is optional in the schema: bundles before contract
-1.3 omit it and still load. Only for a bundle whose manifest `contract_version` is a
+1.3 omit it and still load. `strong_arm` is optional for every contract version; readers
+that predate 1.5 ignore it. A `strong_arm` value is never used to gate or surface a pair
+(the tier and purity state remain authoritative). Only for a bundle whose manifest `contract_version` is a
 well-formed version string (exactly `^[0-9]+\.[0-9]+(\.[0-9]+)?$`: no sign, no
 whitespace) **below** `"1.3"` may consumers treat a **missing** field on a v3 pass as
 `"high"` (the pre-1.3 behaviour). Every other manifest requires the field: 1.3 or later,
@@ -359,7 +369,7 @@ fields are null when undefined or `not_testable`; never read null as zero. For C
 top-level statistics describe `direction` (the first enriched direction, else the one
 with the smaller p); `amp`/`del` hold both. `n_profiled` is the category denominator
 (CNA: patients with a measured call for the gene). The manifest adds `contract_version`
-("1.3"; "1.2" before `confidence_tier`, "1.1" before the CNA driver lists), `alteration_method_version`, `alteration_params`, `build.skip_alterations`,
+("1.5"; "1.4" before `strong_arm`, "1.3" before `confidence_tier`, "1.2" before the CNA driver lists), `alteration_method_version`, `alteration_params`, `build.skip_alterations`,
 `source.alteration_inputs_sha256`, `source.mutation_driver_source`,
 `source.mutation_driver_sha256`, `source.mutation_driver_files`, `source.cna_driver_source`,
 `source.cna_driver_sha256`, `source.cna_driver_files` (contract 1.2), and an `alterations`
@@ -496,7 +506,7 @@ is maintained separately (PR #167). No shared Python imports are permitted.
 ```json
 {
   "schema_version": "1",
-  "contract_version": "1.3",
+  "contract_version": "1.5",
   "release_id": "datahub-<12hex>-m3-<build_sha12>",
   "bundle_tag": "expression-stats-datahub-<12hex>-m3-<build_sha12>-pubmed-<YYYYMMDD>",
   "pubmed_snapshot_date": "<YYYY-MM-DD>",
@@ -592,7 +602,7 @@ per line, unchanged schema; symbols are upper-case canonical symbols.
      "log2fc": 0.0, "log2fc_vs_median_of_type_medians": 0.0,
      "cliffs_delta": 0.0, "auc": 0.0, "p_value": 0.0, "q_value": 0.0,
      "stats_pass": false, "pass_mode": null, "lineage_blocked_by_broad": false,
-     "confidence_tier": null,
+     "confidence_tier": null, "strong_arm": null,
      "subgroup_high_count": 0, "subgroup_high_fraction": 0.0,
      "subgroup_high_fraction_ratio": 0.0, "p95_log2_diff": 0.0, "subgroup_q": 1.0,
      "pubmed_count": null, "literature_precheck_pass": null,
@@ -796,6 +806,24 @@ fingerprint. Use only `call status=called`, finite purity in [0,1], joined on th
 first 15 barcode characters to the exact selected primary expression sample;
 patient-only matches are never used. Duplicate called keys fail closed. DNA and
 RNA can represent different aliquots of the selected sample.
+
+### Contract 1.5: either-arm strong criteria and `strong_arm`
+
+`confidence_tier` is `"high"` when a v3 pass meets the strong cutoffs of **either** arm,
+not only the arm recorded in `pass_mode`. The lineage strong criteria keep the existing
+broad-expression block (a broad-blocked lineage pass cannot be high via lineage); the
+subgroup strong criteria are evaluated from the subgroup statistics whenever they exist,
+regardless of `pass_mode`. No v3 threshold, `stats_pass`, `pass_mode`, broad flag,
+statistic, flag or PubMed field changes. The release identity changes because the tier
+derivation is code, not because any parameter moved.
+
+The additive `strong_arm` field records which arm(s) produced a high tier
+(`"lineage"`, `"subgroup"`, `"both"`), and is null when the pair is not high (including
+after a purity demotion). It is optional in the schema and ignored by readers that
+predate 1.5. Purity demotion (contract 1.4) applies unchanged after promotion and its
+high-purity re-test evaluates both arms' strong statistics. PubMed precheck coverage is
+unchanged: every `stats_pass` pair is checked, so newly promoted candidates already have
+their counts.
 
 We acknowledge TCGA, GDC, and the ABSOLUTE/PanCanAtlas source for these open-access
 data: [PanCanAtlas supplemental data](https://gdc.cancer.gov/about-data/publications/pancanatlas).

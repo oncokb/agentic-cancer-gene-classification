@@ -314,6 +314,8 @@ def test_nullable_wire_fields_preserve_schema_one():
         stats_pass=False,
         flags=["small_n"],
         pass_mode=None,
+        confidence_tier=None,
+        strong_arm=None,
         lineage_blocked_by_broad=False,
         subgroup_high_count=None,
         subgroup_high_fraction=None,
@@ -329,6 +331,12 @@ def test_nullable_wire_fields_preserve_schema_one():
         cancer_types=[record.copy() for _ in range(32)],
     )
     jsonschema.validate(artifact, SCHEMAS["gene"])
+    artifact["cancer_types"][0]["strong_arm"] = "subgroup"
+    jsonschema.validate(artifact, SCHEMAS["gene"])
+    artifact["cancer_types"][0]["strong_arm"] = "invalid"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(artifact, SCHEMAS["gene"])
+    artifact["cancer_types"][0]["strong_arm"] = None
     artifact["cancer_types"][0]["n"] = None
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(artifact, SCHEMAS["gene"])
