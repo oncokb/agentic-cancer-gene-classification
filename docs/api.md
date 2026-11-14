@@ -181,6 +181,7 @@ Fusion partners may be intergenic/no-gene placeholders: `.`, `-`, `NA`, `N/A`,
 `intergenic`, or `?` (case-insensitive, surrounding spaces ignored). Their position
 is preserved. `NA` is reserved as a placeholder here; HGNC lists it only as a
 previous symbol of XK, and it did not resolve through the former symbol search.
+`/v1/genes/query` rejects the whole batch with 422 if any entry is a placeholder such as `NA`.
 Single-gene endpoints reject placeholder-only input with 422 before annotation
 or run persistence; batch annotation accepts it and returns warnings with zero
 annotations. `N/A` is a single partner even with slash fusion notation. For

@@ -215,6 +215,13 @@ class FusionPartnerEvidenceRequest(BaseModel):
     elsewhere? Not the same question as FusionEvidenceResult, which checks an exact
     fusion pair — this checks a single partner gene against any reported fusion."""
 
+    @field_validator("gene")
+    @classmethod
+    def reject_intergenic(cls, value: str) -> str:
+        from src.pipeline.normalization import reject_intergenic_gene_input
+
+        return reject_intergenic_gene_input(value)
+
     gene: str = Field(..., description="Partner gene symbol to check for oncogenic fusion precedent")
     tumor_type: Optional[str] = Field(
         default=None,

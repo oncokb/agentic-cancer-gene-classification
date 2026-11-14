@@ -1298,7 +1298,7 @@ async def normalize_fusions(
     for fusion, tokens in tokens_by_input.items():
         info = CanonicalInput(submitted=fusion, canonical=fusion)
         placeholders = [raw for raw, _ in tokens if is_intergenic_partner(raw)]
-        if placeholders:
+        if placeholders or not tokens:
             if len(placeholders) == len(tokens):
                 info.warnings.append(
                     f"'{fusion}' has no gene partners (intergenic breakpoints); nothing to annotate."

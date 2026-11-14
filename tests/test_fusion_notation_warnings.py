@@ -794,3 +794,13 @@ def test_all_placeholder_fusion_evidence_job_is_skipped(client):
     assert job["status"] == "complete", job
     assert job["fusion_evidence"][0]["retrieval_status"] == "skipped"
     assert main.app.state.run_store.saved_runs == []
+
+
+@pytest.mark.parametrize("fusion", ["--", "::"])
+@pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
+def test_separator_only_batch_has_no_annotations_and_explains_why(client, fake_hgnc, fusion, path):
+    handler = fake_hgnc()
+    result = _annotation_result(client, path, {"fusions": [fusion]})
+    assert result["annotations"] == []
+    assert any("no gene partners" in warning and "nothing to annotate" in warning for warning in result["warnings"])
+    assert handler.requests == []
