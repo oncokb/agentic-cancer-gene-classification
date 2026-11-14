@@ -177,6 +177,16 @@ endpoints return full annotations, including evidence cards.)
 
 ### Gene identifiers
 
+Fusion partners may be intergenic/no-gene placeholders: `.`, `-`, `NA`, `N/A`,
+`intergenic`, or `?` (case-insensitive, surrounding spaces ignored). Their position
+is preserved; `N/A` is a single partner even with slash fusion notation. For
+`.::OR4N2` or `OR4N2::.`, only OR4N2 is annotated. All-placeholder inputs
+(including a bare `.`) produce no gene annotations. The existing `warnings` list
+explains intergenic inputs alongside other input caveats. Exact-pair fusion
+evidence has `retrieval_status: "skipped"` with an explanatory interpretation,
+because there is no two-gene pair to search; named-gene partner precedent remains
+available.
+
 Every endpoint that takes genes or fusions (`/v1/genes/...`, `/v1/annotate`,
 `/v1/annotate/jobs`, `/v1/annotate/gene`, `/v1/fusion-evidence/jobs`) accepts,
 alone or as either fusion partner:

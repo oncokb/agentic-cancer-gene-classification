@@ -111,6 +111,8 @@ async def test_resolve_gene_uses_hgnc_search_after_fetch_miss():
                         "docs": [
                             {
                                 "symbol": "NEW",
+                                # A renamed gene must explicitly list the submitted old symbol.
+                                "prev_symbol": ["OLD"],
                                 "hgnc_id": "HGNC:1",
                             }
                         ]

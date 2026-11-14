@@ -718,3 +718,40 @@ def test_tumor_type_and_notation_warnings_are_both_returned(client, monkeypatch,
     assert {annotation["cache_status"] for annotation in result["annotations"]} == (
         {"reused"} if reused else {None}
     )
+
+
+@pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
+@pytest.mark.parametrize("fusion", [".::.", ".", ".::ALK", "ALK::.", "N/A::ALK"])
+def test_intergenic_api_warnings_and_annotations(client, fake_hgnc, path, fusion):
+    handler = fake_hgnc()
+    result = _annotation_result(client, path, {"fusions": [fusion]})
+    assert [row["gene"] for row in result["annotations"]] == (["ALK"] if "ALK" in fusion else [])
+    assert any("intergenic" in warning for warning in result["warnings"])
+    assert all(request == "/fetch/symbol/ALK" for request in handler.requests)
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_intergenic_separate_partners(client, first):
+    partners = [".", "ALK"] if first else ["ALK", "."]
+    result = _annotation_result(client, "/v1/annotate", {"fusions": [{"gene1": partners[0], "gene2": partners[1]}]})
+    assert [row["gene"] for row in result["annotations"]] == ["ALK"]
+    assert any("intergenic" in warning for warning in result["warnings"])
+
+
+@pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
+def test_intergenic_warnings_combine_with_other_input_warnings(client, monkeypatch, path):
+    async def ensembl_ids(symbols, _client):
+        return {symbol: _resolved("ALK", ensembl_transcript_id=symbol) for symbol in symbols}
+
+    monkeypatch.setattr("src.pipeline.normalization._resolve_ensembl_ids", ensembl_ids)
+    result = _annotation_result(client, path, {"fusions": [
+        {"fusion": ".::ALK", "tumor_type": "LUAD"},
+        {"fusion": "ALK::.", "tumor_type": "AML"},
+        "EWSR1-FLI1",
+        "ENST00000389048:c.12A>G::.",
+    ]})
+    warnings = result["warnings"]
+    assert any("intergenic" in warning for warning in warnings)
+    assert any("ignored tumor types" in warning for warning in warnings)
+    assert _EWSR1_FLI1_WARNING in warnings
+    assert any("variant-level interpretation" in warning for warning in warnings)

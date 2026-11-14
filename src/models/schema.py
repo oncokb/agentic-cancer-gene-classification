@@ -192,9 +192,10 @@ class FusionEvidenceResult(BaseModel):
             "A subset of pmids; may include papers without an evidence card."
         ),
     )
-    retrieval_status: Literal["ok", "failed"] = Field(
+    retrieval_status: Literal["ok", "failed", "skipped"] = Field(
         default="ok",
         description=(
+            "skipped for intergenic breakpoints with no two-gene pair; "
             "failed when exact-pair retrieval raised an error. An empty failed result is not "
             "evidence of missing literature, and its literature_scope is null."
         ),

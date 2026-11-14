@@ -325,7 +325,7 @@ function testRetractionUnavailableCacheBadge() {
   assert.strictEqual(badge.innerHTML, "");
 }
 
-const tests = [testPartialLookupSectionsAndPrompt, testRetractionUnavailableCacheBadge, testSectioningAndOrder, testSectionedCardShowsSubmittedInputNote, testEmptySectionsOmitted,
+const tests = [testIntergenicEvidenceDisplay, testPartialLookupSectionsAndPrompt, testRetractionUnavailableCacheBadge, testSectioningAndOrder, testSectionedCardShowsSubmittedInputNote, testEmptySectionsOmitted,
   testSidebarNavigationAndActiveTracking, testActiveTrackingAcrossObserverBatches,
   testHighlightsAndSafeCardContent, testSharedPmidCountAndFutureScopes,
   testExpansionPersistsAndResetsForNewResults, testResultsAndNoResultSidebarUnchanged];
@@ -334,3 +334,24 @@ for (const test of tests) {
   console.log(`PASS ${test.name}`);
 }
 console.log(`${tests.length} fusion evidence frontend test functions passed`);
+
+function testIntergenicEvidenceDisplay() {
+  for (const fusion of [".::OR4N2", "OR4N2::.", "N/A/OR4N2", "OR4N2/N/A", ".::."]) {
+    const sandbox = app();
+    sandbox.renderFusionEvidenceView([{
+      fusion, retrieval_status: "skipped", literature_scope: null, pmids: [],
+      interpretation: "Exact-pair evidence skipped: intergenic breakpoint.",
+    }]);
+    const text = allText(sandbox.elements.resultsWindow);
+    assert(text.includes("Exact-pair search skipped (1)"));
+    assert(text.includes("intergenic breakpoint"));
+    assert(!text.includes("Lookup failed"));
+    assert(!text.includes("No literature found"));
+    const queries = walk(sandbox.elements.resultsWindow).filter((node) => hasClass(node, "fusion-partner-query-list"));
+    assert.strictEqual(queries.length, fusion === ".::." ? 0 : 1);
+    if (queries.length) {
+      assert.strictEqual(queries[0].children.length, 1);
+      assert(allText(queries[0]).includes("OR4N2"));
+    }
+  }
+}

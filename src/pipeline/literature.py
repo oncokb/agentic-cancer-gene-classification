@@ -47,6 +47,7 @@ from src.pipeline.normalization import (
     has_accession_identifier,
     read_gene_input,
     resolve_gene,
+    is_intergenic_partner,
     split_fusion,
 )
 from src.pipeline.cache import cached_call
@@ -1023,6 +1024,17 @@ async def retrieve_fusion_evidence(
     force_refresh: bool = False,
 ) -> FusionEvidenceResult:
     """Return deterministic fusion-level PubMed evidence for exact gene-pair queries."""
+    five_prime, three_prime = split_fusion(fusion)
+    if any(is_intergenic_partner(partner) for partner in (five_prime, three_prime) if partner):
+        return FusionEvidenceResult(
+            fusion=fusion,
+            tumor_type=tumor_type,
+            retrieval_status="skipped",
+            interpretation=(
+                "Exact-pair evidence was skipped: an intergenic breakpoint has no gene partner, "
+                "so no two-gene pair exists."
+            ),
+        )
     submitted = fusion
     if has_accession_identifier(fusion):
         # PubMed knows symbols, not Ensembl IDs or RefSeq accessions: query the resolved pair.
