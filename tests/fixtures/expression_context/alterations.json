@@ -1,0 +1,162 @@
+{
+  "EGFR": {
+    "oncotree_code": "GBM",
+    "alterations": {
+      "alteration_types_enriched": [
+        "Point Mutation",
+        "Structural Variant",
+        "Copy Number Alteration"
+      ],
+      "categories": {
+        "Point Mutation": {
+          "status": "enriched",
+          "reason": null,
+          "n_profiled": 149,
+          "n_events": 24,
+          "frequency": 0.1610738255033557,
+          "rest_n_events": 52,
+          "rest_n_profiled": 8743,
+          "rest_frequency": 0.005947615235045179,
+          "ratio": 27.082085699535362,
+          "p_value": 6.475040563511692e-25,
+          "q_value": 1.0360064901618707e-23,
+          "direction": null
+        },
+        "Structural Variant": {
+          "status": "enriched",
+          "reason": null,
+          "n_profiled": 152,
+          "n_events": 9,
+          "frequency": 0.05921052631578947,
+          "rest_n_events": 16,
+          "rest_n_profiled": 9286,
+          "rest_frequency": 0.0017230239069567091,
+          "ratio": 34.364309210526315,
+          "p_value": 9.425285291993768e-11,
+          "q_value": 3.0160912934380056e-09,
+          "direction": null
+        },
+        "Copy Number Alteration": {
+          "status": "enriched",
+          "reason": null,
+          "n_profiled": 148,
+          "n_events": 74,
+          "frequency": 0.5,
+          "rest_n_events": 265,
+          "rest_n_profiled": 9374,
+          "rest_frequency": 0.02826968209942394,
+          "ratio": 17.68679245283019,
+          "p_value": 4.508973391464431e-69,
+          "q_value": 1.442871485268618e-67,
+          "direction": "amp",
+          "enriched_directions": [
+            "amp"
+          ],
+          "amp": {
+            "n_events": 74,
+            "frequency": 0.5,
+            "rest_n_events": 265,
+            "rest_n_profiled": 9374,
+            "rest_frequency": 0.02826968209942394,
+            "ratio": 17.68679245283019,
+            "p_value": 4.508973391464431e-69,
+            "q_value": 1.442871485268618e-67,
+            "enriched": true
+          },
+          "del": {
+            "n_events": 0,
+            "frequency": 0.0,
+            "rest_n_events": 10,
+            "rest_n_profiled": 9374,
+            "rest_frequency": 0.0010667804565820354,
+            "ratio": 0.0,
+            "p_value": 1.0,
+            "q_value": 1.0,
+            "enriched": false
+          },
+          "allowed_directions": [
+            "amp"
+          ]
+        }
+      }
+    }
+  },
+  "KRAS": {
+    "oncotree_code": "PAAD",
+    "alterations": {
+      "alteration_types_enriched": [
+        "Point Mutation"
+      ],
+      "categories": {
+        "Point Mutation": {
+          "status": "enriched",
+          "reason": null,
+          "n_profiled": 171,
+          "n_events": 109,
+          "frequency": 0.6374269005847953,
+          "rest_n_events": 485,
+          "rest_n_profiled": 8721,
+          "rest_frequency": 0.05561288843022589,
+          "ratio": 11.461855670103093,
+          "p_value": 3.2661228808654784e-87,
+          "q_value": 5.2257966093847654e-86,
+          "direction": null
+        },
+        "Structural Variant": {
+          "status": "insufficient_data",
+          "reason": "0 fusion events < 3; too rare to call not enriched",
+          "n_profiled": 172,
+          "n_events": 0,
+          "frequency": 0.0,
+          "rest_n_events": 2,
+          "rest_n_profiled": 9266,
+          "rest_frequency": 0.0002158428663932657,
+          "ratio": 0.0,
+          "p_value": 1.0,
+          "q_value": 1.0,
+          "direction": null
+        },
+        "Copy Number Alteration": {
+          "status": "not_enriched",
+          "reason": "amp: q=0.527 >= 0.05; ratio=1.67 < 2.0 | del: not called: oncogene role allows amplification only",
+          "n_profiled": 176,
+          "n_events": 7,
+          "frequency": 0.03977272727272727,
+          "rest_n_events": 222,
+          "rest_n_profiled": 9346,
+          "rest_frequency": 0.023753477423496684,
+          "ratio": 1.6743959868959868,
+          "p_value": 0.13185523923656986,
+          "q_value": 0.5274209569462794,
+          "direction": "amp",
+          "enriched_directions": [],
+          "amp": {
+            "n_events": 7,
+            "frequency": 0.03977272727272727,
+            "rest_n_events": 222,
+            "rest_n_profiled": 9346,
+            "rest_frequency": 0.023753477423496684,
+            "ratio": 1.6743959868959868,
+            "p_value": 0.13185523923656986,
+            "q_value": 0.5274209569462794,
+            "enriched": false
+          },
+          "del": {
+            "n_events": 0,
+            "frequency": 0.0,
+            "rest_n_events": 10,
+            "rest_n_profiled": 9346,
+            "rest_frequency": 0.0010699764605178687,
+            "ratio": 0.0,
+            "p_value": 1.0,
+            "q_value": 1.0,
+            "enriched": false
+          },
+          "allowed_directions": [
+            "amp"
+          ]
+        }
+      }
+    }
+  }
+}

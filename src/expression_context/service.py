@@ -656,6 +656,7 @@ class ExpressionContextService:
                     study_id=cancer_type.study_id if cancer_type else None,
                     tumor_type_query=cancer_type.tumor_type_query if cancer_type else None,
                     stats=stats,
+                    alterations=stats.alterations,
                     stats_pass=passes,
                     enrichment=stats.enrichment_label,
                     broad_blocked=stats.broad_blocked,

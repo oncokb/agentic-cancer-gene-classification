@@ -8,13 +8,14 @@ requires; ``schema_version`` is checked by the bundle loader before parsing.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from dataclasses import dataclass
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SUPPORTED_SCHEMA_VERSION = "1"
 # Method versions this module understands. m3 only adds optional fields, so
@@ -123,6 +124,58 @@ class GeneRef(_Artifact):
     entrez_gene_id: Optional[int] = None
 
 
+ALLOWED_ALTERATION_TYPES = (
+    "Point Mutation", "Structural Variant", "Expression", "Copy Number Alteration",
+)
+AlterationType = Literal[
+    "Point Mutation", "Structural Variant", "Expression", "Copy Number Alteration"
+]
+
+
+class AlterationCounts(_Artifact):
+    n_profiled: Optional[int] = None
+    n_events: Optional[int] = None
+    frequency: Optional[float] = None
+    enriched: Optional[bool] = None
+
+
+class AlterationCategory(AlterationCounts):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    status: Optional[str] = None
+    reason: Optional[str] = None
+    direction: Optional[str] = None
+    enriched_directions: List[str] = Field(default_factory=list)
+    amp: Optional[AlterationCounts] = None
+    del_: Optional[AlterationCounts] = Field(default=None, alias="del")
+
+
+class Alterations(_Artifact):
+    alteration_types_enriched: List[AlterationType] = Field(default_factory=list)
+    categories: Dict[AlterationType, AlterationCategory] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def known_categories(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        categories = value.get("categories") or {}
+        enriched = value.get("alteration_types_enriched") or []
+        for name in set(categories) | set(enriched):
+            if name not in ALLOWED_ALTERATION_TYPES:
+                logging.getLogger(__name__).warning("Ignoring unknown alteration category %r", name)
+        return {
+            **value,
+            "categories": {k: v for k, v in categories.items() if k in ALLOWED_ALTERATION_TYPES},
+            "alteration_types_enriched": [
+                k for k in ALLOWED_ALTERATION_TYPES
+                if k in enriched and (
+                    k not in categories or categories[k].get("status") == "enriched"
+                )
+            ],
+        }
+
+
 class CancerTypeStats(_Artifact):
     """One (gene, cancer type) row of a gene file.
 
@@ -130,6 +183,8 @@ class CancerTypeStats(_Artifact):
     n == 0 or the test can't run) and for the pre-check fields when the
     pre-check was not run (stats_pass false, or a skip mode).
     """
+
+    alterations: Optional[Alterations] = None
 
     oncotree_code: str  # TCGA PanCancer cohort code, e.g. BRCA, COADREAD, GBM
     n: int
@@ -437,6 +492,7 @@ class BundleStatus(BaseModel):
 
 
 class PairStatsView(BaseModel):
+    alterations: Optional[Alterations] = None
     oncotree_code: str
     cancer_type_name: Optional[str] = None
     study_id: Optional[str] = None

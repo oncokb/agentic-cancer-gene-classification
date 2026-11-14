@@ -17,6 +17,28 @@ Given a gene, surface only the (gene, cancer type) pairs where:
 Each surfaced pair shows the statistics and the supporting citations side by
 side, in the API and on the "Expression stats" page.
 
+Optional per-cohort `alterations` (contract 1.2+, including live contract 1.4)
+are detail only: they never change surfacing, statistics passes, confidence tiers,
+literature eligibility, exclusion reasons, history counts, exported cancer types,
+or exported PMIDs. `gene_view` remains the single source for surfacing.
+The `/stats` and `/genes` responses include this detail in each pair's `stats`;
+`PairStatsView` also exposes `alterations` directly.
+
+The page's Alterations column shows enriched Point Mutation, Structural Variant,
+and Copy Number Alteration badges, including CNA amplification (`amp`) / deep
+deletion (`del`) directions. Details lists each category's status, events/profiled,
+frequency and reason, plus both CNA directions where available. This applies to
+candidate and excluded rows in All cancer types too. Missing older-release data
+shows no detail; undefined counts stay undefined. Unknown category names are
+ignored and logged when loading, so they cannot enter exports.
+
+Per-pair CSV adds `alteration_types_enriched` immediately after `enrichment_label`,
+with allowed enriched names joined by `, `. The golden-set CSV has one cell per
+gene in `Relevant alteration type(s)`: the deduplicated union of Expression and
+enriched categories over **surfaced pairs only**, ordered Point Mutation,
+Structural Variant, Expression, Copy Number Alteration. Zero surfaced pairs gives
+an empty cell. Neither export changes which pairs or citations are included.
+
 ## Architecture
 
 ```
