@@ -524,3 +524,47 @@ def test_budget_expiry_after_request_saves_count_and_next_build_resumes(tmp_path
     assert len(requests) == 1  # the resumed build uses the committed count
     assert "precheck_expires_at" in result["source"]
     assert "precheck_incomplete" not in result["source"]
+
+
+@pytest.mark.parametrize("query_invalid", [True, False])
+def test_ncbi_errors_build_unavailable_or_incomplete(tmp_path, monkeypatch, query_invalid):
+    import io
+    import sqlite3
+
+    from gene_expression_relevance import precheck
+
+    real_count = precheck.Precheck.count
+    test_build_contract_and_precheck_gating(tmp_path, monkeypatch, True, None)
+    monkeypatch.setattr(precheck.Precheck, "count", real_count)
+    monkeypatch.setattr(precheck.http.time, "sleep", lambda _: None)
+    calls = []
+
+    def open_url(request, **kwargs):
+        calls.append(1)
+        error = "Query syntax error" if query_invalid else "Search backend unavailable"
+        return io.BytesIO(json.dumps({"esearchresult": {"ERROR": error}}).encode())
+
+    monkeypatch.setattr(precheck.http, "urlopen", open_url)
+    out, cache = tmp_path / "site", tmp_path / "cache"
+    previous = (out / "v1/manifest.json").read_bytes()
+    if query_invalid:
+        builder.build("a" * 40, out, cache)
+        alb = json.loads((out / "v1/genes/ALB.json").read_text())
+        hit = alb["cancer_types"][0]
+        assert hit["stats_pass"]
+        assert hit["pubmed_count"] is None
+        assert hit["literature_precheck_pass"] is None
+        jsonschema.validate(alb, SCHEMAS["gene"])
+        assert (out / "v1/genes/TP53.json").exists()
+    else:
+        with pytest.raises(precheck.PrecheckFailed, match=r"ALB\|LIHC.*incomplete"):
+            builder.build("a" * 40, out, cache)
+        assert (out / "v1/manifest.json").read_bytes() == previous
+        report = json.loads((tmp_path / "site-incomplete/precheck-report.json").read_text())
+        assert report["status"] == "incomplete"
+        assert "ALB|LIHC" in report["reason"]
+        manifest = json.loads((tmp_path / "site-incomplete/manifest.json").read_text())
+        assert manifest["source"]["precheck_incomplete"] is True
+    assert len(calls) == 4
+    with sqlite3.connect(cache / "pubmed.sqlite3") as db:
+        assert db.execute("SELECT * FROM counts").fetchall() == []

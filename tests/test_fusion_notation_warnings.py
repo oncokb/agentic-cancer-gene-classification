@@ -718,3 +718,89 @@ def test_tumor_type_and_notation_warnings_are_both_returned(client, monkeypatch,
     assert {annotation["cache_status"] for annotation in result["annotations"]} == (
         {"reused"} if reused else {None}
     )
+
+
+@pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
+@pytest.mark.parametrize("fusion", [".::.", ".", ".::ALK", "ALK::.", "N/A::ALK"])
+def test_intergenic_api_warnings_and_annotations(client, fake_hgnc, path, fusion):
+    handler = fake_hgnc()
+    result = _annotation_result(client, path, {"fusions": [fusion]})
+    assert [row["gene"] for row in result["annotations"]] == (["ALK"] if "ALK" in fusion else [])
+    assert any("intergenic" in warning for warning in result["warnings"])
+    assert all(request == "/fetch/symbol/ALK" for request in handler.requests)
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_intergenic_separate_partners(client, first):
+    partners = [".", "ALK"] if first else ["ALK", "."]
+    result = _annotation_result(client, "/v1/annotate", {"fusions": [{"gene1": partners[0], "gene2": partners[1]}]})
+    assert [row["gene"] for row in result["annotations"]] == ["ALK"]
+    assert any("intergenic" in warning for warning in result["warnings"])
+
+
+@pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
+def test_intergenic_warnings_combine_with_other_input_warnings(client, monkeypatch, path):
+    async def ensembl_ids(symbols, _client):
+        return {symbol: _resolved("ALK", ensembl_transcript_id=symbol) for symbol in symbols}
+
+    monkeypatch.setattr("src.pipeline.normalization._resolve_ensembl_ids", ensembl_ids)
+    result = _annotation_result(client, path, {"fusions": [
+        {"fusion": ".::ALK", "tumor_type": "LUAD"},
+        {"fusion": "ALK::.", "tumor_type": "AML"},
+        "EWSR1-FLI1",
+        "ENST00000389048:c.12A>G::.",
+    ]})
+    warnings = result["warnings"]
+    assert any("intergenic" in warning for warning in warnings)
+    assert any("ignored tumor types" in warning for warning in warnings)
+    assert _EWSR1_FLI1_WARNING in warnings
+    assert any("variant-level interpretation" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("value", [".", "-", "NA", "N/A", "intergenic", "?", ".::."])
+@pytest.mark.parametrize("path", ["/v1/annotate/gene", "/v1/genes/query", "/v1/genes/query/jobs", "/v1/genes/{}"])
+def test_gene_only_endpoints_reject_placeholders_before_pipeline_or_save(client, monkeypatch, value, path):
+    from unittest.mock import AsyncMock
+    from urllib.parse import quote
+
+    pipeline = AsyncMock(side_effect=AssertionError("Must reject before pipeline"))
+    monkeypatch.setattr(main, "run_pipeline", pipeline)
+    store = main.app.state.run_store
+    if "{}" in path:
+        # A literal dot is URL-normalized away; percent-encode it explicitly.
+        symbol = "%2E" if value == "." else quote(value, safe="")
+        response = client.get(path.format(symbol))
+    else:
+        payload = {"gene": value} if path == "/v1/annotate/gene" else {"genes": [value]}
+        response = client.post(path, json=payload)
+    # Slash is a path separator even when URL-encoded; use the POST counterpart
+    # for N/A, as the GET symbol route does not accept embedded slashes.
+    assert response.status_code == (404 if value == "N/A" and "{}" in path else 422), response.text
+    if response.status_code == 422:
+        assert "intergenic placeholder" in response.text
+    pipeline.assert_not_awaited()
+    assert store.saved_runs == []
+
+
+def test_all_placeholder_fusion_evidence_job_is_skipped(client):
+    response = client.post("/v1/fusion-evidence/jobs", json={"fusions": [".::."]})
+    assert response.status_code == 200
+    deadline = time.monotonic() + 5
+    while True:
+        job = client.get(response.json()["status_url"]).json()
+        if job["status"] in ("complete", "failed") or time.monotonic() > deadline:
+            break
+        time.sleep(0.01)
+    assert job["status"] == "complete", job
+    assert job["fusion_evidence"][0]["retrieval_status"] == "skipped"
+    assert main.app.state.run_store.saved_runs == []
+
+
+@pytest.mark.parametrize("fusion", ["--", "::"])
+@pytest.mark.parametrize("path", ["/v1/annotate", "/v1/annotate/jobs"])
+def test_separator_only_batch_has_no_annotations_and_explains_why(client, fake_hgnc, fusion, path):
+    handler = fake_hgnc()
+    result = _annotation_result(client, path, {"fusions": [fusion]})
+    assert result["annotations"] == []
+    assert any("no gene partners" in warning and "nothing to annotate" in warning for warning in result["warnings"])
+    assert handler.requests == []

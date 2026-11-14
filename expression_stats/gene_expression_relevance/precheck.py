@@ -2,12 +2,15 @@
 
 import hashlib
 import json
+import logging
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 
 from . import PARAMS, http
@@ -19,6 +22,46 @@ RUNTIME_SETTINGS_PATH = Path(__file__).resolve().parents[1] / "runtime-settings.
 
 class PrecheckBudgetExceeded(TimeoutError):
     """Incomplete build; committed SQLite counts are safe to resume next run."""
+
+
+class PrecheckFailed(RuntimeError):
+    """NCBI retries exhausted; successful counts remain safe to resume."""
+
+
+def esearch_count(result):
+    """Reject embedded errors even when NCBI also supplies a count.
+
+    errorlist/warninglist may accompany legitimate zero hits and are not errors.
+    Keep this detector local: expression_stats must not depend on the app.
+    """
+    search = result.get("esearchresult") if isinstance(result, dict) else None
+    for container in (result, search):
+        if isinstance(container, dict):
+            for key in ("error", "ERROR"):
+                if container.get(key):
+                    raise http.InvalidJSONResponse(str(container[key]))
+    count = search.get("count") if isinstance(search, dict) else None
+    if isinstance(count, bool) or not (
+        isinstance(count, int)
+        and count >= 0
+        or isinstance(count, str)
+        and re.fullmatch(r"[0-9]+", count)
+    ):
+        raise http.InvalidJSONResponse("Missing or non-integer esearch count")
+    return int(count)
+
+
+def query_error(message):
+    # Be conservative: backend/search errors and unknown messages must fail closed.
+    return bool(
+        re.search(
+            r"syntax error|(?:invalid|malformed|cannot parse|failed to parse) (?:query|term)"
+            r"|(?:query|term) (?:syntax|parse|parsing) error|invalid (?:search )?field"
+            r"|empty term and query_key",
+            message,
+            re.IGNORECASE,
+        )
+    ) and not re.search(r"rate limit|server|backend|temporar", message, re.IGNORECASE)
 
 
 class Precheck:
@@ -142,12 +185,43 @@ class Precheck:
         )
         if self.api_key:
             params["api_key"] = self.api_key
-        result = http.get_json(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?" + urlencode(params),
-            before=self.throttle,
-            remaining=self.remaining,
-        )
-        count = int(result["esearchresult"]["count"])
+        attempts, errors = 4, []
+
+        def validate(result):
+            try:
+                esearch_count(result)
+            except http.InvalidJSONResponse as exc:
+                errors.append(str(exc))
+                raise
+
+        try:
+            result = http.get_json(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?" + urlencode(params),
+                before=self.throttle,
+                remaining=self.remaining,
+                validate=validate,
+                attempts=attempts,
+            )
+            count = esearch_count(result)
+        except (
+            http.InvalidJSONResponse,
+            json.JSONDecodeError,
+            HTTPError,
+            URLError,
+            TimeoutError,
+        ) as exc:
+            if isinstance(exc, PrecheckBudgetExceeded):
+                raise
+            if len(errors) == attempts and len(set(errors)) == 1 and query_error(errors[0]):
+                logging.getLogger(__name__).warning(
+                    "PubMed precheck unavailable for %s: deterministic query error", key
+                )
+                return None
+            # Do not echo the URL or raw body: NCBI errors can include the API key.
+            raise PrecheckFailed(
+                f"PubMed precheck failed for {key}: NCBI retries exhausted; "
+                "build incomplete, resume cache"
+            ) from None
         with self.lock:
             self.cache[key] = dict(query=term, count=count, fetched_at=self.wall_clock())
             with self.db:

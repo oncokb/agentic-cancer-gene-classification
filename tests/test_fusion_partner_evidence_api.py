@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
 from fastapi.testclient import TestClient
 
 from src import main
@@ -77,3 +80,16 @@ def test_fusion_partner_evidence_rejects_blank_gene():
     response = client.post("/v1/fusion-partner-evidence", json={"gene": "  "})
 
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize("gene", [".", "-", "NA", "N/A", "intergenic", "?", " na ", " INTERGENIC "])
+def test_fusion_partner_evidence_rejects_placeholders_before_pubmed(monkeypatch, gene):
+    lookup = AsyncMock(side_effect=AssertionError("No literature lookup should run"))
+    search = AsyncMock(side_effect=AssertionError("No PubMed query should run"))
+    monkeypatch.setattr(main, "retrieve_fusion_partner_evidence", lookup)
+    monkeypatch.setattr("src.pipeline.literature._esearch", search)
+    response = TestClient(main.app).post("/v1/fusion-partner-evidence", json={"gene": gene})
+    assert response.status_code == 422
+    assert "intergenic placeholder" in response.text
+    lookup.assert_not_awaited()
+    search.assert_not_awaited()

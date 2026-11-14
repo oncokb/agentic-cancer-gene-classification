@@ -403,3 +403,10 @@ def test_redis_dedupe_pipeline_failure_drops_batch(client, monkeypatch):
     assert not any(":event:" in key for key in redis.values)
     redis.fail_dedupe = False
     assert send(client, [item]).json()["accepted"] == 1
+
+
+@pytest.mark.parametrize("subject_id", ["TP53--BRAF", "TP53/BRAF", "TP53:: BRAF", " TP53::BRAF", "TP53::BRAF::ALK"])
+def test_fusion_subject_id_requires_strict_symbol_double_colon_symbol(client, subject_id):
+    response = send(client, [event(subject_kind="fusion", subject_id=subject_id)])
+    assert response.status_code == 202
+    assert response.json() == {"accepted": 0, "rejected": 1, "duplicates": 0}

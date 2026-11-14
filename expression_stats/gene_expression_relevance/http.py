@@ -8,12 +8,16 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-def request(url, *, data=None, headers=None, before=None, attempts=4, remaining=None):
+class InvalidJSONResponse(ValueError):
+    """A JSON response failed validation and can be retried."""
+
+
+def request(url, *, data=None, headers=None, before=None, attempts=4, remaining=None, read=None):
     for attempt in range(attempts):
         if before:
             before()
         try:
-            return urlopen(
+            response = urlopen(
                 Request(
                     url,
                     data=data,
@@ -21,7 +25,17 @@ def request(url, *, data=None, headers=None, before=None, attempts=4, remaining=
                 ),
                 timeout=min(120, remaining()) if remaining else 120,
             )
-        except (HTTPError, URLError, TimeoutError) as exc:
+            if read:
+                with response:
+                    return read(response)
+            return response
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            InvalidJSONResponse,
+            json.JSONDecodeError,
+        ) as exc:
             if isinstance(exc, HTTPError) and exc.code not in (408, 429, 500, 502, 503, 504):
                 raise
             if attempt == attempts - 1:
@@ -37,9 +51,14 @@ def request(url, *, data=None, headers=None, before=None, attempts=4, remaining=
                 remaining()
 
 
-def get_json(url, **kwargs):
-    with request(url, **kwargs) as response:
-        return json.load(response)
+def get_json(url, *, validate=None, **kwargs):
+    def read(response):
+        result = json.load(response)
+        if validate:
+            validate(result)
+        return result
+
+    return request(url, read=read, **kwargs)
 
 
 def download(url, target, *, headers=None):

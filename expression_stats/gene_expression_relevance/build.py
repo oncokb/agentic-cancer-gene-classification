@@ -4,7 +4,7 @@ import json
 import shutil
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,7 +26,7 @@ from .controls import require_passed
 from .fetch import digest, fetch_all
 from .genes import gene_catalog, hgnc, hgnc_path
 from .mapping import cancer_mapping
-from .precheck import Precheck, PrecheckBudgetExceeded
+from .precheck import Precheck, PrecheckBudgetExceeded, PrecheckFailed
 from .provenance import (
     build_fingerprint,
     code_fingerprint,
@@ -292,17 +292,23 @@ def build(
                             queries[record["oncotree_code"]],
                         )
                         record["pubmed_count"] = count
-                        record["literature_precheck_pass"] = count >= PARAMS["precheck_min_pmids"]
+                        record["literature_precheck_pass"] = (
+                            count >= PARAMS["precheck_min_pmids"] if count is not None else None
+                        )
                 write_json(path, artifact)
 
             pool = None
             try:
                 precheck.start_budget(build_deadline=started + precheck.build_time_budget_seconds)
                 pool = ThreadPoolExecutor(max_workers=8)
-                for _ in pool.map(check_gene, sorted((staging / "v1" / "genes").glob("*.json"))):
-                    pass
+                futures = [
+                    pool.submit(check_gene, path)
+                    for path in sorted((staging / "v1" / "genes").glob("*.json"))
+                ]
+                for future in as_completed(futures):
+                    future.result()
                 precheck.remaining()
-            except PrecheckBudgetExceeded as exc:
+            except (PrecheckBudgetExceeded, PrecheckFailed) as exc:
                 precheck.stop()
                 manifest["source"]["precheck_incomplete"] = True
                 incomplete = out.with_name(out.name + "-incomplete")
