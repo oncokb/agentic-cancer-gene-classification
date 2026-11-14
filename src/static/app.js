@@ -2377,10 +2377,12 @@ function renderEmptyState(title, body) {
   cancelOpenEvidenceCardLoads({ abort: false });
   const empty = document.createElement("div");
   empty.className = "empty-state";
-  empty.innerHTML = `
-    <h3>${escapeHtml(title)}</h3>
-    <p>${escapeHtml(body)}</p>
-  `;
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  const message = document.createElement("p");
+  message.textContent = body;
+  empty.appendChild(heading);
+  empty.appendChild(message);
   elements.resultsWindow.replaceChildren(empty);
   rebuildGeneIndex([]);
 }
@@ -2547,7 +2549,7 @@ function renderAnnotationResult(result) {
   if (!allAnnotations.length) {
     renderEmptyState(
       result.run_error ? "Run stopped" : "No results",
-      result.run_error || "No gene annotations were returned.",
+      [result.run_error || "No gene annotations were returned.", ...(result.warnings || [])].join(" "),
     );
     return;
   }
@@ -2972,7 +2974,7 @@ function renderFusionEvidenceCard(item) {
   if (inputNote) heading.appendChild(inputNote);
   const meta = appendFusionText(header, "div", "annotation-card-meta");
   const key = fusionEvidenceKey(item);
-  if (state.canModifyRun) {
+  if (state.canModifyRun && item.retrieval_status !== "skipped") {
     const rerunning = state.fusionEvidenceStatus === "running" && state.rerunningFusionEvidenceKey === key;
     const rerun = appendFusionText(meta, "button", "rerun-fusion-evidence", rerunning ? "Re-running..." : "Re-run");
     rerun.type = "button";
@@ -4006,15 +4008,34 @@ function renderOpenEvidenceCard(annotation, displayPosition = null) {
 // gene with insufficient_evidence; never fired automatically)
 // ---------------------------------------------------------------------------
 
+function isIntergenicPartner(gene) {
+  return [".", "-", "NA", "N/A", "INTERGENIC", "?"].includes(gene.trim().toUpperCase()) || /^-+$/.test(gene.trim());
+}
+
 function splitFusionGenes(fusion) {
-  if (fusion.trim().startsWith("---")) return ["-", fusion.trim().slice(3).trim()];
-  const separators = /(?<![A-Za-z0-9])N\/A(?![A-Za-z0-9])|::|--|\//gi;
-  for (const match of fusion.matchAll(separators)) {
-    if (match[0].toUpperCase() !== "N/A") {
-      return [fusion.slice(0, match.index).trim(), fusion.slice(match.index + match[0].length).trim()];
-    }
+  const parts = [];
+  let start = 0;
+  const leading = fusion.match(/^\s*(-{3,})(::|\/)?/);
+  if (leading) {
+    parts.push(leading[2] ? leading[1] : leading[1].slice(0, -2));
+    start = leading[0].length;
   }
-  return [];
+  // Keep the existing multi-part UI behavior, consuming N/A before slashes.
+  const separators = /(?<![A-Za-z0-9])N\/A(?![A-Za-z0-9])|::|--|\//gi;
+  const offset = start;
+  for (const match of fusion.slice(offset).matchAll(separators)) {
+    if (match[0].toUpperCase() === "N/A") continue;
+    const index = offset + match.index;
+    if (index < start) continue;
+    if (isIntergenicPartner(fusion.slice(start))) break;
+    // match.index is relative to the original slice, not the growing cursor.
+    parts.push(fusion.slice(start, index).trim());
+    start = index + match[0].length;
+    while (start < fusion.length && ":-/".includes(fusion[start]) && !isIntergenicPartner(fusion.slice(start))) start += 1;
+  }
+  if (!parts.length) return [];
+  parts.push(fusion.slice(start).trim());
+  return parts.filter(Boolean);
 }
 
 function fusionPartnerGenes(annotation) {
@@ -4023,7 +4044,7 @@ function fusionPartnerGenes(annotation) {
   (annotation.fusions || []).forEach((fusion) => {
     splitFusionGenes(fusion).forEach((gene) => {
       const normalized = gene.trim().toUpperCase();
-      if (!normalized || [".", "-", "NA", "N/A", "INTERGENIC", "?"].includes(normalized) || normalized === annotation.gene || seen.has(normalized)) return;
+      if (!normalized || isIntergenicPartner(normalized) || normalized === annotation.gene || seen.has(normalized)) return;
       seen.add(normalized);
       partners.push(normalized);
     });
@@ -4255,7 +4276,7 @@ function renderFusionPartnerPrecedentForFusionEvidence(item) {
   const seen = new Set();
   splitFusionGenes(item.fusion || "").forEach((gene) => {
     const normalized = gene.trim().toUpperCase();
-    if (!normalized || [".", "-", "NA", "N/A", "INTERGENIC", "?"].includes(normalized) || seen.has(normalized)) return;
+    if (!normalized || isIntergenicPartner(normalized) || seen.has(normalized)) return;
     seen.add(normalized);
     partners.push(normalized);
   });

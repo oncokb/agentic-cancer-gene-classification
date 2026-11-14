@@ -91,7 +91,7 @@ INTERGENIC_PLACEHOLDERS = frozenset({".", "-", "NA", "N/A", "INTERGENIC", "?"})
 
 def is_intergenic_partner(value: str) -> bool:
     """Whether a partner names an intergenic breakpoint rather than a gene."""
-    return value.strip().upper() in INTERGENIC_PLACEHOLDERS
+    return value.strip().upper() in INTERGENIC_PLACEHOLDERS or bool(re.fullmatch(r"-+", value.strip()))
 
 
 def split_fusion(fusion: str) -> Tuple[str, Optional[str]]:
@@ -99,15 +99,43 @@ def split_fusion(fusion: str) -> Tuple[str, Optional[str]]:
     Split 'GENE1::GENE2' (or '--' / '/' delimited) into partner symbols.
     Returns (gene1, gene2). If no separator found, returns (fusion, None).
     """
-    # A leading '-' partner plus '--' separator starts with three dashes.
+    def after_separator_run(value: str, index: int) -> int:
+        while index < len(value) and value[index] in ":-/":
+            # A trailing dash run is a partner, not more separators.
+            if is_intergenic_partner(value[index:]):
+                break
+            index += 1
+        return index
+
+    # Consume a leading dash placeholder before the separator, including
+    # degenerate dash runs such as '---::ALK'; never manufacture '-ALK'.
     text = fusion.strip()
-    if text.startswith("---"):
-        return "-", text[3:].strip()
+    leading = re.match(r"^(-{3,})(::|/)?", text)
+    if leading:
+        dashes, separator = leading.groups()
+        if leading.end() == len(text) and not separator:
+            return text, None
+        end = after_separator_run(text, leading.end())
+        return (dashes if separator else dashes[:-2]), text[end:].strip()
     # Consume N/A as one token before considering slash separators.
     for match in FUSION_SEPARATORS.finditer(fusion):
         if match.group().upper() != "N/A":
-            return fusion[:match.start()].strip(), fusion[match.end():].strip()
+            end = after_separator_run(fusion, match.end())
+            first, second = fusion[:match.start()].strip(), fusion[end:].strip()
+            if end != match.end():
+                # Consecutive separators describe a missing breakpoint side,
+                # never a gene such as '::ALK'. Keep ordinary dangling forms.
+                return first or ".", second or "."
+            return first, second
     return fusion.strip(), None
+
+
+def reject_intergenic_gene_input(value: str) -> str:
+    """Reject no-gene submissions where an endpoint requires a gene."""
+    partners = [part for part in split_fusion(value) if part]
+    if partners and all(is_intergenic_partner(part) for part in partners):
+        raise ValueError(f'{value!r} is an intergenic placeholder, not a gene')
+    return value
 
 
 def split_input_tumor_types(

@@ -360,3 +360,29 @@ async def test_get_run_request_reads_only_the_request(rows, expected):
 
     assert await RunStore(FakePool(cursor)).get_run_request("run-1") == expected
     assert cursor.executed == [("SELECT request_json FROM runs WHERE run_id = %s", ("run-1",))]
+
+
+@pytest.mark.parametrize("placeholder", [".", "NA", "intergenic", ".::."])
+def test_rerun_rejects_historical_single_gene_placeholder_request(store, placeholder):
+    store.seed(ORIGINAL_ID, {"gene": placeholder})
+    with TestClient(main.app) as client:
+        _session(client)
+        response = client.post(f"/v1/runs/{ORIGINAL_ID}/rerun")
+    assert response.status_code == 422
+    assert "intergenic placeholder" in response.text
+    assert store.pipeline_calls == []
+    assert list(store.runs) == [ORIGINAL_ID]
+
+
+def test_rerun_all_placeholder_batch_retains_empty_result_warning(store, monkeypatch):
+    from src.pipeline.orchestrator import run_pipeline
+
+    store.seed(ORIGINAL_ID, {"fusions": [".::."]})
+    monkeypatch.setattr(main, "run_pipeline", run_pipeline)
+    with TestClient(main.app) as client:
+        _session(client)
+        _, job = _rerun(client)
+    assert job["result"]["annotations"] == []
+    assert any("intergenic" in warning for warning in job["result"]["warnings"])
+    assert len(store.runs) == 2
+    assert store.runs[job["result"]["run_id"]]["result"]["warnings"] == job["result"]["warnings"]

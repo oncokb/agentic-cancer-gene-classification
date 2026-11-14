@@ -23,7 +23,7 @@ def hgnc(monkeypatch):
     return requests
 
 
-@pytest.mark.parametrize("placeholder", PLACEHOLDERS + [" na ", " n/a ", " INTERGENIC "])
+@pytest.mark.parametrize("placeholder", PLACEHOLDERS + [" na ", " n/a ", " INTERGENIC ", "---"])
 @pytest.mark.parametrize("separator", ["::", "--", "/"])
 @pytest.mark.parametrize("first", [True, False])
 async def test_only_named_partner_is_resolved(placeholder, separator, first, hgnc):
@@ -70,7 +70,9 @@ async def test_direct_resolve_placeholder_makes_no_requests(symbol):
 
 
 @pytest.mark.parametrize("field", ["symbol", "alias_symbol", "prev_symbol", None])
-async def test_hgnc_search_requires_matching_identity(field):
+async def test_hgnc_search_guard_checks_symbol_and_synthetic_alias_metadata(field):
+    # Real HGNC search docs contain symbol/hgnc_id/score, not aliases. Extra
+    # metadata here tests the guard defensively; it does not model real alias resolution.
     doc = {"symbol": "MATCH", "alias_symbol": [], "prev_symbol": []}
     if field == "symbol":
         doc["symbol"] = "miX"
@@ -108,3 +110,54 @@ async def test_all_intergenic_evidence_is_skipped_without_cache_or_network(monke
     assert result.retrieval_status == "skipped"
     assert result.pmids == []
     lookup.assert_not_awaited()
+
+
+@pytest.mark.parametrize("fusion", [
+    ".::OR4N2", "OR4N2::.", "N/A/OR4N2", "intergenic::OR4N2",
+    "---OR4N2", "---::OR4N2", "----OR4N2", "OR4N2::---",
+    "--::OR4N2", "::::OR4N2", "---::::OR4N2",
+])
+def test_gene_literature_never_queries_or_scores_placeholder_partners(fusion):
+    from src.models.schema import LiteratureRecord
+
+    partners = literature._fusion_partners("OR4N2", [fusion])
+    assert partners == []
+    assert literature._fusion_partner_search_queries("OR4N2", [fusion], "LUAD") == ([], [])
+    record = LiteratureRecord(pmid="1", title="An unrelated paper.", abstract="N and A. intergenic -OR4N2.")
+    assert literature._fusion_cooccurrence_score(record, partners) is None
+
+
+def test_gene_literature_preserves_real_partner_query_and_boost():
+    from src.models.schema import LiteratureRecord
+
+    partners = literature._fusion_partners("OR4N2", ["ALK::OR4N2"])
+    assert partners == ["ALK"]
+    assert literature._fusion_partner_search_queries("OR4N2", ["ALK::OR4N2"], None)[0] == ['"OR4N2" AND "ALK"']
+    assert literature._fusion_cooccurrence_score(LiteratureRecord(pmid="1", title="ALK fusion", abstract=""), partners) == 1
+
+
+@pytest.mark.parametrize("fusion, expected", [
+    ("---::OR4N2", ("---", "OR4N2")),
+    ("--::OR4N2", (".", "OR4N2")),
+    ("::::OR4N2", (".", "OR4N2")),
+    (":::OR4N2", (".", "OR4N2")),
+    ("/---OR4N2", (".", "OR4N2")),
+    ("---::::OR4N2", ("---", "OR4N2")),
+    ("----OR4N2", ("--", "OR4N2")),
+    ("OR4N2::---", ("OR4N2", "---")),
+    ("ALK::BRAF::TP53", ("ALK", "BRAF::TP53")),
+])
+def test_degenerate_separators_do_not_manufacture_partners(fusion, expected):
+    assert normalization.split_fusion(fusion) == expected
+
+
+def test_standalone_alias_is_not_a_fusion_partner():
+    assert literature._fusion_partners("ALK", ["CD246"]) == []
+
+
+@pytest.mark.parametrize("fusion", ["---::OR4N2", "--::OR4N2", "::::OR4N2", "---::::OR4N2"])
+async def test_degenerate_separators_only_resolve_named_partner(fusion, hgnc):
+    result = await normalization.normalize_fusions([fusion])
+    assert list(result) == ["OR4N2"]
+    assert result.inputs[fusion].warnings
+    assert hgnc == ["/fetch/symbol/OR4N2"]

@@ -755,3 +755,42 @@ def test_intergenic_warnings_combine_with_other_input_warnings(client, monkeypat
     assert any("ignored tumor types" in warning for warning in warnings)
     assert _EWSR1_FLI1_WARNING in warnings
     assert any("variant-level interpretation" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("value", [".", "-", "NA", "N/A", "intergenic", "?", ".::."])
+@pytest.mark.parametrize("path", ["/v1/annotate/gene", "/v1/genes/query", "/v1/genes/query/jobs", "/v1/genes/{}"])
+def test_gene_only_endpoints_reject_placeholders_before_pipeline_or_save(client, monkeypatch, value, path):
+    from unittest.mock import AsyncMock
+    from urllib.parse import quote
+
+    pipeline = AsyncMock(side_effect=AssertionError("Must reject before pipeline"))
+    monkeypatch.setattr(main, "run_pipeline", pipeline)
+    store = main.app.state.run_store
+    if "{}" in path:
+        # A literal dot is URL-normalized away; percent-encode it explicitly.
+        symbol = "%2E" if value == "." else quote(value, safe="")
+        response = client.get(path.format(symbol))
+    else:
+        payload = {"gene": value} if path == "/v1/annotate/gene" else {"genes": [value]}
+        response = client.post(path, json=payload)
+    # Slash is a path separator even when URL-encoded; use the POST counterpart
+    # for N/A, as the GET symbol route does not accept embedded slashes.
+    assert response.status_code == (404 if value == "N/A" and "{}" in path else 422), response.text
+    if response.status_code == 422:
+        assert "intergenic placeholder" in response.text
+    pipeline.assert_not_awaited()
+    assert store.saved_runs == []
+
+
+def test_all_placeholder_fusion_evidence_job_is_skipped(client):
+    response = client.post("/v1/fusion-evidence/jobs", json={"fusions": [".::."]})
+    assert response.status_code == 200
+    deadline = time.monotonic() + 5
+    while True:
+        job = client.get(response.json()["status_url"]).json()
+        if job["status"] in ("complete", "failed") or time.monotonic() > deadline:
+            break
+        time.sleep(0.01)
+    assert job["status"] == "complete", job
+    assert job["fusion_evidence"][0]["retrieval_status"] == "skipped"
+    assert main.app.state.run_store.saved_runs == []

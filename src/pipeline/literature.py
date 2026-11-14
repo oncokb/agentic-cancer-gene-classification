@@ -1852,13 +1852,12 @@ def _fusion_partners(gene: str, fusions: List[str]) -> List[str]:
     """Extract partner symbols from fusion strings, excluding the gene itself."""
     partners: List[str] = []
     for fusion in fusions:
-        for sep in ("::", "--", "/"):
-            if sep in fusion:
-                for part in fusion.split(sep):
-                    part = part.strip()
-                    if part and part != gene:
-                        partners.append(part)
-                break
+        first, second = split_fusion(fusion)
+        if second is None:
+            continue
+        for part in (first, second):
+            if part and part.casefold() != gene.casefold() and not is_intergenic_partner(part):
+                partners.append(part)
     return list(dict.fromkeys(partners))
 
 

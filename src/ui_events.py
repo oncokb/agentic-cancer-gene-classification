@@ -122,8 +122,10 @@ class Event(BaseModel):
             if self.subject_kind == "gene":
                 valid = bool(_SYMBOL.fullmatch(self.subject_id))
             elif self.subject_kind == "fusion":
-                parts = self.subject_id.split("::")
-                valid = len(parts) == 2 and all(_SYMBOL.fullmatch(part) for part in parts)
+                from src.pipeline.normalization import split_fusion
+
+                parts = split_fusion(self.subject_id)
+                valid = all(part and _SYMBOL.fullmatch(part) for part in parts)
             elif self.subject_kind == "run":
                 valid = _uuid4_string(self.subject_id)
             else:

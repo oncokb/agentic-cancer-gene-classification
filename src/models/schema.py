@@ -808,6 +808,13 @@ class AnnotateRequest(BaseModel):
 
 
 class GeneAnnotateRequest(BaseModel):
+    @field_validator("gene")
+    @classmethod
+    def reject_intergenic(cls, value: str) -> str:
+        from src.pipeline.normalization import reject_intergenic_gene_input
+
+        return reject_intergenic_gene_input(value)
+
     gene: str = Field(..., description="Single gene symbol to annotate")
     tumor_type: Optional[str] = Field(default=None, description="Tumor type for literature retrieval")
     local_backend: Optional[LocalBackend] = Field(
