@@ -489,7 +489,7 @@ Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
       "well_supported": false,
       "retrieved_count": 2,
       "pmids": ["17625570", "20979469"],
-      "interpretation": "EML4::ALK has 2 non-retracted PubMed record(s) from exact fusion-pair searches, below the well-supported threshold. Papers mentioning LUAD in the title or abstract: 1 of 2.",
+      "interpretation": "EML4::ALK has 2 non-retracted PubMed record(s) from fusion-evidence searches, below the well-supported threshold. Papers mentioning LUAD in the title or abstract: 1 of 2.",
       "evidence_cards": [ ... ],
       "literature_scope": "requested_tumor",
       "requested_tumor_pmids": ["17625570"],
@@ -511,11 +511,11 @@ Each `fusion_evidence` entry (the same shape is returned inline by
 | Field | Meaning |
 | --- | --- |
 | `fusion`, `tumor_type` | The input pair and the tumor type you sent, or `null`. |
-| `pmids`, `retrieved_count` | Every non-retracted PMID whose title or abstract discusses the exact pair, in ranked order. Both a tumor-scoped and a tumor-agnostic search are run when `tumor_type` is set. |
+| `pmids`, `retrieved_count` | Every non-retracted PMID whose title or abstract discusses the exact pair, in ranked order. Two searches find candidates: exact-pair phrases (`A::B`, `A-B`, `A/B`, `A B`, plus HGNC aliases) and a title/abstract co-occurrence search (both partners or their aliases plus `fusion*`, `rearrang*`, `translocation*` or `chimer*`), which catches papers that write the fusion only as `A::B`. Each runs tumor-scoped and tumor-agnostic when `tumor_type` is set. Every candidate must still name the pair as a fusion in its title or abstract. |
 | `evidence_cards` | Cards for the top 5 `pmids` only. Each card's `requested_tumor_terms` lists the requested tumor type or alias terms found in that paper's title or abstract. |
-| `literature_scope` | Computed over all `pmids`, not just the cards. `requested_tumor`: at least one paper **mentions** the requested tumor type; this does not mean the fusion was shown in that tumor. `other_or_unspecified`: a tumor type was sent but no paper mentions it. `any_tumor`: no tumor type was sent and papers were found. `no_literature`: all searches succeeded and no paper was retained. `null` when retrieval failed, a partial result has no retained papers or its tumor-scoped search failed, the input is not a two-partner fusion, or the result predates this field. |
+| `literature_scope` | Computed over all `pmids`, not just the cards. `requested_tumor`: at least one paper **mentions** the requested tumor type; this does not mean the fusion was shown in that tumor. `other_or_unspecified`: a tumor type was sent but no paper mentions it. `any_tumor`: no tumor type was sent and papers were found. `no_literature`: all searches succeeded and no paper was retained. `null` when retrieval failed, a partial result has no retained papers or a tumor-scoped search failed, the input is not a two-partner fusion, or the result predates this field. |
 | `requested_tumor_pmids` | The `pmids` that mention the requested tumor type, in ranked order. These can include papers without a card. |
-| `partial` | Boolean, default `false`. One exact-pair search failed; evidence from successful searches is retained and the interpretation describes the failure. Partial results are never cached. Scope is unknown (`null`) when no papers were retained or the tumor-scoped query failed; otherwise scope reflects retained papers. The UI labels partial lookups, groups unknown-scope partial results under Lookup failed, and suppresses the no-literature partner prompt. |
+| `partial` | Boolean, default `false`. At least one search failed; evidence from successful searches is retained and the interpretation describes the failure. Partial results are never cached. Scope is unknown (`null`) when no papers were retained or a tumor-scoped query failed; otherwise scope reflects retained papers. The UI labels partial lookups, groups unknown-scope partial results under Lookup failed, and suppresses the no-literature partner prompt. |
 | `retrieval_status` | `ok` when at least one search succeeded (including partial results), or for non-pair inputs where no lookup applies; `failed` when retrieval raised an error. A failed entry is empty because the lookup failed, not because no literature exists; retry it. |
 
 Tumor mentions are matched deterministically on word boundaries against the
