@@ -745,3 +745,60 @@ unique `(hugo_symbol, oncotree_code, release_id, literature_gate)`.
 
 - Swap `LiteratureGate` to LRAS when `/lras/v1/retrieve` ships.
 - Normal-tissue comparison (TCGA adjacent / GTEx) as a separate track.
+
+### Contract 1.4: supplementary tumor-purity gate
+
+Purity only demotes an existing high `confidence_tier` to `candidate`. It never
+changes v3 statistics, `stats_pass`, `pass_mode`, broad-expression flags, alteration
+results, or the strong cutoffs. `purity_check` is optional in the schema and is
+`null` for pairs that were not high before this gate. High pairs receive `pass`,
+`demoted`, `not_applicable`, or `unassessed`. `purity_rho` and `purity_q` retain
+within-cohort Spearman correlation and exploratory BH adjustment for transparency
+(on all v3 passes; unavailable correlation is null and enters BH as p=1).
+
+Rule R2 exactly follows the read-only evaluation: within-cohort Spearman
+rho(log2(RSEM+1), ABSOLUTE purity) <= -0.30 and q < 0.05, with >=30 matched
+finite samples, AND failure to remain strong when both target and pooled rest
+are restricted to purity >=0.6, with >=30 retained target samples. The correlation
+BH family is every existing v3 pass across all genes/cohorts (including exempt
+cohorts and unavailable tests). Correlations require >=10 finite samples and
+nonconstant vectors. Filtered statistics recompute pooled P99/P95, effect sizes,
+MW/Fisher tests and per-gene BH across all 32 cohorts; the original broad flag is
+frozen and lineage wins before subgroup. All thresholds are in `PARAMS` and change
+the release fingerprint. A subset build uses its subset's v3-pass BH family and
+is review-only, as before.
+
+DLBC, LAML, THYM are `not_applicable`; insufficient matched or retained target
+coverage is `unassessed` (including CHOL with 24 high-purity samples). Both states
+retain high but mean **unassessed by this gate, not validated**. Constant-vector
+correlations are also unassessed. Correlation is association with bulk cell
+mixture, not evidence of the expressing cell; R2 can retain stromal signals and
+cannot establish tumor-cell expression. These selected-family q values are
+exploratory, not genome-wide or post-selection FDR guarantees.
+
+ACGC requires a known retaining purity state for high pairs in contract 1.4+;
+missing/null/unknown states fail closed. Only a well-formed pre-1.4 version keeps
+legacy behavior. The loader rejects a 1.4+ high pair missing the field; the service
+also checks independently, including seeded bundles and stored supported
+literature. A `demoted` pair is always candidate, even if its stored tier says
+high, and never triggers paid literature work or surfaces on any read/export
+path. Its “Needs verification” badge explains “Expression may come from non-tumor
+cells (falls with tumor purity)”. Coverage/exemption notes appear in Details and
+the per-pair CSV includes `purity_check`. Controls and publish-time rechecks keep
+the existing v3 gate; positive tiers are reported separately.
+
+Purity source: GDC PanCanAtlas `TCGA_mastercalls.abs_tables_JSedit.fixed.txt`,
+[download](https://api.gdc.cancer.gov/data/4f277128-f793-4354-a13d-30cc7fe9f6b5),
+SHA-256 `f430a975433d82e0098d7405619d4f12a0c765fcd97e7d63cc9b1de7f2d763cd`.
+The content-addressed cache verifies both cached and downloaded bytes; mismatch
+fails the build. URL, version and hash are in manifest provenance and the release
+fingerprint. Use only `call status=called`, finite purity in [0,1], joined on the
+first 15 barcode characters to the exact selected primary expression sample;
+patient-only matches are never used. Duplicate called keys fail closed. DNA and
+RNA can represent different aliquots of the selected sample.
+
+We acknowledge TCGA, GDC, and the ABSOLUTE/PanCanAtlas source for these open-access
+data: [PanCanAtlas supplemental data](https://gdc.cancer.gov/about-data/publications/pancanatlas).
+No software/SPDX licence is asserted for the table. See the
+[GDC data-access policy](https://docs.gdc.cancer.gov/Encyclopedia/pages/Data_Access_Policy/)
+and [analysis policy](https://gdc.cancer.gov/analyze-data/data-analysis-policies).
