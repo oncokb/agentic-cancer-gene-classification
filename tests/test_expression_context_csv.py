@@ -1,7 +1,7 @@
 """CSV export for expression-context curation ("golden set" sheets).
 
 Covers:
-- Header order and exact column set (36 columns; ``cancer_type_code`` omitted
+- Header order and exact column set (37 columns; ``cancer_type_code`` omitted
   because ``oncotree_code`` already holds the TCGA PanCancer cohort code in
   the bundle contract).
 - Surfaced-only default vs ``?include_excluded=true``, alias resolution
@@ -120,6 +120,7 @@ EXPECTED_COLUMNS: Tuple[str, ...] = (
     "enrichment_label",
     "alteration_types_enriched",
     "confidence_tier",
+    "confidence_label",
     "purity_check",
     "broadly_expressed",
     "n_tumor",
