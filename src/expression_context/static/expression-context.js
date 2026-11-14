@@ -202,7 +202,9 @@
       if (pair.status === "surfaced") return [badge("Surfaced", "pass")];
       if (pair.status === "candidate") {
         const needs = badge("Needs verification", "candidate");
-        needs.setAttribute("title", CANDIDATE_TOOLTIP);
+        needs.setAttribute("title", pair.stats.purity_check === "demoted"
+          ? "Expression may come from non-tumor cells (falls with tumor purity)"
+          : CANDIDATE_TOOLTIP);
         return [needs];
       }
       if (pair.status === "literature_pending") return [badge("Awaiting literature check", "warn")];
@@ -321,6 +323,11 @@
         null,
         "ec-subgroup",
       );
+      if (["not_applicable", "unassessed"].includes(s.purity_check)) {
+        addDetail("Tumor purity", s.purity_check === "not_applicable"
+          ? "Not applicable to this cohort; unassessed by this gate, not validated"
+          : "Insufficient purity coverage; unassessed by this gate, not validated");
+      }
       addDetail(
         "PubMed pre-check",
         precheckCell(pair),

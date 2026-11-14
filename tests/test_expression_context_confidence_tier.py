@@ -359,10 +359,16 @@ def test_explicit_null_or_unknown_tier_on_a_pass_is_not_surfaced():
 def with_contract(version, tiers: Dict[str, str]):
     """ERBB2-only bundle declaring ``contract_version`` (ABSENT: no such key);
     only ``tiers`` are set (every other pair omits confidence_tier entirely)."""
+    def edit(doc):
+        tiered(tiers, explicit_null_for_failures=False)(doc)
+        for row in doc["cancer_types"]:
+            if row.get("confidence_tier") == "high":
+                row["purity_check"] = "pass"
+
     bundle = build_bundle(
         ("ERBB2",),
         manifest_overrides={"contract_version": version},
-        edit_gene=tiered(tiers, explicit_null_for_failures=False),
+        edit_gene=edit,
     )
     if version is ABSENT:
         bundle.manifest.pop("contract_version")
@@ -438,10 +444,16 @@ def test_contract_1_2_bundle_without_the_field_keeps_legacy_behaviour(caplog):
     ],
 )
 def test_loader_rejects_untiered_passes_unless_the_version_is_legacy(version, tiers, rejected):
+    def edit(doc):
+        tiered(tiers, explicit_null_for_failures=False)(doc)
+        for row in doc["cancer_types"]:
+            if row.get("confidence_tier") == "high":
+                row["purity_check"] = "pass"
+
     bundle = build_bundle(
         ("ERBB2",),
         manifest_overrides={"contract_version": version},
-        edit_gene=tiered(tiers, explicit_null_for_failures=False),
+        edit_gene=edit,
     )
     if version is None:
         bundle.manifest.pop("contract_version")

@@ -113,3 +113,12 @@ def test_skipped_prechecks_cannot_restore_or_overwrite_pubmed_cache():
         assert "inputs.skip_precheck != true" in step
     saved = workflow.split("      - uses: actions/cache/save@v4\n")[1].split("      - ")[0]
     assert "always()" in saved  # A budget failure still saves committed counts.
+
+
+def test_expression_object_cache_key_includes_purity_pin():
+    from gene_expression_relevance.purity import SOURCE
+
+    workflow = Path("../.github/workflows/expression-stats-release.yml").read_text()
+    key = next(line for line in workflow.splitlines() if "key: expression-objects-" in line)
+    assert "${{ steps.check.outputs.commit }}" in key
+    assert SOURCE["sha256"] in key

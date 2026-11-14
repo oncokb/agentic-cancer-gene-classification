@@ -12,7 +12,9 @@ A (gene, cancer type) pair is *surfaced* iff:
    ``contract_version`` is well-formed and below 1.3 counts a missing field as
    high; in any other bundle (1.3+, or a missing/malformed version) a missing
    tier is not high (fail closed, warned once per bundle; the loader also
-   rejects such bundles). Weaker passes are
+   rejects such bundles). Contract 1.4+ also requires a known retaining
+   ``purity_check``; ``demoted`` is never high, even with a stored high tier.
+   Weaker passes are
    *candidates*: listed, never surfaced, and
 3. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
    pre-check; null means it was not run, and the literature gate itself is
@@ -210,6 +212,7 @@ class ExpressionContextService:
         self._inflight: Dict[Tuple[str, str, str, str], asyncio.Future] = {}
         self._tasks: Set[asyncio.Task] = set()
         self._tier_warned: Set[str] = set()
+        self._purity_warned: Set[str] = set()
 
     def _tier_required(self, manifest: Manifest, artifact: GeneArtifact) -> bool:
         """``manifest.confidence_tier_required``; warns once per bundle when a 1.3+
@@ -223,6 +226,26 @@ class ExpressionContextService:
             self._tier_warned.add(manifest.release_id)
             logger.warning(
                 "Bundle %s (contract_version %r) has stats passes without confidence_tier "
+                "(first seen in %s); treating them as not high-confidence",
+                manifest.release_id, manifest.contract_version, artifact.gene.hugo_symbol,
+            )
+        return required
+
+    def _purity_required(self, manifest: Manifest, artifact: GeneArtifact) -> bool:
+        """Warn once per bundle when a required high-pair purity field is absent."""
+        required = manifest.purity_check_required
+        if (
+            required
+            and manifest.release_id not in self._purity_warned
+            and any(
+                ct.passes_stats and ct.confidence_tier == HIGH_CONFIDENCE
+                and "purity_check" not in ct.model_fields_set
+                for ct in artifact.cancer_types
+            )
+        ):
+            self._purity_warned.add(manifest.release_id)
+            logger.warning(
+                "Bundle %s (contract_version %r) has high pairs without purity_check "
                 "(first seen in %s); treating them as not high-confidence",
                 manifest.release_id, manifest.contract_version, artifact.gene.hugo_symbol,
             )
@@ -318,6 +341,7 @@ class ExpressionContextService:
         now = self._clock()
         expired = precheck_expired(manifest, now)
         tier_required = self._tier_required(manifest, resolved.artifact)
+        purity_required = self._purity_required(manifest, resolved.artifact)
 
         rows: List[StoredPair] = []
         to_check: List[Tuple[CancerTypeStats, TumorContext]] = []
@@ -359,7 +383,9 @@ class ExpressionContextService:
                 # Includes broad-blocked m3 pairs: visible, never sent on.
                 rows.append(row(stats, False, "stats"))
                 continue
-            if not stats.high_confidence(tier_required=tier_required):
+            if not stats.high_confidence(
+                tier_required=tier_required, purity_required=purity_required
+            ):
                 # Candidate: never sent to the paid literature gate.
                 rows.append(row(stats, False, "candidate"))
                 continue
@@ -575,13 +601,16 @@ class ExpressionContextService:
         expired = precheck_expired(resolved.manifest, self._clock())
         has_stored_result = bool(stored)
         tier_required = self._tier_required(resolved.manifest, resolved.artifact)
+        purity_required = self._purity_required(resolved.manifest, resolved.artifact)
         for stats in resolved.artifact.cancer_types:
             cancer_type = resolved.manifest.cancer_type(stats.oncotree_code)
             precheck = {True: "pass", False: "fail", None: "not_run"}[stats.literature_precheck_pass]
             if expired and stats.literature_precheck_pass is not None:
                 precheck = "expired"
             passes = stats.passes_stats
-            tier = stats.effective_confidence_tier(tier_required=tier_required)
+            tier = stats.effective_confidence_tier(
+                tier_required=tier_required, purity_required=purity_required
+            )
             high = passes and tier == HIGH_CONFIDENCE
             eligible = high and effective_precheck(stats, expired) is not False
             verdict = None

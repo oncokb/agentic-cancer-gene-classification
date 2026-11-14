@@ -45,7 +45,10 @@ def mapping_fingerprint(mapping):
 
 
 def build_fingerprint(params, genes, skip, hgnc_sha, code_sha, mapping_sha, alterations=None):
+    from .purity import SOURCE
+
     payload = dict(
+        purity=SOURCE,
         params=params,
         genes=genes,
         skip_precheck=skip,
