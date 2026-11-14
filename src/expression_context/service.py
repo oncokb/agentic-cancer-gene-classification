@@ -8,7 +8,8 @@ A (gene, cancer type) pair is *surfaced* iff:
 1. it passes the statistics: ``stats_pass``, and not a method-m3 pair whose
    lineage enrichment was blocked by broad expression without a subgroup
    pass (``CancerTypeStats.passes_stats``), and
-2. it is not purity-demoted (``purity_check != "demoted"``), and
+2. it passes the versioned purity guard: demotion always excludes, and
+   contract 1.4+ high pairs require a known retaining purity state, and
 3. ``literature_precheck_pass`` is not false (stats repo's PubMed-count
    pre-check; null means it was not run, and the literature gate itself is
    authoritative), and
@@ -588,16 +589,18 @@ class ExpressionContextService:
         expired = precheck_expired(resolved.manifest, self._clock())
         has_stored_result = bool(stored)
         tier_required = self._tier_required(resolved.manifest, resolved.artifact)
-        self._purity_required(resolved.manifest, resolved.artifact)
+        purity_required = self._purity_required(resolved.manifest, resolved.artifact)
         for stats in resolved.artifact.cancer_types:
             cancer_type = resolved.manifest.cancer_type(stats.oncotree_code)
             precheck = {True: "pass", False: "fail", None: "not_run"}[stats.literature_precheck_pass]
             if expired and stats.literature_precheck_pass is not None:
                 precheck = "expired"
             passes = stats.passes_stats
-            tier = stats.effective_confidence_tier(tier_required=tier_required)
-            demoted = stats.purity_check == "demoted"
-            eligible = passes and not demoted and effective_precheck(stats, expired) is not False
+            tier = stats.effective_confidence_tier(
+                tier_required=tier_required, purity_required=purity_required
+            )
+            purity_blocked = stats.purity_blocked(purity_required=purity_required)
+            eligible = passes and not purity_blocked and effective_precheck(stats, expired) is not False
             verdict = None
             prior = stored.get(stats.oncotree_code)
             if (
@@ -622,9 +625,9 @@ class ExpressionContextService:
                     )
             if not passes:
                 status, reason = "excluded", "stats"
-            elif demoted:
-                # Purity demotion remains authoritative over any stored literature.
-                status, reason = "candidate", "candidate"
+            elif purity_blocked:
+                # Includes invalid high-pair purity, even with stored support.
+                status, reason = "excluded", "purity"
             elif not eligible:
                 status, reason = "excluded", "precheck"
             elif verdict is None:
@@ -641,7 +644,6 @@ class ExpressionContextService:
                     study_id=cancer_type.study_id if cancer_type else None,
                     tumor_type_query=cancer_type.tumor_type_query if cancer_type else None,
                     stats=stats,
-                    alterations=stats.alterations,
                     stats_pass=passes,
                     enrichment=stats.enrichment_label,
                     broad_blocked=stats.broad_blocked,

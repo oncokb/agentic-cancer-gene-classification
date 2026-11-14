@@ -92,7 +92,7 @@ def alteration_types_for_pair(view_pair: PairStatsView) -> List[str]:
 
 
 def enriched_alteration_types(pair: PairStatsView) -> List[str]:
-    alterations = pair.stats.alterations
+    alterations = pair.alterations
     if alterations is None:
         return []
     return [cat for cat in ALLOWED_ALTERATION_TYPES if cat in alterations.alteration_types_enriched]
@@ -379,7 +379,7 @@ def pair_view_to_csv_row(
         guard_csv_text(reason),
         guard_csv_text(_format_yes_no(stats.passes_stats)),
         guard_csv_text(_enrichment_code(stats)),
-        ", ".join(enriched_alteration_types(pair)),
+        guard_csv_text(", ".join(enriched_alteration_types(pair))),
         guard_csv_text(pair.confidence_tier),
         guard_csv_text(pair.confidence_label),
         guard_csv_text(stats.purity_check),

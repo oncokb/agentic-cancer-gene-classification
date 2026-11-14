@@ -37,7 +37,7 @@ def block(*names):
 
 def with_alterations(pair, data, **updates):
     stats = CancerTypeStats.model_validate({**pair.stats.model_dump(), "alterations": data})
-    return pair.model_copy(update={"stats": stats, "alterations": stats.alterations, **updates})
+    return pair.model_copy(update={"stats": stats, **updates})
 
 
 def test_golden_set_real_categories_union_and_surfaced_only():
@@ -141,3 +141,48 @@ def test_cna_directions_survive_storage_round_trip():
     round_trip = Alterations.model_validate(alterations.model_dump())
     assert round_trip == alterations
     assert round_trip.categories["Copy Number Alteration"].del_.n_events == 0
+
+
+@pytest.mark.parametrize("invalid", [None, [], "enriched", 12, True])
+def test_non_dict_alteration_categories_are_skipped(invalid):
+    harness = CsvHarness()
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        data = block("Point Mutation", "Copy Number Alteration")
+        data["categories"]["Point Mutation"] = invalid
+        pair = with_alterations(view.pairs[0], data, status="surfaced")
+        assert "Point Mutation" not in pair.alterations.categories
+        assert pair.alterations.alteration_types_enriched == ["Copy Number Alteration"]
+        view = view.model_copy(update={"pairs": [pair]})
+        assert golden_set_row_from_view(view)[2] == "Expression, Copy Number Alteration"
+        assert pair.model_dump(mode="json")["alterations"]["alteration_types_enriched"] == ["Copy Number Alteration"]
+
+
+def test_pair_alteration_accessor_keeps_api_and_exports_in_sync():
+    harness = CsvHarness()
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        pair = with_alterations(view.pairs[0], block("Point Mutation"), status="surfaced")
+        # A stale denormalized value must not override the release stats accessor.
+        pair = pair.model_copy(update={"alterations": Alterations.model_validate(block("Structural Variant"))})
+        payload = pair.model_dump(mode="json")
+        assert payload["alterations"] == payload["stats"]["alterations"]
+        assert payload["alterations"]["alteration_types_enriched"] == ["Point Mutation"]
+        view = view.model_copy(update={"pairs": [pair]})
+        assert golden_set_row_from_view(view)[2] == "Point Mutation, Expression"
+        row = dict(zip(CSV_COLUMNS, gene_view_csv_rows(view)[0], strict=True))
+        assert row["alteration_types_enriched"] == "Point Mutation"
+
+
+def test_per_pair_alteration_cell_uses_csv_guard(monkeypatch):
+    from src.expression_context import csv_export
+
+    harness = CsvHarness()
+    with TestClient(harness.app):
+        view, _ = asyncio.run(harness.service.gene_view("ERBB2"))
+        pair = view.pairs[0].model_copy(update={"status": "surfaced"})
+        view = view.model_copy(update={"pairs": [pair]})
+        # Exercise the cell guard independently of the allowed-category filter.
+        monkeypatch.setattr(csv_export, "enriched_alteration_types", lambda p: ["=unsafe"])
+        row = dict(zip(CSV_COLUMNS, gene_view_csv_rows(view)[0], strict=True))
+        assert row["alteration_types_enriched"] == "'=unsafe"

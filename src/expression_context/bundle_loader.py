@@ -53,6 +53,7 @@ from src.expression_context.github_releases import (
     ReleasesError,
 )
 from src.expression_context.models import (
+    KNOWN_PURITY_STATES,
     SUPPORTED_SCHEMA_VERSION,
     SYMBOL_PATTERN,
     BundleManifest,
@@ -374,12 +375,12 @@ class BundleLoader:
         if manifest.purity_check_required:
             missing = [
                 ct.oncotree_code for ct in artifact.cancer_types
-                if ct.confidence_tier == "high" and "purity_check" not in ct.model_fields_set
+                if ct.confidence_tier == "high" and ct.purity_check not in KNOWN_PURITY_STATES
             ]
             if missing:
                 raise BundleContractError(
                     f"{where}: contract_version {manifest.contract_version!r} requires "
-                    f"purity_check on high pairs; missing for {', '.join(missing)}"
+                    f"purity_check on high pairs; missing or unknown for {', '.join(missing)}"
                 )
         if artifact.release_id != manifest.release_id:
             raise BundleContractError(

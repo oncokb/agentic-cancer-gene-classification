@@ -1039,36 +1039,36 @@ test("re-rendering the same gene (literature job refresh) keeps the All view", a
   assert.strictEqual(summaryRows(nodes).filter((r) => !r.hidden).length, 4);
 });
 
-function viewWithCandidate() {
+function viewWithPurityConcern() {
   const v = view();
-  v.summary = { surfaced: 1, literature_pending: 1, excluded: 2, candidate: 1 };
+  v.summary = { surfaced: 1, literature_pending: 1, excluded: 3, candidate: 0 };
   v.pairs.push({
     oncotree_code: "KIRC", cancer_type_name: "Kidney <b>Renal</b> Clear Cell Carcinoma",
     study_id: "kirc_tcga_pan_can_atlas_2018", stats: stats("KIRC", { confidence_tier: "candidate", purity_check: "demoted" }),
     stats_pass: true, enrichment: "Lineage enriched", confidence_tier: "candidate", precheck: "pass",
-    literature_eligible: false, status: "candidate", exclusion_reason: "candidate", literature: null,
+    literature_eligible: false, status: "excluded", exclusion_reason: "purity", literature: null,
   });
   return v;
 }
 
 test("purity-demoted pairs show a distinct Purity concern badge only in All cancer types", async () => {
-  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(viewWithCandidate()) });
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(viewWithPurityConcern()) });
   await page.lookup("ERBB2");
   const code = (row) => row.children[0].text;
   assert.strictEqual(
     nodes["ec-summary"].textContent,
-    "1 surfaced · 1 awaiting literature check · 2 excluded · 1 purity concern",
+    "1 surfaced · 1 awaiting literature check · 3 excluded",
   );
   // "Shown only" never shows a candidate.
   assert.deepStrictEqual(visibleSummaryRows(nodes).map(code), ["Breast Invasive Carcinoma (BRCA)", "Stomach Adenocarcinoma (STAD)"]);
-  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 purity concern (hidden)");
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 3 excluded (hidden)");
 
   nodes["ec-view-all"].fire("click");
   const rows = visibleSummaryRows(nodes);
   assert.strictEqual(rows.length, 5);
   const kirc = rows.find((r) => code(r).includes("(KIRC)"));
   assert.strictEqual(code(kirc), "Kidney <b>Renal</b> Clear Cell Carcinoma (KIRC)", "names stay text");
-  assert.strictEqual(kirc.getAttribute("class"), "ec-row-excluded ec-row-candidate");
+  assert.strictEqual(kirc.getAttribute("class"), "ec-row-excluded");
   const [result] = kirc.children[5].children;
   assert.strictEqual(result.textContent, "Purity concern");
   assert.ok(!result.textContent.startsWith("Excluded"), "separate from other exclusion reasons");
@@ -1077,24 +1077,74 @@ test("purity-demoted pairs show a distinct Purity concern badge only in All canc
   assert.strictEqual(tooltip, "Expression may come from non-tumor cells (falls with tumor purity)");
   // Not sent to the literature check, so no "Not checked yet" prompt and no citations.
   assert.strictEqual(kirc.children[4].text, "—");
-  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 purity concern");
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 3 excluded");
   // Other exclusion reasons keep their own badges.
   const others = rows.filter((r) => r.getAttribute("class") === "ec-row-excluded");
-  assert.deepStrictEqual(others.map((r) => r.children[5].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
+  assert.deepStrictEqual(others.map((r) => r.children[5].text), ["Excluded: PubMed pre-check", "Excluded: statistics", "Purity concern"]);
 
   nodes["ec-view-shown"].fire("click");
   assert.ok(kirc.hidden, "candidate hidden again in Shown only");
 });
 
-test("a gene with only candidates shows the empty state in Shown only", async () => {
-  const v = viewWithCandidate();
+test("a gene with only exclusions shows the empty state in Shown only", async () => {
+  const v = viewWithPurityConcern();
   v.pairs = v.pairs.filter((p) => p.status !== "surfaced" && p.status !== "literature_pending");
-  v.summary = { surfaced: 0, literature_pending: 0, excluded: 2, candidate: 1 };
+  v.summary = { surfaced: 0, literature_pending: 0, excluded: 3, candidate: 0 };
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
   await page.lookup("ERBB2");
   assert.strictEqual(visibleSummaryRows(nodes).length, 0);
   assert.ok(!nodes["ec-table-empty"].hidden);
-  assert.ok(nodes["ec-table-empty"].textContent.includes("review the 3 not shown"), nodes["ec-table-empty"].textContent);
+  assert.ok(nodes["ec-table-empty"].textContent.includes("review the 3 excluded"), nodes["ec-table-empty"].textContent);
+});
+
+test("legacy candidate status and reason still render", async () => {
+  const v = viewWithPurityConcern();
+  v.summary = { surfaced: 1, literature_pending: 1, excluded: 2, candidate: 1 };
+  const legacy = v.pairs.find(p => p.exclusion_reason === "purity");
+  legacy.status = "candidate";
+  legacy.exclusion_reason = "candidate";
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  const row = summaryRows(nodes).find(r => r.text.includes("(KIRC)"));
+  assert.ok(row.hidden);
+  nodes["ec-view-all"].fire("click");
+  assert.ok(!row.hidden);
+  assert.ok(row.text.includes("Purity concern"));
+  assert.ok(nodes["ec-view-count"].textContent.includes("1 purity concern"));
+});
+
+test("invalid required purity explains why the high pair is excluded", async () => {
+  for (const purity of [null, "PASS"]) {
+    const v = viewWithPurityConcern();
+    const blocked = v.pairs.find(p => p.exclusion_reason === "purity");
+    blocked.stats.purity_check = purity;
+    blocked.stats.confidence_tier = "high";
+    blocked.confidence_tier = null;
+    const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+    await page.lookup("ERBB2");
+    nodes["ec-view-all"].fire("click");
+    const row = summaryRows(nodes).find(r => r.text.includes("(KIRC)"));
+    const badge = row.findAll(n => n.textContent === "Purity concern")[0];
+    assert.strictEqual(badge.getAttribute("title"), "Purity status is missing or unknown; high-tier pairs require a known retaining state.");
+    assert.strictEqual(row.children[4].text, "—");
+  }
+});
+
+test("badges and details share the canonical alteration accessor with legacy fallback", async () => {
+  const detail = {
+    alteration_types_enriched: ["Point Mutation"],
+    categories: { "Point Mutation": { status: "enriched", n_events: 3, n_profiled: 10, frequency: 0.3 } },
+  };
+  for (const shape of ["canonical", "legacy", "both"]) {
+    const v = view();
+    if (shape !== "legacy") v.pairs[0].alterations = detail;
+    if (shape !== "canonical") v.pairs[0].stats.alterations = shape === "both"
+      ? { alteration_types_enriched: ["Structural Variant"], categories: {} } : detail;
+    const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+    await page.lookup("ERBB2");
+    assert.strictEqual(summaryRows(nodes)[0].children[3].text, "Point Mutation");
+    assert.ok(detailRows(nodes)[0].text.includes("3/10 events/profiled; frequency 30.00%"));
+  }
 });
 
 test("the page never assigns innerHTML", () => {
@@ -1103,8 +1153,8 @@ test("the page never assigns innerHTML", () => {
 });
 
 test("purity demotion has a distinct tooltip and coverage states have detail notes", async () => {
-  const v = viewWithCandidate();
-  v.pairs.find(p => p.status === "candidate").stats.purity_check = "demoted";
+  const v = viewWithPurityConcern();
+  v.pairs.find(p => p.exclusion_reason === "purity").stats.purity_check = "demoted";
   v.pairs[0].stats.purity_check = "not_applicable";
   v.pairs[1].stats.purity_check = "unassessed";
   const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });

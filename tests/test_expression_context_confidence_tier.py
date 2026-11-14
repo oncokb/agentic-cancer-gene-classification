@@ -271,17 +271,17 @@ def stats_row(**fields) -> CancerTypeStats:
 def test_effective_tier_before_contract_1_3(fields, tier):
     stats = stats_row(**fields)
     assert stats.effective_confidence_tier(tier_required=False) == tier
-    assert stats.high_confidence(tier_required=False) is (tier == "high")
+    assert (stats.effective_confidence_tier(tier_required=False) == "high") is (tier == "high")
 
 
 def test_missing_tier_fails_closed_when_the_contract_requires_it():
     missing = stats_row()
     assert missing.confidence_tier_missing
     assert missing.effective_confidence_tier(tier_required=True) is None
-    assert missing.high_confidence(tier_required=True) is False
+    assert missing.effective_confidence_tier(tier_required=True) != "high"
     present = stats_row(confidence_tier="high")
     assert not present.confidence_tier_missing
-    assert present.high_confidence(tier_required=True) is True
+    assert present.effective_confidence_tier(tier_required=True) == "high"
     assert not stats_row(stats_pass=False).confidence_tier_missing
 
 

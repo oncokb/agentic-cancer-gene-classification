@@ -15,13 +15,15 @@ from typing import Any, Dict, List, Literal, Optional
 
 from dataclasses import dataclass
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 SUPPORTED_SCHEMA_VERSION = "1"
 # Method versions this module understands. m3 only adds optional fields, so
 # m2 bundles still load; method_version is informational, never enforced.
 SUPPORTED_METHOD_VERSIONS = ("2", "3")
 HIGH_CONFIDENCE = "high"
+RETAINING_PURITY_STATES = frozenset({"pass", "not_applicable", "unassessed"})
+KNOWN_PURITY_STATES = RETAINING_PURITY_STATES | {"demoted"}
 # expression_stats contract version that introduced per-pair confidence_tier.
 CONFIDENCE_TIER_CONTRACT = (1, 3)
 
@@ -56,8 +58,8 @@ PASS_MODE_LABELS = {"lineage": "Lineage enriched", "subgroup": "Subgroup enriche
 # Canonical/alias gene symbols as accepted from users and from bundles.
 SYMBOL_PATTERN = r"[A-Z0-9][A-Z0-9._-]{0,63}\Z"
 
-# "candidate" exclusion/status is retained for purity-demoted pairs only.
-ExclusionReason = Literal["stats", "precheck", "literature", "pending", "candidate"]
+# "candidate" is accepted for old stored responses; new purity exclusions use "purity".
+ExclusionReason = Literal["stats", "precheck", "literature", "pending", "candidate", "purity"]
 JobState = Literal["queued", "running", "succeeded", "failed"]
 
 
@@ -157,9 +159,13 @@ class Alterations(_Artifact):
     def known_categories(cls, value: Any) -> Any:
         if not isinstance(value, dict):
             return value
-        categories = value.get("categories") or {}
+        raw_categories = value.get("categories") or {}
+        if not isinstance(raw_categories, dict):
+            raw_categories = {}
+        categories = {k: v for k, v in raw_categories.items() if isinstance(v, dict)}
+        invalid = set(raw_categories) - set(categories)
         enriched = value.get("alteration_types_enriched") or []
-        for name in set(categories) | set(enriched):
+        for name in set(raw_categories) | set(enriched):
             if name not in ALLOWED_ALTERATION_TYPES:
                 logging.getLogger(__name__).warning("Ignoring unknown alteration category %r", name)
         return {
@@ -167,7 +173,7 @@ class Alterations(_Artifact):
             "categories": {k: v for k, v in categories.items() if k in ALLOWED_ALTERATION_TYPES},
             "alteration_types_enriched": [
                 k for k in ALLOWED_ALTERATION_TYPES
-                if k in enriched and (
+                if k in enriched and k not in invalid and (
                     k not in categories or categories[k].get("status") == "enriched"
                 )
             ],
@@ -242,39 +248,37 @@ class CancerTypeStats(_Artifact):
         """A passing pair whose document omits ``confidence_tier`` entirely."""
         return self.passes_stats and "confidence_tier" not in self.model_fields_set
 
+    def purity_blocked(self, *, purity_required: bool) -> bool:
+        """Demotion always excludes. Purity-era high pairs also fail closed on
+        missing, null or unknown purity; candidate/null remains contract-legal.
+        """
+        return self.purity_check == "demoted" or (
+            purity_required
+            and self.confidence_tier == HIGH_CONFIDENCE
+            and self.purity_check not in RETAINING_PURITY_STATES
+        )
+
     def effective_confidence_tier(
         self, *, tier_required: bool, purity_required: bool = False
     ) -> Optional[str]:
-        """The tier ACGC acts on, None unless ``passes_stats``.
+        """Display tier for a statistical pass, with the versioned purity guard.
 
-        ``tier_required`` is ``Manifest.confidence_tier_required``. Bundles with a
-        well-formed contract_version below 1.3 omit ``confidence_tier``: there (and
-        only there) a missing field on a passing pair counts as "high", so old data
-        behaves exactly as before. Otherwise a missing field fails closed (None).
-        An explicit null or an unknown value on a passing pair is never high.
+        Only well-formed pre-1.3 contracts give a missing tier the legacy high
+        fallback. Other missing/null/unknown tiers label supported pairs Moderate;
+        they do not block eligibility. Explicit demotion displays candidate, and
+        purity-era high pairs with invalid purity have no effective tier. The
+        service independently uses ``purity_blocked`` for eligibility/exclusions.
         """
         if not self.passes_stats:
             return None
         if self.purity_check == "demoted":
             return "candidate"
+        if self.purity_blocked(purity_required=purity_required):
+            return None
         tier = self.confidence_tier
         if "confidence_tier" not in self.model_fields_set:
             tier = None if tier_required else HIGH_CONFIDENCE
-        if (
-            tier == HIGH_CONFIDENCE
-            and purity_required
-            and self.purity_check not in {"pass", "not_applicable", "unassessed"}
-        ):
-            return None
         return tier
-
-    def high_confidence(self, *, tier_required: bool, purity_required: bool = False) -> bool:
-        return (
-            self.effective_confidence_tier(
-                tier_required=tier_required, purity_required=purity_required
-            )
-            == HIGH_CONFIDENCE
-        )
 
     @property
     def enrichment_label(self) -> Optional[str]:
@@ -458,7 +462,7 @@ class HistoryPage(BaseModel):
 # "expired": the bundle's pre-check counts are past source.precheck_expires_at,
 # so the pre-check doesn't exclude (the literature gate decides).
 PrecheckState = Literal["pass", "fail", "not_run", "expired"]
-# "candidate": purity-demoted statistical pass; never surfaced.
+# "candidate" is retained for legacy responses; new purity blocks are excluded.
 PairStatus = Literal["surfaced", "excluded", "literature_pending", "candidate"]
 
 
@@ -491,7 +495,6 @@ class BundleStatus(BaseModel):
 
 
 class PairStatsView(BaseModel):
-    alterations: Optional[Alterations] = None
     oncotree_code: str
     cancer_type_name: Optional[str] = None
     study_id: Optional[str] = None
@@ -508,11 +511,17 @@ class PairStatsView(BaseModel):
     # on a passing pair = "high"); None when the statistics fail.
     confidence_tier: Optional[str] = None
     confidence_label: Optional[Literal["Strong", "Moderate"]] = None
-    # Statistics pass, no purity demotion, and no fresh explicit precheck failure.
+    # Statistics pass, versioned purity guard, and no fresh explicit precheck failure.
     literature_eligible: bool
     status: PairStatus
     exclusion_reason: Optional[ExclusionReason] = None
     literature: Optional[LiteratureVerdict] = None
+
+    @computed_field
+    @property
+    def alterations(self) -> Optional[Alterations]:
+        """Canonical pair detail for APIs/exports, derived from the release stats."""
+        return self.stats.alterations
 
 
 class GeneStatsSummary(BaseModel):

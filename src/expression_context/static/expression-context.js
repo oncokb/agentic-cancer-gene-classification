@@ -206,9 +206,11 @@
         }
         return parts;
       }
-      if (pair.status === "candidate") {
+      if (pair.exclusion_reason === "purity" || pair.status === "candidate") {
         const concern = badge("Purity concern", "candidate");
-        concern.setAttribute("title", "Expression may come from non-tumor cells (falls with tumor purity)");
+        concern.setAttribute("title", pair.stats.purity_check === "demoted"
+          ? "Expression may come from non-tumor cells (falls with tumor purity)"
+          : "Purity status is missing or unknown; high-tier pairs require a known retaining state.");
         return [concern];
       }
       if (pair.status === "literature_pending") return [badge("Awaiting literature check", "warn")];
@@ -271,7 +273,8 @@
 
     const alterationNames = ["Point Mutation", "Structural Variant", "Copy Number Alteration"];
 
-    function alterationsFor(pair) { return pair.stats.alterations || pair.alterations; }
+    // New APIs derive the canonical field from stats; accept older stats-only responses.
+    function alterationsFor(pair) { return pair.alterations || pair.stats.alterations; }
 
     function alterationLabel(name, category) {
       if (name !== "Copy Number Alteration" || !category) return name;
