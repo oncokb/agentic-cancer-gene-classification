@@ -306,7 +306,8 @@ async def test_requested_tumor_counts_a_match_outside_the_top_five_cards(monkeyp
 
     result = await retrieve_fusion_evidence("EML4::ALK", tumor_type="LUAD", max_results=10)
 
-    assert len(queries) == 2  # no extra PubMed calls
+    # Phrase + co-occurrence, each tumor-scoped and any-tumor; no extra PubMed calls.
+    assert len(queries) == 4
     assert result.pmids == ["7", "6", "5", "4", "3", "2", "1"]
     assert [card.pmid for card in result.evidence_cards] == ["7", "6", "5", "4", "3"]
     assert all(card.requested_tumor_terms == [] for card in result.evidence_cards)

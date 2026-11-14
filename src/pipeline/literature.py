@@ -826,26 +826,115 @@ def fusion_evidence_alias_matches(
     return matches
 
 
+# Gene co-occurrence search (issue #166). PubMed's phrase index does not match
+# "GENE1::GENE2" text, so a paper that writes a fusion only in "::" form is
+# invisible to the quoted pair phrases above. This non-phrase [tiab] search
+# finds any paper naming both partners (or their HGNC aliases) next to a fusion
+# word; _match_fusion_evidence stays the precision gate for every candidate.
+_COOCCURRENCE_FUSION_TERMS = (
+    "(fusion*[tiab] OR rearrang*[tiab] OR translocation*[tiab] OR chimer*[tiab])"
+)
+# The co-occurrence query is broader (lower precision) than the exact-pair
+# phrases, so its relevance-ranked top N contains more co-mentions the matcher
+# will discard; IRF2BP2::RUNX2 had true matches ranked past 20. 3x the phrase
+# retmax (60 at the default 20) keeps that headroom while the merged PMID set
+# stays well inside one 200-PMID efetch POST.
+_COOCCURRENCE_RETMAX_MULTIPLIER = 3
+# Characters that cannot be safely quoted inside a PubMed [tiab] term, and a
+# requirement for at least one letter/digit, so "." intergenic placeholders and
+# other punctuation-only partners never become a co-occurrence clause.
+_UNQUOTABLE_QUERY_TERM = re.compile(r'["()\[\]]')
+_QUERY_TERM_HAS_ALNUM = re.compile(r"[A-Za-z0-9]")
+
+
+def _queryable_symbol(symbol: str) -> bool:
+    symbol = symbol.strip()
+    return bool(_QUERY_TERM_HAS_ALNUM.search(symbol)) and not _UNQUOTABLE_QUERY_TERM.search(symbol)
+
+
+def _partner_tiab_clause(gene: Optional[str], aliases: Optional[List[str]]) -> Optional[str]:
+    """`("G"[tiab] OR "ALIAS"[tiab] ...)` for one partner, or None when the
+    partner's own symbol is empty or punctuation-only. Aliases are capped and
+    junk-filtered exactly like the phrase query; [tiab] is case-insensitive, so
+    case-only alias duplicates are dropped."""
+    gene = (gene or "").strip()
+    if not _queryable_symbol(gene):
+        return None
+    options: List[str] = []
+    seen: Set[str] = set()
+    for option in _partner_symbol_options(gene, _query_aliases(aliases)):
+        option = option.strip()
+        if option.upper() in seen or not _queryable_symbol(option):
+            continue
+        seen.add(option.upper())
+        options.append(option)
+        if len(options) > _MAX_QUERY_ALIASES_PER_PARTNER:
+            break
+    return "(" + " OR ".join(f'"{option}"[tiab]' for option in options) + ")"
+
+
+def _fusion_cooccurrence_query(
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> Optional[str]:
+    five_prime, three_prime = split_fusion(fusion)
+    five_clause = _partner_tiab_clause(five_prime, five_aliases)
+    three_clause = _partner_tiab_clause(three_prime, three_aliases)
+    if not five_clause or not three_clause:
+        return None
+    return f"{five_clause} AND {three_clause} AND {_COOCCURRENCE_FUSION_TERMS}"
+
+
+def _fusion_evidence_search_plan(
+    fusion: str,
+    tumor_type: Optional[str] = None,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> List[Tuple[str, bool, bool]]:
+    """Ordered, deduped (query, tumor_scoped, cooccurrence) searches.
+
+    Exact-pair phrase searches come first (tumor-scoped, then any-tumor), then
+    the gene co-occurrence searches in the same order, so PMIDs merge in a
+    deterministic precision-first order.
+    """
+    variants = _fusion_query_variants(fusion, five_aliases, three_aliases)
+    if not variants:
+        return []
+    tumor_fragment = _tumor_type_query_fragment(tumor_type) if tumor_type else None
+    variant_fragment = " OR ".join(f'"{variant}"' for variant in variants)
+    plan: List[Tuple[str, bool, bool]] = []
+    if tumor_fragment:
+        plan.append((f"({variant_fragment}) AND {tumor_fragment}", True, False))
+    plan.append((
+        f"({variant_fragment}) AND (fusion OR rearrangement OR translocation) AND "
+        "(cancer OR tumor OR carcinoma OR neoplasm)",
+        False,
+        False,
+    ))
+    cooccurrence = _fusion_cooccurrence_query(fusion, five_aliases, three_aliases)
+    if cooccurrence:
+        if tumor_fragment:
+            plan.append((f"{cooccurrence} AND {tumor_fragment}", True, True))
+        plan.append((cooccurrence, False, True))
+    deduped: Dict[str, Tuple[str, bool, bool]] = {}
+    for entry in plan:
+        deduped.setdefault(entry[0], entry)
+    return list(deduped.values())
+
+
 def _fusion_evidence_queries(
     fusion: str,
     tumor_type: Optional[str] = None,
     five_aliases: Optional[List[str]] = None,
     three_aliases: Optional[List[str]] = None,
 ) -> List[str]:
-    variants = _fusion_query_variants(fusion, five_aliases, three_aliases)
-    if not variants:
-        return []
-    variant_fragment = " OR ".join(f'"{variant}"' for variant in variants)
-    queries = [
-        f"({variant_fragment}) AND (fusion OR rearrangement OR translocation) AND "
-        "(cancer OR tumor OR carcinoma OR neoplasm)",
-    ]
-    if tumor_type:
-        queries.insert(
-            0,
-            f"({variant_fragment}) AND {_tumor_type_query_fragment(tumor_type)}",
+    return [
+        query
+        for query, _scoped, _cooccurrence in _fusion_evidence_search_plan(
+            fusion, tumor_type, five_aliases, three_aliases
         )
-    return list(dict.fromkeys(queries))
+    ]
 
 
 def _novelty_record_count(records: List[LiteratureRecord]) -> int:
@@ -996,6 +1085,9 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             "retraction_filter_version": 2,
             "alias_expansion_version": 3,
             "partial_search_version": 2,
+            # 1: gene co-occurrence [tiab] search alongside exact-pair phrases
+            # (#166); also recomputes pre-b16374b "no records" entries.
+            "cooccurrence_search_version": 1,
             # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
             # 2: hyphen-aware word edges; case-independent free-text abbreviations.
             # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
@@ -1075,8 +1167,8 @@ async def _retrieve_fusion_evidence_uncached(
     if five_prime and three_prime:
         five_aliases, three_aliases = await resolve_fusion_partner_aliases(five_prime, three_prime)
 
-    queries = _fusion_evidence_queries(fusion, tumor_type, five_aliases, three_aliases)
-    if not queries:
+    plan = _fusion_evidence_search_plan(fusion, tumor_type, five_aliases, three_aliases)
+    if not plan:
         return FusionEvidenceResult(
             fusion=fusion,
             tumor_type=tumor_type,
@@ -1084,8 +1176,13 @@ async def _retrieve_fusion_evidence_uncached(
         )
 
     client = _get_ncbi_client()
+    cooccurrence_retmax = max_results * _COOCCURRENCE_RETMAX_MULTIPLIER
     search_results = await asyncio.gather(
-        *[_esearch(query, max_results, client) for query in queries], return_exceptions=True,
+        *[
+            _esearch(query, cooccurrence_retmax if cooccurrence else max_results, client)
+            for query, _scoped, cooccurrence in plan
+        ],
+        return_exceptions=True,
     )
     for result in search_results:
         if isinstance(result, BaseException) and not isinstance(result, Exception):
@@ -1093,8 +1190,12 @@ async def _retrieve_fusion_evidence_uncached(
     failures = [result for result in search_results if isinstance(result, Exception)]
     for failure in failures:
         logger.warning("Fusion evidence for %s: %s", fusion, pubmed_error_message(failure))
-    if len(failures) == len(queries):
+    if len(failures) == len(plan):
         raise failures[0]
+    tumor_search_failed = any(
+        scoped and isinstance(result, Exception)
+        for (_query, scoped, _cooccurrence), result in zip(plan, search_results)
+    )
     pmid_lists = [result for result in search_results if not isinstance(result, BaseException)]
     seen_pmids: Set[str] = set()
     pmids: List[str] = []
@@ -1139,7 +1240,7 @@ async def _retrieve_fusion_evidence_uncached(
     }
     requested_tumor_pmids = [record.pmid for record in records if record.pmid in requested_tumor_terms]
     literature_scope = fusion_literature_scope(tumor_type, len(records), len(requested_tumor_pmids))
-    if failures and (not records or (tumor_type and isinstance(search_results[0], Exception))):
+    if failures and (not records or tumor_search_failed):
         literature_scope = None
     return FusionEvidenceResult(
         fusion=fusion,
@@ -1155,7 +1256,10 @@ async def _retrieve_fusion_evidence_uncached(
             literature_scope=literature_scope,
             requested_tumor_count=len(requested_tumor_pmids),
         ) + (
-            f" One search failed; results are partial: {pubmed_error_message(failures[0])}."
+            (
+                " One search failed" if len(failures) == 1
+                else f" {len(failures)} of {len(plan)} searches failed"
+            ) + f"; results are partial: {pubmed_error_message(failures[0])}."
             if failures else ""
         ),
         partial=bool(failures),
