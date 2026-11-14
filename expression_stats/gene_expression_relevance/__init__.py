@@ -3,7 +3,9 @@
 METHOD_VERSION = "3"
 # Release-bundle contract minor version (schema_version stays "1"; changes are additive).
 # 1.3: per-pair confidence_tier ("high" | "candidate" | null) from the strong_* params.
-CONTRACT_VERSION = "1.4"
+# 1.4: supplementary tumor-purity gate (purity_check and demotion).
+# 1.5: either-arm strong criteria and the additive strong_arm provenance field.
+CONTRACT_VERSION = "1.5"
 PARAMS = dict(
     fdr=0.05,
     log2fc=1.0,
@@ -21,9 +23,9 @@ PARAMS = dict(
     subgroup_p95_percentile=95,
     subgroup_p95_log2_diff=1.5,
     subgroup_fdr=0.025,
-    # Confidence tier (contract 1.3), applied on top of the unchanged v3 pass. A v3 pass
-    # is "high" if the arm it passes by (pass_mode) meets that arm's strong cutoffs, else
-    # "candidate". These never change stats_pass, pass_mode or any other v3 field.
+    # Confidence tier (contract 1.3; either-arm criteria since 1.5), applied on top of
+    # the unchanged v3 pass. A v3 pass is "high" if either arm meets its strong cutoffs,
+    # else "candidate". These never change stats_pass, pass_mode or any other v3 field.
     strong_log2fc=2.0,
     strong_cliffs_delta=0.70,
     strong_subgroup_min_fraction=0.05,

@@ -381,6 +381,14 @@
                 null
               ]
             },
+            "strong_arm": {
+              "enum": [
+                "lineage",
+                "subgroup",
+                "both",
+                null
+              ]
+            },
             "lineage_blocked_by_broad": {
               "type": "boolean"
             },

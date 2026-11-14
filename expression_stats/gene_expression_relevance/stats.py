@@ -214,15 +214,15 @@ def compute(linear, labels, codes, params=PARAMS):
     result["stats_pass"] = lineage | subgroup
     result["pass_mode"] = np.where(lineage, "lineage", np.where(subgroup, "subgroup", None))
     result["confidence_tier"] = confidence_tier(result, lineage, subgroup, params)
+    result["strong_arm"] = strong_arm(result, lineage, subgroup, params)
     return result
 
 
-def confidence_tier(result, lineage, subgroup, params=PARAMS):
-    """ "high" | "candidate" | None per pair; None exactly when the v3 pass fails.
+def strong_masks(result, lineage, subgroup, params=PARAMS):
+    """Strong-cutoff masks per arm; the lineage mask keeps its broad-expression block.
 
-    Read-only over the v3 arrays: a v3 pass is "high" if the arm it passes by (its
-    pass_mode; lineage wins when both arms pass) also meets that arm's strong cutoffs
-    (both inclusive), otherwise "candidate".
+    The subgroup strong criteria are evaluated from the subgroup statistics whether or
+    not the pair's pass_mode is subgroup, so a lineage-first pass can still be promoted.
     """
     with np.errstate(invalid="ignore"):
         strong_lineage = (
@@ -231,13 +231,34 @@ def confidence_tier(result, lineage, subgroup, params=PARAMS):
             & (result["cliffs_delta"] >= params["strong_cliffs_delta"])
         )
         strong_subgroup = (
-            subgroup
-            & ~lineage
-            & (result["subgroup_high_fraction"] >= params["strong_subgroup_min_fraction"])
-            & (
-                result["subgroup_high_fraction_ratio"]
-                >= params["strong_subgroup_min_fraction_ratio"]
-            )
+            result["subgroup_high_fraction"] >= params["strong_subgroup_min_fraction"]
+        ) & (
+            result["subgroup_high_fraction_ratio"] >= params["strong_subgroup_min_fraction_ratio"]
         )
+    return strong_lineage, strong_subgroup
+
+
+def confidence_tier(result, lineage, subgroup, params=PARAMS):
+    """ "high" | "candidate" | None per pair; None exactly when the v3 pass fails.
+
+    Read-only over the v3 arrays: a v3 pass is "high" if either arm meets its strong
+    cutoffs (both inclusive), otherwise "candidate". The lineage arm retains its
+    broad-expression block; the subgroup arm is tested from its statistics regardless
+    of pass_mode.
+    """
+    strong_lineage, strong_subgroup = strong_masks(result, lineage, subgroup, params)
     passed = lineage | subgroup
-    return np.where(strong_lineage | strong_subgroup, "high", np.where(passed, "candidate", None))
+    high = passed & (strong_lineage | strong_subgroup)
+    return np.where(high, "high", np.where(passed, "candidate", None))
+
+
+def strong_arm(result, lineage, subgroup, params=PARAMS):
+    """Which arm(s) made a high pair high; null whenever the pair is not high."""
+    strong_lineage, strong_subgroup = strong_masks(result, lineage, subgroup, params)
+    high = (lineage | subgroup) & (strong_lineage | strong_subgroup)
+    arm = np.where(
+        strong_lineage & strong_subgroup,
+        "both",
+        np.where(strong_lineage, "lineage", np.where(strong_subgroup, "subgroup", None)),
+    )
+    return np.where(high, arm, None)

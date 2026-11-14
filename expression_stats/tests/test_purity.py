@@ -88,10 +88,36 @@ def test_finalize_global_family_and_only_tier_mutates(tmp_path):
     assert result[0]["purity_q"] == pytest.approx(0.04 / 3)
     for before, after in zip(records, result, strict=True):
         assert {
-            k: v for k, v in after.items() if not k.startswith("purity_") and k != "confidence_tier"
+            k: v
+            for k, v in after.items()
+            if not k.startswith("purity_") and k not in ("confidence_tier", "strong_arm")
         } == {k: v for k, v in before.items() if k != "confidence_tier"}
         if after["purity_check"] != "demoted":
             assert before["confidence_tier"] == after["confidence_tier"]
+
+
+def test_purity_demotes_a_newly_high_subgroup_pair(tmp_path):
+    record = dict(
+        oncotree_code="GBM",
+        stats_pass=True,
+        pass_mode="lineage",
+        confidence_tier="high",
+        strong_arm="subgroup",
+        log2fc=2.73,
+        cliffs_delta=0.58,
+        subgroup_high_fraction=0.163,
+        subgroup_high_fraction_ratio=21.7,
+        p95_log2_diff=3.31,
+    )
+    path = tmp_path / "EGFR.json"
+    path.write_text(json.dumps(dict(gene=dict(hugo_symbol="EGFR"), cancer_types=[record])))
+    # The high-purity re-test no longer finds either arm strong.
+    tests = {("EGFR", "GBM"): dict(rho=-0.55, p=0.001, n=40, hp_n=35, hp_strong=False)}
+    assert purity.finalize(tmp_path, tests) == dict(high_before=1, high_after=0, demoted=1)
+    result = json.loads(path.read_text())["cancer_types"][0]
+    assert result["purity_check"] == "demoted"
+    assert result["confidence_tier"] == "candidate" and result["strong_arm"] is None
+    assert result["subgroup_high_fraction_ratio"] == pytest.approx(21.7)
 
 
 def test_frozen_broad_and_lineage_priority(monkeypatch):
@@ -120,11 +146,17 @@ def test_frozen_broad_and_lineage_priority(monkeypatch):
     }
     monkeypatch.setattr(purity, "compute", lambda *args: hp)
     result = purity.measure(raw, labels, ["A", "B"], original, np.full(60, 0.6))
-    # Lineage passes v3 but fails its strong FC: subgroup cannot rescue the high tier.
-    assert result[0, 0]["hp_strong"] is False
+    # Lineage passes v3 but fails its strong FC; the strong subgroup tail rescues it.
+    assert result[0, 0]["hp_strong"] is True
+    # A broad-blocked lineage arm still leaves the subgroup arm to retain high.
     original["broadly_expressed"][:] = True
     result = purity.measure(raw, labels, ["A", "B"], original, np.full(60, 0.6))
     assert result[0, 0]["hp_strong"] is True
+    # Without either strong arm the re-test cannot retain the high tier.
+    hp["subgroup_high_fraction"][:] = 0.03
+    hp["subgroup_high_fraction_ratio"][:] = 3.0
+    result = purity.measure(raw, labels, ["A", "B"], original, np.full(60, 0.6))
+    assert result[0, 0]["hp_strong"] is False
     assert PARAMS["purity_min_target"] == 30
 
 

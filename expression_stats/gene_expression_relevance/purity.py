@@ -144,6 +144,7 @@ def finalize(genes_dir, tests, params=PARAMS):
                 )
                 if row["purity_check"] == "demoted":
                     row["confidence_tier"] = "candidate"
+                    row["strong_arm"] = None
                     counts["demoted"] += 1
                 else:
                     counts["high_after"] += 1
