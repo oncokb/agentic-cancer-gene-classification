@@ -253,8 +253,134 @@ async def test_cooccurrence_failure_with_no_phrase_hits_is_not_no_literature(mon
     assert result.partial is True
     assert result.literature_scope is None
     assert result.retrieval_status == "ok"
+    assert result.pmids == []
+    assert result.interpretation == (
+        "Fusion evidence lookup for IRF2BP2::RUNX2 is incomplete. "
+        "One search failed: PubMed search failed (timeout). "
+        "The searches that completed retained no matching records, so this does "
+        "not show that no literature exists; retry the lookup."
+    )
+    assert "No non-retracted" not in result.interpretation
+
+
+async def test_several_failures_with_no_records_is_incomplete_not_no_records(monkeypatch):
+    _patch(monkeypatch)
+
+    async def mostly_failing(query, max_results, client):
+        if "sarcoma" in query:
+            raise httpx.ReadTimeout("timeout")
+        return []
+
+    monkeypatch.setattr(literature, "_esearch", mostly_failing)
+    result = await retrieve_fusion_evidence(_FUSION, tumor_type="sarcoma", max_results=20)
+
+    assert result.partial is True
+    assert result.interpretation.startswith(
+        "Fusion evidence lookup for IRF2BP2::RUNX2 is incomplete. 2 of 4 searches failed: "
+    )
+    assert "No non-retracted" not in result.interpretation
 
 
 def test_cache_key_includes_cooccurrence_version():
     key = _fusion_evidence_cache_key(_FUSION, None, 20)
-    assert '"cooccurrence_search_version": 1' in key
+    assert '"cooccurrence_search_version": 2' in key
+
+
+# ---------------------------------------------------------------------------
+# Strict pair check for co-occurrence-only records
+# ---------------------------------------------------------------------------
+
+def _rec(pmid: str, abstract: str, title: str = "Fusion study") -> LiteratureRecord:
+    return LiteratureRecord(
+        pmid=pmid, title=title, abstract=abstract, publication_types=["Journal Article"],
+    )
+
+
+_STRICT_NEGATIVES = [
+    ("ALK::MYC", "ALK fusion and MYC amplification were detected in lung cancer."),
+    ("ALK::RET", "The panel detects fusion events involving ALK, RET, ROS1 and NTRK1 in lung cancer."),
+    ("ALK::RET", "ALK rearrangements and RET rearrangements define distinct subsets of lung cancer."),
+    ("RET::ROS1", "The panel detects fusion events involving ALK, RET, ROS1 and NTRK1 in lung cancer."),
+    ("ALK::ROS1", "Fusions in ALK/ROS1/RET were assayed in lung cancer."),
+    ("ALK::RET", "ALK and RET fusions were mutually exclusive in lung cancer."),
+    ("ALK::RET", "ALK and RET fusion-positive tumors were compared."),
+    ("IRF2BP2::RUNX2", "The IRF2BP2-KLF2 axis regulates RUNX2; no fusion was found."),
+]
+
+_STRICT_POSITIVES = [
+    ("IRF2BP2::RUNX2", "Targeted RNA sequencing detected IRF2BP2::RUNX2 in the tumor."),
+    ("IRF2BP2::RUNX2", "Sequencing detected IRF2BP2 :: RUNX2 in the tumor."),
+    ("IRF2BP2::RUNX2", "An IRF2BP2-RUNX2 fusion was found."),
+    ("IRF2BP2::RUNX2", "An IRF2BP2\u2013RUNX2 fusion was found."),
+    ("IRF2BP2::RUNX2", "An IRF2BP2--RUNX2 transcript was found."),
+    ("IRF2BP2::RUNX2", "A RUNX2/IRF2BP2 rearrangement was found."),
+    ("IRF2BP2::RUNX2", "We describe a fusion of IRF2BP2 and RUNX2 in sarcoma."),
+    ("IRF2BP2::RUNX2", "We describe a fusion between the IRF2BP2 gene and the RUNX2 gene."),
+    ("IRF2BP2::RUNX2", "An IRF2BP2 and RUNX2 fusion was detected."),
+    ("BCR::ABL1", "The t(9;22) BCR/ABL1 translocation was found in leukemia."),
+]
+
+
+@pytest.mark.parametrize("fusion, abstract", _STRICT_NEGATIVES)
+def test_strict_pair_check_rejects_unrelated_events(fusion, abstract):
+    assert not literature.strict_fusion_pair_match(_rec("1", abstract), fusion)
+
+
+@pytest.mark.parametrize("fusion, abstract", _STRICT_POSITIVES)
+def test_strict_pair_check_accepts_explicit_pairs(fusion, abstract):
+    assert literature.strict_fusion_pair_match(_rec("1", abstract), fusion)
+
+
+def test_strict_pair_check_accepts_alias_pair():
+    record = _rec("1", "A PEBP2A1-IRF2BP2 chimera was detected.")
+    assert not literature.strict_fusion_pair_match(record, _FUSION)
+    assert literature.strict_fusion_pair_match(record, _FUSION, [], ["PEBP2A1"])
+
+
+def test_strict_pair_check_accepts_real_irf2bp2_runx2_titles():
+    for record in (_RECORDS["40026174"], _RECORDS["38084005"], _RECORDS["42314909"]):
+        assert literature.strict_fusion_pair_match(record, _FUSION)
+
+
+@pytest.mark.parametrize("fusion, abstract", _STRICT_NEGATIVES[:3])
+async def test_cooccurrence_only_unrelated_event_is_not_evidence(monkeypatch, fusion, abstract):
+    record = _rec("42", abstract, title="Molecular profiling of lung cancer")
+
+    async def fake_esearch(query, max_results, client):
+        return ["42"] if "[tiab]" in query else []
+
+    async def fake_efetch(pmids, client):
+        return [record] if "42" in pmids else []
+
+    monkeypatch.setattr(literature, "cached_call", _uncached)
+    monkeypatch.setattr(literature, "resolve_gene", _resolve_no_aliases)
+    monkeypatch.setattr(literature, "_esearch", fake_esearch)
+    monkeypatch.setattr(literature, "_efetch", fake_efetch)
+
+    result = await retrieve_fusion_evidence(fusion, max_results=20)
+
+    assert result.pmids == []
+    assert result.partial is False
+    assert result.well_supported is False
+    assert result.literature_scope == "no_literature"
+    assert result.evidence_cards == []
+
+
+async def test_phrase_hit_keeps_existing_matcher(monkeypatch):
+    # Scope is not widened to phrase hits: the same text retrieved by an
+    # exact-pair phrase search is judged by _match_fusion_evidence alone.
+    record = _rec("42", _STRICT_NEGATIVES[0][1], title="Molecular profiling of lung cancer")
+
+    async def fake_esearch(query, max_results, client):
+        return [] if "[tiab]" in query else ["42"]
+
+    async def fake_efetch(pmids, client):
+        return [record] if "42" in pmids else []
+
+    monkeypatch.setattr(literature, "cached_call", _uncached)
+    monkeypatch.setattr(literature, "resolve_gene", _resolve_no_aliases)
+    monkeypatch.setattr(literature, "_esearch", fake_esearch)
+    monkeypatch.setattr(literature, "_efetch", fake_efetch)
+
+    result = await retrieve_fusion_evidence("ALK::MYC", max_results=20)
+    assert result.pmids == ["42"]

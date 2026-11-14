@@ -489,7 +489,7 @@ Identical `(fusion, tumor_type)` entries in one request are de-duplicated.
       "well_supported": false,
       "retrieved_count": 2,
       "pmids": ["17625570", "20979469"],
-      "interpretation": "EML4::ALK has 2 non-retracted PubMed record(s) from exact fusion-pair searches, below the well-supported threshold. Papers mentioning LUAD in the title or abstract: 1 of 2.",
+      "interpretation": "EML4::ALK has 2 non-retracted PubMed record(s) from fusion-evidence searches, below the well-supported threshold. Papers mentioning LUAD in the title or abstract: 1 of 2.",
       "evidence_cards": [ ... ],
       "literature_scope": "requested_tumor",
       "requested_tumor_pmids": ["17625570"],

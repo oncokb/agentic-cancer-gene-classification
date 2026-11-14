@@ -834,11 +834,13 @@ def fusion_evidence_alias_matches(
 _COOCCURRENCE_FUSION_TERMS = (
     "(fusion*[tiab] OR rearrang*[tiab] OR translocation*[tiab] OR chimer*[tiab])"
 )
-# The co-occurrence query is broader (lower precision) than the exact-pair
-# phrases, so its relevance-ranked top N contains more co-mentions the matcher
-# will discard; IRF2BP2::RUNX2 had true matches ranked past 20. 3x the phrase
-# retmax (60 at the default 20) keeps that headroom while the merged PMID set
-# stays well inside one 200-PMID efetch POST.
+# The co-occurrence query only needs both genes plus a fusion word, so for a
+# well-studied pair (e.g. two genes that are each fused to many partners) its
+# relevance-ranked hits contain many co-mentions that the strict pair check
+# discards. 3x the phrase retmax (60 at the default 20) leaves room for true
+# pair papers ranked below those, while the merged PMID set stays inside one
+# 200-PMID efetch POST. (For IRF2BP2::RUNX2 it is the alias-expanded PHRASE
+# query whose top 20 missed true matches; this query returns all five.)
 _COOCCURRENCE_RETMAX_MULTIPLIER = 3
 # Characters that cannot be safely quoted inside a PubMed [tiab] term, and a
 # requirement for at least one letter/digit, so "." intergenic placeholders and
@@ -884,6 +886,57 @@ def _fusion_cooccurrence_query(
     if not five_clause or not three_clause:
         return None
     return f"{five_clause} AND {three_clause} AND {_COOCCURRENCE_FUSION_TERMS}"
+
+
+# Strict pair check for records found ONLY by the co-occurrence search (#166
+# review). Its bridges are tight on purpose: "ALK fusion and MYC amplification",
+# "fusion events involving ALK, RET, ROS1" and "ALK rearrangements and RET
+# rearrangements" name both genes near a fusion word but not as one fusion.
+_STRICT_PAIR_SEPARATOR = r"\s*(?:::+|--|[-/\u2010-\u2015\u2212\uFE58\uFE63\uFF0D])\s*"
+_STRICT_FUSION_NOUN = r"(?:FUSION|REARRANGEMENT|TRANSLOCATION|CHIMERA)(?:\s+(?:GENE|TRANSCRIPT|PROTEIN))?"
+_STRICT_SINGULAR_FUSION_NOUN = r"(?:FUSION|REARRANGEMENT|TRANSLOCATION|CHIMERA)(?![A-Z0-9\-])"
+# A "/" chain like "ALK/ROS1/RET" lists genes rather than naming one pair.
+_SLASH_CHAIN_BEFORE = r"(?<![A-Z0-9]/)(?<![A-Z0-9] /)"
+_SLASH_CHAIN_AFTER = r"(?!\s*/\s*[A-Z0-9])"
+
+
+def _strict_pair_text_match(text: str, first: str, second: str) -> bool:
+    """True when `text` (upper-cased) names first/second as one explicit pair."""
+    a = _gene_boundary_pattern(first)
+    b = _gene_boundary_pattern(second)
+    for left, right in ((a, b), (b, a)):
+        patterns = (
+            # G1::G2, G1-G2, G1--G2, G1/G2, G1–G2 (t(...) G1/G2 included).
+            rf"{_SLASH_CHAIN_BEFORE}{left}{_STRICT_PAIR_SEPARATOR}{right}{_SLASH_CHAIN_AFTER}",
+            # fusion of / between / involving (the) G1 (gene) and / with / to (the) G2
+            rf"{_STRICT_FUSION_NOUN}\s+(?:OF|BETWEEN|INVOLVING)\s+(?:THE\s+)?{left}"
+            rf"(?:\s+GENES?)?\s+(?:AND|WITH|TO)\s+(?:THE\s+)?{right}(?!\s*,)",
+            # G1 and / with G2 (gene(s)) fusion — singular noun only.
+            rf"(?<![A-Z0-9],\s)(?<![A-Z0-9],){left}\s+(?:AND|WITH)\s+{right}"
+            rf"(?:\s+GENES?)?\s+{_STRICT_SINGULAR_FUSION_NOUN}",
+        )
+        if any(re.search(pattern, text) for pattern in patterns):
+            return True
+    return False
+
+
+def strict_fusion_pair_match(
+    record: LiteratureRecord,
+    fusion: str,
+    five_aliases: Optional[List[str]] = None,
+    three_aliases: Optional[List[str]] = None,
+) -> bool:
+    """Explicit-pair check over every symbol/alias combination of the partners."""
+    five_prime, three_prime = split_fusion(fusion)
+    if not five_prime or not three_prime:
+        return False
+    text = f"{record.title} {record.abstract}".upper()
+    return any(
+        _strict_pair_text_match(text, five, three)
+        for five in _partner_symbol_options(five_prime, five_aliases)
+        for three in _partner_symbol_options(three_prime, three_aliases)
+        if five.strip() and three.strip()
+    )
 
 
 def _fusion_evidence_search_plan(
@@ -1061,17 +1114,17 @@ def _fusion_evidence_interpretation(
     )
     if well_supported:
         return (
-            f"{fusion} has {len(records)} non-retracted PubMed record(s) from exact "
-            "fusion-pair searches, suggesting this is a studied fusion event rather than a "
+            f"{fusion} has {len(records)} non-retracted PubMed record(s) from "
+            "fusion-evidence searches, suggesting this is a studied fusion event rather than a "
             f"single novelty-only report.{scope_note}"
         )
     if records:
         novelty_note = " Most retrieved records look novelty or case-report driven." if novelty_count else ""
         return (
-            f"{fusion} has {len(records)} non-retracted PubMed record(s) from exact "
-            f"fusion-pair searches, below the well-supported threshold.{novelty_note}{scope_note}"
+            f"{fusion} has {len(records)} non-retracted PubMed record(s) from "
+            f"fusion-evidence searches, below the well-supported threshold.{novelty_note}{scope_note}"
         )
-    return f"No non-retracted PubMed records were found for exact {fusion} fusion-pair searches."
+    return f"No non-retracted PubMed records were found for {fusion} fusion-evidence searches."
 
 
 def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_results: int) -> str:
@@ -1087,7 +1140,8 @@ def _fusion_evidence_cache_key(fusion: str, tumor_type: Optional[str], max_resul
             "partial_search_version": 2,
             # 1: gene co-occurrence [tiab] search alongside exact-pair phrases
             # (#166); also recomputes pre-b16374b "no records" entries.
-            "cooccurrence_search_version": 1,
+            # 2: co-occurrence-only records must pass the strict pair check.
+            "cooccurrence_search_version": 2,
             # 1: literature_scope / requested_tumor_pmids / requested_tumor_terms.
             # 2: hyphen-aware word edges; case-independent free-text abbreviations.
             # 3: Unicode dashes and "non " guarded like "-"; B-ALL/T-ALL aliases.
@@ -1196,6 +1250,14 @@ async def _retrieve_fusion_evidence_uncached(
         scoped and isinstance(result, Exception)
         for (_query, scoped, _cooccurrence), result in zip(plan, search_results)
     )
+    # PMIDs returned by an exact-pair phrase search keep the existing matcher;
+    # co-occurrence-only PMIDs must also pass strict_fusion_pair_match.
+    phrase_pmids: Set[str] = {
+        pmid
+        for (_query, _scoped, cooccurrence), result in zip(plan, search_results)
+        if not cooccurrence and not isinstance(result, BaseException)
+        for pmid in result
+    }
     pmid_lists = [result for result in search_results if not isinstance(result, BaseException)]
     seen_pmids: Set[str] = set()
     pmids: List[str] = []
@@ -1208,6 +1270,13 @@ async def _retrieve_fusion_evidence_uncached(
 
     records = _filter_retracted_records(records)
     alias_matches = fusion_evidence_alias_matches(records, fusion, five_aliases, three_aliases)
+    for record in records:
+        if (
+            record.pmid in alias_matches
+            and record.pmid not in phrase_pmids
+            and not strict_fusion_pair_match(record, fusion, five_aliases, three_aliases)
+        ):
+            del alias_matches[record.pmid]
     matched_records = [record for record in records if record.pmid in alias_matches]
     dropped = len(records) - len(matched_records)
     if dropped:
@@ -1242,26 +1311,37 @@ async def _retrieve_fusion_evidence_uncached(
     literature_scope = fusion_literature_scope(tumor_type, len(records), len(requested_tumor_pmids))
     if failures and (not records or tumor_search_failed):
         literature_scope = None
-    return FusionEvidenceResult(
-        fusion=fusion,
-        tumor_type=tumor_type,
-        well_supported=well_supported,
-        retrieved_count=len(records),
-        pmids=[record.pmid for record in records],
-        interpretation=_fusion_evidence_interpretation(
+    failure_note = ""
+    if failures:
+        failure_note = (
+            "One search failed" if len(failures) == 1
+            else f"{len(failures)} of {len(plan)} searches failed"
+        ) + f": {pubmed_error_message(failures[0])}"
+    if failures and not records:
+        # Never claim "no records found" when part of the lookup did not run.
+        interpretation = (
+            f"Fusion evidence lookup for {fusion} is incomplete. {failure_note}. "
+            "The searches that completed retained no matching records, so this does "
+            "not show that no literature exists; retry the lookup."
+        )
+    else:
+        interpretation = _fusion_evidence_interpretation(
             fusion=fusion,
             tumor_type=tumor_type,
             records=records,
             well_supported=well_supported,
             literature_scope=literature_scope,
             requested_tumor_count=len(requested_tumor_pmids),
-        ) + (
-            (
-                " One search failed" if len(failures) == 1
-                else f" {len(failures)} of {len(plan)} searches failed"
-            ) + f"; results are partial: {pubmed_error_message(failures[0])}."
-            if failures else ""
-        ),
+        )
+        if failures:
+            interpretation += f" {failure_note}; results are partial."
+    return FusionEvidenceResult(
+        fusion=fusion,
+        tumor_type=tumor_type,
+        well_supported=well_supported,
+        retrieved_count=len(records),
+        pmids=[record.pmid for record in records],
+        interpretation=interpretation,
         partial=bool(failures),
         evidence_cards=_build_fusion_evidence_cards(
             fusion, records, alias_matches, requested_tumor_terms=requested_tumor_terms,

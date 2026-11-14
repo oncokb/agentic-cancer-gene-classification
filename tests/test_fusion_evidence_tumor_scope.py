@@ -315,7 +315,7 @@ async def test_requested_tumor_counts_a_match_outside_the_top_five_cards(monkeyp
     assert result.requested_tumor_pmids == ["1"]
     assert result.retrieval_status == "ok"
     assert result.interpretation == (
-        "EML4::ALK has 7 non-retracted PubMed record(s) from exact fusion-pair searches, "
+        "EML4::ALK has 7 non-retracted PubMed record(s) from fusion-evidence searches, "
         "suggesting this is a studied fusion event rather than a single novelty-only report. "
         "Papers mentioning LUAD in the title or abstract: 1 of 7."
     )
@@ -348,7 +348,7 @@ async def test_other_or_unspecified_when_no_paper_mentions_the_tumor(monkeypatch
     assert result.literature_scope == "other_or_unspecified"
     assert result.requested_tumor_pmids == []
     assert result.interpretation == (
-        "EML4::ALK has 2 non-retracted PubMed record(s) from exact fusion-pair searches, "
+        "EML4::ALK has 2 non-retracted PubMed record(s) from fusion-evidence searches, "
         "below the well-supported threshold. None of the retrieved papers mention ALL."
     )
     assert " in ALL" not in result.interpretation
@@ -363,7 +363,7 @@ async def test_any_tumor_when_no_tumor_type_requested(monkeypatch):
     assert result.requested_tumor_pmids == []
     assert result.evidence_cards[0].requested_tumor_terms == []
     assert result.interpretation == (
-        "EML4::ALK has 1 non-retracted PubMed record(s) from exact fusion-pair searches, "
+        "EML4::ALK has 1 non-retracted PubMed record(s) from fusion-evidence searches, "
         "below the well-supported threshold."
     )
 
@@ -379,7 +379,7 @@ async def test_no_literature_when_nothing_is_retained(monkeypatch, tumor_type):
     assert result.literature_scope == "no_literature"
     assert result.retrieval_status == "ok"
     assert result.interpretation == (
-        "No non-retracted PubMed records were found for exact EML4::ALK fusion-pair searches."
+        "No non-retracted PubMed records were found for EML4::ALK fusion-evidence searches."
     )
 
 
