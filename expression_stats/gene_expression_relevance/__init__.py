@@ -2,7 +2,8 @@
 
 METHOD_VERSION = "3"
 # Release-bundle contract minor version (schema_version stays "1"; changes are additive).
-CONTRACT_VERSION = "1.2"
+# 1.3: per-pair confidence_tier ("high" | "candidate" | null) from the strong_* params.
+CONTRACT_VERSION = "1.3"
 PARAMS = dict(
     fdr=0.05,
     log2fc=1.0,
@@ -20,6 +21,13 @@ PARAMS = dict(
     subgroup_p95_percentile=95,
     subgroup_p95_log2_diff=1.5,
     subgroup_fdr=0.025,
+    # Confidence tier (contract 1.3), applied on top of the unchanged v3 pass. A v3 pass
+    # is "high" if the arm it passes by (pass_mode) meets that arm's strong cutoffs, else
+    # "candidate". These never change stats_pass, pass_mode or any other v3 field.
+    strong_log2fc=2.0,
+    strong_cliffs_delta=0.70,
+    strong_subgroup_min_fraction=0.05,
+    strong_subgroup_min_fraction_ratio=5.0,
     precheck_min_pmids=1,
     precheck_cache_ttl_days=30,
 )

@@ -429,7 +429,7 @@ def test_stats_view_before_and_after_literature_check(harness, client):
     assert pairs["BRCA"]["stats"]["flags"] == ["tissue_of_origin_risk"]
     assert pairs["BRCA"]["cancer_type_name"] == "Breast Invasive Carcinoma"
     assert pairs["BRCA"]["tumor_type_query"] == "breast cancer"
-    assert view["summary"] == {"surfaced": 0, "literature_pending": 3, "excluded": 2}
+    assert view["summary"] == {"surfaced": 0, "literature_pending": 3, "excluded": 2, "candidate": 0}
     assert harness.gate.calls == []  # viewing statistics never runs the literature gate
 
     run_job(client)
@@ -439,7 +439,7 @@ def test_stats_view_before_and_after_literature_check(harness, client):
     assert pairs["BRCA"]["literature"]["pmids"] == ["12345678", "23456789"]
     assert pairs["STAD"]["status"] == "excluded" and pairs["STAD"]["exclusion_reason"] == "literature"
     assert pairs["STAD"]["literature"]["supported"] is False  # recomputed, not trusted
-    assert after["summary"] == {"surfaced": 1, "literature_pending": 0, "excluded": 4}
+    assert after["summary"] == {"surfaced": 1, "literature_pending": 0, "excluded": 4, "candidate": 0}
 
 
 def test_stats_view_resolves_aliases_and_rejects_unknown(client):

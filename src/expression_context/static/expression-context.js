@@ -17,12 +17,20 @@
     fail: "quality-critical",
     warn: "medium",
     neutral: "low",
+    candidate: "medium",
   };
   const REASON_LABELS = {
     stats: "statistics",
     precheck: "PubMed pre-check",
     literature: "literature",
   };
+  // Candidates (contract 1.3): pass the screening statistics but not the stricter
+  // high-confidence bar, so they are never surfaced or literature-checked.
+  const CANDIDATE_TOOLTIP =
+    "Passes the screening statistics but not the stricter high-confidence bar " +
+    "(lineage: log2 fold change ≥ 2 and Cliff's delta ≥ 0.70; subgroup: ≥ 5% high " +
+    "cases and ≥ 5× enrichment over other cancer types). Not surfaced and not " +
+    "literature-checked; verify independently before use.";
 
   function formatNumber(value, digits = 2) {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
@@ -192,12 +200,20 @@
 
     function resultCell(pair) {
       if (pair.status === "surfaced") return [badge("Surfaced", "pass")];
+      if (pair.status === "candidate") {
+        const needs = badge("Needs verification", "candidate");
+        needs.setAttribute("title", CANDIDATE_TOOLTIP);
+        return [needs];
+      }
       if (pair.status === "literature_pending") return [badge("Awaiting literature check", "warn")];
       const reason = REASON_LABELS[pair.exclusion_reason] || pair.exclusion_reason || "unknown";
       return [badge(`Excluded: ${reason}`, "neutral")];
     }
 
     function isExcluded(pair) { return pair.status === "excluded"; }
+    function isCandidate(pair) { return pair.status === "candidate"; }
+    // Hidden in the "Shown only" view: excluded pairs and candidates.
+    function isHidden(pair) { return isExcluded(pair) || isCandidate(pair); }
 
     function precheckCell(pair) {
       const count = pair.stats.pubmed_count;
@@ -318,6 +334,7 @@
     function renderRows(pair, symbol) {
       const row = doc.createElement("tr");
       if (pair.status === "surfaced") row.setAttribute("class", "ec-row-surfaced");
+      else if (isCandidate(pair)) row.setAttribute("class", "ec-row-excluded ec-row-candidate");
       else if (isExcluded(pair)) row.setAttribute("class", "ec-row-excluded");
       const s = pair.stats;
       const code = pair.oncotree_code;
@@ -390,23 +407,27 @@
         button.classList.toggle("active", pressed);
       }
       for (const { pair, code, row, detailRow } of state.rows) {
-        const visible = showAll || !isExcluded(pair);
+        const visible = showAll || !isHidden(pair);
         show(row, visible);
         show(detailRow, visible && state.expanded.has(code));
       }
       const pairs = (state.view && state.view.pairs) || [];
       const excluded = pairs.filter(isExcluded).length;
-      const shown = pairs.length - excluded;
+      const candidates = pairs.filter(isCandidate).length;
+      const hidden = excluded + candidates;
+      const shown = pairs.length - hidden;
+      const needs = candidates ? ` · ${candidates} need verification` : "";
       if (el["ec-view-count"]) {
         el["ec-view-count"].textContent = showAll
-          ? `${shown} shown · ${excluded} excluded`
-          : `${shown} shown · ${excluded} excluded (hidden)`;
+          ? `${shown} shown · ${excluded} excluded${needs}`
+          : `${shown} shown · ${excluded} excluded${needs} (hidden)`;
       }
       const empty = !showAll && shown === 0 && pairs.length > 0;
       if (el["ec-table-empty"]) {
         el["ec-table-empty"].textContent = empty
           ? `No cancer types pass for ${state.view.hugo_symbol} in this release. ` +
-            `Choose "All cancer types" to review the ${excluded} excluded.`
+            `Choose "All cancer types" to review the ` +
+            (candidates ? `${hidden} not shown.` : `${excluded} excluded.`)
           : "";
         show(el["ec-table-empty"], empty);
       }
@@ -441,7 +462,8 @@
       const summary = view.summary || {};
       el["ec-summary"].textContent =
         `${summary.surfaced || 0} surfaced · ${summary.literature_pending || 0} awaiting literature check · ` +
-        `${summary.excluded || 0} excluded`;
+        `${summary.excluded || 0} excluded` +
+        (summary.candidate ? ` · ${summary.candidate} need verification` : "");
       if (el["ec-release"]) el["ec-release"].textContent = releaseText(view.bundle);
       show(el["ec-run"], (summary.literature_pending || 0) > 0 && !state.jobRunning);
       renderCbioCompare(view);

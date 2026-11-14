@@ -72,6 +72,9 @@ def publish(directory):
         or report.get("negative_total") != negative_total
         or report.get("missing") != 0
         or report.get("failures") != []
+        # Tier is reported, not gated, for positives; no negative may ever be high.
+        or (report.get("tiers") or {}).get("negative_high") != 0
+        or (report.get("tiers") or {}).get("negative_total") != negative_total
         or alterations.get("status") != "passed"
         or controls.get("alterations", {}).get("status") != "passed"
         or alterations.get("positive_passed") != alteration_positives

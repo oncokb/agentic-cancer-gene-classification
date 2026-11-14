@@ -47,6 +47,7 @@ def synthesize(panel, codes, genes_dir, release_id):
                     oncotree_code=code,
                     stats_pass=(gene, code) in expression,
                     pass_mode="lineage" if (gene, code) in expression else None,
+                    confidence_tier="high" if (gene, code) in expression else None,
                     alterations=dict(categories=categories),
                 )
             )

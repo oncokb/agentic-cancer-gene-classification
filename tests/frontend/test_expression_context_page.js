@@ -974,6 +974,70 @@ test("re-rendering the same gene (literature job refresh) keeps the All view", a
   assert.strictEqual(summaryRows(nodes).filter((r) => !r.hidden).length, 4);
 });
 
+function viewWithCandidate() {
+  const v = view();
+  v.summary = { surfaced: 1, literature_pending: 1, excluded: 2, candidate: 1 };
+  v.pairs.push({
+    oncotree_code: "KIRC", cancer_type_name: "Kidney <b>Renal</b> Clear Cell Carcinoma",
+    study_id: "kirc_tcga_pan_can_atlas_2018", stats: stats("KIRC", { confidence_tier: "candidate" }),
+    stats_pass: true, enrichment: "Lineage enriched", confidence_tier: "candidate", precheck: "pass",
+    literature_eligible: false, status: "candidate", exclusion_reason: "candidate", literature: null,
+  });
+  return v;
+}
+
+test("candidates show a distinct Needs verification badge only in All cancer types", async () => {
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(viewWithCandidate()) });
+  await page.lookup("ERBB2");
+  const code = (row) => row.children[0].text;
+  assert.strictEqual(
+    nodes["ec-summary"].textContent,
+    "1 surfaced · 1 awaiting literature check · 2 excluded · 1 need verification",
+  );
+  // "Shown only" never shows a candidate.
+  assert.deepStrictEqual(visibleSummaryRows(nodes).map(code), ["Breast Invasive Carcinoma (BRCA)", "Stomach Adenocarcinoma (STAD)"]);
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 need verification (hidden)");
+
+  nodes["ec-view-all"].fire("click");
+  const rows = visibleSummaryRows(nodes);
+  assert.strictEqual(rows.length, 5);
+  const kirc = rows.find((r) => code(r).includes("(KIRC)"));
+  assert.strictEqual(code(kirc), "Kidney <b>Renal</b> Clear Cell Carcinoma (KIRC)", "names stay text");
+  assert.strictEqual(kirc.getAttribute("class"), "ec-row-excluded ec-row-candidate");
+  const [result] = kirc.children[4].children;
+  assert.strictEqual(result.textContent, "Needs verification");
+  assert.ok(!result.textContent.startsWith("Excluded"), "separate from other exclusion reasons");
+  assert.ok(result.getAttribute("class").includes("ec-candidate"));
+  const tooltip = result.getAttribute("title");
+  assert.ok(tooltip.includes("stricter high-confidence bar"), tooltip);
+  assert.ok(tooltip.includes("log2 fold change ≥ 2") && tooltip.includes("≥ 5×"), tooltip);
+  // Not sent to the literature check, so no "Not checked yet" prompt and no citations.
+  assert.strictEqual(kirc.children[3].text, "—");
+  assert.strictEqual(nodes["ec-view-count"].textContent, "2 shown · 2 excluded · 1 need verification");
+  // Other exclusion reasons keep their own badges.
+  const others = rows.filter((r) => r.getAttribute("class") === "ec-row-excluded");
+  assert.deepStrictEqual(others.map((r) => r.children[4].text), ["Excluded: PubMed pre-check", "Excluded: statistics"]);
+
+  nodes["ec-view-shown"].fire("click");
+  assert.ok(kirc.hidden, "candidate hidden again in Shown only");
+});
+
+test("a gene with only candidates shows the empty state in Shown only", async () => {
+  const v = viewWithCandidate();
+  v.pairs = v.pairs.filter((p) => p.status !== "surfaced" && p.status !== "literature_pending");
+  v.summary = { surfaced: 0, literature_pending: 0, excluded: 2, candidate: 1 };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  assert.strictEqual(visibleSummaryRows(nodes).length, 0);
+  assert.ok(!nodes["ec-table-empty"].hidden);
+  assert.ok(nodes["ec-table-empty"].textContent.includes("review the 3 not shown"), nodes["ec-table-empty"].textContent);
+});
+
+test("the page never assigns innerHTML", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../../src/expression_context/static/expression-context.js"), "utf8");
+  assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML/.test(source));
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of tests) {

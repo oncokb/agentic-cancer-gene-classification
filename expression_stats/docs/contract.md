@@ -1,7 +1,7 @@
 # Expression context (optional, removable module)
 
-Status: artifact schema_version 1, contract 1.2 (additive alteration detail and scope),
-expression method v3, alteration method v2 — 2026-11-12
+Status: artifact schema_version 1, contract 1.3 (additive alteration detail and scope;
+per-pair `confidence_tier`), expression method v3, alteration method v2 — 2026-11-13
 
 ## Goal
 
@@ -148,6 +148,50 @@ and subgroup q=1. Group-specific measured summaries remain defined when the
 opposite group is empty. Existing nullable fields retain their semantics.
 `p90_log2`/`rest_p90_log2` remain informational. `tissue_of_origin_risk` and
 `small_n` remain informational flags. Do not interpret a null as measured zero.
+
+### Confidence tier (contract 1.3)
+
+Product rule: only high-confidence pairs may be surfaced to curators; every weaker v3
+pass is an unsurfaced **candidate** that curators can still find. On top of the
+unchanged v3 pass (every rule above still required), each pair carries
+
+| Field | Type / meaning |
+| --- | --- |
+| `confidence_tier` | `"high"`, `"candidate"`, or null; null exactly when `stats_pass` is false |
+
+A v3 pass is `"high"` if the arm it passes by (its `pass_mode`) also meets that arm's
+strong cutoffs (inclusive), otherwise `"candidate"`:
+
+| Arm | Strong cutoffs (manifest `params`) |
+| --- | --- |
+| lineage | `log2fc >= strong_log2fc` (2.0) **and** `cliffs_delta >= strong_cliffs_delta` (0.70) |
+| subgroup | `subgroup_high_fraction >= strong_subgroup_min_fraction` (0.05) **and** `subgroup_high_fraction_ratio >= strong_subgroup_min_fraction_ratio` (5.0) |
+
+The arm is the pair's `pass_mode`: when both arms pass, lineage wins (as for
+`pass_mode`), so only the lineage cutoffs apply; a strong subgroup tail never promotes a
+weak lineage call. The tier is derived
+read-only from the v3 arrays: no v3 threshold, pass/fail call, `pass_mode` or label
+changes, and every v3 field is byte-identical to the contract 1.2 build (tested). The
+four `strong_*` params are hashed into the release ID. The cutoffs come from the
+read-only confidence-tier evaluation (45/51 positives high, 0/27 negatives); they are a
+selective statistical screen, not a calibrated precision.
+
+**Optional field.** `confidence_tier` is optional in the schema: bundles before contract
+1.3 omit it and still load. Only for a bundle whose manifest `contract_version` is a
+well-formed version string (exactly `^[0-9]+\.[0-9]+(\.[0-9]+)?$`: no sign, no
+whitespace) **below** `"1.3"` may consumers treat a **missing** field on a v3 pass as
+`"high"` (the pre-1.3 behaviour). Every other manifest requires the field: 1.3 or later,
+and also a missing, null, empty, non-string or malformed `contract_version` (fail
+closed; every bundle since contract 1.1 writes the version). A missing tier on a v3 pass
+in such a bundle is malformed and never high: ACGC rejects the bundle at load, and any
+pair that still reaches it fails closed, logged once per bundle. An explicit null or any
+unknown value on a v3 pass is never high.
+
+**Consumer rule (ACGC).** A pair is surfaced only if its statistics pass (v3, minus
+broad-blocked pairs), `confidence_tier` is (effectively) `"high"`, the effective PubMed
+precheck is not a fresh `false`, and a valid tumor-specific v2 literature verdict for the
+active release supports it. Candidates are never sent to the paid literature check and
+never surfaced or exported as golden-set rows.
 
 ## Alteration-type statistics (detail only; alteration method "2", contract 1.2)
 
@@ -315,7 +359,7 @@ fields are null when undefined or `not_testable`; never read null as zero. For C
 top-level statistics describe `direction` (the first enriched direction, else the one
 with the smaller p); `amp`/`del` hold both. `n_profiled` is the category denominator
 (CNA: patients with a measured call for the gene). The manifest adds `contract_version`
-("1.2"; "1.1" before the CNA driver lists), `alteration_method_version`, `alteration_params`, `build.skip_alterations`,
+("1.3"; "1.2" before `confidence_tier`, "1.1" before the CNA driver lists), `alteration_method_version`, `alteration_params`, `build.skip_alterations`,
 `source.alteration_inputs_sha256`, `source.mutation_driver_source`,
 `source.mutation_driver_sha256`, `source.mutation_driver_files`, `source.cna_driver_source`,
 `source.cna_driver_sha256`, `source.cna_driver_files` (contract 1.2), and an `alterations`
@@ -373,6 +417,16 @@ do not enforce the gate, and remain unpublishable. The manifest's `controls`
 summary records status, panel SHA-256, counts, missing count and failures.
 Publication independently requires the complete passing report for the current
 panel, 51/51 positives and 0/27 negatives, in addition to full precheck coverage.
+
+**Control tiers (contract 1.3).** The gate stays on the v3 pass: positives are never
+required to be high. The report's `tiers` block (also in the manifest `controls`
+summary) records `positive_high`, `positive_candidate`, `negative_high`, the totals and
+`positive_candidate_ids`, and each control row records its `confidence_tier`. Any
+negative with `confidence_tier: "high"` fails the gate (implied by the v3 negative rule,
+asserted separately). With the cutoffs above, PAX8–KIRC, ERBB2–BRCA, ERBB2–STAD,
+EGFR–GBM, MSLN–PAAD and SLC34A2–OV are candidates (45/51 high, 0/27 negatives high).
+Publication also requires `tiers.negative_high == 0`, and the publish-time recheck
+compares every control's re-derived tier and the `tiers` block.
 `controls-report.json` is a separate release asset with its existing bytes.
 
 **Alteration controls.** `alteration_controls` in the same panel gate category statuses
@@ -395,7 +449,7 @@ builds are review-only.
 `controls-report.json` or the manifest. After verifying `genes.jsonl.gz` size and
 SHA-256, it reads every expression and alteration control gene's document from the
 bundle and re-derives each control with the same stdlib evaluator: the expression
-`stats_pass` for the cohort, and the alteration category status (and required CNA
+`stats_pass` and `confidence_tier` for the cohort, and the alteration category status (and required CNA
 direction) for the cohort. It refuses to publish if a control gene or record is
 missing, a positive is not enriched/passing, a negative is enriched/passing, or the
 re-derived counters or per-control calls (id, observed, directions, events, profiled,
@@ -442,7 +496,7 @@ is maintained separately (PR #167). No shared Python imports are permitted.
 ```json
 {
   "schema_version": "1",
-  "contract_version": "1.2",
+  "contract_version": "1.3",
   "release_id": "datahub-<12hex>-m3-<build_sha12>",
   "bundle_tag": "expression-stats-datahub-<12hex>-m3-<build_sha12>-pubmed-<YYYYMMDD>",
   "pubmed_snapshot_date": "<YYYY-MM-DD>",
@@ -467,6 +521,10 @@ is maintained separately (PR #167). No shared Python imports are permitted.
     "subgroup_p95_percentile": 95,
     "subgroup_p95_log2_diff": 1.5,
     "subgroup_fdr": 0.025,
+    "strong_log2fc": 2.0,
+    "strong_cliffs_delta": 0.7,
+    "strong_subgroup_min_fraction": 0.05,
+    "strong_subgroup_min_fraction_ratio": 5.0,
     "precheck_min_pmids": 1,
     "precheck_cache_ttl_days": 30,
     "detection_log2": 3.4594316186372973
@@ -505,7 +563,15 @@ is maintained separately (PR #167). No shared Python imports are permitted.
     "negative_passed": 0,
     "negative_total": 27,
     "missing": 0,
-    "failures": []
+    "failures": [],
+    "tiers": {
+      "positive_high": 45,
+      "positive_candidate": 6,
+      "positive_total": 51,
+      "negative_high": 0,
+      "negative_total": 27,
+      "positive_candidate_ids": ["..."]
+    }
   }
 }
 ```
@@ -526,6 +592,7 @@ per line, unchanged schema; symbols are upper-case canonical symbols.
      "log2fc": 0.0, "log2fc_vs_median_of_type_medians": 0.0,
      "cliffs_delta": 0.0, "auc": 0.0, "p_value": 0.0, "q_value": 0.0,
      "stats_pass": false, "pass_mode": null, "lineage_blocked_by_broad": false,
+     "confidence_tier": null,
      "subgroup_high_count": 0, "subgroup_high_fraction": 0.0,
      "subgroup_high_fraction_ratio": 0.0, "p95_log2_diff": 0.0, "subgroup_q": 1.0,
      "pubmed_count": null, "literature_precheck_pass": null,
