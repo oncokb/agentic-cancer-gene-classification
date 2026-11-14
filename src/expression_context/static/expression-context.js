@@ -18,6 +18,7 @@
     warn: "medium",
     neutral: "low",
     candidate: "medium",
+    alteration: "context",
   };
   const REASON_LABELS = {
     stats: "statistics",
@@ -265,6 +266,33 @@
       ));
     }
 
+    const alterationNames = ["Point Mutation", "Structural Variant", "Copy Number Alteration"];
+
+    function alterationsFor(pair) { return pair.stats.alterations || pair.alterations; }
+
+    function alterationLabel(name, category) {
+      if (name !== "Copy Number Alteration" || !category) return name;
+      const directions = (category.enriched_directions || []).filter((d) => ["amp", "del"].includes(d));
+      if (!directions.length && ["amp", "del"].includes(category.direction)) directions.push(category.direction);
+      return directions.length ? `${name} (${directions.join(", ")})` : name;
+    }
+
+    function alterationBadges(pair) {
+      const alterations = alterationsFor(pair);
+      if (!alterations) return "—";
+      const categories = alterations.categories || {};
+      const names = alterationNames.filter((name) =>
+        (alterations.alteration_types_enriched || []).includes(name) &&
+        (!categories[name] || categories[name].status === "enriched"));
+      return names.length ? names.map((name) => badge(alterationLabel(name, categories[name]), "alteration")) : "—";
+    }
+
+    function alterationCounts(counts, fallbackProfiled) {
+      const count = (n) => n == null ? "—" : String(n);
+      const frequency = counts.frequency == null ? "—" : `${formatNumber(counts.frequency * 100)}%`;
+      return `${count(counts.n_events)}/${count(counts.n_profiled ?? fallbackProfiled)} events/profiled; frequency ${frequency}`;
+    }
+
     function renderDetailRow(pair, detailId, expanded) {
       const s = pair.stats;
       const detailRow = doc.createElement("tr");
@@ -272,9 +300,9 @@
       detailRow.setAttribute("class", "ec-detail-row");
       show(detailRow, expanded);
       const td = doc.createElement("td");
-      td.setAttribute("colspan", "7");
+      td.setAttribute("colspan", "8");
       td.setAttribute("class", "ec-detail-cell");
-      const dl = node("dl", null, "ec-details-list");
+      let dl = node("dl", null, "ec-details-list");
       const addDetail = (label, value, tooltip, ddClass) => {
         const dt = node("dt", label);
         if (tooltip) {
@@ -333,6 +361,26 @@
         precheckCell(pair),
         "PubMed count for the gene and tumor type",
       );
+      const alterations = alterationsFor(pair);
+      if (alterations) {
+        td.appendChild(dl);
+        dl = node("dl", null, "ec-details-list");
+        td.appendChild(node("h4", "Alterations", "ec-alterations-heading"));
+        const categories = alterations.categories || {};
+        for (const name of alterationNames) {
+          const category = categories[name];
+          if (!category) continue;
+          const status = (category.status || "unknown").replace(/_/g, " ");
+          let text = `${status}; ${alterationCounts(category)}`;
+          if (category.reason) text += `; ${category.reason}`;
+          if (name === "Copy Number Alteration") {
+            for (const direction of ["amp", "del"]) {
+              if (category[direction]) text += `; ${direction}: ${alterationCounts(category[direction], category.n_profiled)}`;
+            }
+          }
+          addDetail(name, text);
+        }
+      }
       td.appendChild(dl);
       detailRow.appendChild(td);
       return detailRow;
@@ -363,6 +411,7 @@
       cell(row, name);
       cell(row, statsCell(pair));
       cell(row, flagsCell(s.flags));
+      cell(row, alterationBadges(pair), "ec-alterations");
       cell(row, literatureCell(pair));
       cell(row, resultCell(pair));
       cell(row, cbioportalCell(pair, symbol));
