@@ -10,7 +10,7 @@ from scipy.stats import spearmanr
 
 from . import PARAMS, http
 from .fetch import digest
-from .stats import bh, compute, confidence_tier, passes
+from .stats import bh, compute, passes, strong_masks, subgroup_pass
 
 SOURCE = dict(
     url="https://api.gdc.cancer.gov/data/4f277128-f793-4354-a13d-30cc7fe9f6b5",
@@ -66,7 +66,8 @@ def measure(raw, labels, codes, original, purity, params=PARAMS):
     """All v3 passes enter one global BH family, including unavailable tests (p=1).
 
     Recompute the filtered statistics across every cohort for each high gene, then
-    restore the original broad flag and lineage-before-subgroup priority.
+    restore the original broad flag and lineage-before-subgroup priority. Only an arm
+    that made the pair high before filtering can retain it after filtering.
     """
     tests = {}
     high = high_purity_mask(purity, params)
@@ -82,17 +83,14 @@ def measure(raw, labels, codes, original, purity, params=PARAMS):
             )
             & ~original["broadly_expressed"][needed, None]
         )
-        # Use the explicit subgroup conditions: a filtered lineage pass alone is not subgroup.
-        subgroup = (
-            (hp["n"] >= params["min_n"])
-            & (hp["n_rest"] >= params["min_n"])
-            & (hp["subgroup_high_count"] >= params["subgroup_min_count"])
-            & (hp["subgroup_high_fraction"] >= params["subgroup_min_fraction"])
-            & (hp["subgroup_high_fraction_ratio"] >= params["subgroup_min_fraction_ratio"])
-            & (hp["p95_log2_diff"] >= params["subgroup_p95_log2_diff"])
-            & (hp["subgroup_q"] < params["subgroup_fdr"])
+        subgroup = subgroup_pass(hp, params)
+        strong_lineage, strong_subgroup = strong_masks(hp, lineage, subgroup, params)
+        original_arm = original["strong_arm"][needed]
+        hp_strong = (
+            ((original_arm == "lineage") & strong_lineage)
+            | ((original_arm == "subgroup") & strong_subgroup)
+            | ((original_arm == "both") & (strong_lineage | strong_subgroup))
         )
-        hp_strong = confidence_tier(hp, lineage, subgroup, params) == "high"
     for i, j in zip(*np.where(original["stats_pass"]), strict=True):
         matched = (labels == codes[j]) & np.isfinite(purity) & np.isfinite(raw[i])
         z, v = np.log2(raw[i, matched] + 1), purity[matched]
@@ -144,6 +142,7 @@ def finalize(genes_dir, tests, params=PARAMS):
                 )
                 if row["purity_check"] == "demoted":
                     row["confidence_tier"] = "candidate"
+                    row["strong_arm"] = None
                     counts["demoted"] += 1
                 else:
                     counts["high_after"] += 1
