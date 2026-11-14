@@ -22,13 +22,16 @@ are detail only: they never change surfacing, statistics passes, confidence tier
 literature eligibility, exclusion reasons, history counts, exported cancer types,
 or exported PMIDs. `gene_view` remains the single source for surfacing.
 The `/stats` and `/genes` responses include this detail in each pair's `stats`;
-`PairStatsView` also exposes `alterations` directly.
+`PairStatsView.alterations` is a computed accessor derived from `stats` and used
+by both exports. The page uses one accessor for badges and Details, reading that
+canonical API field with a stats-only fallback for older responses. Non-dict
+category values are skipped, including in enriched-category output.
 
 The page's Alterations column shows enriched Point Mutation, Structural Variant,
 and Copy Number Alteration badges, including CNA amplification (`amp`) / deep
 deletion (`del`) directions. Details lists each category's status, events/profiled,
 frequency and reason, plus both CNA directions where available. This applies to
-candidate and excluded rows in All cancer types too. Missing older-release data
+purity-demoted and excluded rows in All cancer types too. Missing older-release data
 shows no detail; undefined counts stay undefined. Unknown category names are
 ignored and logged when loading, so they cannot enter exports.
 
@@ -38,6 +41,48 @@ gene in `Relevant alteration type(s)`: the deduplicated union of Expression and
 enriched categories over **surfaced pairs only**, ordered Point Mutation,
 Structural Variant, Expression, Copy Number Alteration. Zero surfaced pairs gives
 an empty cell. Neither export changes which pairs or citations are included.
+
+## Literature eligibility and surfaced confidence labels
+
+Every statistical pass (`passes_stats`: `stats_pass` and no lineage broad block)
+is eligible for literature checking after the versioned purity guard and unless
+the effective precheck is a fresh explicit false. Candidate tier alone never gates
+eligibility. Explicit `purity_check == "demoted"` excludes any tier. In contract
+1.4+ (also missing/malformed versions), explicit high-tier pairs additionally
+require exactly `pass`, `not_applicable`, or `unassessed`; absent, null, and unknown
+purity states fail closed. Only well-formed pre-1.4 contracts retain legacy
+missing-purity behavior. Candidate-tier pairs with null purity remain eligible.
+A supported, valid tumor-specific verdict for the active release
+surfaces the pair. Pending pairs say “Not checked yet”; unsupported checked pairs
+are excluded for no literature support. Job concurrency and cost limits are unchanged.
+
+Surfaced pairs expose `confidence_label` on `/stats`, `/genes`, and polled job
+results: **Strong** for effective tier `high`, **Moderate** otherwise (including
+`candidate`, null or unknown tiers). A missing tier gets the legacy Strong fallback
+only with a well-formed contract version below 1.3. Newer, missing or malformed
+versions give Moderate and retain the existing once-per-bundle missing-tier warning.
+The loader accepts missing tiers so this fallback can be used. For purity-era
+high pairs, the loader rejects absent/null/unknown purity states
+(the known `demoted` state loads but remains excluded). The service independently
+applies the same model purity guard in `gene_view`, including seeded bundles and
+stored supported evidence. Scheduling uses that view, so blocked pairs never
+reach paid literature checks or surface through APIs, polling, history or exports.
+
+The page adds Strong / Moderate badges to surfaced rows. Moderate means
+“Statistically significant and literature-supported, but below the strong
+effect-size bar; worth a closer look.” Strong meets strong effect-size criteria.
+The former “Needs verification” badge is replaced by **Purity concern**, reserved
+for purity-blocked pairs, to explain why they cannot be shown. Their API status
+is `excluded` and exclusion reason is `purity` (also in per-pair CSV); these count
+as excluded in summaries. The badge distinguishes explicit demotion from missing
+or unknown required purity via its tooltip. They never reach literature checking
+or surface, even with stored supported evidence. Legacy `candidate` status/reason
+values remain accepted and render with the purity badge for compatibility.
+
+Per-pair CSV adds `confidence_label` immediately after `confidence_tier`, filled
+for surfaced rows only. Golden-set columns are unchanged and include both Strong
+and Moderate surfaced pairs. All read paths and literature scheduling use the
+same `gene_view` eligibility and surfaced decisions.
 
 ## Architecture
 

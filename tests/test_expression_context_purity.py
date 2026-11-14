@@ -55,12 +55,17 @@ def test_demoted_never_surfaces_or_calls_literature(tier):
         job = run_job(client)
         assert_agreement(surfaced_everywhere(client, job["job_id"]), set())
         assert gate.calls == []
+        view = client.get(f"{PREFIX}/stats/ERBB2").json()
+        demoted = [p for p in view["pairs"] if p["stats_pass"]]
+        assert all(p["status"] == "excluded" and p["exclusion_reason"] == "purity" for p in demoted)
+        assert all(not p["literature_eligible"] and p["confidence_label"] is None for p in demoted)
         _, rows = parse_csv_response(
             client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text
         )
         passing = [r for r in rows if r["stats_pass"] == "yes"]
         assert passing and all(r["purity_check"] == "demoted" for r in passing)
         assert all(r["confidence_tier"] == "candidate" for r in passing)
+        assert all(r["exclusion_reason"] == "purity" for r in passing)
 
 
 @pytest.mark.parametrize("version,expected", [("1.3", {"BRCA"}), ("1.4", set())])
@@ -87,6 +92,8 @@ def test_missing_purity_versioned_fail_closed(version, expected, caplog):
         )
         if version == "1.4":
             assert gate.calls == []
+        else:
+            assert {p["confidence_label"] for p in job["result"]["surfaced"]} == {"Strong"}
     warnings = [r for r in caplog.records if "without purity_check" in r.getMessage()]
     assert len(warnings) == (1 if version == "1.4" else 0)
 
@@ -128,7 +135,8 @@ def test_only_known_retaining_states_allow_high(state, high):
         confidence_tier="high",
         purity_check=state,
     )
-    assert stats.high_confidence(tier_required=True, purity_required=True) is high
+    assert stats.purity_blocked(purity_required=True) is (not high)
+    assert (stats.effective_confidence_tier(tier_required=True, purity_required=True) == "high") is high
 
 
 @pytest.mark.parametrize("version,rejected", [("1.3", False), ("1.4", True)])
@@ -184,10 +192,108 @@ def test_purity_warning_once_per_bundle(version, tier, state, warn, caplog):
         if warn:
             assert manifest.release_id in warnings[0].getMessage()
             assert "ERBB2" in warnings[0].getMessage()
-            assert "treating them as not high-confidence" in warnings[0].getMessage()
+            assert "purity status unavailable" in warnings[0].getMessage()
         # A different bundle gets its own warning; repeats still log only once.
         other = manifest.model_copy(update={"release_id": manifest.release_id + "-other"})
         for _ in range(2):
             service._purity_required(other, artifact)
         warnings = [r for r in caplog.records if "without purity_check" in r.getMessage()]
         assert len(warnings) == 2 * int(warn)
+
+
+@pytest.mark.parametrize("version", ["1.4", "1.5"])
+@pytest.mark.parametrize("state", [None, "PASS"])
+def test_invalid_high_purity_never_surfaces_or_calls_literature(version, state):
+    def edit(doc):
+        for row in doc["cancer_types"]:
+            row["confidence_tier"] = "high" if row["stats_pass"] else None
+            row["purity_check"] = state
+
+    harness = CsvHarness(
+        gate=FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE)),
+        bundle=build_bundle(("ERBB2",), manifest_overrides={"contract_version": version}, edit_gene=edit),
+    )
+    # Seed directly to verify the service protects reads even if loading was bypassed.
+    with TestClient(harness.app) as client:
+        harness.service._clock = lambda: NOW
+        store_supported(harness, "BRCA", "breast cancer", "12345678")
+        store_supported(harness, "STAD", "gastric cancer", "23456789")
+        assert_agreement(surfaced_everywhere(client), set())
+        job = run_job(client)
+        assert harness.gate.calls == []
+        assert job["literature_evaluated"] == 0 and job["literature_reused"] == 0
+        assert_agreement(surfaced_everywhere(client, job["job_id"]), set())
+        view = client.get(f"{PREFIX}/stats/ERBB2").json()
+        for pair in view["pairs"]:
+            if pair["stats_pass"]:
+                assert (pair["status"], pair["exclusion_reason"]) == ("excluded", "purity")
+                assert not pair["literature_eligible"] and pair["confidence_label"] is None
+        _, rows = parse_csv_response(
+            client.get(f"{PREFIX}/genes/ERBB2/export.csv?include_excluded=true").text
+        )
+        assert all(r["exclusion_reason"] == "purity" for r in rows if r["stats_pass"] == "yes")
+        assert all(not r["confidence_label"] for r in rows)
+        for row in golden_rows(client):
+            assert not row["Relevant expression-based cancer type(s)"]
+            assert not row["Evidence-associated PMIDs"]
+
+
+@pytest.mark.parametrize("state", [None, "PASS", "unknown"])
+@pytest.mark.parametrize("version,rejected", [("1.3", False), ("1.4", True)])
+def test_loader_rejects_invalid_high_purity(version, rejected, state):
+    def edit(doc):
+        for row in doc["cancer_types"]:
+            row["confidence_tier"] = "high" if row["stats_pass"] else None
+            row["purity_check"] = state
+
+    bundle = build_bundle(("ERBB2",), manifest_overrides={"contract_version": version}, edit_gene=edit)
+    manifest = BundleManifest.model_validate(bundle.manifest)
+    line = json.dumps(bundle.genes[0]).encode()
+    if rejected:
+        with pytest.raises(BundleContractError, match="requires purity_check"):
+            BundleLoader._gene_row(line, manifest, set(), 1)
+    else:
+        assert BundleLoader._gene_row(line, manifest, set(), 1)[0] == "ERBB2"
+
+
+@pytest.mark.parametrize("state", ["pass", "not_applicable", "unassessed", "demoted"])
+def test_loader_accepts_known_high_purity(state):
+    def edit(doc):
+        for row in doc["cancer_types"]:
+            row["confidence_tier"] = "high" if row["stats_pass"] else None
+            row["purity_check"] = state
+
+    bundle = build_bundle(("ERBB2",), manifest_overrides={"contract_version": "1.4"}, edit_gene=edit)
+    assert BundleLoader._gene_row(
+        json.dumps(bundle.genes[0]).encode(), BundleManifest.model_validate(bundle.manifest), set(), 1
+    )[0] == "ERBB2"
+
+
+def test_candidate_null_purity_remains_eligible_and_surfaces_moderate():
+    def edit(doc):
+        for row in doc["cancer_types"]:
+            row["confidence_tier"] = "candidate" if row["stats_pass"] else None
+            row["purity_check"] = None
+
+    bundle = build_bundle(("ERBB2",), manifest_overrides={"contract_version": "1.4"}, edit_gene=edit)
+    assert BundleLoader._gene_row(
+        json.dumps(bundle.genes[0]).encode(), BundleManifest.model_validate(bundle.manifest), set(), 1
+    )[0] == "ERBB2"
+    harness = CsvHarness(bundle=bundle, gate=FakeLiteratureGate(verdicts=dict(SUPPORTING_GATE)))
+    with TestClient(harness.app) as client:
+        harness.service._clock = lambda: NOW
+        store_supported(harness, "STAD", "gastric cancer", "23456789")
+        assert_agreement(surfaced_everywhere(client), {"STAD"})
+        pending = client.get(f"{PREFIX}/stats/ERBB2").json()
+        brca = next(p for p in pending["pairs"] if p["oncotree_code"] == "BRCA")
+        assert brca["literature_eligible"] and brca["status"] == "literature_pending"
+        job = run_job(client)
+        assert sorted(harness.gate.calls) == [("ERBB2", "breast cancer"), ("ERBB2", "esophageal cancer")]
+        assert_agreement(surfaced_everywhere(client, job["job_id"]), {"BRCA", "STAD"})
+        assert {p["confidence_label"] for p in job["result"]["surfaced"]} == {"Moderate"}
+        view = client.get(f"{PREFIX}/stats/ERBB2").json()
+        assert all(p["literature_eligible"] for p in view["pairs"] if p["oncotree_code"] in {"BRCA", "STAD"})
+        _, rows = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
+        assert {r["confidence_label"] for r in rows} == {"Moderate"}
+        for row in golden_rows(client):
+            assert row["Relevant expression-based cancer type(s)"] == "Breast cancer; Stomach adenocarcinoma"
