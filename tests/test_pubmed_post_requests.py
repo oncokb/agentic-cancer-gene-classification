@@ -136,7 +136,12 @@ async def test_429_retry_after_bounded_by_deadline(monkeypatch, retry_after, exp
     assert sleeps == ([2.0] if expected_calls == 2 else [])
 
 
-@pytest.mark.parametrize("failed_index", [0, 1])
+# Search plan with a tumor type: [tumor phrase, any phrase, tumor co-occurrence,
+# any co-occurrence]; indices 0 and 2 are tumor-scoped.
+_TUMOR_SCOPED_SEARCHES = {0, 2}
+
+
+@pytest.mark.parametrize("failed_index", [0, 1, 2, 3])
 async def test_one_search_fails_keeps_other_results_and_scope(monkeypatch, failed_index):
     monkeypatch.setattr(literature, "resolve_fusion_partner_aliases", AsyncMock(return_value=([], [])))
     calls = []
@@ -156,7 +161,9 @@ async def test_one_search_fails_keeps_other_results_and_scope(monkeypatch, faile
     assert result.pmids == ["42"]
     assert result.partial is True
     assert result.retrieval_status == "ok"
-    assert result.literature_scope == (None if failed_index == 0 else "requested_tumor")
+    assert result.literature_scope == (
+        None if failed_index in _TUMOR_SCOPED_SEARCHES else "requested_tumor"
+    )
     assert result.requested_tumor_pmids == ["42"]
     assert "One search failed" in result.interpretation
     assert "HTTP 414" in result.interpretation
@@ -272,12 +279,12 @@ async def test_partial_fusion_result_is_not_cached(monkeypatch, fake_redis, forc
     assert compute.await_count == 2
 
 
-@pytest.mark.parametrize("failed_index", [0, 1])
+@pytest.mark.parametrize("failed_index", [0, 1, 2, 3])
 @pytest.mark.parametrize("paper", [None, "other", "tumor"])
 async def test_partial_scope_is_unknown_if_empty_or_tumor_search_failed(monkeypatch, failed_index, paper):
     monkeypatch.setattr(literature, "resolve_fusion_partner_aliases", AsyncMock(return_value=([], [])))
     error = httpx.HTTPStatusError("upstream error", request=httpx.Request("POST", literature.ESEARCH_URL), response=httpx.Response(503))
-    outcomes = [[], []] if paper is None else [["42"], ["42"]]
+    outcomes = [[] if paper is None else ["42"] for _ in range(4)]
     outcomes[failed_index] = error
     monkeypatch.setattr(literature, "_esearch", AsyncMock(side_effect=outcomes))
     records = [] if paper is None else [LiteratureRecord(
@@ -287,7 +294,7 @@ async def test_partial_scope_is_unknown_if_empty_or_tumor_search_failed(monkeypa
     result = await literature._retrieve_fusion_evidence_uncached("EML4::ALK", "LUAD", 20)
     assert result.partial
     assert result.retrieval_status == "ok"
-    expected = None if failed_index == 0 or paper is None else ("requested_tumor" if paper == "tumor" else "other_or_unspecified")
+    expected = None if failed_index in _TUMOR_SCOPED_SEARCHES or paper is None else ("requested_tumor" if paper == "tumor" else "other_or_unspecified")
     assert result.literature_scope == expected
     assert "One search failed" in result.interpretation
 

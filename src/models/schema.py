@@ -159,7 +159,7 @@ class FusionEvidenceResult(BaseModel):
     fusion: str
     partial: bool = Field(
         default=False,
-        description="True when one exact-pair search failed; retained evidence is incomplete.",
+        description="True when at least one fusion-evidence search failed; retained evidence is incomplete.",
     )
     input: Optional[str] = Field(
         default=None,
