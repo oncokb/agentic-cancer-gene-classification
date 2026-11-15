@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 
 from src.auth import AuthenticatedUser, require_auth
-from src.admin_users_routes import require_admin_write
+from src.admin_users_routes import require_admin_role, require_admin_write
 from src.expression_context.catalog import BundleGone, BundleNotLoaded
 from src.expression_context.models import (
     BundleStatus,
@@ -66,6 +66,7 @@ async def create_job(
 ) -> JobAccepted:
     try:
         if body.refresh:
+            await require_admin_role(user)
             await require_admin_write(request, user)
         job = await service.submit(body.gene, owner=job_owner(user), refresh=body.refresh)
     except InvalidGene as exc:

@@ -578,6 +578,7 @@ class ExpressionContextService:
         self,
         resolved: ResolvedGene,
         stored: Mapping[str, StoredPair],
+        has_checked: Optional[bool] = None,
     ) -> GeneStatsView:
         bundle = resolved.bundle
         if bundle is not None:
@@ -602,7 +603,7 @@ class ExpressionContextService:
         pairs: List[PairStatsView] = []
         summary = GeneStatsSummary()
         expired = precheck_expired(resolved.manifest, self._clock())
-        has_stored_result = bool(stored)
+        has_stored_result = bool(stored) if has_checked is None else has_checked
         tier_required = self._tier_required(resolved.manifest, resolved.artifact)
         purity_required = self._purity_required(resolved.manifest, resolved.artifact)
         for stats in resolved.artifact.cancer_types:
@@ -628,7 +629,6 @@ class ExpressionContextService:
                 stored_verdict = LiteratureVerdict.model_validate(prior.evidence)
                 if stored_verdict.literature_gate == TUMOR_SPECIFIC_GATE:
                     is_surfaced = stored_verdict_surfaced(
-                        row_release_id=prior.release_id,
                         active_release_id=active_release_id,
                         literature_gate=prior.literature_gate,
                         evidence=prior.evidence,
@@ -711,7 +711,8 @@ class ExpressionContextService:
             except BundleGone:
                 resolved = await self.resolve(gene)
         stored = await self.store.get_verdict_pairs(resolved.hugo_symbol, self.gate.name)
-        return self._evaluate_gene_view(resolved, stored), stored
+        checked = await self.store.has_checked_gene(resolved.hugo_symbol, self.gate.name)
+        return self._evaluate_gene_view(resolved, stored, has_checked=checked), stored
 
     async def latest_result(
         self, gene: str, include_excluded: bool
@@ -720,7 +721,7 @@ class ExpressionContextService:
         historical: List[StoredPair] = []
         if not stored:
             historical = await self.store.latest_pairs(view.hugo_symbol, self.gate.name)
-            if not historical:
+            if not view.has_stored_result:
                 raise GeneNotFound(view.hugo_symbol)
         return self._gene_result_from_view(
             view, stored, historical, include_excluded=include_excluded
@@ -730,7 +731,7 @@ class ExpressionContextService:
         self, gene: str, *, include_excluded: bool = False
     ) -> Tuple[str, str]:
         view, stored = await self.gene_view(gene)
-        if not stored:
+        if not view.has_stored_result:
             historical = await self.store.latest_pairs(view.hugo_symbol, self.gate.name)
             if not historical:
                 raise GeneNotFound(view.hugo_symbol)
@@ -757,7 +758,7 @@ class ExpressionContextService:
             if include_excluded:
                 symbols = await self.catalog.list_genes(bundle, batch_size, after_symbol=after)
             else:
-                symbols = await self.store.list_verdict_genes(gate_name, batch_size, after_symbol=after)
+                symbols = await self.store.list_checked_genes(gate_name, batch_size, after_symbol=after)
             if not symbols:
                 return symbols, []
 
@@ -775,7 +776,10 @@ class ExpressionContextService:
                     bundle=bundle,
                 )
                 stored = await self.store.get_verdict_pairs(resolved.hugo_symbol, gate_name)
-                view = self._evaluate_gene_view(resolved, stored)
+                checked = True if not include_excluded else await self.store.has_checked_gene(
+                    resolved.hugo_symbol, gate_name
+                )
+                view = self._evaluate_gene_view(resolved, stored, has_checked=checked)
                 rows = view_to_rows(view)
                 page_rows.extend(rows)
             return symbols, page_rows
@@ -917,7 +921,7 @@ class ExpressionContextService:
         not_yet_checked: List[str] = []
         for resolved in resolved_genes:
             view, stored = await self.gene_view(resolved.hugo_symbol, resolved=resolved)
-            if not stored:
+            if not view.has_stored_result:
                 not_yet_checked.append(resolved.hugo_symbol)
             else:
                 rows.append(golden_set_row_from_view(view, name_map=name_map))
@@ -1043,6 +1047,8 @@ class ExpressionContextService:
                     exclusion_reason=reason,
                     stats=pair.stats,
                     literature=pair.literature,
+                    literature_checked_at=pair.literature_checked_at,
+                    verdict_release_id=pair.verdict_release_id,
                     computed_at=computed_at,
                     bundle_tag=view.bundle.bundle_tag,
                 )

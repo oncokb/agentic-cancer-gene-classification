@@ -295,6 +295,12 @@ What ACGC relies on from the contract:
   The row's `release_id` remains as provenance for where it was written.
   The API exposes `literature_checked_at` and `verdict_release_id` on a pair;
   per-pair CSV `literature_checked_at` uses the verdict row's `computed_at`.
+  A gene counts as checked when it has any row under the current gate, including
+  exclusion rows without evidence and rows from older releases. This remains true
+  after a verdict expires, so exports still include the gene with pending pairs.
+  History pair counts and last-checked times include current-gate exclusion rows
+  and expired verdicts; rows carrying old-rule evidence are excluded. Surfaced
+  counts are evaluated against the active bundle and current clock.
 
 ## ACGC API and page (when enabled)
 

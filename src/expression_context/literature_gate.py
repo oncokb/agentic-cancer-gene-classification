@@ -112,7 +112,6 @@ def stored_v2_verdict(
 
 def stored_verdict_surfaced(
     *,
-    row_release_id: str,
     active_release_id: str,
     literature_gate: str,
     evidence: Optional[Dict[str, Any]],

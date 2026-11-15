@@ -386,6 +386,8 @@ class PairResult(BaseModel):
     exclusion_reason: Optional[ExclusionReason] = None
     stats: CancerTypeStats
     literature: Optional[LiteratureVerdict] = None
+    literature_checked_at: Optional[datetime] = None
+    verdict_release_id: Optional[str] = None
     computed_at: datetime
     bundle_tag: Optional[str] = None
 

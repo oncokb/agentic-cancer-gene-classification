@@ -198,9 +198,18 @@ def test_verdicts_from_another_release_are_reused_but_other_gate_is_not(harness,
             literature_gate=gate, surfaced=True, stats=stats, evidence=evidence,
             computed_at=now - timedelta(days=1),
         )
+    old_rule = {**evidence, "literature_gate": "acgc_pipeline_v1"}
+    harness.store.rows[("ERBB2", "STAD", "older-release", "acgc_tumor_specific_v2")] = StoredPair(
+        hugo_symbol="ERBB2", oncotree_code="STAD", release_id="older-release",
+        literature_gate="acgc_tumor_specific_v2", surfaced=True,
+        stats=gene_file()["cancer_types"][1], evidence=old_rule,
+        computed_at=now - timedelta(days=1),
+    )
     job = run_job(client)
     assert ("ERBB2", "breast cancer") not in harness.gate.calls
+    assert ("ERBB2", "gastric cancer") in harness.gate.calls
     assert job["literature_reused"] == 1
+    assert job["literature_evaluated"] == 2
 
 
 def test_refresh_requires_admin_and_forces_literature_recheck(harness, client):
@@ -208,6 +217,12 @@ def test_refresh_requires_admin_and_forces_literature_recheck(harness, client):
     before = harness.gate.calls.count(("ERBB2", "breast cancer"))
     forbidden = client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2", "refresh": True})
     assert forbidden.status_code == 403
+    harness.user = ALICE.model_copy(update={"role": "viewer", "auth_method": "api_key"})
+    assert client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2", "refresh": True}).status_code == 403
+    harness.user = ALICE.model_copy(update={"role": "viewer", "auth_method": "session"})
+    same_origin = {"sec-fetch-site": "same-origin"}
+    assert client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2", "refresh": True}, headers=same_origin).status_code == 403
+    assert client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2"}).status_code == 202
     harness.user = ALICE.model_copy(update={"role": "admin", "auth_method": "api_key"})
     accepted = client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2", "refresh": True})
     assert accepted.status_code == 202
@@ -218,6 +233,9 @@ def test_refresh_requires_admin_and_forces_literature_recheck(harness, client):
         time.sleep(0.01)
     assert polled["literature_evaluated"] == 3
     assert harness.gate.calls.count(("ERBB2", "breast cancer")) == before + 1
+    harness.user = ALICE.model_copy(update={"role": "admin", "auth_method": "session"})
+    assert client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2", "refresh": True}).status_code == 403
+    assert client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2", "refresh": True}, headers=same_origin).status_code == 202
 
 
 def test_cross_release_only_eligible_pair_reuses_without_judge_call():
@@ -244,6 +262,12 @@ def test_cross_release_only_eligible_pair_reuses_without_judge_call():
         assert job["literature_reused"] == 1
         assert harness.gate.calls == []
         assert [pair["oncotree_code"] for pair in job["result"]["surfaced"]] == ["BRCA"]
+        pair = job["result"]["surfaced"][0]
+        assert pair["verdict_release_id"] == "release-a"
+        assert datetime.fromisoformat(pair["literature_checked_at"]) == now
+        gene_pair = client.get(f"{PREFIX}/genes/ERBB2").json()["surfaced"][0]
+        assert gene_pair["verdict_release_id"] == "release-a"
+        assert datetime.fromisoformat(gene_pair["literature_checked_at"]) == now
 
 
 def test_gate_failure_is_reported_and_retried_next_run(harness, client):

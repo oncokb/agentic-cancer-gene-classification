@@ -495,7 +495,8 @@ def test_csv_agrees_row_for_row_with_get_gene_and_history_under_stats_and_old_ru
 
         assert history["items"][0]["hugo_symbol"] == "ERBB2"
         assert history["items"][0]["surfaced_count"] == len(json_surfaced_codes) == 1
-        assert history["items"][0]["pair_count"] == len(csv_full) == 5
+        assert history["items"][0]["pair_count"] == 4
+        assert len(csv_full) == 5
 
         # Also cover history after a mid-request BundleGone (retries and recovers)
         orig_gene = harness.service.catalog.gene
@@ -1324,14 +1325,14 @@ async def test_early_query_failure_in_bulk_export_returns_non_200_and_midstream_
         async def failing_list_release_genes(*args, **kwargs):
             raise RuntimeError("Database connection refused during initial page query")
 
-        orig_method = harness.store.list_verdict_genes
-        harness.store.list_verdict_genes = failing_list_release_genes
+        orig_method = harness.store.list_checked_genes
+        harness.store.list_checked_genes = failing_list_release_genes
 
         with TestClient(harness.app, raise_server_exceptions=False) as client_no_raise:
             resp = client_no_raise.get(f"{PREFIX}/export.csv")
             assert resp.status_code == 500, "Early failure must return non-200"
 
-            harness.store.list_verdict_genes = orig_method
+            harness.store.list_checked_genes = orig_method
 
         # 2. Mid-stream bundle gone: active bundle superseded mid-stream
         assert harness.service is not None
@@ -1851,6 +1852,42 @@ def test_golden_set_zero_surfaced_gene_only_genes_filled():
         for col in header:
             if col != "Genes":
                 assert row[col] == "", f"Zero-surfaced gene column {col!r} should be empty string, got {row[col]!r}"
+
+
+def test_checked_without_evidence_counts_across_releases_and_in_bulk():
+    def exclude_all(doc):
+        for cancer_type in doc["cancer_types"]:
+            cancer_type["literature_precheck_pass"] = False
+
+    bundle = build_bundle(("MYCN",), release_id="rel-current", edit_gene=exclude_all)
+    harness = CsvHarness(bundle=bundle)
+    with TestClient(harness.app) as client:
+        job = run_job(client, "MYCN")
+        assert job["literature_evaluated"] == 0
+        assert not harness.gate.calls
+        assert client.get(f"{PREFIX}/stats/MYCN").json()["has_stored_result"] is True
+        assert client.get(f"{PREFIX}/genes").json()["items"][0]["hugo_symbol"] == "MYCN"
+        for url in (f"{PREFIX}/golden-set.csv?genes=MYCN", f"{PREFIX}/golden-set.csv"):
+            response = client.get(url)
+            assert response.status_code == 200
+            _, rows = parse_csv_response(response.text)
+            assert len(rows) == 1 and rows[0]["Genes"] == "MYCN"
+            assert all(value == "" for key, value in rows[0].items() if key != "Genes")
+
+    old_release_store = InMemoryExpressionContextStore()
+    old_release_store.rows[("MYCN", "NBL", "rel-old", TUMOR_SPECIFIC_GATE)] = StoredPair(
+        hugo_symbol="MYCN", oncotree_code="NBL", release_id="rel-old",
+        literature_gate=TUMOR_SPECIFIC_GATE, surfaced=False, exclusion_reason="precheck",
+        stats=gene_file("MYCN")["cancer_types"][0], evidence=None,
+        computed_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    old_harness = CsvHarness(bundle=bundle, store=old_release_store)
+    with TestClient(old_harness.app) as client:
+        assert client.get(f"{PREFIX}/stats/MYCN").json()["has_stored_result"] is True
+        assert client.get(f"{PREFIX}/genes").json()["items"][0]["hugo_symbol"] == "MYCN"
+        assert client.get(f"{PREFIX}/golden-set.csv?genes=MYCN").status_code == 200
+        _, rows = parse_csv_response(client.get(f"{PREFIX}/golden-set.csv").text)
+        assert len(rows) == 1 and rows[0]["Genes"] == "MYCN"
 
 
 def test_golden_set_unchecked_gene_returns_422():
