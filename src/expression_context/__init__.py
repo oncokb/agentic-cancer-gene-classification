@@ -68,6 +68,7 @@ async def _default_service_factory(app: Any, settings: ExpressionContextSettings
         store=store,
         jobs=JobStore("expression_context", JobRecord),
         literature_concurrency=settings.literature_concurrency,
+        verdict_ttl_days=settings.verdict_ttl_days,
         history_max_limit=settings.history_max_limit,
         lease=VerdictLease(ttl_seconds=settings.lease_ttl_seconds, redis=redis),
         lease_wait_seconds=settings.lease_wait_seconds,

@@ -122,14 +122,14 @@ def stored_verdict_surfaced(
     """Fail-closed surfacing predicate for a stored row against the active bundle.
 
     A pair is surfaced iff evaluated against the active bundle and current clock:
-    1. ``row_release_id`` equals the non-empty ``active_release_id``,
+    1. the active bundle has a non-empty release ID,
     2. ``stats`` is present and ``CancerTypeStats.passes_stats`` is True,
     3. the effective PubMed precheck is not a fresh explicit False
        (``precheck_is_expired`` recomputed from the active manifest and clock),
     4. ``literature_gate`` and ``evidence`` form a valid supported
        ``acgc_tumor_specific_v2`` verdict.
     """
-    if not active_release_id or row_release_id != active_release_id:
+    if not active_release_id:
         return False
     if stats is None:
         return False

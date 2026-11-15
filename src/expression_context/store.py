@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     UNIQUE KEY uq_expression_context_pair (hugo_symbol, oncotree_code, release_id, literature_gate),
     INDEX idx_expression_context_gene (hugo_symbol, literature_gate, computed_at),
     INDEX idx_expression_context_computed (literature_gate, computed_at),
-    INDEX idx_expression_context_release_gene (release_id, literature_gate, hugo_symbol)
+    INDEX idx_expression_context_release_gene (release_id, literature_gate, hugo_symbol),
+    INDEX idx_expression_context_verdict (hugo_symbol, literature_gate, oncotree_code, computed_at)
 )
 """
 
@@ -114,6 +115,8 @@ class ExpressionContextStore(Protocol):
         self, hugo_symbol: str, release_id: str, literature_gate: str
     ) -> Dict[str, StoredPair]: ...
 
+    async def get_verdict_pairs(self, hugo_symbol: str, literature_gate: str) -> Dict[str, StoredPair]: ...
+
     async def upsert_pairs(self, pairs: List[StoredPair]) -> None: ...
 
     async def latest_pairs(self, hugo_symbol: str, literature_gate: str) -> List[StoredPair]: ...
@@ -125,12 +128,20 @@ class ExpressionContextStore(Protocol):
         cursor: Optional[Cursor],
     ) -> List[HistoryEntry]: ...
 
+    async def list_verdict_history(
+        self, literature_gate: str, release_id: str, limit: int, cursor: Optional[Cursor]
+    ) -> List[HistoryEntry]: ...
+
     async def list_release_genes(
         self,
         release_id: str,
         literature_gate: str,
         limit: int,
         after_symbol: Optional[str] = None,
+    ) -> List[str]: ...
+
+    async def list_verdict_genes(
+        self, literature_gate: str, limit: int, after_symbol: Optional[str] = None
     ) -> List[str]: ...
 
 
@@ -157,6 +168,18 @@ class InMemoryExpressionContextStore:
             for (symbol, _code, release, gate), row in self.rows.items()
             if symbol == hugo_symbol and release == release_id and gate == literature_gate
         }
+
+    async def get_verdict_pairs(self, hugo_symbol, literature_gate):
+        result = {}
+        for row in self.rows.values():
+            if (row.hugo_symbol != hugo_symbol or row.literature_gate != literature_gate
+                    or not isinstance(row.evidence, dict)
+                    or row.evidence.get("literature_gate") != literature_gate):
+                continue
+            prior = result.get(row.oncotree_code)
+            if prior is None or row.computed_at > prior.computed_at:
+                result[row.oncotree_code] = row
+        return result
 
     async def upsert_pairs(self, pairs):
         for pair in pairs:
@@ -200,6 +223,23 @@ class InMemoryExpressionContextStore:
             entries = [entry for entry in entries if _history_sort_key(entry) < cursor]
         return entries[:limit]
 
+    async def list_verdict_history(self, literature_gate, release_id, limit, cursor):
+        groups: Dict[str, Dict[str, StoredPair]] = {}
+        for row in self.rows.values():
+            if row.literature_gate != literature_gate:
+                continue
+            pairs = groups.setdefault(row.hugo_symbol, {})
+            prior = pairs.get(row.oncotree_code)
+            if prior is None or row.computed_at > prior.computed_at:
+                pairs[row.oncotree_code] = row
+        entries = [HistoryEntry(
+            hugo_symbol=symbol, release_id=release_id, literature_gate=literature_gate,
+            computed_at=max(row.computed_at for row in pairs.values()),
+            pair_count=len(pairs), surfaced_count=0,
+        ) for symbol, pairs in groups.items()]
+        entries.sort(key=_history_sort_key, reverse=True)
+        return [entry for entry in entries if cursor is None or _history_sort_key(entry) < cursor][:limit]
+
     async def list_release_genes(
         self,
         release_id: str,
@@ -217,6 +257,13 @@ class InMemoryExpressionContextStore:
             }
         )
         return symbols[:limit]
+
+    async def list_verdict_genes(self, literature_gate, limit, after_symbol=None):
+        return sorted({
+            row.hugo_symbol for row in self.rows.values()
+            if row.literature_gate == literature_gate and row.evidence is not None
+            and (after_symbol is None or row.hugo_symbol > after_symbol)
+        })[:limit]
 
 
 class MySQLExpressionContextStore:
@@ -269,6 +316,21 @@ class MySQLExpressionContextStore:
                         else:
                             logger.warning("Failed to create idx_expression_context_release_gene index: %s", exc)
                             raise
+                await cursor.execute(
+                    f"SHOW INDEX FROM {TABLE_NAME} WHERE Key_name = 'idx_expression_context_verdict'"
+                )
+                if not await cursor.fetchone():
+                    try:
+                        await cursor.execute(
+                            f"ALTER TABLE {TABLE_NAME} ADD INDEX idx_expression_context_verdict "
+                            "(hugo_symbol, literature_gate, oncotree_code, computed_at)"
+                        )
+                    except Exception as exc:
+                        errno = getattr(exc, "errno", None)
+                        if errno is None and getattr(exc, "args", None):
+                            errno = exc.args[0]
+                        if errno != 1061:
+                            raise
 
     @staticmethod
     def _row_to_pair(row: Tuple[Any, ...]) -> StoredPair:
@@ -302,6 +364,26 @@ class MySQLExpressionContextStore:
                 rows = await cursor.fetchall()
         pairs = [self._row_to_pair(row) for row in rows]
         return {pair.oncotree_code: pair for pair in pairs}
+
+    async def get_verdict_pairs(self, hugo_symbol, literature_gate):
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT {_COLUMNS} FROM (SELECT {_COLUMNS}, "
+                    "ROW_NUMBER() OVER (PARTITION BY oncotree_code "
+                    "ORDER BY computed_at DESC, release_id DESC) AS verdict_rank "
+                    f"FROM {TABLE_NAME} "
+                    "WHERE hugo_symbol = %s AND literature_gate = %s "
+                    "AND JSON_UNQUOTE(JSON_EXTRACT(evidence_json, '$.literature_gate')) = %s) "
+                    "ranked WHERE verdict_rank = 1",
+                    (hugo_symbol, literature_gate, literature_gate),
+                )
+                rows = await cursor.fetchall()
+        result = {}
+        for raw in rows:
+            pair = self._row_to_pair(raw)
+            result.setdefault(pair.oncotree_code, pair)
+        return result
 
     async def upsert_pairs(self, pairs):
         if not pairs:
@@ -399,6 +481,29 @@ class MySQLExpressionContextStore:
             for symbol, release_id, computed_at, pair_count in rows
         ]
 
+    async def list_verdict_history(self, literature_gate, release_id, limit, cursor):
+        params: List[Any] = [literature_gate]
+        having = ""
+        if cursor is not None:
+            when, symbol, _ = cursor
+            having = "HAVING last_computed_at < %s OR (last_computed_at = %s AND hugo_symbol < %s) "
+            params.extend([_naive_utc(when), _naive_utc(when), symbol])
+        params.append(limit)
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as db_cursor:
+                await db_cursor.execute(
+                    "SELECT hugo_symbol, MAX(computed_at) AS last_computed_at, "
+                    "COUNT(DISTINCT oncotree_code) AS pair_count "
+                    f"FROM {TABLE_NAME} WHERE literature_gate = %s "
+                    "GROUP BY hugo_symbol " + having +
+                    "ORDER BY last_computed_at DESC, hugo_symbol DESC LIMIT %s", params,
+                )
+                rows = await db_cursor.fetchall()
+        return [HistoryEntry(
+            hugo_symbol=symbol, release_id=release_id, literature_gate=literature_gate,
+            computed_at=_utc(computed_at), pair_count=int(count), surfaced_count=0,
+        ) for symbol, computed_at, count in rows]
+
     async def list_release_genes(
         self,
         release_id: str,
@@ -419,6 +524,22 @@ class MySQLExpressionContextStore:
                     f"{where}"
                     "ORDER BY hugo_symbol ASC LIMIT %s",
                     params,
+                )
+                rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def list_verdict_genes(self, literature_gate, limit, after_symbol=None):
+        where = "WHERE literature_gate = %s AND evidence_json IS NOT NULL "
+        params: List[Any] = [literature_gate]
+        if after_symbol is not None:
+            where += "AND hugo_symbol > %s "
+            params.append(after_symbol)
+        params.append(limit)
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT DISTINCT hugo_symbol FROM {TABLE_NAME} "
+                    f"{where}ORDER BY hugo_symbol ASC LIMIT %s", params,
                 )
                 rows = await cursor.fetchall()
         return [row[0] for row in rows]

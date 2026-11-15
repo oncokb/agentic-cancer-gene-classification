@@ -1,7 +1,7 @@
 """Best-effort cross-pod lease on a literature-verdict key.
 
 Only one holder should run the (expensive) literature gate for a given
-(hugo_symbol, oncotree_code, release_id, literature_gate) at a time. Other
+(hugo_symbol, oncotree_code, literature_gate) at a time. Other
 pods wait for the holder's stored verdict instead of duplicating the work.
 
 - claim: ``SET key token NX PX ttl``.
@@ -47,7 +47,7 @@ ClaimOutcome = Literal["claimed", "held", "unavailable"]
 
 
 def lease_key(hugo_symbol: str, oncotree_code: str, release_id: str, literature_gate: str) -> str:
-    return f"{LEASE_PREFIX}{literature_gate}:{release_id}:{hugo_symbol}:{oncotree_code}"
+    return f"{LEASE_PREFIX}{literature_gate}:{hugo_symbol}:{oncotree_code}"
 
 
 @dataclass

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 
 from src.auth import AuthenticatedUser, require_auth
+from src.admin_users_routes import require_admin_write
 from src.expression_context.catalog import BundleGone, BundleNotLoaded
 from src.expression_context.models import (
     BundleStatus,
@@ -58,12 +59,15 @@ def _not_loaded(exc: BundleNotLoaded) -> HTTPException:
 
 @router.post("/jobs", status_code=status.HTTP_202_ACCEPTED, response_model=JobAccepted)
 async def create_job(
+    request: Request,
     body: JobCreateRequest,
     user: AuthenticatedUser = Depends(require_auth),
     service: ExpressionContextService = Depends(get_service),
 ) -> JobAccepted:
     try:
-        job = await service.submit(body.gene, owner=job_owner(user))
+        if body.refresh:
+            await require_admin_write(request, user)
+        job = await service.submit(body.gene, owner=job_owner(user), refresh=body.refresh)
     except InvalidGene as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GeneNotFound as exc:

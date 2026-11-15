@@ -286,19 +286,23 @@ What ACGC relies on from the contract:
   shows "Pre-check expired". The raw value is still stored and displayed.
 - **Unknown fields are ignored; an unknown `schema_version` is rejected** (the
   bundle is not loaded; the previous one keeps serving).
-- **Verdict reuse:** literature verdicts are stored and reused per
-  `(hugo_symbol, oncotree_code, release_id, literature_gate)` — keyed on
-  `release_id`, not `bundle_tag` — so a new `release_id` re-evaluates and a
-  PubMed refresh alone does not. Bumping the gate version changes
-  `literature_gate`, so no verdict of the previous version is reused.
+- **Verdict reuse:** the freshest current-rule verdict per
+  `(hugo_symbol, oncotree_code, literature_gate)` is reusable across statistics
+  releases while `computed_at` is within `EXPRESSION_CONTEXT_VERDICT_TTL_DAYS`
+  (default 90, minimum 1). Expired verdicts are pending and checked again by
+  the next job. Bumping the gate version prevents reuse of old-rule verdicts.
+  Statistics, tier, purity and pre-check always come from the active bundle.
+  The row's `release_id` remains as provenance for where it was written.
+  The API exposes `literature_checked_at` and `verdict_release_id` on a pair;
+  per-pair CSV `literature_checked_at` uses the verdict row's `computed_at`.
 
 ## ACGC API and page (when enabled)
 
 - `POST /v1/expression-context/jobs` `{ "gene": "ERBB2" }` → 202
   `{job_id, status_url}`. Runs the literature gate for each pair with
   `stats_pass` true and `literature_precheck_pass` not `false` (`null` passes).
-  Reuses stored verdicts for the same (gene, oncotree_code, release_id,
-  literature_gate).
+  Reuses fresh current-rule verdicts across releases. An admin can submit
+  `{ "gene": "ERBB2", "refresh": true }` to force a literature check.
 - `GET /v1/expression-context/jobs/{job_id}` → status + result when done.
 - `GET /v1/expression-context/stats/{gene}` → the active bundle's statistics for
   every cancer type of the gene, each with its call (`surfaced`, `excluded`
@@ -393,7 +397,8 @@ All created by the module, only when enabled; dropped on removal.
 - `expression_context_results` — literature verdicts joined with the stats:
   `hugo_symbol, oncotree_code, release_id, literature_gate, surfaced (bool),
   exclusion_reason, stats_json, evidence_json, computed_at, requested_by`;
-  unique `(hugo_symbol, oncotree_code, release_id, literature_gate)`.
+  unique `(hugo_symbol, oncotree_code, release_id, literature_gate)` for writes;
+  reads choose the freshest verdict per gene, cancer type and rule version.
 - `expression_context_bundles` — one row per bundle loaded or attempted:
   `bundle_tag` (PK), `release_id`, `schema_version`, `method_version`,
   `pubmed_snapshot_date`, `published_at`, `release_url`, `gene_count`,

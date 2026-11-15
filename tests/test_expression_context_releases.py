@@ -48,6 +48,12 @@ def _bundle(day: int, published: str):
 # ------------------------------------------------------------------ settings
 
 
+def test_verdict_ttl_setting_default_and_validation():
+    assert ExpressionContextSettings(_env_file=None).verdict_ttl_days == 90
+    with pytest.raises(ValueError):
+        ExpressionContextSettings(_env_file=None, verdict_ttl_days=0)
+
+
 def test_settings_defaults_need_no_url_or_token(monkeypatch):
     for name in ("ENABLED", "RELEASES_REPO", "PINNED_BUNDLE_TAG", "GITHUB_TOKEN", "REFRESH_INTERVAL"):
         monkeypatch.delenv(f"EXPRESSION_CONTEXT_{name}", raising=False)

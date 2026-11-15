@@ -403,6 +403,7 @@ class GeneResult(BaseModel):
 class JobCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     gene: str = Field(..., min_length=1, max_length=64)
+    refresh: bool = False
 
 
 class JobAccepted(BaseModel):
@@ -516,6 +517,8 @@ class PairStatsView(BaseModel):
     status: PairStatus
     exclusion_reason: Optional[ExclusionReason] = None
     literature: Optional[LiteratureVerdict] = None
+    literature_checked_at: Optional[datetime] = None
+    verdict_release_id: Optional[str] = None
 
     @computed_field
     @property

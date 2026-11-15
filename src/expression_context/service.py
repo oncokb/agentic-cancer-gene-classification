@@ -24,8 +24,8 @@ missing or unknown tiers are Moderate, with missing-tier warnings retained.
 This rule lives only in ``_evaluate_gene_view``; /stats, /genes, both CSVs,
 history and job polling all read that view. Only pairs passing 1-3 reach the
 (paid) literature gate; exclusion reason ``precheck`` is recorded only for an
-explicit ``literature_precheck_pass: false``. Verdicts are stored per
-(hugo_symbol, oncotree_code, release_id, literature_gate) and reused.
+explicit ``literature_precheck_pass: false``. Fresh verdicts are reused per
+(hugo_symbol, oncotree_code, literature_gate) across statistics releases.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import (
     Any,
     AsyncIterator,
@@ -180,6 +180,7 @@ class ExpressionContextService:
         jobs: JobStoreLike,
         literature_concurrency: int = 2,
         history_max_limit: int = 100,
+        verdict_ttl_days: int = 90,
         lease: Optional[VerdictLease] = None,
         lease_wait_seconds: float = 300.0,
         lease_poll_seconds: float = 2.0,
@@ -204,10 +205,13 @@ class ExpressionContextService:
         # shared by every job, on concurrent literature-gate evaluations.
         self._gate_slots = asyncio.Semaphore(literature_concurrency)
         self.history_max_limit = history_max_limit
+        if verdict_ttl_days < 1:
+            raise ValueError("verdict_ttl_days must be >= 1")
+        self.verdict_ttl = timedelta(days=verdict_ttl_days)
         self._lease = lease or VerdictLease(ttl_seconds=120.0)
         self._lease_wait_seconds = lease_wait_seconds
         self._lease_poll_seconds = lease_poll_seconds
-        self._inflight: Dict[Tuple[str, str, str, str], asyncio.Future] = {}
+        self._inflight: Dict[Tuple[str, str, str], asyncio.Future] = {}
         self._tasks: Set[asyncio.Task] = set()
         self._tier_warned: Set[str] = set()
         self._purity_warned: Set[str] = set()
@@ -280,7 +284,7 @@ class ExpressionContextService:
 
     # ------------------------------------------------------------------ jobs
 
-    async def submit(self, gene: str, owner: Optional[str]) -> JobRecord:
+    async def submit(self, gene: str, owner: Optional[str], refresh: bool = False) -> JobRecord:
         resolved = await self.resolve(gene)
         job = JobRecord(
             job_id=str(uuid.uuid4()),
@@ -293,16 +297,16 @@ class ExpressionContextService:
             owner=owner,
         )
         await self.jobs.put(job)
-        task = asyncio.create_task(self._run_job(job, resolved))
+        task = asyncio.create_task(self._run_job(job, resolved, refresh))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return job
 
-    async def _run_job(self, job: JobRecord, resolved: ResolvedGene) -> None:
+    async def _run_job(self, job: JobRecord, resolved: ResolvedGene, refresh: bool = False) -> None:
         try:
             job.status = "running"
             await self.jobs.put(job)
-            result, evaluated, reused, errors = await self.evaluate(resolved, job.owner)
+            result, evaluated, reused, errors = await self.evaluate(resolved, job.owner, refresh=refresh)
         except Exception as exc:
             logger.exception("Expression-context job %s failed", job.job_id)
             job.status = "failed"
@@ -330,12 +334,12 @@ class ExpressionContextService:
         return job.public()
 
     async def evaluate(
-        self, resolved: ResolvedGene, requested_by: Optional[str]
+        self, resolved: ResolvedGene, requested_by: Optional[str], *, refresh: bool = False
     ) -> Tuple[GeneResult, int, int, List[JobPairError]]:
         manifest = resolved.manifest
         symbol = resolved.hugo_symbol
         gate_name = self.gate.name
-        existing = await self.store.get_pairs(symbol, manifest.release_id, gate_name)
+        existing = await self.store.get_verdict_pairs(symbol, gate_name)
         now = self._clock()
         expired = precheck_expired(manifest, now)
         pairs = {p.oncotree_code: p for p in self._evaluate_gene_view(resolved, existing).pairs}
@@ -378,16 +382,16 @@ class ExpressionContextService:
         for stats in resolved.artifact.cancer_types:
             pair = pairs[stats.oncotree_code]
             if not pair.literature_eligible:
-                rows.append(row(stats, False, pair.exclusion_reason))
+                if stats.oncotree_code not in existing:
+                    rows.append(row(stats, False, pair.exclusion_reason))
                 continue
             prior = existing.get(stats.oncotree_code)
-            if prior is not None and prior.evidence is not None:
+            if not refresh and self._fresh_verdict(prior, now):
                 verdict = LiteratureVerdict.model_validate(prior.evidence)
                 # Never reuse evidence from another gate, even if it is stored
                 # under this gate's key (a legacy row written before the
                 # version bump): recompute it instead.
                 if verdict.literature_gate == gate_name:
-                    rows.append(_verdict_row(row, stats, verdict))
                     reused += 1
                     continue
             cancer_type = manifest.cancer_type(stats.oncotree_code)
@@ -408,6 +412,7 @@ class ExpressionContextService:
                 verdict, was_reused = await self._single_flight_verdict(
                     symbol, stats.oncotree_code, manifest.release_id, tumor,
                     lambda verdict: _verdict_row(row, stats, verdict),
+                    refresh=refresh,
                 )
                 return stats, verdict, was_reused, None
             except Exception as exc:
@@ -427,7 +432,8 @@ class ExpressionContextService:
                 reused += 1
             else:
                 evaluated += 1
-            rows.append(_verdict_row(row, stats, verdict))
+            if not was_reused:
+                rows.append(_verdict_row(row, stats, verdict))
 
         await self.store.upsert_pairs(rows)
         view, stored = await self.gene_view(symbol, resolved=resolved)
@@ -443,6 +449,7 @@ class ExpressionContextService:
         release_id: str,
         tumor: TumorContext,
         make_row: Callable[[LiteratureVerdict], StoredPair],
+        refresh: bool = False,
     ) -> Tuple[LiteratureVerdict, bool]:
         """(verdict, reused) for one verdict key, computing it at most once.
 
@@ -452,7 +459,8 @@ class ExpressionContextService:
         own evaluation only after ``lease_wait_seconds``.
         """
         key = (symbol, oncotree_code, release_id, self.gate.name)
-        while (pending := self._inflight.get(key)) is not None:
+        flight_key = (symbol, oncotree_code, self.gate.name)
+        while (pending := self._inflight.get(flight_key)) is not None:
             try:
                 verdict, _ = await asyncio.shield(pending)
                 return verdict, True
@@ -467,9 +475,9 @@ class ExpressionContextService:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         # Waiters retrieve the exception; don't warn if there were none.
         future.add_done_callback(lambda f: f.cancelled() or f.exception())
-        self._inflight[key] = future
+        self._inflight[flight_key] = future
         try:
-            outcome = await self._resolve_verdict(key, tumor, make_row)
+            outcome = await self._resolve_verdict(key, tumor, make_row, refresh=refresh)
         except asyncio.CancelledError:
             future.cancel()
             raise
@@ -480,13 +488,19 @@ class ExpressionContextService:
             future.set_result(outcome)
             return outcome
         finally:
-            if self._inflight.get(key) is future:
-                del self._inflight[key]
+            if self._inflight.get(flight_key) is future:
+                del self._inflight[flight_key]
+
+    def _fresh_verdict(self, prior: Optional[StoredPair], now: datetime) -> bool:
+        if prior is None or prior.evidence is None or prior.literature_gate != self.gate.name:
+            return False
+        age = now - prior.computed_at.replace(tzinfo=prior.computed_at.tzinfo or timezone.utc)
+        return timedelta(0) <= age <= self.verdict_ttl
 
     async def _stored_verdict(self, key: Tuple[str, str, str, str]) -> Optional[LiteratureVerdict]:
-        symbol, oncotree_code, release_id, gate_name = key
-        prior = (await self.store.get_pairs(symbol, release_id, gate_name)).get(oncotree_code)
-        if prior is None or prior.evidence is None:
+        symbol, oncotree_code, _release_id, gate_name = key
+        prior = (await self.store.get_verdict_pairs(symbol, gate_name)).get(oncotree_code)
+        if not self._fresh_verdict(prior, self._clock()):
             return None
         verdict = LiteratureVerdict.model_validate(prior.evidence)
         # Evidence from a different gate is not this gate's verdict, even when
@@ -498,11 +512,12 @@ class ExpressionContextService:
         key: Tuple[str, str, str, str],
         tumor: TumorContext,
         make_row: Callable[[LiteratureVerdict], StoredPair],
+        refresh: bool = False,
     ) -> Tuple[LiteratureVerdict, bool]:
         lkey = lease_key(*key)
         deadline = time.monotonic() + self._lease_wait_seconds
         while True:
-            stored = await self._stored_verdict(key)
+            stored = None if refresh else await self._stored_verdict(key)
             if stored is not None:
                 return stored, True
             claim = await self._lease.claim(lkey)
@@ -517,7 +532,7 @@ class ExpressionContextService:
                 continue
             try:
                 # Re-check: the previous holder may have stored it just now.
-                stored = await self._stored_verdict(key)
+                stored = None if refresh else await self._stored_verdict(key)
                 if stored is not None:
                     return stored, True
                 verdict = await self._evaluate_and_store(
@@ -608,7 +623,7 @@ class ExpressionContextService:
                 and self.gate.name == TUMOR_SPECIFIC_GATE
                 and prior is not None
                 and prior.evidence is not None
-                and prior.release_id == active_release_id
+                and self._fresh_verdict(prior, self._clock())
             ):
                 stored_verdict = LiteratureVerdict.model_validate(prior.evidence)
                 if stored_verdict.literature_gate == TUMOR_SPECIFIC_GATE:
@@ -656,6 +671,8 @@ class ExpressionContextService:
                     status=status,
                     exclusion_reason=reason,
                     literature=verdict,
+                    literature_checked_at=prior.computed_at if verdict is not None else None,
+                    verdict_release_id=prior.release_id if verdict is not None else None,
                 )
             )
         pairs.sort(
@@ -685,7 +702,7 @@ class ExpressionContextService:
         resolved: Optional[ResolvedGene] = None,
     ) -> Tuple[GeneStatsView, Dict[str, StoredPair]]:
         """The active bundle's statistics for every cancer type of a gene, joined
-        with any stored literature verdicts for this release only (the reference view)."""
+        with fresh current-rule literature verdicts across releases (the reference view)."""
         if resolved is None or resolved.bundle is None:
             resolved = await self.resolve(gene)
         else:
@@ -693,9 +710,7 @@ class ExpressionContextService:
                 await self.catalog.verify_active(resolved.bundle)
             except BundleGone:
                 resolved = await self.resolve(gene)
-        stored = await self.store.get_pairs(
-            resolved.hugo_symbol, resolved.manifest.release_id, self.gate.name
-        )
+        stored = await self.store.get_verdict_pairs(resolved.hugo_symbol, self.gate.name)
         return self._evaluate_gene_view(resolved, stored), stored
 
     async def latest_result(
@@ -734,7 +749,6 @@ class ExpressionContextService:
         include_excluded: bool = False,
         page_size: int = 50,
     ) -> Tuple[ActiveBundle, AsyncIterator[str]]:
-        release_id = bundle.release_id
         gate_name = self.gate.name
         batch_size = max(1, min(page_size, self.history_max_limit))
 
@@ -743,9 +757,7 @@ class ExpressionContextService:
             if include_excluded:
                 symbols = await self.catalog.list_genes(bundle, batch_size, after_symbol=after)
             else:
-                symbols = await self.store.list_release_genes(
-                    release_id, gate_name, batch_size, after_symbol=after
-                )
+                symbols = await self.store.list_verdict_genes(gate_name, batch_size, after_symbol=after)
             if not symbols:
                 return symbols, []
 
@@ -762,9 +774,7 @@ class ExpressionContextService:
                     artifact=artifact,
                     bundle=bundle,
                 )
-                stored = await self.store.get_pairs(
-                    resolved.hugo_symbol, release_id, gate_name
-                )
+                stored = await self.store.get_verdict_pairs(resolved.hugo_symbol, gate_name)
                 view = self._evaluate_gene_view(resolved, stored)
                 rows = view_to_rows(view)
                 page_rows.extend(rows)
@@ -939,7 +949,7 @@ class ExpressionContextService:
 
     async def stats_view(self, gene: str) -> GeneStatsView:
         """The active bundle's statistics for every cancer type of a gene, joined
-        with any stored literature verdicts for this release (the stats page)."""
+        with fresh current-rule literature verdicts across releases (the stats page)."""
         view, _ = await self.gene_view(gene)
         return view
 
@@ -948,23 +958,22 @@ class ExpressionContextService:
         limit = max(1, min(limit, self.history_max_limit))
         for attempt in range(2):
             bundle = await self.catalog.active()
-            raw_entries = await self.store.list_history(self.gate.name, limit + 1, decoded)
+            raw_entries = await self.store.list_verdict_history(
+                self.gate.name, bundle.release_id, limit + 1, decoded
+            )
             page = raw_entries[:limit]
             try:
                 evaluated_page: List[HistoryEntry] = []
                 for entry in page:
-                    if entry.release_id != bundle.release_id:
-                        evaluated_page.append(entry.model_copy(update={"surfaced_count": 0}))
-                    else:
-                        try:
-                            view, _ = await self.gene_view(entry.hugo_symbol)
-                            await self.catalog.verify_active(bundle)
-                            surfaced_count = view.summary.surfaced
-                        except GeneNotFound:
-                            surfaced_count = 0
-                        evaluated_page.append(
-                            entry.model_copy(update={"surfaced_count": surfaced_count})
-                        )
+                    try:
+                        view, _ = await self.gene_view(entry.hugo_symbol)
+                        await self.catalog.verify_active(bundle)
+                        surfaced_count = view.summary.surfaced
+                    except GeneNotFound:
+                        surfaced_count = 0
+                    evaluated_page.append(
+                        entry.model_copy(update={"surfaced_count": surfaced_count})
+                    )
                 break
             except BundleGone:
                 if attempt:

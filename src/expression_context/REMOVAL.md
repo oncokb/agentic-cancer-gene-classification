@@ -49,6 +49,7 @@ own removal notes in that directory.
    `EXPRESSION_CONTEXT_BUNDLE_PRUNE_GRACE`, `EXPRESSION_CONTEXT_REDIS_URL`,
    `EXPRESSION_CONTEXT_JUDGE_MODEL`, `EXPRESSION_CONTEXT_JUDGE_MAX_PAPERS`,
    `EXPRESSION_CONTEXT_JUDGE_ABSTRACT_CHARS` that were set.
+   This includes `EXPRESSION_CONTEXT_VERDICT_TTL_DAYS` if configured.
 7. Optional Redis cleanup (entries expire on their own TTLs):
    `expression_context:lease:*` keys and `job:expression_context:*` job
    snapshots.
