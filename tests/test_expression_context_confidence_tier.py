@@ -213,7 +213,8 @@ def snapshot(bundle):
         job = run_job(client)
         stats = client.get(f"{PREFIX}/stats/ERBB2").json()
         pairs = [
-            {k: v for k, v in p.items() if k not in ("stats", "literature")} for p in stats["pairs"]
+            {k: v for k, v in p.items() if k not in ("stats", "literature", "literature_checked_at")}
+            for p in stats["pairs"]
         ]
         _, every = parse_csv_response(
             client.get(f"{PREFIX}/genes/ERBB2/export.csv", params={"include_excluded": "true"}).text
@@ -497,8 +498,8 @@ def test_reevaluation_concurrent_direct_and_post_refresh_runs_check_candidates()
         assert gate.calls.count(gastric) == 2
         assert gate.calls.count(("ERBB2", "esophageal cancer")) == 2
 
-        # 4. Bundle refresh: release B demotes BRCA to a candidate. Its release-A
-        # verdict is never reused; all eligible pairs are checked under B.
+        # 4. Bundle refresh: release B changes the tier, while the literature
+        # verdict remains reusable.
         release_b = build_bundle(
             ("ERBB2",),
             release_id="datahub-abc1234def56-m2-b7e9f01a2c3e",
@@ -508,7 +509,7 @@ def test_reevaluation_concurrent_direct_and_post_refresh_runs_check_candidates()
         service.catalog.invalidate()
         before = list(gate.calls)
         job = run_job(client)
-        assert len(gate.calls) == len(before) + 3, "fresh release needs fresh literature for every tier"
+        assert len(gate.calls) == len(before)
         assert job["release_id"] == release_b.release_id
         assert {p["confidence_label"] for p in job["result"]["surfaced"]} == {"Moderate"}
         assert_agreement(surfaced_everywhere(client, job["job_id"]), {"BRCA", "STAD"})

@@ -105,6 +105,7 @@ class ExpressionContextSettings(BaseSettings):
     # changing it (v1 -> v2) re-evaluates every pair instead of reusing
     # verdicts of the old rule. v2 confirms the SPECIFIC tumor type.
     literature_gate: Literal["acgc_tumor_specific_v2"] = "acgc_tumor_specific_v2"
+    verdict_ttl_days: int = Field(default=90, ge=1)
     # Model for the tumor-specific judgement; empty = ACGC's selection_model
     # (read from the public settings, never modified).
     judge_model: str = ""

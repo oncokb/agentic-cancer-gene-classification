@@ -79,6 +79,7 @@ def test_ddl_is_module_owned_and_keyed_as_contracted():
     assert "(hugo_symbol, oncotree_code, release_id, literature_gate)" in CREATE_TABLE_SQL
     assert "FOREIGN KEY" not in CREATE_TABLE_SQL.upper()
     assert "idx_expression_context_release_gene" in CREATE_TABLE_SQL
+    assert "idx_expression_context_verdict" in CREATE_TABLE_SQL
     for column in ("surfaced", "exclusion_reason", "stats_json", "evidence_json",
                    "computed_at", "requested_by"):
         assert column in CREATE_TABLE_SQL
@@ -97,38 +98,57 @@ async def _exercise_store(store):
               evidence=_v2_evidence("2")),
         _pair("EGFR", "LUAD", release="r2", gate="other_gate", minutes_ago=0),
     ])
-    pairs = await store.get_pairs("ERBB2", "r1", GATE)
-    assert set(pairs) == {"BRCA", "STAD"}
-    assert pairs["BRCA"].evidence["literature_gate"] == GATE
-    assert pairs["BRCA"].evidence["pmids"] == ["1"]
-    assert pairs["BRCA"].surfaced is True
-    assert pairs["BRCA"].computed_at.tzinfo is not None
+    verdicts = await store.get_verdict_pairs("ERBB2", GATE)
+    assert verdicts["BRCA"].release_id == "r1"
+    assert verdicts["BRCA"].evidence["pmids"] == ["1"]
+    assert verdicts["BRCA"].computed_at.tzinfo is not None
+    assert await store.has_checked_gene("ERBB2", GATE)
+    assert not await store.has_checked_gene("NOPE", GATE)
+    assert await store.list_checked_genes(GATE, 10) == ["EGFR", "ERBB2"]
+    history = await store.list_verdict_history(GATE, "active", 10, None)
+    assert {entry.hugo_symbol: entry.release_id for entry in history} == {
+        "ERBB2": "active", "EGFR": "active",
+    }
 
     # Upsert replaces on the unique key.
     await store.upsert_pairs([_pair("ERBB2", "STAD", "r1", minutes_ago=10, surfaced=True,
                                     evidence=_v2_evidence("2"))])
-    assert (await store.get_pairs("ERBB2", "r1", GATE))["STAD"].surfaced is True
+    assert (await store.get_verdict_pairs("ERBB2", GATE))["STAD"].surfaced is True
 
     latest = await store.latest_pairs("ERBB2", GATE)
     assert {(p.release_id, p.oncotree_code) for p in latest} == {("r2", "BRCA")}
     assert await store.latest_pairs("NOPE", GATE) == []
 
-    assert await store.list_release_genes("r2", GATE, 10) == ["EGFR", "ERBB2"]
-    assert await store.list_release_genes("r2", GATE, 1) == ["EGFR"]
-    assert await store.list_release_genes("r2", GATE, 1, after_symbol="EGFR") == ["ERBB2"]
-    assert await store.list_release_genes("r2", GATE, 1, after_symbol="ERBB2") == []
+    assert await store.list_checked_genes(GATE, 1) == ["EGFR"]
+    assert await store.list_checked_genes(GATE, 1, after_symbol="EGFR") == ["ERBB2"]
+    assert await store.list_checked_genes(GATE, 1, after_symbol="ERBB2") == []
 
-    history = await store.list_history(GATE, 10, None)
-    assert [(e.hugo_symbol, e.release_id) for e in history] == [
-        ("EGFR", "r2"), ("ERBB2", "r2"), ("ERBB2", "r1"),
-    ]
-    assert history[2].pair_count == 2
-    assert history[0].pair_count == 1
-    assert history[1].pair_count == 1
-
+    history = await store.list_verdict_history(GATE, "active", 10, None)
+    assert [(e.hugo_symbol, e.pair_count) for e in history] == [("EGFR", 1), ("ERBB2", 2)]
     after = (history[0].computed_at, history[0].hugo_symbol, history[0].release_id)
-    page = await store.list_history(GATE, 1, after)
-    assert [(e.hugo_symbol, e.release_id) for e in page] == [("ERBB2", "r2")]
+    page = await store.list_verdict_history(GATE, "active", 1, after)
+    assert [(e.hugo_symbol, e.release_id) for e in page] == [("ERBB2", "active")]
+
+    old_rule = {**_v2_evidence("3"), "literature_gate": "acgc_pipeline_v1"}
+    await store.upsert_pairs([
+        _pair("ERBB2", "BRCA", "r3", minutes_ago=0, evidence=old_rule)
+    ])
+    assert (await store.get_verdict_pairs("ERBB2", GATE))["BRCA"].release_id == "r1"
+    history_after_old_rule = await store.list_verdict_history(GATE, "active", 10, None)
+    assert history_after_old_rule[-1].pair_count == 2
+    assert history_after_old_rule[-1].computed_at == history[-1].computed_at
+
+    # Equal timestamps select the lexically later release in either insertion order.
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
+    a = _pair("TIE", "BRCA", "a", evidence=_v2_evidence("a")).model_copy(
+        update={"computed_at": timestamp}
+    )
+    z = _pair("TIE", "BRCA", "z", evidence=_v2_evidence("z")).model_copy(
+        update={"computed_at": timestamp}
+    )
+    for order in ([a, z], [z, a]):
+        await store.upsert_pairs(order)
+        assert (await store.get_verdict_pairs("TIE", GATE))["BRCA"].release_id == "z"
 
 
 async def test_in_memory_store_contract():
@@ -143,6 +163,7 @@ async def mysql_store():
     try:
         store = await MySQLExpressionContextStore.create()
         await store.ensure_schema()
+        await store.ensure_schema()  # the verdict index migration is idempotent
     except Exception as exc:
         pytest.skip(f"MySQL not reachable: {exc}")
     async with store._pool.acquire() as conn:

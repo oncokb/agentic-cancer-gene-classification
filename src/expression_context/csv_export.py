@@ -349,10 +349,10 @@ def pair_view_to_csv_row(
     )
     pmids_str = ";".join(verdict.pmids) if verdict is not None and verdict.pmids else ""
     rationale_str = verdict.rationale if verdict is not None and verdict.rationale else ""
+    checked_time = pair.literature_checked_at or (verdict.evaluated_at if verdict else None)
     checked_at = (
-        verdict.evaluated_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        if verdict is not None and verdict.evaluated_at is not None
-        else ""
+        checked_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        if checked_time is not None else ""
     )
     single_url = (
         cbioportal_expression_url(view.hugo_symbol, [study_id], "CANCER_STUDY")
