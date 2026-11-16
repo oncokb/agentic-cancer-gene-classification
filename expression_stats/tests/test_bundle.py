@@ -29,6 +29,9 @@ def synthesize(panel, codes, genes_dir, release_id):
         for r in controls.expand_alteration_controls(panel, codes)
         if r["expected"] is True
     }
+    high_rows = controls.expand_alteration_controls(
+        {"alteration_controls": panel.get("high_expression_controls", [])}, codes
+    )
     genes_dir.mkdir(parents=True, exist_ok=True)
     for gene in sorted(controls.control_genes(panel)):
         records = []
@@ -49,6 +52,11 @@ def synthesize(panel, codes, genes_dir, release_id):
                     pass_mode="lineage" if (gene, code) in expression else None,
                     confidence_tier="high" if (gene, code) in expression else None,
                     alterations=dict(categories=categories),
+                    alteration_high_expression={
+                        r["category"]: dict(status=("associated_high_expression" if r["expected"]
+                                                   else "not_associated"))
+                        for r in high_rows if r["gene"] == gene and r["tcga"] == code
+                    },
                 )
             )
         document = dict(release_id=release_id, gene={"hugo_symbol": gene}, cancer_types=records)

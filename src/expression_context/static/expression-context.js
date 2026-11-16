@@ -291,7 +291,7 @@
         (name === "Expression" && pair.status === "surfaced") ||
         (alterations && (alterations.alteration_types_enriched || []).includes(name) &&
          (!categories[name] || categories[name].status === "enriched")));
-      return names.length ? names.map((name) => {
+      const badges = names.map((name) => {
         const key = `${pair.oncotree_code}|${name}`;
         const panelId = `ec-alteration-${pair.oncotree_code}-${name.replace(/\W+/g, "-")}`;
         const wrap = node("span", null, "ec-alteration-item");
@@ -333,7 +333,15 @@
         wrap.appendChild(button);
         wrap.appendChild(panel);
         return wrap;
-      }) : "—";
+      });
+      for (const [category, entry] of Object.entries(pair.stats.alteration_high_expression || {})) {
+        if (entry.status === "associated_high_expression") {
+          badges.push(node("span", `${category}: High-expression assoc.`, "ec-badge ec-high-expression"));
+        } else if (entry.status === "anecdotal") {
+          badges.push(node("span", `${category}: anecdotal (1–2 tumors)`, "ec-muted"));
+        }
+      }
+      return badges.length ? badges : "—";
     }
 
     function alterationCounts(counts, fallbackProfiled) {
@@ -429,6 +437,15 @@
           }
           addDetail(name, text);
         }
+      }
+      for (const [name, entry] of Object.entries(pair.stats.alteration_high_expression || {})) {
+        const status = entry.status.replace(/_/g, " ");
+        let text = `${status}; ${entry.n_altered}/${entry.n_profiled} altered/profiled; ` +
+          `Δ median ${formatNumber(entry.delta_median)} log2; MW q ${formatQ(entry.q)}; ` +
+          `top-decile k ${entry.k_top10}; OR ${entry.or_top10 ?? "—"}; ` +
+          `Fisher p ${formatQ(entry.p_top10)}; altered fraction ${formatNumber(entry.frac_top10_altered)}`;
+        if (entry.reason) text += `; ${entry.reason}`;
+        addDetail(`${name}: high-expression association`, text);
       }
       td.appendChild(dl);
       detailRow.appendChild(td);

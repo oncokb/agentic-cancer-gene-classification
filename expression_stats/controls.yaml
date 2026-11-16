@@ -1010,14 +1010,6 @@
       "note": "3% amplified but not above the TCGA mixture"
     },
     {
-      "id": "CNA-MET-LUAD",
-      "gene": "MET",
-      "tcga": "LUAD",
-      "category": "Copy Number Alteration",
-      "expected": false,
-      "note": "2% amplified; not enriched versus rest (q~0.15 in audit)"
-    },
-    {
       "id": "SV-ALK-LUAD",
       "gene": "ALK",
       "tcga": "LUAD",
@@ -1042,6 +1034,164 @@
       "classification": "candidate_miss",
       "note": "c-Met protein over-expression; telisotuzumab vedotin (ADC), c-Met-selected non-squamous NSCLC. Fails the m3 rule: lineage delta 0.394 < 0.5; subgroup P95 shift 0.99 < 1.5 (26/510 high, q 4.0e-11). Candidate RNA-method miss scoped to non-squamous NSCLC.",
       "source": "OncoKB curator workbook (agcg-control-eval human-genes report, control_recommendations.csv): documented non-must-pass; candidate miss"
+    }
+  ],
+  "alteration_known_misses": [
+    {
+      "id": "CNA-MET-LUAD",
+      "gene": "MET",
+      "tcga": "LUAD",
+      "category": "Copy Number Alteration",
+      "note": "Known miss / underpowered: TCGA ~2% of 507, frequency q~0.15; replicates in MSK-IMPACT 50K q~3e-26 and is associated with high expression. Never gated."
+    }
+  ],
+  "high_expression_controls": [
+    {
+      "id": "HE-ERBB2-BRCA-Copy Number Alteration (amp)",
+      "gene": "ERBB2",
+      "tcga": "BRCA",
+      "category": "Copy Number Alteration (amp)",
+      "expected": true
+    },
+    {
+      "id": "HE-ERBB2-STAD-Copy Number Alteration (amp)",
+      "gene": "ERBB2",
+      "tcga": "STAD",
+      "category": "Copy Number Alteration (amp)",
+      "expected": true
+    },
+    {
+      "id": "HE-MDM2-SARC-Copy Number Alteration (amp)",
+      "gene": "MDM2",
+      "tcga": "SARC",
+      "category": "Copy Number Alteration (amp)",
+      "expected": true
+    },
+    {
+      "id": "HE-CDK4-SARC-Copy Number Alteration (amp)",
+      "gene": "CDK4",
+      "tcga": "SARC",
+      "category": "Copy Number Alteration (amp)",
+      "expected": true
+    },
+    {
+      "id": "HE-EGFR-GBM-Copy Number Alteration (amp)",
+      "gene": "EGFR",
+      "tcga": "GBM",
+      "category": "Copy Number Alteration (amp)",
+      "expected": true
+    },
+    {
+      "id": "HE-MET-LUAD-Copy Number Alteration (amp)",
+      "gene": "MET",
+      "tcga": "LUAD",
+      "category": "Copy Number Alteration (amp)",
+      "expected": true
+    },
+    {
+      "id": "HE-MET-LUAD-Structural Variant",
+      "gene": "MET",
+      "tcga": "LUAD",
+      "category": "Structural Variant",
+      "expected": true
+    },
+    {
+      "id": "HE-ALK-LUAD-Structural Variant",
+      "gene": "ALK",
+      "tcga": "LUAD",
+      "category": "Structural Variant",
+      "expected": true
+    },
+    {
+      "id": "HE-ROS1-LUAD-Structural Variant",
+      "gene": "ROS1",
+      "tcga": "LUAD",
+      "category": "Structural Variant",
+      "expected": true
+    },
+    {
+      "id": "HE-NEG-TTN-Point Mutation",
+      "gene": "TTN",
+      "tcga": "*",
+      "category": "Point Mutation",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-TTN-Structural Variant",
+      "gene": "TTN",
+      "tcga": "*",
+      "category": "Structural Variant",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-TTN-Copy Number Alteration (amp)",
+      "gene": "TTN",
+      "tcga": "*",
+      "category": "Copy Number Alteration (amp)",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-TTN-Copy Number Alteration (deep del)",
+      "gene": "TTN",
+      "tcga": "*",
+      "category": "Copy Number Alteration (deep del)",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-MUC16-Point Mutation",
+      "gene": "MUC16",
+      "tcga": "*",
+      "category": "Point Mutation",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-MUC16-Structural Variant",
+      "gene": "MUC16",
+      "tcga": "*",
+      "category": "Structural Variant",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-MUC16-Copy Number Alteration (amp)",
+      "gene": "MUC16",
+      "tcga": "*",
+      "category": "Copy Number Alteration (amp)",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-MUC16-Copy Number Alteration (deep del)",
+      "gene": "MUC16",
+      "tcga": "*",
+      "category": "Copy Number Alteration (deep del)",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-GAPDH-Point Mutation",
+      "gene": "GAPDH",
+      "tcga": "*",
+      "category": "Point Mutation",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-GAPDH-Structural Variant",
+      "gene": "GAPDH",
+      "tcga": "*",
+      "category": "Structural Variant",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-GAPDH-Copy Number Alteration (amp)",
+      "gene": "GAPDH",
+      "tcga": "*",
+      "category": "Copy Number Alteration (amp)",
+      "expected": false
+    },
+    {
+      "id": "HE-NEG-GAPDH-Copy Number Alteration (deep del)",
+      "gene": "GAPDH",
+      "tcga": "*",
+      "category": "Copy Number Alteration (deep del)",
+      "expected": false
     }
   ]
 }

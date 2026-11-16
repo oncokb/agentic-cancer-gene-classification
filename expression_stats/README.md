@@ -7,7 +7,7 @@ HGNC checksum, sample selection, and date-free identity semantics remain.
 Each (gene, cohort) also carries alteration-type detail (Point Mutation, Structural
 Variant, Copy Number Alteration) from the same pinned mutation/GISTIC/SV files; it never
 changes expression results. Full builds also require the alteration controls (13
-enriched, 66 not enriched). `--delete-alteration-downloads` removes each ~0.1–0.9 GB raw
+enriched, 65 not enriched). `--delete-alteration-downloads` removes each ~0.1–0.9 GB raw
 file once its compact summary is cached (the workflow uses it); `--skip-alterations` is
 review-only. Full builds require 51/51 curated positives and 0/27 negative passes; a failed
 control gate stops before PubMed and writes `<out>-failed/controls-report.json`.

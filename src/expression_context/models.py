@@ -180,6 +180,23 @@ class Alterations(_Artifact):
         }
 
 
+class AlterationHighExpression(_Artifact):
+    status: Literal["associated_high_expression", "anecdotal", "not_associated", "not_testable"]
+    reason: Optional[str] = None
+    n_altered: int = 0
+    n_profiled: int = 0
+    delta_median: Optional[float] = None
+    q: Optional[float] = None
+    or_top10: Optional[float | Literal["Infinity"]] = None
+    p_top10: Optional[float] = None
+    frac_top10_altered: Optional[float] = None
+    k_top10: int = 0
+    k_top5: int = 0
+    median_altered: Optional[float] = None
+    median_unaltered: Optional[float] = None
+    p: Optional[float] = None
+
+
 class CancerTypeStats(_Artifact):
     """One (gene, cancer type) row of a gene file.
 
@@ -189,6 +206,7 @@ class CancerTypeStats(_Artifact):
     """
 
     alterations: Optional[Alterations] = None
+    alteration_high_expression: Optional[Dict[str, AlterationHighExpression]] = None
 
     oncotree_code: str  # TCGA PanCancer cohort code, e.g. BRCA, COADREAD, GBM
     n: int

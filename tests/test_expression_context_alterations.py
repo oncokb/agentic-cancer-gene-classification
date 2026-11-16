@@ -98,13 +98,22 @@ def test_old_unknown_and_untestable_categories(caplog):
 
 
 def test_alterations_are_detail_only_through_apis_exports_and_history():
-    snapshots = []
-    for add_detail in (False, True):
+    snapshots, golden_snapshots = [], []
+    for add_detail, add_high in ((False, False), (True, False), (True, True)):
         def edit(doc):
             # Exercise candidate, excluded, pending and surfaced decisions with detail.
             doc["cancer_types"][1]["confidence_tier"] = "candidate"
             if add_detail:
                 for pair in doc["cancer_types"]:
+                    if add_high:
+                        pair["alteration_high_expression"] = {
+                            "Copy Number Alteration (amp)": {
+                                "status": "associated_high_expression", "n_altered": 11,
+                                "n_profiled": 507, "delta_median": 3.53, "q": 4.8e-6,
+                                "or_top10": 48.6, "p_top10": 2.52e-8,
+                            },
+                            "Structural Variant": {"status": "anecdotal", "n_altered": 1},
+                        }
                     pair["alterations"] = copy.deepcopy(FIXTURE["EGFR"]["alterations"])
                     pair["alterations"]["categories"]["Future Category"] = {"status": "enriched"}
         harness = CsvHarness(bundle=build_bundle(("ERBB2",), edit_gene=edit))
@@ -126,14 +135,19 @@ def test_alterations_are_detail_only_through_apis_exports_and_history():
             def strip(value):
                 if isinstance(value, dict):
                     return {k: strip(v) for k, v in value.items() if k not in {
-                        "alterations", "alteration_types_enriched", "Relevant alteration type(s)",
+                        "alterations", "alteration_types_enriched", "alteration_high_expression", "Relevant alteration type(s)",
                         "computed_at", "evaluated_at", "loaded_at", "literature_checked_at",
                     }}
                 if isinstance(value, list):
                     return [strip(v) for v in value]
                 return value
             snapshots.append(json.dumps(strip([stats, result, history, rows, golden]), sort_keys=True))
-    assert snapshots[0] == snapshots[1]
+            golden_snapshots.append(golden)
+    assert snapshots[0] == snapshots[1] == snapshots[2]
+    # With frequency detail held constant, high-expression detail leaves all four
+    # golden-set columns byte-for-byte equivalent, including alteration types.
+    assert golden_snapshots[1] == golden_snapshots[2]
+    assert all(len(row) == 4 for row in golden_snapshots[2])
 
 
 def test_cna_directions_survive_storage_round_trip():
@@ -186,3 +200,14 @@ def test_per_pair_alteration_cell_uses_csv_guard(monkeypatch):
         monkeypatch.setattr(csv_export, "enriched_alteration_types", lambda p: ["=unsafe"])
         row = dict(zip(CSV_COLUMNS, gene_view_csv_rows(view)[0], strict=True))
         assert row["alteration_types_enriched"] == "'=unsafe"
+
+
+def test_per_pair_high_expression_cell_uses_csv_guard(monkeypatch):
+    from src.expression_context import csv_export
+
+    harness = CsvHarness()
+    with TestClient(harness.app) as client:
+        run_job(client)
+        monkeypatch.setattr(csv_export, "high_expression_types", lambda pair: ["=unsafe"])
+        _, rows = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
+        assert rows[0]["alteration_high_expression"] == "'=unsafe"

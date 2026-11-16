@@ -499,6 +499,7 @@ def expression_only(directory):
         document.pop("release_id")
         for record in document["cancer_types"]:
             record.pop("alterations")
+            record.pop("alteration_high_expression", None)
         out[path.name] = document
     return out
 
@@ -522,7 +523,7 @@ def test_alterations_are_detail_only(tmp_path, monkeypatch):
     assert all(record["alterations"] is None for record in skipped["cancer_types"])
     manifest = json.loads((with_alterations / "v1/manifest.json").read_text())
     jsonschema.validate(manifest, SCHEMAS["manifest"])
-    assert manifest["contract_version"] == "1.5" and manifest["method_version"] == "3"
+    assert manifest["contract_version"] == "1.6" and manifest["method_version"] == "3"
     assert manifest["source"]["mutation_driver_source"] == "test"
     assert manifest["source"]["cna_driver_source"] == "test-cna"
     assert manifest["source"]["cna_driver_sha256"] == "1" * 64
@@ -666,5 +667,5 @@ def test_real_panel_has_the_required_alteration_controls():
     assert rows[("ALK", "LUAD", STRUCTURAL_VARIANT)]["expected"] is None
     positives, negatives = controls.expected_alteration_counts(panel, [f"C{i}" for i in range(32)])
     assert positives == 13
-    assert negatives == 2 * 32 + 2
+    assert negatives == 2 * 32 + 1
     assert {r["category"] for r in rows.values()} == set(ALTERATION_CATEGORIES)

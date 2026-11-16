@@ -1234,6 +1234,25 @@ test("purity demotion has a distinct tooltip and coverage states have detail not
   assert.ok(details[1].text.includes("unassessed by this gate, not validated"));
 });
 
+test("high-expression association stays separate from clickable frequency badges", async () => {
+  const v = viewWithPurityConcern();
+  v.pairs[0].stats.alteration_high_expression = {
+    "Copy Number Alteration (amp)": {status: "associated_high_expression", n_altered: 11,
+      n_profiled: 507, delta_median: 3.53, q: 0.0000048, or_top10: 48.6,
+      p_top10: 0.0000000252, k_top10: 9, frac_top10_altered: 9/51},
+    "Structural Variant": {status: "anecdotal", n_altered: 1, n_profiled: 510,
+      reason: "<script>unsafe</script>"},
+  };
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  const row = summaryRows(nodes)[0];
+  const badge = row.findAll(n => n.textContent.includes("High-expression assoc."));
+  assert.ok(badge.some(n => n.tagName === "span" && (n.getAttribute("class") || "").includes("ec-high-expression")));
+  assert.ok(row.text.includes("anecdotal (1–2 tumors)"));
+  assert.ok(detailRows(nodes)[0].text.includes("11/507 altered/profiled"));
+  assert.ok(detailRows(nodes)[0].text.includes("<script>unsafe</script>"));
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of tests) {
