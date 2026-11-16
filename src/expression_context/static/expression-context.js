@@ -91,12 +91,13 @@
       "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
       "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
       "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
+      "ec-dmt-index",
     ]) {
       el[id] = doc.getElementById(id);
     }
     const sleep = wait || ((ms) => new Promise((done) => win.setTimeout(done, ms)));
     // showAll: the "All cancer types" view (excluded pairs listed, CSV include_excluded=true).
-    const state = { view: null, loading: false, jobRunning: false, expanded: new Set(), showAll: false, rows: [] };
+    const state = { view: null, loading: false, jobRunning: false, expanded: new Set(), alterationExpanded: new Set(), showAll: false, rows: [] };
 
     function show(node, visible) { if (node) node.classList.toggle("hidden", !visible); }
 
@@ -271,7 +272,7 @@
       ));
     }
 
-    const alterationNames = ["Point Mutation", "Structural Variant", "Copy Number Alteration"];
+    const alterationNames = ["Point Mutation", "Structural Variant", "Copy Number Alteration", "Expression"];
 
     // New APIs derive the canonical field from stats; accept older stats-only responses.
     function alterationsFor(pair) { return pair.alterations || pair.stats.alterations; }
@@ -285,12 +286,54 @@
 
     function alterationBadges(pair) {
       const alterations = alterationsFor(pair);
-      if (!alterations) return "—";
-      const categories = alterations.categories || {};
+      const categories = alterations && alterations.categories || {};
       const names = alterationNames.filter((name) =>
-        (alterations.alteration_types_enriched || []).includes(name) &&
-        (!categories[name] || categories[name].status === "enriched"));
-      return names.length ? names.map((name) => badge(alterationLabel(name, categories[name]), "alteration")) : "—";
+        (name === "Expression" && pair.status === "surfaced") ||
+        (alterations && (alterations.alteration_types_enriched || []).includes(name) &&
+         (!categories[name] || categories[name].status === "enriched")));
+      return names.length ? names.map((name) => {
+        const key = `${pair.oncotree_code}|${name}`;
+        const panelId = `ec-alteration-${pair.oncotree_code}-${name.replace(/\W+/g, "-")}`;
+        const wrap = node("span", null, "ec-alteration-item");
+        const button = node("button", alterationLabel(name, categories[name]),
+          `review-badge ec-badge ec-alteration context ec-alteration-button`);
+        button.setAttribute("type", "button");
+        button.setAttribute("aria-expanded", state.alterationExpanded.has(key) ? "true" : "false");
+        button.setAttribute("aria-controls", panelId);
+        const panel = node("span", null, "ec-alteration-panel");
+        panel.setAttribute("id", panelId);
+        const verdict = pair.literature;
+        if (verdict && verdict.alteration_pmids == null) {
+          panel.textContent = "Re-run literature check to see alteration-specific papers";
+        } else {
+          const pmids = verdict && verdict.alteration_pmids && verdict.alteration_pmids[name] || [];
+          const allowed = new Set(verdict && verdict.pmids || []);
+          const papers = new Map((verdict && verdict.papers || []).map((paper) => [paper.pmid, paper]));
+          let count = 0;
+          for (const pmid of pmids) {
+            const url = allowed.has(pmid) && pmidUrl(pmid);
+            if (!url) continue;
+            const paper = papers.get(pmid);
+            const link = node("a", paper && paper.title ? `${paper.title} (PMID ${pmid})` : `PMID ${pmid}`);
+            link.setAttribute("href", url);
+            link.setAttribute("target", "_blank");
+            link.setAttribute("rel", "noopener noreferrer");
+            panel.appendChild(link);
+            count += 1;
+          }
+          if (!count) panel.textContent = "No alteration-specific paper found";
+        }
+        show(panel, state.alterationExpanded.has(key));
+        button.addEventListener("click", () => {
+          const next = !state.alterationExpanded.has(key);
+          if (next) state.alterationExpanded.add(key); else state.alterationExpanded.delete(key);
+          button.setAttribute("aria-expanded", next ? "true" : "false");
+          show(panel, next);
+        });
+        wrap.appendChild(button);
+        wrap.appendChild(panel);
+        return wrap;
+      }) : "—";
     }
 
     function alterationCounts(counts, fallbackProfiled) {
@@ -397,6 +440,9 @@
       if (pair.status === "surfaced") row.setAttribute("class", "ec-row-surfaced");
       else if (isCandidate(pair)) row.setAttribute("class", "ec-row-excluded ec-row-candidate");
       else if (isExcluded(pair)) row.setAttribute("class", "ec-row-excluded");
+      const dmtRows = (state.view.dmt_adc_index || []).filter((item) =>
+        (item.tcga_codes || []).includes(pair.oncotree_code));
+      if (dmtRows.length) row.classList.toggle("ec-row-dmt", true);
       const s = pair.stats;
       const code = pair.oncotree_code;
       const name = pair.cancer_type_name ? `${pair.cancer_type_name} (${code})` : code;
@@ -414,7 +460,15 @@
         toggleBtn.setAttribute("aria-expanded", next ? "true" : "false");
         show(detailRow, next);
       });
-      cell(row, name);
+      const cancerCell = cell(row, name);
+      if (dmtRows.length) {
+        const info = node("details", null, "ec-dmt-detail");
+        info.appendChild(node("summary", "DMT ADC interest", "review-badge ec-badge context"));
+        for (const item of dmtRows) {
+          info.appendChild(node("div", `${item.tissue_type}${item.from ? ` · From: ${item.from}` : ""}${item.notes ? ` · ${item.notes}` : ""}`));
+        }
+        cancerCell.appendChild(info);
+      }
       cell(row, statsCell(pair));
       cell(row, flagsCell(s.flags));
       cell(row, alterationBadges(pair), "ec-alterations");
@@ -509,6 +563,7 @@
     function render(view) {
       if (!state.view || state.view.hugo_symbol !== view.hugo_symbol) {
         state.expanded.clear();
+        state.alterationExpanded.clear();
         // A new gene starts on "Shown only"; same-gene re-renders keep the view.
         state.showAll = false;
       }
@@ -527,6 +582,12 @@
         `${summary.excluded || 0} excluded` +
         (summary.candidate ? ` · ${summary.candidate} purity ${summary.candidate === 1 ? "concern" : "concerns"}` : "");
       if (el["ec-release"]) el["ec-release"].textContent = releaseText(view.bundle);
+      if (el["ec-dmt-index"]) {
+        const tissues = [...new Set((view.dmt_adc_index || []).map((item) =>
+          `${item.tissue_type}${item.tcga_codes.length ? "" : " (no TCGA cohort)"}`))];
+        el["ec-dmt-index"].textContent = tissues.length ? `DMT ADC index cancers: ${tissues.join(", ")}` : "";
+        show(el["ec-dmt-index"], tissues.length > 0);
+      }
       show(el["ec-run"], (summary.literature_pending || 0) > 0 && !state.jobRunning);
       renderCbioCompare(view);
       el["ec-tbody"].replaceChildren();
@@ -570,6 +631,7 @@
         (!state.view.query || gene !== state.view.query.trim().toUpperCase())
       ) {
         state.expanded.clear();
+        state.alterationExpanded.clear();
       }
       state.loading = true;
       el["ec-loading"].textContent = `Loading ${gene}…`;

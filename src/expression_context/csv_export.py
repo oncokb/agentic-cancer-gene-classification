@@ -46,6 +46,8 @@ CSV_COLUMNS: Tuple[str, ...] = (
     "stats_pass",
     "enrichment_label",
     "alteration_types_enriched",
+    "alteration_pmids",
+    "dmt_adc_index",
     "confidence_tier",
     "confidence_label",
     "purity_check",
@@ -380,6 +382,12 @@ def pair_view_to_csv_row(
         guard_csv_text(_format_yes_no(stats.passes_stats)),
         guard_csv_text(_enrichment_code(stats)),
         guard_csv_text(", ".join(enriched_alteration_types(pair))),
+        guard_csv_text(" | ".join(
+            f"{category}: {'; '.join(verdict.alteration_pmids[category])}"
+            for category in ALLOWED_ALTERATION_TYPES
+            if verdict is not None and verdict.alteration_pmids and verdict.alteration_pmids.get(category)
+        )),
+        guard_csv_text("yes" if any(code in row["tcga_codes"] for row in view.dmt_adc_index) else ""),
         guard_csv_text(pair.confidence_tier),
         guard_csv_text(pair.confidence_label),
         guard_csv_text(stats.purity_check),

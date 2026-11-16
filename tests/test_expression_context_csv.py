@@ -119,6 +119,8 @@ EXPECTED_COLUMNS: Tuple[str, ...] = (
     "stats_pass",
     "enrichment_label",
     "alteration_types_enriched",
+    "alteration_pmids",
+    "dmt_adc_index",
     "confidence_tier",
     "confidence_label",
     "purity_check",
@@ -2080,6 +2082,54 @@ def test_golden_set_agreement_with_all_read_paths():
         assert golden_row["Relevant alteration type(s)"] == "Expression"
         assert golden_row["Evidence-associated PMIDs"] == "12345678; 23456789"
         assert set(golden_row["Evidence-associated PMIDs"].split("; ")) == pair_pmids
+
+
+def test_alteration_pmids_and_dmt_data_leave_every_surfaced_read_path_unchanged(monkeypatch):
+    """Detail fields may appear independently without changing the canonical gene view call."""
+    harness = CsvHarness()
+    monkeypatch.setattr("src.expression_context.service.index_for_gene", lambda _gene: [])
+
+    def snapshot(client):
+        stats = client.get(f"{PREFIX}/stats/ERBB2").json()
+        genes = client.get(f"{PREFIX}/genes/ERBB2").json()
+        history = client.get(f"{PREFIX}/genes").json()
+        _, pair_rows = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
+        golden_header, golden_rows = parse_csv_response(client.get(f"{PREFIX}/golden-set.csv?genes=ERBB2").text)
+        assert len(golden_header) == 4
+        return (
+            {p["oncotree_code"] for p in stats["pairs"] if p["status"] == "surfaced"},
+            {p["oncotree_code"] for p in genes["surfaced"]},
+            next(item["surfaced_count"] for item in history["items"] if item["hugo_symbol"] == "ERBB2"),
+            {p["oncotree_code"] for p in pair_rows if p["surfaced"] == "yes"},
+            (golden_rows[0]["Relevant expression-based cancer type(s)"],
+             golden_rows[0]["Evidence-associated PMIDs"]),
+        )
+
+    with TestClient(harness.app) as client:
+        run_job(client, "ERBB2")
+        baseline = snapshot(client)
+        assert baseline[0]
+        for row in harness.store.rows.values():
+            if row.hugo_symbol == "ERBB2" and row.evidence and row.evidence.get("pmids"):
+                row.evidence["alteration_pmids"] = {
+                    "Expression": list(row.evidence["pmids"]),
+                }
+        assert snapshot(client) == baseline, "alteration PMIDs changed surfaced read paths"
+        for row in harness.store.rows.values():
+            if row.hugo_symbol == "ERBB2" and row.evidence:
+                row.evidence.pop("alteration_pmids", None)
+        monkeypatch.setattr("src.expression_context.service.index_for_gene", lambda gene: [
+            {"tissue_type": "Breast", "tcga_codes": ["BRCA"], "from": "DMT", "notes": ""},
+        ] if gene == "ERBB2" else [])
+        assert snapshot(client) == baseline, "DMT index changed surfaced read paths"
+        for row in harness.store.rows.values():
+            if row.hugo_symbol == "ERBB2" and row.evidence and row.evidence.get("pmids"):
+                row.evidence["alteration_pmids"] = {"Expression": list(row.evidence["pmids"])}
+        assert snapshot(client) == baseline, "combined details changed surfaced read paths"
+        _, enriched_rows = parse_csv_response(client.get(f"{PREFIX}/genes/ERBB2/export.csv").text)
+        brca = next(row for row in enriched_rows if row["oncotree_code"] == "BRCA")
+        assert brca["alteration_pmids"].startswith("Expression: ")
+        assert brca["dmt_adc_index"] == "yes"
 
 
 def test_golden_set_multi_cohort_coadread_pmid_numeric_sorting_and_dedupe():

@@ -332,6 +332,7 @@ class PaperJudgement(BaseModel):
     matched_terms: List[str] = Field(default_factory=list)
     # Describes the gene's expression/role IN this tumor type.
     tumor_specific: bool = False
+    alterations: List[AlterationType] = Field(default_factory=list)
     reason: Optional[str] = None
 
 
@@ -352,9 +353,22 @@ class LiteratureVerdict(BaseModel):
     cancer_type_name: Optional[str] = None
     retrieved_count: Optional[int] = None
     papers: List[PaperJudgement] = Field(default_factory=list)
+    # None identifies durable verdicts written before alteration tagging.
+    alteration_pmids: Optional[Dict[str, List[str]]] = None
     # "guard": no paper mentioned the tumor type, so no LLM judgement was made
     # (always "insufficient"); "judge": the LLM judged the papers.
     decided_by: Optional[Literal["guard", "judge"]] = None
+
+    @model_validator(mode="after")
+    def keep_only_tumor_specific_alteration_pmids(self) -> "LiteratureVerdict":
+        if self.alteration_pmids is not None:
+            allowed = set(self.pmids)
+            self.alteration_pmids = {
+                category: list(dict.fromkeys(pmid for pmid in values if pmid in allowed))
+                for category, values in self.alteration_pmids.items()
+                if category in ALLOWED_ALTERATION_TYPES
+            }
+        return self
 
 
 # --------------------------------------------------------------------------
@@ -545,4 +559,5 @@ class GeneStatsView(BaseModel):
     bundle: BundleProvenance
     summary: GeneStatsSummary
     pairs: List[PairStatsView]
+    dmt_adc_index: List[Dict[str, Any]] = Field(default_factory=list)
     has_stored_result: bool = False
