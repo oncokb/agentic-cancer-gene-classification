@@ -1984,6 +1984,10 @@ test("stale cancel to Single mode or stale cancel failure leaves new state and b
   assert.strictEqual(envS.page.state.mode, "single");
   assert.strictEqual(envS.nodes["ec-batch-result"].hidden, true);
   assert.strictEqual(envS.nodes["ec-error"].hidden, true);
+  // Stale settlement did nothing on the page while in Single mode
+  assert.strictEqual(envS.nodes["ec-batch-cancel"].disabled, true);
+  // Switching back to Batch tab syncs Cancel button from pendingCancelIds
+  envS.page.setMode("batch");
   assert.strictEqual(envS.nodes["ec-batch-cancel"].disabled, false);
 
   // Case 2: stale cancel failure (500) on A does not overwrite B's banner or state
@@ -2062,6 +2066,168 @@ test("failed cancel on still-current batch shows error banner and resumes single
   assert.strictEqual(getCount, 3);
   assert.ok(envR.nodes["ec-batch-summary"].textContent.includes("Status: done"));
   assert.strictEqual(envR.nodes["ec-error"].hidden, false);
+});
+
+test("reload while cancel pending keeps Cancel disabled and blocks duplicate POST until settle", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const runningA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const doneA = {
+    batch_id: "batch-A", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+  const cancelledA = {
+    batch_id: "batch-A", status: "cancelled", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+
+  let resolveCancelA = null;
+  const timers = [];
+  let getCalls = 0;
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": () => {
+        getCalls += 1;
+        // Both initial load and reload before cancel settles return running; later poll returns done
+        return response(getCalls <= 2 ? runningA : doneA);
+      },
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => {
+        resolveCancelA = () => r(response(cancelledA));
+      }),
+    },
+    { wait: () => new Promise((r) => { timers.push(r); }) }
+  );
+
+  const p1 = ref.page.loadBatch("batch-A");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  // Click Cancel on A (POST now pending)
+  const c1 = ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+  while (!resolveCancelA) await new Promise((r) => setTimeout(r, 0));
+
+  // Reload batch A while POST /cancel is STILL pending
+  const p2 = ref.page.loadBatch("batch-A");
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Clicking Cancel again during reload must send NO second POST
+  await ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(ref.calls.filter((c) => c.method === "POST").length, 1);
+
+  // Settle first POST -> Cancel reflects new state (no longer pending-disabled)
+  resolveCancelA();
+  await c1;
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  // Clean up remaining poll loops
+  timers[1]();
+  await p2;
+  timers[0]();
+  await p1;
+});
+
+test("pending cancel on A allows B's Cancel to work and A settling does not touch B", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const runningA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const cancelledA = { ...runningA, status: "cancelled", genes: [makeGene("ERBB2", "done")] };
+  const runningB = {
+    batch_id: "batch-B", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("MYCN", "running")],
+  };
+  const cancelledB = { ...runningB, status: "cancelled", genes: [makeGene("MYCN", "done")] };
+
+  let resolveCancelA = null;
+  let resolveCancelB = null;
+  const timers = [];
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(runningA),
+      "GET /v1/expression-context/batches/batch-B": response(runningB),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => {
+        resolveCancelA = () => r(response(cancelledA));
+      }),
+      "POST /v1/expression-context/batches/batch-B/cancel": () => new Promise((r) => {
+        resolveCancelB = () => r(response(cancelledB));
+      }),
+    },
+    { wait: () => new Promise((r) => { timers.push(r); }) }
+  );
+
+  const pA = ref.page.loadBatch("batch-A");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  const cA = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolveCancelA) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Switch to batch B -> B's Cancel must be enabled and usable
+  const pB = ref.page.loadBatch("batch-B");
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.page.state.batch.batch_id, "batch-B");
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  // Click Cancel on B
+  const cB = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolveCancelB) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+  assert.strictEqual(ref.calls.filter((c) => c.method === "POST").length, 2);
+
+  // Settle A's POST -> must NOT overwrite B or re-enable B's Cancel while B's POST is pending
+  resolveCancelA();
+  await cA;
+  assert.strictEqual(ref.page.state.batch.batch_id, "batch-B");
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Settle B's POST -> B finishes cancelled
+  resolveCancelB();
+  await cB;
+  assert.ok(ref.nodes["ec-batch-summary"].textContent.includes("Status: cancelled"));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  timers[1]();
+  await pB;
+  timers[0]();
+  await pA;
+});
+
+test("submitBatch: switching to Single before 202 arrives leaves Single active and skips loadBatch", async () => {
+  let resolvePost = null;
+  const ref = env({
+    "POST /v1/expression-context/batches": () => new Promise((r) => {
+      resolvePost = () => r(response({ batch_id: "batch-late", status: "queued" }, 202));
+    }),
+  });
+
+  ref.page.setMode("batch");
+  const subP = ref.page.submitBatch("ERBB2, MYCN");
+  while (!resolvePost) await new Promise((r) => setTimeout(r, 0));
+
+  // Switch to Single before POST /batches resolves
+  ref.page.setMode("single");
+  assert.strictEqual(ref.page.state.mode, "single");
+
+  resolvePost();
+  await subP;
+
+  // Single stays active; no GET /batches/batch-late was issued
+  assert.strictEqual(ref.page.state.mode, "single");
+  assert.strictEqual(ref.nodes["ec-batch-result"].hidden, true);
+  assert.strictEqual(ref.calls.filter((c) => c.method === "GET").length, 0);
 });
 
 (async () => {

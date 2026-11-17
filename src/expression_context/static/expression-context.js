@@ -184,12 +184,17 @@
     let activeBatchController = null;
     let activeBatchTimer = null;
     let activeBatchTimerResolve = null;
-    let cancelInFlight = false;
+    let currentBatchId = null;
+    const pendingCancelIds = new Set();
+
+    function syncCancelButton() {
+      if (!el["ec-batch-cancel"]) return;
+      const shownId = currentBatchId || (state.batch && state.batch.batch_id) || null;
+      el["ec-batch-cancel"].disabled = Boolean(shownId && pendingCancelIds.has(shownId));
+    }
 
     function cancelActiveBatchLoop() {
       activeBatchGeneration += 1;
-      cancelInFlight = false;
-      if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = false;
       if (activeBatchController) {
         try { activeBatchController.abort(); } catch (_) {}
         activeBatchController = null;
@@ -893,8 +898,13 @@
       show(el["ec-batch-mode"], isBatch);
       if (isBatch) {
         show(el["ec-result"], false);
-        if (state.batch) show(el["ec-batch-result"], true);
+        if (state.batch) {
+          currentBatchId = state.batch.batch_id || currentBatchId;
+          show(el["ec-batch-result"], true);
+        }
+        syncCancelButton();
       } else {
+        currentBatchId = null;
         cancelActiveBatchLoop();
         show(el["ec-batch-result"], false);
         if (state.view) show(el["ec-result"], true);
@@ -1056,6 +1066,7 @@
       }
       const genesList = batch.genes;
       state.batch = batch;
+      currentBatchId = batch.batch_id || currentBatchId;
       const total = expectedTotal !== null ? expectedTotal : (genesList.length || 0);
       const finished = (counts.done || 0) + (counts.skipped_no_stats || 0) +
         (counts.skipped_fresh || 0) + (counts.failed || 0) + (counts.not_found || 0);
@@ -1079,6 +1090,7 @@
       }
       const running = batch.status === "queued" || batch.status === "running";
       show(el["ec-batch-cancel"], running);
+      syncCancelButton();
       updateBatchExportLinks();
 
       // Invalidate cached per-gene views when a gene's status changes
@@ -1129,6 +1141,7 @@
     async function loadBatch(batchId, { preserveError = false } = {}) {
       const id = String(batchId || "").trim();
       if (!id) return;
+      currentBatchId = id;
       cancelActiveBatchLoop();
       const generation = activeBatchGeneration;
       const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
@@ -1248,6 +1261,9 @@
         setError("A batch can include at most 2000 gene entries.");
         return;
       }
+      const submitGeneration = activeBatchGeneration;
+      const submitBatchId = currentBatchId;
+      const submitMode = state.mode;
       if (el["ec-batch-submit"]) el["ec-batch-submit"].disabled = true;
       try {
         const { status, body } = await getJson(`${API}/batches`, {
@@ -1255,6 +1271,13 @@
           headers: { Accept: "application/json", "Content-Type": "application/json" },
           body: JSON.stringify({ genes: tokens }),
         });
+        if (
+          submitGeneration !== activeBatchGeneration ||
+          currentBatchId !== submitBatchId ||
+          state.mode !== submitMode
+        ) {
+          return;
+        }
         if (status === 401) {
           redirectToLogin();
           return;
@@ -1270,8 +1293,9 @@
     }
 
     async function cancelCurrentBatch() {
-      if (cancelInFlight || !state.batch || !state.batch.batch_id) return;
+      if (!state.batch || !state.batch.batch_id) return;
       const id = state.batch.batch_id;
+      if (pendingCancelIds.has(id)) return;
       cancelActiveBatchLoop();
       const cancelGeneration = activeBatchGeneration;
       const isStillCurrentCancel = () => (
@@ -1279,14 +1303,15 @@
         state.mode === "batch" &&
         Boolean(state.batch && state.batch.batch_id === id)
       );
-      cancelInFlight = true;
-      if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = true;
+      pendingCancelIds.add(id);
+      syncCancelButton();
       try {
         const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}/cancel`, {
           method: "POST",
           headers: { Accept: "application/json", "Content-Type": "application/json" },
           body: JSON.stringify({}),
         });
+        pendingCancelIds.delete(id);
         if (!isStillCurrentCancel()) return;
         if (status === 401) {
           redirectToLogin();
@@ -1305,14 +1330,13 @@
           }
         } else {
           setError(friendlyError(status, id));
-          cancelInFlight = false;
-          if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = false;
+          syncCancelButton();
           await loadBatch(id, { preserveError: true });
         }
       } finally {
-        if (isStillCurrentCancel()) {
-          cancelInFlight = false;
-          if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = false;
+        pendingCancelIds.delete(id);
+        if (state.mode === "batch" && currentBatchId === id) {
+          syncCancelButton();
         }
       }
     }
