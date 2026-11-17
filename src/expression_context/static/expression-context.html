@@ -29,14 +29,38 @@
       </header>
 
       <section class="api-keys-card" aria-labelledby="ec-search-heading">
-        <h2 id="ec-search-heading" class="ec-visually-hidden">Look up a gene</h2>
-        <form class="ec-form" id="ec-form" autocomplete="off">
-          <label class="field ec-gene-field" for="ec-gene">
-            <span>Gene</span>
-            <input id="ec-gene" name="gene" type="text" placeholder="e.g. ERBB2" maxlength="64" spellcheck="false" />
-          </label>
-          <button class="primary-action" id="ec-submit" type="submit">Show statistics</button>
-        </form>
+        <div class="ec-search-header">
+          <h2 id="ec-search-heading" class="ec-visually-hidden">Look up a gene</h2>
+          <div class="input-mode-tabs ec-mode-tabs" role="group" aria-label="Input mode">
+            <button class="mode-tab active" id="ec-tab-single" type="button" aria-pressed="true">Single</button>
+            <button class="mode-tab" id="ec-tab-batch" type="button" aria-pressed="false">Batch</button>
+          </div>
+        </div>
+        <div id="ec-single-mode">
+          <form class="ec-form" id="ec-form" autocomplete="off">
+            <label class="field ec-gene-field" for="ec-gene">
+              <span>Gene</span>
+              <input id="ec-gene" name="gene" type="text" placeholder="e.g. ERBB2" maxlength="64" spellcheck="false" />
+            </label>
+            <button class="primary-action" id="ec-submit" type="submit">Show statistics</button>
+          </form>
+        </div>
+        <div id="ec-batch-mode" class="hidden">
+          <form class="ec-batch-form" id="ec-batch-form" autocomplete="off">
+            <label class="field ec-batch-field" for="ec-batch-input">
+              <span>Genes (newline, comma, or tab separated)</span>
+              <textarea id="ec-batch-input" rows="5" placeholder="ERBB2, EGFR, KRAS&#10;MET&#10;ALK" spellcheck="false"></textarea>
+            </label>
+            <div class="ec-batch-actions">
+              <div class="ec-batch-upload-group">
+                <button class="ec-button" id="ec-batch-upload-btn" type="button">Upload .txt/.csv</button>
+                <input id="ec-batch-upload" type="file" accept=".txt,.csv,.tsv,text/plain,text/csv,text/tab-separated-values" class="hidden" />
+                <span class="ec-batch-preview" id="ec-batch-preview" role="status" aria-live="polite">0 genes</span>
+              </div>
+              <button class="primary-action" id="ec-batch-submit" type="submit">Submit batch</button>
+            </div>
+          </form>
+        </div>
         <div class="api-keys-alert ec-state hidden" id="ec-error" role="alert"></div>
         <p class="api-keys-empty ec-state hidden" id="ec-loading" role="status">Loading…</p>
       </section>
@@ -102,6 +126,7 @@
           <div class="ec-toolbar-group ec-downloads">
             <a class="ec-button primary-action hidden" id="ec-export" href="#">Download CSV</a>
             <a class="ec-button hidden" id="ec-export-golden" href="#">Download golden-set row</a>
+            <a class="ec-button hidden" id="ec-export-curator" href="#">Download curator sheet row</a>
           </div>
         </div>
 
@@ -123,6 +148,36 @@
             <tbody id="ec-tbody"></tbody>
           </table>
         </div>
+      </section>
+
+      <section class="api-keys-card ec-batch-result hidden" id="ec-batch-result" aria-labelledby="ec-batch-title">
+        <div class="ec-result-head">
+          <div class="ec-result-title">
+            <h2 id="ec-batch-title">Batch results</h2>
+            <p class="ec-summary" id="ec-batch-summary" role="status" aria-live="polite"></p>
+            <p class="ec-release" id="ec-batch-counts"></p>
+          </div>
+          <div class="ec-run-wrap">
+            <button class="ec-button hidden" id="ec-batch-cancel" type="button">Cancel batch</button>
+          </div>
+        </div>
+        <div class="ec-batch-progress-wrap">
+          <progress class="ec-batch-progress" id="ec-batch-progress" value="0" max="1"></progress>
+        </div>
+        <div class="ec-toolbar" id="ec-batch-toolbar">
+          <div class="ec-toolbar-group">
+            <div class="input-mode-tabs ec-view-toggle" role="group" aria-label="Per-pair CSV cancer types">
+              <button class="mode-tab active" id="ec-batch-export-shown" type="button" aria-pressed="true">Shown only</button>
+              <button class="mode-tab" id="ec-batch-export-all" type="button" aria-pressed="false">Include excluded</button>
+            </div>
+          </div>
+          <div class="ec-toolbar-group ec-downloads">
+            <a class="ec-button primary-action" id="ec-batch-export" href="#">Download per-pair CSV</a>
+            <a class="ec-button" id="ec-batch-export-golden" href="#">Download golden-set CSV</a>
+            <a class="ec-button" id="ec-batch-export-curator" href="#">Download curator sheet CSV</a>
+          </div>
+        </div>
+        <div class="ec-batch-genes" id="ec-batch-genes"></div>
       </section>
     </main>
 

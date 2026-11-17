@@ -6,15 +6,23 @@ producer (`expression_stats/`, its workflows and its release bundles) has its
 own removal notes in that directory.
 
 1. **Delete the package**, which includes the "Expression stats" page, its
-   static files (`src/expression_context/static/`, including the "Download CSV"
-   and "Download golden-set row" controls), the cancer names mapping
-   (`src/expression_context/sheet_cancer_names.json`), and the CSV export
-   helpers and endpoints (`/v1/expression-context/genes/{gene}/export.csv`,
-   `/v1/expression-context/export.csv`, `/v1/expression-context/golden-set.csv`):
+   static files (`src/expression_context/static/`, including the "Single"/"Batch"
+   tabs, batch view, and the "Download CSV", "Download golden-set row", and
+   "Download curator sheet row" controls), the cancer names mapping
+   (`src/expression_context/sheet_cancer_names.json`), the persistent batch
+   worker, and the CSV export and batch endpoints
+   (`/v1/expression-context/genes/{gene}/export.csv`,
+   `/v1/expression-context/genes/{gene}/curator-sheet.csv`,
+   `/v1/expression-context/export.csv`, `/v1/expression-context/golden-set.csv`,
+   `/v1/expression-context/batches`, `/v1/expression-context/batches/{id}`,
+   `/v1/expression-context/batches/{id}/cancel`,
+   `/v1/expression-context/batches/{id}/export.csv`,
+   `/v1/expression-context/batches/{id}/golden-set.csv`,
+   `/v1/expression-context/batches/{id}/curator-sheet.csv`):
    `git rm -r src/expression_context/`
    This includes `dmt_adc_index.json`, its read-only loader, and the page's
    DMT index and alteration-PMID controls. Also remove the standalone
-   generator: `git rm scripts/generate_dmt_adc_index.py`.
+   scripts: `git rm scripts/generate_dmt_adc_index.py scripts/expression_context_batch.py`.
 2. **Delete the registration** in `src/main.py` — exactly two lines:
    - `from src.expression_context import register_expression_context`
    - `register_expression_context(app)  # optional module; ...`
@@ -36,6 +44,8 @@ own removal notes in that directory.
    `expression_context_results` with `literature_gate = 'acgc_pipeline_v1'`,
    so there is nothing else to clean up):
    ```sql
+   DROP TABLE IF EXISTS expression_context_batch_genes;
+   DROP TABLE IF EXISTS expression_context_batches;
    DROP TABLE IF EXISTS expression_context_results;
    DROP TABLE IF EXISTS expression_context_stats;
    DROP TABLE IF EXISTS expression_context_aliases;

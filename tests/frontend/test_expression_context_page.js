@@ -7,6 +7,8 @@ const fs = require("fs");
 const path = require("path");
 const {
   createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL, goldenSetExportURL,
+  curatorSheetExportURL, batchExportURL, batchGoldenSetExportURL, batchCuratorSheetExportURL,
+  parseBatchText, parseUploadedFileColumn,
 } = require("../../src/expression_context/static/expression-context.js");
 
 const HTML_PATH = path.join(__dirname, "../../src/expression_context/static/expression-context.html");
@@ -44,9 +46,14 @@ class Element {
 
 const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-  "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
-  "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
+  "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-export-curator",
+  "ec-view-shown", "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
   "ec-dmt-index",
+  "ec-tab-single", "ec-tab-batch", "ec-single-mode", "ec-batch-mode", "ec-batch-form",
+  "ec-batch-input", "ec-batch-upload-btn", "ec-batch-upload", "ec-batch-preview", "ec-batch-submit",
+  "ec-batch-result", "ec-batch-title", "ec-batch-summary", "ec-batch-counts", "ec-batch-cancel",
+  "ec-batch-progress", "ec-batch-export-shown", "ec-batch-export-all",
+  "ec-batch-export", "ec-batch-export-golden", "ec-batch-export-curator", "ec-batch-genes",
 ];
 
 const response = (body, status = 200) => ({ status, json: async () => body });
@@ -83,10 +90,20 @@ function env(routes, { search = "" } = {}) {
   nodes["ec-run"].classList.toggle("hidden", true);
   nodes["ec-export"].classList.toggle("hidden", true);
   nodes["ec-export-golden"].classList.toggle("hidden", true);
+  nodes["ec-export-curator"].classList.toggle("hidden", true);
   nodes["ec-table-empty"].classList.toggle("hidden", true);
   nodes["ec-view-shown"].classList.toggle("active", true);
   nodes["ec-view-shown"].setAttribute("aria-pressed", "true");
   nodes["ec-view-all"].setAttribute("aria-pressed", "false");
+  nodes["ec-tab-single"].classList.toggle("active", true);
+  nodes["ec-tab-single"].setAttribute("aria-pressed", "true");
+  nodes["ec-tab-batch"].setAttribute("aria-pressed", "false");
+  nodes["ec-batch-mode"].classList.toggle("hidden", true);
+  nodes["ec-batch-result"].classList.toggle("hidden", true);
+  nodes["ec-batch-cancel"].classList.toggle("hidden", true);
+  nodes["ec-batch-export-shown"].classList.toggle("active", true);
+  nodes["ec-batch-export-shown"].setAttribute("aria-pressed", "true");
+  nodes["ec-batch-export-all"].setAttribute("aria-pressed", "false");
   const document = { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
   const calls = [];
   const replaced = [];
@@ -1251,6 +1268,117 @@ test("high-expression association stays separate from clickable frequency badges
   assert.ok(row.text.includes("anecdotal (1–2 tumors)"));
   assert.ok(detailRows(nodes)[0].text.includes("11/507 altered/profiled"));
   assert.ok(detailRows(nodes)[0].text.includes("<script>unsafe</script>"));
+});
+
+test("single view curator sheet row link and batch tab parsing, upload, submit, polling, grouped sections, download URLs, and ?batch= reload", async () => {
+  assert.strictEqual(curatorSheetExportURL("A/B"), "/v1/expression-context/genes/A%2FB/curator-sheet.csv");
+  assert.strictEqual(batchExportURL("b/1", false), "/v1/expression-context/batches/b%2F1/export.csv");
+  assert.strictEqual(batchExportURL("b/1", true), "/v1/expression-context/batches/b%2F1/export.csv?include_excluded=true");
+  assert.strictEqual(batchGoldenSetExportURL("b/1"), "/v1/expression-context/batches/b%2F1/golden-set.csv");
+  assert.strictEqual(batchCuratorSheetExportURL("b/1"), "/v1/expression-context/batches/b%2F1/curator-sheet.csv");
+
+  const parsed = parseBatchText("ERBB2, egfr\nerbb2\tKRAS");
+  assert.deepStrictEqual(parsed.unique, ["ERBB2", "egfr", "KRAS"]);
+  assert.strictEqual(parsed.duplicates, 1);
+
+  const uploaded = parseUploadedFileColumn("Gene,Notes\nERBB2,amp\nEGFR,mut\n", "genes.csv");
+  assert.deepStrictEqual(uploaded, ["ERBB2", "EGFR"]);
+
+  const vErbb2 = view({ has_stored_result: true });
+  vErbb2.pairs[0].confidence_label = "Strong";
+  vErbb2.pairs[0].stats.alterations = {
+    alteration_types_enriched: ["Copy Number Alteration"],
+    categories: { "Copy Number Alteration": { status: "enriched", enriched_directions: ["amp"] } },
+  };
+  let pollCount = 0;
+  const batchRunning = {
+    batch_id: "batch-123",
+    status: "running",
+    release_id: BUNDLE.release_id,
+    counts: { total: 2, queued: 1, running: 0, done: 0, skipped_fresh: 0, skipped_no_stats: 0, failed: 0, not_found: 1 },
+    genes: [
+      { position: 0, input_symbol: "HER2", hugo_symbol: "ERBB2", status: "running", error: null, notes: "duplicate of row 1", updated_at: "2026-11-17T00:00:00Z" },
+      { position: 1, input_symbol: "NOPE", hugo_symbol: null, status: "not_found", error: "not in expression data", notes: null, updated_at: "2026-11-17T00:00:00Z" },
+    ],
+  };
+  const batchDone = {
+    ...batchRunning,
+    status: "done",
+    counts: { total: 2, queued: 0, running: 0, done: 1, skipped_fresh: 0, skipped_no_stats: 0, failed: 0, not_found: 1 },
+    genes: [
+      { ...batchRunning.genes[0], status: "done" },
+      batchRunning.genes[1],
+    ],
+  };
+
+  const { nodes, page, calls, replaced } = env({
+    "GET /v1/expression-context/stats/ERBB2": response(vErbb2),
+    "POST /v1/expression-context/batches": response({ batch_id: "batch-123", status: "queued", status_url: "/v1/expression-context/batches/batch-123" }, 202),
+    "GET /v1/expression-context/batches/batch-123": () => {
+      pollCount += 1;
+      return response(pollCount === 1 ? batchRunning : batchDone);
+    },
+  });
+
+  // Single view shows curator sheet row download
+  await page.lookup("ERBB2");
+  assert.ok(!nodes["ec-export-curator"].hidden);
+  assert.strictEqual(nodes["ec-export-curator"].getAttribute("href"), "/v1/expression-context/genes/ERBB2/curator-sheet.csv");
+
+  // Switch to Batch tab
+  nodes["ec-tab-batch"].fire("click");
+  assert.ok(nodes["ec-single-mode"].hidden);
+  assert.ok(!nodes["ec-batch-mode"].hidden);
+  assert.strictEqual(nodes["ec-tab-batch"].getAttribute("aria-pressed"), "true");
+
+  // Input + preview count + duplicates
+  nodes["ec-batch-input"].value = "HER2, HER2\nNOPE";
+  nodes["ec-batch-input"].fire("input");
+  assert.strictEqual(nodes["ec-batch-preview"].textContent, "2 genes (1 duplicate)");
+
+  // File upload simulation
+  await nodes["ec-batch-upload"].fire("change", {
+    target: { files: [{ name: "list.csv", text: async () => "Gene,Other\nHER2,1\nHER2,2\nNOPE,3" }] },
+  });
+  assert.strictEqual(nodes["ec-batch-preview"].textContent, "2 genes (1 duplicate)");
+
+  // Submit batch -> polls running then done -> renders grouped sections and download URLs
+  await nodes["ec-batch-form"].fire("submit", { preventDefault() {} });
+  assert.ok(replaced.includes("?batch=batch-123"));
+  assert.ok(!nodes["ec-batch-result"].hidden);
+  assert.strictEqual(nodes["ec-batch-summary"].textContent, "Status: done · 2/2 processed");
+  assert.strictEqual(nodes["ec-batch-progress"].getAttribute("value"), "2");
+  assert.strictEqual(nodes["ec-batch-progress"].getAttribute("max"), "2");
+  assert.strictEqual(nodes["ec-batch-export"].getAttribute("href"), "/v1/expression-context/batches/batch-123/export.csv");
+  assert.strictEqual(nodes["ec-batch-export-golden"].getAttribute("href"), "/v1/expression-context/batches/batch-123/golden-set.csv");
+  assert.strictEqual(nodes["ec-batch-export-curator"].getAttribute("href"), "/v1/expression-context/batches/batch-123/curator-sheet.csv");
+
+  // Toggle include excluded on batch per-pair export
+  nodes["ec-batch-export-all"].fire("click");
+  assert.strictEqual(nodes["ec-batch-export"].getAttribute("href"), "/v1/expression-context/batches/batch-123/export.csv?include_excluded=true");
+
+  // Grouped collapsible sections
+  const sections = nodes["ec-batch-genes"].children;
+  assert.strictEqual(sections.length, 2);
+  assert.ok(sections[0].children[0].text.includes("ERBB2 (from HER2)"));
+  assert.ok(sections[1].children[0].text.includes("NOPE"));
+
+  // Expand first gene section -> loads stats summary with Strong/Moderate and alteration badges
+  sections[0].children[0].fire("click");
+  await new Promise((r) => setTimeout(r, 0));
+  assert.ok(sections[0].text.includes("Breast Invasive Carcinoma (BRCA)"));
+  assert.ok(sections[0].text.includes("Strong"));
+  assert.ok(sections[0].text.includes("Copy Number Alteration (amp)"));
+  assert.ok(sections[0].text.includes("Open ERBB2 in Single view"));
+
+  // Reload with ?batch=batch-123
+  const reloadEnv = env({
+    "GET /v1/expression-context/batches/batch-123": response(batchDone),
+  }, { search: "?batch=batch-123" });
+  await reloadEnv.page.init();
+  assert.strictEqual(reloadEnv.page.state.mode, "batch");
+  assert.ok(!reloadEnv.nodes["ec-batch-result"].hidden);
+  assert.strictEqual(reloadEnv.nodes["ec-batch-title"].textContent, "Batch batch-123");
 });
 
 (async () => {
