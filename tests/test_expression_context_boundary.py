@@ -317,8 +317,16 @@ def test_flag_off_app_boots_routes_404_no_ddl_no_outbound(monkeypatch, ddl_recor
     with TestClient(app) as client:
         assert client.post(f"{PREFIX}/jobs", json={"gene": "ERBB2"}).status_code == 404
         assert client.get(f"{PREFIX}/jobs/abc").status_code == 404
+        assert client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]}).status_code == 404
+        assert client.get(f"{PREFIX}/batches").status_code == 404
+        assert client.get(f"{PREFIX}/batches/abc").status_code == 404
+        assert client.post(f"{PREFIX}/batches/abc/cancel", json={}).status_code == 404
+        assert client.get(f"{PREFIX}/batches/abc/export.csv").status_code == 404
+        assert client.get(f"{PREFIX}/batches/abc/golden-set.csv").status_code == 404
+        assert client.get(f"{PREFIX}/batches/abc/curator-sheet.csv").status_code == 404
         assert client.get(f"{PREFIX}/genes/ERBB2").status_code == 404
         assert client.get(f"{PREFIX}/genes/ERBB2/export.csv").status_code == 404
+        assert client.get(f"{PREFIX}/genes/ERBB2/curator-sheet.csv").status_code == 404
         assert client.get(f"{PREFIX}/export.csv").status_code == 404
         assert client.get(f"{PREFIX}/golden-set.csv").status_code == 404
         assert client.get(f"{PREFIX}/genes").status_code == 404
@@ -344,10 +352,22 @@ def test_flag_on_default_factory_creates_tables_and_checks_github(ddl_recorder, 
     settings = ExpressionContextSettings(_env_file=None, enabled=True)
     assert register_expression_context(app, settings=settings)
     assert sorted(_module_paths(app)) == [
-        f"{PREFIX}/bundle", f"{PREFIX}/export.csv", f"{PREFIX}/genes",
-        f"{PREFIX}/genes/{{gene}}", f"{PREFIX}/genes/{{gene}}/export.csv",
+        f"{PREFIX}/batches",
+        f"{PREFIX}/batches/{{batch_id}}",
+        f"{PREFIX}/batches/{{batch_id}}/cancel",
+        f"{PREFIX}/batches/{{batch_id}}/curator-sheet.csv",
+        f"{PREFIX}/batches/{{batch_id}}/export.csv",
+        f"{PREFIX}/batches/{{batch_id}}/golden-set.csv",
+        f"{PREFIX}/bundle",
+        f"{PREFIX}/export.csv",
+        f"{PREFIX}/genes",
+        f"{PREFIX}/genes/{{gene}}",
+        f"{PREFIX}/genes/{{gene}}/curator-sheet.csv",
+        f"{PREFIX}/genes/{{gene}}/export.csv",
         f"{PREFIX}/golden-set.csv",
-        f"{PREFIX}/jobs", f"{PREFIX}/jobs/{{job_id}}", f"{PREFIX}/stats/{{gene}}",
+        f"{PREFIX}/jobs",
+        f"{PREFIX}/jobs/{{job_id}}",
+        f"{PREFIX}/stats/{{gene}}",
     ]
     with TestClient(app) as client:
         assert ddl_recorder == ["create_pool", "ensure_schema", "ensure_bundle_schema"]

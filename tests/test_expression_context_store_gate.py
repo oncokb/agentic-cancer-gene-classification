@@ -17,8 +17,18 @@ from src.expression_context.bundle_store import (
     MySQLBundleStore,
 )
 
-from src.expression_context.models import HistoryEntry, StoredPair
+from src.expression_context.models import (
+    BatchCounts,
+    BatchGeneRecord,
+    BatchRecord,
+    HistoryEntry,
+    StoredPair,
+)
 from src.expression_context.store import (
+    BATCH_GENES_TABLE,
+    BATCH_TABLES,
+    BATCHES_TABLE,
+    CREATE_BATCH_TABLES_SQL,
     CREATE_TABLE_SQL,
     TABLE_NAME,
     InMemoryExpressionContextStore,
@@ -83,6 +93,12 @@ def test_ddl_is_module_owned_and_keyed_as_contracted():
     for column in ("surfaced", "exclusion_reason", "stats_json", "evidence_json",
                    "computed_at", "requested_by"):
         assert column in CREATE_TABLE_SQL
+    batch_ddl = "\n".join(CREATE_BATCH_TABLES_SQL)
+    for table in BATCH_TABLES:
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in batch_ddl
+    assert "FOREIGN KEY" not in batch_ddl.upper()
+    assert "PRIMARY KEY (batch_id, position)" in batch_ddl
+    assert "idx_expression_context_batch_genes_pos" not in batch_ddl
 
 
 # ------------------------------------------------------------ store contract
@@ -150,6 +166,115 @@ async def _exercise_store(store):
         await store.upsert_pairs(order)
         assert (await store.get_verdict_pairs("TIE", GATE))["BRCA"].release_id == "z"
 
+    # Batch tables contract
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    batch = BatchRecord(
+        batch_id="batch-1",
+        created_by="alice@example.org",
+        created_at=now,
+        release_id="r1",
+        status="queued",
+        counts=BatchCounts(),
+    )
+    genes = [
+        BatchGeneRecord(
+            batch_id="batch-1",
+            position=0,
+            input_symbol="ERBB2",
+            hugo_symbol="ERBB2",
+            status="queued",
+            updated_at=now,
+        ),
+        BatchGeneRecord(
+            batch_id="batch-1",
+            position=1,
+            input_symbol="NOPE",
+            hugo_symbol=None,
+            status="not_found",
+            error="not in expression data",
+            updated_at=now,
+        ),
+    ]
+    await store.create_batch(batch, genes)
+    fetched = await store.get_batch("batch-1")
+    assert fetched is not None
+    assert fetched.counts.total == 2 and fetched.counts.queued == 1 and fetched.counts.not_found == 1
+    assert await store.count_batch_genes("batch-1") == 2
+    assert [g.input_symbol for g in await store.list_batch_genes("batch-1")] == ["ERBB2", "NOPE"]
+    assert [g.input_symbol for g in await store.list_batch_genes("batch-1", offset=1, limit=1)] == ["NOPE"]
+    assert await store.list_unfinished_batches() == ["batch-1"]
+
+    assert await store.acquire_batch_lock("batch-1", "pod-a", 0.3)
+    assert not await store.acquire_batch_lock("batch-1", "pod-b", 0.3)
+    assert await store.renew_batch_lock("batch-1", "pod-a", 0.3)
+    assert not await store.renew_batch_lock("batch-1", "pod-b", 0.3)
+    await asyncio.sleep(0.4)
+    assert await store.acquire_batch_lock("batch-1", "pod-b", 0.3)
+    await store.release_batch_lock("batch-1", "pod-b")
+
+    await store.update_batch_status("batch-1", "running")
+    await store.update_batch_gene("batch-1", 0, "done", updated_at=now)
+    await store.update_batch_status("batch-1", "done")
+    done_batch = await store.get_batch("batch-1")
+    assert done_batch is not None and done_batch.status == "done" and done_batch.counts.done == 1
+    assert await store.list_unfinished_batches() == []
+    assert [b.batch_id for b in await store.list_batches("alice@example.org")] == ["batch-1"]
+
+    # Blocker 7: 65-character entry test on store (both in-memory and MySQL)
+    long_65 = "A" * 65
+    batch_long = BatchRecord(
+        batch_id="batch-long-65",
+        created_by="alice@example.org",
+        created_at=now,
+        release_id="r1",
+        status="queued",
+        counts=BatchCounts(),
+    )
+    long_gene = BatchGeneRecord(
+        batch_id="batch-long-65",
+        position=0,
+        input_symbol=long_65,
+        hugo_symbol=None,
+        status="not_found",
+        notes="entry exceeds 64 characters (truncated)",
+        updated_at=now,
+    )
+    await store.create_batch(batch_long, [long_gene])
+    stored_genes = await store.list_batch_genes("batch-long-65")
+    assert len(stored_genes) == 1
+    assert stored_genes[0].input_symbol == "A" * 64
+    assert stored_genes[0].status == "not_found"
+
+    # Blocker 3: Conditional writes with expected_token and lease checks
+    assert await store.acquire_batch_lock("batch-long-65", "token-owner", 10.0)
+    # Correct token succeeds
+    updated_counts = await store.update_batch_gene(
+        "batch-long-65", 0, "failed", error="err", updated_at=now, expected_token="token-owner"
+    )
+    assert updated_counts is not None and updated_counts.failed == 1
+
+    # Wrong token fails (no-op write)
+    stale_write = await store.update_batch_gene(
+        "batch-long-65", 0, "done", updated_at=now, expected_token="token-stale"
+    )
+    assert stale_write is None
+    # Stale status write fails
+    stale_status = await store.update_batch_status(
+        "batch-long-65", "done", expected_token="token-stale"
+    )
+    assert stale_status is None
+
+    # Blocker 2: Cancelled batch rejects worker writes
+    assert await store.cancel_batch("batch-long-65") is not None
+    cancelled_gene_write = await store.update_batch_gene(
+        "batch-long-65", 0, "done", updated_at=now, expected_token="token-owner"
+    )
+    assert cancelled_gene_write is None
+    cancelled_status_write = await store.update_batch_status(
+        "batch-long-65", "done", expected_token="token-owner"
+    )
+    assert cancelled_status_write is None
+
 
 async def test_in_memory_store_contract():
     store = InMemoryExpressionContextStore()
@@ -169,15 +294,86 @@ async def mysql_store():
     async with store._pool.acquire() as conn:
         async with conn.cursor() as cursor:
             await cursor.execute(f"DELETE FROM {TABLE_NAME}")
+            await cursor.execute(f"DELETE FROM {BATCH_GENES_TABLE}")
+            await cursor.execute(f"DELETE FROM {BATCHES_TABLE}")
     yield store
     async with store._pool.acquire() as conn:
         async with conn.cursor() as cursor:
+            await cursor.execute(f"DROP TABLE IF EXISTS {BATCH_GENES_TABLE}")
+            await cursor.execute(f"DROP TABLE IF EXISTS {BATCHES_TABLE}")
             await cursor.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
     await store.close()
 
 
 async def test_mysql_store_contract(mysql_store):
     await _exercise_store(mysql_store)
+
+
+async def test_mysql_ensure_schema_drops_duplicate_batch_genes_index(mysql_store):
+    async with mysql_store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"ALTER TABLE {BATCH_GENES_TABLE} ADD INDEX idx_expression_context_batch_genes_pos (batch_id, position)"
+            )
+            await cursor.execute(
+                f"SHOW INDEX FROM {BATCH_GENES_TABLE} WHERE Key_name = 'idx_expression_context_batch_genes_pos'"
+            )
+            assert await cursor.fetchone() is not None
+
+    await mysql_store.ensure_schema()
+    await mysql_store.ensure_schema()
+
+    async with mysql_store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SHOW INDEX FROM {BATCH_GENES_TABLE} WHERE Key_name = 'idx_expression_context_batch_genes_pos'"
+            )
+            assert await cursor.fetchone() is None
+
+
+async def test_ensure_schema_tolerates_missing_index_drop_race():
+    import pymysql
+
+    for err in (
+        pymysql.err.OperationalError(1091, "Can't DROP 'idx_expression_context_batch_genes_pos'; check that column/key exists"),
+        RuntimeError("index idx_expression_context_batch_genes_pos doesn't exist"),
+    ):
+        class FakeCursor:
+            def __init__(self):
+                self._last_sql = ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def execute(self, sql, args=None):
+                self._last_sql = sql
+                if "DROP INDEX idx_expression_context_batch_genes_pos" in sql:
+                    raise err
+
+            async def fetchone(self):
+                if "SHOW INDEX" in self._last_sql and "idx_expression_context_batch_genes_pos" in self._last_sql:
+                    return ("row",)
+                return ("row",)
+
+        class FakeConn:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def cursor(self):
+                return FakeCursor()
+
+        class FakePool:
+            def acquire(self):
+                return FakeConn()
+
+        store = MySQLExpressionContextStore(FakePool())
+        await store.ensure_schema()
 
 
 # ------------------------------------------------------------- bundle store

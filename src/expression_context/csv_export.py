@@ -85,6 +85,17 @@ GOLDEN_SET_COLUMNS: Tuple[str, ...] = (
     "Evidence-associated PMIDs",
 )
 
+CURATOR_SHEET_COLUMNS: Tuple[str, ...] = (
+    "Gene",
+    "Expression - TCGA cancer types",
+    "Expression - MSK-TARGET cancer types",
+    "CNAs - TCGA cancer types",
+    "SVs - TCGA cancer types",
+    "SVs - MSK-TARGET cancer types",
+    "Point mutations - TCGA cancer types",
+    "Notes",
+)
+
 ALLOWED_ALTERATION_CATEGORIES: Tuple[str, ...] = ALLOWED_ALTERATION_TYPES
 
 
@@ -454,3 +465,167 @@ def gene_view_csv_rows(
 def high_expression_types(pair: PairStatsView) -> List[str]:
     return [category for category, entry in (pair.stats.alteration_high_expression or {}).items()
             if entry.status == "associated_high_expression"]
+
+
+def curator_sheet_filename(gene_or_batch: str, release_id: str) -> str:
+    safe_target = _SAFE_FILENAME.sub("_", (gene_or_batch or "all").strip()) or "all"
+    safe_release = _SAFE_FILENAME.sub("_", (release_id or "unknown").strip()) or "unknown"
+    return f"expression-context_curator-sheet_{safe_target}_{safe_release}.csv"
+
+
+def format_curator_sheet_rows(
+    rows: Iterable[Sequence[str]], *, include_header: bool = False, include_bom: bool = False
+) -> str:
+    buf = io.StringIO()
+    if include_bom:
+        buf.write(UTF8_BOM)
+    writer = csv.writer(buf, lineterminator="\r\n")
+    if include_header:
+        writer.writerow(CURATOR_SHEET_COLUMNS)
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+def msk_target_cancer_types(view: Optional[GeneStatsView], category: str) -> List[str]:
+    """Placeholder for MSK-TARGET cancer types; returns [] until a data source is added."""
+    _ = (view, category)
+    return []
+
+
+def _pair_sheet_cancer_name(pair: PairStatsView, name_map: Mapping[str, str]) -> str:
+    code = pair.oncotree_code
+    if code not in name_map:
+        raise KeyError(f"No sheet cancer name for cohort code {code!r}")
+    return name_map[code]
+
+
+def _curator_expression_tcga(view: GeneStatsView, name_map: Mapping[str, str]) -> str:
+    surfaced = sorted(
+        (p for p in view.pairs if p.status == "surfaced"),
+        key=lambda p: p.oncotree_code,
+    )
+    items: List[str] = []
+    seen_names: set[str] = set()
+    for pair in surfaced:
+        name = _pair_sheet_cancer_name(pair, name_map)
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        label = pair.confidence_label or "Moderate"
+        items.append(f"{name} ({label})")
+    return "; ".join(items)
+
+
+def _curator_cna_tcga(view: GeneStatsView, name_map: Mapping[str, str]) -> str:
+    pairs = sorted(view.pairs, key=lambda p: p.oncotree_code)
+    items: List[str] = []
+    for pair in pairs:
+        if "Copy Number Alteration" not in enriched_alteration_types(pair):
+            continue
+        alterations = pair.alterations
+        cna = alterations.categories.get("Copy Number Alteration") if alterations else None
+        if cna is None:
+            continue
+        directions = [d for d in (cna.enriched_directions or []) if d in ("amp", "del")]
+        if not directions and cna.direction in ("amp", "del"):
+            directions = [cna.direction]
+        high_expr = set(high_expression_types(pair))
+        name = _pair_sheet_cancer_name(pair, name_map)
+        for direction in directions:
+            he_key = (
+                "Copy Number Alteration (amp)"
+                if direction == "amp"
+                else "Copy Number Alteration (deep del)"
+            )
+            suffix = " [high-expr]" if he_key in high_expr else ""
+            entry = f"{name} ({direction}){suffix}"
+            if entry not in items:
+                items.append(entry)
+    return "; ".join(items)
+
+
+def _curator_category_tcga(
+    view: GeneStatsView, category: str, name_map: Mapping[str, str]
+) -> str:
+    pairs = sorted(view.pairs, key=lambda p: p.oncotree_code)
+    items: List[str] = []
+    for pair in pairs:
+        if category not in enriched_alteration_types(pair):
+            continue
+        high_expr = set(high_expression_types(pair))
+        name = _pair_sheet_cancer_name(pair, name_map)
+        suffix = " [high-expr]" if category in high_expr else ""
+        entry = f"{name}{suffix}"
+        if entry not in items:
+            items.append(entry)
+    return "; ".join(items)
+
+
+def curator_sheet_row_from_view(
+    view: GeneStatsView,
+    *,
+    name_map: Optional[Mapping[str, str]] = None,
+    queried_as: Optional[str] = None,
+    extra_notes: Sequence[str] = (),
+    literature_failed: bool = False,
+) -> List[str]:
+    if name_map is None:
+        name_map = load_sheet_cancer_names()
+
+    exp_tcga = _curator_expression_tcga(view, name_map)
+    exp_msk = "; ".join(msk_target_cancer_types(view, "Expression"))
+    cna_tcga = _curator_cna_tcga(view, name_map)
+    sv_tcga = _curator_category_tcga(view, "Structural Variant", name_map)
+    sv_msk = "; ".join(msk_target_cancer_types(view, "Structural Variant"))
+    pm_tcga = _curator_category_tcga(view, "Point Mutation", name_map)
+
+    notes_parts: List[str] = []
+    raw_query = (queried_as if queried_as is not None else view.query or "").strip()
+    if raw_query and raw_query.upper() != view.hugo_symbol.upper():
+        notes_parts.append(f"queried as {raw_query}")
+    for note in extra_notes:
+        if note and note not in notes_parts:
+            notes_parts.append(note)
+
+    pending_count = sum(1 for p in view.pairs if p.status == "literature_pending")
+    if literature_failed:
+        notes_parts.append("literature failed")
+    if not view.has_stored_result:
+        if pending_count > 0:
+            notes_parts.append("literature not checked")
+    elif pending_count > 0:
+        notes_parts.append(f"literature pending for {pending_count} cancer types")
+
+    return [
+        guard_csv_text(view.hugo_symbol),
+        guard_csv_text(exp_tcga),
+        guard_csv_text(exp_msk),
+        guard_csv_text(cna_tcga),
+        guard_csv_text(sv_tcga),
+        guard_csv_text(sv_msk),
+        guard_csv_text(pm_tcga),
+        guard_csv_text("; ".join(notes_parts)),
+    ]
+
+
+def curator_sheet_not_found_row(
+    input_symbol: str,
+    *,
+    extra_notes: Sequence[str] = (),
+) -> List[str]:
+    notes_parts = ["not in expression data"]
+    for note in extra_notes:
+        if note and note not in notes_parts:
+            notes_parts.append(note)
+    return [
+        guard_csv_text(input_symbol),
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        guard_csv_text("; ".join(notes_parts)),
+    ]
+

@@ -75,6 +75,67 @@
     return `${API}/golden-set.csv?genes=${encoded}`;
   }
 
+  function curatorSheetExportURL(gene) {
+    const encoded = encodeURIComponent(String(gene || "").trim());
+    return `${API}/genes/${encoded}/curator-sheet.csv`;
+  }
+
+  function batchExportURL(batchId, includeExcluded = false) {
+    const encoded = encodeURIComponent(String(batchId || "").trim());
+    return includeExcluded
+      ? `${API}/batches/${encoded}/export.csv?include_excluded=true`
+      : `${API}/batches/${encoded}/export.csv`;
+  }
+
+  function batchGoldenSetExportURL(batchId) {
+    const encoded = encodeURIComponent(String(batchId || "").trim());
+    return `${API}/batches/${encoded}/golden-set.csv`;
+  }
+
+  function batchCuratorSheetExportURL(batchId) {
+    const encoded = encodeURIComponent(String(batchId || "").trim());
+    return `${API}/batches/${encoded}/curator-sheet.csv`;
+  }
+
+  function parseBatchText(text) {
+    const raw = String(text || "");
+    const tokens = raw.split(/[\r\n,\t]+/).map((s) => s.trim()).filter(Boolean);
+    const seen = new Set();
+    const unique = [];
+    let duplicates = 0;
+    for (const token of tokens) {
+      const upper = token.toUpperCase();
+      if (seen.has(upper)) {
+        duplicates += 1;
+      } else {
+        seen.add(upper);
+        unique.push(token);
+      }
+    }
+    return { tokens, unique, duplicates };
+  }
+
+  function parseUploadedFileColumn(text, filename = "") {
+    const lines = String(text || "").split(/\r?\n/);
+    const isDelimited = /\.(csv|tsv)$/i.test(String(filename || ""));
+    const genes = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let first = line;
+      if (isDelimited || line.includes("\t") || line.includes(",")) {
+        const delim = line.includes("\t") ? "\t" : ",";
+        first = line.split(delim)[0].trim().replace(/^["']|["']$/g, "").trim();
+      }
+      if (!first) continue;
+      if (i === 0 && /^(gene|genes|hugo_symbol|symbol|gene_symbol)$/i.test(first)) {
+        continue;
+      }
+      genes.push(first);
+    }
+    return genes;
+  }
+
   function friendlyError(status, gene) {
     if (status === 401) return "Your session has expired. Redirecting you to sign in…";
     if (status === 403) return "Your account isn't active yet. Please contact your AGCG administrator.";
@@ -85,19 +146,103 @@
     return "Couldn't load expression statistics. Check your connection and try again.";
   }
 
-  function createExpressionContextPage({ document: doc, window: win, fetch: fetchFn, wait, pollMs = 2000, maxPolls = 600 }) {
+  function createExpressionContextPage({ document: doc, window: win, fetch: fetchFn, wait, pollMs = 2000, maxPolls = 600, maxPageRetries = 5 }) {
     const el = {};
     for (const id of [
       "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-      "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
-      "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
+      "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-export-curator",
+      "ec-view-shown", "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
       "ec-dmt-index",
+      "ec-tab-single", "ec-tab-batch", "ec-single-mode", "ec-batch-mode", "ec-batch-form",
+      "ec-batch-input", "ec-batch-upload-btn", "ec-batch-upload", "ec-batch-preview", "ec-batch-submit",
+      "ec-batch-result", "ec-batch-title", "ec-batch-summary", "ec-batch-counts", "ec-batch-cancel",
+      "ec-batch-progress", "ec-batch-export-shown", "ec-batch-export-all",
+      "ec-batch-export", "ec-batch-export-golden", "ec-batch-export-curator", "ec-batch-genes",
     ]) {
       el[id] = doc.getElementById(id);
     }
     const sleep = wait || ((ms) => new Promise((done) => win.setTimeout(done, ms)));
     // showAll: the "All cancer types" view (excluded pairs listed, CSV include_excluded=true).
-    const state = { view: null, loading: false, jobRunning: false, expanded: new Set(), alterationExpanded: new Set(), showAll: false, rows: [] };
+    const state = {
+      view: null,
+      loading: false,
+      jobRunning: false,
+      expanded: new Set(),
+      alterationExpanded: new Set(),
+      showAll: false,
+      rows: [],
+      mode: "single",
+      batch: null,
+      batchShowAll: false,
+      batchExpanded: new Set(),
+      batchGeneViews: new Map(),
+      batchItemStatuses: new Map(),
+      batchPolling: false,
+      batchIncomplete: false,
+    };
+    let activeBatchGeneration = 0;
+    let activeBatchController = null;
+    let activeBatchTimer = null;
+    let activeBatchTimerResolve = null;
+    let currentBatchId = null;
+    let nextCancelToken = 0;
+    const pendingCancels = new Map();
+
+    function syncCancelButton() {
+      if (!el["ec-batch-cancel"]) return;
+      const shownId = currentBatchId || (state.batch && state.batch.batch_id) || null;
+      el["ec-batch-cancel"].disabled = Boolean(shownId && pendingCancels.has(shownId));
+    }
+
+    function cancelActiveBatchLoop() {
+      activeBatchGeneration += 1;
+      if (activeBatchController) {
+        try { activeBatchController.abort(); } catch (_) {}
+        activeBatchController = null;
+      }
+      if (activeBatchTimer !== null && typeof win.clearTimeout === "function") {
+        win.clearTimeout(activeBatchTimer);
+        activeBatchTimer = null;
+      }
+      if (activeBatchTimerResolve) {
+        const resolve = activeBatchTimerResolve;
+        activeBatchTimerResolve = null;
+        resolve();
+      }
+      state.batchPolling = false;
+    }
+
+    function sleepBatch(ms, generation, controller) {
+      if (generation !== activeBatchGeneration || (controller && controller.signal.aborted)) {
+        return Promise.resolve();
+      }
+      if (wait) {
+        return new Promise((done) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (activeBatchTimerResolve === finish) activeBatchTimerResolve = null;
+            done();
+          };
+          activeBatchTimerResolve = finish;
+          Promise.resolve(wait(ms, controller ? controller.signal : undefined)).then(finish, finish);
+        });
+      }
+      return new Promise((done) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          activeBatchTimer = null;
+          if (activeBatchTimerResolve === finish) activeBatchTimerResolve = null;
+          done();
+        };
+        activeBatchTimerResolve = finish;
+        const timerId = win.setTimeout(finish, ms);
+        if (!settled) activeBatchTimer = timerId;
+      });
+    }
 
     function show(node, visible) { if (node) node.classList.toggle("hidden", !visible); }
 
@@ -508,7 +653,16 @@
       const view = state.view;
       const link = el["ec-export"];
       const goldenLink = el["ec-export-golden"];
+      const curatorLink = el["ec-export-curator"];
       const symbol = view && (view.hugo_symbol || view.query) ? String(view.hugo_symbol || view.query).trim() : "";
+      if (curatorLink) {
+        if (symbol) {
+          curatorLink.setAttribute("href", curatorSheetExportURL(symbol));
+          show(curatorLink, true);
+        } else {
+          show(curatorLink, false);
+        }
+      }
       if (!symbol || !hasStoredResult(view)) {
         show(link, false);
         show(goldenLink, false);
@@ -730,8 +884,506 @@
     if (el["ec-view-shown"]) el["ec-view-shown"].addEventListener("click", () => setView(false));
     if (el["ec-view-all"]) el["ec-view-all"].addEventListener("click", () => setView(true));
 
+    function setMode(mode) {
+      state.mode = mode === "batch" ? "batch" : "single";
+      const isBatch = state.mode === "batch";
+      if (el["ec-tab-single"]) {
+        el["ec-tab-single"].setAttribute("aria-pressed", !isBatch ? "true" : "false");
+        el["ec-tab-single"].classList.toggle("active", !isBatch);
+      }
+      if (el["ec-tab-batch"]) {
+        el["ec-tab-batch"].setAttribute("aria-pressed", isBatch ? "true" : "false");
+        el["ec-tab-batch"].classList.toggle("active", isBatch);
+      }
+      show(el["ec-single-mode"], !isBatch);
+      show(el["ec-batch-mode"], isBatch);
+      if (isBatch) {
+        show(el["ec-result"], false);
+        if (state.batch) {
+          currentBatchId = state.batch.batch_id || currentBatchId;
+          show(el["ec-batch-result"], true);
+        }
+        syncCancelButton();
+      } else {
+        currentBatchId = null;
+        cancelActiveBatchLoop();
+        show(el["ec-batch-result"], false);
+        if (state.view) show(el["ec-result"], true);
+      }
+    }
+
+    function updateBatchPreview() {
+      if (!el["ec-batch-input"] || !el["ec-batch-preview"]) return;
+      const { unique, duplicates } = parseBatchText(el["ec-batch-input"].value);
+      const countText = `${unique.length} ${unique.length === 1 ? "gene" : "genes"}`;
+      const dupText = duplicates > 0 ? ` (${duplicates} ${duplicates === 1 ? "duplicate" : "duplicates"})` : "";
+      el["ec-batch-preview"].textContent = `${countText}${dupText}`;
+    }
+
+    function updateBatchExportLinks() {
+      const batch = state.batch;
+      if (!batch || !batch.batch_id) return;
+      for (const [id, pressed] of [
+        ["ec-batch-export-shown", !state.batchShowAll],
+        ["ec-batch-export-all", state.batchShowAll],
+      ]) {
+        const btn = el[id];
+        if (!btn) continue;
+        btn.setAttribute("aria-pressed", pressed ? "true" : "false");
+        btn.classList.toggle("active", pressed);
+      }
+      if (el["ec-batch-export"]) {
+        el["ec-batch-export"].setAttribute("href", batchExportURL(batch.batch_id, state.batchShowAll));
+      }
+      if (el["ec-batch-export-golden"]) {
+        el["ec-batch-export-golden"].setAttribute("href", batchGoldenSetExportURL(batch.batch_id));
+      }
+      if (el["ec-batch-export-curator"]) {
+        el["ec-batch-export-curator"].setAttribute("href", batchCuratorSheetExportURL(batch.batch_id));
+      }
+    }
+
+    function setBatchExportView(includeExcluded) {
+      state.batchShowAll = Boolean(includeExcluded);
+      updateBatchExportLinks();
+    }
+
+    function renderBatchGeneSummary(bodyNode, view, item) {
+      bodyNode.replaceChildren();
+      if (item.notes) {
+        bodyNode.appendChild(node("div", `Note: ${item.notes}`, "ec-neutral"));
+      }
+      if (item.error) {
+        bodyNode.appendChild(node("div", `Error: ${item.error}`, "ec-neutral"));
+      }
+      if (view && Array.isArray(view.pairs)) {
+        const shown = view.pairs.filter((p) => !isHidden(p));
+        if (shown.length) {
+          for (const pair of shown) {
+            const line = node("div", null, "ec-batch-pair-line");
+            const label = pair.cancer_type_name ? `${pair.cancer_type_name} (${pair.oncotree_code})` : pair.oncotree_code;
+            line.appendChild(node("span", `${label}: `, "ec-batch-pair-name"));
+            if (pair.status === "surfaced") {
+              line.appendChild(badge("Surfaced", "pass"));
+              if (["Strong", "Moderate"].includes(pair.confidence_label)) {
+                line.appendChild(badge(pair.confidence_label, pair.confidence_label.toLowerCase()));
+              }
+            } else if (pair.status === "literature_pending") {
+              line.appendChild(badge("Awaiting literature check", "warn"));
+            }
+            const alt = alterationsFor(pair);
+            const enriched = (alt && alt.alteration_types_enriched) || [];
+            for (const cat of enriched) {
+              const catObj = alt && alt.categories && alt.categories[cat];
+              line.appendChild(badge(alterationLabel(cat, catObj), "alteration"));
+            }
+            for (const [cat, entry] of Object.entries((pair.stats && pair.stats.alteration_high_expression) || {})) {
+              if (entry && entry.status === "associated_high_expression") {
+                line.appendChild(node("span", `${cat}: High-expression assoc.`, "ec-badge ec-high-expression"));
+              }
+            }
+            bodyNode.appendChild(line);
+          }
+        } else {
+          bodyNode.appendChild(node("div", "No shown cancer types.", "ec-neutral"));
+        }
+      } else if (item.status === "not_found") {
+        bodyNode.appendChild(node("div", "Not in expression data.", "ec-neutral"));
+      }
+      if (item.hugo_symbol) {
+        const links = node("div", null, "ec-batch-gene-links");
+        const singleLink = node("a", `Open ${item.hugo_symbol} in Single view`);
+        singleLink.setAttribute("href", `?gene=${encodeURIComponent(item.hugo_symbol)}`);
+        singleLink.addEventListener("click", (ev) => {
+          if (ev && typeof ev.preventDefault === "function") ev.preventDefault();
+          setMode("single");
+          if (el["ec-gene"]) el["ec-gene"].value = item.hugo_symbol;
+          lookup(item.hugo_symbol);
+        });
+        links.appendChild(singleLink);
+        bodyNode.appendChild(links);
+      }
+    }
+
+    async function loadBatchGeneSection(item, bodyNode) {
+      if (!item.hugo_symbol) {
+        renderBatchGeneSummary(bodyNode, null, item);
+        return;
+      }
+      if (state.batchGeneViews.has(item.hugo_symbol)) {
+        renderBatchGeneSummary(bodyNode, state.batchGeneViews.get(item.hugo_symbol), item);
+        return;
+      }
+      bodyNode.textContent = `Loading ${item.hugo_symbol}…`;
+      const { status, body } = await getJson(`${API}/stats/${encodeURIComponent(item.hugo_symbol)}`);
+      if (status === 200 && body) {
+        state.batchGeneViews.set(item.hugo_symbol, body);
+        renderBatchGeneSummary(bodyNode, body, item);
+      } else {
+        renderBatchGeneSummary(bodyNode, null, item);
+      }
+    }
+
+    function batchGeneBadge(status) {
+      if (status === "done") return badge("Done", "pass");
+      if (status === "skipped_fresh") return badge("Reused fresh", "info");
+      if (status === "skipped_no_stats") return badge("No stats pass", "neutral");
+      if (status === "running") return badge("Running", "warn");
+      if (status === "queued") return badge("Queued", "neutral");
+      if (status === "not_found") return badge("Not found", "fail");
+      return badge("Failed", "fail");
+    }
+
+    const VALID_BATCH_GENE_STATUSES = new Set([
+      "queued",
+      "skipped_no_stats",
+      "skipped_fresh",
+      "running",
+      "done",
+      "failed",
+      "not_found",
+    ]);
+
+    function isValidBatchGene(g) {
+      if (!g || typeof g !== "object" || Array.isArray(g)) return false;
+      if (Object.prototype.toString.call(g) !== "[object Object]") return false;
+      if (typeof g.position !== "number" || !Number.isFinite(g.position)) return false;
+      if (typeof g.input_symbol !== "string") return false;
+      if (typeof g.status !== "string" || !VALID_BATCH_GENE_STATUSES.has(g.status)) return false;
+      if (g.hugo_symbol !== null && typeof g.hugo_symbol !== "string") return false;
+      return true;
+    }
+
+    function isValidGeneList(genes) {
+      return Array.isArray(genes) && genes.every(isValidBatchGene);
+    }
+
+    function renderBatch(batch) {
+      const counts = batch.counts || {};
+      const expectedTotal = typeof counts.total === "number" ? counts.total : null;
+      if (!isValidGeneList(batch.genes) || (expectedTotal !== null && batch.genes.length !== expectedTotal)) {
+        state.batchIncomplete = true;
+        return;
+      }
+      const genesList = batch.genes;
+      state.batch = batch;
+      currentBatchId = batch.batch_id || currentBatchId;
+      const total = expectedTotal !== null ? expectedTotal : (genesList.length || 0);
+      const finished = (counts.done || 0) + (counts.skipped_no_stats || 0) +
+        (counts.skipped_fresh || 0) + (counts.failed || 0) + (counts.not_found || 0);
+      if (el["ec-batch-title"]) {
+        el["ec-batch-title"].textContent = `Batch ${batch.batch_id}`;
+      }
+      if (el["ec-batch-summary"]) {
+        el["ec-batch-summary"].textContent =
+          `Status: ${batch.status} · ${finished}/${total} processed`;
+      }
+      if (el["ec-batch-counts"]) {
+        el["ec-batch-counts"].textContent =
+          `${counts.done || 0} done · ${counts.skipped_fresh || 0} reused · ` +
+          `${counts.skipped_no_stats || 0} no stats · ${counts.queued || 0} queued · ` +
+          `${counts.running || 0} running · ${counts.failed || 0} failed · ` +
+          `${counts.not_found || 0} not found`;
+      }
+      if (el["ec-batch-progress"]) {
+        el["ec-batch-progress"].setAttribute("max", String(Math.max(1, total)));
+        el["ec-batch-progress"].setAttribute("value", String(finished));
+      }
+      const running = batch.status === "queued" || batch.status === "running";
+      show(el["ec-batch-cancel"], running);
+      syncCancelButton();
+      updateBatchExportLinks();
+
+      // Invalidate cached per-gene views when a gene's status changes
+      for (const item of batch.genes || []) {
+        const prev = state.batchItemStatuses.get(item.position);
+        if (prev !== undefined && prev !== item.status) {
+          if (item.hugo_symbol) {
+            state.batchGeneViews.delete(item.hugo_symbol);
+          }
+        }
+        state.batchItemStatuses.set(item.position, item.status);
+      }
+
+      if (el["ec-batch-genes"]) {
+        el["ec-batch-genes"].replaceChildren();
+        for (const item of batch.genes || []) {
+          const key = `${item.position}:${item.hugo_symbol || item.input_symbol}`;
+          const section = node("details", null, "ec-batch-gene-section");
+          if (state.batchExpanded.has(key)) section.open = true;
+          const summary = node("summary");
+          const label = item.hugo_symbol && item.input_symbol.trim().toUpperCase() !== item.hugo_symbol
+            ? `${item.hugo_symbol} (from ${item.input_symbol.trim()})`
+            : (item.hugo_symbol || item.input_symbol);
+          summary.appendChild(node("span", label, "ec-batch-gene-title"));
+          summary.appendChild(batchGeneBadge(item.status));
+          const bodyNode = node("div", null, "ec-batch-gene-body");
+          section.appendChild(summary);
+          section.appendChild(bodyNode);
+          if (state.batchExpanded.has(key)) {
+            loadBatchGeneSection(item, bodyNode);
+          } else {
+            renderBatchGeneSummary(bodyNode, state.batchGeneViews.get(item.hugo_symbol) || null, item);
+          }
+          section.addEventListener("toggle", () => {
+            if (section.open) {
+              state.batchExpanded.add(key);
+              loadBatchGeneSection(item, bodyNode);
+            } else {
+              state.batchExpanded.delete(key);
+            }
+          });
+          el["ec-batch-genes"].appendChild(section);
+        }
+      }
+      show(el["ec-batch-result"], true);
+    }
+
+    async function loadBatch(batchId, { preserveError = false } = {}) {
+      const id = String(batchId || "").trim();
+      if (!id) return;
+      currentBatchId = id;
+      cancelActiveBatchLoop();
+      const generation = activeBatchGeneration;
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      activeBatchController = controller;
+      state.batchPolling = true;
+      const isStale = () => generation !== activeBatchGeneration || Boolean(controller && controller.signal.aborted);
+      const fetchOpts = controller ? { signal: controller.signal } : undefined;
+
+      if (!preserveError) setError("");
+      setMode("batch");
+      state.batchGeneViews.clear();
+      state.batchItemStatuses.clear();
+      state.batchIncomplete = false;
+      if (win.history && typeof win.history.replaceState === "function") {
+        win.history.replaceState(null, "", `?batch=${encodeURIComponent(id)}`);
+      }
+      let pageFailures = 0;
+      let retryBannerShown = false;
+      try {
+        for (let poll = 0; poll < maxPolls; poll += 1) {
+          if (isStale()) return;
+          const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}`, fetchOpts);
+          if (isStale()) return;
+          if (status === 401) {
+            redirectToLogin();
+            return;
+          }
+          if (status !== 200 || !body) {
+            setError(status === 404 ? "Batch not found." : friendlyError(status, id));
+            return;
+          }
+
+          let incomplete = false;
+          let allGenes = null;
+          const expectedTotal = body.counts && typeof body.counts.total === "number"
+            ? body.counts.total
+            : null;
+
+          if (!isValidGeneList(body.genes) || expectedTotal === null) {
+            incomplete = true;
+          } else {
+            allGenes = [...body.genes];
+            while (allGenes.length < expectedTotal) {
+              if (isStale()) return;
+              const nextRes = await getJson(
+                `${API}/batches/${encodeURIComponent(id)}?offset=${allGenes.length}&limit=200`,
+                fetchOpts
+              );
+              if (isStale()) return;
+              if (nextRes.status === 401) {
+                redirectToLogin();
+                return;
+              }
+              if (
+                nextRes.status !== 200 ||
+                !nextRes.body ||
+                !isValidGeneList(nextRes.body.genes) ||
+                nextRes.body.genes.length === 0
+              ) {
+                incomplete = true;
+                break;
+              }
+              allGenes = allGenes.concat(nextRes.body.genes);
+            }
+            if (!incomplete && allGenes.length !== expectedTotal) {
+              incomplete = true;
+            }
+          }
+
+          if (isStale()) return;
+          if (incomplete) {
+            state.batchIncomplete = true;
+            pageFailures += 1;
+            if (poll + 1 < maxPolls && pageFailures <= maxPageRetries) {
+              retryBannerShown = true;
+              setError("Couldn't load all genes; retrying");
+              const backoff = Math.min(30000, pollMs * (2 ** (pageFailures - 1)));
+              await sleepBatch(backoff, generation, controller);
+              if (isStale()) return;
+              continue;
+            }
+            setError("Couldn't load all genes. Please reload to try again.");
+            return;
+          }
+
+          pageFailures = 0;
+          state.batchIncomplete = false;
+          if (retryBannerShown || !preserveError) {
+            setError("");
+            retryBannerShown = false;
+          }
+          body.genes = allGenes;
+          renderBatch(body);
+          if (!["queued", "running"].includes(body.status)) {
+            return;
+          }
+          await sleepBatch(pollMs, generation, controller);
+          if (isStale()) return;
+        }
+      } finally {
+        if (generation === activeBatchGeneration) {
+          state.batchPolling = false;
+          if (activeBatchController === controller) activeBatchController = null;
+        }
+      }
+    }
+
+    async function submitBatch(rawText) {
+      const text = rawText !== undefined ? rawText : (el["ec-batch-input"] ? el["ec-batch-input"].value : "");
+      const { tokens } = parseBatchText(text);
+      setError("");
+      if (!tokens.length) {
+        setError("Enter at least one gene symbol.");
+        return;
+      }
+      if (tokens.length > 2000) {
+        setError("A batch can include at most 2000 gene entries.");
+        return;
+      }
+      const submitGeneration = activeBatchGeneration;
+      const submitBatchId = currentBatchId;
+      const submitMode = state.mode;
+      if (el["ec-batch-submit"]) el["ec-batch-submit"].disabled = true;
+      try {
+        const { status, body } = await getJson(`${API}/batches`, {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ genes: tokens }),
+        });
+        if (
+          submitGeneration !== activeBatchGeneration ||
+          currentBatchId !== submitBatchId ||
+          state.mode !== submitMode
+        ) {
+          return;
+        }
+        if (status === 401) {
+          redirectToLogin();
+          return;
+        }
+        if (status !== 202 || !body || !body.batch_id) {
+          setError(friendlyError(status, ""));
+          return;
+        }
+        await loadBatch(body.batch_id);
+      } finally {
+        if (el["ec-batch-submit"]) el["ec-batch-submit"].disabled = false;
+      }
+    }
+
+    async function cancelCurrentBatch() {
+      if (!state.batch || !state.batch.batch_id) return;
+      const id = state.batch.batch_id;
+      if (pendingCancels.has(id)) return;
+      cancelActiveBatchLoop();
+      const cancelGeneration = activeBatchGeneration;
+      const isStillCurrentCancel = () => (
+        cancelGeneration === activeBatchGeneration &&
+        state.mode === "batch" &&
+        Boolean(state.batch && state.batch.batch_id === id)
+      );
+      nextCancelToken += 1;
+      const token = nextCancelToken;
+      pendingCancels.set(id, token);
+      syncCancelButton();
+
+      let cancelResult;
+      try {
+        cancelResult = await getJson(`${API}/batches/${encodeURIComponent(id)}/cancel`, {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+      } finally {
+        if (pendingCancels.get(id) === token) {
+          pendingCancels.delete(id);
+        }
+        if (state.mode === "batch" && currentBatchId === id) {
+          syncCancelButton();
+        }
+      }
+
+      if (!isStillCurrentCancel()) return;
+      const { status, body } = cancelResult;
+      if (status === 401) {
+        redirectToLogin();
+        return;
+      }
+      if (status === 200 && body) {
+        if (
+          body.counts && typeof body.counts.total === "number" &&
+          isValidGeneList(body.genes) && body.genes.length === body.counts.total
+        ) {
+          state.batchIncomplete = false;
+          setError("");
+          renderBatch(body);
+        } else {
+          await loadBatch(id);
+        }
+      } else {
+        setError(friendlyError(status, id));
+        await loadBatch(id, { preserveError: true });
+      }
+    }
+
+    if (el["ec-tab-single"]) el["ec-tab-single"].addEventListener("click", () => setMode("single"));
+    if (el["ec-tab-batch"]) el["ec-tab-batch"].addEventListener("click", () => setMode("batch"));
+    if (el["ec-batch-input"]) el["ec-batch-input"].addEventListener("input", () => updateBatchPreview());
+    if (el["ec-batch-upload-btn"] && el["ec-batch-upload"]) {
+      el["ec-batch-upload-btn"].addEventListener("click", () => {
+        if (typeof el["ec-batch-upload"].click === "function") el["ec-batch-upload"].click();
+      });
+      el["ec-batch-upload"].addEventListener("change", async (event) => {
+        const file = (event && event.target && event.target.files && event.target.files[0]) ||
+          (el["ec-batch-upload"].files && el["ec-batch-upload"].files[0]);
+        if (!file) return;
+        const text = typeof file.text === "function" ? await file.text() : String(file.content || "");
+        const genes = parseUploadedFileColumn(text, file.name || "");
+        if (el["ec-batch-input"]) {
+          el["ec-batch-input"].value = genes.join("\n");
+          updateBatchPreview();
+        }
+      });
+    }
+    if (el["ec-batch-form"]) {
+      el["ec-batch-form"].addEventListener("submit", (event) => {
+        if (event && typeof event.preventDefault === "function") event.preventDefault();
+        return submitBatch();
+      });
+    }
+    if (el["ec-batch-cancel"]) el["ec-batch-cancel"].addEventListener("click", () => cancelCurrentBatch());
+    if (el["ec-batch-export-shown"]) el["ec-batch-export-shown"].addEventListener("click", () => setBatchExportView(false));
+    if (el["ec-batch-export-all"]) el["ec-batch-export-all"].addEventListener("click", () => setBatchExportView(true));
+
     async function init() {
       const params = new URLSearchParams(win.location.search || "");
+      const batchId = params.get("batch");
+      if (batchId) {
+        await loadBatch(batchId);
+        return;
+      }
       const gene = params.get("gene");
       if (gene) {
         el["ec-gene"].value = gene;
@@ -739,11 +1391,37 @@
       }
     }
 
-    return { init, lookup, runLiteratureCheck, setView, state };
+    return {
+      init,
+      lookup,
+      runLiteratureCheck,
+      setView,
+      setMode,
+      submitBatch,
+      loadBatch,
+      cancelCurrentBatch,
+      setBatchExportView,
+      updateBatchPreview,
+      state,
+    };
   }
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL, goldenSetExportURL };
+    module.exports = {
+      createExpressionContextPage,
+      formatNumber,
+      formatQ,
+      pmidUrl,
+      expressionURL,
+      exportURL,
+      goldenSetExportURL,
+      curatorSheetExportURL,
+      batchExportURL,
+      batchGoldenSetExportURL,
+      batchCuratorSheetExportURL,
+      parseBatchText,
+      parseUploadedFileColumn,
+    };
   } else {
     createExpressionContextPage({ document: root.document, window: root, fetch: root.fetch.bind(root) }).init();
   }

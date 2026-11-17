@@ -7,6 +7,8 @@ const fs = require("fs");
 const path = require("path");
 const {
   createExpressionContextPage, formatNumber, formatQ, pmidUrl, expressionURL, exportURL, goldenSetExportURL,
+  curatorSheetExportURL, batchExportURL, batchGoldenSetExportURL, batchCuratorSheetExportURL,
+  parseBatchText, parseUploadedFileColumn,
 } = require("../../src/expression_context/static/expression-context.js");
 
 const HTML_PATH = path.join(__dirname, "../../src/expression_context/static/expression-context.html");
@@ -44,9 +46,14 @@ class Element {
 
 const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
-  "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
-  "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
+  "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-export-curator",
+  "ec-view-shown", "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
   "ec-dmt-index",
+  "ec-tab-single", "ec-tab-batch", "ec-single-mode", "ec-batch-mode", "ec-batch-form",
+  "ec-batch-input", "ec-batch-upload-btn", "ec-batch-upload", "ec-batch-preview", "ec-batch-submit",
+  "ec-batch-result", "ec-batch-title", "ec-batch-summary", "ec-batch-counts", "ec-batch-cancel",
+  "ec-batch-progress", "ec-batch-export-shown", "ec-batch-export-all",
+  "ec-batch-export", "ec-batch-export-golden", "ec-batch-export-curator", "ec-batch-genes",
 ];
 
 const response = (body, status = 200) => ({ status, json: async () => body });
@@ -76,17 +83,27 @@ function plotParams(href) {
   };
 }
 
-function env(routes, { search = "" } = {}) {
+function env(routes, { search = "", wait = async () => {}, pollMs = 2000, maxPageRetries = 5 } = {}) {
   const nodes = Object.fromEntries(IDS.map((id) => [id, new Element("div")]));
   nodes["ec-error"].classList.toggle("hidden", true);
   nodes["ec-result"].classList.toggle("hidden", true);
   nodes["ec-run"].classList.toggle("hidden", true);
   nodes["ec-export"].classList.toggle("hidden", true);
   nodes["ec-export-golden"].classList.toggle("hidden", true);
+  nodes["ec-export-curator"].classList.toggle("hidden", true);
   nodes["ec-table-empty"].classList.toggle("hidden", true);
   nodes["ec-view-shown"].classList.toggle("active", true);
   nodes["ec-view-shown"].setAttribute("aria-pressed", "true");
   nodes["ec-view-all"].setAttribute("aria-pressed", "false");
+  nodes["ec-tab-single"].classList.toggle("active", true);
+  nodes["ec-tab-single"].setAttribute("aria-pressed", "true");
+  nodes["ec-tab-batch"].setAttribute("aria-pressed", "false");
+  nodes["ec-batch-mode"].classList.toggle("hidden", true);
+  nodes["ec-batch-result"].classList.toggle("hidden", true);
+  nodes["ec-batch-cancel"].classList.toggle("hidden", true);
+  nodes["ec-batch-export-shown"].classList.toggle("active", true);
+  nodes["ec-batch-export-shown"].setAttribute("aria-pressed", "true");
+  nodes["ec-batch-export-all"].setAttribute("aria-pressed", "false");
   const document = { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
   const calls = [];
   const replaced = [];
@@ -96,12 +113,12 @@ function env(routes, { search = "" } = {}) {
     setTimeout: (fn) => fn(),
   };
   const fetch = async (url, options = {}) => {
-    calls.push({ url, method: options.method || "GET", body: options.body });
+    calls.push({ url, method: options.method || "GET", body: options.body, signal: options.signal });
     const handler = routes[`${options.method || "GET"} ${url}`];
     if (!handler) throw new Error(`unexpected request ${options.method || "GET"} ${url}`);
-    return typeof handler === "function" ? handler() : handler;
+    return typeof handler === "function" ? handler(url, options) : handler;
   };
-  const page = createExpressionContextPage({ document, window, fetch, wait: async () => {} });
+  const page = createExpressionContextPage({ document, window, fetch, wait, pollMs, maxPageRetries });
   return { nodes, page, calls, window, replaced };
 }
 
@@ -1251,6 +1268,1116 @@ test("high-expression association stays separate from clickable frequency badges
   assert.ok(row.text.includes("anecdotal (1–2 tumors)"));
   assert.ok(detailRows(nodes)[0].text.includes("11/507 altered/profiled"));
   assert.ok(detailRows(nodes)[0].text.includes("<script>unsafe</script>"));
+});
+
+test("single view curator sheet row link and batch tab parsing, upload, submit, polling, grouped sections, download URLs, and ?batch= reload", async () => {
+  assert.strictEqual(curatorSheetExportURL("A/B"), "/v1/expression-context/genes/A%2FB/curator-sheet.csv");
+  assert.strictEqual(batchExportURL("b/1", false), "/v1/expression-context/batches/b%2F1/export.csv");
+  assert.strictEqual(batchExportURL("b/1", true), "/v1/expression-context/batches/b%2F1/export.csv?include_excluded=true");
+  assert.strictEqual(batchGoldenSetExportURL("b/1"), "/v1/expression-context/batches/b%2F1/golden-set.csv");
+  assert.strictEqual(batchCuratorSheetExportURL("b/1"), "/v1/expression-context/batches/b%2F1/curator-sheet.csv");
+
+  const parsed = parseBatchText("ERBB2, egfr\nerbb2\tKRAS");
+  assert.deepStrictEqual(parsed.unique, ["ERBB2", "egfr", "KRAS"]);
+  assert.strictEqual(parsed.duplicates, 1);
+
+  const uploaded = parseUploadedFileColumn("Gene,Notes\nERBB2,amp\nEGFR,mut\n", "genes.csv");
+  assert.deepStrictEqual(uploaded, ["ERBB2", "EGFR"]);
+
+  const vErbb2 = view({ has_stored_result: true });
+  vErbb2.pairs[0].confidence_label = "Strong";
+  vErbb2.pairs[0].stats.alterations = {
+    alteration_types_enriched: ["Copy Number Alteration"],
+    categories: { "Copy Number Alteration": { status: "enriched", enriched_directions: ["amp"] } },
+  };
+  let pollCount = 0;
+  const batchRunning = {
+    batch_id: "batch-123",
+    status: "running",
+    release_id: BUNDLE.release_id,
+    counts: { total: 2, queued: 1, running: 0, done: 0, skipped_fresh: 0, skipped_no_stats: 0, failed: 0, not_found: 1 },
+    genes: [
+      { position: 0, input_symbol: "HER2", hugo_symbol: "ERBB2", status: "running", error: null, notes: "duplicate of row 1", updated_at: "2026-11-17T00:00:00Z" },
+      { position: 1, input_symbol: "NOPE", hugo_symbol: null, status: "not_found", error: "not in expression data", notes: null, updated_at: "2026-11-17T00:00:00Z" },
+    ],
+  };
+  const batchDone = {
+    ...batchRunning,
+    status: "done",
+    counts: { total: 2, queued: 0, running: 0, done: 1, skipped_fresh: 0, skipped_no_stats: 0, failed: 0, not_found: 1 },
+    genes: [
+      { ...batchRunning.genes[0], status: "done" },
+      batchRunning.genes[1],
+    ],
+  };
+
+  const { nodes, page, calls, replaced } = env({
+    "GET /v1/expression-context/stats/ERBB2": response(vErbb2),
+    "POST /v1/expression-context/batches": response({ batch_id: "batch-123", status: "queued", status_url: "/v1/expression-context/batches/batch-123" }, 202),
+    "GET /v1/expression-context/batches/batch-123": () => {
+      pollCount += 1;
+      return response(pollCount === 1 ? batchRunning : batchDone);
+    },
+  });
+
+  // Single view shows curator sheet row download
+  await page.lookup("ERBB2");
+  assert.ok(!nodes["ec-export-curator"].hidden);
+  assert.strictEqual(nodes["ec-export-curator"].getAttribute("href"), "/v1/expression-context/genes/ERBB2/curator-sheet.csv");
+
+  // Switch to Batch tab
+  nodes["ec-tab-batch"].fire("click");
+  assert.ok(nodes["ec-single-mode"].hidden);
+  assert.ok(!nodes["ec-batch-mode"].hidden);
+  assert.strictEqual(nodes["ec-tab-batch"].getAttribute("aria-pressed"), "true");
+
+  // Input + preview count + duplicates
+  nodes["ec-batch-input"].value = "HER2, HER2\nNOPE";
+  nodes["ec-batch-input"].fire("input");
+  assert.strictEqual(nodes["ec-batch-preview"].textContent, "2 genes (1 duplicate)");
+
+  // File upload simulation
+  await nodes["ec-batch-upload"].fire("change", {
+    target: { files: [{ name: "list.csv", text: async () => "Gene,Other\nHER2,1\nHER2,2\nNOPE,3" }] },
+  });
+  assert.strictEqual(nodes["ec-batch-preview"].textContent, "2 genes (1 duplicate)");
+
+  // Submit batch -> polls running then done -> renders grouped sections and download URLs
+  await nodes["ec-batch-form"].fire("submit", { preventDefault() {} });
+  assert.ok(replaced.includes("?batch=batch-123"));
+  assert.ok(!nodes["ec-batch-result"].hidden);
+  assert.strictEqual(nodes["ec-batch-summary"].textContent, "Status: done · 2/2 processed");
+  assert.strictEqual(nodes["ec-batch-progress"].getAttribute("value"), "2");
+  assert.strictEqual(nodes["ec-batch-progress"].getAttribute("max"), "2");
+  assert.strictEqual(nodes["ec-batch-export"].getAttribute("href"), "/v1/expression-context/batches/batch-123/export.csv");
+  assert.strictEqual(nodes["ec-batch-export-golden"].getAttribute("href"), "/v1/expression-context/batches/batch-123/golden-set.csv");
+  assert.strictEqual(nodes["ec-batch-export-curator"].getAttribute("href"), "/v1/expression-context/batches/batch-123/curator-sheet.csv");
+
+  // Toggle include excluded on batch per-pair export
+  nodes["ec-batch-export-all"].fire("click");
+  assert.strictEqual(nodes["ec-batch-export"].getAttribute("href"), "/v1/expression-context/batches/batch-123/export.csv?include_excluded=true");
+
+  // Grouped collapsible sections
+  const sections = nodes["ec-batch-genes"].children;
+  assert.strictEqual(sections.length, 2);
+  assert.ok(sections[0].children[0].text.includes("ERBB2 (from HER2)"));
+  assert.ok(sections[1].children[0].text.includes("NOPE"));
+
+  // Expand first gene section via native toggle -> loads stats summary with Strong/Moderate and alteration badges
+  sections[0].open = true;
+  sections[0].fire("toggle");
+  await new Promise((r) => setTimeout(r, 0));
+  assert.ok(sections[0].text.includes("Breast Invasive Carcinoma (BRCA)"));
+  assert.ok(sections[0].text.includes("Strong"));
+  assert.ok(sections[0].text.includes("Copy Number Alteration (amp)"));
+  assert.ok(sections[0].text.includes("Open ERBB2 in Single view"));
+
+  // Reload with ?batch=batch-123
+  const reloadEnv = env({
+    "GET /v1/expression-context/batches/batch-123": response(batchDone),
+  }, { search: "?batch=batch-123" });
+  await reloadEnv.page.init();
+  assert.strictEqual(reloadEnv.page.state.mode, "batch");
+  assert.ok(!reloadEnv.nodes["ec-batch-result"].hidden);
+  assert.strictEqual(reloadEnv.nodes["ec-batch-title"].textContent, "Batch batch-123");
+});
+
+test("batch with >200 genes pages all genes and listed count matches total count", async () => {
+  const TOTAL = 250;
+  const allGenes = Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status: "done",
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const page1 = {
+    batch_id: "batch-250",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(0, 200),
+  };
+  const page2 = {
+    batch_id: "batch-250",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(200, 250),
+  };
+  const { page, nodes } = env({
+    "GET /v1/expression-context/batches/batch-250": response(page1),
+    "GET /v1/expression-context/batches/batch-250?offset=200&limit=200": response(page2),
+  });
+  await page.loadBatch("batch-250");
+  assert.strictEqual(nodes["ec-batch-counts"].textContent, "250 done · 0 reused · 0 no stats · 0 queued · 0 running · 0 failed · 0 not found");
+  const renderedSections = nodes["ec-batch-genes"].children;
+  assert.strictEqual(renderedSections.length, 250);
+  assert.ok(renderedSections[0].children[0].text.includes("GENE1"));
+  assert.ok(renderedSections[249].children[0].text.includes("GENE250"));
+});
+
+test("page 2 returns 500 -> shows error banner, retries with backoff, then renders full list", async () => {
+  const TOTAL = 250;
+  const allGenes = Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status: "done",
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const page1 = {
+    batch_id: "batch-retry",
+    status: "running",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: 200, queued: 50, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(0, 200),
+  };
+  const page1Done = {
+    ...page1,
+    status: "done",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+  };
+  const page2 = {
+    ...page1Done,
+    genes: allGenes.slice(200, 250),
+  };
+
+  let p1Calls = 0;
+  let p2Calls = 0;
+  const delays = [];
+  const snapshotsDuringRetry = [];
+
+  let ref;
+  ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-retry": () => {
+        p1Calls += 1;
+        return response(p1Calls >= 3 ? page1Done : page1);
+      },
+      "GET /v1/expression-context/batches/batch-retry?offset=200&limit=200": () => {
+        p2Calls += 1;
+        if (p2Calls <= 2) return response({ detail: "internal error" }, 500);
+        return response(page2);
+      },
+    },
+    {
+      pollMs: 1000,
+      wait: async (ms) => {
+        delays.push(ms);
+        snapshotsDuringRetry.push({
+          errorHidden: ref.nodes["ec-error"].hidden,
+          errorText: ref.nodes["ec-error"].textContent,
+          renderedLen: ref.nodes["ec-batch-genes"].children.length,
+          incomplete: ref.page.state.batchIncomplete,
+        });
+      },
+    }
+  );
+
+  await ref.page.loadBatch("batch-retry");
+
+  // During attempts 1 & 2, banner was shown, incomplete was true, partial list was never rendered, and backoff grew
+  assert.strictEqual(p2Calls, 3);
+  assert.strictEqual(delays.length, 2);
+  assert.strictEqual(delays[0], 1000);
+  assert.strictEqual(delays[1], 2000);
+  for (const snap of snapshotsDuringRetry) {
+    assert.strictEqual(snap.errorHidden, false);
+    assert.ok(snap.errorText.includes("Couldn't load all genes; retrying"));
+    assert.strictEqual(snap.renderedLen, 0);
+    assert.strictEqual(snap.incomplete, true);
+  }
+
+  // After retry succeeds, error clears and full 250 genes render
+  assert.strictEqual(ref.nodes["ec-error"].hidden, true);
+  assert.strictEqual(ref.nodes["ec-error"].textContent, "");
+  assert.strictEqual(ref.page.state.batchIncomplete, false);
+  assert.strictEqual(ref.nodes["ec-batch-genes"].children.length, 250);
+  assert.ok(ref.nodes["ec-batch-genes"].children[249].children[0].text.includes("GENE250"));
+});
+
+test("done batch with failed page 2 still retries and renders full list", async () => {
+  const TOTAL = 250;
+  const allGenes = Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status: "done",
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const page1Done = {
+    batch_id: "batch-done-retry",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(0, 200),
+  };
+  const page2Done = {
+    ...page1Done,
+    genes: allGenes.slice(200, 250),
+  };
+
+  let p2Calls = 0;
+  let sawBanner = false;
+  let ref;
+  ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-done-retry": response(page1Done),
+      "GET /v1/expression-context/batches/batch-done-retry?offset=200&limit=200": () => {
+        p2Calls += 1;
+        if (p2Calls === 1) return response({ detail: "upstream 502" }, 502);
+        return response(page2Done);
+      },
+    },
+    {
+      wait: async () => {
+        if (!ref.nodes["ec-error"].hidden && ref.nodes["ec-error"].textContent.includes("Couldn't load all genes; retrying")) {
+          sawBanner = true;
+        }
+      },
+    }
+  );
+
+  await ref.page.loadBatch("batch-done-retry");
+  assert.strictEqual(p2Calls, 2);
+  assert.strictEqual(sawBanner, true);
+  assert.strictEqual(ref.nodes["ec-error"].hidden, true);
+  assert.strictEqual(ref.page.state.batchIncomplete, false);
+  assert.strictEqual(ref.nodes["ec-batch-genes"].children.length, 250);
+});
+
+test("malformed or empty-but-short page leaves batch incomplete without partial list", async () => {
+  const TOTAL = 250;
+  const allGenes = Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status: "done",
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const page1 = {
+    batch_id: "batch-malformed",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(0, 200),
+  };
+
+  // Case A: malformed page 2 (genes is not an array)
+  const malEnv = env(
+    {
+      "GET /v1/expression-context/batches/batch-malformed": response(page1),
+      "GET /v1/expression-context/batches/batch-malformed?offset=200&limit=200": response({ batch_id: "batch-malformed", genes: "not-an-array" }),
+    },
+    { maxPageRetries: 2 }
+  );
+  await malEnv.page.loadBatch("batch-malformed");
+  assert.strictEqual(malEnv.page.state.batchIncomplete, true);
+  assert.strictEqual(malEnv.nodes["ec-error"].hidden, false);
+  assert.ok(malEnv.nodes["ec-error"].textContent.includes("Couldn't load all genes"));
+  assert.strictEqual(malEnv.nodes["ec-batch-genes"].children.length, 0);
+  assert.strictEqual(malEnv.nodes["ec-batch-result"].hidden, true);
+
+  // Case B: empty-but-short page 2 (genes: [] while total=250)
+  const shortEnv = env(
+    {
+      "GET /v1/expression-context/batches/batch-malformed": response(page1),
+      "GET /v1/expression-context/batches/batch-malformed?offset=200&limit=200": response({ ...page1, genes: [] }),
+    },
+    { maxPageRetries: 2 }
+  );
+  await shortEnv.page.loadBatch("batch-malformed");
+  assert.strictEqual(shortEnv.page.state.batchIncomplete, true);
+  assert.strictEqual(shortEnv.nodes["ec-error"].hidden, false);
+  assert.ok(shortEnv.nodes["ec-error"].textContent.includes("Couldn't load all genes"));
+  assert.strictEqual(shortEnv.nodes["ec-batch-genes"].children.length, 0);
+  assert.strictEqual(shortEnv.nodes["ec-batch-result"].hidden, true);
+});
+
+test("cancel on >200-gene batch while polling -> single loop and repeated clicks don't multiply loops", async () => {
+  const TOTAL = 250;
+  const makeGenes = (status) => Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status,
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const runningGenes = makeGenes("running");
+  const cancelledGenes = makeGenes("cancelled").map((g) => ({ ...g, status: "done" }));
+  const runningPage1 = {
+    batch_id: "batch-cancel-250",
+    status: "running",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: 0, queued: 0, running: TOTAL, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: runningGenes.slice(0, 200),
+  };
+  const runningPage2 = {
+    ...runningPage1,
+    genes: runningGenes.slice(200, 250),
+  };
+  const cancelledPage1 = {
+    batch_id: "batch-cancel-250",
+    status: "cancelled",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: cancelledGenes.slice(0, 200),
+  };
+  const cancelledPage2 = {
+    ...cancelledPage1,
+    genes: cancelledGenes.slice(200, 250),
+  };
+
+  let cancelled = false;
+  let poll1TimerResolve = null;
+  let resolveCancelPost = null;
+  let timerCount = 0;
+
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-cancel-250": () => response(cancelled ? cancelledPage1 : runningPage1),
+      "GET /v1/expression-context/batches/batch-cancel-250?offset=200&limit=200": () => response(cancelled ? cancelledPage2 : runningPage2),
+      "POST /v1/expression-context/batches/batch-cancel-250/cancel": () => new Promise((done) => {
+        resolveCancelPost = () => {
+          cancelled = true;
+          done(response(cancelledPage1));
+        };
+      }),
+    },
+    {
+      wait: () => {
+        timerCount += 1;
+        return new Promise((resolve) => { poll1TimerResolve = resolve; });
+      },
+    }
+  );
+
+  const loadPromise = ref.page.loadBatch("batch-cancel-250");
+  // Wait until poll 0 finishes fetching both pages and enters sleepBatch
+  while (!poll1TimerResolve) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(timerCount, 1);
+
+  // Rapidly fire cancel 3 times while POST /cancel is in flight
+  const c1 = ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+  const c2 = ref.nodes["ec-batch-cancel"].fire("click");
+  const c3 = ref.nodes["ec-batch-cancel"].fire("click");
+
+  while (!resolveCancelPost) await new Promise((r) => setTimeout(r, 0));
+  const cancelPosts = ref.calls.filter((c) => c.method === "POST");
+  assert.strictEqual(cancelPosts.length, 1);
+
+  // Finish POST /cancel and resolve old timer handle too
+  resolveCancelPost();
+  await Promise.all([c1, c2, c3]);
+  poll1TimerResolve();
+  await loadPromise;
+
+  // Flush microtasks and confirm exactly one active loop ran (2 fetches of page 1, 2 of page 2, 1 timer)
+  await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(timerCount, 1);
+  assert.strictEqual(ref.calls.filter((c) => c.url.endsWith("/batch-cancel-250")).length, 2);
+  assert.strictEqual(ref.calls.filter((c) => c.url.includes("offset=200")).length, 2);
+  assert.strictEqual(ref.calls.filter((c) => c.method === "POST").length, 1);
+  assert.strictEqual(ref.nodes["ec-batch-genes"].children.length, 250);
+  assert.ok(ref.nodes["ec-batch-summary"].textContent.includes("Status: cancelled"));
+  assert.strictEqual(ref.page.state.batchPolling, false);
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+});
+
+test("switching to another batch or tab stops old loop, cancels timers/fetches, and ignores stale results", async () => {
+  const oldRunning = {
+    batch_id: "batch-old",
+    status: "running",
+    release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [{ position: 0, input_symbol: "ERBB2", hugo_symbol: "ERBB2", status: "running", error: null, notes: null, updated_at: "2026-11-17T00:00:00Z" }],
+  };
+  const newDone = {
+    batch_id: "batch-new",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [{ position: 0, input_symbol: "MYCN", hugo_symbol: "MYCN", status: "done", error: null, notes: null, updated_at: "2026-11-17T00:00:00Z" }],
+  };
+
+  let oldPollCalls = 0;
+  let oldSignal = null;
+  let releaseOldSecondFetch = null;
+  const clearedTimers = [];
+  const scheduledTimers = [];
+
+  const nodes = Object.fromEntries(IDS.map((id) => [id, new Element("div")]));
+  nodes["ec-error"].classList.toggle("hidden", true);
+  nodes["ec-batch-result"].classList.toggle("hidden", true);
+  nodes["ec-batch-cancel"].classList.toggle("hidden", true);
+  const document = { getElementById: (id) => nodes[id], createElement: (tag) => new Element(tag) };
+  const calls = [];
+  const win = {
+    location: { pathname: "/expression-context", search: "", href: "/expression-context" },
+    history: { replaceState: () => {} },
+    setTimeout: (fn) => {
+      const id = scheduledTimers.length + 1;
+      scheduledTimers.push({ id, fn });
+      return id;
+    },
+    clearTimeout: (id) => clearedTimers.push(id),
+  };
+  const fetchFn = async (url, options = {}) => {
+    calls.push({ url, signal: options.signal });
+    if (url.endsWith("/batch-old")) {
+      oldPollCalls += 1;
+      if (oldPollCalls === 1) return response(oldRunning);
+      oldSignal = options.signal;
+      return new Promise((resolve) => {
+        releaseOldSecondFetch = () => resolve(response({ detail: "boom" }, 500));
+      });
+    }
+    if (url.endsWith("/batch-new")) {
+      return response(newDone);
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+  const page = createExpressionContextPage({ document, window: win, fetch: fetchFn });
+
+  const oldPromise = page.loadBatch("batch-old");
+  while (scheduledTimers.length === 0) await new Promise((r) => setTimeout(r, 0));
+  // Fire timer for poll 2 of batch-old so its fetch is now in flight
+  scheduledTimers[0].fn();
+  while (!releaseOldSecondFetch) await new Promise((r) => setTimeout(r, 0));
+  assert.ok(oldSignal);
+  assert.strictEqual(oldSignal.aborted, false);
+
+  // Switch to batch-new while batch-old fetch is in flight
+  await page.loadBatch("batch-new");
+  assert.strictEqual(oldSignal.aborted, true);
+  assert.strictEqual(page.state.batch.batch_id, "batch-new");
+
+  // Resolve stale batch-old fetch with 500 -> ignored cleanly, no error banner, no state overwrite
+  releaseOldSecondFetch();
+  await oldPromise;
+  assert.strictEqual(page.state.batch.batch_id, "batch-new");
+  assert.strictEqual(nodes["ec-error"].hidden, true);
+  assert.strictEqual(oldPollCalls, 2);
+
+  // Switching to single tab also cancels pending timer of a running batch
+  const timerBefore = scheduledTimers.length;
+  oldPollCalls = 0; // force poll 1 to return running
+  const oldAgain = page.loadBatch("batch-old");
+  while (scheduledTimers.length === timerBefore) await new Promise((r) => setTimeout(r, 0));
+  const pendingTimerId = scheduledTimers[scheduledTimers.length - 1].id;
+  page.setMode("single");
+  await oldAgain;
+  assert.ok(clearedTimers.includes(pendingTimerId));
+});
+
+test("malformed gene records ({hugo_symbol} only, array item, unknown status) -> incomplete, no crash, no blank rows", async () => {
+  const badRecords = [
+    [{ hugo_symbol: "ERBB2" }],
+    [["ERBB2"]],
+    [{ position: 0, input_symbol: "ERBB2", hugo_symbol: "ERBB2", status: "bogus_status" }],
+  ];
+
+  for (const badGenes of badRecords) {
+    // Case A: malformed gene on page 1
+    const envP1 = env(
+      {
+        "GET /v1/expression-context/batches/batch-bad-gene": response({
+          batch_id: "batch-bad-gene",
+          status: "done",
+          release_id: "rel-1",
+          counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+          genes: badGenes,
+        }),
+      },
+      { maxPageRetries: 1 }
+    );
+    await envP1.page.loadBatch("batch-bad-gene");
+    assert.strictEqual(envP1.page.state.batchIncomplete, true);
+    assert.strictEqual(envP1.nodes["ec-error"].hidden, false);
+    assert.ok(envP1.nodes["ec-error"].textContent.includes("Couldn't load all genes"));
+    assert.strictEqual(envP1.nodes["ec-batch-genes"].children.length, 0);
+    assert.strictEqual(envP1.nodes["ec-batch-result"].hidden, true);
+
+    // Case B: malformed gene on page 2
+    const goodFirstPage = Array.from({ length: 200 }, (_, i) => ({
+      position: i,
+      input_symbol: `GENE${i + 1}`,
+      hugo_symbol: `GENE${i + 1}`,
+      status: "done",
+      error: null,
+      notes: null,
+      updated_at: "2026-11-17T00:00:00Z",
+    }));
+    const envP2 = env(
+      {
+        "GET /v1/expression-context/batches/batch-bad-p2": response({
+          batch_id: "batch-bad-p2",
+          status: "done",
+          release_id: "rel-1",
+          counts: { total: 201, done: 201, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+          genes: goodFirstPage,
+        }),
+        "GET /v1/expression-context/batches/batch-bad-p2?offset=200&limit=200": response({
+          batch_id: "batch-bad-p2",
+          status: "done",
+          release_id: "rel-1",
+          counts: { total: 201, done: 201, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+          genes: badGenes,
+        }),
+      },
+      { maxPageRetries: 1 }
+    );
+    await envP2.page.loadBatch("batch-bad-p2");
+    assert.strictEqual(envP2.page.state.batchIncomplete, true);
+    assert.strictEqual(envP2.nodes["ec-error"].hidden, false);
+    assert.ok(envP2.nodes["ec-error"].textContent.includes("Couldn't load all genes"));
+    assert.strictEqual(envP2.nodes["ec-batch-genes"].children.length, 0);
+    assert.strictEqual(envP2.nodes["ec-batch-result"].hidden, true);
+  }
+});
+
+test("stale cancel response (complete or paginated) when switching to batch B is ignored and B keeps running", async () => {
+  const makeGene = (sym, status = "running") => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const batchA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const batchACancelledComplete = {
+    batch_id: "batch-A", status: "cancelled", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+  const batchBRunning = {
+    batch_id: "batch-B", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("MYCN", "running")],
+  };
+  const batchBDone = {
+    batch_id: "batch-B", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("MYCN", "done")],
+  };
+
+  // Case 1: complete cancel response for A arrives after switching to B -> B stays shown, A never rendered
+  let resolveCancelA1 = null;
+  let pollA1Timer = null;
+  const env1 = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(batchA),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => { resolveCancelA1 = () => r(response(batchACancelledComplete)); }),
+      "GET /v1/expression-context/batches/batch-B": response(batchBDone),
+    },
+    { wait: () => new Promise((r) => { pollA1Timer = r; }) }
+  );
+  const pA1 = env1.page.loadBatch("batch-A");
+  while (!pollA1Timer) await new Promise((r) => setTimeout(r, 0));
+  const cancelPromise1 = env1.page.cancelCurrentBatch();
+  while (!resolveCancelA1) await new Promise((r) => setTimeout(r, 0));
+  await env1.page.loadBatch("batch-B");
+  assert.strictEqual(env1.page.state.batch.batch_id, "batch-B");
+
+  // Resolve stale cancel A -> must be ignored
+  resolveCancelA1();
+  await cancelPromise1;
+  pollA1Timer();
+  await pA1;
+  assert.strictEqual(env1.page.state.batch.batch_id, "batch-B");
+  assert.strictEqual(env1.nodes["ec-batch-title"].textContent, "Batch batch-B");
+
+  // Case 2: paginated (>200 genes) cancel response for A arrives while B is polling -> no loadBatch(A), B's loop keeps running
+  let resolveCancelA2 = null;
+  let bPollCalls = 0;
+  let bTimerResolve = null;
+  let a2Timer = null;
+  const batchAPaginated = {
+    batch_id: "batch-A", status: "cancelled", release_id: "rel-1",
+    counts: { total: 250, done: 250, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: Array.from({ length: 200 }, (_, i) => ({ ...makeGene(`G${i}`, "done"), position: i })),
+  };
+  const env2 = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(batchA),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => { resolveCancelA2 = () => r(response(batchAPaginated)); }),
+      "GET /v1/expression-context/batches/batch-B": () => {
+        bPollCalls += 1;
+        return response(bPollCalls === 1 ? batchBRunning : batchBDone);
+      },
+    },
+    {
+      wait: () => new Promise((r) => {
+        if (!a2Timer) a2Timer = r;
+        else bTimerResolve = r;
+      }),
+    }
+  );
+  const pA2 = env2.page.loadBatch("batch-A");
+  while (!a2Timer) await new Promise((r) => setTimeout(r, 0));
+  const cancelPromise2 = env2.page.cancelCurrentBatch();
+  while (!resolveCancelA2) await new Promise((r) => setTimeout(r, 0));
+  const pB2 = env2.page.loadBatch("batch-B");
+  while (!bTimerResolve) await new Promise((r) => setTimeout(r, 0));
+
+  const aCallsBefore = env2.calls.filter((c) => c.method === "GET" && c.url.endsWith("/batch-A")).length;
+  resolveCancelA2();
+  await cancelPromise2;
+  // Must NOT trigger loadBatch(A)
+  assert.strictEqual(env2.calls.filter((c) => c.method === "GET" && c.url.endsWith("/batch-A")).length, aCallsBefore);
+  assert.strictEqual(env2.page.state.batch.batch_id, "batch-B");
+
+  // B's polling loop still finishes cleanly to done
+  bTimerResolve();
+  await pB2;
+  a2Timer();
+  await pA2;
+  assert.strictEqual(bPollCalls, 2);
+  assert.strictEqual(env2.page.state.batch.batch_id, "batch-B");
+  assert.ok(env2.nodes["ec-batch-summary"].textContent.includes("Status: done"));
+});
+
+test("stale cancel to Single mode or stale cancel failure leaves new state and banner intact", async () => {
+  const makeGene = (sym, status = "running") => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const batchA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const batchADone = { ...batchA, status: "cancelled", genes: [makeGene("ERBB2", "done")] };
+
+  // Case 1: cancel A -> switch to Single before POST resolves -> Single stays, no batch render, no banner
+  let resolveCancelSingle = null;
+  let timerSingle = null;
+  const envS = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(batchA),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => { resolveCancelSingle = () => r(response(batchADone)); }),
+    },
+    { wait: () => new Promise((r) => { timerSingle = r; }) }
+  );
+  const pA = envS.page.loadBatch("batch-A");
+  while (!timerSingle) await new Promise((r) => setTimeout(r, 0));
+  const cancelS = envS.page.cancelCurrentBatch();
+  while (!resolveCancelSingle) await new Promise((r) => setTimeout(r, 0));
+
+  envS.page.setMode("single");
+  resolveCancelSingle();
+  await cancelS;
+  timerSingle();
+  await pA;
+
+  assert.strictEqual(envS.page.state.mode, "single");
+  assert.strictEqual(envS.nodes["ec-batch-result"].hidden, true);
+  assert.strictEqual(envS.nodes["ec-error"].hidden, true);
+  // Stale settlement did nothing on the page while in Single mode
+  assert.strictEqual(envS.nodes["ec-batch-cancel"].disabled, true);
+  // Switching back to Batch tab syncs Cancel button from pendingCancelIds
+  envS.page.setMode("batch");
+  assert.strictEqual(envS.nodes["ec-batch-cancel"].disabled, false);
+
+  // Case 2: stale cancel failure (500) on A does not overwrite B's banner or state
+  let resolveCancelFail = null;
+  let timerB = null;
+  const envF = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(batchA),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => { resolveCancelFail = () => r(response({ detail: "err" }, 500)); }),
+      "GET /v1/expression-context/batches/batch-B": response({ detail: "missing" }, 404),
+    },
+    { wait: () => new Promise((r) => { timerB = r; }) }
+  );
+  const pA2 = envF.page.loadBatch("batch-A");
+  while (!timerB) await new Promise((r) => setTimeout(r, 0));
+  const cancelF = envF.page.cancelCurrentBatch();
+  while (!resolveCancelFail) await new Promise((r) => setTimeout(r, 0));
+
+  await envF.page.loadBatch("batch-B");
+  assert.strictEqual(envF.nodes["ec-error"].textContent, "Batch not found.");
+  resolveCancelFail();
+  await cancelF;
+  timerB();
+  await pA2;
+  assert.strictEqual(envF.nodes["ec-error"].textContent, "Batch not found.");
+});
+
+test("failed cancel on still-current batch shows error banner and resumes single-flight polling until done", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const batchRunning = {
+    batch_id: "batch-resume", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const batchDone = {
+    batch_id: "batch-resume", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+
+  let getCount = 0;
+  const timers = [];
+  const envR = env(
+    {
+      "GET /v1/expression-context/batches/batch-resume": () => {
+        getCount += 1;
+        return response(getCount <= 2 ? batchRunning : batchDone);
+      },
+      "POST /v1/expression-context/batches/batch-resume/cancel": response({ detail: "fail" }, 500),
+    },
+    {
+      wait: () => new Promise((r) => { timers.push(r); }),
+    }
+  );
+
+  const loadP = envR.page.loadBatch("batch-resume");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  const cancelP = envR.page.cancelCurrentBatch();
+  // Wait for resumed polling's first poll (getCount === 2) and its wait timer
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+
+  // Error banner must stay visible while polling resumed, and cancel button is enabled again
+  assert.strictEqual(envR.nodes["ec-error"].hidden, false);
+  assert.ok(envR.nodes["ec-error"].textContent.includes("couldn't load expression statistics"));
+  assert.strictEqual(envR.nodes["ec-batch-cancel"].disabled, false);
+
+  // Advance resumed polling to done
+  timers[1]();
+  await cancelP;
+  timers[0]();
+  await loadP;
+
+  assert.strictEqual(getCount, 3);
+  assert.ok(envR.nodes["ec-batch-summary"].textContent.includes("Status: done"));
+  assert.strictEqual(envR.nodes["ec-error"].hidden, false);
+});
+
+test("reload while cancel pending keeps Cancel disabled and blocks duplicate POST until settle", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const runningA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const doneA = {
+    batch_id: "batch-A", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+  const cancelledA = {
+    batch_id: "batch-A", status: "cancelled", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+
+  let resolveCancelA = null;
+  const timers = [];
+  let getCalls = 0;
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": () => {
+        getCalls += 1;
+        // Both initial load and reload before cancel settles return running; later poll returns done
+        return response(getCalls <= 2 ? runningA : doneA);
+      },
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => {
+        resolveCancelA = () => r(response(cancelledA));
+      }),
+    },
+    { wait: () => new Promise((r) => { timers.push(r); }) }
+  );
+
+  const p1 = ref.page.loadBatch("batch-A");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  // Click Cancel on A (POST now pending)
+  const c1 = ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+  while (!resolveCancelA) await new Promise((r) => setTimeout(r, 0));
+
+  // Reload batch A while POST /cancel is STILL pending
+  const p2 = ref.page.loadBatch("batch-A");
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Clicking Cancel again during reload must send NO second POST
+  await ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(ref.calls.filter((c) => c.method === "POST").length, 1);
+
+  // Settle first POST -> Cancel reflects new state (no longer pending-disabled)
+  resolveCancelA();
+  await c1;
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  // Clean up remaining poll loops
+  timers[1]();
+  await p2;
+  timers[0]();
+  await p1;
+});
+
+test("pending cancel on A allows B's Cancel to work and A settling does not touch B", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const runningA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const cancelledA = { ...runningA, status: "cancelled", genes: [makeGene("ERBB2", "done")] };
+  const runningB = {
+    batch_id: "batch-B", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("MYCN", "running")],
+  };
+  const cancelledB = { ...runningB, status: "cancelled", genes: [makeGene("MYCN", "done")] };
+
+  let resolveCancelA = null;
+  let resolveCancelB = null;
+  const timers = [];
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(runningA),
+      "GET /v1/expression-context/batches/batch-B": response(runningB),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => {
+        resolveCancelA = () => r(response(cancelledA));
+      }),
+      "POST /v1/expression-context/batches/batch-B/cancel": () => new Promise((r) => {
+        resolveCancelB = () => r(response(cancelledB));
+      }),
+    },
+    { wait: () => new Promise((r) => { timers.push(r); }) }
+  );
+
+  const pA = ref.page.loadBatch("batch-A");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  const cA = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolveCancelA) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Switch to batch B -> B's Cancel must be enabled and usable
+  const pB = ref.page.loadBatch("batch-B");
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.page.state.batch.batch_id, "batch-B");
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  // Click Cancel on B
+  const cB = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolveCancelB) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+  assert.strictEqual(ref.calls.filter((c) => c.method === "POST").length, 2);
+
+  // Settle A's POST -> must NOT overwrite B or re-enable B's Cancel while B's POST is pending
+  resolveCancelA();
+  await cA;
+  assert.strictEqual(ref.page.state.batch.batch_id, "batch-B");
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Settle B's POST -> B finishes cancelled
+  resolveCancelB();
+  await cB;
+  assert.ok(ref.nodes["ec-batch-summary"].textContent.includes("Status: cancelled"));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  timers[1]();
+  await pB;
+  timers[0]();
+  await pA;
+});
+
+test("submitBatch: switching to Single before 202 arrives leaves Single active and skips loadBatch", async () => {
+  let resolvePost = null;
+  const ref = env({
+    "POST /v1/expression-context/batches": () => new Promise((r) => {
+      resolvePost = () => r(response({ batch_id: "batch-late", status: "queued" }, 202));
+    }),
+  });
+
+  ref.page.setMode("batch");
+  const subP = ref.page.submitBatch("ERBB2, MYCN");
+  while (!resolvePost) await new Promise((r) => setTimeout(r, 0));
+
+  // Switch to Single before POST /batches resolves
+  ref.page.setMode("single");
+  assert.strictEqual(ref.page.state.mode, "single");
+
+  resolvePost();
+  await subP;
+
+  // Single stays active; no GET /batches/batch-late was issued
+  assert.strictEqual(ref.page.state.mode, "single");
+  assert.strictEqual(ref.nodes["ec-batch-result"].hidden, true);
+  assert.strictEqual(ref.calls.filter((c) => c.method === "GET").length, 0);
+});
+
+test("failed cancel -> recovery polling -> second cancel aborts recovery -> Cancel stays disabled until second POST settles", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const runningA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const doneA = {
+    batch_id: "batch-A", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+
+  let postCount = 0;
+  let getCount = 0;
+  let resolveSecondPost = null;
+  const timers = [];
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": () => {
+        getCount += 1;
+        return response(getCount <= 3 ? runningA : doneA);
+      },
+      "POST /v1/expression-context/batches/batch-A/cancel": () => {
+        postCount += 1;
+        if (postCount === 1) return response({ detail: "fail 1" }, 500);
+        return new Promise((r) => {
+          resolveSecondPost = () => r(response({ detail: "fail 2" }, 500));
+        });
+      },
+    },
+    { wait: () => new Promise((r) => { timers.push(r); }) }
+  );
+
+  const pLoad = ref.page.loadBatch("batch-A");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  // Step 1-2: First cancel fails (500) and starts recovery polling (timers[1])
+  const c1 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(postCount, 1);
+
+  // Step 3: Second cancel click (POST 2 held pending) aborts c1's recovery polling
+  const c2 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolveSecondPost) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(postCount, 2);
+
+  // Step 4: First invocation completely settles (timers[1] resolves c1's recovery loadBatch)
+  timers[1]();
+  await c1;
+
+  // After c1 settles, Cancel MUST still be disabled because c2's POST is pending!
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Step 5: Third click sends NO duplicate POST
+  await ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(ref.calls.filter((c) => c.method === "POST").length, 2);
+
+  // Step 6: Second POST settles (with 500, A still shown) -> Cancel re-enables
+  resolveSecondPost();
+  while (timers.length < 3) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  timers[2]();
+  await c2;
+  timers[0]();
+  await pLoad;
+});
+
+test("older cancel invocation finishing after newer one has settled does not alter pending cancel map", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const runningA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const doneA = {
+    batch_id: "batch-A", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+
+  let getCount = 0;
+  let postCount = 0;
+  let resolveSlowC1RecoveryGet = null;
+  let resolvePost3 = null;
+  const timers = [];
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": () => {
+        getCount += 1;
+        if (getCount === 2) {
+          // Held open for c1's recovery loadBatch
+          return new Promise((r) => {
+            resolveSlowC1RecoveryGet = () => r(response(runningA));
+          });
+        }
+        return response(getCount <= 3 ? runningA : doneA);
+      },
+      "POST /v1/expression-context/batches/batch-A/cancel": () => {
+        postCount += 1;
+        if (postCount <= 2) return response({ detail: "fail" }, 500);
+        return new Promise((r) => {
+          resolvePost3 = () => r(response({ ...doneA, status: "cancelled" }));
+        });
+      },
+    },
+    { wait: () => new Promise((r) => { timers.push(r); }) }
+  );
+
+  const pLoad = ref.page.loadBatch("batch-A");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  // c1 fails POST 1 and hangs in recovery GET (getCount === 2)
+  const c1 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolveSlowC1RecoveryGet) await new Promise((r) => setTimeout(r, 0));
+
+  // c2 runs POST 2 -> fails (500) -> enters recovery polling -> pauses at timers[1]
+  const c2 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+
+  // c3 starts POST 3 (held pending)
+  const c3 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolvePost3) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Now c1's held network GET resolves and c1 finishes completely WHILE c3 is pending
+  resolveSlowC1RecoveryGet();
+  await c1;
+
+  // c1 finishing must NOT delete c3's pending cancel token or re-enable Cancel
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+  await ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(postCount, 3);
+
+  // Settle c3 -> A is cancelled
+  resolvePost3();
+  await c3;
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  timers[1]();
+  await c2;
+  timers[0]();
+  await pLoad;
 });
 
 (async () => {

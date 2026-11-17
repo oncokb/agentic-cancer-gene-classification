@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date, datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from dataclasses import dataclass
 
@@ -579,3 +579,104 @@ class GeneStatsView(BaseModel):
     pairs: List[PairStatsView]
     dmt_adc_index: List[Dict[str, Any]] = Field(default_factory=list)
     has_stored_result: bool = False
+
+
+# --------------------------------------------------------------------------
+# Batches
+# --------------------------------------------------------------------------
+
+BatchStatus = Literal["queued", "running", "done", "failed", "cancelled"]
+BatchGeneStatus = Literal[
+    "queued",
+    "skipped_no_stats",
+    "skipped_fresh",
+    "running",
+    "done",
+    "failed",
+    "not_found",
+]
+
+BATCH_GENE_STATUSES: Tuple[BatchGeneStatus, ...] = (
+    "queued",
+    "skipped_no_stats",
+    "skipped_fresh",
+    "running",
+    "done",
+    "failed",
+    "not_found",
+)
+
+
+class BatchCounts(BaseModel):
+    total: int = 0
+    queued: int = 0
+    skipped_no_stats: int = 0
+    skipped_fresh: int = 0
+    running: int = 0
+    done: int = 0
+    failed: int = 0
+    not_found: int = 0
+
+
+class BatchCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    genes: List[str] = Field(..., min_length=1, max_length=2000)
+
+
+class BatchAccepted(BaseModel):
+    batch_id: str
+    status: BatchStatus
+    status_url: str
+
+
+class BatchGeneRecord(BaseModel):
+    batch_id: str
+    position: int
+    input_symbol: str
+    hugo_symbol: Optional[str] = None
+    status: BatchGeneStatus = "queued"
+    error: Optional[str] = None
+    notes: Optional[str] = None
+    updated_at: datetime
+
+
+class BatchGeneItem(BaseModel):
+    position: int
+    input_symbol: str
+    hugo_symbol: Optional[str] = None
+    status: BatchGeneStatus
+    error: Optional[str] = None
+    notes: Optional[str] = None
+    updated_at: datetime
+
+
+class BatchRecord(BaseModel):
+    batch_id: str
+    created_by: Optional[str] = None
+    created_at: datetime
+    release_id: str
+    status: BatchStatus = "queued"
+    counts: BatchCounts = Field(default_factory=BatchCounts)
+    error: Optional[str] = None
+
+
+class BatchSummary(BaseModel):
+    batch_id: str
+    created_by: Optional[str] = None
+    created_at: datetime
+    release_id: str
+    status: BatchStatus
+    counts: BatchCounts
+    error: Optional[str] = None
+
+
+class BatchDetail(BatchSummary):
+    genes: List[BatchGeneItem] = Field(default_factory=list)
+    total_genes: int = 0
+    offset: int = 0
+    limit: int = 200
+
+
+class BatchListPage(BaseModel):
+    items: List[BatchSummary] = Field(default_factory=list)
+

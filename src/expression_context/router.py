@@ -11,6 +11,10 @@ from src.auth import AuthenticatedUser, require_auth
 from src.admin_users_routes import require_admin_role, require_admin_write
 from src.expression_context.catalog import BundleGone, BundleNotLoaded
 from src.expression_context.models import (
+    BatchAccepted,
+    BatchCreateRequest,
+    BatchDetail,
+    BatchListPage,
     BundleStatus,
     GeneResult,
     GeneStatsView,
@@ -21,6 +25,7 @@ from src.expression_context.models import (
 )
 from src.expression_context.csv_export import UnmappedCancerTypeError
 from src.expression_context.service import (
+    BatchNotFound,
     ExpressionContextService,
     GeneNotFound,
     GenesNotChecked,
@@ -28,12 +33,27 @@ from src.expression_context.service import (
 )
 from src.expression_context.store import InvalidCursor
 from src.job_store import can_read_job, job_owner
+from src.request_origin import require_same_origin_json
 
 PREFIX = "/v1/expression-context"
 STATE_ATTR = "expression_context"
 NOT_LOADED_RETRY_AFTER_SECONDS = 60
 
 router = APIRouter(prefix=PREFIX, tags=["expression-context"])
+
+
+def _check_browser_csrf(request: Request, user: AuthenticatedUser) -> None:
+    """Enforce same-origin JSON check when browser CSRF headers are present."""
+    if user.auth_method == "api_key":
+        return
+    require_same_origin_json(request)
+
+
+def can_cancel_batch(created_by: Optional[str], user: AuthenticatedUser) -> bool:
+    """Explicit authorization for cancelling a batch: owner or admin."""
+    if user.role == "admin":
+        return True
+    return bool(created_by and created_by == job_owner(user))
 
 
 def get_service(request: Request) -> ExpressionContextService:
@@ -234,3 +254,191 @@ async def export_golden_set_csv(
         ) from exc
     except (BundleNotLoaded, BundleGone) as exc:
         raise _not_loaded(exc) from exc
+
+
+@router.get("/genes/{gene}/curator-sheet.csv")
+async def export_gene_curator_sheet_csv(
+    gene: str,
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> Response:
+    try:
+        filename, body = await service.export_gene_curator_sheet_csv(gene)
+    except InvalidGene as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except GeneNotFound as exc:
+        raise HTTPException(
+            status_code=404, detail=f"Gene {exc} is not in the expression statistics bundle."
+        ) from exc
+    except UnmappedCancerTypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/batches", status_code=status.HTTP_202_ACCEPTED, response_model=BatchAccepted)
+async def create_batch(
+    request: Request,
+    body: BatchCreateRequest,
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> BatchAccepted:
+    _check_browser_csrf(request, user)
+    try:
+        batch = await service.submit_batch(body.genes, owner=job_owner(user))
+    except InvalidGene as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+    return BatchAccepted(
+        batch_id=batch.batch_id,
+        status=batch.status,
+        status_url=f"{PREFIX}/batches/{batch.batch_id}",
+    )
+
+
+@router.get("/batches", response_model=BatchListPage)
+async def list_batches(
+    limit: int = Query(default=25, ge=1, le=100),
+    all: bool = Query(default=False),
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> BatchListPage:
+    try:
+        await service.catalog.active()
+        owner = None if (user.role == "admin" and all) else job_owner(user)
+        return await service.list_user_batches(owner, limit=limit)
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+
+
+@router.get("/batches/{batch_id}", response_model=BatchDetail)
+async def get_batch(
+    batch_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=2000),
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> BatchDetail:
+    try:
+        await service.catalog.active()
+        detail = await service.get_batch_detail(batch_id, offset=offset, limit=limit)
+    except BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Batch not found.") from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+    if not can_read_job(detail.created_by, user):
+        raise HTTPException(status_code=404, detail="Batch not found.")
+    return detail
+
+
+@router.post("/batches/{batch_id}/cancel", response_model=BatchDetail)
+async def cancel_batch(
+    batch_id: str,
+    request: Request,
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> BatchDetail:
+    _check_browser_csrf(request, user)
+    try:
+        await service.catalog.active()
+        existing = await service.get_batch_detail(batch_id, offset=0, limit=1)
+    except BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Batch not found.") from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+    if not can_cancel_batch(existing.created_by, user):
+        raise HTTPException(status_code=403, detail="Forbidden.")
+    try:
+        return await service.cancel_batch(batch_id)
+    except BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Batch not found.") from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+
+
+@router.get("/batches/{batch_id}/export.csv")
+async def export_batch_csv(
+    batch_id: str,
+    include_excluded: bool = Query(default=False),
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> StreamingResponse:
+    try:
+        batch = await service.store.get_batch(batch_id)
+        if batch is None or not can_read_job(batch.created_by, user):
+            raise HTTPException(status_code=404, detail="Batch not found.")
+        filename, stream = await service.export_batch_per_pair_csv(
+            batch_id, include_excluded=include_excluded
+        )
+    except BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Batch not found.") from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+    return StreamingResponse(
+        stream,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/batches/{batch_id}/golden-set.csv")
+async def export_batch_golden_set_csv(
+    batch_id: str,
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> StreamingResponse:
+    try:
+        batch = await service.store.get_batch(batch_id)
+        if batch is None or not can_read_job(batch.created_by, user):
+            raise HTTPException(status_code=404, detail="Batch not found.")
+        filename, stream = await service.export_batch_golden_set_csv(batch_id)
+    except BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Batch not found.") from exc
+    except UnmappedCancerTypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+    return StreamingResponse(
+        stream,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/batches/{batch_id}/curator-sheet.csv")
+async def export_batch_curator_sheet_csv(
+    batch_id: str,
+    user: AuthenticatedUser = Depends(require_auth),
+    service: ExpressionContextService = Depends(get_service),
+) -> StreamingResponse:
+    try:
+        batch = await service.store.get_batch(batch_id)
+        if batch is None or not can_read_job(batch.created_by, user):
+            raise HTTPException(status_code=404, detail="Batch not found.")
+        filename, stream = await service.export_batch_curator_sheet_csv(batch_id)
+    except BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail="Batch not found.") from exc
+    except UnmappedCancerTypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+    except (BundleNotLoaded, BundleGone) as exc:
+        raise _not_loaded(exc) from exc
+    return StreamingResponse(
+        stream,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

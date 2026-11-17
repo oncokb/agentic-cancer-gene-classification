@@ -14,13 +14,26 @@ import base64
 import binascii
 import json
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Protocol, Tuple
-from src.expression_context.models import HistoryEntry, StoredPair
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
+from src.expression_context.models import (
+    BATCH_GENE_STATUSES,
+    BatchCounts,
+    BatchGeneRecord,
+    BatchGeneStatus,
+    BatchRecord,
+    BatchStatus,
+    HistoryEntry,
+    StoredPair,
+)
 
 logger = logging.getLogger(__name__)
 
 TABLE_NAME = "expression_context_results"
+BATCHES_TABLE = "expression_context_batches"
+BATCH_GENES_TABLE = "expression_context_batch_genes"
+BATCH_TABLES = (BATCHES_TABLE, BATCH_GENES_TABLE)
 
 CREATE_TABLE_SQL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -41,6 +54,37 @@ CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     INDEX idx_expression_context_verdict (hugo_symbol, literature_gate, oncotree_code, computed_at)
 )
 """
+
+CREATE_BATCH_TABLES_SQL = (
+    f"""
+CREATE TABLE IF NOT EXISTS {BATCHES_TABLE} (
+    batch_id VARCHAR(64) NOT NULL PRIMARY KEY,
+    created_by VARCHAR(255) NULL,
+    created_at DATETIME(6) NOT NULL,
+    release_id VARCHAR(128) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    counts_json JSON NOT NULL,
+    error VARCHAR(1000) NULL,
+    worker_owner VARCHAR(64) NULL,
+    worker_expires_at DATETIME(6) NULL,
+    INDEX idx_expression_context_batches_creator (created_by, created_at),
+    INDEX idx_expression_context_batches_status (status, created_at)
+)
+""",
+    f"""
+CREATE TABLE IF NOT EXISTS {BATCH_GENES_TABLE} (
+    batch_id VARCHAR(64) NOT NULL,
+    position INT NOT NULL,
+    input_symbol VARCHAR(64) NOT NULL,
+    hugo_symbol VARCHAR(64) NULL,
+    status VARCHAR(32) NOT NULL,
+    error VARCHAR(1000) NULL,
+    notes VARCHAR(1000) NULL,
+    updated_at DATETIME(6) NOT NULL,
+    PRIMARY KEY (batch_id, position)
+)
+""",
+)
 
 _COLUMNS = (
     "hugo_symbol, oncotree_code, release_id, literature_gate, surfaced, exclusion_reason, "
@@ -127,16 +171,84 @@ class ExpressionContextStore(Protocol):
         self, literature_gate: str, limit: int, after_symbol: Optional[str] = None
     ) -> List[str]: ...
 
+    async def create_batch(
+        self, batch: BatchRecord, genes: Sequence[BatchGeneRecord]
+    ) -> None: ...
+
+    async def get_batch(self, batch_id: str) -> Optional[BatchRecord]: ...
+
+    async def list_batch_genes(
+        self, batch_id: str, offset: int = 0, limit: Optional[int] = None
+    ) -> List[BatchGeneRecord]: ...
+
+    async def count_batch_genes(self, batch_id: str) -> int: ...
+
+    async def list_batches(
+        self, created_by: Optional[str], limit: int = 50
+    ) -> List[BatchRecord]: ...
+
+    async def list_unfinished_batches(self) -> List[str]: ...
+
+    async def acquire_batch_lock(
+        self, batch_id: str, token: str, ttl_seconds: float
+    ) -> bool: ...
+
+    async def renew_batch_lock(
+        self, batch_id: str, token: str, ttl_seconds: float
+    ) -> bool: ...
+
+    async def release_batch_lock(self, batch_id: str, token: str) -> None: ...
+
+    async def update_batch_gene(
+        self,
+        batch_id: str,
+        position: int,
+        status: BatchGeneStatus,
+        *,
+        error: Optional[str] = None,
+        updated_at: Optional[datetime] = None,
+        expected_token: Optional[str] = None,
+    ) -> Optional[BatchCounts]: ...
+
+    async def update_batch_status(
+        self,
+        batch_id: str,
+        status: BatchStatus,
+        *,
+        error: Optional[str] = None,
+        expected_token: Optional[str] = None,
+    ) -> Optional[BatchRecord]: ...
+
+    async def cancel_batch(
+        self, batch_id: str, *, updated_at: Optional[datetime] = None
+    ) -> Optional[BatchRecord]: ...
+
+
+def compute_batch_counts(genes: Sequence[BatchGeneRecord]) -> BatchCounts:
+    counts: Dict[str, int] = {status: 0 for status in BATCH_GENE_STATUSES}
+    for gene in genes:
+        if gene.status in counts:
+            counts[gene.status] += 1
+    return BatchCounts(total=len(genes), **counts)
+
 
 def _history_sort_key(entry: HistoryEntry) -> Cursor:
     return (entry.computed_at, entry.hugo_symbol, entry.release_id)
 
 
+def _clip(text: Optional[str], limit: int = 1000) -> Optional[str]:
+    return None if text is None else str(text)[:limit]
+
+
 class InMemoryExpressionContextStore:
     """Same semantics as the MySQL store; used by tests and local runs."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, lock_clock: Callable[[], float] = time.monotonic) -> None:
         self.rows: Dict[Tuple[str, str, str, str], StoredPair] = {}
+        self.batches: Dict[str, BatchRecord] = {}
+        self.batch_genes: Dict[str, List[BatchGeneRecord]] = {}
+        self.batch_locks: Dict[str, Tuple[str, float]] = {}
+        self.lock_clock = lock_clock
         self.schema_created = False
 
     async def ensure_schema(self) -> None:
@@ -203,6 +315,188 @@ class InMemoryExpressionContextStore:
             and (after_symbol is None or row.hugo_symbol > after_symbol)
         })[:limit]
 
+    async def create_batch(self, batch: BatchRecord, genes: Sequence[BatchGeneRecord]) -> None:
+        ordered = sorted(
+            (
+                g.model_copy(
+                    update={
+                        "input_symbol": _clip(g.input_symbol, limit=64) or "",
+                        "updated_at": _utc(g.updated_at),
+                        "error": _clip(g.error),
+                        "notes": _clip(g.notes),
+                    }
+                )
+                for g in genes
+            ),
+            key=lambda g: g.position,
+        )
+        counts = compute_batch_counts(ordered)
+        self.batches[batch.batch_id] = batch.model_copy(
+            update={
+                "created_at": _utc(batch.created_at),
+                "counts": counts,
+                "error": _clip(batch.error),
+            }
+        )
+        self.batch_genes[batch.batch_id] = ordered
+
+    async def get_batch(self, batch_id: str) -> Optional[BatchRecord]:
+        batch = self.batches.get(batch_id)
+        if batch is None:
+            return None
+        genes = self.batch_genes.get(batch_id, [])
+        counts = compute_batch_counts(genes)
+        if batch.counts != counts:
+            batch = batch.model_copy(update={"counts": counts})
+            self.batches[batch_id] = batch
+        return batch.model_copy(deep=True)
+
+    async def list_batch_genes(
+        self, batch_id: str, offset: int = 0, limit: Optional[int] = None
+    ) -> List[BatchGeneRecord]:
+        genes = sorted(self.batch_genes.get(batch_id, []), key=lambda g: g.position)
+        sliced = genes[max(0, offset) :]
+        if limit is not None:
+            sliced = sliced[: max(0, limit)]
+        return [g.model_copy(deep=True) for g in sliced]
+
+    async def count_batch_genes(self, batch_id: str) -> int:
+        return len(self.batch_genes.get(batch_id, []))
+
+    async def list_batches(
+        self, created_by: Optional[str], limit: int = 50
+    ) -> List[BatchRecord]:
+        items = [
+            b
+            for b in self.batches.values()
+            if created_by is None or b.created_by == created_by
+        ]
+        items.sort(key=lambda b: (b.created_at, b.batch_id), reverse=True)
+        out: List[BatchRecord] = []
+        for b in items[: max(1, limit)]:
+            refreshed = await self.get_batch(b.batch_id)
+            if refreshed is not None:
+                out.append(refreshed)
+        return out
+
+    async def list_unfinished_batches(self) -> List[str]:
+        unfinished = [
+            b
+            for b in self.batches.values()
+            if b.status in ("queued", "running")
+        ]
+        unfinished.sort(key=lambda b: (b.created_at, b.batch_id))
+        return [b.batch_id for b in unfinished]
+
+    def _holds_batch_lock(self, batch_id: str, token: str) -> bool:
+        entry = self.batch_locks.get(batch_id)
+        if entry is None:
+            return False
+        owner, expires = entry
+        return owner == token and self.lock_clock() <= expires
+
+    async def acquire_batch_lock(
+        self, batch_id: str, token: str, ttl_seconds: float
+    ) -> bool:
+        if batch_id not in self.batches:
+            return False
+        now = self.lock_clock()
+        entry = self.batch_locks.get(batch_id)
+        if entry is None or now > entry[1] or entry[0] == token:
+            self.batch_locks[batch_id] = (token, now + ttl_seconds)
+            return True
+        return False
+
+    async def renew_batch_lock(
+        self, batch_id: str, token: str, ttl_seconds: float
+    ) -> bool:
+        if not self._holds_batch_lock(batch_id, token):
+            return False
+        self.batch_locks[batch_id] = (token, self.lock_clock() + ttl_seconds)
+        return True
+
+    async def release_batch_lock(self, batch_id: str, token: str) -> None:
+        entry = self.batch_locks.get(batch_id)
+        if entry is not None and entry[0] == token:
+            del self.batch_locks[batch_id]
+
+    async def update_batch_gene(
+        self,
+        batch_id: str,
+        position: int,
+        status: BatchGeneStatus,
+        *,
+        error: Optional[str] = None,
+        updated_at: Optional[datetime] = None,
+        expected_token: Optional[str] = None,
+    ) -> Optional[BatchCounts]:
+        if batch_id not in self.batches:
+            return None
+        batch = self.batches[batch_id]
+        if batch.status == "cancelled":
+            return None
+        if expected_token is not None and not self._holds_batch_lock(batch_id, expected_token):
+            return None
+        when = _utc(updated_at or datetime.now(timezone.utc))
+        genes = self.batch_genes.get(batch_id, [])
+        for idx, gene in enumerate(genes):
+            if gene.position == position:
+                genes[idx] = gene.model_copy(
+                    update={"status": status, "error": _clip(error), "updated_at": when}
+                )
+                break
+        counts = compute_batch_counts(genes)
+        self.batches[batch_id] = self.batches[batch_id].model_copy(update={"counts": counts})
+        return counts
+
+    async def update_batch_status(
+        self,
+        batch_id: str,
+        status: BatchStatus,
+        *,
+        error: Optional[str] = None,
+        expected_token: Optional[str] = None,
+    ) -> Optional[BatchRecord]:
+        batch = self.batches.get(batch_id)
+        if batch is None:
+            return None
+        if batch.status == "cancelled":
+            return None
+        if expected_token is not None and not self._holds_batch_lock(batch_id, expected_token):
+            return None
+        genes = self.batch_genes.get(batch_id, [])
+        counts = compute_batch_counts(genes)
+        updated = batch.model_copy(
+            update={"status": status, "counts": counts, "error": _clip(error)}
+        )
+        self.batches[batch_id] = updated
+        return updated.model_copy(deep=True)
+
+    async def cancel_batch(
+        self, batch_id: str, *, updated_at: Optional[datetime] = None
+    ) -> Optional[BatchRecord]:
+        batch = self.batches.get(batch_id)
+        if batch is None:
+            return None
+        if batch.status in ("done", "failed", "cancelled"):
+            return await self.get_batch(batch_id)
+        when = _utc(updated_at or datetime.now(timezone.utc))
+        genes = self.batch_genes.get(batch_id, [])
+        for idx, gene in enumerate(genes):
+            if gene.status in ("queued", "running"):
+                genes[idx] = gene.model_copy(
+                    update={
+                        "status": "failed",
+                        "error": "cancelled",
+                        "updated_at": when,
+                    }
+                )
+        counts = compute_batch_counts(genes)
+        updated = batch.model_copy(update={"status": "cancelled", "counts": counts})
+        self.batches[batch_id] = updated
+        return updated.model_copy(deep=True)
+
+
 
 class MySQLExpressionContextStore:
     def __init__(self, pool: Any) -> None:
@@ -268,6 +562,22 @@ class MySQLExpressionContextStore:
                         if errno is None and getattr(exc, "args", None):
                             errno = exc.args[0]
                         if errno != 1061:
+                            raise
+                for ddl in CREATE_BATCH_TABLES_SQL:
+                    await cursor.execute(ddl)
+                await cursor.execute(
+                    f"SHOW INDEX FROM {BATCH_GENES_TABLE} WHERE Key_name = 'idx_expression_context_batch_genes_pos'"
+                )
+                if await cursor.fetchone():
+                    try:
+                        await cursor.execute(
+                            f"ALTER TABLE {BATCH_GENES_TABLE} DROP INDEX idx_expression_context_batch_genes_pos"
+                        )
+                    except Exception as exc:
+                        errno = getattr(exc, "errno", None)
+                        if errno is None and getattr(exc, "args", None):
+                            errno = exc.args[0]
+                        if errno != 1091 and "doesn't exist" not in str(exc).lower():
                             raise
 
     @staticmethod
@@ -414,3 +724,345 @@ class MySQLExpressionContextStore:
                 )
                 rows = await cursor.fetchall()
         return [row[0] for row in rows]
+
+    @staticmethod
+    def _row_to_batch(row: Tuple[Any, ...]) -> BatchRecord:
+        batch_id, created_by, created_at, release_id, status, counts_raw, error = row
+        counts_dict = (
+            json.loads(counts_raw) if isinstance(counts_raw, (str, bytes)) else (counts_raw or {})
+        )
+        return BatchRecord(
+            batch_id=batch_id,
+            created_by=created_by,
+            created_at=_utc(created_at),
+            release_id=release_id,
+            status=status,
+            counts=BatchCounts.model_validate(counts_dict),
+            error=error,
+        )
+
+    @staticmethod
+    def _row_to_batch_gene(row: Tuple[Any, ...]) -> BatchGeneRecord:
+        batch_id, position, input_symbol, hugo_symbol, status, error, notes, updated_at = row
+        return BatchGeneRecord(
+            batch_id=batch_id,
+            position=int(position),
+            input_symbol=input_symbol,
+            hugo_symbol=hugo_symbol,
+            status=status,
+            error=error,
+            notes=notes,
+            updated_at=_utc(updated_at),
+        )
+
+    async def _recompute_batch_counts(self, cursor: Any, batch_id: str) -> BatchCounts:
+        await cursor.execute(
+            f"SELECT status, COUNT(*) FROM {BATCH_GENES_TABLE} "
+            "WHERE batch_id = %s GROUP BY status",
+            (batch_id,),
+        )
+        status_rows = await cursor.fetchall()
+        counts_map: Dict[str, int] = {status: 0 for status in BATCH_GENE_STATUSES}
+        total = 0
+        for status_val, cnt in status_rows:
+            c = int(cnt)
+            total += c
+            if status_val in counts_map:
+                counts_map[status_val] = c
+        counts = BatchCounts(total=total, **counts_map)
+        await cursor.execute(
+            f"UPDATE {BATCHES_TABLE} SET counts_json = %s WHERE batch_id = %s",
+            (json.dumps(counts.model_dump()), batch_id),
+        )
+        return counts
+
+    async def create_batch(
+        self, batch: BatchRecord, genes: Sequence[BatchGeneRecord]
+    ) -> None:
+        ordered = sorted(genes, key=lambda g: g.position)
+        counts = compute_batch_counts(ordered)
+        async with self._pool.acquire() as conn:
+            await conn.begin()
+            try:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        f"INSERT INTO {BATCHES_TABLE} "
+                        "(batch_id, created_by, created_at, release_id, status, counts_json, error) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            batch.batch_id,
+                            batch.created_by,
+                            _naive_utc(batch.created_at),
+                            batch.release_id,
+                            batch.status,
+                            json.dumps(counts.model_dump()),
+                            _clip(batch.error),
+                        ),
+                    )
+                    if ordered:
+                        await cursor.executemany(
+                            f"INSERT INTO {BATCH_GENES_TABLE} "
+                            "(batch_id, position, input_symbol, hugo_symbol, status, error, notes, updated_at) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                            [
+                                (
+                                    g.batch_id,
+                                    g.position,
+                                    _clip(g.input_symbol, limit=64) or "",
+                                    g.hugo_symbol,
+                                    g.status,
+                                    _clip(g.error),
+                                    _clip(g.notes),
+                                    _naive_utc(g.updated_at),
+                                )
+                                for g in ordered
+                            ],
+                        )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def get_batch(self, batch_id: str) -> Optional[BatchRecord]:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT batch_id, created_by, created_at, release_id, status, counts_json, error "
+                    f"FROM {BATCHES_TABLE} WHERE batch_id = %s",
+                    (batch_id,),
+                )
+                row = await cursor.fetchone()
+        return None if row is None else self._row_to_batch(row)
+
+    async def list_batch_genes(
+        self, batch_id: str, offset: int = 0, limit: Optional[int] = None
+    ) -> List[BatchGeneRecord]:
+        sql = (
+            "SELECT batch_id, position, input_symbol, hugo_symbol, status, error, notes, updated_at "
+            f"FROM {BATCH_GENES_TABLE} WHERE batch_id = %s ORDER BY position ASC"
+        )
+        params: List[Any] = [batch_id]
+        if limit is not None:
+            sql += " LIMIT %s OFFSET %s"
+            params.extend([max(0, int(limit)), max(0, int(offset))])
+        elif offset > 0:
+            sql += " LIMIT 18446744073709551615 OFFSET %s"
+            params.append(max(0, int(offset)))
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(sql, tuple(params))
+                rows = await cursor.fetchall()
+        return [self._row_to_batch_gene(row) for row in rows]
+
+    async def count_batch_genes(self, batch_id: str) -> int:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT COUNT(*) FROM {BATCH_GENES_TABLE} WHERE batch_id = %s",
+                    (batch_id,),
+                )
+                row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def list_batches(
+        self, created_by: Optional[str], limit: int = 50
+    ) -> List[BatchRecord]:
+        where = "WHERE created_by = %s " if created_by is not None else ""
+        params: List[Any] = [created_by] if created_by is not None else []
+        params.append(max(1, int(limit)))
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT batch_id, created_by, created_at, release_id, status, counts_json, error "
+                    f"FROM {BATCHES_TABLE} {where}ORDER BY created_at DESC, batch_id DESC LIMIT %s",
+                    tuple(params),
+                )
+                rows = await cursor.fetchall()
+        return [self._row_to_batch(row) for row in rows]
+
+    async def list_unfinished_batches(self) -> List[str]:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT batch_id FROM {BATCHES_TABLE} "
+                    "WHERE status IN ('queued', 'running') "
+                    "ORDER BY created_at ASC, batch_id ASC"
+                )
+                rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def acquire_batch_lock(
+        self, batch_id: str, token: str, ttl_seconds: float
+    ) -> bool:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"UPDATE {BATCHES_TABLE} SET worker_owner = %s, "
+                    "worker_expires_at = UTC_TIMESTAMP(6) + INTERVAL %s MICROSECOND "
+                    "WHERE batch_id = %s AND (worker_owner IS NULL "
+                    "OR worker_expires_at < UTC_TIMESTAMP(6) OR worker_owner = %s)",
+                    (token, int(ttl_seconds * 1_000_000), batch_id, token),
+                )
+                await cursor.execute(
+                    f"SELECT COUNT(*) FROM {BATCHES_TABLE} "
+                    "WHERE batch_id = %s AND worker_owner = %s "
+                    "AND worker_expires_at >= UTC_TIMESTAMP(6)",
+                    (batch_id, token),
+                )
+                row = await cursor.fetchone()
+                return bool(row and row[0])
+
+    async def renew_batch_lock(
+        self, batch_id: str, token: str, ttl_seconds: float
+    ) -> bool:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"UPDATE {BATCHES_TABLE} SET "
+                    "worker_expires_at = UTC_TIMESTAMP(6) + INTERVAL %s MICROSECOND "
+                    "WHERE batch_id = %s AND worker_owner = %s "
+                    "AND worker_expires_at >= UTC_TIMESTAMP(6)",
+                    (int(ttl_seconds * 1_000_000), batch_id, token),
+                )
+                await cursor.execute(
+                    f"SELECT COUNT(*) FROM {BATCHES_TABLE} "
+                    "WHERE batch_id = %s AND worker_owner = %s "
+                    "AND worker_expires_at >= UTC_TIMESTAMP(6)",
+                    (batch_id, token),
+                )
+                row = await cursor.fetchone()
+                return bool(row and row[0])
+
+    async def release_batch_lock(self, batch_id: str, token: str) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"UPDATE {BATCHES_TABLE} SET worker_owner = NULL, worker_expires_at = NULL "
+                    "WHERE batch_id = %s AND worker_owner = %s",
+                    (batch_id, token),
+                )
+
+    async def update_batch_gene(
+        self,
+        batch_id: str,
+        position: int,
+        status: BatchGeneStatus,
+        *,
+        error: Optional[str] = None,
+        updated_at: Optional[datetime] = None,
+        expected_token: Optional[str] = None,
+    ) -> Optional[BatchCounts]:
+        when = _naive_utc(updated_at or datetime.now(timezone.utc))
+        async with self._pool.acquire() as conn:
+            await conn.begin()
+            try:
+                async with conn.cursor() as cursor:
+                    if expected_token is not None:
+                        sql = (
+                            f"UPDATE {BATCH_GENES_TABLE} g "
+                            f"JOIN {BATCHES_TABLE} b ON b.batch_id = g.batch_id "
+                            "SET g.status = %s, g.error = %s, g.updated_at = %s "
+                            "WHERE g.batch_id = %s AND g.position = %s "
+                            "AND b.worker_owner = %s AND b.worker_expires_at >= UTC_TIMESTAMP(6) "
+                            "AND b.status != 'cancelled'"
+                        )
+                        await cursor.execute(
+                            sql,
+                            (status, _clip(error), when, batch_id, position, expected_token),
+                        )
+                    else:
+                        sql = (
+                            f"UPDATE {BATCH_GENES_TABLE} g "
+                            f"JOIN {BATCHES_TABLE} b ON b.batch_id = g.batch_id "
+                            "SET g.status = %s, g.error = %s, g.updated_at = %s "
+                            "WHERE g.batch_id = %s AND g.position = %s "
+                            "AND b.status != 'cancelled'"
+                        )
+                        await cursor.execute(
+                            sql,
+                            (status, _clip(error), when, batch_id, position),
+                        )
+                    if cursor.rowcount == 0:
+                        await conn.rollback()
+                        return None
+                    counts = await self._recompute_batch_counts(cursor, batch_id)
+                await conn.commit()
+                return counts
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def update_batch_status(
+        self,
+        batch_id: str,
+        status: BatchStatus,
+        *,
+        error: Optional[str] = None,
+        expected_token: Optional[str] = None,
+    ) -> Optional[BatchRecord]:
+        async with self._pool.acquire() as conn:
+            await conn.begin()
+            try:
+                async with conn.cursor() as cursor:
+                    if expected_token is not None:
+                        sql = (
+                            f"UPDATE {BATCHES_TABLE} SET status = %s, error = %s "
+                            "WHERE batch_id = %s AND status != 'cancelled' "
+                            "AND worker_owner = %s AND worker_expires_at >= UTC_TIMESTAMP(6)"
+                        )
+                        await cursor.execute(
+                            sql,
+                            (status, _clip(error), batch_id, expected_token),
+                        )
+                    else:
+                        sql = (
+                            f"UPDATE {BATCHES_TABLE} SET status = %s, error = %s "
+                            "WHERE batch_id = %s AND status != 'cancelled'"
+                        )
+                        await cursor.execute(
+                            sql,
+                            (status, _clip(error), batch_id),
+                        )
+                    if cursor.rowcount == 0:
+                        await conn.rollback()
+                        return None
+                    await self._recompute_batch_counts(cursor, batch_id)
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+        return await self.get_batch(batch_id)
+
+    async def cancel_batch(
+        self, batch_id: str, *, updated_at: Optional[datetime] = None
+    ) -> Optional[BatchRecord]:
+        when = _naive_utc(updated_at or datetime.now(timezone.utc))
+        async with self._pool.acquire() as conn:
+            await conn.begin()
+            try:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        f"SELECT status FROM {BATCHES_TABLE} WHERE batch_id = %s FOR UPDATE",
+                        (batch_id,),
+                    )
+                    row = await cursor.fetchone()
+                    if row is None:
+                        await conn.rollback()
+                        return None
+                    if row[0] not in ("done", "failed", "cancelled"):
+                        await cursor.execute(
+                            f"UPDATE {BATCH_GENES_TABLE} "
+                            "SET status = 'failed', error = 'cancelled', updated_at = %s "
+                            "WHERE batch_id = %s AND status IN ('queued', 'running')",
+                            (when, batch_id),
+                        )
+                        await self._recompute_batch_counts(cursor, batch_id)
+                        await cursor.execute(
+                            f"UPDATE {BATCHES_TABLE} SET status = 'cancelled' WHERE batch_id = %s",
+                            (batch_id,),
+                        )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+        return await self.get_batch(batch_id)

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 import time
 import uuid
@@ -56,7 +57,11 @@ from src.expression_context.dmt_adc import index_for_gene
 from src.expression_context.csv_export import (
     check_sheet_cancer_names,
     csv_filename,
+    curator_sheet_filename,
+    curator_sheet_not_found_row,
+    curator_sheet_row_from_view,
     format_csv_rows,
+    format_curator_sheet_rows,
     format_golden_set_rows,
     gene_view_csv_rows,
     golden_set_filename,
@@ -73,6 +78,12 @@ from src.expression_context.literature_gate import (
 from src.expression_context.models import (
     HIGH_CONFIDENCE,
     SYMBOL_PATTERN,
+    BatchDetail,
+    BatchGeneItem,
+    BatchGeneRecord,
+    BatchListPage,
+    BatchRecord,
+    BatchSummary,
     BundleProvenance,
     BundleStatus,
     CancerTypeStats,
@@ -94,6 +105,7 @@ from src.expression_context.models import (
 )
 from src.expression_context.store import (
     ExpressionContextStore,
+    compute_batch_counts,
     decode_cursor,
     encode_cursor,
 )
@@ -108,6 +120,10 @@ class InvalidGene(ValueError):
 
 
 class GeneNotFound(LookupError):
+    pass
+
+
+class BatchNotFound(LookupError):
     pass
 
 
@@ -185,6 +201,8 @@ class ExpressionContextService:
         lease: Optional[VerdictLease] = None,
         lease_wait_seconds: float = 300.0,
         lease_poll_seconds: float = 2.0,
+        batch_lock_ttl_seconds: float = 60.0,
+        batch_recovery_interval: float = 60.0,
         refresher: Optional[Any] = None,
         closers: Sequence[Callable[[], Awaitable[None]]] = (),
         releases_repo: str = "",
@@ -212,8 +230,12 @@ class ExpressionContextService:
         self._lease = lease or VerdictLease(ttl_seconds=120.0)
         self._lease_wait_seconds = lease_wait_seconds
         self._lease_poll_seconds = lease_poll_seconds
+        self._batch_lock_ttl_seconds = batch_lock_ttl_seconds
+        self._batch_recovery_interval = batch_recovery_interval
+        self._recovery_task: Optional[asyncio.Task] = None
         self._inflight: Dict[Tuple[str, str, str], asyncio.Future] = {}
         self._tasks: Set[asyncio.Task] = set()
+        self._batch_tasks: Dict[str, asyncio.Task] = {}
         self._tier_warned: Set[str] = set()
         self._purity_warned: Set[str] = set()
 
@@ -937,6 +959,629 @@ class ExpressionContextService:
         content = format_golden_set_rows(rows, include_header=True, include_bom=True)
         return filename, content
 
+    async def export_gene_curator_sheet_csv(self, gene: str) -> Tuple[str, str]:
+        bundle = await self.catalog.active()
+        await self.catalog.verify_active(bundle)
+        name_map = load_sheet_cancer_names()
+        check_sheet_cancer_names(bundle, name_map)
+
+        view, _ = await self.gene_view(gene)
+        await self.catalog.verify_active(bundle)
+
+        row = curator_sheet_row_from_view(
+            view,
+            name_map=name_map,
+            queried_as=gene,
+        )
+        filename = curator_sheet_filename(view.hugo_symbol, bundle.release_id)
+        content = format_curator_sheet_rows([row], include_header=True, include_bom=True)
+        return filename, content
+
+    # --------------------------------------------------------------- batches
+
+    async def submit_batch(
+        self, raw_genes: Sequence[str], owner: Optional[str]
+    ) -> BatchRecord:
+        cleaned = [str(g or "").strip() for g in raw_genes if str(g or "").strip()]
+        if not cleaned or len(cleaned) > 2000:
+            raise InvalidGene("Batch must contain between 1 and 2000 non-empty gene entries.")
+
+        bundle = await self.catalog.active()
+        await self.catalog.verify_active(bundle)
+
+        now = self._clock()
+        batch_id = str(uuid.uuid4())
+        genes: List[BatchGeneRecord] = []
+        seen_hugo: Dict[str, int] = {}
+        seen_not_found: Dict[str, int] = {}
+        dup_notes: Dict[int, List[str]] = {}
+
+        for input_idx, raw in enumerate(cleaned, start=1):
+            if len(raw) > 64:
+                stored_raw = raw[:64]
+                key = raw.upper()
+                if key in seen_not_found:
+                    first_pos = seen_not_found[key]
+                    dup_notes.setdefault(first_pos, []).append(
+                        f"duplicate of row {first_pos + 1}"
+                    )
+                    continue
+                pos = len(genes)
+                seen_not_found[key] = pos
+                genes.append(
+                    BatchGeneRecord(
+                        batch_id=batch_id,
+                        position=pos,
+                        input_symbol=stored_raw,
+                        hugo_symbol=None,
+                        status="not_found",
+                        error="entry exceeds 64 characters (truncated)",
+                        notes="entry exceeds 64 characters (truncated)",
+                        updated_at=now,
+                    )
+                )
+                continue
+
+            hugo: Optional[str] = None
+            try:
+                symbol = normalize_symbol(raw)
+            except InvalidGene:
+                symbol = None
+
+            if symbol is not None:
+                artifact = await self.catalog.gene(bundle, symbol)
+                if artifact is None:
+                    target = await self.catalog.alias(bundle, symbol)
+                    if target and target != symbol:
+                        artifact = await self.catalog.gene(bundle, target)
+                if artifact is not None:
+                    hugo = artifact.gene.hugo_symbol.upper()
+
+            if hugo is not None:
+                if hugo in seen_hugo:
+                    first_pos = seen_hugo[hugo]
+                    note = f"duplicate of row {first_pos + 1}"
+                    if raw.upper() != hugo:
+                        note = f"queried as {raw} (row {input_idx}); duplicate of row {first_pos + 1}"
+                    dup_notes.setdefault(first_pos, []).append(note)
+                    continue
+                pos = len(genes)
+                seen_hugo[hugo] = pos
+                genes.append(
+                    BatchGeneRecord(
+                        batch_id=batch_id,
+                        position=pos,
+                        input_symbol=raw,
+                        hugo_symbol=hugo,
+                        status="queued",
+                        updated_at=now,
+                    )
+                )
+            else:
+                key = raw.upper()
+                if key in seen_not_found:
+                    first_pos = seen_not_found[key]
+                    dup_notes.setdefault(first_pos, []).append(
+                        f"duplicate of row {first_pos + 1}"
+                    )
+                    continue
+                pos = len(genes)
+                seen_not_found[key] = pos
+                genes.append(
+                    BatchGeneRecord(
+                        batch_id=batch_id,
+                        position=pos,
+                        input_symbol=raw,
+                        hugo_symbol=None,
+                        status="not_found",
+                        error="not in expression data",
+                        updated_at=now,
+                    )
+                )
+
+        for pos, notes_list in dup_notes.items():
+            existing = [genes[pos].notes] if genes[pos].notes else []
+            unique_notes = list(dict.fromkeys(existing + notes_list))
+            genes[pos] = genes[pos].model_copy(
+                update={"notes": "; ".join(unique_notes)}
+            )
+
+        counts = compute_batch_counts(genes)
+        initial_status = "done" if counts.queued == 0 else "queued"
+        batch = BatchRecord(
+            batch_id=batch_id,
+            created_by=owner,
+            created_at=now,
+            release_id=bundle.release_id,
+            status=initial_status,
+            counts=counts,
+        )
+        await self.store.create_batch(batch, genes)
+        if initial_status == "queued":
+            self._spawn_batch_worker(batch_id)
+        return batch
+
+    def _spawn_batch_worker(self, batch_id: str) -> None:
+        existing = self._batch_tasks.get(batch_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._run_batch(batch_id))
+        self._tasks.add(task)
+        self._batch_tasks[batch_id] = task
+
+        def _cleanup(t: asyncio.Task) -> None:
+            self._tasks.discard(t)
+            if self._batch_tasks.get(batch_id) is t:
+                self._batch_tasks.pop(batch_id, None)
+
+        task.add_done_callback(_cleanup)
+
+    async def resume_unfinished_batches(self) -> List[str]:
+        batch_ids = await self.store.list_unfinished_batches()
+        resumed = []
+        for batch_id in batch_ids:
+            existing = self._batch_tasks.get(batch_id)
+            if existing is None or existing.done():
+                self._spawn_batch_worker(batch_id)
+                resumed.append(batch_id)
+        return resumed
+
+    async def _batch_recovery_loop(self) -> None:
+        while True:
+            jitter = random.uniform(0.0, min(10.0, self._batch_recovery_interval * 0.2))
+            await asyncio.sleep(self._batch_recovery_interval + jitter)
+            try:
+                await self.resume_unfinished_batches()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Periodic batch recovery failed: %s", exc)
+
+    async def _batch_heartbeat(
+        self, batch_id: str, token: str, ttl: float, lost_flag: List[bool]
+    ) -> None:
+        interval = max(0.02, ttl / 3)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                held = await self.store.renew_batch_lock(batch_id, token, ttl)
+            except Exception as exc:
+                logger.warning("Batch lock renewal failed for %s: %s", batch_id, exc)
+                held = False
+            if not held:
+                lost_flag[0] = True
+                return
+
+    async def _run_batch(self, batch_id: str) -> None:
+        token = uuid.uuid4().hex
+        ttl = self._batch_lock_ttl_seconds
+        try:
+            acquired = await self.store.acquire_batch_lock(batch_id, token, ttl)
+        except Exception as exc:
+            logger.warning("Could not acquire batch lock for %s: %s", batch_id, exc)
+            return
+        if not acquired:
+            return
+
+        lost_flag = [False]
+        heartbeat = asyncio.create_task(
+            self._batch_heartbeat(batch_id, token, ttl, lost_flag)
+        )
+        try:
+            batch = await self.store.get_batch(batch_id)
+            if batch is None or batch.status in ("done", "failed", "cancelled"):
+                return
+            if batch.status == "queued":
+                res = await self.store.update_batch_status(
+                    batch_id, "running", expected_token=token
+                )
+                if res is None:
+                    return
+
+            genes = await self.store.list_batch_genes(batch_id)
+            for gene_row in genes:
+                if lost_flag[0]:
+                    logger.warning("Lost batch worker lease for %s; stopping", batch_id)
+                    return
+                current_batch = await self.store.get_batch(batch_id)
+                if current_batch is None or current_batch.status == "cancelled":
+                    return
+                if gene_row.status not in ("queued", "running"):
+                    continue
+                if not gene_row.hugo_symbol:
+                    res = await self.store.update_batch_gene(
+                        batch_id,
+                        gene_row.position,
+                        "not_found",
+                        error="not in expression data",
+                        updated_at=self._clock(),
+                        expected_token=token,
+                    )
+                    if res is None:
+                        return
+                    continue
+
+                res = await self.store.update_batch_gene(
+                    batch_id,
+                    gene_row.position,
+                    "running",
+                    updated_at=self._clock(),
+                    expected_token=token,
+                )
+                if res is None:
+                    return
+                try:
+                    resolved = await self.resolve(gene_row.hugo_symbol)
+                    existing = await self.store.get_verdict_pairs(
+                        resolved.hugo_symbol, self.gate.name
+                    )
+                    view = self._evaluate_gene_view(resolved, existing)
+                    has_stats_pass = any(p.stats_pass for p in view.pairs)
+                    eligible_pairs = [p for p in view.pairs if p.literature_eligible]
+
+                    if not has_stats_pass or not eligible_pairs:
+                        res = await self.store.update_batch_gene(
+                            batch_id,
+                            gene_row.position,
+                            "skipped_no_stats",
+                            updated_at=self._clock(),
+                            expected_token=token,
+                        )
+                        if res is None:
+                            return
+                        continue
+
+                    pending_eligible = [
+                        p for p in eligible_pairs if p.status == "literature_pending"
+                    ]
+                    if not pending_eligible:
+                        res = await self.store.update_batch_gene(
+                            batch_id,
+                            gene_row.position,
+                            "skipped_fresh",
+                            updated_at=self._clock(),
+                            expected_token=token,
+                        )
+                        if res is None:
+                            return
+                        continue
+
+                    evaluate_entrypoint = getattr(self, "evaluate")
+                    _result, _evaluated, _reused, pair_errors = await evaluate_entrypoint(
+                        resolved, batch.created_by, refresh=False
+                    )
+                    if pair_errors:
+                        err_msg = "; ".join(
+                            f"{e.oncotree_code}: {e.error}" for e in pair_errors
+                        )
+                        res = await self.store.update_batch_gene(
+                            batch_id,
+                            gene_row.position,
+                            "failed",
+                            error=err_msg[:1000],
+                            updated_at=self._clock(),
+                            expected_token=token,
+                        )
+                    else:
+                        res = await self.store.update_batch_gene(
+                            batch_id,
+                            gene_row.position,
+                            "done",
+                            updated_at=self._clock(),
+                            expected_token=token,
+                        )
+                    if res is None:
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except GeneNotFound:
+                    res = await self.store.update_batch_gene(
+                        batch_id,
+                        gene_row.position,
+                        "not_found",
+                        error="not in expression data",
+                        updated_at=self._clock(),
+                        expected_token=token,
+                    )
+                    if res is None:
+                        return
+                except Exception as exc:
+                    logger.warning(
+                        "Batch %s gene %s failed: %s",
+                        batch_id,
+                        gene_row.input_symbol,
+                        exc,
+                    )
+                    res = await self.store.update_batch_gene(
+                        batch_id,
+                        gene_row.position,
+                        "failed",
+                        error=f"{type(exc).__name__}: {exc}"[:1000],
+                        updated_at=self._clock(),
+                        expected_token=token,
+                    )
+                    if res is None:
+                        return
+
+            if not lost_flag[0]:
+                final_batch = await self.store.get_batch(batch_id)
+                if final_batch is not None and final_batch.status not in (
+                    "cancelled",
+                    "failed",
+                ):
+                    await self.store.update_batch_status(
+                        batch_id, "done", expected_token=token
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Expression-context batch %s crashed", batch_id)
+            if not lost_flag[0]:
+                await self.store.update_batch_status(
+                    batch_id, "failed", error=f"{type(exc).__name__}: {exc}"[:1000], expected_token=token
+                )
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            try:
+                await self.store.release_batch_lock(batch_id, token)
+            except Exception as exc:
+                logger.warning("Batch lock release failed for %s: %s", batch_id, exc)
+
+    async def get_batch_detail(
+        self, batch_id: str, *, offset: int = 0, limit: int = 200
+    ) -> BatchDetail:
+        batch = await self.store.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFound(batch_id)
+        total = await self.store.count_batch_genes(batch_id)
+        gene_rows = await self.store.list_batch_genes(batch_id, offset=offset, limit=limit)
+        items = [
+            BatchGeneItem(
+                position=g.position,
+                input_symbol=g.input_symbol,
+                hugo_symbol=g.hugo_symbol,
+                status=g.status,
+                error=g.error,
+                notes=g.notes,
+                updated_at=g.updated_at,
+            )
+            for g in gene_rows
+        ]
+        return BatchDetail(
+            batch_id=batch.batch_id,
+            created_by=batch.created_by,
+            created_at=batch.created_at,
+            release_id=batch.release_id,
+            status=batch.status,
+            counts=batch.counts,
+            error=batch.error,
+            genes=items,
+            total_genes=total,
+            offset=offset,
+            limit=limit,
+        )
+
+    async def list_user_batches(
+        self, created_by: Optional[str], *, limit: int = 50
+    ) -> BatchListPage:
+        records = await self.store.list_batches(created_by, limit=limit)
+        return BatchListPage(
+            items=[
+                BatchSummary(
+                    batch_id=r.batch_id,
+                    created_by=r.created_by,
+                    created_at=r.created_at,
+                    release_id=r.release_id,
+                    status=r.status,
+                    counts=r.counts,
+                    error=r.error,
+                )
+                for r in records
+            ]
+        )
+
+    async def cancel_batch(self, batch_id: str) -> BatchDetail:
+        batch = await self.store.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFound(batch_id)
+        await self.store.cancel_batch(batch_id, updated_at=self._clock())
+        task = self._batch_tasks.get(batch_id)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return await self.get_batch_detail(batch_id)
+
+    async def _resolve_in_bundle(
+        self, bundle: ActiveBundle, symbol: str, query: str
+    ) -> Optional[ResolvedGene]:
+        artifact = await self.catalog.gene(bundle, symbol)
+        if artifact is None:
+            target = await self.catalog.alias(bundle, symbol)
+            if target and target != symbol:
+                artifact = await self.catalog.gene(bundle, target)
+        if artifact is None:
+            return None
+        return ResolvedGene(
+            query=query,
+            hugo_symbol=artifact.gene.hugo_symbol.upper(),
+            manifest=bundle.manifest,
+            artifact=artifact,
+            bundle=bundle,
+        )
+
+    async def _stream_batch_views_to_csv(
+        self,
+        batch_id: str,
+        bundle: ActiveBundle,
+        *,
+        gene_to_rows: Callable[[BatchGeneRecord, ActiveBundle], Awaitable[List[List[str]]]],
+        format_rows: Callable[..., str],
+        page_size: int = 50,
+    ) -> Tuple[ActiveBundle, AsyncIterator[str]]:
+        batch = await self.store.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFound(batch_id)
+
+        await self.catalog.verify_active(bundle)
+        page_limit = max(1, min(page_size, 200))
+
+        async def fetch_page(offset: int) -> Tuple[List[BatchGeneRecord], List[List[str]]]:
+            await self.catalog.verify_active(bundle)
+            gene_records = await self.store.list_batch_genes(
+                batch_id, offset=offset, limit=page_limit
+            )
+            if not gene_records:
+                return [], []
+            page_rows: List[List[str]] = []
+            for gene_record in gene_records:
+                await self.catalog.verify_active(bundle)
+                rows = await gene_to_rows(gene_record, bundle)
+                page_rows.extend(rows)
+            return gene_records, page_rows
+
+        first_genes, first_page_rows = await fetch_page(0)
+        await self.catalog.verify_active(bundle)
+
+        async def stream() -> AsyncIterator[str]:
+            try:
+                await self.catalog.verify_active(bundle)
+            except (BundleGone, BundleNotLoaded) as exc:
+                logger.error("Active bundle superseded before starting batch export stream: %s", exc)
+                raise
+
+            yield format_rows((), include_header=True, include_bom=True)
+
+            if first_page_rows:
+                yield format_rows(first_page_rows, include_header=False, include_bom=False)
+
+            if len(first_genes) < page_limit:
+                try:
+                    await self.catalog.verify_active(bundle)
+                except (BundleGone, BundleNotLoaded) as exc:
+                    logger.error("Active bundle superseded before ending batch export stream: %s", exc)
+                    raise
+                return
+
+            offset = len(first_genes)
+            while True:
+                genes, page_rows = await fetch_page(offset)
+                if not genes:
+                    break
+                try:
+                    await self.catalog.verify_active(bundle)
+                except (BundleGone, BundleNotLoaded) as exc:
+                    logger.error("Active bundle superseded during batch export stream: %s", exc)
+                    raise
+                if page_rows:
+                    yield format_rows(page_rows, include_header=False, include_bom=False)
+                if len(genes) < page_limit:
+                    break
+                offset += len(genes)
+
+            try:
+                await self.catalog.verify_active(bundle)
+            except (BundleGone, BundleNotLoaded) as exc:
+                logger.error("Active bundle superseded before ending batch export stream: %s", exc)
+                raise
+
+        return bundle, stream()
+
+    async def export_batch_per_pair_csv(
+        self, batch_id: str, *, include_excluded: bool = False, page_size: int = 50
+    ) -> Tuple[str, AsyncIterator[str]]:
+        bundle = await self.catalog.active()
+        await self.catalog.verify_active(bundle)
+
+        async def gene_to_rows(gene_row: BatchGeneRecord, active_bundle: ActiveBundle) -> List[List[str]]:
+            if not gene_row.hugo_symbol or gene_row.status == "not_found":
+                return []
+            resolved = await self._resolve_in_bundle(
+                active_bundle, gene_row.hugo_symbol, gene_row.input_symbol
+            )
+            if resolved is None:
+                return []
+            view, _ = await self.gene_view(resolved.hugo_symbol, resolved=resolved)
+            return gene_view_csv_rows(view, include_excluded=include_excluded)
+
+        active_bundle, stream = await self._stream_batch_views_to_csv(
+            batch_id,
+            bundle,
+            gene_to_rows=gene_to_rows,
+            format_rows=format_csv_rows,
+            page_size=page_size,
+        )
+        return csv_filename(f"batch-{batch_id}", active_bundle.release_id), stream
+
+    async def export_batch_golden_set_csv(
+        self, batch_id: str, *, page_size: int = 50
+    ) -> Tuple[str, AsyncIterator[str]]:
+        bundle = await self.catalog.active()
+        await self.catalog.verify_active(bundle)
+        name_map = load_sheet_cancer_names()
+        check_sheet_cancer_names(bundle, name_map)
+
+        async def gene_to_rows(gene_row: BatchGeneRecord, active_bundle: ActiveBundle) -> List[List[str]]:
+            if not gene_row.hugo_symbol or gene_row.status == "not_found":
+                return []
+            resolved = await self._resolve_in_bundle(
+                active_bundle, gene_row.hugo_symbol, gene_row.input_symbol
+            )
+            if resolved is None:
+                return []
+            view, _ = await self.gene_view(resolved.hugo_symbol, resolved=resolved)
+            return [golden_set_row_from_view(view, name_map=name_map)]
+
+        active_bundle, stream = await self._stream_batch_views_to_csv(
+            batch_id,
+            bundle,
+            gene_to_rows=gene_to_rows,
+            format_rows=format_golden_set_rows,
+            page_size=page_size,
+        )
+        return golden_set_filename(f"batch-{batch_id}_{active_bundle.release_id}"), stream
+
+    async def export_batch_curator_sheet_csv(
+        self, batch_id: str, *, page_size: int = 50
+    ) -> Tuple[str, AsyncIterator[str]]:
+        bundle = await self.catalog.active()
+        await self.catalog.verify_active(bundle)
+        name_map = load_sheet_cancer_names()
+        check_sheet_cancer_names(bundle, name_map)
+
+        async def gene_to_rows(gene_row: BatchGeneRecord, active_bundle: ActiveBundle) -> List[List[str]]:
+            extra_notes = (
+                [n.strip() for n in gene_row.notes.split(";") if n.strip()]
+                if gene_row.notes
+                else []
+            )
+            if not gene_row.hugo_symbol or gene_row.status == "not_found":
+                return [curator_sheet_not_found_row(gene_row.input_symbol, extra_notes=extra_notes)]
+            resolved = await self._resolve_in_bundle(
+                active_bundle, gene_row.hugo_symbol, gene_row.input_symbol
+            )
+            if resolved is None:
+                return [curator_sheet_not_found_row(gene_row.input_symbol, extra_notes=extra_notes)]
+            view, _ = await self.gene_view(resolved.hugo_symbol, resolved=resolved)
+            return [
+                curator_sheet_row_from_view(
+                    view,
+                    name_map=name_map,
+                    queried_as=gene_row.input_symbol,
+                    extra_notes=extra_notes,
+                    literature_failed=(gene_row.status == "failed"),
+                )
+            ]
+
+        active_bundle, stream = await self._stream_batch_views_to_csv(
+            batch_id,
+            bundle,
+            gene_to_rows=gene_to_rows,
+            format_rows=format_curator_sheet_rows,
+            page_size=page_size,
+        )
+        return curator_sheet_filename(f"batch-{batch_id}", active_bundle.release_id), stream
+
     async def _alias_target(self, symbol: str) -> Optional[str]:
         # BundleNotLoaded propagates (-> 503): "can't resolve yet" is not a 404.
         for attempt in range(2):
@@ -990,15 +1635,23 @@ class ExpressionContextService:
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
-        """Start the background bundle refresher (first check runs immediately)."""
+        """Start the background bundle refresher and resume any unfinished batches."""
         if self.refresher is not None and self._refresh_task is None:
             self._refresh_task = asyncio.create_task(self.refresher.run_forever())
+        resume_task = asyncio.create_task(self.resume_unfinished_batches())
+        self._tasks.add(resume_task)
+        resume_task.add_done_callback(self._tasks.discard)
+        if self._recovery_task is None:
+            self._recovery_task = asyncio.create_task(self._batch_recovery_loop())
 
     async def aclose(self) -> None:
         tasks = list(self._tasks)
         if self._refresh_task is not None:
             tasks.append(self._refresh_task)
             self._refresh_task = None
+        if self._recovery_task is not None:
+            tasks.append(self._recovery_task)
+            self._recovery_task = None
         for task in tasks:
             task.cancel()
         if tasks:
