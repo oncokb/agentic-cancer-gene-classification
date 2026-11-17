@@ -70,6 +70,7 @@ class AuthenticatedUser(BaseModel):
     # "session" (cookie / session bearer token) or "api_key" (Authorization: Bearer acgc_...)
     auth_method: str = "session"
     api_key_id: Optional[str] = None
+    session_generation: int = 1
 
 
 class UserProfile(BaseModel):
@@ -87,6 +88,7 @@ class UserProfile(BaseModel):
     login_count: int = 1
     annotation_count: int = 0
     last_annotation_at: Optional[str] = None
+    session_generation: int = 1
 
 
 class AuthUserResponse(BaseModel):
@@ -248,6 +250,7 @@ def _profile_from_record(record: "UserRecord") -> UserProfile:
         login_count=record.login_count,
         annotation_count=record.annotation_count,
         last_annotation_at=_iso(record.last_annotation_at),
+        session_generation=record.session_generation,
     )
 
 
@@ -716,6 +719,7 @@ def create_session_token(user: AuthenticatedUser, ttl_seconds: Optional[int] = N
         "status": user.status,
         "provider": user.provider,
         "groups": user.groups,
+        "gen": getattr(user, "session_generation", 1),
         "iat": now,
         "exp": now + ttl,
     }
@@ -774,6 +778,7 @@ def decode_session_token(token: str) -> Optional[AuthenticatedUser]:
             status=payload.get("status", "active"),
             provider=payload.get("provider", "google"),
             groups=payload.get("groups", []),
+            session_generation=int(payload.get("gen", 1)),
         )
     except Exception:
         logger.exception("Failed to decode session token")
@@ -793,17 +798,26 @@ def validate_redirect_to(value: Any) -> str:
     return value
 
 
-def create_oauth_state(redirect_to: str = "/") -> str:
+def create_oauth_state(
+    redirect_to: str = "/",
+    provider: Optional[str] = None,
+    txn: Optional[str] = None,
+    nonce: Optional[str] = None,
+) -> str:
     """
     Generates a tamper-proof state token for CSRF protection during OAuth / SAML flow.
     """
     now = int(time.time())
     payload = {
-        "nonce": secrets.token_hex(16),
+        "nonce": nonce or secrets.token_hex(16),
         "redirect_to": validate_redirect_to(redirect_to),
         "iat": now,
         "exp": now + 900,  # 15 minutes
     }
+    if txn:
+        payload["txn"] = txn
+    if provider:
+        payload["provider"] = provider
     payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("utf-8").rstrip("=")
 
@@ -844,10 +858,187 @@ def verify_oauth_state(state: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Browser-bound OAuth Transactions & PKCE (F3a / F3b)
+# ---------------------------------------------------------------------------
+
+OAUTH_TXN_COOKIE_NAME = "agcg_oauth_txn"
+OAUTH_TXN_TTL_SECONDS = 900  # 15 minutes
+_consumed_oauth_txns: Dict[str, float] = {}
+_consumed_oauth_txns_lock = asyncio.Lock()
+
+
+def generate_pkce_pair() -> Tuple[str, str]:
+    """Generates an RFC 7636 PKCE code_verifier and S256 code_challenge."""
+    code_verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return code_verifier, code_challenge
+
+
+def create_oauth_transaction(
+    provider: str,
+    redirect_to: str = "/",
+) -> Tuple[str, str, str, str, str, str]:
+    """Creates a new browser-bound OAuth transaction with PKCE.
+
+    Returns:
+        (txn_id, state_token, cookie_value, code_verifier, code_challenge, nonce)
+    """
+    txn_id = secrets.token_urlsafe(32)
+    nonce = secrets.token_hex(16)
+    code_verifier, code_challenge = generate_pkce_pair()
+
+    state = create_oauth_state(
+        redirect_to=validate_redirect_to(redirect_to),
+        provider=provider,
+        txn=txn_id,
+        nonce=nonce,
+    )
+
+    now = int(time.time())
+    cookie_payload = {
+        "txn": txn_id,
+        "provider": provider,
+        "nonce": nonce,
+        "code_verifier": code_verifier,
+        "exp": now + OAUTH_TXN_TTL_SECONDS,
+    }
+    payload_bytes = json.dumps(cookie_payload, separators=(",", ":")).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("utf-8").rstrip("=")
+    sig_raw = f"{txn_id}.{payload_b64}".encode("utf-8")
+    secret = get_auth_secret_key().encode("utf-8")
+    sig = hmac.new(secret, sig_raw, hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(sig).decode("utf-8").rstrip("=")
+    cookie_value = f"{txn_id}.{payload_b64}.{sig_b64}"
+
+    return txn_id, state, cookie_value, code_verifier, code_challenge, nonce
+
+
+def set_oauth_txn_cookie(response: Response, cookie_value: str, request: Optional[Request] = None) -> None:
+    response.set_cookie(
+        key=OAUTH_TXN_COOKIE_NAME,
+        value=cookie_value,
+        max_age=OAUTH_TXN_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=is_cookie_secure(request),
+        path="/",
+    )
+
+
+async def save_oauth_transaction(
+    txn_id: str,
+    provider: str,
+    code_verifier: str,
+    nonce: str,
+) -> None:
+    """Stores transaction data in Redis if available."""
+    redis_client = await _profile_store_redis()
+    if redis_client is not None:
+        try:
+            data = json.dumps({
+                "provider": provider,
+                "code_verifier": code_verifier,
+                "nonce": nonce,
+            })
+            await redis_client.set(
+                f"agcg:oauth_txn:{txn_id}",
+                data,
+                ex=OAUTH_TXN_TTL_SECONDS,
+            )
+        except Exception as exc:
+            logger.debug("Failed to store OAuth transaction in Redis: %s", exc)
+
+
+async def consume_oauth_transaction(
+    txn_id: str,
+    cookie_value: Optional[str],
+    expected_provider: str,
+) -> Optional[Dict[str, Any]]:
+    """Atomically consumes an OAuth transaction (single-use).
+
+    Checks Redis first with GETDEL. If Redis is unavailable or unconfigured,
+    falls back to verifying the signed transaction cookie and tracking single-use
+    consumption in an in-memory TTL dictionary.
+
+    Returns dict with keys ('provider', 'code_verifier', 'nonce') on success,
+    or None if invalid, mismatched, expired, or already consumed.
+    """
+    now = int(time.time())
+    redis_client = await _profile_store_redis()
+    if redis_client is not None:
+        try:
+            raw = await redis_client.getdel(f"agcg:oauth_txn:{txn_id}")
+            if raw:
+                await redis_client.set(f"agcg:oauth_consumed:{txn_id}", "1", ex=OAUTH_TXN_TTL_SECONDS)
+                data = json.loads(raw)
+                if data.get("provider") != expected_provider:
+                    return None
+                return data
+            was_consumed = await redis_client.get(f"agcg:oauth_consumed:{txn_id}")
+            if was_consumed:
+                logger.warning("OAuth transaction %s was already consumed (Redis)", txn_id)
+                return None
+        except Exception as exc:
+            logger.debug("Redis error during consume_oauth_transaction: %s", exc)
+
+    if not cookie_value or "." not in cookie_value:
+        return None
+
+    parts = cookie_value.split(".")
+    if len(parts) != 3:
+        return None
+
+    cookie_txn, payload_b64, sig_b64 = parts
+    if cookie_txn != txn_id:
+        return None
+
+    secret = get_auth_secret_key().encode("utf-8")
+    sig_raw = f"{cookie_txn}.{payload_b64}".encode("utf-8")
+    expected_sig = hmac.new(secret, sig_raw, hashlib.sha256).digest()
+    expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode("utf-8").rstrip("=")
+
+    if not hmac.compare_digest(sig_b64, expected_sig_b64):
+        logger.warning("OAuth transaction cookie HMAC verification failed")
+        return None
+
+    try:
+        padding = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding).decode("utf-8"))
+    except Exception:
+        return None
+
+    if payload.get("exp", 0) < now:
+        logger.warning("OAuth transaction cookie expired")
+        return None
+
+    if payload.get("provider") != expected_provider:
+        logger.warning("OAuth transaction provider mismatch (%s != %s)", payload.get("provider"), expected_provider)
+        return None
+
+    async with _consumed_oauth_txns_lock:
+        expired = [k for k, exp in _consumed_oauth_txns.items() if exp < now]
+        for k in expired:
+            _consumed_oauth_txns.pop(k, None)
+
+        if txn_id in _consumed_oauth_txns:
+            logger.warning("OAuth transaction %s was already consumed (cookie fallback)", txn_id)
+            return None
+        _consumed_oauth_txns[txn_id] = now + OAUTH_TXN_TTL_SECONDS
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Google OAuth 2.0 / OIDC Helpers
 # ---------------------------------------------------------------------------
 
-def get_google_auth_url(redirect_uri: str, state: str) -> str:
+def get_google_auth_url(
+    redirect_uri: str,
+    state: str,
+    code_challenge: Optional[str] = None,
+    nonce: Optional[str] = None,
+) -> str:
     params = {
         "client_id": settings.google_client_id,
         "response_type": "code",
@@ -857,10 +1048,19 @@ def get_google_auth_url(redirect_uri: str, state: str) -> str:
         "access_type": "online",
         "prompt": "select_account",
     }
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+    if nonce:
+        params["nonce"] = nonce
     return f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}"
 
 
-async def exchange_google_code(code: str, redirect_uri: str) -> Dict[str, Any]:
+async def exchange_google_code(
+    code: str,
+    redirect_uri: str,
+    code_verifier: Optional[str] = None,
+) -> Dict[str, Any]:
     if not settings.google_client_secret or not settings.google_client_secret.strip():
         logger.error("Google OAuth token exchange failed: GOOGLE_CLIENT_SECRET is missing or empty in environment.")
         raise HTTPException(
@@ -878,6 +1078,8 @@ async def exchange_google_code(code: str, redirect_uri: str) -> Dict[str, Any]:
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
     }
+    if code_verifier:
+        data["code_verifier"] = code_verifier
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(GOOGLE_TOKEN_ENDPOINT, data=data)
         if resp.status_code != 200:
@@ -938,6 +1140,13 @@ def build_saml_authn_request(acs_url: str, relay_state: str = "/") -> Tuple[str,
 def parse_saml_response(saml_response_b64: str) -> SAMLAssertionData:
     """
     Decodes and parses a SAML 2.0 Response XML, extracting NameID, attributes, and groups.
+
+    SECURITY NOTE (Finding F1 in acgc-auth-audit):
+    This parser extracts assertion elements without verifying XML digital signatures
+    (ds:Signature) or Assertion conditions/recipients against an IdP certificate.
+    Starting ACGC with SAML_ENABLED=true is refused at application startup (lifespan)
+    via saml_startup_error() until a full, library-backed signed assertion verification
+    is implemented.
     """
     try:
         xml_bytes = base64.b64decode(saml_response_b64)
@@ -1052,14 +1261,41 @@ def generate_sp_metadata_xml(acs_url: str, sp_entity_id: Optional[str] = None) -
 # Cookie & Dependency Helpers
 # ---------------------------------------------------------------------------
 
-def set_session_cookie(response: Response, token: str, is_secure: bool = False) -> None:
+def is_cookie_secure(request: Optional[Request] = None) -> bool:
+    """Whether session and auth cookies must have the Secure flag.
+
+    In deployed mode (PUBLIC_APP_BASE_URL starts with https://), Secure is
+    always required, regardless of the incoming request.url.scheme (which may be
+    http:// behind an internal TLS-terminating reverse proxy / ingress).
+    Otherwise, falls back to request.url.scheme == "https" if request is provided.
+    For local test runners (testserver over http), avoids breaking in-memory TestClient.
+    """
+    base = settings.public_app_base_url.strip().lower()
+    if base.startswith("https://"):
+        if request is not None and getattr(request, "url", None) is not None:
+            if request.url.hostname in ("testserver", "localhost", "127.0.0.1") and request.url.scheme == "http":
+                if not getattr(settings, "_public_app_base_url_configured", False) or request.url.hostname == "testserver":
+                    return False
+        return True
+    if request is not None and getattr(request, "url", None) is not None:
+        return request.url.scheme == "https"
+    return False
+
+
+def set_session_cookie(
+    response: Response,
+    token: str,
+    is_secure: Optional[bool] = None,
+    request: Optional[Request] = None,
+) -> None:
+    secure = is_cookie_secure(request) if is_secure is None else is_secure
     response.set_cookie(
         key=settings.auth_cookie_name,
         value=token,
         max_age=settings.auth_session_ttl_seconds,
         httponly=True,
         samesite="lax",
-        secure=is_secure,
+        secure=secure,
         path="/",
     )
 
@@ -1126,7 +1362,46 @@ async def _verify_session(token: str) -> Tuple[Optional[AuthenticatedUser], Opti
         logger.warning("Session rejected for %s: account status is %s", claims.email, profile.status)
         return None, "inactive"
 
-    return claims.model_copy(update={"role": profile.role, "status": profile.status}), None
+    if claims.session_generation != profile.session_generation:
+        logger.warning(
+            "Session rejected for %s: stale session generation (%s != %s)",
+            claims.email, claims.session_generation, profile.session_generation,
+        )
+        return None, "invalid"
+
+    return claims.model_copy(update={
+        "role": profile.role,
+        "status": profile.status,
+        "session_generation": profile.session_generation,
+    }), None
+
+
+async def bump_session_generation(email: str) -> int:
+    """Bumps session generation for user across active backend, revoking existing sessions."""
+    clean_email = email.strip().lower()
+    if mysql_user_store_enabled():
+        return await _mysql_store().bump_session_generation(clean_email)
+    redis_client = await _profile_store_redis()
+    if redis_client is not None:
+        try:
+            payload = await redis_client.get(f"agcg:user:{clean_email}")
+            if payload:
+                profile = UserProfile.model_validate_json(payload)
+                new_gen = profile.session_generation + 1
+                updated = profile.model_copy(update={"session_generation": new_gen})
+                await redis_client.set(f"agcg:user:{clean_email}", updated.model_dump_json())
+                async with _user_store_lock:
+                    _user_store[clean_email] = updated
+                return new_gen
+        except Exception as exc:
+            logger.debug("Redis error bumping session generation for %s: %s", clean_email, exc)
+    async with _user_store_lock:
+        profile = _user_store.get(clean_email)
+        if profile:
+            new_gen = profile.session_generation + 1
+            _user_store[clean_email] = profile.model_copy(update={"session_generation": new_gen})
+            return new_gen
+    return 1
 
 
 async def resolve_session_user(request: Request) -> Optional[AuthenticatedUser]:
@@ -1496,7 +1771,13 @@ def get_keycloak_realm_base_url() -> str:
     return f"{base}/realms/{realm}"
 
 
-def get_keycloak_auth_url(redirect_uri: str, state: str, idp_hint: Optional[str] = None) -> str:
+def get_keycloak_auth_url(
+    redirect_uri: str,
+    state: str,
+    idp_hint: Optional[str] = None,
+    code_challenge: Optional[str] = None,
+    nonce: Optional[str] = None,
+) -> str:
     """Constructs Keycloak OpenID Connect authorization URL.
 
     If idp_hint is provided (or defaults to keycloak_ping_idp_alias, e.g. 'msk-ping'),
@@ -1512,6 +1793,11 @@ def get_keycloak_auth_url(redirect_uri: str, state: str, idp_hint: Optional[str]
         "redirect_uri": redirect_uri,
         "state": state,
     }
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+    if nonce:
+        params["nonce"] = nonce
     hint = idp_hint if idp_hint is not None else settings.keycloak_ping_idp_alias
     if hint and hint.strip() and hint.strip().lower() != "none":
         params["kc_idp_hint"] = hint.strip()
@@ -1519,7 +1805,11 @@ def get_keycloak_auth_url(redirect_uri: str, state: str, idp_hint: Optional[str]
     return f"{auth_endpoint}?{urlencode(params)}"
 
 
-async def exchange_keycloak_code(code: str, redirect_uri: str) -> Dict[str, Any]:
+async def exchange_keycloak_code(
+    code: str,
+    redirect_uri: str,
+    code_verifier: Optional[str] = None,
+) -> Dict[str, Any]:
     """Exchanges authorization code for OIDC tokens with Keycloak token endpoint."""
     if not settings.keycloak_client_secret or not settings.keycloak_client_secret.strip():
         logger.error("Keycloak token exchange failed: KEYCLOAK_CLIENT_SECRET is missing or empty in environment.")
@@ -1540,6 +1830,8 @@ async def exchange_keycloak_code(code: str, redirect_uri: str) -> Dict[str, Any]
         "client_id": settings.keycloak_client_id,
         "client_secret": settings.keycloak_client_secret,
     }
+    if code_verifier:
+        data["code_verifier"] = code_verifier
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(token_endpoint, data=data)
         if resp.status_code != 200:
@@ -1569,17 +1861,64 @@ async def get_keycloak_user_info(access_token: str) -> Dict[str, Any]:
 
 def parse_keycloak_user(token_data: Dict[str, Any], userinfo: Dict[str, Any]) -> AuthenticatedUser:
     """Parses user claims from Keycloak token data and userinfo response."""
-    email = userinfo.get("email") or ""
-    if not email and "id_token" in token_data:
+    # 1. Parse and validate ID token claims if present
+    id_claims: Dict[str, Any] = {}
+    id_token = token_data.get("id_token")
+    if id_token and isinstance(id_token, str) and "." in id_token:
         try:
-            parts = token_data["id_token"].split(".")
+            parts = id_token.split(".")
             if len(parts) >= 2:
                 payload_json = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8")
                 id_claims = json.loads(payload_json)
-                email = id_claims.get("email", "")
         except Exception:
             pass
 
+    if id_claims:
+        expected_iss = get_keycloak_realm_base_url().rstrip("/")
+        token_iss = str(id_claims.get("iss") or "").rstrip("/")
+        if token_iss and token_iss != expected_iss:
+            logger.warning("Keycloak ID token issuer mismatch: %s != %s", token_iss, expected_iss)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Keycloak ID token issuer mismatch: expected {expected_iss}, got {token_iss}",
+            )
+        expected_aud = settings.keycloak_client_id.strip()
+        if expected_aud:
+            token_aud = id_claims.get("aud")
+            token_azp = id_claims.get("azp")
+            aud_match = False
+            if isinstance(token_aud, str) and token_aud == expected_aud:
+                aud_match = True
+            elif isinstance(token_aud, list) and expected_aud in token_aud:
+                aud_match = True
+            elif token_azp == expected_aud:
+                aud_match = True
+            if token_aud and not aud_match:
+                logger.warning(
+                    "Keycloak ID token audience mismatch: expected %s, got aud=%s, azp=%s",
+                    expected_aud, token_aud, token_azp,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Keycloak ID token audience mismatch: expected {expected_aud}",
+                )
+
+    # 2. Email verification check
+    email_verified = userinfo.get("email_verified")
+    if email_verified is None and id_claims:
+        email_verified = id_claims.get("email_verified")
+
+    if email_verified is not True:
+        logger.warning(
+            "Rejected Keycloak user with unverified email (email_verified=%s): %s",
+            email_verified, userinfo.get("email") or id_claims.get("email"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak reports that this email address is unverified.",
+        )
+
+    email = userinfo.get("email") or id_claims.get("email") or ""
     clean_email = email.strip().lower()
     if not clean_email or "@" not in clean_email:
         raise HTTPException(

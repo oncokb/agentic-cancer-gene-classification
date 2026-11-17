@@ -5,6 +5,7 @@ FastAPI application — manually invokable, Docker/K8s-ready.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -39,19 +40,24 @@ from src.curator_requests_routes import router as curator_requests_router
 from src.expression_context import register_expression_context
 from src.api_keys_routes import router as api_keys_router
 from src.auth import (
+    OAUTH_TXN_COOKIE_NAME,
     AuthenticatedUser,
     AuthMeResponse,
     AuthUserResponse,
     UserProfile,
     UserStoreUnavailable,
+    _session_token,
     bootstrap_admins_at_startup,
+    bump_session_generation,
     describe_store_error,
     build_saml_authn_request,
     can_curate,
     clear_session_cookie,
     configure_mysql_user_store,
-    create_oauth_state,
+    consume_oauth_transaction,
+    create_oauth_transaction,
     create_session_token,
+    decode_session_token,
     exchange_google_code,
     exchange_keycloak_code,
     generate_sp_metadata_xml,
@@ -61,6 +67,7 @@ from src.auth import (
     get_google_user_info,
     get_keycloak_auth_url,
     get_keycloak_user_info,
+    is_cookie_secure,
     is_email_allowed,
     is_saml_group_allowed,
     list_user_profiles,
@@ -72,12 +79,14 @@ from src.auth import (
     render_access_denied_html,
     require_admin,
     require_auth,
+    save_oauth_transaction,
     session_store_unavailable,
+    set_oauth_txn_cookie,
     set_session_cookie,
     validate_redirect_to,
     verify_oauth_state,
 )
-from src.config import dev_mode_startup_error, settings
+from src.config import dev_mode_startup_error, saml_startup_error, settings
 from src.job_store import JobStore, can_read_job, job_owner
 from src.logging_utils import install_secret_redaction_filter
 from src.models.schema import (
@@ -203,6 +212,10 @@ async def lifespan(app: FastAPI):
     if dev_mode_error:
         logger.critical(dev_mode_error)
         raise RuntimeError(dev_mode_error)
+    saml_error = saml_startup_error(settings)
+    if saml_error:
+        logger.critical(saml_error)
+        raise RuntimeError(saml_error)
     # Build the DogStatsD client (file/DNS I/O) off the event loop, once,
     # before any request can emit a metric. Metrics are optional: nothing
     # about them may stop the app from starting.
@@ -1630,9 +1643,15 @@ async def auth_login(
             redirect_uri = settings.google_redirect_uri.strip()
         else:
             redirect_uri = f"{_public_app_base_url(request)}/auth/callback/google"
-        state = create_oauth_state(redirect_to=validate_redirect_to(redirect_to))
-        google_url = get_google_auth_url(redirect_uri=redirect_uri, state=state)
-        return RedirectResponse(url=google_url)
+        txn_id, state, cookie_val, verifier, challenge, nonce = create_oauth_transaction(
+            provider="google",
+            redirect_to=validate_redirect_to(redirect_to),
+        )
+        await save_oauth_transaction(txn_id, provider="google", code_verifier=verifier, nonce=nonce)
+        google_url = get_google_auth_url(redirect_uri=redirect_uri, state=state, code_challenge=challenge, nonce=nonce)
+        response = RedirectResponse(url=google_url)
+        set_oauth_txn_cookie(response, cookie_val, request=request)
+        return response
 
     if settings.keycloak_enabled:
         return RedirectResponse(url=f"/auth/keycloak/login?redirect_to={quote(validate_redirect_to(redirect_to), safe='')}")
@@ -1672,18 +1691,50 @@ async def auth_callback_google(
     if not state_data:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state token")
 
+    code_verifier = None
+    expected_nonce = None
+    if state_data.get("txn"):
+        cookie_val = request.cookies.get(OAUTH_TXN_COOKIE_NAME)
+        if not cookie_val:
+            raise HTTPException(status_code=400, detail="Missing OAuth transaction cookie")
+        cookie_txn = cookie_val.split(".", 1)[0]
+        if cookie_txn != state_data["txn"]:
+            raise HTTPException(status_code=400, detail="OAuth transaction cookie mismatch")
+        if state_data.get("provider") != "google":
+            raise HTTPException(status_code=400, detail="OAuth state provider mismatch")
+        txn_data = await consume_oauth_transaction(state_data["txn"], cookie_val, expected_provider="google")
+        if not txn_data:
+            raise HTTPException(status_code=400, detail="OAuth transaction already consumed or invalid")
+        code_verifier = txn_data.get("code_verifier")
+        expected_nonce = txn_data.get("nonce")
+
     redirect_uri = settings.google_redirect_uri.strip() or f"{_public_app_base_url(request)}/auth/callback/google"
 
-    tokens = await exchange_google_code(code, redirect_uri=redirect_uri)
+    tokens = await exchange_google_code(code, redirect_uri=redirect_uri, code_verifier=code_verifier)
     access_token = tokens.get("access_token")
     if not access_token:
         raise HTTPException(status_code=400, detail="Failed to obtain access token from Google")
 
+    # Validate ID token nonce if present
+    if expected_nonce and "id_token" in tokens:
+        try:
+            parts = tokens["id_token"].split(".")
+            if len(parts) >= 2:
+                payload_json = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8")
+                id_claims = json.loads(payload_json)
+                id_nonce = id_claims.get("nonce")
+                if id_nonce and id_nonce != expected_nonce:
+                    raise HTTPException(status_code=400, detail="Google ID token nonce mismatch")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
     userinfo = await get_google_user_info(access_token)
     email = str(userinfo.get("email") or "").strip().lower()
-    email_verified = bool(userinfo.get("email_verified"))
+    email_verified = userinfo.get("email_verified")
 
-    if not email_verified:
+    if email_verified is not True:
         return HTMLResponse(
             render_access_denied_html(
                 email=email,
@@ -1691,6 +1742,18 @@ async def auth_callback_google(
             ),
             status_code=403,
         )
+
+    if settings.google_allowed_hd_list:
+        hd = str(userinfo.get("hd") or "").strip().lower()
+        if hd not in settings.google_allowed_hd_list:
+            logger.warning("Rejected Google user %s with unauthorized hosted domain: %r", email, hd)
+            return HTMLResponse(
+                render_access_denied_html(
+                    email=email,
+                    reason=f"Google account does not belong to an allowed hosted domain ({', '.join(settings.google_allowed_hd_list)}).",
+                ),
+                status_code=403,
+            )
 
     allowed, reason = is_email_allowed(email)
     if not allowed:
@@ -1726,11 +1789,13 @@ async def auth_callback_google(
         status=profile.status,
         provider="google",
         groups=profile.groups,
+        session_generation=profile.session_generation,
     )
     session_token = create_session_token(user)
     target_url = validate_redirect_to(state_data.get("redirect_to"))
     response = RedirectResponse(url=target_url, status_code=303)
-    set_session_cookie(response, session_token, is_secure=request.url.scheme == "https")
+    response.delete_cookie(OAUTH_TXN_COOKIE_NAME, path="/")
+    set_session_cookie(response, session_token, is_secure=is_cookie_secure(request))
     record_user_action(
         user.email,
         action="login",
@@ -1846,11 +1911,12 @@ async def auth_saml_acs(request: Request) -> Response:
         status=profile.status,
         provider="saml",
         groups=profile.groups,
+        session_generation=profile.session_generation,
     )
     session_token = create_session_token(user)
     target_url = validate_redirect_to(relay_state)
     response = RedirectResponse(url=target_url, status_code=303)
-    set_session_cookie(response, session_token, is_secure=request.url.scheme == "https")
+    set_session_cookie(response, session_token, is_secure=is_cookie_secure(request))
     record_user_action(
         user.email,
         action="login",
@@ -1885,9 +1951,21 @@ async def auth_keycloak_login(
     else:
         redirect_uri = f"{_public_app_base_url(request)}/auth/callback/keycloak"
 
-    state = create_oauth_state(redirect_to=validate_redirect_to(redirect_to))
-    keycloak_url = get_keycloak_auth_url(redirect_uri=redirect_uri, state=state, idp_hint=idp_hint)
-    return RedirectResponse(url=keycloak_url, status_code=status.HTTP_303_SEE_OTHER)
+    txn_id, state, cookie_val, verifier, challenge, nonce = create_oauth_transaction(
+        provider="keycloak",
+        redirect_to=validate_redirect_to(redirect_to),
+    )
+    await save_oauth_transaction(txn_id, provider="keycloak", code_verifier=verifier, nonce=nonce)
+    keycloak_url = get_keycloak_auth_url(
+        redirect_uri=redirect_uri,
+        state=state,
+        idp_hint=idp_hint,
+        code_challenge=challenge,
+        nonce=nonce,
+    )
+    response = RedirectResponse(url=keycloak_url, status_code=status.HTTP_303_SEE_OTHER)
+    set_oauth_txn_cookie(response, cookie_val, request=request)
+    return response
 
 
 @app.get("/auth/callback/keycloak")
@@ -1918,6 +1996,23 @@ async def auth_callback_keycloak(
             detail="Invalid or expired OAuth state parameter.",
         )
 
+    code_verifier = None
+    expected_nonce = None
+    if state_data.get("txn"):
+        cookie_val = request.cookies.get(OAUTH_TXN_COOKIE_NAME)
+        if not cookie_val:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing OAuth transaction cookie")
+        cookie_txn = cookie_val.split(".", 1)[0]
+        if cookie_txn != state_data["txn"]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth transaction cookie mismatch")
+        if state_data.get("provider") != "keycloak":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth state provider mismatch")
+        txn_data = await consume_oauth_transaction(state_data["txn"], cookie_val, expected_provider="keycloak")
+        if not txn_data:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth transaction already consumed or invalid")
+        code_verifier = txn_data.get("code_verifier")
+        expected_nonce = txn_data.get("nonce")
+
     redirect_to = validate_redirect_to(state_data.get("redirect_to"))
 
     if settings.keycloak_redirect_uri.strip():
@@ -1925,13 +2020,28 @@ async def auth_callback_keycloak(
     else:
         redirect_uri = f"{_public_app_base_url(request)}/auth/callback/keycloak"
 
-    token_data = await exchange_keycloak_code(code, redirect_uri)
+    token_data = await exchange_keycloak_code(code, redirect_uri, code_verifier=code_verifier)
     access_token = token_data.get("access_token")
     if not access_token:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Keycloak did not return an access token.",
         )
+
+    # Validate ID token nonce if present
+    if expected_nonce and "id_token" in token_data:
+        try:
+            parts = token_data["id_token"].split(".")
+            if len(parts) >= 2:
+                payload_json = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8")
+                id_claims = json.loads(payload_json)
+                id_nonce = id_claims.get("nonce")
+                if id_nonce and id_nonce != expected_nonce:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Keycloak ID token nonce mismatch")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
     userinfo = await get_keycloak_user_info(access_token)
     user = parse_keycloak_user(token_data, userinfo)
@@ -1989,10 +2099,12 @@ async def auth_callback_keycloak(
         )
     user.role = profile.role
     user.status = profile.status
+    user.session_generation = profile.session_generation
 
     session_token = create_session_token(user)
     response = RedirectResponse(url=redirect_to, status_code=status.HTTP_303_SEE_OTHER)
-    set_session_cookie(response, session_token, is_secure=request.url.scheme == "https")
+    response.delete_cookie(OAUTH_TXN_COOKIE_NAME, path="/")
+    set_session_cookie(response, session_token, is_secure=is_cookie_secure(request))
     record_user_action(
         user.email,
         action="login_keycloak",
@@ -2003,7 +2115,16 @@ async def auth_callback_keycloak(
 
 @app.get("/auth/logout")
 @app.post("/auth/logout")
-async def auth_logout() -> Response:
+async def auth_logout(request: Request) -> Response:
+    token = _session_token(request)
+    if token:
+        try:
+            claims = decode_session_token(token)
+            if claims and claims.email:
+                await bump_session_generation(claims.email)
+        except Exception as exc:
+            logger.warning("Failed to bump session generation on logout: %s", exc)
+
     target = "/login" if settings.auth_enabled else "/"
     response = RedirectResponse(url=target, status_code=303)
     clear_session_cookie(response)
@@ -2071,10 +2192,11 @@ async def auth_dev_login(
         status=profile.status,
         provider="dev",
         groups=profile.groups,
+        session_generation=profile.session_generation,
     )
     session_token = create_session_token(user)
     response = RedirectResponse(url=validate_redirect_to(redirect_to), status_code=303)
-    set_session_cookie(response, session_token, is_secure=request.url.scheme == "https")
+    set_session_cookie(response, session_token, is_secure=is_cookie_secure(request))
     record_user_action(
         user.email,
         action="login",

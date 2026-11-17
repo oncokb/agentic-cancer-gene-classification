@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import zlib
 from typing import Optional
 from unittest.mock import AsyncMock, patch
@@ -867,6 +868,7 @@ async def test_keycloak_callback_flow(monkeypatch):
     # Case A: Successful MSK user login with admin role mapping
     fake_userinfo_msk = {
         "email": "oncologist@mskcc.org",
+        "email_verified": True,
         "name": "MSK Oncologist",
         "given_name": "MSK",
         "family_name": "Oncologist",
@@ -893,6 +895,7 @@ async def test_keycloak_callback_flow(monkeypatch):
     # Case B: Unauthorized domain rejected with 403
     fake_userinfo_external = {
         "email": "intruder@gmail.com",
+        "email_verified": True,
         "name": "External User",
     }
     with patch("src.main.exchange_keycloak_code", AsyncMock(return_value=fake_tokens)), \
@@ -955,6 +958,7 @@ def test_parse_keycloak_user(monkeypatch):
     token_data = {"access_token": "token1", "id_token": "id1"}
     userinfo = {
         "email": "curator@mskcc.org",
+        "email_verified": True,
         "given_name": "Curator",
         "family_name": "User",
         "roles": ["acgc-admin"],
@@ -966,7 +970,13 @@ def test_parse_keycloak_user(monkeypatch):
     assert user.provider == "keycloak"
 
     # 2. Email fallback to JWT payload if not in userinfo
-    fake_jwt_payload = base64.urlsafe_b64encode(b'{"email":"jwt.user@mskcc.org"}').decode().rstrip("=")
+    jwt_claims = {
+        "email": "jwt.user@mskcc.org",
+        "email_verified": True,
+        "iss": "https://keycloak.oncokb.org/realms/oncokb-public",
+        "aud": "acgc",
+    }
+    fake_jwt_payload = base64.urlsafe_b64encode(json.dumps(jwt_claims).encode()).decode().rstrip("=")
     token_data_jwt = {"access_token": "token2", "id_token": f"header.{fake_jwt_payload}.sig"}
     user2 = parse_keycloak_user(token_data_jwt, {"name": "JWT User"})
     assert user2.email == "jwt.user@mskcc.org"
@@ -974,7 +984,7 @@ def test_parse_keycloak_user(monkeypatch):
 
     # 3. Missing email raises HTTPException 400
     with pytest.raises(HTTPException) as exc_info:
-        parse_keycloak_user({}, {"name": "No Email"})
+        parse_keycloak_user({}, {"name": "No Email", "email_verified": True})
     assert exc_info.value.status_code == 400
 
 

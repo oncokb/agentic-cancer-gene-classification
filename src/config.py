@@ -302,6 +302,7 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = ""  # If left empty, computed from request or public_app_base_url
+    google_allowed_hd: str = ""  # Comma-separated list of allowed Google Workspace hosted domains (e.g. "mskcc.org")
     dev_login_enabled: bool = False  # Allows mock SSO login during local development/testing
 
     # Enterprise SAML & SSO Settings
@@ -359,6 +360,12 @@ class Settings(BaseSettings):
         if not self.keycloak_admin_roles:
             return []
         return [r.strip() for r in self.keycloak_admin_roles.split(",") if r.strip()]
+
+    @property
+    def google_allowed_hd_list(self) -> List[str]:
+        if not self.google_allowed_hd:
+            return []
+        return [d.strip().lower() for d in self.google_allowed_hd.split(",") if d.strip()]
 
     @property
     def allowed_domains_list(self) -> List[str]:
@@ -448,6 +455,23 @@ def dev_mode_startup_error(config: Settings) -> Optional[str]:
         f"privileges, but PUBLIC_APP_BASE_URL points at a non-local host ({host or url!r}). "
         "Unset AGCG_DEV_MODE for deployed environments, or point PUBLIC_APP_BASE_URL at "
         "localhost for local development."
+    )
+
+
+def saml_startup_error(config: Settings) -> Optional[str]:
+    """Why the app must refuse to start with SAML_ENABLED on, or None.
+
+    ACGC's SAML parser (src/auth.py parse_saml_response) extracts Assertion attributes
+    without cryptographically verifying XML signatures (Finding F1 in the auth audit).
+    Until signed assertion verification is implemented, starting with SAML enabled is
+    unsafe.
+    """
+    if not config.saml_enabled:
+        return None
+    return (
+        "Refusing to start: SAML_ENABLED is true, but ACGC's SAML 2.0 response parser "
+        "does not perform cryptographic signature verification on SAML assertions (auth audit F1). "
+        "Disable SAML_ENABLED or use Keycloak/Google OIDC instead."
     )
 
 
