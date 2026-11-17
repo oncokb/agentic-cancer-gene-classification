@@ -188,6 +188,8 @@
 
     function cancelActiveBatchLoop() {
       activeBatchGeneration += 1;
+      cancelInFlight = false;
+      if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = false;
       if (activeBatchController) {
         try { activeBatchController.abort(); } catch (_) {}
         activeBatchController = null;
@@ -1124,7 +1126,7 @@
       show(el["ec-batch-result"], true);
     }
 
-    async function loadBatch(batchId) {
+    async function loadBatch(batchId, { preserveError = false } = {}) {
       const id = String(batchId || "").trim();
       if (!id) return;
       cancelActiveBatchLoop();
@@ -1135,7 +1137,7 @@
       const isStale = () => generation !== activeBatchGeneration || Boolean(controller && controller.signal.aborted);
       const fetchOpts = controller ? { signal: controller.signal } : undefined;
 
-      setError("");
+      if (!preserveError) setError("");
       setMode("batch");
       state.batchGeneViews.clear();
       state.batchItemStatuses.clear();
@@ -1144,6 +1146,7 @@
         win.history.replaceState(null, "", `?batch=${encodeURIComponent(id)}`);
       }
       let pageFailures = 0;
+      let retryBannerShown = false;
       try {
         for (let poll = 0; poll < maxPolls; poll += 1) {
           if (isStale()) return;
@@ -1200,6 +1203,7 @@
             state.batchIncomplete = true;
             pageFailures += 1;
             if (poll + 1 < maxPolls && pageFailures <= maxPageRetries) {
+              retryBannerShown = true;
               setError("Couldn't load all genes; retrying");
               const backoff = Math.min(30000, pollMs * (2 ** (pageFailures - 1)));
               await sleepBatch(backoff, generation, controller);
@@ -1212,7 +1216,10 @@
 
           pageFailures = 0;
           state.batchIncomplete = false;
-          setError("");
+          if (retryBannerShown || !preserveError) {
+            setError("");
+            retryBannerShown = false;
+          }
           body.genes = allGenes;
           renderBatch(body);
           if (!["queued", "running"].includes(body.status)) {
@@ -1265,15 +1272,22 @@
     async function cancelCurrentBatch() {
       if (cancelInFlight || !state.batch || !state.batch.batch_id) return;
       const id = state.batch.batch_id;
+      cancelActiveBatchLoop();
+      const cancelGeneration = activeBatchGeneration;
+      const isStillCurrentCancel = () => (
+        cancelGeneration === activeBatchGeneration &&
+        state.mode === "batch" &&
+        Boolean(state.batch && state.batch.batch_id === id)
+      );
       cancelInFlight = true;
       if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = true;
-      cancelActiveBatchLoop();
       try {
         const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}/cancel`, {
           method: "POST",
           headers: { Accept: "application/json", "Content-Type": "application/json" },
           body: JSON.stringify({}),
         });
+        if (!isStillCurrentCancel()) return;
         if (status === 401) {
           redirectToLogin();
           return;
@@ -1291,10 +1305,15 @@
           }
         } else {
           setError(friendlyError(status, id));
+          cancelInFlight = false;
+          if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = false;
+          await loadBatch(id, { preserveError: true });
         }
       } finally {
-        cancelInFlight = false;
-        if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = false;
+        if (isStillCurrentCancel()) {
+          cancelInFlight = false;
+          if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = false;
+        }
       }
     }
 

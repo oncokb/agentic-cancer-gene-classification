@@ -1848,6 +1848,222 @@ test("malformed gene records ({hugo_symbol} only, array item, unknown status) ->
   }
 });
 
+test("stale cancel response (complete or paginated) when switching to batch B is ignored and B keeps running", async () => {
+  const makeGene = (sym, status = "running") => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const batchA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const batchACancelledComplete = {
+    batch_id: "batch-A", status: "cancelled", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+  const batchBRunning = {
+    batch_id: "batch-B", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("MYCN", "running")],
+  };
+  const batchBDone = {
+    batch_id: "batch-B", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("MYCN", "done")],
+  };
+
+  // Case 1: complete cancel response for A arrives after switching to B -> B stays shown, A never rendered
+  let resolveCancelA1 = null;
+  let pollA1Timer = null;
+  const env1 = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(batchA),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => { resolveCancelA1 = () => r(response(batchACancelledComplete)); }),
+      "GET /v1/expression-context/batches/batch-B": response(batchBDone),
+    },
+    { wait: () => new Promise((r) => { pollA1Timer = r; }) }
+  );
+  const pA1 = env1.page.loadBatch("batch-A");
+  while (!pollA1Timer) await new Promise((r) => setTimeout(r, 0));
+  const cancelPromise1 = env1.page.cancelCurrentBatch();
+  while (!resolveCancelA1) await new Promise((r) => setTimeout(r, 0));
+  await env1.page.loadBatch("batch-B");
+  assert.strictEqual(env1.page.state.batch.batch_id, "batch-B");
+
+  // Resolve stale cancel A -> must be ignored
+  resolveCancelA1();
+  await cancelPromise1;
+  pollA1Timer();
+  await pA1;
+  assert.strictEqual(env1.page.state.batch.batch_id, "batch-B");
+  assert.strictEqual(env1.nodes["ec-batch-title"].textContent, "Batch batch-B");
+
+  // Case 2: paginated (>200 genes) cancel response for A arrives while B is polling -> no loadBatch(A), B's loop keeps running
+  let resolveCancelA2 = null;
+  let bPollCalls = 0;
+  let bTimerResolve = null;
+  let a2Timer = null;
+  const batchAPaginated = {
+    batch_id: "batch-A", status: "cancelled", release_id: "rel-1",
+    counts: { total: 250, done: 250, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: Array.from({ length: 200 }, (_, i) => ({ ...makeGene(`G${i}`, "done"), position: i })),
+  };
+  const env2 = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(batchA),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => { resolveCancelA2 = () => r(response(batchAPaginated)); }),
+      "GET /v1/expression-context/batches/batch-B": () => {
+        bPollCalls += 1;
+        return response(bPollCalls === 1 ? batchBRunning : batchBDone);
+      },
+    },
+    {
+      wait: () => new Promise((r) => {
+        if (!a2Timer) a2Timer = r;
+        else bTimerResolve = r;
+      }),
+    }
+  );
+  const pA2 = env2.page.loadBatch("batch-A");
+  while (!a2Timer) await new Promise((r) => setTimeout(r, 0));
+  const cancelPromise2 = env2.page.cancelCurrentBatch();
+  while (!resolveCancelA2) await new Promise((r) => setTimeout(r, 0));
+  const pB2 = env2.page.loadBatch("batch-B");
+  while (!bTimerResolve) await new Promise((r) => setTimeout(r, 0));
+
+  const aCallsBefore = env2.calls.filter((c) => c.method === "GET" && c.url.endsWith("/batch-A")).length;
+  resolveCancelA2();
+  await cancelPromise2;
+  // Must NOT trigger loadBatch(A)
+  assert.strictEqual(env2.calls.filter((c) => c.method === "GET" && c.url.endsWith("/batch-A")).length, aCallsBefore);
+  assert.strictEqual(env2.page.state.batch.batch_id, "batch-B");
+
+  // B's polling loop still finishes cleanly to done
+  bTimerResolve();
+  await pB2;
+  a2Timer();
+  await pA2;
+  assert.strictEqual(bPollCalls, 2);
+  assert.strictEqual(env2.page.state.batch.batch_id, "batch-B");
+  assert.ok(env2.nodes["ec-batch-summary"].textContent.includes("Status: done"));
+});
+
+test("stale cancel to Single mode or stale cancel failure leaves new state and banner intact", async () => {
+  const makeGene = (sym, status = "running") => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const batchA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const batchADone = { ...batchA, status: "cancelled", genes: [makeGene("ERBB2", "done")] };
+
+  // Case 1: cancel A -> switch to Single before POST resolves -> Single stays, no batch render, no banner
+  let resolveCancelSingle = null;
+  let timerSingle = null;
+  const envS = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(batchA),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => { resolveCancelSingle = () => r(response(batchADone)); }),
+    },
+    { wait: () => new Promise((r) => { timerSingle = r; }) }
+  );
+  const pA = envS.page.loadBatch("batch-A");
+  while (!timerSingle) await new Promise((r) => setTimeout(r, 0));
+  const cancelS = envS.page.cancelCurrentBatch();
+  while (!resolveCancelSingle) await new Promise((r) => setTimeout(r, 0));
+
+  envS.page.setMode("single");
+  resolveCancelSingle();
+  await cancelS;
+  timerSingle();
+  await pA;
+
+  assert.strictEqual(envS.page.state.mode, "single");
+  assert.strictEqual(envS.nodes["ec-batch-result"].hidden, true);
+  assert.strictEqual(envS.nodes["ec-error"].hidden, true);
+  assert.strictEqual(envS.nodes["ec-batch-cancel"].disabled, false);
+
+  // Case 2: stale cancel failure (500) on A does not overwrite B's banner or state
+  let resolveCancelFail = null;
+  let timerB = null;
+  const envF = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": response(batchA),
+      "POST /v1/expression-context/batches/batch-A/cancel": () => new Promise((r) => { resolveCancelFail = () => r(response({ detail: "err" }, 500)); }),
+      "GET /v1/expression-context/batches/batch-B": response({ detail: "missing" }, 404),
+    },
+    { wait: () => new Promise((r) => { timerB = r; }) }
+  );
+  const pA2 = envF.page.loadBatch("batch-A");
+  while (!timerB) await new Promise((r) => setTimeout(r, 0));
+  const cancelF = envF.page.cancelCurrentBatch();
+  while (!resolveCancelFail) await new Promise((r) => setTimeout(r, 0));
+
+  await envF.page.loadBatch("batch-B");
+  assert.strictEqual(envF.nodes["ec-error"].textContent, "Batch not found.");
+  resolveCancelFail();
+  await cancelF;
+  timerB();
+  await pA2;
+  assert.strictEqual(envF.nodes["ec-error"].textContent, "Batch not found.");
+});
+
+test("failed cancel on still-current batch shows error banner and resumes single-flight polling until done", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const batchRunning = {
+    batch_id: "batch-resume", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const batchDone = {
+    batch_id: "batch-resume", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+
+  let getCount = 0;
+  const timers = [];
+  const envR = env(
+    {
+      "GET /v1/expression-context/batches/batch-resume": () => {
+        getCount += 1;
+        return response(getCount <= 2 ? batchRunning : batchDone);
+      },
+      "POST /v1/expression-context/batches/batch-resume/cancel": response({ detail: "fail" }, 500),
+    },
+    {
+      wait: () => new Promise((r) => { timers.push(r); }),
+    }
+  );
+
+  const loadP = envR.page.loadBatch("batch-resume");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  const cancelP = envR.page.cancelCurrentBatch();
+  // Wait for resumed polling's first poll (getCount === 2) and its wait timer
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+
+  // Error banner must stay visible while polling resumed, and cancel button is enabled again
+  assert.strictEqual(envR.nodes["ec-error"].hidden, false);
+  assert.ok(envR.nodes["ec-error"].textContent.includes("couldn't load expression statistics"));
+  assert.strictEqual(envR.nodes["ec-batch-cancel"].disabled, false);
+
+  // Advance resumed polling to done
+  timers[1]();
+  await cancelP;
+  timers[0]();
+  await loadP;
+
+  assert.strictEqual(getCount, 3);
+  assert.ok(envR.nodes["ec-batch-summary"].textContent.includes("Status: done"));
+  assert.strictEqual(envR.nodes["ec-error"].hidden, false);
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of tests) {
