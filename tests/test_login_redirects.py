@@ -16,12 +16,17 @@ from src import main
 from src.auth import (
     AuthenticatedUser,
     SAMLAssertionData,
-    create_oauth_state,
     validate_redirect_to,
     verify_oauth_state,
 )
 from src.config import settings
-from tests.auth_helpers import save_profile_for, session_token_for
+from tests.auth_helpers import (
+    install_test_keycloak_jwks,
+    make_keycloak_id_claims,
+    save_profile_for,
+    session_token_for,
+    sign_rs256_jwt,
+)
 
 # Every test runs once per USER_STORE_BACKEND (see conftest.user_store_backend).
 pytestmark = pytest.mark.usefixtures("user_store_backend")
@@ -55,14 +60,28 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, "keycloak_allowed_roles", "")
     monkeypatch.setattr(settings, "google_client_id", "test-client")
     monkeypatch.setattr(settings, "dev_login_enabled", True)
+    install_test_keycloak_jwks(monkeypatch)
     user = AuthenticatedUser(email="user@mskcc.org", name="User", domain="mskcc.org")
     # provision_or_update_user is mocked out, so store the profile it would have written.
     save_profile_for(user)
     monkeypatch.setattr(main, "provision_or_update_user", AsyncMock(return_value=user))
     monkeypatch.setattr(main, "record_user_action", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        main, "exchange_google_code", AsyncMock(return_value={"access_token": "token"})
-    )
+    nonce_holder = {"nonce": ""}
+
+    async def _exchange_google(code, redirect_uri, code_verifier=None):
+        return {
+            "access_token": "token",
+            "id_token": sign_rs256_jwt({"nonce": nonce_holder["nonce"]}),
+        }
+
+    async def _exchange_keycloak(code, redirect_uri, code_verifier=None):
+        claims = make_keycloak_id_claims(email=user.email, sub="kc-sub", nonce=nonce_holder["nonce"])
+        return {
+            "access_token": "token",
+            "id_token": sign_rs256_jwt(claims),
+        }
+
+    monkeypatch.setattr(main, "exchange_google_code", _exchange_google)
     monkeypatch.setattr(
         main,
         "get_google_user_info",
@@ -73,15 +92,12 @@ def client(monkeypatch):
             }
         ),
     )
-    monkeypatch.setattr(
-        main, "exchange_keycloak_code", AsyncMock(return_value={"access_token": "token"})
-    )
-    monkeypatch.setattr(main, "get_keycloak_user_info", AsyncMock(return_value={}))
-    monkeypatch.setattr(main, "parse_keycloak_user", lambda *args: user)
+    monkeypatch.setattr(main, "exchange_keycloak_code", _exchange_keycloak)
+    monkeypatch.setattr(main, "get_keycloak_user_info", AsyncMock(return_value={"sub": "kc-sub", "name": "User"}))
     monkeypatch.setattr(
         main, "parse_saml_response", lambda *args: SAMLAssertionData(name_id=user.email)
     )
-    return TestClient(main.app), user
+    return TestClient(main.app), user, nonce_holder
 
 
 @pytest.mark.parametrize("target", BAD_TARGETS)
@@ -96,7 +112,7 @@ def test_validator_preserves_local_targets(target):
 
 @pytest.mark.parametrize("session", ["missing", "expired", "valid"])
 def test_root_login_redirect(client, session):
-    browser, user = client
+    browser, user, _ = client
     if session != "missing":
         browser.cookies.set(
             settings.auth_cookie_name,
@@ -116,7 +132,7 @@ def test_root_login_redirect(client, session):
 @pytest.mark.parametrize("target", [TARGET, *BAD_TARGETS[:6]])
 @pytest.mark.parametrize("provider", ["google", "keycloak", "saml", "dev"])
 def test_provider_round_trip(client, provider, target):
-    browser, _ = client
+    browser, _, nonce_holder = client
     expected = validate_redirect_to(target)
     route = "/auth/login" if provider == "google" else f"/auth/{provider}/login"
     response = browser.get(route, params={"redirect_to": target}, follow_redirects=False)
@@ -139,6 +155,7 @@ def test_provider_round_trip(client, provider, target):
             )
         else:
             state = query["state"][0]
+            nonce_holder["nonce"] = query["nonce"][0]
             assert verify_oauth_state(state)["redirect_to"] == expected
             response = browser.get(
                 f"/auth/callback/{provider}",
@@ -155,8 +172,8 @@ def test_provider_round_trip(client, provider, target):
 
 @pytest.mark.parametrize("provider", ["google", "keycloak", "saml"])
 @pytest.mark.parametrize("target", BAD_TARGETS[:6])
-def test_callback_rejects_unsafe_legacy_state(client, provider, target):
-    browser, _ = client
+def test_callback_rejects_unsafe_redirect_in_state(client, provider, target):
+    browser, _, nonce_holder = client
     if provider == "saml":
         response = browser.post(
             "/auth/saml/acs",
@@ -167,9 +184,13 @@ def test_callback_rejects_unsafe_legacy_state(client, provider, target):
             follow_redirects=False,
         )
     else:
-        # Sign a legacy payload directly so creation-time validation cannot mask
-        # a missing callback check.
-        payload = verify_oauth_state(create_oauth_state())
+        # Start a valid transaction so cookie/Redis checks pass, then sign a
+        # tampered state payload directly to ensure callback validates redirect_to.
+        route = "/auth/login" if provider == "google" else f"/auth/{provider}/login"
+        login_resp = browser.get(route, follow_redirects=False)
+        query = parse_qs(urlsplit(login_resp.headers["location"]).query)
+        nonce_holder["nonce"] = query["nonce"][0]
+        payload = verify_oauth_state(query["state"][0])
         payload["redirect_to"] = target
         encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
         signature = hmac.new(
@@ -190,7 +211,7 @@ def test_callback_rejects_unsafe_legacy_state(client, provider, target):
 
 @pytest.mark.parametrize("target", [TARGET, *BAD_TARGETS[:6]])
 def test_authenticated_login_page(client, target):
-    browser, user = client
+    browser, user, _ = client
     browser.cookies.set(settings.auth_cookie_name, session_token_for(user))
     response = browser.get("/login", params={"redirect_to": target}, follow_redirects=False)
     assert response.status_code == 303
@@ -199,7 +220,7 @@ def test_authenticated_login_page(client, target):
 
 @pytest.mark.parametrize("provider", ["keycloak", "saml", "dev"])
 def test_fallback_provider_preserves_query(client, monkeypatch, provider):
-    browser, _ = client
+    browser, _, _ = client
     monkeypatch.setattr(settings, "google_client_id", "")
     if provider != "keycloak":
         monkeypatch.setattr(settings, "keycloak_client_id", "")

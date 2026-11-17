@@ -23,6 +23,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from fastapi import HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
@@ -863,8 +867,15 @@ def verify_oauth_state(state: str) -> Optional[Dict[str, Any]]:
 
 OAUTH_TXN_COOKIE_NAME = "agcg_oauth_txn"
 OAUTH_TXN_TTL_SECONDS = 900  # 15 minutes
-_consumed_oauth_txns: Dict[str, float] = {}
-_consumed_oauth_txns_lock = asyncio.Lock()
+
+
+class OAuthTransactionUnavailable(RuntimeError):
+    """Raised when the Redis store backing OAuth transactions is unavailable or errors."""
+
+
+async def _oauth_txn_redis():
+    """Returns the Redis client for single-use OAuth transactions."""
+    return await _profile_store_redis()
 
 
 def generate_pkce_pair() -> Tuple[str, str]:
@@ -914,6 +925,63 @@ def create_oauth_transaction(
     return txn_id, state, cookie_value, code_verifier, code_challenge, nonce
 
 
+def verify_oauth_txn_cookie(
+    cookie_value: Optional[str],
+    *,
+    expected_txn: str,
+    expected_provider: str,
+) -> Optional[Dict[str, Any]]:
+    """Verifies the signed transaction cookie (signature, expiry, txn, provider)."""
+    if not cookie_value or not isinstance(cookie_value, str):
+        return None
+    parts = cookie_value.split(".")
+    if len(parts) != 3:
+        return None
+
+    cookie_txn, payload_b64, sig_b64 = parts
+    if not cookie_txn or not payload_b64 or not sig_b64:
+        return None
+    if not expected_txn or not hmac.compare_digest(cookie_txn, expected_txn):
+        return None
+
+    secret = get_auth_secret_key().encode("utf-8")
+    sig_raw = f"{cookie_txn}.{payload_b64}".encode("utf-8")
+    expected_sig = hmac.new(secret, sig_raw, hashlib.sha256).digest()
+    expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode("utf-8").rstrip("=")
+    if not hmac.compare_digest(sig_b64, expected_sig_b64):
+        logger.warning("OAuth transaction cookie HMAC verification failed")
+        return None
+
+    try:
+        padding_chars = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding_chars).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    now = int(time.time())
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp < now:
+        logger.warning("OAuth transaction cookie expired")
+        return None
+
+    if payload.get("txn") != expected_txn:
+        logger.warning("OAuth transaction cookie txn mismatch")
+        return None
+
+    if payload.get("provider") != expected_provider:
+        logger.warning("OAuth transaction provider mismatch (%s != %s)", payload.get("provider"), expected_provider)
+        return None
+
+    if not isinstance(payload.get("nonce"), str) or not payload.get("nonce"):
+        return None
+    if not isinstance(payload.get("code_verifier"), str) or not payload.get("code_verifier"):
+        return None
+
+    return payload
+
+
 def set_oauth_txn_cookie(response: Response, cookie_value: str, request: Optional[Request] = None) -> None:
     response.set_cookie(
         key=OAUTH_TXN_COOKIE_NAME,
@@ -932,22 +1000,29 @@ async def save_oauth_transaction(
     code_verifier: str,
     nonce: str,
 ) -> None:
-    """Stores transaction data in Redis if available."""
-    redis_client = await _profile_store_redis()
-    if redis_client is not None:
-        try:
-            data = json.dumps({
-                "provider": provider,
-                "code_verifier": code_verifier,
-                "nonce": nonce,
-            })
-            await redis_client.set(
-                f"agcg:oauth_txn:{txn_id}",
-                data,
-                ex=OAUTH_TXN_TTL_SECONDS,
-            )
-        except Exception as exc:
-            logger.debug("Failed to store OAuth transaction in Redis: %s", exc)
+    """Stores transaction data in Redis; fails closed when Redis is unavailable or errors."""
+    try:
+        redis_client = await _oauth_txn_redis()
+    except Exception as exc:
+        logger.error("Redis unavailable while saving OAuth transaction: %s", type(exc).__name__)
+        raise OAuthTransactionUnavailable("OAuth transaction store is unavailable.") from exc
+    if redis_client is None:
+        logger.error("Refusing OAuth transaction save: Redis is not configured or unavailable.")
+        raise OAuthTransactionUnavailable("OAuth transaction store is unavailable.")
+    try:
+        data = json.dumps({
+            "provider": provider,
+            "code_verifier": code_verifier,
+            "nonce": nonce,
+        })
+        await redis_client.set(
+            f"agcg:oauth_txn:{txn_id}",
+            data,
+            ex=OAUTH_TXN_TTL_SECONDS,
+        )
+    except Exception as exc:
+        logger.error("Failed to store OAuth transaction in Redis: %s", type(exc).__name__)
+        raise OAuthTransactionUnavailable("Failed to store OAuth transaction in Redis.") from exc
 
 
 async def consume_oauth_transaction(
@@ -955,77 +1030,109 @@ async def consume_oauth_transaction(
     cookie_value: Optional[str],
     expected_provider: str,
 ) -> Optional[Dict[str, Any]]:
-    """Atomically consumes an OAuth transaction (single-use).
-
-    Checks Redis first with GETDEL. If Redis is unavailable or unconfigured,
-    falls back to verifying the signed transaction cookie and tracking single-use
-    consumption in an in-memory TTL dictionary.
-
-    Returns dict with keys ('provider', 'code_verifier', 'nonce') on success,
-    or None if invalid, mismatched, expired, or already consumed.
-    """
-    now = int(time.time())
-    redis_client = await _profile_store_redis()
-    if redis_client is not None:
-        try:
-            raw = await redis_client.getdel(f"agcg:oauth_txn:{txn_id}")
-            if raw:
-                await redis_client.set(f"agcg:oauth_consumed:{txn_id}", "1", ex=OAUTH_TXN_TTL_SECONDS)
-                data = json.loads(raw)
-                if data.get("provider") != expected_provider:
-                    return None
-                return data
-            was_consumed = await redis_client.get(f"agcg:oauth_consumed:{txn_id}")
-            if was_consumed:
-                logger.warning("OAuth transaction %s was already consumed (Redis)", txn_id)
-                return None
-        except Exception as exc:
-            logger.debug("Redis error during consume_oauth_transaction: %s", exc)
-
-    if not cookie_value or "." not in cookie_value:
-        return None
-
-    parts = cookie_value.split(".")
-    if len(parts) != 3:
-        return None
-
-    cookie_txn, payload_b64, sig_b64 = parts
-    if cookie_txn != txn_id:
-        return None
-
-    secret = get_auth_secret_key().encode("utf-8")
-    sig_raw = f"{cookie_txn}.{payload_b64}".encode("utf-8")
-    expected_sig = hmac.new(secret, sig_raw, hashlib.sha256).digest()
-    expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode("utf-8").rstrip("=")
-
-    if not hmac.compare_digest(sig_b64, expected_sig_b64):
-        logger.warning("OAuth transaction cookie HMAC verification failed")
+    """Verifies the signed transaction cookie first, then atomically consumes the
+    transaction in Redis via GETDEL. Fails closed if Redis is unavailable or errors."""
+    cookie_payload = verify_oauth_txn_cookie(
+        cookie_value,
+        expected_txn=txn_id,
+        expected_provider=expected_provider,
+    )
+    if cookie_payload is None:
         return None
 
     try:
-        padding = "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding).decode("utf-8"))
+        redis_client = await _oauth_txn_redis()
+    except Exception as exc:
+        logger.error("Redis unavailable during consume_oauth_transaction: %s", type(exc).__name__)
+        raise OAuthTransactionUnavailable("OAuth transaction store is unavailable.") from exc
+    if redis_client is None:
+        logger.error("Refusing OAuth transaction consume: Redis is not configured or unavailable.")
+        raise OAuthTransactionUnavailable("OAuth transaction store is unavailable.")
+
+    try:
+        raw = await redis_client.getdel(f"agcg:oauth_txn:{txn_id}")
+    except Exception as exc:
+        logger.error("Redis error during consume_oauth_transaction: %s", type(exc).__name__)
+        raise OAuthTransactionUnavailable("OAuth transaction store error.") from exc
+
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
     except Exception:
         return None
-
-    if payload.get("exp", 0) < now:
-        logger.warning("OAuth transaction cookie expired")
+    if not isinstance(data, dict):
         return None
-
-    if payload.get("provider") != expected_provider:
-        logger.warning("OAuth transaction provider mismatch (%s != %s)", payload.get("provider"), expected_provider)
+    if data.get("provider") != expected_provider:
         return None
+    if data.get("nonce") != cookie_payload.get("nonce"):
+        return None
+    if data.get("code_verifier") != cookie_payload.get("code_verifier"):
+        return None
+    return data
 
-    async with _consumed_oauth_txns_lock:
-        expired = [k for k, exp in _consumed_oauth_txns.items() if exp < now]
-        for k in expired:
-            _consumed_oauth_txns.pop(k, None)
 
-        if txn_id in _consumed_oauth_txns:
-            logger.warning("OAuth transaction %s was already consumed (cookie fallback)", txn_id)
-            return None
-        _consumed_oauth_txns[txn_id] = now + OAUTH_TXN_TTL_SECONDS
+def _b64url_decode_bytes(segment: str) -> bytes:
+    pad = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + pad)
 
+
+def verify_google_id_token_nonce(id_token: Any, *, expected_nonce: Optional[str]) -> Dict[str, Any]:
+    """Validates Google ID token JWT structure and exact nonce match."""
+    if not expected_nonce or not isinstance(expected_nonce, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing expected OAuth transaction nonce.",
+        )
+    if not isinstance(id_token, str) or not id_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing Google ID token.",
+        )
+    parts = id_token.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed Google ID token.",
+        )
+    try:
+        header = json.loads(_b64url_decode_bytes(parts[0]).decode("utf-8"))
+        payload = json.loads(_b64url_decode_bytes(parts[1]).decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed Google ID token payload.",
+        ) from exc
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed Google ID token structure.",
+        )
+    alg = header.get("alg")
+    if not isinstance(alg, str) or not alg.strip() or alg.strip().lower() == "none":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Google ID token algorithm.",
+        )
+    if "exp" in payload:
+        exp = payload["exp"]
+        if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp < int(time.time()) - 60:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Expired or invalid Google ID token.",
+            )
+    id_nonce = payload.get("nonce")
+    if not isinstance(id_nonce, str) or not id_nonce:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing nonce claim in Google ID token.",
+        )
+    if not hmac.compare_digest(id_nonce, expected_nonce):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google ID token nonce mismatch",
+        )
     return payload
 
 
@@ -1380,21 +1487,27 @@ async def bump_session_generation(email: str) -> int:
     """Bumps session generation for user across active backend, revoking existing sessions."""
     clean_email = email.strip().lower()
     if mysql_user_store_enabled():
-        return await _mysql_store().bump_session_generation(clean_email)
+        try:
+            return await _mysql_store().bump_session_generation(clean_email)
+        except UserStoreUnavailable:
+            raise
+        except Exception as exc:
+            raise UserStoreUnavailable("User store bump_session_generation failed") from exc
     redis_client = await _profile_store_redis()
     if redis_client is not None:
         try:
             payload = await redis_client.get(f"agcg:user:{clean_email}")
-            if payload:
-                profile = UserProfile.model_validate_json(payload)
-                new_gen = profile.session_generation + 1
-                updated = profile.model_copy(update={"session_generation": new_gen})
-                await redis_client.set(f"agcg:user:{clean_email}", updated.model_dump_json())
-                async with _user_store_lock:
-                    _user_store[clean_email] = updated
-                return new_gen
+            if not payload:
+                return 1
+            profile = UserProfile.model_validate_json(payload)
+            new_gen = profile.session_generation + 1
+            updated = profile.model_copy(update={"session_generation": new_gen})
+            await redis_client.set(f"agcg:user:{clean_email}", updated.model_dump_json())
         except Exception as exc:
-            logger.debug("Redis error bumping session generation for %s: %s", clean_email, exc)
+            raise UserStoreUnavailable("Failed to bump session generation in Redis") from exc
+        async with _user_store_lock:
+            _user_store[clean_email] = updated
+        return new_gen
     async with _user_store_lock:
         profile = _user_store.get(clean_email)
         if profile:
@@ -1859,117 +1972,458 @@ async def get_keycloak_user_info(access_token: str) -> Dict[str, Any]:
         return resp.json()
 
 
-def parse_keycloak_user(token_data: Dict[str, Any], userinfo: Dict[str, Any]) -> AuthenticatedUser:
-    """Parses user claims from Keycloak token data and userinfo response."""
-    # 1. Parse and validate ID token claims if present
-    id_claims: Dict[str, Any] = {}
-    id_token = token_data.get("id_token")
-    if id_token and isinstance(id_token, str) and "." in id_token:
-        try:
-            parts = id_token.split(".")
-            if len(parts) >= 2:
-                payload_json = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8")
-                id_claims = json.loads(payload_json)
-        except Exception:
-            pass
+KEYCLOAK_JWKS_CACHE_TTL_SECONDS = 300
+KEYCLOAK_JWT_LEEWAY_SECONDS = 60
+_KEYCLOAK_JWKS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
-    if id_claims:
-        expected_iss = get_keycloak_realm_base_url().rstrip("/")
-        token_iss = str(id_claims.get("iss") or "").rstrip("/")
-        if token_iss and token_iss != expected_iss:
-            logger.warning("Keycloak ID token issuer mismatch: %s != %s", token_iss, expected_iss)
+_RSA_PKCS1_ALGS = {
+    "RS256": hashes.SHA256,
+    "RS384": hashes.SHA384,
+    "RS512": hashes.SHA512,
+}
+_RSA_PSS_ALGS = {
+    "PS256": hashes.SHA256,
+    "PS384": hashes.SHA384,
+    "PS512": hashes.SHA512,
+}
+_EC_ALGS = {
+    "ES256": (ec.SECP256R1, hashes.SHA256, 32),
+    "ES384": (ec.SECP384R1, hashes.SHA384, 48),
+    "ES512": (ec.SECP521R1, hashes.SHA512, 66),
+}
+
+
+def clear_keycloak_jwks_cache() -> None:
+    """Clears cached Keycloak realm JWKS keys."""
+    _KEYCLOAK_JWKS_CACHE.clear()
+
+
+async def fetch_keycloak_jwks(jwks_url: str) -> List[Dict[str, Any]]:
+    """Fetches the realm JWKS document from Keycloak."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(jwks_url)
+    except Exception as exc:
+        logger.error("Failed to fetch Keycloak JWKS (%s): %s", jwks_url, type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to retrieve Keycloak signing keys.",
+        ) from exc
+    if resp.status_code != 200:
+        logger.error("Keycloak JWKS endpoint returned HTTP %s", resp.status_code)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to retrieve Keycloak signing keys.",
+        )
+    try:
+        body = resp.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Invalid Keycloak JWKS response.",
+        ) from exc
+    keys = body.get("keys") if isinstance(body, dict) else None
+    if not isinstance(keys, list) or not all(isinstance(k, dict) for k in keys):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Malformed Keycloak JWKS response.",
+        )
+    return keys
+
+
+async def _get_keycloak_jwks(jwks_url: str, *, force_refresh: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
+    now_mono = time.monotonic()
+    if not force_refresh:
+        cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
+        if cached is not None and now_mono < cached[0]:
+            return cached[1], True
+    keys = await fetch_keycloak_jwks(jwks_url)
+    _KEYCLOAK_JWKS_CACHE[jwks_url] = (time.monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS, keys)
+    return keys, False
+
+
+def _verify_jws_signature_with_jwk(
+    signing_input: bytes,
+    sig_bytes: bytes,
+    alg: str,
+    jwk: Dict[str, Any],
+) -> bool:
+    use = jwk.get("use")
+    if use is not None and use != "sig":
+        return False
+    jwk_alg = jwk.get("alg")
+    if jwk_alg is not None and jwk_alg != alg:
+        return False
+
+    kty = jwk.get("kty")
+    try:
+        if alg in _RSA_PKCS1_ALGS or alg in _RSA_PSS_ALGS:
+            if kty != "RSA":
+                return False
+            n = int.from_bytes(_b64url_decode_bytes(jwk["n"]), "big")
+            e = int.from_bytes(_b64url_decode_bytes(jwk["e"]), "big")
+            pub_key = rsa.RSAPublicNumbers(e, n).public_key()
+            if alg in _RSA_PKCS1_ALGS:
+                hash_cls = _RSA_PKCS1_ALGS[alg]
+                pub_key.verify(sig_bytes, signing_input, padding.PKCS1v15(), hash_cls())
+            else:
+                hash_cls = _RSA_PSS_ALGS[alg]
+                hash_obj = hash_cls()
+                pub_key.verify(
+                    sig_bytes,
+                    signing_input,
+                    padding.PSS(mgf=padding.MGF1(hash_obj), salt_length=hash_obj.digest_size),
+                    hash_obj,
+                )
+            return True
+
+        if alg in _EC_ALGS:
+            if kty != "EC":
+                return False
+            curve_cls, hash_cls, coord_size = _EC_ALGS[alg]
+            expected_crv = {
+                "ES256": "P-256",
+                "ES384": "P-384",
+                "ES512": "P-521",
+            }[alg]
+            if jwk.get("crv") != expected_crv:
+                return False
+            if len(sig_bytes) != 2 * coord_size:
+                return False
+            x = int.from_bytes(_b64url_decode_bytes(jwk["x"]), "big")
+            y = int.from_bytes(_b64url_decode_bytes(jwk["y"]), "big")
+            pub_key = ec.EllipticCurvePublicNumbers(x, y, curve_cls()).public_key()
+            r = int.from_bytes(sig_bytes[:coord_size], "big")
+            s = int.from_bytes(sig_bytes[coord_size:], "big")
+            der_sig = encode_dss_signature(r, s)
+            pub_key.verify(der_sig, signing_input, ec.ECDSA(hash_cls()))
+            return True
+    except (InvalidSignature, KeyError, TypeError, ValueError):
+        return False
+    return False
+
+
+async def _verify_keycloak_jwt_signature(token: str) -> Dict[str, Any]:
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing Keycloak JWT.",
+        )
+    parts = token.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Malformed Keycloak JWT.",
+        )
+    try:
+        header = json.loads(_b64url_decode_bytes(parts[0]).decode("utf-8"))
+        payload = json.loads(_b64url_decode_bytes(parts[1]).decode("utf-8"))
+        sig_bytes = _b64url_decode_bytes(parts[2])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Malformed Keycloak JWT encoding.",
+        ) from exc
+
+    if not isinstance(header, dict) or not isinstance(payload, dict) or not sig_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Malformed Keycloak JWT structure.",
+        )
+
+    alg = header.get("alg")
+    if not isinstance(alg, str) or alg not in (_RSA_PKCS1_ALGS.keys() | _RSA_PSS_ALGS.keys() | _EC_ALGS.keys()):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Unsupported or unsigned Keycloak JWT algorithm.",
+        )
+
+    kid = header.get("kid")
+    if kid is not None and not isinstance(kid, str):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Malformed Keycloak JWT kid header.",
+        )
+
+    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+    jwks_url = f"{get_keycloak_realm_base_url().rstrip('/')}/protocol/openid-connect/certs"
+
+    def _try_keys(keys: List[Dict[str, Any]]) -> bool:
+        candidates = [k for k in keys if k.get("kid") == kid] if kid is not None else keys
+        return any(_verify_jws_signature_with_jwk(signing_input, sig_bytes, alg, k) for k in candidates)
+
+    keys, from_cache = await _get_keycloak_jwks(jwks_url, force_refresh=False)
+    verified = _try_keys(keys)
+    if not verified and from_cache:
+        keys, _ = await _get_keycloak_jwks(jwks_url, force_refresh=True)
+        verified = _try_keys(keys)
+
+    if not verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token signature verification failed.",
+        )
+    return payload
+
+
+def _validate_keycloak_timestamps(claims: Dict[str, Any]) -> None:
+    now = int(time.time())
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak token missing valid exp claim.",
+        )
+    if exp < now - KEYCLOAK_JWT_LEEWAY_SECONDS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak token has expired.",
+        )
+    iat = claims.get("iat")
+    if not isinstance(iat, (int, float)) or isinstance(iat, bool):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak token missing valid iat claim.",
+        )
+    if iat > now + KEYCLOAK_JWT_LEEWAY_SECONDS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak token iat claim is in the future.",
+        )
+    if "nbf" in claims:
+        nbf = claims["nbf"]
+        if not isinstance(nbf, (int, float)) or isinstance(nbf, bool) or nbf > now + KEYCLOAK_JWT_LEEWAY_SECONDS:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Keycloak ID token issuer mismatch: expected {expected_iss}, got {token_iss}",
+                detail="Keycloak token is not yet valid (nbf).",
             )
-        expected_aud = settings.keycloak_client_id.strip()
-        if expected_aud:
-            token_aud = id_claims.get("aud")
-            token_azp = id_claims.get("azp")
-            aud_match = False
-            if isinstance(token_aud, str) and token_aud == expected_aud:
-                aud_match = True
-            elif isinstance(token_aud, list) and expected_aud in token_aud:
-                aud_match = True
-            elif token_azp == expected_aud:
-                aud_match = True
-            if token_aud and not aud_match:
-                logger.warning(
-                    "Keycloak ID token audience mismatch: expected %s, got aud=%s, azp=%s",
-                    expected_aud, token_aud, token_azp,
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Keycloak ID token audience mismatch: expected {expected_aud}",
-                )
 
-    # 2. Email verification check
-    email_verified = userinfo.get("email_verified")
-    if email_verified is None and id_claims:
-        email_verified = id_claims.get("email_verified")
 
-    if email_verified is not True:
+async def verify_keycloak_id_token(
+    id_token: Any,
+    *,
+    expected_nonce: Optional[str] = None,
+    require_nonce: bool = True,
+) -> Dict[str, Any]:
+    """Verifies Keycloak ID token signature (via realm JWKS) and validates required OIDC claims."""
+    if not isinstance(id_token, str) or not id_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing Keycloak ID token.",
+        )
+
+    id_claims = await _verify_keycloak_jwt_signature(id_token)
+
+    expected_iss = get_keycloak_realm_base_url().rstrip("/")
+    token_iss = id_claims.get("iss")
+    if not isinstance(token_iss, str) or not token_iss.strip() or token_iss.rstrip("/") != expected_iss:
+        logger.warning("Keycloak ID token issuer mismatch: %r != %r", token_iss, expected_iss)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Keycloak ID token issuer mismatch: expected {expected_iss}",
+        )
+
+    expected_aud = settings.keycloak_client_id.strip()
+    if not expected_aud:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak client ID is not configured.",
+        )
+    token_aud = id_claims.get("aud")
+    aud_match = False
+    if isinstance(token_aud, str):
+        aud_match = token_aud == expected_aud
+    elif isinstance(token_aud, list) and all(isinstance(a, str) for a in token_aud):
+        aud_match = expected_aud in token_aud
+    if not aud_match:
         logger.warning(
-            "Rejected Keycloak user with unverified email (email_verified=%s): %s",
-            email_verified, userinfo.get("email") or id_claims.get("email"),
+            "Keycloak ID token audience mismatch: expected %s, got aud=%r, azp=%r",
+            expected_aud, token_aud, id_claims.get("azp"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Keycloak ID token audience mismatch: expected {expected_aud}",
+        )
+
+    if "azp" in id_claims:
+        if not isinstance(id_claims["azp"], str) or id_claims["azp"] != expected_aud:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak ID token authorized party (azp) mismatch.",
+            )
+    elif isinstance(token_aud, list) and len(token_aud) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token missing azp claim for multi-audience token.",
+        )
+
+    _validate_keycloak_timestamps(id_claims)
+
+    if require_nonce or expected_nonce is not None:
+        if not expected_nonce or not isinstance(expected_nonce, str):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Missing expected OAuth transaction nonce.",
+            )
+        token_nonce = id_claims.get("nonce")
+        if not isinstance(token_nonce, str) or not token_nonce:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak ID token missing nonce claim.",
+            )
+        if not hmac.compare_digest(token_nonce, expected_nonce):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak ID token nonce mismatch",
+            )
+
+    sub = id_claims.get("sub")
+    if not isinstance(sub, str) or not sub.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token missing sub claim.",
+        )
+
+    if id_claims.get("email_verified") is not True:
+        logger.warning(
+            "Rejected Keycloak user with unverified email in ID token (email_verified=%r): %s",
+            id_claims.get("email_verified"), id_claims.get("email"),
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Keycloak reports that this email address is unverified.",
         )
 
-    email = userinfo.get("email") or id_claims.get("email") or ""
-    clean_email = email.strip().lower()
+    raw_email = id_claims.get("email")
+    if not isinstance(raw_email, str):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token does not contain a valid email address.",
+        )
+    clean_email = raw_email.strip().lower()
     if not clean_email or "@" not in clean_email:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Keycloak user profile does not contain a valid email address.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token does not contain a valid email address.",
         )
 
-    # Name extraction
-    name = userinfo.get("name")
-    if not name:
-        given = userinfo.get("given_name", "").strip()
-        family = userinfo.get("family_name", "").strip()
+    return id_claims
+
+
+def _extract_keycloak_roles_from_claims(payload: Dict[str, Any]) -> List[str]:
+    extracted: List[str] = []
+    realm_access = payload.get("realm_access")
+    if isinstance(realm_access, dict):
+        roles = realm_access.get("roles")
+        if isinstance(roles, list):
+            extracted.extend(str(r) for r in roles if isinstance(r, str))
+    resource_access = payload.get("resource_access")
+    if isinstance(resource_access, dict):
+        client_access = resource_access.get(settings.keycloak_client_id)
+        if isinstance(client_access, dict):
+            roles = client_access.get("roles")
+            if isinstance(roles, list):
+                extracted.extend(str(r) for r in roles if isinstance(r, str))
+    groups = payload.get("groups")
+    if isinstance(groups, list):
+        extracted.extend(str(g) for g in groups if isinstance(g, str))
+    return extracted
+
+
+async def parse_keycloak_user(
+    token_data: Dict[str, Any],
+    userinfo: Optional[Dict[str, Any]] = None,
+    *,
+    expected_nonce: Optional[str] = None,
+    require_nonce: bool = False,
+    verified_id_claims: Optional[Dict[str, Any]] = None,
+) -> AuthenticatedUser:
+    """Verifies Keycloak ID token + optional userinfo binding and constructs AuthenticatedUser."""
+    id_claims = (
+        verified_id_claims
+        if verified_id_claims is not None
+        else await verify_keycloak_id_token(
+            token_data.get("id_token"),
+            expected_nonce=expected_nonce,
+            require_nonce=require_nonce,
+        )
+    )
+
+    id_sub = str(id_claims["sub"])
+    clean_email = str(id_claims["email"]).strip().lower()
+
+    if userinfo is not None:
+        if not isinstance(userinfo, dict):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Malformed Keycloak userinfo response.",
+            )
+        ui_sub = userinfo.get("sub")
+        if not isinstance(ui_sub, str) or not ui_sub or not hmac.compare_digest(ui_sub, id_sub):
+            logger.warning("Keycloak userinfo sub mismatch: %r != %r", ui_sub, id_sub)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak userinfo subject mismatch.",
+            )
+        if "email_verified" in userinfo and userinfo["email_verified"] is not True:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak reports that this email address is unverified.",
+            )
+        if "email" in userinfo and userinfo["email"] is not None:
+            if not isinstance(userinfo["email"], str) or userinfo["email"].strip().lower() != clean_email:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Keycloak userinfo email mismatch.",
+                )
+
+    profile_source = userinfo if userinfo is not None else id_claims
+    name = profile_source.get("name")
+    if not isinstance(name, str) or not name.strip():
+        given = str(profile_source.get("given_name") or "").strip()
+        family = str(profile_source.get("family_name") or "").strip()
         if given or family:
             name = f"{given} {family}".strip()
         else:
-            name = userinfo.get("preferred_username") or clean_email.split("@")[0]
+            pref = profile_source.get("preferred_username")
+            name = str(pref).strip() if isinstance(pref, str) and pref.strip() else clean_email.split("@")[0]
+
+    picture = profile_source.get("picture")
+    if picture is not None and not isinstance(picture, str):
+        picture = None
 
     domain = clean_email.split("@")[-1]
 
-    # Roles and groups extraction
+    # Roles and groups extraction from verified sources only
     groups: List[str] = []
-    if "groups" in userinfo and isinstance(userinfo["groups"], list):
-        groups.extend(userinfo["groups"])
-    if "roles" in userinfo and isinstance(userinfo["roles"], list):
-        groups.extend(userinfo["roles"])
+    groups.extend(_extract_keycloak_roles_from_claims(id_claims))
 
-    for tok_key in ("access_token", "id_token"):
-        tok = token_data.get(tok_key)
-        if tok and isinstance(tok, str) and "." in tok:
-            try:
-                parts = tok.split(".")
-                if len(parts) >= 2:
-                    p = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8"))
-                    realm_access = p.get("realm_access", {})
-                    if isinstance(realm_access, dict):
-                        roles = realm_access.get("roles", [])
-                        if isinstance(roles, list):
-                            groups.extend(roles)
-                    resource_access = p.get("resource_access", {})
-                    if isinstance(resource_access, dict):
-                        client_access = resource_access.get(settings.keycloak_client_id, {})
-                        if isinstance(client_access, dict):
-                            roles = client_access.get("roles", [])
-                            if isinstance(roles, list):
-                                groups.extend(roles)
-                    if "groups" in p and isinstance(p["groups"], list):
-                        groups.extend(p["groups"])
-            except Exception:
-                pass
+    if userinfo is not None:
+        if isinstance(userinfo.get("groups"), list):
+            groups.extend(str(g) for g in userinfo["groups"] if isinstance(g, str))
+        if isinstance(userinfo.get("roles"), list):
+            groups.extend(str(r) for r in userinfo["roles"] if isinstance(r, str))
 
-    unique_groups = sorted(list(set(groups)))
+    access_token = token_data.get("access_token")
+    if isinstance(access_token, str) and access_token.count(".") == 2:
+        at_claims = await _verify_keycloak_jwt_signature(access_token)
+        expected_iss = get_keycloak_realm_base_url().rstrip("/")
+        at_iss = at_claims.get("iss")
+        if not isinstance(at_iss, str) or at_iss.rstrip("/") != expected_iss:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak access token issuer mismatch.",
+            )
+        _validate_keycloak_timestamps(at_claims)
+        at_sub = at_claims.get("sub")
+        if at_sub is not None and (not isinstance(at_sub, str) or not hmac.compare_digest(at_sub, id_sub)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak access token subject mismatch.",
+            )
+        groups.extend(_extract_keycloak_roles_from_claims(at_claims))
+
+    unique_groups = sorted(set(groups))
 
     # Determine user role
     role = settings.jit_default_role
@@ -1982,7 +2436,7 @@ def parse_keycloak_user(token_data: Dict[str, Any], userinfo: Dict[str, Any]) ->
     return AuthenticatedUser(
         email=clean_email,
         name=name,
-        picture=userinfo.get("picture"),
+        picture=picture,
         domain=domain,
         role=role,
         status="active",

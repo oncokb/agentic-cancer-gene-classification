@@ -5,7 +5,7 @@ FastAPI application — manually invokable, Docker/K8s-ready.
 from __future__ import annotations
 
 import asyncio
-import base64
+import inspect
 import json
 import logging
 import os
@@ -44,6 +44,7 @@ from src.auth import (
     AuthenticatedUser,
     AuthMeResponse,
     AuthUserResponse,
+    OAuthTransactionUnavailable,
     UserProfile,
     UserStoreUnavailable,
     _session_token,
@@ -71,6 +72,7 @@ from src.auth import (
     is_email_allowed,
     is_saml_group_allowed,
     list_user_profiles,
+    load_user_profile_strict,
     mysql_user_store_enabled,
     parse_keycloak_user,
     parse_saml_response,
@@ -84,7 +86,10 @@ from src.auth import (
     set_oauth_txn_cookie,
     set_session_cookie,
     validate_redirect_to,
+    verify_google_id_token_nonce,
+    verify_keycloak_id_token,
     verify_oauth_state,
+    verify_oauth_txn_cookie,
 )
 from src.config import dev_mode_startup_error, saml_startup_error, settings
 from src.job_store import JobStore, can_read_job, job_owner
@@ -1633,6 +1638,67 @@ async def auth_me(request: Request) -> AuthMeResponse:
     )
 
 
+async def _consume_callback_oauth_txn(
+    request: Request,
+    state_data: Dict[str, Any],
+    *,
+    expected_provider: str,
+) -> Tuple[Optional[str], str]:
+    """Validate state txn/provider, verify signed txn cookie before storage lookup,
+    and atomically consume the transaction in Redis (failing closed if unavailable)."""
+    txn_id = state_data.get("txn")
+    state_provider = state_data.get("provider")
+    if not isinstance(txn_id, str) or not txn_id or not isinstance(state_provider, str) or not state_provider:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or legacy OAuth state token.",
+        )
+    if state_provider != expected_provider:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth state provider mismatch",
+        )
+
+    cookie_val = request.cookies.get(OAUTH_TXN_COOKIE_NAME)
+    if not cookie_val:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing OAuth transaction cookie",
+        )
+    if verify_oauth_txn_cookie(cookie_val, expected_txn=txn_id, expected_provider=expected_provider) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth transaction cookie mismatch or invalid",
+        )
+
+    try:
+        txn_data = await consume_oauth_transaction(txn_id, cookie_val, expected_provider=expected_provider)
+    except OAuthTransactionUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication transaction store is temporarily unavailable. Please retry shortly.",
+        ) from exc
+    if not txn_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth transaction already consumed or invalid",
+        )
+
+    expected_nonce = txn_data.get("nonce")
+    if not isinstance(expected_nonce, str) or not expected_nonce:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth transaction missing nonce",
+        )
+    state_nonce = state_data.get("nonce")
+    if not isinstance(state_nonce, str) or state_nonce != expected_nonce:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth transaction nonce mismatch",
+        )
+    return txn_data.get("code_verifier"), expected_nonce
+
+
 @app.get("/auth/login")
 async def auth_login(
     request: Request,
@@ -1647,7 +1713,13 @@ async def auth_login(
             provider="google",
             redirect_to=validate_redirect_to(redirect_to),
         )
-        await save_oauth_transaction(txn_id, provider="google", code_verifier=verifier, nonce=nonce)
+        try:
+            await save_oauth_transaction(txn_id, provider="google", code_verifier=verifier, nonce=nonce)
+        except OAuthTransactionUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication transaction store is temporarily unavailable. Please retry shortly.",
+            ) from exc
         google_url = get_google_auth_url(redirect_uri=redirect_uri, state=state, code_challenge=challenge, nonce=nonce)
         response = RedirectResponse(url=google_url)
         set_oauth_txn_cookie(response, cookie_val, request=request)
@@ -1691,22 +1763,11 @@ async def auth_callback_google(
     if not state_data:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state token")
 
-    code_verifier = None
-    expected_nonce = None
-    if state_data.get("txn"):
-        cookie_val = request.cookies.get(OAUTH_TXN_COOKIE_NAME)
-        if not cookie_val:
-            raise HTTPException(status_code=400, detail="Missing OAuth transaction cookie")
-        cookie_txn = cookie_val.split(".", 1)[0]
-        if cookie_txn != state_data["txn"]:
-            raise HTTPException(status_code=400, detail="OAuth transaction cookie mismatch")
-        if state_data.get("provider") != "google":
-            raise HTTPException(status_code=400, detail="OAuth state provider mismatch")
-        txn_data = await consume_oauth_transaction(state_data["txn"], cookie_val, expected_provider="google")
-        if not txn_data:
-            raise HTTPException(status_code=400, detail="OAuth transaction already consumed or invalid")
-        code_verifier = txn_data.get("code_verifier")
-        expected_nonce = txn_data.get("nonce")
+    code_verifier, expected_nonce = await _consume_callback_oauth_txn(
+        request,
+        state_data,
+        expected_provider="google",
+    )
 
     redirect_uri = settings.google_redirect_uri.strip() or f"{_public_app_base_url(request)}/auth/callback/google"
 
@@ -1715,20 +1776,7 @@ async def auth_callback_google(
     if not access_token:
         raise HTTPException(status_code=400, detail="Failed to obtain access token from Google")
 
-    # Validate ID token nonce if present
-    if expected_nonce and "id_token" in tokens:
-        try:
-            parts = tokens["id_token"].split(".")
-            if len(parts) >= 2:
-                payload_json = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8")
-                id_claims = json.loads(payload_json)
-                id_nonce = id_claims.get("nonce")
-                if id_nonce and id_nonce != expected_nonce:
-                    raise HTTPException(status_code=400, detail="Google ID token nonce mismatch")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
+    verify_google_id_token_nonce(tokens.get("id_token"), expected_nonce=expected_nonce)
 
     userinfo = await get_google_user_info(access_token)
     email = str(userinfo.get("email") or "").strip().lower()
@@ -1955,7 +2003,13 @@ async def auth_keycloak_login(
         provider="keycloak",
         redirect_to=validate_redirect_to(redirect_to),
     )
-    await save_oauth_transaction(txn_id, provider="keycloak", code_verifier=verifier, nonce=nonce)
+    try:
+        await save_oauth_transaction(txn_id, provider="keycloak", code_verifier=verifier, nonce=nonce)
+    except OAuthTransactionUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication transaction store is temporarily unavailable. Please retry shortly.",
+        ) from exc
     keycloak_url = get_keycloak_auth_url(
         redirect_uri=redirect_uri,
         state=state,
@@ -1996,22 +2050,11 @@ async def auth_callback_keycloak(
             detail="Invalid or expired OAuth state parameter.",
         )
 
-    code_verifier = None
-    expected_nonce = None
-    if state_data.get("txn"):
-        cookie_val = request.cookies.get(OAUTH_TXN_COOKIE_NAME)
-        if not cookie_val:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing OAuth transaction cookie")
-        cookie_txn = cookie_val.split(".", 1)[0]
-        if cookie_txn != state_data["txn"]:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth transaction cookie mismatch")
-        if state_data.get("provider") != "keycloak":
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth state provider mismatch")
-        txn_data = await consume_oauth_transaction(state_data["txn"], cookie_val, expected_provider="keycloak")
-        if not txn_data:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth transaction already consumed or invalid")
-        code_verifier = txn_data.get("code_verifier")
-        expected_nonce = txn_data.get("nonce")
+    code_verifier, expected_nonce = await _consume_callback_oauth_txn(
+        request,
+        state_data,
+        expected_provider="keycloak",
+    )
 
     redirect_to = validate_redirect_to(state_data.get("redirect_to"))
 
@@ -2028,23 +2071,21 @@ async def auth_callback_keycloak(
             detail="Keycloak did not return an access token.",
         )
 
-    # Validate ID token nonce if present
-    if expected_nonce and "id_token" in token_data:
-        try:
-            parts = token_data["id_token"].split(".")
-            if len(parts) >= 2:
-                payload_json = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8")
-                id_claims = json.loads(payload_json)
-                id_nonce = id_claims.get("nonce")
-                if id_nonce and id_nonce != expected_nonce:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Keycloak ID token nonce mismatch")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
+    verified_id_claims = await verify_keycloak_id_token(
+        token_data.get("id_token"),
+        expected_nonce=expected_nonce,
+        require_nonce=True,
+    )
 
     userinfo = await get_keycloak_user_info(access_token)
-    user = parse_keycloak_user(token_data, userinfo)
+    parsed = parse_keycloak_user(
+        token_data,
+        userinfo,
+        expected_nonce=expected_nonce,
+        require_nonce=True,
+        verified_id_claims=verified_id_claims,
+    )
+    user = await parsed if inspect.isawaitable(parsed) else parsed
 
     # Validate authorization (domain & optional role check)
     is_allowed, reason = is_email_allowed(user.email)
@@ -2117,15 +2158,39 @@ async def auth_callback_keycloak(
 @app.post("/auth/logout")
 async def auth_logout(request: Request) -> Response:
     token = _session_token(request)
-    if token:
-        try:
-            claims = decode_session_token(token)
-            if claims and claims.email:
-                await bump_session_generation(claims.email)
-        except Exception as exc:
-            logger.warning("Failed to bump session generation on logout: %s", exc)
-
     target = "/login" if settings.auth_enabled else "/"
+    if token:
+        claims = decode_session_token(token)
+        if claims and claims.email:
+            try:
+                profile = await load_user_profile_strict(claims.email)
+                if profile is not None and claims.session_generation == profile.session_generation:
+                    await bump_session_generation(claims.email)
+            except Exception as exc:
+                logger.error("Session revocation failed on logout: %s", describe_store_error(exc))
+                if "application/json" in (request.headers.get("accept") or "").lower():
+                    err_resp: Response = JSONResponse(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        content={
+                            "detail": (
+                                "Session revocation failed; your local cookie was cleared, "
+                                "but existing sessions may remain active until revocation succeeds."
+                            )
+                        },
+                    )
+                else:
+                    err_resp = HTMLResponse(
+                        content=(
+                            "<!doctype html><html><body><h1>Logout Incomplete</h1>"
+                            "<p>Session revocation failed because the user store could not be updated. "
+                            "Your browser cookie was cleared, but existing session tokens could not be revoked. "
+                            "Please try again shortly.</p></body></html>"
+                        ),
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
+                clear_session_cookie(err_resp)
+                return err_resp
+
     response = RedirectResponse(url=target, status_code=303)
     clear_session_cookie(response)
     return response

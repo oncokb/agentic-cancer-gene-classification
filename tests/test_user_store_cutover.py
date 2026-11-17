@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,7 +28,7 @@ from fastapi.testclient import TestClient
 from src import auth as auth_module
 from src import main as main_module
 from src.api_keys import ApiKeyRecord, generate_api_key, hash_api_key
-from src.auth import AuthenticatedUser, SAMLAssertionData, UserProfile, create_oauth_state, create_session_token
+from src.auth import AuthenticatedUser, SAMLAssertionData, UserProfile, create_session_token
 from src.config import settings
 from src.main import app
 from src.pipeline.user_store import (
@@ -38,7 +39,12 @@ from src.pipeline.user_store import (
     LoginIdentity,
 )
 from src.pipeline.user_store_fake import FakeUserStore
-from tests.auth_helpers import put_profile
+from tests.auth_helpers import (
+    install_test_keycloak_jwks,
+    make_keycloak_id_claims,
+    put_profile,
+    sign_rs256_jwt,
+)
 from tests.test_api_keys import FakeStore
 from tests.test_session_live_status import FakeAuthRedis
 
@@ -184,7 +190,6 @@ def _api_key(keys: FakeStore, owner: str = EMAIL) -> dict:
 @pytest.fixture
 def google_login(monkeypatch):
     monkeypatch.setattr(settings, "google_client_id", "test-client")
-    monkeypatch.setattr(main_module, "exchange_google_code", AsyncMock(return_value={"access_token": "t"}))
 
     def login(email: str = EMAIL):
         monkeypatch.setattr(
@@ -192,8 +197,17 @@ def google_login(monkeypatch):
             AsyncMock(return_value={"email": email, "email_verified": True, "name": "Google Name"}),
         )
         browser = TestClient(app)
+        login_resp = browser.get("/auth/login", params={"redirect_to": "/"}, follow_redirects=False)
+        if login_resp.status_code not in (302, 303, 307):
+            return browser, login_resp
+        qs = parse_qs(urlsplit(login_resp.headers["location"]).query)
+        state, nonce = qs["state"][0], qs["nonce"][0]
+        monkeypatch.setattr(
+            main_module, "exchange_google_code",
+            AsyncMock(return_value={"access_token": "t", "id_token": sign_rs256_jwt({"nonce": nonce})}),
+        )
         resp = browser.get(
-            "/auth/callback/google", params={"code": "c", "state": create_oauth_state("/")},
+            "/auth/callback/google", params={"code": "c", "state": state},
             follow_redirects=False,
         )
         return browser, resp
@@ -207,20 +221,32 @@ def keycloak_login(monkeypatch):
     monkeypatch.setattr(settings, "keycloak_client_id", "test-client")
     monkeypatch.setattr(settings, "keycloak_allowed_roles", "")
     monkeypatch.setattr(settings, "keycloak_admin_roles", "acgc-admin")
-    monkeypatch.setattr(main_module, "exchange_keycloak_code", AsyncMock(return_value={"access_token": "t"}))
-    monkeypatch.setattr(main_module, "get_keycloak_user_info", AsyncMock(return_value={}))
+    install_test_keycloak_jwks(monkeypatch)
 
     def login(groups=()):
         groups = list(groups)
-        # parse_keycloak_user maps admin roles to "admin" before provisioning.
-        role = "admin" if "acgc-admin" in groups else settings.jit_default_role
-        user = AuthenticatedUser(
-            email=EMAIL, name="KC User", domain="mskcc.org", role=role, provider="keycloak", groups=groups,
-        )
-        monkeypatch.setattr(main_module, "parse_keycloak_user", lambda *args: user)
         browser = TestClient(app)
+        login_resp = browser.get("/auth/keycloak/login", params={"redirect_to": "/"}, follow_redirects=False)
+        if login_resp.status_code != 303:
+            return browser, login_resp
+        qs = parse_qs(urlsplit(login_resp.headers["location"]).query)
+        state, nonce = qs["state"][0], qs["nonce"][0]
+        id_claims = make_keycloak_id_claims(
+            email=EMAIL,
+            sub="kc-sub",
+            nonce=nonce,
+            extra={"groups": groups} if groups else None,
+        )
+        monkeypatch.setattr(
+            main_module, "exchange_keycloak_code",
+            AsyncMock(return_value={"access_token": "t", "id_token": sign_rs256_jwt(id_claims)}),
+        )
+        monkeypatch.setattr(
+            main_module, "get_keycloak_user_info",
+            AsyncMock(return_value={"sub": "kc-sub", "name": "KC User", "groups": groups}),
+        )
         resp = browser.get(
-            "/auth/callback/keycloak", params={"code": "c", "state": create_oauth_state("/")},
+            "/auth/callback/keycloak", params={"code": "c", "state": state},
             follow_redirects=False,
         )
         return browser, resp
@@ -500,13 +526,17 @@ def test_store_error_at_sign_in_is_503_without_cookie(backend, provider, google_
     assert "set-cookie" not in resp.headers
 
 
-def test_sign_in_with_mysql_never_touches_redis(mysql, google_login, monkeypatch):
+def test_sign_in_with_mysql_never_touches_redis(mysql, google_login, fake_oauth_redis, monkeypatch):
     async def no_redis():
         raise AssertionError("USER_STORE_BACKEND=mysql must not read or write Redis user records")
+
+    async def oauth_only_redis():
+        return fake_oauth_redis
 
     monkeypatch.setattr(settings, "redis_url", FAKE_REDIS_URL)
     monkeypatch.setattr(auth_module, "_get_auth_redis_client", no_redis)
     monkeypatch.setattr(auth_module, "_profile_store_redis", no_redis)
+    monkeypatch.setattr(auth_module, "_oauth_txn_redis", oauth_only_redis)
     browser, resp = google_login()
     assert resp.status_code == 303
     assert browser.get(PROTECTED).status_code == 404

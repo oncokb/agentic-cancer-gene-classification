@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import zlib
 from typing import Optional
 from unittest.mock import AsyncMock, patch
@@ -28,7 +27,13 @@ from src.auth import (
 )
 from src.config import settings
 from src.main import app
-from tests.auth_helpers import session_token_for
+from tests.auth_helpers import (
+    begin_oauth_login,
+    install_test_keycloak_jwks,
+    make_keycloak_id_claims,
+    session_token_for,
+    sign_rs256_jwt,
+)
 
 # Every test runs once per USER_STORE_BACKEND (see conftest.user_store_backend).
 pytestmark = pytest.mark.usefixtures("user_store_backend")
@@ -256,23 +261,20 @@ async def test_google_callback_flow(monkeypatch):
     monkeypatch.setattr(settings, "google_client_secret", "mock-google-client-secret")
     client = TestClient(app)
 
-    state = create_oauth_state(redirect_to="/results/target-job")
-
-    # Mock token exchange and userinfo retrieval
-    fake_tokens = {"access_token": "mock-access-token-123"}
-
     # Case A: Successful MSK login
+    state_a, nonce_a = begin_oauth_login(client, "google", "/results/target-job")
     fake_userinfo_msk = {
         "email": "doctor@mskcc.org",
         "email_verified": True,
         "name": "Dr. MSK",
         "picture": "https://avatar.example.com/msk.png",
     }
-    with patch("src.main.exchange_google_code", AsyncMock(return_value=fake_tokens)), \
-         patch("src.main.get_google_user_info", AsyncMock(return_value=fake_userinfo_msk)):
-
+    with patch(
+        "src.main.exchange_google_code",
+        AsyncMock(return_value={"access_token": "mock-access-token-123", "id_token": sign_rs256_jwt({"nonce": nonce_a})}),
+    ), patch("src.main.get_google_user_info", AsyncMock(return_value=fake_userinfo_msk)):
         resp = client.get(
-            f"/auth/callback/google?code=fake-code&state={state}",
+            f"/auth/callback/google?code=fake-code&state={state_a}",
             follow_redirects=False,
         )
         assert resp.status_code == 303
@@ -280,33 +282,37 @@ async def test_google_callback_flow(monkeypatch):
         assert any(settings.auth_cookie_name in c for c in resp.headers.get_list("set-cookie"))
 
     # Case B: Successful OpenEvidence login
+    state_b, nonce_b = begin_oauth_login(client, "google", "/results/target-job")
     fake_userinfo_oe = {
         "email": "curator@openevidence.com",
         "email_verified": True,
         "name": "OE Curator",
         "picture": "https://avatar.example.com/oe.png",
     }
-    with patch("src.main.exchange_google_code", AsyncMock(return_value=fake_tokens)), \
-         patch("src.main.get_google_user_info", AsyncMock(return_value=fake_userinfo_oe)):
-
+    with patch(
+        "src.main.exchange_google_code",
+        AsyncMock(return_value={"access_token": "mock-access-token-123", "id_token": sign_rs256_jwt({"nonce": nonce_b})}),
+    ), patch("src.main.get_google_user_info", AsyncMock(return_value=fake_userinfo_oe)):
         resp = client.get(
-            f"/auth/callback/google?code=fake-code&state={state}",
+            f"/auth/callback/google?code=fake-code&state={state_b}",
             follow_redirects=False,
         )
         assert resp.status_code == 303
         assert resp.headers["location"] == "/results/target-job"
 
     # Case C: Unauthorized domain rejected with 403
+    state_c, nonce_c = begin_oauth_login(client, "google", "/results/target-job")
     fake_userinfo_unauthorized = {
         "email": "intruder@gmail.com",
         "email_verified": True,
         "name": "Intruder",
     }
-    with patch("src.main.exchange_google_code", AsyncMock(return_value=fake_tokens)), \
-         patch("src.main.get_google_user_info", AsyncMock(return_value=fake_userinfo_unauthorized)):
-
+    with patch(
+        "src.main.exchange_google_code",
+        AsyncMock(return_value={"access_token": "mock-access-token-123", "id_token": sign_rs256_jwt({"nonce": nonce_c})}),
+    ), patch("src.main.get_google_user_info", AsyncMock(return_value=fake_userinfo_unauthorized)):
         resp = client.get(
-            f"/auth/callback/google?code=fake-code&state={state}",
+            f"/auth/callback/google?code=fake-code&state={state_c}",
             follow_redirects=False,
         )
         assert resp.status_code == 403
@@ -314,16 +320,18 @@ async def test_google_callback_flow(monkeypatch):
         assert "intruder@gmail.com" in resp.text
 
     # Case D: Unverified email rejected with 403
+    state_d, nonce_d = begin_oauth_login(client, "google", "/results/target-job")
     fake_userinfo_unverified = {
         "email": "doctor@mskcc.org",
         "email_verified": False,
         "name": "Unverified Doctor",
     }
-    with patch("src.main.exchange_google_code", AsyncMock(return_value=fake_tokens)), \
-         patch("src.main.get_google_user_info", AsyncMock(return_value=fake_userinfo_unverified)):
-
+    with patch(
+        "src.main.exchange_google_code",
+        AsyncMock(return_value={"access_token": "mock-access-token-123", "id_token": sign_rs256_jwt({"nonce": nonce_d})}),
+    ), patch("src.main.get_google_user_info", AsyncMock(return_value=fake_userinfo_unverified)):
         resp = client.get(
-            f"/auth/callback/google?code=fake-code&state={state}",
+            f"/auth/callback/google?code=fake-code&state={state_d}",
             follow_redirects=False,
         )
         assert resp.status_code == 403
@@ -856,17 +864,18 @@ async def test_keycloak_callback_flow(monkeypatch):
     monkeypatch.setattr(settings, "keycloak_client_id", "acgc")
     monkeypatch.setattr(settings, "keycloak_client_secret", "mock-kc-secret")
     monkeypatch.setattr(settings, "keycloak_admin_roles", "acgc-admin")
+    install_test_keycloak_jwks(monkeypatch)
     client = TestClient(app)
 
-    state = create_oauth_state(redirect_to="/results/job-kc-1")
-
-    fake_tokens = {
-        "access_token": "mock-access-token",
-        "id_token": "mock-id-token",
-    }
-
     # Case A: Successful MSK user login with admin role mapping
+    state_a, nonce_a = begin_oauth_login(client, "keycloak", "/results/job-kc-1")
+    id_claims_a = make_keycloak_id_claims(email="oncologist@mskcc.org", sub="kc-sub-a", nonce=nonce_a)
+    fake_tokens_a = {
+        "access_token": "mock-access-token",
+        "id_token": sign_rs256_jwt(id_claims_a),
+    }
     fake_userinfo_msk = {
+        "sub": "kc-sub-a",
         "email": "oncologist@mskcc.org",
         "email_verified": True,
         "name": "MSK Oncologist",
@@ -875,11 +884,11 @@ async def test_keycloak_callback_flow(monkeypatch):
         "preferred_username": "oncomsk",
         "groups": ["acgc-admin", "curators"],
     }
-    with patch("src.main.exchange_keycloak_code", AsyncMock(return_value=fake_tokens)), \
+    with patch("src.main.exchange_keycloak_code", AsyncMock(return_value=fake_tokens_a)), \
          patch("src.main.get_keycloak_user_info", AsyncMock(return_value=fake_userinfo_msk)):
 
         resp = client.get(
-            f"/auth/callback/keycloak?code=fake-code-123&state={state}",
+            f"/auth/callback/keycloak?code=fake-code-123&state={state_a}",
             follow_redirects=False,
         )
         assert resp.status_code == 303
@@ -893,16 +902,23 @@ async def test_keycloak_callback_flow(monkeypatch):
         assert user.role == "admin"
 
     # Case B: Unauthorized domain rejected with 403
+    state_b, nonce_b = begin_oauth_login(client, "keycloak", "/results/job-kc-1")
+    id_claims_b = make_keycloak_id_claims(email="intruder@gmail.com", sub="kc-sub-b", nonce=nonce_b)
+    fake_tokens_b = {
+        "access_token": "mock-access-token",
+        "id_token": sign_rs256_jwt(id_claims_b),
+    }
     fake_userinfo_external = {
+        "sub": "kc-sub-b",
         "email": "intruder@gmail.com",
         "email_verified": True,
         "name": "External User",
     }
-    with patch("src.main.exchange_keycloak_code", AsyncMock(return_value=fake_tokens)), \
+    with patch("src.main.exchange_keycloak_code", AsyncMock(return_value=fake_tokens_b)), \
          patch("src.main.get_keycloak_user_info", AsyncMock(return_value=fake_userinfo_external)):
 
         resp_bad_domain = client.get(
-            f"/auth/callback/keycloak?code=fake-code-123&state={state}",
+            f"/auth/callback/keycloak?code=fake-code-123&state={state_b}",
             follow_redirects=False,
         )
         assert resp_bad_domain.status_code == 403
@@ -949,43 +965,40 @@ def test_auth_me_reflects_keycloak_status(monkeypatch):
     assert data["keycloak_enabled"] is True
 
 
-def test_parse_keycloak_user(monkeypatch):
+@pytest.mark.asyncio
+async def test_parse_keycloak_user(monkeypatch):
+    monkeypatch.setattr(settings, "keycloak_url", "https://keycloak.oncokb.org")
+    monkeypatch.setattr(settings, "keycloak_realm", "oncokb-public")
     monkeypatch.setattr(settings, "keycloak_client_id", "acgc")
     monkeypatch.setattr(settings, "keycloak_admin_roles", "acgc-admin,super-admin")
+    install_test_keycloak_jwks(monkeypatch)
     from fastapi import HTTPException
 
-    # 1. Normal user claims from userinfo
-    token_data = {"access_token": "token1", "id_token": "id1"}
+    # 1. Verified ID token + sub-matched userinfo profile
+    id_tok1 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="sub-1"))
+    token_data = {"access_token": "token1", "id_token": id_tok1}
     userinfo = {
-        "email": "curator@mskcc.org",
-        "email_verified": True,
+        "sub": "sub-1",
         "given_name": "Curator",
         "family_name": "User",
         "roles": ["acgc-admin"],
     }
-    user = parse_keycloak_user(token_data, userinfo)
+    user = await parse_keycloak_user(token_data, userinfo)
     assert user.email == "curator@mskcc.org"
     assert user.name == "Curator User"
     assert user.role == "admin"
     assert user.provider == "keycloak"
 
-    # 2. Email fallback to JWT payload if not in userinfo
-    jwt_claims = {
-        "email": "jwt.user@mskcc.org",
-        "email_verified": True,
-        "iss": "https://keycloak.oncokb.org/realms/oncokb-public",
-        "aud": "acgc",
-    }
-    fake_jwt_payload = base64.urlsafe_b64encode(json.dumps(jwt_claims).encode()).decode().rstrip("=")
-    token_data_jwt = {"access_token": "token2", "id_token": f"header.{fake_jwt_payload}.sig"}
-    user2 = parse_keycloak_user(token_data_jwt, {"name": "JWT User"})
+    # 2. Email comes strictly from verified ID token even when userinfo omits email
+    id_tok2 = sign_rs256_jwt(make_keycloak_id_claims(email="jwt.user@mskcc.org", sub="sub-2"))
+    user2 = await parse_keycloak_user({"access_token": "token2", "id_token": id_tok2}, {"sub": "sub-2", "name": "JWT User"})
     assert user2.email == "jwt.user@mskcc.org"
     assert user2.name == "JWT User"
 
-    # 3. Missing email raises HTTPException 400
+    # 3. Missing ID token raises HTTPException 403
     with pytest.raises(HTTPException) as exc_info:
-        parse_keycloak_user({}, {"name": "No Email", "email_verified": True})
-    assert exc_info.value.status_code == 400
+        await parse_keycloak_user({}, {"sub": "sub-x", "name": "No Token", "email_verified": True})
+    assert exc_info.value.status_code == 403
 
 
 

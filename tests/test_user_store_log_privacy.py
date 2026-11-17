@@ -18,11 +18,12 @@ from fastapi.testclient import TestClient
 from src import auth as auth_module
 from src import main as main_module
 from src.api_keys import ApiKeyRecord, generate_api_key, hash_api_key
-from src.auth import AuthenticatedUser, create_oauth_state, create_session_token
+from src.auth import AuthenticatedUser, create_session_token
 from src.config import settings
 from src.main import app
 from src.pipeline.run_store import RunStore
 from src.pipeline.user_store import LoginIdentity
+from tests.auth_helpers import begin_oauth_login, sign_rs256_jwt
 from tests.test_api_keys import FakeStore
 
 LEAKED = "reviewer@example.invalid"
@@ -170,12 +171,18 @@ def test_api_key_owner_check_failure_logs_no_email(store, logs):
 
 def test_sign_in_failure_logs_no_email(store, logs, monkeypatch):
     monkeypatch.setattr(settings, "google_client_id", "test-client")
-    monkeypatch.setattr(main_module, "exchange_google_code", AsyncMock(return_value={"access_token": "t"}))
+    browser = TestClient(app)
+    state, nonce = begin_oauth_login(browser, "google", "/")
+    monkeypatch.setattr(
+        main_module,
+        "exchange_google_code",
+        AsyncMock(return_value={"access_token": "t", "id_token": sign_rs256_jwt({"nonce": nonce})}),
+    )
     monkeypatch.setattr(
         main_module, "get_google_user_info", AsyncMock(return_value={"email": EMAIL, "email_verified": True}),
     )
-    resp = TestClient(app).get(
-        "/auth/callback/google", params={"code": "c", "state": create_oauth_state("/")}, follow_redirects=False,
+    resp = browser.get(
+        "/auth/callback/google", params={"code": "c", "state": state}, follow_redirects=False,
     )
     assert resp.status_code == 503
     assert "set-cookie" not in resp.headers
