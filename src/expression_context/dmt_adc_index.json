@@ -1,0 +1,2169 @@
+{
+  "version": 1,
+  "source": {
+    "name": "DMT ADC Compiled List",
+    "csv_sha256": "89e353a92f16d55c0beb22cf3665b475d006a32a965b61186df8da12cd633473",
+    "hgnc_snapshot_sha256": "8bf6f686e640dbc864a346484626953621b0500d900d26cd085a35c2782d725d",
+    "rows": 221,
+    "uncertain_tissues": [
+      "Lung/solid?"
+    ],
+    "unresolved_genes": [
+      "IGTA10"
+    ]
+  },
+  "tissue_to_tcga": {
+    "Bladder": [
+      "BLCA"
+    ],
+    "Breast": [
+      "BRCA"
+    ],
+    "CRC": [
+      "COADREAD"
+    ],
+    "GI": [
+      "STAD",
+      "ESCA"
+    ],
+    "Chol/gall": [
+      "CHOL"
+    ],
+    "HCC": [
+      "LIHC"
+    ],
+    "Pancreas": [
+      "PAAD"
+    ],
+    "RCC": [
+      "KIRC",
+      "KIRP",
+      "KICH"
+    ],
+    "HeadAndNeck": [
+      "HNSC"
+    ],
+    "Prostate": [
+      "PRAD"
+    ],
+    "Glioma": [
+      "GBM",
+      "LGG"
+    ],
+    "Sarcoma": [
+      "SARC"
+    ],
+    "GCT": [
+      "TGCT"
+    ],
+    "GYN": [
+      "UCEC",
+      "UCS",
+      "OV",
+      "CESC"
+    ],
+    "Ovarian": [
+      "OV"
+    ],
+    "Uterine": [
+      "UCEC",
+      "UCS"
+    ],
+    "Cervical": [
+      "CESC"
+    ],
+    "Melanoma": [
+      "SKCM",
+      "UVM"
+    ],
+    "NSCLC": [
+      "LUAD",
+      "LUSC"
+    ],
+    "Lung": [
+      "LUAD",
+      "LUSC"
+    ],
+    "Lung/solid?": [
+      "LUAD",
+      "LUSC"
+    ],
+    "SCLC": []
+  },
+  "genes": {
+    "ALK": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "ANO1": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "AREG": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "ASCL1": [
+      {
+        "tissue_type": "SCLC",
+        "tcga_codes": [],
+        "from": "Stew",
+        "notes": "Type: NOT AN ADC, but relevant"
+      }
+    ],
+    "AXL": [
+      {
+        "tissue_type": "Lung/solid?",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Maria/Ladanyi (signout)",
+        "notes": "Type: resistance mechanism?"
+      },
+      {
+        "tissue_type": "Melanoma",
+        "tcga_codes": [
+          "SKCM",
+          "UVM"
+        ],
+        "from": "",
+        "notes": "No ADC yet?"
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "BTC": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "CA9": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "CD274": [
+      {
+        "tissue_type": "Breast",
+        "tcga_codes": [
+          "BRCA"
+        ],
+        "from": "",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Cervical",
+        "tcga_codes": [
+          "CESC"
+        ],
+        "from": "Ge",
+        "notes": ""
+      },
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      },
+      {
+        "tissue_type": "Melanoma",
+        "tcga_codes": [
+          "SKCM",
+          "UVM"
+        ],
+        "from": "Smithy",
+        "notes": "not for ADC, but relevant for treatment"
+      },
+      {
+        "tissue_type": "Ovarian",
+        "tcga_codes": [
+          "OV"
+        ],
+        "from": "Ge",
+        "notes": ""
+      }
+    ],
+    "CD276": [
+      {
+        "tissue_type": "Chol/gall",
+        "tcga_codes": [
+          "CHOL"
+        ],
+        "from": "Olca",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GCT",
+        "tcga_codes": [
+          "TGCT"
+        ],
+        "from": "Funt/Feldman",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      },
+      {
+        "tissue_type": "GYN",
+        "tcga_codes": [
+          "UCEC",
+          "UCS",
+          "OV",
+          "CESC"
+        ],
+        "from": "Ge",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "HCC",
+        "tcga_codes": [
+          "LIHC"
+        ],
+        "from": "Olca",
+        "notes": ""
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Lung",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": ""
+      }
+    ],
+    "CD70": [
+      {
+        "tissue_type": "Lung/solid?",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Maria/Ladanyi (signout)",
+        "notes": "Type: resistance mechanism?"
+      }
+    ],
+    "CDCP1": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "CDH17": [
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "CDH3": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "CDH6": [
+      {
+        "tissue_type": "GYN",
+        "tcga_codes": [
+          "UCEC",
+          "UCS",
+          "OV",
+          "CESC"
+        ],
+        "from": "Ge",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "CEACAM5": [
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Tsai",
+        "notes": ""
+      },
+      {
+        "tissue_type": "NSCLC",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      }
+    ],
+    "CEACAM6": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Tsai",
+        "notes": ""
+      }
+    ],
+    "CLDN18": [
+      {
+        "tissue_type": "Chol/gall",
+        "tcga_codes": [
+          "CHOL"
+        ],
+        "from": "Olca",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": "Type: she just said \"Claudin\", but I assume it's 18.2?"
+      }
+    ],
+    "CLDN6": [
+      {
+        "tissue_type": "GCT",
+        "tcga_codes": [
+          "TGCT"
+        ],
+        "from": "Funt/Feldman",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GYN",
+        "tcga_codes": [
+          "UCEC",
+          "UCS",
+          "OV",
+          "CESC"
+        ],
+        "from": "Ge",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "CLDN7": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      }
+    ],
+    "DLK1": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "DLL3": [
+      {
+        "tissue_type": "Bladder",
+        "tcga_codes": [
+          "BLCA"
+        ],
+        "from": "Iyer",
+        "notes": ""
+      },
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Melanoma",
+        "tcga_codes": [
+          "SKCM",
+          "UVM"
+        ],
+        "from": "Shoushtari",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": "Type: would be great for neuroendocrine"
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      },
+      {
+        "tissue_type": "SCLC",
+        "tcga_codes": [],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": ""
+      }
+    ],
+    "EDNRB": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "EGF": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "EGFR": [
+      {
+        "tissue_type": "Bladder",
+        "tcga_codes": [
+          "BLCA"
+        ],
+        "from": "David Aggen",
+        "notes": ""
+      },
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      },
+      {
+        "tissue_type": "NSCLC",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": ""
+      }
+    ],
+    "ENPP3": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "ENTPD1": [
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": "Type: potential"
+      }
+    ],
+    "EPCAM": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "EPGN": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "EPHA2": [
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "Park",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "EPHA5": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "EPO": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "EPOR": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "ERBB2": [
+      {
+        "tissue_type": "Bladder",
+        "tcga_codes": [
+          "BLCA"
+        ],
+        "from": "David Aggen, Iyer",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Breast",
+        "tcga_codes": [
+          "BRCA"
+        ],
+        "from": "Chandarlapaty",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Cervical",
+        "tcga_codes": [
+          "CESC"
+        ],
+        "from": "Ge",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Chol/gall",
+        "tcga_codes": [
+          "CHOL"
+        ],
+        "from": "Olca",
+        "notes": ""
+      },
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GCT",
+        "tcga_codes": [
+          "TGCT"
+        ],
+        "from": "Funt/Feldman",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "NSCLC",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Ovarian",
+        "tcga_codes": [
+          "OV"
+        ],
+        "from": "Ge",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "Park",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Uterine",
+        "tcga_codes": [
+          "UCEC",
+          "UCS"
+        ],
+        "from": "Ge",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": ""
+      }
+    ],
+    "ERBB3": [
+      {
+        "tissue_type": "Bladder",
+        "tcga_codes": [
+          "BLCA"
+        ],
+        "from": "David Aggen",
+        "notes": "ERBB3/EGFR bi-specific in development"
+      },
+      {
+        "tissue_type": "Breast",
+        "tcga_codes": [
+          "BRCA"
+        ],
+        "from": "Chandarlapaty",
+        "notes": ""
+      },
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Melanoma",
+        "tcga_codes": [
+          "SKCM",
+          "UVM"
+        ],
+        "from": "Smithy",
+        "notes": ""
+      },
+      {
+        "tissue_type": "NSCLC",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "Park",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "ERBB4": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "EREG": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "ESR1": [
+      {
+        "tissue_type": "Uterine",
+        "tcga_codes": [
+          "UCEC",
+          "UCS"
+        ],
+        "from": "Ge",
+        "notes": ""
+      }
+    ],
+    "FAP": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      }
+    ],
+    "FGFR1": [
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "FGFR2": [
+      {
+        "tissue_type": "Chol/gall",
+        "tcga_codes": [
+          "CHOL"
+        ],
+        "from": "Harding",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Tsai",
+        "notes": ""
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "FGFR3": [
+      {
+        "tissue_type": "Chol/gall",
+        "tcga_codes": [
+          "CHOL"
+        ],
+        "from": "Harding",
+        "notes": ""
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "FGFR4": [
+      {
+        "tissue_type": "HCC",
+        "tcga_codes": [
+          "LIHC"
+        ],
+        "from": "Olca",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "FN1": [
+      {
+        "tissue_type": "Breast",
+        "tcga_codes": [
+          "BRCA"
+        ],
+        "from": "",
+        "notes": ""
+      }
+    ],
+    "FOLH1": [
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": "Type: potential"
+      }
+    ],
+    "FOLR1": [
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Ovarian",
+        "tcga_codes": [
+          "OV"
+        ],
+        "from": "Ge",
+        "notes": ""
+      }
+    ],
+    "GPC3": [
+      {
+        "tissue_type": "GCT",
+        "tcga_codes": [
+          "TGCT"
+        ],
+        "from": "Funt/Feldman",
+        "notes": ""
+      },
+      {
+        "tissue_type": "HCC",
+        "tcga_codes": [
+          "LIHC"
+        ],
+        "from": "Olca",
+        "notes": ""
+      }
+    ],
+    "GPNMB": [
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Melanoma",
+        "tcga_codes": [
+          "SKCM",
+          "UVM"
+        ],
+        "from": "Shoushtari",
+        "notes": ""
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "GUCY2C": [
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": "Type: diagnostic?"
+      }
+    ],
+    "HAVCR1": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "HBEGF": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "HK2": [
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": "Type: in development"
+      }
+    ],
+    "HLA-G": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "ITGB6": [
+      {
+        "tissue_type": "Bladder",
+        "tcga_codes": [
+          "BLCA"
+        ],
+        "from": "David Aggen",
+        "notes": "ADC used in NMIBC"
+      }
+    ],
+    "KDR": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "KIT": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "KLK2": [
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": "Type: in development"
+      }
+    ],
+    "KRAS": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      }
+    ],
+    "L1CAM": [
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      }
+    ],
+    "LGR5": [
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      }
+    ],
+    "LRRC15": [
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": "Type: (stromal target for EDD trial)."
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "MET": [
+      {
+        "tissue_type": "Chol/gall",
+        "tcga_codes": [
+          "CHOL"
+        ],
+        "from": "Olca",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Tsai",
+        "notes": ""
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "NSCLC",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": ""
+      }
+    ],
+    "MSLN": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Tsai",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "MTAP": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      }
+    ],
+    "MUC1": [
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      }
+    ],
+    "MUC16": [
+      {
+        "tissue_type": "GYN",
+        "tcga_codes": [
+          "UCEC",
+          "UCS",
+          "OV",
+          "CESC"
+        ],
+        "from": "Ge",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "MUC20": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "NECTIN4": [
+      {
+        "tissue_type": "Bladder",
+        "tcga_codes": [
+          "BLCA"
+        ],
+        "from": "Iyer",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Breast",
+        "tcga_codes": [
+          "BRCA"
+        ],
+        "from": "",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Chol/gall",
+        "tcga_codes": [
+          "CHOL"
+        ],
+        "from": "Olca",
+        "notes": ""
+      },
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GCT",
+        "tcga_codes": [
+          "TGCT"
+        ],
+        "from": "Funt/Feldman",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Tsai",
+        "notes": ""
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "NSCLC",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "NEUROD1": [
+      {
+        "tissue_type": "SCLC",
+        "tcga_codes": [],
+        "from": "Stew",
+        "notes": "Type: NOT AN ADC, but relevant"
+      }
+    ],
+    "NRG1": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "NRG2": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "NRG3": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "NRG4": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "NT5E": [
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": "Type: potential"
+      }
+    ],
+    "NTRK1": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "NTRK2": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "NTRK3": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "PDGFRA": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Glioma",
+        "tcga_codes": [
+          "GBM",
+          "LGG"
+        ],
+        "from": "Tejus",
+        "notes": "Type: potential"
+      }
+    ],
+    "PGR": [
+      {
+        "tissue_type": "Uterine",
+        "tcga_codes": [
+          "UCEC",
+          "UCS"
+        ],
+        "from": "Ge",
+        "notes": ""
+      }
+    ],
+    "PLAUR": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "POU2F3": [
+      {
+        "tissue_type": "SCLC",
+        "tcga_codes": [],
+        "from": "Stew",
+        "notes": "Type: NOT AN ADC, but relevant"
+      }
+    ],
+    "PRAME": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      }
+    ],
+    "PROM1": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "PTK7": [
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "ROBO1": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "ROBO2": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "ROR1": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "ROR2": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "SEZ6": [
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "SCLC",
+        "tcga_codes": [],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      }
+    ],
+    "STEAP1": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": ""
+      }
+    ],
+    "STEAP2": [
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": "Type: in development"
+      }
+    ],
+    "TACSTD2": [
+      {
+        "tissue_type": "Bladder",
+        "tcga_codes": [
+          "BLCA"
+        ],
+        "from": "Iyer",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Breast",
+        "tcga_codes": [
+          "BRCA"
+        ],
+        "from": "Chandarlapaty",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Chol/gall",
+        "tcga_codes": [
+          "CHOL"
+        ],
+        "from": "Olca",
+        "notes": ""
+      },
+      {
+        "tissue_type": "CRC",
+        "tcga_codes": [
+          "COADREAD"
+        ],
+        "from": "Jinru",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GCT",
+        "tcga_codes": [
+          "TGCT"
+        ],
+        "from": "Funt/Feldman",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      },
+      {
+        "tissue_type": "GYN",
+        "tcga_codes": [
+          "UCEC",
+          "UCS",
+          "OV",
+          "CESC"
+        ],
+        "from": "Ge",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "NSCLC",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Pancreas",
+        "tcga_codes": [
+          "PAAD"
+        ],
+        "from": "OReilly",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Prostate",
+        "tcga_codes": [
+          "PRAD"
+        ],
+        "from": "Abida/Gopalan/Autio",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "TF": [
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      }
+    ],
+    "TGFA": [
+      {
+        "tissue_type": "Sarcoma",
+        "tcga_codes": [
+          "SARC"
+        ],
+        "from": "Ping",
+        "notes": "Type: Ligands"
+      }
+    ],
+    "TOP1": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      }
+    ],
+    "TRIM63": [
+      {
+        "tissue_type": "RCC",
+        "tcga_codes": [
+          "KIRC",
+          "KIRP",
+          "KICH"
+        ],
+        "from": "Jie-Fu",
+        "notes": ""
+      }
+    ],
+    "VEGFA": [
+      {
+        "tissue_type": "Breast",
+        "tcga_codes": [
+          "BRCA"
+        ],
+        "from": "",
+        "notes": ""
+      }
+    ],
+    "VSIG1": [
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Yelena",
+        "notes": "Type: sensitive?"
+      }
+    ],
+    "VTCN1": [
+      {
+        "tissue_type": "Breast",
+        "tcga_codes": [
+          "BRCA"
+        ],
+        "from": "",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GI",
+        "tcga_codes": [
+          "STAD",
+          "ESCA"
+        ],
+        "from": "Maron",
+        "notes": ""
+      },
+      {
+        "tissue_type": "GYN",
+        "tcga_codes": [
+          "UCEC",
+          "UCS",
+          "OV",
+          "CESC"
+        ],
+        "from": "Ge",
+        "notes": "Type: in development"
+      },
+      {
+        "tissue_type": "HeadAndNeck",
+        "tcga_codes": [
+          "HNSC"
+        ],
+        "from": "Ho",
+        "notes": ""
+      },
+      {
+        "tissue_type": "Lung",
+        "tcga_codes": [
+          "LUAD",
+          "LUSC"
+        ],
+        "from": "Lee/Shoenfeld",
+        "notes": ""
+      }
+    ]
+  }
+}

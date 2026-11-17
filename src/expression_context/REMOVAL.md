@@ -12,6 +12,9 @@ own removal notes in that directory.
    helpers and endpoints (`/v1/expression-context/genes/{gene}/export.csv`,
    `/v1/expression-context/export.csv`, `/v1/expression-context/golden-set.csv`):
    `git rm -r src/expression_context/`
+   This includes `dmt_adc_index.json`, its read-only loader, and the page's
+   DMT index and alteration-PMID controls. Also remove the standalone
+   generator: `git rm scripts/generate_dmt_adc_index.py`.
 2. **Delete the registration** in `src/main.py` — exactly two lines:
    - `from src.expression_context import register_expression_context`
    - `register_expression_context(app)  # optional module; ...`

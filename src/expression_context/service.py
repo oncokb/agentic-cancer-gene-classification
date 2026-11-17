@@ -52,6 +52,7 @@ from typing import (
 )
 
 from src.expression_context.catalog import ActiveBundle, BundleGone, BundleNotLoaded, StatsCatalog
+from src.expression_context.dmt_adc import index_for_gene
 from src.expression_context.csv_export import (
     check_sheet_cancer_names,
     csv_filename,
@@ -692,6 +693,7 @@ class ExpressionContextService:
             bundle=bundle_provenance,
             summary=summary,
             pairs=pairs,
+            dmt_adc_index=index_for_gene(resolved.hugo_symbol),
             has_stored_result=has_stored_result,
         )
 

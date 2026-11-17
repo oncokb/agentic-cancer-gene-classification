@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Sequence, runtime_checkable
 
 from src.expression_context.models import (
+    ALLOWED_ALTERATION_TYPES,
     CancerTypeStats,
     LiteratureVerdict,
     PaperJudgement,
@@ -252,6 +253,11 @@ Give a short rationale (1-3 sentences) that names the tumor type and cites
 only tumor-specific papers. Judge only the papers provided, by their PMID;
 never cite any other PMID. Return exactly one judgement for every paper
 provided. Call judge_tumor_specific_evidence exactly once.
+For each tumor-specific paper, also return alterations: the subset of
+"Point Mutation", "Structural Variant", "Copy Number Alteration", and
+"Expression" that the paper characterizes for this gene in this tumor.
+Return an empty array when none of these is characterized. Do not infer an
+alteration from another paper or from the statistical enrichment result.
 
 The papers arrive as a JSON array between <papers> and </papers>; each
 element is one paper ({"pmid", "title", "abstract", "tumor_terms_found"}).
@@ -276,6 +282,7 @@ JUDGE_TOOL: Dict[str, Any] = {
                     "properties": {
                         "pmid": {"type": "string", "description": "PMID of a provided paper."},
                         "tumor_specific": {"type": "boolean"},
+                        "alterations": {"type": "array", "items": {"type": "string", "enum": ["Point Mutation", "Structural Variant", "Copy Number Alteration", "Expression"]}},
                         "reason": {"type": "string", "description": "One short sentence."},
                     },
                 },
@@ -445,13 +452,22 @@ class TumorSpecificGate:
         specific = [pmid for pmid in sent if judged[pmid]["tumor_specific"]]
         allowed = set(specific)
         papers: List[PaperJudgement] = []
+        alteration_pmids: Dict[str, List[str]] = {}
         for pmid, record in sent.items():
             entry = judged[pmid]
+            raw = entry.get("alterations")
+            tags = list(dict.fromkeys(
+                category for category in raw
+                if isinstance(category, str) and category in ALLOWED_ALTERATION_TYPES
+            )) if entry["tumor_specific"] and isinstance(raw, list) else []
+            for category in tags:
+                alteration_pmids.setdefault(category, []).append(pmid)
             papers.append(PaperJudgement(
                 pmid=pmid,
                 title=(getattr(record, "title", None) or None),
                 matched_terms=matched.get(pmid, []),
                 tumor_specific=entry["tumor_specific"],
+                alterations=tags,
                 reason=_clip(entry.get("reason"), 300, allowed | {pmid}),
             ))
         if verdict == "supported" and not specific:
@@ -459,7 +475,7 @@ class TumorSpecificGate:
             rationale = (rationale + " " if rationale else "") + (
                 "[No paper was judged specific to this tumor type.]"
             )
-        return self._verdict(tumor, verdict, papers, len(seen), rationale, decided_by="judge")
+        return self._verdict(tumor, verdict, papers, len(seen), rationale, decided_by="judge", alteration_pmids=alteration_pmids)
 
     async def _judge_with_recovery(
         self,
@@ -598,6 +614,7 @@ class TumorSpecificGate:
         rationale: Optional[str],
         *,
         decided_by: str,
+        alteration_pmids: Optional[Dict[str, List[str]]] = None,
     ) -> LiteratureVerdict:
         pmids = [paper.pmid for paper in papers if paper.tumor_specific]
         if decided_by == "judge":
@@ -615,6 +632,7 @@ class TumorSpecificGate:
             cancer_type_name=tumor.name,
             retrieved_count=retrieved,
             papers=papers,
+            alteration_pmids=alteration_pmids if alteration_pmids is not None else {},
             decided_by=decided_by,
         )
         return result.model_copy(update={"supported": verdict_supported(result)})

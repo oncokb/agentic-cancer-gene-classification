@@ -46,6 +46,7 @@ const IDS = [
   "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
   "ec-summary", "ec-release", "ec-cbio", "ec-run", "ec-export", "ec-export-golden", "ec-view-shown",
   "ec-view-all", "ec-view-count", "ec-table", "ec-table-empty", "ec-job-status", "ec-tbody",
+  "ec-dmt-index",
 ];
 
 const response = (body, status = 200) => ({ status, json: async () => body });
@@ -199,8 +200,9 @@ test("alterations render badges and safe category details on surfaced, candidate
   nodes["ec-view-all"].fire("click");
   for (let i = 0; i < 3; i++) {
     const badges = summaryRows(nodes)[i].children[3];
-    assert.strictEqual(badges.text, "Point MutationCopy Number Alteration (amp, del)");
-    assert.strictEqual(badges.children.length, 2);
+    assert.strictEqual(badges.children.map((n) => n.children[0].text).join(""),
+      `Point MutationCopy Number Alteration (amp, del)${i === 0 ? "Expression" : ""}`);
+    assert.strictEqual(badges.children.length, i === 0 ? 3 : 2);
     const detail = detailRows(nodes)[i];
     assert.ok(detail.text.includes("Alterations"));
     assert.ok(detail.text.includes("24/149 events/profiled; frequency 16.00%"));
@@ -1142,9 +1144,70 @@ test("badges and details share the canonical alteration accessor with legacy fal
       ? { alteration_types_enriched: ["Structural Variant"], categories: {} } : detail;
     const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
     await page.lookup("ERBB2");
-    assert.strictEqual(summaryRows(nodes)[0].children[3].text, "Point Mutation");
+    assert.strictEqual(summaryRows(nodes)[0].children[3].children[0].children[0].text, "Point Mutation");
     assert.ok(detailRows(nodes)[0].text.includes("3/10 events/profiled; frequency 30.00%"));
   }
+});
+
+test("alteration buttons show scoped PubMed papers and preserve expansion only for the same gene", async () => {
+  const v = view();
+  v.pairs[0].stats.alterations = {
+    alteration_types_enriched: ["Point Mutation", "Expression"], categories: {},
+  };
+  v.pairs[0].literature.alteration_pmids = { "Point Mutation": ["12345678", "99999999"] };
+  v.pairs[0].literature.papers = [{ pmid: "12345678", title: "Trusted title" }];
+  const next = { ...v, hugo_symbol: "EGFR", query: "EGFR" };
+  const { nodes, page } = env({
+    "GET /v1/expression-context/stats/ERBB2": response(v),
+    "GET /v1/expression-context/stats/EGFR": response(next),
+  });
+  await page.lookup("ERBB2");
+  let badges = summaryRows(nodes)[0].children[3].children;
+  let button = badges[0].children[0];
+  let panel = badges[0].children[1];
+  assert.strictEqual(button.tagName, "button");
+  assert.strictEqual(button.getAttribute("type"), "button");
+  assert.strictEqual(button.getAttribute("aria-expanded"), "false");
+  assert.ok(panel.hidden);
+  button.fire("click");
+  assert.strictEqual(button.getAttribute("aria-expanded"), "true");
+  assert.ok(!panel.hidden);
+  assert.strictEqual(panel.children.length, 1, "PMIDs outside the final tumor-specific set are omitted");
+  assert.strictEqual(panel.children[0].getAttribute("href"), "https://pubmed.ncbi.nlm.nih.gov/12345678/");
+  assert.ok(panel.text.includes("Trusted title"));
+  assert.strictEqual(badges[1].children[1].text, "No alteration-specific paper found");
+  await page.lookup("ERBB2");
+  badges = summaryRows(nodes)[0].children[3].children;
+  assert.strictEqual(badges[0].children[0].getAttribute("aria-expanded"), "true");
+  await page.lookup("EGFR");
+  badges = summaryRows(nodes)[0].children[3].children;
+  assert.strictEqual(badges[0].children[0].getAttribute("aria-expanded"), "false");
+});
+
+test("old alteration verdicts prompt a re-run and DMT index highlights rows in both views", async () => {
+  const v = view();
+  v.pairs[0].stats.alterations = { alteration_types_enriched: ["Point Mutation"], categories: {} };
+  v.dmt_adc_index = [
+    { tissue_type: "Breast", tcga_codes: ["BRCA"], from: "Curator", notes: "ADC note" },
+    { tissue_type: "Uterine", tcga_codes: ["UCEC"], from: "Curator", notes: "Review" },
+    { tissue_type: "SCLC", tcga_codes: [], from: "Team", notes: "" },
+  ];
+  const { nodes, page } = env({ "GET /v1/expression-context/stats/ERBB2": response(v) });
+  await page.lookup("ERBB2");
+  const button = summaryRows(nodes)[0].children[3].children[0].children[0];
+  button.fire("click");
+  assert.ok(summaryRows(nodes)[0].children[3].text.includes("Re-run literature check to see alteration-specific papers"));
+  assert.ok(nodes["ec-dmt-index"].text.includes("SCLC (no TCGA cohort)"));
+  assert.ok(summaryRows(nodes)[0].classList.contains("ec-row-dmt"));
+  assert.ok(summaryRows(nodes)[0].text.includes("DMT ADC interest"));
+  assert.ok(summaryRows(nodes)[0].text.includes("ADC note"));
+  nodes["ec-view-all"].fire("click");
+  assert.ok(summaryRows(nodes)[0].classList.contains("ec-row-dmt"));
+  assert.ok(summaryRows(nodes)[2].classList.contains("ec-row-dmt"), "excluded DMT row is highlighted in All view");
+  v.dmt_adc_index = [];
+  await page.lookup("ERBB2");
+  assert.ok(nodes["ec-dmt-index"].hidden);
+  assert.ok(!summaryRows(nodes)[0].classList.contains("ec-row-dmt"));
 });
 
 test("the page never assigns innerHTML", () => {
