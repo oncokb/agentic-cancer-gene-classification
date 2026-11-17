@@ -176,6 +176,7 @@
       batchShowAll: false,
       batchExpanded: new Set(),
       batchGeneViews: new Map(),
+      batchItemStatuses: new Map(),
       batchPolling: false,
     };
 
@@ -991,12 +992,23 @@
       show(el["ec-batch-cancel"], running);
       updateBatchExportLinks();
 
+      // Invalidate cached per-gene views when a gene's status changes
+      for (const item of batch.genes || []) {
+        const prev = state.batchItemStatuses.get(item.position);
+        if (prev !== undefined && prev !== item.status) {
+          if (item.hugo_symbol) {
+            state.batchGeneViews.delete(item.hugo_symbol);
+          }
+        }
+        state.batchItemStatuses.set(item.position, item.status);
+      }
+
       if (el["ec-batch-genes"]) {
         el["ec-batch-genes"].replaceChildren();
         for (const item of batch.genes || []) {
           const key = `${item.position}:${item.hugo_symbol || item.input_symbol}`;
           const section = node("details", null, "ec-batch-gene-section");
-          if (state.batchExpanded.has(key)) section.setAttribute("open", "open");
+          if (state.batchExpanded.has(key)) section.open = true;
           const summary = node("summary");
           const label = item.hugo_symbol && item.input_symbol.trim().toUpperCase() !== item.hugo_symbol
             ? `${item.hugo_symbol} (from ${item.input_symbol.trim()})`
@@ -1011,11 +1023,9 @@
           } else {
             renderBatchGeneSummary(bodyNode, state.batchGeneViews.get(item.hugo_symbol) || null, item);
           }
-          summary.addEventListener("click", () => {
-            const willOpen = !state.batchExpanded.has(key);
-            if (willOpen) {
+          section.addEventListener("toggle", () => {
+            if (section.open) {
               state.batchExpanded.add(key);
-              section.setAttribute("open", "open");
               loadBatchGeneSection(item, bodyNode);
             } else {
               state.batchExpanded.delete(key);
@@ -1033,6 +1043,7 @@
       setError("");
       setMode("batch");
       state.batchGeneViews.clear();
+      state.batchItemStatuses.clear();
       if (win.history && typeof win.history.replaceState === "function") {
         win.history.replaceState(null, "", `?batch=${encodeURIComponent(id)}`);
       }
@@ -1045,6 +1056,20 @@
         if (status !== 200 || !body) {
           setError(status === 404 ? "Batch not found." : friendlyError(status, id));
           return;
+        }
+        // Fetch all pages if batch contains more than 200 genes
+        if (body.counts && body.counts.total > (body.genes ? body.genes.length : 0)) {
+          let allGenes = body.genes ? [...body.genes] : [];
+          while (allGenes.length < body.counts.total) {
+            const nextRes = await getJson(
+              `${API}/batches/${encodeURIComponent(id)}?offset=${allGenes.length}&limit=200`
+            );
+            if (nextRes.status !== 200 || !nextRes.body || !nextRes.body.genes || !nextRes.body.genes.length) {
+              break;
+            }
+            allGenes = allGenes.concat(nextRes.body.genes);
+          }
+          body.genes = allGenes;
         }
         renderBatch(body);
         if (!["queued", "running"].includes(body.status)) {

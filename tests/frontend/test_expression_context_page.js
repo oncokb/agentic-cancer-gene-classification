@@ -1363,8 +1363,9 @@ test("single view curator sheet row link and batch tab parsing, upload, submit, 
   assert.ok(sections[0].children[0].text.includes("ERBB2 (from HER2)"));
   assert.ok(sections[1].children[0].text.includes("NOPE"));
 
-  // Expand first gene section -> loads stats summary with Strong/Moderate and alteration badges
-  sections[0].children[0].fire("click");
+  // Expand first gene section via native toggle -> loads stats summary with Strong/Moderate and alteration badges
+  sections[0].open = true;
+  sections[0].fire("toggle");
   await new Promise((r) => setTimeout(r, 0));
   assert.ok(sections[0].text.includes("Breast Invasive Carcinoma (BRCA)"));
   assert.ok(sections[0].text.includes("Strong"));
@@ -1379,6 +1380,43 @@ test("single view curator sheet row link and batch tab parsing, upload, submit, 
   assert.strictEqual(reloadEnv.page.state.mode, "batch");
   assert.ok(!reloadEnv.nodes["ec-batch-result"].hidden);
   assert.strictEqual(reloadEnv.nodes["ec-batch-title"].textContent, "Batch batch-123");
+});
+
+test("batch with >200 genes pages all genes and listed count matches total count", async () => {
+  const TOTAL = 250;
+  const allGenes = Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status: "done",
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const page1 = {
+    batch_id: "batch-250",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(0, 200),
+  };
+  const page2 = {
+    batch_id: "batch-250",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(200, 250),
+  };
+  const { page, nodes } = env({
+    "GET /v1/expression-context/batches/batch-250": response(page1),
+    "GET /v1/expression-context/batches/batch-250?offset=200&limit=200": response(page2),
+  });
+  await page.loadBatch("batch-250");
+  assert.strictEqual(nodes["ec-batch-counts"].textContent, "250 done · 0 reused · 0 no stats · 0 queued · 0 running · 0 failed · 0 not found");
+  const renderedSections = nodes["ec-batch-genes"].children;
+  assert.strictEqual(renderedSections.length, 250);
+  assert.ok(renderedSections[0].children[0].text.includes("GENE1"));
+  assert.ok(renderedSections[249].children[0].text.includes("GENE250"));
 });
 
 (async () => {

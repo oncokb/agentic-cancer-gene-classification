@@ -8,7 +8,7 @@ import csv
 import io
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Tuple
 
@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from scripts.expression_context_batch import main as cli_main
 from scripts.expression_context_batch import run_batch_cli
 from src.auth import AuthenticatedUser
-from src.expression_context.bundle_store import InMemoryBundleStore
+from src.expression_context.bundle_store import BundleState, InMemoryBundleStore
 from src.expression_context.catalog import StatsCatalog
 from src.expression_context.csv_export import (
     CURATOR_SHEET_COLUMNS,
@@ -38,11 +38,12 @@ from src.expression_context.models import (
     StoredPair,
     TumorContext,
 )
-from src.expression_context.service import ExpressionContextService
+from src.expression_context.service import BundleGone, ExpressionContextService
 from src.expression_context.store import InMemoryExpressionContextStore
 from src.job_store import JobStore
 from tests.expression_context_helpers import (
     RELEASE_ID,
+    REPO,
     FakeLiteratureGate,
     LeaseFakeRedis,
     build_bundle,
@@ -64,6 +65,7 @@ pytestmark = [
 ]
 
 BOB = AuthenticatedUser(email="bob@example.org", name="Bob", domain="example.org")
+SAME_ORIGIN = {"sec-fetch-site": "same-origin"}
 ALTERATIONS_FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures/expression_context/alterations.json").read_text()
 )
@@ -118,6 +120,7 @@ def test_batch_submit_dedupe_alias_not_found_skip_no_stats_skip_fresh_and_run():
         resp = client.post(
             f"{PREFIX}/batches",
             json={"genes": ["HER2", "ERBB2", "MYCN", "UNKNOWN1", "UNKNOWN1"]},
+            headers=SAME_ORIGIN,
         )
         assert resp.status_code == 202, resp.text
         accepted = resp.json()
@@ -156,7 +159,7 @@ def test_batch_submit_dedupe_alias_not_found_skip_no_stats_skip_fresh_and_run():
         assert calls_count == 3
 
         # Submitting a second batch with ERBB2 reuses fresh verdicts -> skipped_fresh, 0 new model calls
-        resp2 = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]})
+        resp2 = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]}, headers=SAME_ORIGIN)
         assert resp2.status_code == 202
         detail2 = wait_for_batch(client, resp2.json()["batch_id"])
         assert detail2["status"] == "done"
@@ -209,7 +212,7 @@ def test_batch_failure_recorded_per_gene_and_batch_continues():
     harness = CsvHarness(gate=fail_gate, bundle=bundle)
 
     with TestClient(harness.app) as client:
-        resp = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2", "EGFR"]})
+        resp = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2", "EGFR"]}, headers=SAME_ORIGIN)
         assert resp.status_code == 202
         detail = wait_for_batch(client, resp.json()["batch_id"])
         assert detail["status"] == "done"
@@ -520,6 +523,7 @@ def test_exports_grouped_in_batch_order_curator_sheet_rules_and_single_gene_pari
         resp = client.post(
             f"{PREFIX}/batches",
             json={"genes": ["MYCN", "HER2", "UNKNOWN_GENE", "ERBB2"]},
+            headers=SAME_ORIGIN,
         )
         assert resp.status_code == 202
         batch_id = resp.json()["batch_id"]
@@ -727,44 +731,31 @@ def test_unchecked_and_partial_pending_notes_and_golden_set_batch_unchecked_row(
 
 def test_batch_exports_bundle_supersession_mid_stream_and_503_when_no_bundle():
     bundle_a = build_bundle(("ERBB2", "MYCN"), release_id="rel-a")
-    bundle_b = build_bundle(("ERBB2", "MYCN"), release_id="rel-b")
     harness = CsvHarness(bundle=bundle_a)
 
     with TestClient(harness.app) as client:
-        resp = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2", "MYCN"]})
+        resp = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2", "MYCN"]}, headers=SAME_ORIGIN)
         batch_id = resp.json()["batch_id"]
         wait_for_batch(client, batch_id)
-
-        orig_gene_view = harness.service.gene_view
 
         for export_path in (
             f"{PREFIX}/batches/{batch_id}/export.csv",
             f"{PREFIX}/batches/{batch_id}/golden-set.csv",
             f"{PREFIX}/batches/{batch_id}/curator-sheet.csv",
         ):
-            asyncio.run(seed_bundle(harness.bundles, bundle_a))
+            harness.bundles.bundles.clear()
+            harness.bundles.state = BundleState()
             harness.service.catalog.invalidate()
-            first = True
-
-            async def switch_mid_stream(gene, *, resolved=None):
-                nonlocal first
-                out = await orig_gene_view(gene, resolved=resolved)
-                if first:
-                    first = False
-                    await seed_bundle(harness.bundles, bundle_b)
-                    harness.service.catalog.invalidate()
-                return out
-
-            harness.service.gene_view = switch_mid_stream
             r = client.get(export_path)
             assert r.status_code == 503, f"Expected 503 on supersession for {export_path}, got {r.status_code}"
             assert "text/csv" not in r.headers.get("content-type", "")
-            harness.service.gene_view = orig_gene_view
+            asyncio.run(seed_bundle(harness.bundles, bundle_a))
+            harness.service.catalog.invalidate()
 
     # 503 when no bundle is loaded
     unseeded = CsvHarness(seed=False)
     with TestClient(unseeded.app) as client:
-        assert client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]}).status_code == 503
+        assert client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]}, headers=SAME_ORIGIN).status_code == 503
         assert client.get(f"{PREFIX}/batches").status_code == 503
         assert client.get(f"{PREFIX}/genes/ERBB2/curator-sheet.csv").status_code == 503
 
@@ -790,7 +781,7 @@ def test_single_gene_read_paths_and_exports_unchanged_with_and_without_batches()
             if not use_batch:
                 run_job(client, "ERBB2")
             else:
-                b_resp = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2", "UNKNOWN"]})
+                b_resp = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2", "UNKNOWN"]}, headers=SAME_ORIGIN)
                 wait_for_batch(client, b_resp.json()["batch_id"])
 
             stats = client.get(f"{PREFIX}/stats/ERBB2").json()
@@ -839,7 +830,7 @@ def test_every_csv_export_endpoint_has_gene_symbol_first_column_and_non_empty_fi
     harness = CsvHarness(gate=gate, bundle=bundle)
 
     with TestClient(harness.app) as client:
-        b_resp = client.post(f"{PREFIX}/batches", json={"genes": ["HER2", "MYCN", "NOT_IN_DATA"]})
+        b_resp = client.post(f"{PREFIX}/batches", json={"genes": ["HER2", "MYCN", "NOT_IN_DATA"]}, headers=SAME_ORIGIN)
         batch_id = b_resp.json()["batch_id"]
         wait_for_batch(client, batch_id)
 
@@ -943,10 +934,6 @@ def test_cli_with_mocked_transport_polls_downloads_and_never_prints_api_key(
 
     # Also test main() error path and ensure key is never printed to stdout or stderr
     bad_transport = httpx.MockTransport(lambda req: httpx.Response(500, text="server error"))
-    monkeypatch.setattr(
-        "scripts.expression_context_batch.httpx.Client",
-        lambda **kw: httpx.Client(**{**kw, "transport": bad_transport}),
-    )
     rc = cli_main(
         [
             "--base-url",
@@ -955,9 +942,442 @@ def test_cli_with_mocked_transport_polls_downloads_and_never_prints_api_key(
             str(genes_file),
             "--out-dir",
             str(out_dir),
-        ]
+        ],
+        transport=bad_transport,
     )
     assert rc == 1
     captured = capsys.readouterr()
     assert secret_key not in captured.out
     assert secret_key not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Blocker 1: Restart recovery can strand batches
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restart_recovery_crashed_owner_and_replacement_resumes_after_expiry():
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    gate = FakeLiteratureGate(
+        verdicts={
+            "breast cancer": (False, ["12345678"]),
+            "gastric cancer": (True, []),
+        }
+    )
+    store = InMemoryExpressionContextStore()
+    now = datetime.now(timezone.utc)
+    # Crashed pod with short lease
+    batch = BatchRecord(
+        batch_id="stranded-b1",
+        created_by="alice@example.org",
+        created_at=now,
+        release_id=RELEASE_ID,
+        status="running",
+        worker_owner="crashed-pod",
+        worker_expires_at=now + timedelta(seconds=0.2),
+        counts=BatchCounts(total=2, queued=2),
+    )
+    genes = [
+        BatchGeneRecord(
+            batch_id="stranded-b1",
+            position=0,
+            input_symbol="ERBB2",
+            hugo_symbol="ERBB2",
+            status="queued",
+            updated_at=now,
+        ),
+        BatchGeneRecord(
+            batch_id="stranded-b1",
+            position=1,
+            input_symbol="MYCN",
+            hugo_symbol="MYCN",
+            status="queued",
+            updated_at=now,
+        ),
+    ]
+    await store.create_batch(batch, genes)
+    store.batch_locks["stranded-b1"] = ("crashed-pod", store.lock_clock() + 0.2)
+
+    bundles = InMemoryBundleStore()
+    await seed_bundle(bundles, bundle)
+    redis = LeaseFakeRedis()
+    replacement_service = ExpressionContextService(
+        catalog=StatsCatalog(bundles, cache_seconds=0),
+        gate=gate,
+        store=store,
+        jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
+        lease=VerdictLease(ttl_seconds=5, redis=module_redis(redis)),
+        lease_poll_seconds=0.01,
+        releases_repo=REPO,
+        batch_recovery_interval=0.1,
+    )
+    replacement_service.start()
+    try:
+        deadline = time.monotonic() + 4.0
+        recovered = False
+        while time.monotonic() < deadline:
+            b = await store.get_batch("stranded-b1")
+            if b and b.status == "done":
+                recovered = True
+                break
+            await asyncio.sleep(0.05)
+        assert recovered, "Batch did not recover and finish after crashed owner lease expiry"
+        final_batch = await store.get_batch("stranded-b1")
+        assert final_batch.status == "done"
+        assert final_batch.counts.done >= 1
+    finally:
+        await replacement_service.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2: Cross-pod cancel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cross_pod_cancel_honored_by_worker_pod():
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    store = InMemoryExpressionContextStore()
+    bundles = InMemoryBundleStore()
+    await seed_bundle(bundles, bundle)
+    redis = LeaseFakeRedis()
+
+    erbb2_started = asyncio.Event()
+    cancel_done = asyncio.Event()
+
+    class CoordinatingGate(FakeLiteratureGate):
+        async def evaluate(self, hugo_symbol: str, tumor: TumorContext) -> LiteratureVerdict:
+            if hugo_symbol == "ERBB2":
+                erbb2_started.set()
+                await cancel_done.wait()
+            return await super().evaluate(hugo_symbol, tumor)
+
+    gate = CoordinatingGate(
+        verdicts={
+            "breast cancer": (False, ["12345678"]),
+            "gastric cancer": (True, []),
+        }
+    )
+
+    pod1_worker = ExpressionContextService(
+        catalog=StatsCatalog(bundles, cache_seconds=0),
+        gate=gate,
+        store=store,
+        jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
+        lease=VerdictLease(ttl_seconds=5, redis=module_redis(redis)),
+        lease_poll_seconds=0.01,
+        releases_repo=REPO,
+    )
+    pod2_api = ExpressionContextService(
+        catalog=StatsCatalog(bundles, cache_seconds=0),
+        gate=gate,
+        store=store,
+        jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
+        lease=VerdictLease(ttl_seconds=5, redis=module_redis(redis)),
+        lease_poll_seconds=0.01,
+        releases_repo=REPO,
+    )
+
+    now = datetime.now(timezone.utc)
+    batch = BatchRecord(
+        batch_id="cancel-b1",
+        created_by="alice@example.org",
+        created_at=now,
+        release_id=RELEASE_ID,
+        status="queued",
+        counts=BatchCounts(total=2, queued=2),
+    )
+    genes = [
+        BatchGeneRecord(
+            batch_id="cancel-b1",
+            position=0,
+            input_symbol="ERBB2",
+            hugo_symbol="ERBB2",
+            status="queued",
+            updated_at=now,
+        ),
+        BatchGeneRecord(
+            batch_id="cancel-b1",
+            position=1,
+            input_symbol="MYCN",
+            hugo_symbol="MYCN",
+            status="queued",
+            updated_at=now,
+        ),
+    ]
+    await store.create_batch(batch, genes)
+
+    # Worker starts batch
+    worker_task = asyncio.create_task(pod1_worker._run_batch("cancel-b1"))
+
+    # Wait for ERBB2 evaluation to start
+    await erbb2_started.wait()
+
+    # Simulated Pod 2 receives cancel request
+    cancelled_detail = await pod2_api.cancel_batch("cancel-b1")
+    assert cancelled_detail.status == "cancelled"
+
+    # Allow ERBB2 in-flight evaluation to finish
+    cancel_done.set()
+    await worker_task
+
+    final_batch = await store.get_batch("cancel-b1")
+    assert final_batch.status == "cancelled"
+
+    batch_genes = await store.list_batch_genes("cancel-b1")
+    # ERBB2 in-flight was cancelled, and late writes are no-ops
+    assert batch_genes[0].error == "cancelled"
+    # MYCN was never started by worker (error is cancelled from cancel_batch)
+    assert batch_genes[1].error == "cancelled"
+    assert all(sym == "ERBB2" for sym, _ in gate.calls)
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3: Lease loss mid-gene
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_worker_stops_and_stale_writes_are_no_ops():
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    store = InMemoryExpressionContextStore()
+    bundles = InMemoryBundleStore()
+    await seed_bundle(bundles, bundle)
+    redis = LeaseFakeRedis()
+
+    lease_lost = asyncio.Event()
+
+    class StolenLeaseGate(FakeLiteratureGate):
+        async def evaluate(self, hugo_symbol: str, tumor: TumorContext) -> LiteratureVerdict:
+            if hugo_symbol == "ERBB2":
+                # Lease is stolen by pod-b while pod-a is in the gate
+                store.batch_locks["loss-b1"] = ("pod-b", store.lock_clock() + 300.0)
+                lease_lost.set()
+            return await super().evaluate(hugo_symbol, tumor)
+
+    gate = StolenLeaseGate(
+        verdicts={
+            "breast cancer": (False, ["12345678"]),
+            "gastric cancer": (True, []),
+        }
+    )
+
+    pod_a_service = ExpressionContextService(
+        catalog=StatsCatalog(bundles, cache_seconds=0),
+        gate=gate,
+        store=store,
+        jobs=JobStore("expression_context", JobRecord, redis_client_factory=lambda: None),
+        lease=VerdictLease(ttl_seconds=5, redis=module_redis(redis)),
+        lease_poll_seconds=0.01,
+        releases_repo=REPO,
+    )
+
+    now = datetime.now(timezone.utc)
+    batch = BatchRecord(
+        batch_id="loss-b1",
+        created_by="alice@example.org",
+        created_at=now,
+        release_id=RELEASE_ID,
+        status="queued",
+        counts=BatchCounts(total=2, queued=2),
+    )
+    genes = [
+        BatchGeneRecord(
+            batch_id="loss-b1",
+            position=0,
+            input_symbol="ERBB2",
+            hugo_symbol="ERBB2",
+            status="queued",
+            updated_at=now,
+        ),
+        BatchGeneRecord(
+            batch_id="loss-b1",
+            position=1,
+            input_symbol="MYCN",
+            hugo_symbol="MYCN",
+            status="queued",
+            updated_at=now,
+        ),
+    ]
+    await store.create_batch(batch, genes)
+
+    # pod-a starts running the batch
+    await pod_a_service._run_batch("loss-b1")
+
+    assert lease_lost.is_set()
+    # pod-a's write to "done" for ERBB2 was rejected because token "pod-a" was no longer owner
+    batch_genes = await store.list_batch_genes("loss-b1")
+    # ERBB2 is still running because pod-a's write to done was rejected
+    assert batch_genes[0].status == "running"
+    # MYCN was never started
+    assert batch_genes[1].status == "queued"
+    # pod-a never evaluated MYCN
+    assert all(sym != "MYCN" for sym, _ in gate.calls)
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4: Streamed batch exports (page-by-page and supersession)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_exports_streaming_page_by_page_and_supersession():
+    bundle_a = build_bundle(("ERBB2", "MYCN"), release_id="rel-a")
+    bundle_b = build_bundle(("ERBB2", "MYCN"), release_id="rel-b")
+    harness = CsvHarness(bundle=bundle_a)
+
+    with TestClient(harness.app) as client:
+        resp = client.post(
+            f"{PREFIX}/batches",
+            json={"genes": ["ERBB2", "MYCN"]},
+            headers=SAME_ORIGIN,
+        )
+        assert resp.status_code == 202
+        batch_id = resp.json()["batch_id"]
+        wait_for_batch(client, batch_id)
+
+    # For all three exports, test streaming page by page with supersession mid-stream
+    for export_fn_name in (
+        "export_batch_per_pair_csv",
+        "export_batch_golden_set_csv",
+        "export_batch_curator_sheet_csv",
+    ):
+        await seed_bundle(harness.bundles, bundle_a)
+        harness.service.catalog.invalidate()
+
+        export_fn = getattr(harness.service, export_fn_name)
+        filename, stream = await export_fn(batch_id, page_size=1)
+        assert filename.endswith(".csv")
+
+        header = await anext(stream)
+        assert header.startswith(UTF8_BOM)
+
+        page1 = await anext(stream)
+        assert len(page1) > 0
+
+        # Supersession mid-stream: switch active bundle to rel-b
+        await seed_bundle(harness.bundles, bundle_b)
+        harness.service.catalog.invalidate()
+
+        with pytest.raises(BundleGone):
+            async for _ in stream:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Blocker 6: Authorization & CSRF tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_authorization_and_csrf():
+    bundle = build_bundle(("ERBB2", "MYCN"))
+    harness = CsvHarness(bundle=bundle)
+
+    ALICE_SESSION = AuthenticatedUser(
+        email="alice@example.org", name="Alice", domain="example.org", auth_method="session", role="viewer"
+    )
+    ALICE_API_KEY = AuthenticatedUser(
+        email="alice@example.org", name="Alice", domain="example.org", auth_method="api_key", role="viewer"
+    )
+    BOB_SESSION = AuthenticatedUser(
+        email="bob@example.org", name="Bob", domain="example.org", auth_method="session", role="viewer"
+    )
+    ADMIN_SESSION = AuthenticatedUser(
+        email="admin@example.org", name="Admin", domain="example.org", auth_method="session", role="admin"
+    )
+
+    with TestClient(harness.app) as client:
+        # 1. CSRF on POST /batches
+        # Cookie session without CSRF header -> 403
+        harness.user = ALICE_SESSION
+        r = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]})
+        assert r.status_code == 403
+        assert "Same-origin request evidence required" in r.text
+
+        # Cookie session with bad sec-fetch-site -> 403
+        r = client.post(
+            f"{PREFIX}/batches",
+            json={"genes": ["ERBB2"]},
+            headers={"sec-fetch-site": "cross-site"},
+        )
+        assert r.status_code == 403
+
+        # API key user without CSRF header -> 202
+        harness.user = ALICE_API_KEY
+        r = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]})
+        assert r.status_code == 202
+
+        # Cookie session with valid same-origin header -> 202
+        harness.user = ALICE_SESSION
+        r = client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]}, headers=SAME_ORIGIN)
+        assert r.status_code == 202
+        batch_id = r.json()["batch_id"]
+
+        # 2. CSRF on POST /batches/{id}/cancel
+        # Cookie session without CSRF header -> 403 CSRF error
+        r = client.post(f"{PREFIX}/batches/{batch_id}/cancel", json={})
+        assert r.status_code == 403
+        assert "Same-origin request evidence required" in r.text
+
+        # 3. Non-owner authorization: Bob (viewer) vs Alice's batch
+        harness.user = BOB_SESSION
+        # Detail -> 404
+        assert client.get(f"{PREFIX}/batches/{batch_id}").status_code == 404
+        # Exports -> 404
+        assert client.get(f"{PREFIX}/batches/{batch_id}/export.csv").status_code == 404
+        assert client.get(f"{PREFIX}/batches/{batch_id}/golden-set.csv").status_code == 404
+        assert client.get(f"{PREFIX}/batches/{batch_id}/curator-sheet.csv").status_code == 404
+        # Cancel -> 403 Forbidden
+        assert client.post(f"{PREFIX}/batches/{batch_id}/cancel", json={}, headers=SAME_ORIGIN).status_code == 403
+
+        # 4. Admin authorization: Admin can read, export, and cancel any batch
+        harness.user = ADMIN_SESSION
+        assert client.get(f"{PREFIX}/batches/{batch_id}").status_code == 200
+        assert client.get(f"{PREFIX}/batches/{batch_id}/export.csv").status_code == 200
+        assert client.get(f"{PREFIX}/batches/{batch_id}/golden-set.csv").status_code == 200
+        assert client.get(f"{PREFIX}/batches/{batch_id}/curator-sheet.csv").status_code == 200
+
+        # Mark batch running so it can be cancelled
+        await harness.store.update_batch_status(batch_id, "running")
+        cancel_resp = client.post(f"{PREFIX}/batches/{batch_id}/cancel", json={}, headers=SAME_ORIGIN)
+        assert cancel_resp.status_code == 200
+        assert cancel_resp.json()["status"] == "cancelled"
+
+        # 5. GET /batches filtering: lists only caller's batches, admin ?all=true
+        # Bob creates a batch
+        harness.user = BOB_SESSION
+        r_bob = client.post(f"{PREFIX}/batches", json={"genes": ["MYCN"]}, headers=SAME_ORIGIN)
+        assert r_bob.status_code == 202
+        bob_batch_id = r_bob.json()["batch_id"]
+
+        # Alice lists batches -> sees only Alice's batches
+        harness.user = ALICE_SESSION
+        alice_batches = client.get(f"{PREFIX}/batches").json()["items"]
+        alice_ids = [b["batch_id"] for b in alice_batches]
+        assert batch_id in alice_ids
+        assert bob_batch_id not in alice_ids
+
+        # Bob lists batches -> sees only Bob's batch
+        harness.user = BOB_SESSION
+        bob_batches = client.get(f"{PREFIX}/batches").json()["items"]
+        bob_ids = [b["batch_id"] for b in bob_batches]
+        assert bob_batch_id in bob_ids
+        assert batch_id not in bob_ids
+
+        # Bob passes ?all=true -> ignored for non-admin, still only sees own batches
+        bob_all = client.get(f"{PREFIX}/batches?all=true").json()["items"]
+        assert [b["batch_id"] for b in bob_all] == bob_ids
+
+        # Admin lists batches without ?all=true -> sees only admin's own batches
+        harness.user = ADMIN_SESSION
+        admin_own = client.get(f"{PREFIX}/batches").json()["items"]
+        assert batch_id not in [b["batch_id"] for b in admin_own]
+        assert bob_batch_id not in [b["batch_id"] for b in admin_own]
+
+        # Admin passes ?all=true -> sees all batches (both Alice's and Bob's)
+        admin_all = client.get(f"{PREFIX}/batches?all=true").json()["items"]
+        all_ids = [b["batch_id"] for b in admin_all]
+        assert batch_id in all_ids
+        assert bob_batch_id in all_ids

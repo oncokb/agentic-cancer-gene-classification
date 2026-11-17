@@ -52,14 +52,13 @@ def run_batch_cli(
     base_url: str,
     genes_file: Path,
     out_dir: Path,
-    api_key: Optional[str] = None,
     poll_interval: float = 2.0,
     max_polls: int = 1800,
     include_excluded: bool = False,
     transport: Optional[httpx.BaseTransport] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> Dict[str, Path]:
-    key = (api_key if api_key is not None else os.environ.get("ACGC_API_KEY") or "").strip()
+    key = (os.environ.get("ACGC_API_KEY") or "").strip()
     if not key:
         raise RuntimeError("ACGC_API_KEY environment variable is required.")
 
@@ -132,7 +131,11 @@ def run_batch_cli(
     return written
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    transport: Optional[httpx.BaseTransport] = None,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True, help="ACGC server base URL")
     parser.add_argument(
@@ -157,6 +160,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             out_dir=args.out_dir,
             poll_interval=args.poll_interval,
             include_excluded=args.include_excluded,
+            transport=transport,
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

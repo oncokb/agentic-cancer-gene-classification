@@ -81,8 +81,7 @@ CREATE TABLE IF NOT EXISTS {BATCH_GENES_TABLE} (
     error VARCHAR(1000) NULL,
     notes VARCHAR(1000) NULL,
     updated_at DATETIME(6) NOT NULL,
-    PRIMARY KEY (batch_id, position),
-    INDEX idx_expression_context_batch_genes_pos (batch_id, position)
+    PRIMARY KEY (batch_id, position)
 )
 """,
 )
@@ -208,6 +207,7 @@ class ExpressionContextStore(Protocol):
         *,
         error: Optional[str] = None,
         updated_at: Optional[datetime] = None,
+        expected_token: Optional[str] = None,
     ) -> Optional[BatchCounts]: ...
 
     async def update_batch_status(
@@ -216,6 +216,7 @@ class ExpressionContextStore(Protocol):
         status: BatchStatus,
         *,
         error: Optional[str] = None,
+        expected_token: Optional[str] = None,
     ) -> Optional[BatchRecord]: ...
 
     async def cancel_batch(
@@ -319,6 +320,7 @@ class InMemoryExpressionContextStore:
             (
                 g.model_copy(
                     update={
+                        "input_symbol": _clip(g.input_symbol, limit=64) or "",
                         "updated_at": _utc(g.updated_at),
                         "error": _clip(g.error),
                         "notes": _clip(g.notes),
@@ -426,8 +428,14 @@ class InMemoryExpressionContextStore:
         *,
         error: Optional[str] = None,
         updated_at: Optional[datetime] = None,
+        expected_token: Optional[str] = None,
     ) -> Optional[BatchCounts]:
         if batch_id not in self.batches:
+            return None
+        batch = self.batches[batch_id]
+        if batch.status == "cancelled":
+            return None
+        if expected_token is not None and not self._holds_batch_lock(batch_id, expected_token):
             return None
         when = _utc(updated_at or datetime.now(timezone.utc))
         genes = self.batch_genes.get(batch_id, [])
@@ -447,9 +455,14 @@ class InMemoryExpressionContextStore:
         status: BatchStatus,
         *,
         error: Optional[str] = None,
+        expected_token: Optional[str] = None,
     ) -> Optional[BatchRecord]:
         batch = self.batches.get(batch_id)
         if batch is None:
+            return None
+        if batch.status == "cancelled":
+            return None
+        if expected_token is not None and not self._holds_batch_lock(batch_id, expected_token):
             return None
         genes = self.batch_genes.get(batch_id, [])
         counts = compute_batch_counts(genes)
@@ -781,7 +794,7 @@ class MySQLExpressionContextStore:
                                 (
                                     g.batch_id,
                                     g.position,
-                                    g.input_symbol,
+                                    _clip(g.input_symbol, limit=64) or "",
                                     g.hugo_symbol,
                                     g.status,
                                     _clip(g.error),
@@ -923,17 +936,41 @@ class MySQLExpressionContextStore:
         *,
         error: Optional[str] = None,
         updated_at: Optional[datetime] = None,
+        expected_token: Optional[str] = None,
     ) -> Optional[BatchCounts]:
         when = _naive_utc(updated_at or datetime.now(timezone.utc))
         async with self._pool.acquire() as conn:
             await conn.begin()
             try:
                 async with conn.cursor() as cursor:
-                    await cursor.execute(
-                        f"UPDATE {BATCH_GENES_TABLE} SET status = %s, error = %s, updated_at = %s "
-                        "WHERE batch_id = %s AND position = %s",
-                        (status, _clip(error), when, batch_id, position),
-                    )
+                    if expected_token is not None:
+                        sql = (
+                            f"UPDATE {BATCH_GENES_TABLE} g "
+                            f"JOIN {BATCHES_TABLE} b ON b.batch_id = g.batch_id "
+                            "SET g.status = %s, g.error = %s, g.updated_at = %s "
+                            "WHERE g.batch_id = %s AND g.position = %s "
+                            "AND b.worker_owner = %s AND b.worker_expires_at >= UTC_TIMESTAMP(6) "
+                            "AND b.status != 'cancelled'"
+                        )
+                        await cursor.execute(
+                            sql,
+                            (status, _clip(error), when, batch_id, position, expected_token),
+                        )
+                    else:
+                        sql = (
+                            f"UPDATE {BATCH_GENES_TABLE} g "
+                            f"JOIN {BATCHES_TABLE} b ON b.batch_id = g.batch_id "
+                            "SET g.status = %s, g.error = %s, g.updated_at = %s "
+                            "WHERE g.batch_id = %s AND g.position = %s "
+                            "AND b.status != 'cancelled'"
+                        )
+                        await cursor.execute(
+                            sql,
+                            (status, _clip(error), when, batch_id, position),
+                        )
+                    if cursor.rowcount == 0:
+                        await conn.rollback()
+                        return None
                     counts = await self._recompute_batch_counts(cursor, batch_id)
                 await conn.commit()
                 return counts
@@ -947,16 +984,35 @@ class MySQLExpressionContextStore:
         status: BatchStatus,
         *,
         error: Optional[str] = None,
+        expected_token: Optional[str] = None,
     ) -> Optional[BatchRecord]:
         async with self._pool.acquire() as conn:
             await conn.begin()
             try:
                 async with conn.cursor() as cursor:
+                    if expected_token is not None:
+                        sql = (
+                            f"UPDATE {BATCHES_TABLE} SET status = %s, error = %s "
+                            "WHERE batch_id = %s AND status != 'cancelled' "
+                            "AND worker_owner = %s AND worker_expires_at >= UTC_TIMESTAMP(6)"
+                        )
+                        await cursor.execute(
+                            sql,
+                            (status, _clip(error), batch_id, expected_token),
+                        )
+                    else:
+                        sql = (
+                            f"UPDATE {BATCHES_TABLE} SET status = %s, error = %s "
+                            "WHERE batch_id = %s AND status != 'cancelled'"
+                        )
+                        await cursor.execute(
+                            sql,
+                            (status, _clip(error), batch_id),
+                        )
+                    if cursor.rowcount == 0:
+                        await conn.rollback()
+                        return None
                     await self._recompute_batch_counts(cursor, batch_id)
-                    await cursor.execute(
-                        f"UPDATE {BATCHES_TABLE} SET status = %s, error = %s WHERE batch_id = %s",
-                        (status, _clip(error), batch_id),
-                    )
                 await conn.commit()
             except BaseException:
                 await conn.rollback()

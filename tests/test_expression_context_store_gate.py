@@ -97,7 +97,8 @@ def test_ddl_is_module_owned_and_keyed_as_contracted():
     for table in BATCH_TABLES:
         assert f"CREATE TABLE IF NOT EXISTS {table}" in batch_ddl
     assert "FOREIGN KEY" not in batch_ddl.upper()
-    assert "INDEX idx_expression_context_batch_genes_pos (batch_id, position)" in batch_ddl
+    assert "PRIMARY KEY (batch_id, position)" in batch_ddl
+    assert "idx_expression_context_batch_genes_pos" not in batch_ddl
 
 
 # ------------------------------------------------------------ store contract
@@ -218,6 +219,61 @@ async def _exercise_store(store):
     assert done_batch is not None and done_batch.status == "done" and done_batch.counts.done == 1
     assert await store.list_unfinished_batches() == []
     assert [b.batch_id for b in await store.list_batches("alice@example.org")] == ["batch-1"]
+
+    # Blocker 7: 65-character entry test on store (both in-memory and MySQL)
+    long_65 = "A" * 65
+    batch_long = BatchRecord(
+        batch_id="batch-long-65",
+        created_by="alice@example.org",
+        created_at=now,
+        release_id="r1",
+        status="queued",
+        counts=BatchCounts(),
+    )
+    long_gene = BatchGeneRecord(
+        batch_id="batch-long-65",
+        position=0,
+        input_symbol=long_65,
+        hugo_symbol=None,
+        status="not_found",
+        notes="entry exceeds 64 characters (truncated)",
+        updated_at=now,
+    )
+    await store.create_batch(batch_long, [long_gene])
+    stored_genes = await store.list_batch_genes("batch-long-65")
+    assert len(stored_genes) == 1
+    assert stored_genes[0].input_symbol == "A" * 64
+    assert stored_genes[0].status == "not_found"
+
+    # Blocker 3: Conditional writes with expected_token and lease checks
+    assert await store.acquire_batch_lock("batch-long-65", "token-owner", 10.0)
+    # Correct token succeeds
+    updated_counts = await store.update_batch_gene(
+        "batch-long-65", 0, "failed", error="err", updated_at=now, expected_token="token-owner"
+    )
+    assert updated_counts is not None and updated_counts.failed == 1
+
+    # Wrong token fails (no-op write)
+    stale_write = await store.update_batch_gene(
+        "batch-long-65", 0, "done", updated_at=now, expected_token="token-stale"
+    )
+    assert stale_write is None
+    # Stale status write fails
+    stale_status = await store.update_batch_status(
+        "batch-long-65", "done", expected_token="token-stale"
+    )
+    assert stale_status is None
+
+    # Blocker 2: Cancelled batch rejects worker writes
+    assert await store.cancel_batch("batch-long-65") is not None
+    cancelled_gene_write = await store.update_batch_gene(
+        "batch-long-65", 0, "done", updated_at=now, expected_token="token-owner"
+    )
+    assert cancelled_gene_write is None
+    cancelled_status_write = await store.update_batch_status(
+        "batch-long-65", "done", expected_token="token-owner"
+    )
+    assert cancelled_status_write is None
 
 
 async def test_in_memory_store_contract():
