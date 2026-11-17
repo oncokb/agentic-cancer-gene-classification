@@ -16,6 +16,7 @@ import logging
 import secrets
 import time
 import uuid
+import weakref
 import xml.etree.ElementTree as ET
 import zlib
 from datetime import datetime, timezone
@@ -2007,12 +2008,19 @@ async def get_keycloak_user_info(access_token: str) -> Dict[str, Any]:
 
 KEYCLOAK_JWKS_CACHE_TTL_SECONDS = 300
 KEYCLOAK_JWKS_REFRESH_MIN_INTERVAL_SECONDS = 60
+KEYCLOAK_JWKS_FAILURE_BACKOFF_SECONDS = 10
 KEYCLOAK_JWT_LEEWAY_SECONDS = 60
 # Maps jwks_url -> (expires_at, keys, version)
 _KEYCLOAK_JWKS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]], int]] = {}
+# Maps jwks_url -> monotonic timestamp of the last successful refresh after a key miss / bad sig (60s bound).
 _KEYCLOAK_JWKS_LAST_REFRESH: Dict[str, float] = {}
+# Maps jwks_url -> (failed_at_mono, error_detail) for failed JWKS fetches/refreshes (10s short backoff).
+_KEYCLOAK_JWKS_LAST_FAILURE: Dict[str, Tuple[float, str]] = {}
 _KEYCLOAK_JWKS_VERSION: Dict[str, int] = {}
-_KEYCLOAK_JWKS_LOCKS: Dict[Tuple[int, str], asyncio.Lock] = {}
+# Keyed weakly by the running event loop so closed loops are GC'd instead of pinning entries or reusing id(loop).
+_KEYCLOAK_JWKS_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
 
 _RSA_PKCS1_ALGS = {
     "RS256": hashes.SHA256,
@@ -2032,21 +2040,29 @@ _EC_ALGS = {
 
 
 def clear_keycloak_jwks_cache() -> None:
-    """Clears cached Keycloak realm JWKS keys and refresh throttle state."""
+    """Clears cached Keycloak realm JWKS keys, refresh throttle, and failure backoff state."""
     _KEYCLOAK_JWKS_CACHE.clear()
     _KEYCLOAK_JWKS_LAST_REFRESH.clear()
+    _KEYCLOAK_JWKS_LAST_FAILURE.clear()
     _KEYCLOAK_JWKS_VERSION.clear()
     _KEYCLOAK_JWKS_LOCKS.clear()
 
 
 def _get_jwks_lock(jwks_url: str) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
-    key = (id(loop), jwks_url)
-    lock = _KEYCLOAK_JWKS_LOCKS.get(key)
+    per_loop = _KEYCLOAK_JWKS_LOCKS.get(loop)
+    if per_loop is None:
+        per_loop = {}
+        _KEYCLOAK_JWKS_LOCKS[loop] = per_loop
+    lock = per_loop.get(jwks_url)
     if lock is None:
         lock = asyncio.Lock()
-        _KEYCLOAK_JWKS_LOCKS[key] = lock
+        per_loop[jwks_url] = lock
     return lock
+
+
+def _jwks_monotonic() -> float:
+    return time.monotonic()
 
 
 def _jwks_refresh_min_interval_seconds() -> int:
@@ -2060,6 +2076,28 @@ def _jwks_refresh_min_interval_seconds() -> int:
             )
         ),
     )
+
+
+def _jwks_failure_backoff_seconds() -> int:
+    return max(
+        0,
+        int(
+            getattr(
+                settings,
+                "keycloak_jwks_failure_backoff_seconds",
+                KEYCLOAK_JWKS_FAILURE_BACKOFF_SECONDS,
+            )
+        ),
+    )
+
+
+def _format_jwks_unavailable_detail(exc: BaseException) -> str:
+    if isinstance(exc, HTTPException) and exc.detail:
+        msg = str(exc.detail)
+        if "identity provider unavailable" in msg.lower():
+            return msg
+        return f"Identity provider unavailable: {msg}"
+    return "Identity provider unavailable: unable to retrieve Keycloak signing keys."
 
 
 async def fetch_keycloak_jwks(jwks_url: str) -> List[Dict[str, Any]]:
@@ -2095,35 +2133,79 @@ async def fetch_keycloak_jwks(jwks_url: str) -> List[Dict[str, Any]]:
     return keys
 
 
+async def _fetch_and_store_jwks(jwks_url: str) -> Tuple[List[Dict[str, Any]], int]:
+    """Fetches JWKS, updating the cache on success or recording failure backoff on error.
+
+    Caller must hold _get_jwks_lock(jwks_url). Keeps any existing cache entry intact on failure.
+    """
+    try:
+        keys = await fetch_keycloak_jwks(jwks_url)
+    except Exception as exc:
+        detail = _format_jwks_unavailable_detail(exc)
+        _KEYCLOAK_JWKS_LAST_FAILURE[jwks_url] = (_jwks_monotonic(), detail)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        ) from exc
+
+    _KEYCLOAK_JWKS_LAST_FAILURE.pop(jwks_url, None)
+    new_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0) + 1
+    _KEYCLOAK_JWKS_VERSION[jwks_url] = new_version
+    _KEYCLOAK_JWKS_CACHE[jwks_url] = (
+        _jwks_monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS,
+        keys,
+        new_version,
+    )
+    return keys, new_version
+
+
+def _maybe_raise_recent_jwks_failure(
+    jwks_url: str,
+    *,
+    now_mono: float,
+    wait_started_mono: float,
+) -> None:
+    last_failure = _KEYCLOAK_JWKS_LAST_FAILURE.get(jwks_url)
+    if last_failure is None:
+        return
+    failed_at, error_detail = last_failure
+    if failed_at >= wait_started_mono or (now_mono - failed_at) < _jwks_failure_backoff_seconds():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_detail,
+        )
+
+
 async def _get_keycloak_jwks(
     jwks_url: str,
     *,
     force_refresh: bool = False,
 ) -> Tuple[List[Dict[str, Any]], int, bool]:
-    now_mono = time.monotonic()
+    now_mono = _jwks_monotonic()
     if not force_refresh:
         cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
         if cached is not None and now_mono < cached[0]:
             return cached[1], cached[2], True
 
     observed_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0)
+    wait_started_mono = now_mono
     lock = _get_jwks_lock(jwks_url)
     async with lock:
-        now_mono = time.monotonic()
+        now_mono = _jwks_monotonic()
         cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
         if not force_refresh and cached is not None and now_mono < cached[0]:
             # If another waiter fetched new keys while we waited on the lock, treat them as
             # fresh for this caller so concurrent failures don't immediately re-fetch.
             from_cache = cached[2] == observed_version
             return cached[1], cached[2], from_cache
-        keys = await fetch_keycloak_jwks(jwks_url)
-        new_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0) + 1
-        _KEYCLOAK_JWKS_VERSION[jwks_url] = new_version
-        _KEYCLOAK_JWKS_CACHE[jwks_url] = (
-            time.monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS,
-            keys,
-            new_version,
+        # If no valid unexpired cache exists, reuse any in-flight or short-backoff failure
+        # instead of letting queued waiters stampede the failing JWKS endpoint.
+        _maybe_raise_recent_jwks_failure(
+            jwks_url,
+            now_mono=now_mono,
+            wait_started_mono=wait_started_mono,
         )
+        keys, new_version = await _fetch_and_store_jwks(jwks_url)
         return keys, new_version, False
 
 
@@ -2132,28 +2214,33 @@ async def _refresh_keycloak_jwks_on_failure(
     *,
     failed_version: int,
 ) -> Optional[List[Dict[str, Any]]]:
-    """Coalesces concurrent JWKS refreshes and bounds them to once per min interval per realm."""
+    """Coalesces concurrent JWKS refreshes and bounds them per realm.
+
+    Uses two distinct intervals:
+    - Successful refreshes update ``_KEYCLOAK_JWKS_LAST_REFRESH`` and are bounded by the
+      full minimum interval (default 60s), avoiding repeated fetches on attacker bad-kid floods.
+    - Failed refreshes update ``_KEYCLOAK_JWKS_LAST_FAILURE`` (leaving ``_KEYCLOAK_JWKS_LAST_REFRESH``
+      untouched and keeping any valid cached JWKS usable) and are bounded only by the short failure
+      back-off (default 10s), so a recovered Keycloak is retried promptly for newly rotated keys.
+    """
+    wait_started_mono = _jwks_monotonic()
     lock = _get_jwks_lock(jwks_url)
     async with lock:
         cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
         if cached is not None and cached[2] != failed_version:
             # Another concurrent request already refreshed this realm's JWKS while we waited.
             return cached[1]
-        now_mono = time.monotonic()
+        now_mono = _jwks_monotonic()
         last_refresh = _KEYCLOAK_JWKS_LAST_REFRESH.get(jwks_url)
         if last_refresh is not None and (now_mono - last_refresh) < _jwks_refresh_min_interval_seconds():
             return None
-        try:
-            keys = await fetch_keycloak_jwks(jwks_url)
-        finally:
-            _KEYCLOAK_JWKS_LAST_REFRESH[jwks_url] = time.monotonic()
-        new_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0) + 1
-        _KEYCLOAK_JWKS_VERSION[jwks_url] = new_version
-        _KEYCLOAK_JWKS_CACHE[jwks_url] = (
-            time.monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS,
-            keys,
-            new_version,
+        _maybe_raise_recent_jwks_failure(
+            jwks_url,
+            now_mono=now_mono,
+            wait_started_mono=wait_started_mono,
         )
+        keys, _new_version = await _fetch_and_store_jwks(jwks_url)
+        _KEYCLOAK_JWKS_LAST_REFRESH[jwks_url] = _jwks_monotonic()
         return keys
 
 
@@ -2273,7 +2360,7 @@ async def _verify_keycloak_jwt_signature(token: str) -> Dict[str, Any]:
         if not from_cache:
             # Freshly fetched (or coalesced onto a fresh fetch) and verification still failed;
             # record the failure refresh timestamp so subsequent failures are throttled.
-            _KEYCLOAK_JWKS_LAST_REFRESH[jwks_url] = time.monotonic()
+            _KEYCLOAK_JWKS_LAST_REFRESH[jwks_url] = _jwks_monotonic()
         else:
             refreshed_keys = await _refresh_keycloak_jwks_on_failure(
                 jwks_url,

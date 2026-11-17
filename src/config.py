@@ -323,6 +323,7 @@ class Settings(BaseSettings):
     keycloak_allowed_roles: str = ""  # Optional comma-separated list of required Keycloak roles
     keycloak_admin_roles: str = ""  # Keycloak roles that map to "admin" role
     keycloak_jwks_refresh_min_interval_seconds: int = Field(default=60, ge=0)
+    keycloak_jwks_failure_backoff_seconds: int = Field(default=10, ge=0)
 
     # JIT (Just-In-Time) Provisioning Settings
     jit_provisioning_enabled: bool = True
