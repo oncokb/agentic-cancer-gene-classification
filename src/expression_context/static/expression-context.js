@@ -185,12 +185,13 @@
     let activeBatchTimer = null;
     let activeBatchTimerResolve = null;
     let currentBatchId = null;
-    const pendingCancelIds = new Set();
+    let nextCancelToken = 0;
+    const pendingCancels = new Map();
 
     function syncCancelButton() {
       if (!el["ec-batch-cancel"]) return;
       const shownId = currentBatchId || (state.batch && state.batch.batch_id) || null;
-      el["ec-batch-cancel"].disabled = Boolean(shownId && pendingCancelIds.has(shownId));
+      el["ec-batch-cancel"].disabled = Boolean(shownId && pendingCancels.has(shownId));
     }
 
     function cancelActiveBatchLoop() {
@@ -1295,7 +1296,7 @@
     async function cancelCurrentBatch() {
       if (!state.batch || !state.batch.batch_id) return;
       const id = state.batch.batch_id;
-      if (pendingCancelIds.has(id)) return;
+      if (pendingCancels.has(id)) return;
       cancelActiveBatchLoop();
       const cancelGeneration = activeBatchGeneration;
       const isStillCurrentCancel = () => (
@@ -1303,41 +1304,47 @@
         state.mode === "batch" &&
         Boolean(state.batch && state.batch.batch_id === id)
       );
-      pendingCancelIds.add(id);
+      nextCancelToken += 1;
+      const token = nextCancelToken;
+      pendingCancels.set(id, token);
       syncCancelButton();
+
+      let cancelResult;
       try {
-        const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}/cancel`, {
+        cancelResult = await getJson(`${API}/batches/${encodeURIComponent(id)}/cancel`, {
           method: "POST",
           headers: { Accept: "application/json", "Content-Type": "application/json" },
           body: JSON.stringify({}),
         });
-        pendingCancelIds.delete(id);
-        if (!isStillCurrentCancel()) return;
-        if (status === 401) {
-          redirectToLogin();
-          return;
-        }
-        if (status === 200 && body) {
-          if (
-            body.counts && typeof body.counts.total === "number" &&
-            isValidGeneList(body.genes) && body.genes.length === body.counts.total
-          ) {
-            state.batchIncomplete = false;
-            setError("");
-            renderBatch(body);
-          } else {
-            await loadBatch(id);
-          }
-        } else {
-          setError(friendlyError(status, id));
-          syncCancelButton();
-          await loadBatch(id, { preserveError: true });
-        }
       } finally {
-        pendingCancelIds.delete(id);
+        if (pendingCancels.get(id) === token) {
+          pendingCancels.delete(id);
+        }
         if (state.mode === "batch" && currentBatchId === id) {
           syncCancelButton();
         }
+      }
+
+      if (!isStillCurrentCancel()) return;
+      const { status, body } = cancelResult;
+      if (status === 401) {
+        redirectToLogin();
+        return;
+      }
+      if (status === 200 && body) {
+        if (
+          body.counts && typeof body.counts.total === "number" &&
+          isValidGeneList(body.genes) && body.genes.length === body.counts.total
+        ) {
+          state.batchIncomplete = false;
+          setError("");
+          renderBatch(body);
+        } else {
+          await loadBatch(id);
+        }
+      } else {
+        setError(friendlyError(status, id));
+        await loadBatch(id, { preserveError: true });
       }
     }
 

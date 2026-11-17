@@ -2230,6 +2230,156 @@ test("submitBatch: switching to Single before 202 arrives leaves Single active a
   assert.strictEqual(ref.calls.filter((c) => c.method === "GET").length, 0);
 });
 
+test("failed cancel -> recovery polling -> second cancel aborts recovery -> Cancel stays disabled until second POST settles", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const runningA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const doneA = {
+    batch_id: "batch-A", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+
+  let postCount = 0;
+  let getCount = 0;
+  let resolveSecondPost = null;
+  const timers = [];
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": () => {
+        getCount += 1;
+        return response(getCount <= 3 ? runningA : doneA);
+      },
+      "POST /v1/expression-context/batches/batch-A/cancel": () => {
+        postCount += 1;
+        if (postCount === 1) return response({ detail: "fail 1" }, 500);
+        return new Promise((r) => {
+          resolveSecondPost = () => r(response({ detail: "fail 2" }, 500));
+        });
+      },
+    },
+    { wait: () => new Promise((r) => { timers.push(r); }) }
+  );
+
+  const pLoad = ref.page.loadBatch("batch-A");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  // Step 1-2: First cancel fails (500) and starts recovery polling (timers[1])
+  const c1 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(postCount, 1);
+
+  // Step 3: Second cancel click (POST 2 held pending) aborts c1's recovery polling
+  const c2 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolveSecondPost) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(postCount, 2);
+
+  // Step 4: First invocation completely settles (timers[1] resolves c1's recovery loadBatch)
+  timers[1]();
+  await c1;
+
+  // After c1 settles, Cancel MUST still be disabled because c2's POST is pending!
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Step 5: Third click sends NO duplicate POST
+  await ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(ref.calls.filter((c) => c.method === "POST").length, 2);
+
+  // Step 6: Second POST settles (with 500, A still shown) -> Cancel re-enables
+  resolveSecondPost();
+  while (timers.length < 3) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  timers[2]();
+  await c2;
+  timers[0]();
+  await pLoad;
+});
+
+test("older cancel invocation finishing after newer one has settled does not alter pending cancel map", async () => {
+  const makeGene = (sym, status) => ({
+    position: 0, input_symbol: sym, hugo_symbol: sym, status, error: null, notes: null, updated_at: "2026-11-17T00:00:00Z",
+  });
+  const runningA = {
+    batch_id: "batch-A", status: "running", release_id: "rel-1",
+    counts: { total: 1, done: 0, queued: 0, running: 1, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "running")],
+  };
+  const doneA = {
+    batch_id: "batch-A", status: "done", release_id: "rel-1",
+    counts: { total: 1, done: 1, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: [makeGene("ERBB2", "done")],
+  };
+
+  let getCount = 0;
+  let postCount = 0;
+  let resolveSlowC1RecoveryGet = null;
+  let resolvePost3 = null;
+  const timers = [];
+  const ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-A": () => {
+        getCount += 1;
+        if (getCount === 2) {
+          // Held open for c1's recovery loadBatch
+          return new Promise((r) => {
+            resolveSlowC1RecoveryGet = () => r(response(runningA));
+          });
+        }
+        return response(getCount <= 3 ? runningA : doneA);
+      },
+      "POST /v1/expression-context/batches/batch-A/cancel": () => {
+        postCount += 1;
+        if (postCount <= 2) return response({ detail: "fail" }, 500);
+        return new Promise((r) => {
+          resolvePost3 = () => r(response({ ...doneA, status: "cancelled" }));
+        });
+      },
+    },
+    { wait: () => new Promise((r) => { timers.push(r); }) }
+  );
+
+  const pLoad = ref.page.loadBatch("batch-A");
+  while (timers.length < 1) await new Promise((r) => setTimeout(r, 0));
+
+  // c1 fails POST 1 and hangs in recovery GET (getCount === 2)
+  const c1 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolveSlowC1RecoveryGet) await new Promise((r) => setTimeout(r, 0));
+
+  // c2 runs POST 2 -> fails (500) -> enters recovery polling -> pauses at timers[1]
+  const c2 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (timers.length < 2) await new Promise((r) => setTimeout(r, 0));
+
+  // c3 starts POST 3 (held pending)
+  const c3 = ref.nodes["ec-batch-cancel"].fire("click");
+  while (!resolvePost3) await new Promise((r) => setTimeout(r, 0));
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+
+  // Now c1's held network GET resolves and c1 finishes completely WHILE c3 is pending
+  resolveSlowC1RecoveryGet();
+  await c1;
+
+  // c1 finishing must NOT delete c3's pending cancel token or re-enable Cancel
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, true);
+  await ref.nodes["ec-batch-cancel"].fire("click");
+  assert.strictEqual(postCount, 3);
+
+  // Settle c3 -> A is cancelled
+  resolvePost3();
+  await c3;
+  assert.strictEqual(ref.nodes["ec-batch-cancel"].disabled, false);
+
+  timers[1]();
+  await c2;
+  timers[0]();
+  await pLoad;
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of tests) {
