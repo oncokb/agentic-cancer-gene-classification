@@ -1483,26 +1483,57 @@ async def _verify_session(token: str) -> Tuple[Optional[AuthenticatedUser], Opti
     }), None
 
 
-async def bump_session_generation(email: str) -> int:
-    """Bumps session generation for user across active backend, revoking existing sessions."""
+async def bump_session_generation(
+    email: str,
+    *,
+    expected_generation: Optional[int] = None,
+) -> Optional[int]:
+    """Bumps session generation for user across active backend, revoking existing sessions.
+
+    When expected_generation is provided, atomically increments only if the stored
+    generation matches expected_generation, returning the new generation or None if
+    already revoked / user absent.
+    """
     clean_email = email.strip().lower()
     if mysql_user_store_enabled():
         try:
-            return await _mysql_store().bump_session_generation(clean_email)
+            return await _mysql_store().bump_session_generation(
+                clean_email,
+                expected_generation=expected_generation,
+            )
         except UserStoreUnavailable:
             raise
         except Exception as exc:
             raise UserStoreUnavailable("User store bump_session_generation failed") from exc
     redis_client = await _profile_store_redis()
     if redis_client is not None:
+        key = f"agcg:user:{clean_email}"
         try:
-            payload = await redis_client.get(f"agcg:user:{clean_email}")
-            if not payload:
-                return 1
-            profile = UserProfile.model_validate_json(payload)
-            new_gen = profile.session_generation + 1
-            updated = profile.model_copy(update={"session_generation": new_gen})
-            await redis_client.set(f"agcg:user:{clean_email}", updated.model_dump_json())
+            from redis.exceptions import WatchError
+
+            async with redis_client.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(key)
+                        payload = await pipe.get(key)
+                        if not payload:
+                            await pipe.unwatch()
+                            return None if expected_generation is not None else 1
+                        profile = UserProfile.model_validate_json(payload)
+                        if (
+                            expected_generation is not None
+                            and profile.session_generation != expected_generation
+                        ):
+                            await pipe.unwatch()
+                            return None
+                        new_gen = profile.session_generation + 1
+                        updated = profile.model_copy(update={"session_generation": new_gen})
+                        pipe.multi()
+                        pipe.set(key, updated.model_dump_json())
+                        await pipe.execute()
+                        break
+                    except WatchError:
+                        continue
         except Exception as exc:
             raise UserStoreUnavailable("Failed to bump session generation in Redis") from exc
         async with _user_store_lock:
@@ -1510,11 +1541,13 @@ async def bump_session_generation(email: str) -> int:
         return new_gen
     async with _user_store_lock:
         profile = _user_store.get(clean_email)
-        if profile:
-            new_gen = profile.session_generation + 1
-            _user_store[clean_email] = profile.model_copy(update={"session_generation": new_gen})
-            return new_gen
-    return 1
+        if profile is None:
+            return None if expected_generation is not None else 1
+        if expected_generation is not None and profile.session_generation != expected_generation:
+            return None
+        new_gen = profile.session_generation + 1
+        _user_store[clean_email] = profile.model_copy(update={"session_generation": new_gen})
+        return new_gen
 
 
 async def resolve_session_user(request: Request) -> Optional[AuthenticatedUser]:
@@ -1973,8 +2006,13 @@ async def get_keycloak_user_info(access_token: str) -> Dict[str, Any]:
 
 
 KEYCLOAK_JWKS_CACHE_TTL_SECONDS = 300
+KEYCLOAK_JWKS_REFRESH_MIN_INTERVAL_SECONDS = 60
 KEYCLOAK_JWT_LEEWAY_SECONDS = 60
-_KEYCLOAK_JWKS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+# Maps jwks_url -> (expires_at, keys, version)
+_KEYCLOAK_JWKS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]], int]] = {}
+_KEYCLOAK_JWKS_LAST_REFRESH: Dict[str, float] = {}
+_KEYCLOAK_JWKS_VERSION: Dict[str, int] = {}
+_KEYCLOAK_JWKS_LOCKS: Dict[Tuple[int, str], asyncio.Lock] = {}
 
 _RSA_PKCS1_ALGS = {
     "RS256": hashes.SHA256,
@@ -1994,8 +2032,34 @@ _EC_ALGS = {
 
 
 def clear_keycloak_jwks_cache() -> None:
-    """Clears cached Keycloak realm JWKS keys."""
+    """Clears cached Keycloak realm JWKS keys and refresh throttle state."""
     _KEYCLOAK_JWKS_CACHE.clear()
+    _KEYCLOAK_JWKS_LAST_REFRESH.clear()
+    _KEYCLOAK_JWKS_VERSION.clear()
+    _KEYCLOAK_JWKS_LOCKS.clear()
+
+
+def _get_jwks_lock(jwks_url: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = (id(loop), jwks_url)
+    lock = _KEYCLOAK_JWKS_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _KEYCLOAK_JWKS_LOCKS[key] = lock
+    return lock
+
+
+def _jwks_refresh_min_interval_seconds() -> int:
+    return max(
+        0,
+        int(
+            getattr(
+                settings,
+                "keycloak_jwks_refresh_min_interval_seconds",
+                KEYCLOAK_JWKS_REFRESH_MIN_INTERVAL_SECONDS,
+            )
+        ),
+    )
 
 
 async def fetch_keycloak_jwks(jwks_url: str) -> List[Dict[str, Any]]:
@@ -2031,15 +2095,66 @@ async def fetch_keycloak_jwks(jwks_url: str) -> List[Dict[str, Any]]:
     return keys
 
 
-async def _get_keycloak_jwks(jwks_url: str, *, force_refresh: bool = False) -> Tuple[List[Dict[str, Any]], bool]:
+async def _get_keycloak_jwks(
+    jwks_url: str,
+    *,
+    force_refresh: bool = False,
+) -> Tuple[List[Dict[str, Any]], int, bool]:
     now_mono = time.monotonic()
     if not force_refresh:
         cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
         if cached is not None and now_mono < cached[0]:
-            return cached[1], True
-    keys = await fetch_keycloak_jwks(jwks_url)
-    _KEYCLOAK_JWKS_CACHE[jwks_url] = (time.monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS, keys)
-    return keys, False
+            return cached[1], cached[2], True
+
+    observed_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0)
+    lock = _get_jwks_lock(jwks_url)
+    async with lock:
+        now_mono = time.monotonic()
+        cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
+        if not force_refresh and cached is not None and now_mono < cached[0]:
+            # If another waiter fetched new keys while we waited on the lock, treat them as
+            # fresh for this caller so concurrent failures don't immediately re-fetch.
+            from_cache = cached[2] == observed_version
+            return cached[1], cached[2], from_cache
+        keys = await fetch_keycloak_jwks(jwks_url)
+        new_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0) + 1
+        _KEYCLOAK_JWKS_VERSION[jwks_url] = new_version
+        _KEYCLOAK_JWKS_CACHE[jwks_url] = (
+            time.monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS,
+            keys,
+            new_version,
+        )
+        return keys, new_version, False
+
+
+async def _refresh_keycloak_jwks_on_failure(
+    jwks_url: str,
+    *,
+    failed_version: int,
+) -> Optional[List[Dict[str, Any]]]:
+    """Coalesces concurrent JWKS refreshes and bounds them to once per min interval per realm."""
+    lock = _get_jwks_lock(jwks_url)
+    async with lock:
+        cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
+        if cached is not None and cached[2] != failed_version:
+            # Another concurrent request already refreshed this realm's JWKS while we waited.
+            return cached[1]
+        now_mono = time.monotonic()
+        last_refresh = _KEYCLOAK_JWKS_LAST_REFRESH.get(jwks_url)
+        if last_refresh is not None and (now_mono - last_refresh) < _jwks_refresh_min_interval_seconds():
+            return None
+        try:
+            keys = await fetch_keycloak_jwks(jwks_url)
+        finally:
+            _KEYCLOAK_JWKS_LAST_REFRESH[jwks_url] = time.monotonic()
+        new_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0) + 1
+        _KEYCLOAK_JWKS_VERSION[jwks_url] = new_version
+        _KEYCLOAK_JWKS_CACHE[jwks_url] = (
+            time.monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS,
+            keys,
+            new_version,
+        )
+        return keys
 
 
 def _verify_jws_signature_with_jwk(
@@ -2152,11 +2267,20 @@ async def _verify_keycloak_jwt_signature(token: str) -> Dict[str, Any]:
         candidates = [k for k in keys if k.get("kid") == kid] if kid is not None else keys
         return any(_verify_jws_signature_with_jwk(signing_input, sig_bytes, alg, k) for k in candidates)
 
-    keys, from_cache = await _get_keycloak_jwks(jwks_url, force_refresh=False)
+    keys, jwks_version, from_cache = await _get_keycloak_jwks(jwks_url, force_refresh=False)
     verified = _try_keys(keys)
-    if not verified and from_cache:
-        keys, _ = await _get_keycloak_jwks(jwks_url, force_refresh=True)
-        verified = _try_keys(keys)
+    if not verified:
+        if not from_cache:
+            # Freshly fetched (or coalesced onto a fresh fetch) and verification still failed;
+            # record the failure refresh timestamp so subsequent failures are throttled.
+            _KEYCLOAK_JWKS_LAST_REFRESH[jwks_url] = time.monotonic()
+        else:
+            refreshed_keys = await _refresh_keycloak_jwks_on_failure(
+                jwks_url,
+                failed_version=jwks_version,
+            )
+            if refreshed_keys is not None:
+                verified = _try_keys(refreshed_keys)
 
     if not verified:
         raise HTTPException(

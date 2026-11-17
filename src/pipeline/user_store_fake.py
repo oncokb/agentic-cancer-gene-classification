@@ -332,13 +332,22 @@ class FakeUserStore:
             )
             return True
 
-    async def bump_session_generation(self, email: str) -> int:
+    async def bump_session_generation(
+        self,
+        email: str,
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> Optional[int]:
         clean = normalize_email(email)
         self._check_available("bump_session_generation")
         async with self._lock:
             user = self._users.get(clean)
             if user is None:
+                if expected_generation is not None:
+                    return None
                 raise UserNotFound(clean)
+            if expected_generation is not None and user.session_generation != expected_generation:
+                return None
             new_gen = user.session_generation + 1
             self._users[clean] = replace(user, session_generation=new_gen, updated_at=_db_time())
             return new_gen

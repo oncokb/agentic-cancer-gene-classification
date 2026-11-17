@@ -910,3 +910,27 @@ async def test_list_role_changes_paginates_newest_first(store, email):
     second = await store.list_role_changes(email=address, limit=2, cursor=first.next_cursor)
     values = [c.new_value for c in first.changes + second.changes]
     assert values == ["viewer", "admin", "curator"] and second.next_cursor is None
+
+
+async def test_conditional_bump_session_generation_and_concurrent_race(store, email):
+    address = email("logout-race")
+    user = await _login(store, address)
+    assert user.session_generation == 1
+
+    # Two concurrent conditional bumps with the same gen=1 token: only one wins
+    results = await asyncio.gather(
+        store.bump_session_generation(address, expected_generation=1),
+        store.bump_session_generation(address, expected_generation=1),
+    )
+    assert sorted(r for r in results if r is not None) == [2]
+    assert results.count(None) == 1
+    assert (await store.get_user(address)).session_generation == 2
+
+    # Subsequent login keeps generation=2; stale gen=1 logout does not revoke it
+    relogged = await _login(store, address)
+    assert relogged.session_generation == 2
+    assert await store.bump_session_generation(address, expected_generation=1) is None
+    assert (await store.get_user(address)).session_generation == 2
+
+    # Missing user with conditional bump is a no-op returning None
+    assert await store.bump_session_generation(email("absent"), expected_generation=1) is None

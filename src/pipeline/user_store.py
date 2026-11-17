@@ -323,7 +323,12 @@ class UserStore(Protocol):
         actor: str, reason: Optional[str] = None,
     ) -> List[RoleChange]: ...
 
-    async def bump_session_generation(self, email: str) -> int: ...
+    async def bump_session_generation(
+        self,
+        email: str,
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> Optional[int]: ...
 
     async def incr_activity(self, email: str, n: int = 1, at: Optional[datetime] = None) -> bool: ...
 
@@ -1015,15 +1020,33 @@ class UserStoreMixin:
                     )
                     return cursor.rowcount == 1
 
-    async def bump_session_generation(self, email: str) -> int:
+    async def bump_session_generation(
+        self,
+        email: str,
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> Optional[int]:
         """Increment session_generation for the user, revoking existing sessions.
-        Returns the new session_generation. Raises UserNotFound if the user doesn't exist.
+
+        When expected_generation is provided, performs an atomic conditional update
+        (only when stored session_generation matches expected_generation) in a single
+        statement, returning the new generation or None if 0 rows matched.
+        When expected_generation is None, raises UserNotFound if the user doesn't exist.
         """
         clean = normalize_email(email)
         now = _to_db(utc_now())
         async with _store_errors("bump_session_generation"):
             async with self._pool.acquire() as conn:
                 async with conn.cursor() as cursor:
+                    if expected_generation is not None:
+                        await cursor.execute(
+                            "UPDATE users SET session_generation = session_generation + 1, updated_at = %s "
+                            "WHERE email = %s AND session_generation = %s",
+                            (now, clean, expected_generation),
+                        )
+                        if cursor.rowcount == 0:
+                            return None
+                        return expected_generation + 1
                     await cursor.execute(
                         "UPDATE users SET session_generation = session_generation + 1, updated_at = %s "
                         "WHERE email = %s",

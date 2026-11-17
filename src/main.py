@@ -72,7 +72,6 @@ from src.auth import (
     is_email_allowed,
     is_saml_group_allowed,
     list_user_profiles,
-    load_user_profile_strict,
     mysql_user_store_enabled,
     parse_keycloak_user,
     parse_saml_response,
@@ -2163,9 +2162,10 @@ async def auth_logout(request: Request) -> Response:
         claims = decode_session_token(token)
         if claims and claims.email:
             try:
-                profile = await load_user_profile_strict(claims.email)
-                if profile is not None and claims.session_generation == profile.session_generation:
-                    await bump_session_generation(claims.email)
+                await bump_session_generation(
+                    claims.email,
+                    expected_generation=claims.session_generation,
+                )
             except Exception as exc:
                 logger.error("Session revocation failed on logout: %s", describe_store_error(exc))
                 if "application/json" in (request.headers.get("accept") or "").lower():

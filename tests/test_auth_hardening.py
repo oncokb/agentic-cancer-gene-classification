@@ -985,7 +985,7 @@ def test_logout_generation_bump_failure_returns_error_and_clears_cookie(auth_set
     token = session_token_for(user)
     client.cookies.set(settings.auth_cookie_name, token)
 
-    async def broken_bump(email: str) -> int:
+    async def broken_bump(email: str, *, expected_generation=None) -> int:
         raise auth_module.UserStoreUnavailable("store unavailable")
 
     monkeypatch.setattr(main_module, "bump_session_generation", broken_bump)
@@ -1014,12 +1014,46 @@ def test_logout_redis_bump_failure_fails_loudly_and_clears_cookie(auth_settings,
     )
     token = session_token_for(user)
 
+    class _FailingPipeline:
+        def __init__(self, redis):
+            self.redis = redis
+            self.ops = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def watch(self, *keys):
+            return None
+
+        async def unwatch(self):
+            return None
+
+        async def get(self, key):
+            return await self.redis.get(key)
+
+        def multi(self):
+            return self
+
+        def set(self, key, val, ex=None):
+            self.ops.append((key, val))
+            return self
+
+        async def execute(self):
+            for key, val in self.ops:
+                await self.redis.set(key, val)
+
     class FailingRedis:
         async def get(self, key):
             return stored_profile(user.email).model_dump_json()
 
         async def set(self, key, val):
             raise ConnectionError("redis write down")
+
+        def pipeline(self, transaction=True):
+            return _FailingPipeline(self)
 
     async def get_failing_redis():
         return FailingRedis()
@@ -1065,3 +1099,398 @@ def test_logout_repeat_with_already_revoked_token_is_noop(auth_settings):
         settings.auth_cookie_name in c and ("max-age=0" in c.lower() or '""' in c)
         for c in resp2.headers.get_list("set-cookie")
     )
+
+
+# ===========================================================================
+# 7. Bounded & coalesced JWKS refresh, atomic logout race, & OAuth Redis check
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_keycloak_jwks_coalesces_concurrent_unknown_kid_requests(auth_settings, monkeypatch):
+    """Blocker 1: N concurrent unknown-kid tokens trigger exactly 1 JWKS fetch (cold & warm)."""
+    clear_keycloak_jwks_cache()
+    k1 = get_test_rsa_key("primary")
+    jwks_doc = {"keys": [rsa_jwk_from_key(k1, kid="key-1")]}
+    fetch_count = 0
+
+    async def fake_fetch(jwks_url: str):
+        nonlocal fetch_count
+        fetch_count += 1
+        await asyncio.sleep(0.02)
+        return jwks_doc["keys"]
+
+    monkeypatch.setattr(auth_module, "fetch_keycloak_jwks", fake_fetch)
+    monkeypatch.setattr(settings, "keycloak_jwks_refresh_min_interval_seconds", 60)
+
+    # Part A: Cold cache + 8 concurrent unknown-kid tokens -> exactly 1 fetch, all rejected 403
+    bad_tokens = [
+        sign_rs256_jwt(
+            make_keycloak_id_claims(email="attacker@mskcc.org", sub=f"s-{i}"),
+            kid=f"unknown-{i}",
+            private_key=k1,
+        )
+        for i in range(8)
+    ]
+
+    async def _attempt(tok: str):
+        with pytest.raises(HTTPException) as exc:
+            await parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": "s-0"})
+        return exc.value.status_code
+
+    statuses = await asyncio.gather(*(_attempt(tok) for tok in bad_tokens))
+    assert all(code == 403 for code in statuses)
+    assert fetch_count == 1
+
+    # Part B: Warm cache (valid login, no prior failure refresh) + 8 concurrent unknown-kid -> 1 refresh
+    clear_keycloak_jwks_cache()
+    fetch_count = 0
+    valid_tok = sign_rs256_jwt(
+        make_keycloak_id_claims(email="curator@mskcc.org", sub="s-valid"),
+        kid="key-1",
+        private_key=k1,
+    )
+    valid_user = await parse_keycloak_user({"access_token": "tok", "id_token": valid_tok}, {"sub": "s-valid"})
+    assert valid_user.email == "curator@mskcc.org"
+    assert fetch_count == 1
+
+    statuses_warm = await asyncio.gather(*(_attempt(tok) for tok in bad_tokens))
+    assert all(code == 403 for code in statuses_warm)
+    assert fetch_count == 2  # +1 coalesced refresh for all 8 concurrent unknown-kid attempts
+
+
+@pytest.mark.asyncio
+async def test_keycloak_jwks_rate_limits_failures_and_allows_after_interval(auth_settings, monkeypatch):
+    """Blocker 1: Repeated failures within min interval trigger 0 extra fetches; after interval, 1 more."""
+    clear_keycloak_jwks_cache()
+    clock = [1000.0]
+    monkeypatch.setattr(auth_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(settings, "keycloak_jwks_refresh_min_interval_seconds", 60)
+
+    k1 = get_test_rsa_key("primary")
+    k2 = get_test_rsa_key("rotated")
+    active_keys = [rsa_jwk_from_key(k1, kid="key-1")]
+    fetches = 0
+
+    async def fake_fetch(jwks_url: str):
+        nonlocal fetches
+        fetches += 1
+        return list(active_keys)
+
+    monkeypatch.setattr(auth_module, "fetch_keycloak_jwks", fake_fetch)
+
+    # Warm cache with valid key-1
+    tok1 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-1", private_key=k1)
+    await parse_keycloak_user({"access_token": "tok", "id_token": tok1}, {"sub": "s1"})
+    assert fetches == 1
+
+    # Unknown kid triggers 1 forced refresh at t=1001
+    clock[0] = 1001.0
+    bad_kid = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="missing-kid", private_key=k1)
+    with pytest.raises(HTTPException) as exc1:
+        await parse_keycloak_user({"access_token": "tok", "id_token": bad_kid}, {"sub": "s1"})
+    assert exc1.value.status_code == 403
+    assert fetches == 2
+
+    # Repeated failures (unknown kid and bad signature) within 60s -> 403 WITHOUT extra fetch
+    bad_sig_parts = tok1.split(".")
+    bad_sig_tok = f"{bad_sig_parts[0]}.{bad_sig_parts[1]}.AAAA_invalid_signature"
+    for dt in (10.0, 30.0, 59.0):
+        clock[0] = 1001.0 + dt
+        for tok in (bad_kid, bad_sig_tok):
+            with pytest.raises(HTTPException) as exc_rep:
+                await parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": "s1"})
+            assert exc_rep.value.status_code == 403
+    assert fetches == 2
+
+    # Rotate keys after interval expires -> allows 1 more refresh and accepts rotated token
+    active_keys[:] = [rsa_jwk_from_key(k2, kid="key-2")]
+    clock[0] = 1061.0
+    tok2 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-2", private_key=k2)
+    user2 = await parse_keycloak_user({"access_token": "tok", "id_token": tok2}, {"sub": "s1"})
+    assert user2.email == "curator@mskcc.org"
+    assert fetches == 3
+
+
+@pytest.mark.asyncio
+async def test_keycloak_jwks_coalesces_concurrent_key_rotation(auth_settings, monkeypatch):
+    """Blocker 1: N concurrent tokens for a rotated key coalesce onto 1 refresh and all succeed."""
+    clear_keycloak_jwks_cache()
+    k1 = get_test_rsa_key("primary")
+    k2 = get_test_rsa_key("rotated")
+    active_keys = [rsa_jwk_from_key(k1, kid="key-1")]
+    fetches = 0
+
+    async def fake_fetch(jwks_url: str):
+        nonlocal fetches
+        fetches += 1
+        await asyncio.sleep(0.02)
+        return list(active_keys)
+
+    monkeypatch.setattr(auth_module, "fetch_keycloak_jwks", fake_fetch)
+
+    tok1 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-1", private_key=k1)
+    await parse_keycloak_user({"access_token": "tok", "id_token": tok1}, {"sub": "s1"})
+    assert fetches == 1
+
+    active_keys[:] = [rsa_jwk_from_key(k2, kid="key-2")]
+    rotated_tokens = [
+        sign_rs256_jwt(make_keycloak_id_claims(email=f"u{i}@mskcc.org", sub=f"s-{i}"), kid="key-2", private_key=k2)
+        for i in range(6)
+    ]
+    users = await asyncio.gather(
+        *(parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": f"s-{i}"}) for i, tok in enumerate(rotated_tokens))
+    )
+    assert len(users) == 6
+    assert fetches == 2
+
+
+@pytest.mark.asyncio
+async def test_logout_concurrent_requests_with_interleaved_login_keep_new_session_valid(
+    auth_settings, monkeypatch
+):
+    """Blocker 2: Two concurrent logouts with the same gen=1 token interleaved with a new login
+    bump session_generation exactly once; the new gen=2 session remains valid."""
+    email = "racelogout@mskcc.org"
+    user_v1 = AuthenticatedUser(
+        email=email,
+        name="Race Logout",
+        domain="mskcc.org",
+        role="curator",
+        status="active",
+        provider="google",
+        session_generation=1,
+    )
+    save_profile_for(user_v1)
+    token_v1 = session_token_for(user_v1)
+
+    real_bump = main_module.bump_session_generation
+    first_entered = asyncio.Event()
+    release_second = asyncio.Event()
+    call_index = 0
+
+    async def coordinated_bump(target_email: str, *, expected_generation=None):
+        nonlocal call_index
+        call_index += 1
+        my_idx = call_index
+        if my_idx == 1:
+            res = await real_bump(target_email, expected_generation=expected_generation)
+            first_entered.set()
+            return res
+        await first_entered.wait()
+        await release_second.wait()
+        return await real_bump(target_email, expected_generation=expected_generation)
+
+    monkeypatch.setattr(main_module, "bump_session_generation", coordinated_bump)
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+            cookies={settings.auth_cookie_name: token_v1},
+        ) as ac1,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+            cookies={settings.auth_cookie_name: token_v1},
+        ) as ac2,
+    ):
+        t1 = asyncio.create_task(ac1.post("/auth/logout"))
+        t2 = asyncio.create_task(ac2.post("/auth/logout"))
+        await first_entered.wait()
+        assert stored_profile(email).session_generation == 2
+
+        # User logs in again between Logout 1 and Logout 2 -> issued new session with gen=2
+        user_v2 = await auth_module.provision_or_update_user(
+            email=email,
+            name="Race Logout",
+            domain="mskcc.org",
+            provider="google",
+        )
+        assert user_v2.session_generation == 2
+        token_v2 = auth_module.create_session_token(
+            AuthenticatedUser(
+                email=user_v2.email,
+                name=user_v2.name,
+                domain=user_v2.domain,
+                role=user_v2.role,
+                status=user_v2.status,
+                provider=user_v2.provider,
+                session_generation=user_v2.session_generation,
+            )
+        )
+
+        # Let Logout 2 finish its conditional bump attempt with expected_generation=1
+        release_second.set()
+        r1, r2 = await asyncio.gather(t1, t2)
+        assert r1.status_code == 303
+        assert r2.status_code == 303
+        assert call_index == 2
+
+        # Generation was bumped strictly once (remains 2), and new login session stays valid
+        assert stored_profile(email).session_generation == 2
+        ac1.cookies.set(settings.auth_cookie_name, token_v2)
+        status_new = await ac1.get("/auth/me")
+        assert status_new.status_code == 200
+        assert status_new.json()["authenticated"] is True
+
+        ac1.cookies.set(settings.auth_cookie_name, token_v1)
+        status_old = await ac1.get("/auth/me")
+        assert status_old.status_code == 200
+        assert status_old.json()["authenticated"] is False
+
+
+@pytest.mark.redis_user_store_only
+@pytest.mark.asyncio
+async def test_logout_redis_watch_multi_race_aborts_on_concurrent_login(
+    auth_settings, _auth_profiles_in_memory, monkeypatch
+):
+    """Blocker 2 (Redis): WATCH/MULTI aborts cleanly when generation advances concurrently."""
+    from tests.test_session_live_status import FakeAuthRedis
+
+    fake_redis = FakeAuthRedis()
+    email = "redisrace@mskcc.org"
+    initial = auth_module.UserProfile(
+        email=email,
+        name="Redis Race",
+        domain="mskcc.org",
+        role="curator",
+        status="active",
+        provider="google",
+        first_login_at="2026-01-01T00:00:00Z",
+        last_login_at="2026-01-01T00:00:00Z",
+        session_generation=1,
+    )
+    await fake_redis.set(f"agcg:user:{email}", initial.model_dump_json())
+
+    class InterleavingRedis(FakeAuthRedis):
+        def __init__(self, backing: FakeAuthRedis):
+            self._backing = backing
+            self._injected = False
+
+        async def get(self, key):
+            return await self._backing.get(key)
+
+        async def set(self, key, value, ex=None):
+            return await self._backing.set(key, value, ex=ex)
+
+        def pipeline(self, transaction=True):
+            real_pipe = self._backing.pipeline(transaction=transaction)
+            outer = self
+
+            class _RacePipe:
+                async def __aenter__(self):
+                    await real_pipe.__aenter__()
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return await real_pipe.__aexit__(exc_type, exc, tb)
+
+                async def watch(self, *keys):
+                    return await real_pipe.watch(*keys)
+
+                async def unwatch(self):
+                    return await real_pipe.unwatch()
+
+                async def get(self, key):
+                    return await real_pipe.get(key)
+
+                def multi(self):
+                    if not outer._injected:
+                        outer._injected = True
+                        # Concurrent login/first logout advances gen 1 -> 2 before EXEC
+                        updated = initial.model_copy(update={"session_generation": 2})
+                        outer._backing.data[f"agcg:user:{email}"] = updated.model_dump_json()
+                        outer._backing._versions[f"agcg:user:{email}"] += 1
+                    return real_pipe.multi()
+
+                def set(self, key, value, ex=None):
+                    return real_pipe.set(key, value, ex=ex)
+
+                async def execute(self):
+                    return await real_pipe.execute()
+
+            return _RacePipe()
+
+    race_redis = InterleavingRedis(fake_redis)
+
+    async def get_race_redis():
+        return race_redis
+
+    monkeypatch.setattr(auth_module, "_profile_store_redis", get_race_redis)
+    monkeypatch.setattr(settings, "user_store_backend", "redis")
+
+    result = await auth_module.bump_session_generation(email, expected_generation=1)
+    assert result is None
+    stored_after = auth_module.UserProfile.model_validate_json(fake_redis.data[f"agcg:user:{email}"])
+    assert stored_after.session_generation == 2
+
+
+def test_oauth_txn_store_uses_real_accessor_with_mysql_and_redis_url(
+    auth_settings, _auth_profiles_in_memory, monkeypatch
+):
+    """Operational check 4: Using the REAL _oauth_txn_redis accessor (no override), when
+    USER_STORE_BACKEND=mysql and REDIS_URL is set, OAuth transactions get a working Redis client
+    and sign-in succeeds end-to-end."""
+    import redis.asyncio as redis_asyncio
+    from src.pipeline.user_store_fake import FakeUserStore
+    from tests.test_session_live_status import FakeAuthRedis
+
+    fake_redis = FakeAuthRedis()
+    from_url_calls = []
+
+    def fake_from_url(url: str, **kwargs):
+        from_url_calls.append((url, kwargs))
+        return fake_redis
+
+    # Restore REAL auth Redis accessors (no override of _oauth_txn_redis)
+    monkeypatch.setattr(auth_module, "_get_auth_redis_client", _auth_profiles_in_memory["_get_auth_redis_client"])
+    monkeypatch.setattr(auth_module, "_profile_store_redis", _auth_profiles_in_memory["_profile_store_redis"])
+    monkeypatch.setattr(auth_module, "_oauth_txn_redis", _auth_profiles_in_memory["_oauth_txn_redis"])
+    monkeypatch.setattr(auth_module, "_redis_client", None)
+
+    monkeypatch.setattr(redis_asyncio, "from_url", fake_from_url)
+    monkeypatch.setattr(settings, "user_store_backend", "mysql")
+    monkeypatch.setattr(settings, "redis_url", "redis://oauth-check-redis:6379/2")
+
+    mysql_fake = FakeUserStore()
+    monkeypatch.setattr(auth_module, "_mysql_user_store", mysql_fake)
+    previous = getattr(app.state, "run_store", None)
+    app.state.run_store = mysql_fake
+    try:
+        client = TestClient(app)
+        login_resp = client.get("/auth/login", follow_redirects=False)
+        assert login_resp.status_code in (302, 303, 307)
+        assert any(k.startswith("agcg:oauth_txn:") for k in fake_redis.data)
+        assert from_url_calls == [("redis://oauth-check-redis:6379/2", {"decode_responses": True})]
+
+        login_query = parse_qs(urlsplit(login_resp.headers["location"]).query)
+        state = login_query["state"][0]
+        nonce = login_query["nonce"][0]
+
+        async def fake_exchange(code, redirect_uri, code_verifier=None):
+            return {"access_token": "tok", "id_token": sign_rs256_jwt({"nonce": nonce})}
+
+        async def fake_userinfo(access_token):
+            return {
+                "email": "oauth.real@mskcc.org",
+                "name": "Real OAuth User",
+                "email_verified": True,
+            }
+
+        monkeypatch.setattr(main_module, "exchange_google_code", fake_exchange)
+        monkeypatch.setattr(main_module, "get_google_user_info", fake_userinfo)
+
+        cb_resp = client.get("/auth/callback/google", params={"code": "c1", "state": state}, follow_redirects=False)
+        assert cb_resp.status_code == 303
+        assert not any(k.startswith("agcg:oauth_txn:") for k in fake_redis.data)
+
+        status_resp = client.get("/auth/me")
+        assert status_resp.status_code == 200
+        assert status_resp.json()["authenticated"] is True
+        assert status_resp.json()["user"]["email"] == "oauth.real@mskcc.org"
+    finally:
+        if previous is None:
+            delattr(app.state, "run_store")
+        else:
+            app.state.run_store = previous

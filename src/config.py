@@ -322,6 +322,7 @@ class Settings(BaseSettings):
     keycloak_redirect_uri: str = ""  # If left empty, computed from request or public_app_base_url
     keycloak_allowed_roles: str = ""  # Optional comma-separated list of required Keycloak roles
     keycloak_admin_roles: str = ""  # Keycloak roles that map to "admin" role
+    keycloak_jwks_refresh_min_interval_seconds: int = Field(default=60, ge=0)
 
     # JIT (Just-In-Time) Provisioning Settings
     jit_provisioning_enabled: bool = True

@@ -87,6 +87,7 @@ class FakeAuthRedis:
         self.sets = {}
         self.hashes = {}
         self.gets = []
+        self._versions = {}
         self.fail = False
 
     def _check(self):
@@ -101,9 +102,12 @@ class FakeAuthRedis:
     async def set(self, key, value, ex=None):
         self._check()
         self.data[key] = value
+        self._versions[key] = self._versions.get(key, 0) + 1
 
     async def getdel(self, key):
         self._check()
+        if key in self.data:
+            self._versions[key] = self._versions.get(key, 0) + 1
         return self.data.pop(key, None)
 
     async def sadd(self, key, *members):
@@ -118,26 +122,76 @@ class FakeAuthRedis:
         self._check()
         return dict(self.hashes.get(key, {}))
 
-    def pipeline(self):
-        return _FakePipeline(self)
+    def pipeline(self, transaction=True):
+        return _FakePipeline(self, transaction=transaction)
 
 
 class _FakePipeline:
-    def __init__(self, redis):
+    def __init__(self, redis, *, transaction=True):
         self.redis = redis
+        self.transaction = transaction
         self.ops = []
+        self._watched = {}
+        self._in_multi = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.unwatch()
+        return False
+
+    async def watch(self, *keys):
+        self.redis._check()
+        self._watched = {k: self.redis._versions.get(k, 0) for k in keys}
+
+    async def unwatch(self):
+        self._watched.clear()
+        self._in_multi = False
+        self.ops.clear()
+
+    async def get(self, key):
+        return await self.redis.get(key)
+
+    def multi(self):
+        self._in_multi = True
+        return self
+
+    def set(self, key, value, ex=None):
+        self.ops.append(("set", key, value, ex))
+        return self
 
     def hincrby(self, key, field, amount):
         self.ops.append(("hincrby", key, field, amount))
+        return self
 
     def hset(self, key, field, value):
         self.ops.append(("hset", key, field, value))
+        return self
 
     async def execute(self):
+        from redis.exceptions import WatchError
+
         self.redis._check()
-        for op, key, field, value in self.ops:
-            fields = self.redis.hashes.setdefault(key, {})
-            fields[field] = str(int(fields.get(field, 0)) + value) if op == "hincrby" else value
+        for key, snap_ver in self._watched.items():
+            if self.redis._versions.get(key, 0) != snap_ver:
+                self.ops.clear()
+                self._watched.clear()
+                self._in_multi = False
+                raise WatchError(f"Watched key {key!r} changed")
+        for op in self.ops:
+            kind = op[0]
+            if kind == "set":
+                _, key, value, _ex = op
+                self.redis.data[key] = value
+                self.redis._versions[key] = self.redis._versions.get(key, 0) + 1
+            else:
+                _, key, field, value = op
+                fields = self.redis.hashes.setdefault(key, {})
+                fields[field] = str(int(fields.get(field, 0)) + value) if kind == "hincrby" else value
+        self.ops.clear()
+        self._watched.clear()
+        self._in_multi = False
 
 
 @pytest.fixture

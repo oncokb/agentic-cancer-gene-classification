@@ -1000,5 +1000,17 @@ async def test_parse_keycloak_user(monkeypatch):
         await parse_keycloak_user({}, {"sub": "sub-x", "name": "No Token", "email_verified": True})
     assert exc_info.value.status_code == 403
 
+    # 4. Validly signed ID token missing email claim raises missing-email error
+    no_email_claims = make_keycloak_id_claims(sub="sub-no-email")
+    no_email_claims.pop("email", None)
+    no_email_tok = sign_rs256_jwt(no_email_claims)
+    with pytest.raises(HTTPException) as exc_info:
+        await parse_keycloak_user(
+            {"access_token": "tok-no-email", "id_token": no_email_tok},
+            {"sub": "sub-no-email", "name": "No Email"},
+        )
+    assert exc_info.value.status_code == 403
+    assert "does not contain a valid email address" in exc_info.value.detail
+
 
 
