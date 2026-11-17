@@ -239,9 +239,17 @@ def _auth_profiles_in_memory(monkeypatch):
     monkeypatch.setattr(auth, "_oauth_txn_redis", _test_oauth_txn_redis)
     monkeypatch.setattr(auth, "_user_store", {})
     monkeypatch.setattr(auth, "_user_activity", {})
-    auth.clear_keycloak_jwks_cache()
+    from src import main as main_module
+
+    def _reset_app_jwks_state() -> None:
+        state = getattr(main_module.app.state, "jwks_state", None)
+        if state is not None:
+            state.clear_keycloak_jwks_cache()
+            delattr(main_module.app.state, "jwks_state")
+
+    _reset_app_jwks_state()
     yield originals
-    auth.clear_keycloak_jwks_cache()
+    _reset_app_jwks_state()
 
 
 @pytest.fixture

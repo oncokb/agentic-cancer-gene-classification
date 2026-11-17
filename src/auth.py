@@ -16,7 +16,6 @@ import logging
 import secrets
 import time
 import uuid
-import weakref
 import xml.etree.ElementTree as ET
 import zlib
 from datetime import datetime, timezone
@@ -2010,15 +2009,39 @@ KEYCLOAK_JWKS_CACHE_TTL_SECONDS = 300
 KEYCLOAK_JWKS_REFRESH_MIN_INTERVAL_SECONDS = 60
 KEYCLOAK_JWKS_FAILURE_BACKOFF_SECONDS = 10
 KEYCLOAK_JWT_LEEWAY_SECONDS = 60
-# Maps jwks_url -> (expires_at, keys, version)
-_KEYCLOAK_JWKS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]], int]] = {}
-# Maps jwks_url -> monotonic timestamp of the last successful refresh after a key miss / bad sig (60s bound).
-_KEYCLOAK_JWKS_LAST_REFRESH: Dict[str, float] = {}
-# Maps jwks_url -> (failed_at_mono, error_detail) for failed JWKS fetches/refreshes (10s short backoff).
-_KEYCLOAK_JWKS_LAST_FAILURE: Dict[str, Tuple[float, str]] = {}
-_KEYCLOAK_JWKS_VERSION: Dict[str, int] = {}
-# Maps jwks_url -> (weakref(loop), lock), bounded by the number of JWKS URLs.
-_KEYCLOAK_JWKS_LOCKS: Dict[str, Tuple["weakref.ref[asyncio.AbstractEventLoop]", asyncio.Lock]] = {}
+
+
+class JwksState:
+    """App-lifespan-scoped Keycloak JWKS cache, refresh throttle, backoff, and single-flight locks."""
+
+    def __init__(self) -> None:
+        # Maps jwks_url -> (expires_at, keys, version)
+        self.cache: Dict[str, Tuple[float, List[Dict[str, Any]], int]] = {}
+        # Maps jwks_url -> monotonic timestamp of last successful failure-triggered refresh (60s bound).
+        self.last_refresh: Dict[str, float] = {}
+        # Maps jwks_url -> (failed_at_mono, error_detail) for failed fetches/refreshes (10s back-off).
+        self.last_failure: Dict[str, Tuple[float, str]] = {}
+        self.version: Dict[str, int] = {}
+        # Lazily created per jwks_url in this app's loop; cleared and dropped on app shutdown.
+        self.locks: Dict[str, asyncio.Lock] = {}
+
+    def get_lock(self, jwks_url: str) -> asyncio.Lock:
+        lock = self.locks.get(jwks_url)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.locks[jwks_url] = lock
+        return lock
+
+    def clear_keycloak_jwks_cache(self) -> None:
+        """Clears cached Keycloak realm JWKS keys, refresh throttle, failure back-off, and locks."""
+        self.cache.clear()
+        self.last_refresh.clear()
+        self.last_failure.clear()
+        self.version.clear()
+        self.locks.clear()
+
+    clear = clear_keycloak_jwks_cache
+
 
 _RSA_PKCS1_ALGS = {
     "RS256": hashes.SHA256,
@@ -2037,25 +2060,9 @@ _EC_ALGS = {
 }
 
 
-def clear_keycloak_jwks_cache() -> None:
-    """Clears cached Keycloak realm JWKS keys, refresh throttle, and failure backoff state."""
-    _KEYCLOAK_JWKS_CACHE.clear()
-    _KEYCLOAK_JWKS_LAST_REFRESH.clear()
-    _KEYCLOAK_JWKS_LAST_FAILURE.clear()
-    _KEYCLOAK_JWKS_VERSION.clear()
-    _KEYCLOAK_JWKS_LOCKS.clear()
-
-
-def _get_jwks_lock(jwks_url: str) -> asyncio.Lock:
-    loop = asyncio.get_running_loop()
-    entry = _KEYCLOAK_JWKS_LOCKS.get(jwks_url)
-    if entry is not None:
-        loop_ref, lock = entry
-        if loop_ref() is loop:
-            return lock
-    lock = asyncio.Lock()
-    _KEYCLOAK_JWKS_LOCKS[jwks_url] = (weakref.ref(loop), lock)
-    return lock
+def clear_keycloak_jwks_cache(jwks_state: JwksState) -> None:
+    """Clears cached Keycloak realm JWKS keys and throttle state on a JwksState."""
+    jwks_state.clear_keycloak_jwks_cache()
 
 
 def _jwks_monotonic() -> float:
@@ -2130,25 +2137,29 @@ async def fetch_keycloak_jwks(jwks_url: str) -> List[Dict[str, Any]]:
     return keys
 
 
-async def _fetch_and_store_jwks(jwks_url: str) -> Tuple[List[Dict[str, Any]], int]:
+async def _fetch_and_store_jwks(
+    jwks_url: str,
+    *,
+    jwks_state: JwksState,
+) -> Tuple[List[Dict[str, Any]], int]:
     """Fetches JWKS, updating the cache on success or recording failure backoff on error.
 
-    Caller must hold _get_jwks_lock(jwks_url). Keeps any existing cache entry intact on failure.
+    Caller must hold ``jwks_state.get_lock(jwks_url)``. Keeps any existing cache entry intact on failure.
     """
     try:
         keys = await fetch_keycloak_jwks(jwks_url)
     except Exception as exc:
         detail = _format_jwks_unavailable_detail(exc)
-        _KEYCLOAK_JWKS_LAST_FAILURE[jwks_url] = (_jwks_monotonic(), detail)
+        jwks_state.last_failure[jwks_url] = (_jwks_monotonic(), detail)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=detail,
         ) from exc
 
-    _KEYCLOAK_JWKS_LAST_FAILURE.pop(jwks_url, None)
-    new_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0) + 1
-    _KEYCLOAK_JWKS_VERSION[jwks_url] = new_version
-    _KEYCLOAK_JWKS_CACHE[jwks_url] = (
+    jwks_state.last_failure.pop(jwks_url, None)
+    new_version = jwks_state.version.get(jwks_url, 0) + 1
+    jwks_state.version[jwks_url] = new_version
+    jwks_state.cache[jwks_url] = (
         _jwks_monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS,
         keys,
         new_version,
@@ -2159,10 +2170,11 @@ async def _fetch_and_store_jwks(jwks_url: str) -> Tuple[List[Dict[str, Any]], in
 def _maybe_raise_recent_jwks_failure(
     jwks_url: str,
     *,
+    jwks_state: JwksState,
     now_mono: float,
     wait_started_mono: float,
 ) -> None:
-    last_failure = _KEYCLOAK_JWKS_LAST_FAILURE.get(jwks_url)
+    last_failure = jwks_state.last_failure.get(jwks_url)
     if last_failure is None:
         return
     failed_at, error_detail = last_failure
@@ -2176,20 +2188,21 @@ def _maybe_raise_recent_jwks_failure(
 async def _get_keycloak_jwks(
     jwks_url: str,
     *,
+    jwks_state: JwksState,
     force_refresh: bool = False,
 ) -> Tuple[List[Dict[str, Any]], int, bool]:
     now_mono = _jwks_monotonic()
     if not force_refresh:
-        cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
+        cached = jwks_state.cache.get(jwks_url)
         if cached is not None and now_mono < cached[0]:
             return cached[1], cached[2], True
 
-    observed_version = _KEYCLOAK_JWKS_VERSION.get(jwks_url, 0)
+    observed_version = jwks_state.version.get(jwks_url, 0)
     wait_started_mono = now_mono
-    lock = _get_jwks_lock(jwks_url)
+    lock = jwks_state.get_lock(jwks_url)
     async with lock:
         now_mono = _jwks_monotonic()
-        cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
+        cached = jwks_state.cache.get(jwks_url)
         if not force_refresh and cached is not None and now_mono < cached[0]:
             # If another waiter fetched new keys while we waited on the lock, treat them as
             # fresh for this caller so concurrent failures don't immediately re-fetch.
@@ -2199,45 +2212,48 @@ async def _get_keycloak_jwks(
         # instead of letting queued waiters stampede the failing JWKS endpoint.
         _maybe_raise_recent_jwks_failure(
             jwks_url,
+            jwks_state=jwks_state,
             now_mono=now_mono,
             wait_started_mono=wait_started_mono,
         )
-        keys, new_version = await _fetch_and_store_jwks(jwks_url)
+        keys, new_version = await _fetch_and_store_jwks(jwks_url, jwks_state=jwks_state)
         return keys, new_version, False
 
 
 async def _refresh_keycloak_jwks_on_failure(
     jwks_url: str,
     *,
+    jwks_state: JwksState,
     failed_version: int,
 ) -> Optional[List[Dict[str, Any]]]:
     """Coalesces concurrent JWKS refreshes and bounds them per realm.
 
     Uses two distinct intervals:
-    - Successful refreshes update ``_KEYCLOAK_JWKS_LAST_REFRESH`` and are bounded by the
+    - Successful refreshes update ``jwks_state.last_refresh`` and are bounded by the
       full minimum interval (default 60s), avoiding repeated fetches on attacker bad-kid floods.
-    - Failed refreshes update ``_KEYCLOAK_JWKS_LAST_FAILURE`` (leaving ``_KEYCLOAK_JWKS_LAST_REFRESH``
+    - Failed refreshes update ``jwks_state.last_failure`` (leaving ``jwks_state.last_refresh``
       untouched and keeping any valid cached JWKS usable) and are bounded only by the short failure
       back-off (default 10s), so a recovered Keycloak is retried promptly for newly rotated keys.
     """
     wait_started_mono = _jwks_monotonic()
-    lock = _get_jwks_lock(jwks_url)
+    lock = jwks_state.get_lock(jwks_url)
     async with lock:
-        cached = _KEYCLOAK_JWKS_CACHE.get(jwks_url)
+        cached = jwks_state.cache.get(jwks_url)
         if cached is not None and cached[2] != failed_version:
             # Another concurrent request already refreshed this realm's JWKS while we waited.
             return cached[1]
         now_mono = _jwks_monotonic()
-        last_refresh = _KEYCLOAK_JWKS_LAST_REFRESH.get(jwks_url)
+        last_refresh = jwks_state.last_refresh.get(jwks_url)
         if last_refresh is not None and (now_mono - last_refresh) < _jwks_refresh_min_interval_seconds():
             return None
         _maybe_raise_recent_jwks_failure(
             jwks_url,
+            jwks_state=jwks_state,
             now_mono=now_mono,
             wait_started_mono=wait_started_mono,
         )
-        keys, _new_version = await _fetch_and_store_jwks(jwks_url)
-        _KEYCLOAK_JWKS_LAST_REFRESH[jwks_url] = _jwks_monotonic()
+        keys, _new_version = await _fetch_and_store_jwks(jwks_url, jwks_state=jwks_state)
+        jwks_state.last_refresh[jwks_url] = _jwks_monotonic()
         return keys
 
 
@@ -2302,7 +2318,11 @@ def _verify_jws_signature_with_jwk(
     return False
 
 
-async def _verify_keycloak_jwt_signature(token: str) -> Dict[str, Any]:
+async def _verify_keycloak_jwt_signature(
+    token: str,
+    *,
+    jwks_state: JwksState,
+) -> Dict[str, Any]:
     if not isinstance(token, str) or not token.strip():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -2351,16 +2371,21 @@ async def _verify_keycloak_jwt_signature(token: str) -> Dict[str, Any]:
         candidates = [k for k in keys if k.get("kid") == kid] if kid is not None else keys
         return any(_verify_jws_signature_with_jwk(signing_input, sig_bytes, alg, k) for k in candidates)
 
-    keys, jwks_version, from_cache = await _get_keycloak_jwks(jwks_url, force_refresh=False)
+    keys, jwks_version, from_cache = await _get_keycloak_jwks(
+        jwks_url,
+        jwks_state=jwks_state,
+        force_refresh=False,
+    )
     verified = _try_keys(keys)
     if not verified:
         if not from_cache:
             # Freshly fetched (or coalesced onto a fresh fetch) and verification still failed;
             # record the failure refresh timestamp so subsequent failures are throttled.
-            _KEYCLOAK_JWKS_LAST_REFRESH[jwks_url] = _jwks_monotonic()
+            jwks_state.last_refresh[jwks_url] = _jwks_monotonic()
         else:
             refreshed_keys = await _refresh_keycloak_jwks_on_failure(
                 jwks_url,
+                jwks_state=jwks_state,
                 failed_version=jwks_version,
             )
             if refreshed_keys is not None:
@@ -2410,6 +2435,7 @@ def _validate_keycloak_timestamps(claims: Dict[str, Any]) -> None:
 async def verify_keycloak_id_token(
     id_token: Any,
     *,
+    jwks_state: JwksState,
     expected_nonce: Optional[str] = None,
     require_nonce: bool = True,
 ) -> Dict[str, Any]:
@@ -2420,7 +2446,7 @@ async def verify_keycloak_id_token(
             detail="Missing Keycloak ID token.",
         )
 
-    id_claims = await _verify_keycloak_jwt_signature(id_token)
+    id_claims = await _verify_keycloak_jwt_signature(id_token, jwks_state=jwks_state)
 
     expected_iss = get_keycloak_realm_base_url().rstrip("/")
     token_iss = id_claims.get("iss")
@@ -2542,6 +2568,7 @@ async def parse_keycloak_user(
     token_data: Dict[str, Any],
     userinfo: Optional[Dict[str, Any]] = None,
     *,
+    jwks_state: JwksState,
     expected_nonce: Optional[str] = None,
     require_nonce: bool = False,
     verified_id_claims: Optional[Dict[str, Any]] = None,
@@ -2552,6 +2579,7 @@ async def parse_keycloak_user(
         if verified_id_claims is not None
         else await verify_keycloak_id_token(
             token_data.get("id_token"),
+            jwks_state=jwks_state,
             expected_nonce=expected_nonce,
             require_nonce=require_nonce,
         )
@@ -2614,7 +2642,7 @@ async def parse_keycloak_user(
 
     access_token = token_data.get("access_token")
     if isinstance(access_token, str) and access_token.count(".") == 2:
-        at_claims = await _verify_keycloak_jwt_signature(access_token)
+        at_claims = await _verify_keycloak_jwt_signature(access_token, jwks_state=jwks_state)
         expected_iss = get_keycloak_realm_base_url().rstrip("/")
         at_iss = at_claims.get("iss")
         if not isinstance(at_iss, str) or at_iss.rstrip("/") != expected_iss:

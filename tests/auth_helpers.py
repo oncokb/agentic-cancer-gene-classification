@@ -163,7 +163,11 @@ def install_test_keycloak_jwks(
     keys: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
     """Patches auth.fetch_keycloak_jwks to return test JWKS keys and records fetched URLs."""
-    auth.clear_keycloak_jwks_cache()
+    from src import main as main_module
+
+    app_jwks_state = getattr(main_module.app.state, "jwks_state", None)
+    if app_jwks_state is not None:
+        app_jwks_state.clear_keycloak_jwks_cache()
     jwk_list = keys if keys is not None else [rsa_jwk_from_key(get_test_rsa_key("primary"), kid="test-key-1")]
     fetches: List[str] = []
 

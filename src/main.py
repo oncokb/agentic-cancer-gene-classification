@@ -44,6 +44,7 @@ from src.auth import (
     AuthenticatedUser,
     AuthMeResponse,
     AuthUserResponse,
+    JwksState,
     OAuthTransactionUnavailable,
     UserProfile,
     UserStoreUnavailable,
@@ -228,6 +229,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Datadog metrics initialization failed; continuing without metrics", exc_info=True)
     app.state.run_store = await RunStore.create()
+    app.state.jwks_state = JwksState()
     if mysql_user_store_enabled():
         # Sign-in and per-request permission checks read the users table;
         # Redis user records are left untouched (rollback = USER_STORE_BACKEND=redis).
@@ -242,7 +244,14 @@ async def lifespan(app: FastAPI):
         len(settings.google_client_secret.strip()),
         bool(settings.auth_secret_key.strip()),
     )
-    yield
+    try:
+        yield
+    finally:
+        jwks_state = getattr(app.state, "jwks_state", None)
+        if isinstance(jwks_state, JwksState):
+            jwks_state.clear_keycloak_jwks_cache()
+        if hasattr(app.state, "jwks_state"):
+            delattr(app.state, "jwks_state")
     await _cancel_openevidence_sidecar_lookups()
     configure_mysql_user_store(None)
     await app.state.run_store.close()
@@ -2070,8 +2079,14 @@ async def auth_callback_keycloak(
             detail="Keycloak did not return an access token.",
         )
 
+    jwks_state = getattr(request.app.state, "jwks_state", None)
+    if jwks_state is None:
+        jwks_state = JwksState()
+        request.app.state.jwks_state = jwks_state
+
     verified_id_claims = await verify_keycloak_id_token(
         token_data.get("id_token"),
+        jwks_state=jwks_state,
         expected_nonce=expected_nonce,
         require_nonce=True,
     )
@@ -2080,6 +2095,7 @@ async def auth_callback_keycloak(
     parsed = parse_keycloak_user(
         token_data,
         userinfo,
+        jwks_state=jwks_state,
         expected_nonce=expected_nonce,
         require_nonce=True,
         verified_id_claims=verified_id_claims,

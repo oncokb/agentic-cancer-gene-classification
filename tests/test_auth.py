@@ -973,6 +973,9 @@ async def test_parse_keycloak_user(monkeypatch):
     monkeypatch.setattr(settings, "keycloak_admin_roles", "acgc-admin,super-admin")
     install_test_keycloak_jwks(monkeypatch)
     from fastapi import HTTPException
+    from src.auth import JwksState
+
+    jwks_state = JwksState()
 
     # 1. Verified ID token + sub-matched userinfo profile
     id_tok1 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="sub-1"))
@@ -983,7 +986,7 @@ async def test_parse_keycloak_user(monkeypatch):
         "family_name": "User",
         "roles": ["acgc-admin"],
     }
-    user = await parse_keycloak_user(token_data, userinfo)
+    user = await parse_keycloak_user(token_data, userinfo, jwks_state=jwks_state)
     assert user.email == "curator@mskcc.org"
     assert user.name == "Curator User"
     assert user.role == "admin"
@@ -991,13 +994,21 @@ async def test_parse_keycloak_user(monkeypatch):
 
     # 2. Email comes strictly from verified ID token even when userinfo omits email
     id_tok2 = sign_rs256_jwt(make_keycloak_id_claims(email="jwt.user@mskcc.org", sub="sub-2"))
-    user2 = await parse_keycloak_user({"access_token": "token2", "id_token": id_tok2}, {"sub": "sub-2", "name": "JWT User"})
+    user2 = await parse_keycloak_user(
+        {"access_token": "token2", "id_token": id_tok2},
+        {"sub": "sub-2", "name": "JWT User"},
+        jwks_state=jwks_state,
+    )
     assert user2.email == "jwt.user@mskcc.org"
     assert user2.name == "JWT User"
 
     # 3. Missing ID token raises HTTPException 403
     with pytest.raises(HTTPException) as exc_info:
-        await parse_keycloak_user({}, {"sub": "sub-x", "name": "No Token", "email_verified": True})
+        await parse_keycloak_user(
+            {},
+            {"sub": "sub-x", "name": "No Token", "email_verified": True},
+            jwks_state=jwks_state,
+        )
     assert exc_info.value.status_code == 403
 
     # 4. Validly signed ID token missing email claim raises missing-email error
@@ -1008,6 +1019,7 @@ async def test_parse_keycloak_user(monkeypatch):
         await parse_keycloak_user(
             {"access_token": "tok-no-email", "id_token": no_email_tok},
             {"sub": "sub-no-email", "name": "No Email"},
+            jwks_state=jwks_state,
         )
     assert exc_info.value.status_code == 403
     assert "does not contain a valid email address" in exc_info.value.detail

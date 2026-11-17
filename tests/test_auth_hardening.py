@@ -28,7 +28,7 @@ from src import main as main_module
 from src.auth import (
     OAUTH_TXN_COOKIE_NAME,
     AuthenticatedUser,
-    clear_keycloak_jwks_cache,
+    JwksState,
     create_oauth_state,
     create_oauth_transaction,
     is_cookie_secure,
@@ -217,7 +217,11 @@ async def test_keycloak_parse_user_unverified_email_rejected(auth_settings, monk
     userinfo = {"sub": "sub-1", "email": "kcuser@mskcc.org", "email_verified": True}
 
     with pytest.raises(HTTPException) as exc_info:
-        await parse_keycloak_user({"access_token": "tok", "id_token": id_token}, userinfo)
+        await parse_keycloak_user(
+            {"access_token": "tok", "id_token": id_token},
+            userinfo,
+            jwks_state=JwksState(),
+        )
     assert exc_info.value.status_code == 403
     assert "unverified" in exc_info.value.detail.lower()
 
@@ -225,6 +229,7 @@ async def test_keycloak_parse_user_unverified_email_rejected(auth_settings, monk
 @pytest.mark.asyncio
 async def test_keycloak_id_token_issuer_validation(auth_settings, monkeypatch):
     install_test_keycloak_jwks(monkeypatch)
+    jwks_state = JwksState()
     userinfo = {"sub": "sub-1"}
 
     # Wrong issuer (even with valid JWKS signature)
@@ -236,7 +241,11 @@ async def test_keycloak_id_token_issuer_validation(auth_settings, monkeypatch):
         )
     )
     with pytest.raises(HTTPException) as exc_info:
-        await parse_keycloak_user({"access_token": "tok", "id_token": bad_iss_jwt}, userinfo)
+        await parse_keycloak_user(
+            {"access_token": "tok", "id_token": bad_iss_jwt},
+            userinfo,
+            jwks_state=jwks_state,
+        )
     assert exc_info.value.status_code == 403
     assert "issuer mismatch" in exc_info.value.detail
 
@@ -244,6 +253,7 @@ async def test_keycloak_id_token_issuer_validation(auth_settings, monkeypatch):
 @pytest.mark.asyncio
 async def test_keycloak_id_token_audience_validation(auth_settings, monkeypatch):
     install_test_keycloak_jwks(monkeypatch)
+    jwks_state = JwksState()
     userinfo = {"sub": "sub-1"}
 
     # Wrong audience even with matching azp -> 403
@@ -256,7 +266,11 @@ async def test_keycloak_id_token_audience_validation(auth_settings, monkeypatch)
         )
     )
     with pytest.raises(HTTPException) as exc_info:
-        await parse_keycloak_user({"access_token": "tok", "id_token": bad_aud_jwt}, userinfo)
+        await parse_keycloak_user(
+            {"access_token": "tok", "id_token": bad_aud_jwt},
+            userinfo,
+            jwks_state=jwks_state,
+        )
     assert exc_info.value.status_code == 403
     assert "audience mismatch" in exc_info.value.detail
 
@@ -268,7 +282,11 @@ async def test_keycloak_id_token_audience_validation(auth_settings, monkeypatch)
             aud="acgc-client",
         )
     )
-    user = await parse_keycloak_user({"access_token": "tok", "id_token": valid_jwt}, userinfo)
+    user = await parse_keycloak_user(
+        {"access_token": "tok", "id_token": valid_jwt},
+        userinfo,
+        jwks_state=jwks_state,
+    )
     assert user.email == "kcuser@mskcc.org"
 
 
@@ -748,7 +766,7 @@ def test_oauth_callback_replay_from_second_client_with_copied_cookie_refused(aut
 @pytest.mark.asyncio
 async def test_keycloak_jwks_caching_and_key_rotation(auth_settings, monkeypatch):
     """Blocker 3: Keycloak JWKS keys are cached and rotated keys trigger refresh."""
-    clear_keycloak_jwks_cache()
+    jwks_state = JwksState()
     k1 = get_test_rsa_key("primary")
     k2 = get_test_rsa_key("rotated")
     active_jwks = {"keys": [rsa_jwk_from_key(k1, kid="key-1")]}
@@ -766,20 +784,20 @@ async def test_keycloak_jwks_caching_and_key_rotation(auth_settings, monkeypatch
     )
 
     tok1 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-1", private_key=k1)
-    user1 = await parse_keycloak_user({"access_token": "tok", "id_token": tok1}, {"sub": "s1"})
+    user1 = await parse_keycloak_user({"access_token": "tok", "id_token": tok1}, {"sub": "s1"}, jwks_state=jwks_state)
     assert user1.email == "curator@mskcc.org"
     assert len(http_calls) == 1
 
     # Second verification uses cached JWKS without another HTTP request
     tok1b = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-1", private_key=k1)
-    user1b = await parse_keycloak_user({"access_token": "tok", "id_token": tok1b}, {"sub": "s1"})
+    user1b = await parse_keycloak_user({"access_token": "tok", "id_token": tok1b}, {"sub": "s1"}, jwks_state=jwks_state)
     assert user1b.email == "curator@mskcc.org"
     assert len(http_calls) == 1
 
     # Rotate keys at Keycloak JWKS endpoint to key-2
     active_jwks["keys"] = [rsa_jwk_from_key(k2, kid="key-2")]
     tok2 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-2", private_key=k2)
-    user2 = await parse_keycloak_user({"access_token": "tok", "id_token": tok2}, {"sub": "s1"})
+    user2 = await parse_keycloak_user({"access_token": "tok", "id_token": tok2}, {"sub": "s1"}, jwks_state=jwks_state)
     assert user2.email == "curator@mskcc.org"
     assert len(http_calls) == 2
 
@@ -788,6 +806,7 @@ async def test_keycloak_jwks_caching_and_key_rotation(auth_settings, monkeypatch
 async def test_keycloak_rejects_unsigned_and_wrongly_signed_tokens(auth_settings, monkeypatch):
     """Blocker 3: Unsigned (alg=none), malformed, HS256, or wrongly signed ID tokens -> 403."""
     install_test_keycloak_jwks(monkeypatch)
+    jwks_state = JwksState()
     claims = make_keycloak_id_claims(email="curator@mskcc.org", sub="s1")
 
     # 1. alg: none token
@@ -808,7 +827,7 @@ async def test_keycloak_rejects_unsigned_and_wrongly_signed_tokens(auth_settings
 
     for bad_tok in (alg_none_tok, wrong_key_tok, unknown_kid_tok, hs256_tok, "not-a-jwt", "a.b"):
         with pytest.raises(HTTPException) as exc_info:
-            await parse_keycloak_user({"access_token": "tok", "id_token": bad_tok}, {"sub": "s1"})
+            await parse_keycloak_user({"access_token": "tok", "id_token": bad_tok}, {"sub": "s1"}, jwks_state=jwks_state)
         assert exc_info.value.status_code == 403
 
 
@@ -816,6 +835,7 @@ async def test_keycloak_rejects_unsigned_and_wrongly_signed_tokens(auth_settings
 async def test_keycloak_rejects_missing_or_invalid_claims(auth_settings, monkeypatch):
     """Blocker 3: Missing iss/aud, wrong aud with matching azp, wrong azp, expired/future exp/iat -> 403."""
     install_test_keycloak_jwks(monkeypatch)
+    jwks_state = JwksState()
     now = int(time.time())
 
     bad_claim_sets = [
@@ -844,7 +864,11 @@ async def test_keycloak_rejects_missing_or_invalid_claims(auth_settings, monkeyp
     for bad_claims in bad_claim_sets:
         tok = sign_rs256_jwt(bad_claims)
         with pytest.raises(HTTPException) as exc_info:
-            await parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": "kc-sub-123"})
+            await parse_keycloak_user(
+                {"access_token": "tok", "id_token": tok},
+                {"sub": "kc-sub-123"},
+                jwks_state=jwks_state,
+            )
         assert exc_info.value.status_code == 403, f"Expected 403 for claims {bad_claims}"
 
 
@@ -853,6 +877,7 @@ async def test_keycloak_userinfo_sub_mismatch_and_no_claim_mixing(auth_settings,
     """Blocker 3: userinfo.sub != id_token.sub, missing userinfo.sub, and email_verified
     only in the other source -> all 403; email & email_verified come only from ID token."""
     install_test_keycloak_jwks(monkeypatch)
+    jwks_state = JwksState()
 
     valid_id_tok = sign_rs256_jwt(
         make_keycloak_id_claims(email="curator@mskcc.org", sub="sub-id-1", email_verified=True)
@@ -860,12 +885,20 @@ async def test_keycloak_userinfo_sub_mismatch_and_no_claim_mixing(auth_settings,
 
     # 1. userinfo sub mismatch -> 403
     with pytest.raises(HTTPException) as exc1:
-        await parse_keycloak_user({"id_token": valid_id_tok}, {"sub": "sub-other", "email_verified": True})
+        await parse_keycloak_user(
+            {"id_token": valid_id_tok},
+            {"sub": "sub-other", "email_verified": True},
+            jwks_state=jwks_state,
+        )
     assert exc1.value.status_code == 403
 
     # 2. userinfo missing sub -> 403
     with pytest.raises(HTTPException) as exc2:
-        await parse_keycloak_user({"id_token": valid_id_tok}, {"email": "curator@mskcc.org", "email_verified": True})
+        await parse_keycloak_user(
+            {"id_token": valid_id_tok},
+            {"email": "curator@mskcc.org", "email_verified": True},
+            jwks_state=jwks_state,
+        )
     assert exc2.value.status_code == 403
 
     # 3. email_verified=True ONLY in userinfo (missing in id_token) -> 403
@@ -873,12 +906,20 @@ async def test_keycloak_userinfo_sub_mismatch_and_no_claim_mixing(auth_settings,
     no_verified_claims.pop("email_verified")
     tok_no_verified = sign_rs256_jwt(no_verified_claims)
     with pytest.raises(HTTPException) as exc3:
-        await parse_keycloak_user({"id_token": tok_no_verified}, {"sub": "sub-id-1", "email_verified": True})
+        await parse_keycloak_user(
+            {"id_token": tok_no_verified},
+            {"sub": "sub-id-1", "email_verified": True},
+            jwks_state=jwks_state,
+        )
     assert exc3.value.status_code == 403
 
     # 4. email_verified=True in id_token, but False in userinfo -> 403
     with pytest.raises(HTTPException) as exc4:
-        await parse_keycloak_user({"id_token": valid_id_tok}, {"sub": "sub-id-1", "email_verified": False})
+        await parse_keycloak_user(
+            {"id_token": valid_id_tok},
+            {"sub": "sub-id-1", "email_verified": False},
+            jwks_state=jwks_state,
+        )
     assert exc4.value.status_code == 403
 
     # 5. email ONLY in userinfo (missing in id_token) -> 403 (never mix email from userinfo)
@@ -889,6 +930,7 @@ async def test_keycloak_userinfo_sub_mismatch_and_no_claim_mixing(auth_settings,
         await parse_keycloak_user(
             {"id_token": tok_no_email},
             {"sub": "sub-id-1", "email": "curator@mskcc.org", "email_verified": True},
+            jwks_state=jwks_state,
         )
     assert exc5.value.status_code == 403
 
@@ -1109,7 +1151,7 @@ def test_logout_repeat_with_already_revoked_token_is_noop(auth_settings):
 @pytest.mark.asyncio
 async def test_keycloak_jwks_coalesces_concurrent_unknown_kid_requests(auth_settings, monkeypatch):
     """Blocker 1: N concurrent unknown-kid tokens trigger exactly 1 JWKS fetch (cold & warm)."""
-    clear_keycloak_jwks_cache()
+    jwks_state = JwksState()
     k1 = get_test_rsa_key("primary")
     jwks_doc = {"keys": [rsa_jwk_from_key(k1, kid="key-1")]}
     fetch_count = 0
@@ -1135,7 +1177,11 @@ async def test_keycloak_jwks_coalesces_concurrent_unknown_kid_requests(auth_sett
 
     async def _attempt(tok: str):
         with pytest.raises(HTTPException) as exc:
-            await parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": "s-0"})
+            await parse_keycloak_user(
+                {"access_token": "tok", "id_token": tok},
+                {"sub": "s-0"},
+                jwks_state=jwks_state,
+            )
         return exc.value.status_code
 
     statuses = await asyncio.gather(*(_attempt(tok) for tok in bad_tokens))
@@ -1143,14 +1189,18 @@ async def test_keycloak_jwks_coalesces_concurrent_unknown_kid_requests(auth_sett
     assert fetch_count == 1
 
     # Part B: Warm cache (valid login, no prior failure refresh) + 8 concurrent unknown-kid -> 1 refresh
-    clear_keycloak_jwks_cache()
+    jwks_state.clear_keycloak_jwks_cache()
     fetch_count = 0
     valid_tok = sign_rs256_jwt(
         make_keycloak_id_claims(email="curator@mskcc.org", sub="s-valid"),
         kid="key-1",
         private_key=k1,
     )
-    valid_user = await parse_keycloak_user({"access_token": "tok", "id_token": valid_tok}, {"sub": "s-valid"})
+    valid_user = await parse_keycloak_user(
+        {"access_token": "tok", "id_token": valid_tok},
+        {"sub": "s-valid"},
+        jwks_state=jwks_state,
+    )
     assert valid_user.email == "curator@mskcc.org"
     assert fetch_count == 1
 
@@ -1162,7 +1212,7 @@ async def test_keycloak_jwks_coalesces_concurrent_unknown_kid_requests(auth_sett
 @pytest.mark.asyncio
 async def test_keycloak_jwks_rate_limits_failures_and_allows_after_interval(auth_settings, monkeypatch):
     """Blocker 1: Repeated failures within min interval trigger 0 extra fetches; after interval, 1 more."""
-    clear_keycloak_jwks_cache()
+    jwks_state = JwksState()
     clock = [1000.0]
     monkeypatch.setattr(auth_module, "_jwks_monotonic", lambda: clock[0])
     monkeypatch.setattr(settings, "keycloak_jwks_refresh_min_interval_seconds", 60)
@@ -1181,14 +1231,14 @@ async def test_keycloak_jwks_rate_limits_failures_and_allows_after_interval(auth
 
     # Warm cache with valid key-1
     tok1 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-1", private_key=k1)
-    await parse_keycloak_user({"access_token": "tok", "id_token": tok1}, {"sub": "s1"})
+    await parse_keycloak_user({"access_token": "tok", "id_token": tok1}, {"sub": "s1"}, jwks_state=jwks_state)
     assert fetches == 1
 
     # Unknown kid triggers 1 forced refresh at t=1001
     clock[0] = 1001.0
     bad_kid = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="missing-kid", private_key=k1)
     with pytest.raises(HTTPException) as exc1:
-        await parse_keycloak_user({"access_token": "tok", "id_token": bad_kid}, {"sub": "s1"})
+        await parse_keycloak_user({"access_token": "tok", "id_token": bad_kid}, {"sub": "s1"}, jwks_state=jwks_state)
     assert exc1.value.status_code == 403
     assert fetches == 2
 
@@ -1199,7 +1249,7 @@ async def test_keycloak_jwks_rate_limits_failures_and_allows_after_interval(auth
         clock[0] = 1001.0 + dt
         for tok in (bad_kid, bad_sig_tok):
             with pytest.raises(HTTPException) as exc_rep:
-                await parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": "s1"})
+                await parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": "s1"}, jwks_state=jwks_state)
             assert exc_rep.value.status_code == 403
     assert fetches == 2
 
@@ -1207,7 +1257,7 @@ async def test_keycloak_jwks_rate_limits_failures_and_allows_after_interval(auth
     active_keys[:] = [rsa_jwk_from_key(k2, kid="key-2")]
     clock[0] = 1061.0
     tok2 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-2", private_key=k2)
-    user2 = await parse_keycloak_user({"access_token": "tok", "id_token": tok2}, {"sub": "s1"})
+    user2 = await parse_keycloak_user({"access_token": "tok", "id_token": tok2}, {"sub": "s1"}, jwks_state=jwks_state)
     assert user2.email == "curator@mskcc.org"
     assert fetches == 3
 
@@ -1215,7 +1265,7 @@ async def test_keycloak_jwks_rate_limits_failures_and_allows_after_interval(auth
 @pytest.mark.asyncio
 async def test_keycloak_jwks_coalesces_concurrent_key_rotation(auth_settings, monkeypatch):
     """Blocker 1: N concurrent tokens for a rotated key coalesce onto 1 refresh and all succeed."""
-    clear_keycloak_jwks_cache()
+    jwks_state = JwksState()
     k1 = get_test_rsa_key("primary")
     k2 = get_test_rsa_key("rotated")
     active_keys = [rsa_jwk_from_key(k1, kid="key-1")]
@@ -1230,7 +1280,7 @@ async def test_keycloak_jwks_coalesces_concurrent_key_rotation(auth_settings, mo
     monkeypatch.setattr(auth_module, "fetch_keycloak_jwks", fake_fetch)
 
     tok1 = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="key-1", private_key=k1)
-    await parse_keycloak_user({"access_token": "tok", "id_token": tok1}, {"sub": "s1"})
+    await parse_keycloak_user({"access_token": "tok", "id_token": tok1}, {"sub": "s1"}, jwks_state=jwks_state)
     assert fetches == 1
 
     active_keys[:] = [rsa_jwk_from_key(k2, kid="key-2")]
@@ -1239,7 +1289,10 @@ async def test_keycloak_jwks_coalesces_concurrent_key_rotation(auth_settings, mo
         for i in range(6)
     ]
     users = await asyncio.gather(
-        *(parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": f"s-{i}"}) for i, tok in enumerate(rotated_tokens))
+        *(
+            parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": f"s-{i}"}, jwks_state=jwks_state)
+            for i, tok in enumerate(rotated_tokens)
+        )
     )
     assert len(users) == 6
     assert fetches == 2
@@ -1502,7 +1555,7 @@ async def test_keycloak_jwks_failed_cold_fetch_coalesces_backs_off_and_recovers(
 ):
     """Blocker 1: N concurrent logins with cold/expired cache + failing JWKS -> 1 fetch, all 503;
     subsequent login within failure backoff -> 0 fetches, 503; after backoff -> 1 fetch."""
-    clear_keycloak_jwks_cache()
+    jwks_state = JwksState()
     clock = [1000.0]
     monkeypatch.setattr(auth_module, "_jwks_monotonic", lambda: clock[0])
     monkeypatch.setattr(settings, "keycloak_jwks_failure_backoff_seconds", 10)
@@ -1531,7 +1584,11 @@ async def test_keycloak_jwks_failed_cold_fetch_coalesces_backs_off_and_recovers(
 
     async def _attempt(tok: str, sub: str):
         with pytest.raises(HTTPException) as exc:
-            await parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": sub})
+            await parse_keycloak_user(
+                {"access_token": "tok", "id_token": tok},
+                {"sub": sub},
+                jwks_state=jwks_state,
+            )
         return exc.value.status_code, str(exc.value.detail).lower()
 
     # 1. Cold cache + 6 concurrent logins while JWKS fails -> 1 fetch total, all get 503
@@ -1554,7 +1611,11 @@ async def test_keycloak_jwks_failed_cold_fetch_coalesces_backs_off_and_recovers(
     # 4. Past next 10s backoff, JWKS recovers -> 1 fetch, login succeeds
     should_fail = False
     clock[0] = 1022.0
-    user = await parse_keycloak_user({"access_token": "tok", "id_token": tokens[0]}, {"sub": "s-0"})
+    user = await parse_keycloak_user(
+        {"access_token": "tok", "id_token": tokens[0]},
+        {"sub": "s-0"},
+        jwks_state=jwks_state,
+    )
     assert user.email == "u0@mskcc.org"
     assert fetches == 3
 
@@ -1566,20 +1627,136 @@ async def test_keycloak_jwks_failed_cold_fetch_coalesces_backs_off_and_recovers(
     assert fetches == 4
 
 
-def test_keycloak_jwks_locks_are_loop_scoped_and_gc_closed_loops(auth_settings):
-    """Blocker: JWKS lock map stores jwks_url -> (weakref(loop), lock); contended locks are never
-    shared across loops, map stays bounded to <= 1 entry per URL, and closed loops are GC'd."""
+@pytest.mark.asyncio
+async def test_keycloak_jwks_single_flight_isolated_across_concurrent_app_loops(
+    auth_settings, monkeypatch
+):
+    """Within one app/loop, N concurrent unknown-kid verifications perform 1 fetch even when
+    another app/loop concurrently verifies against the same JWKS URL on a separate thread."""
+    import threading
+
+    k1 = get_test_rsa_key("primary")
+    keys = [rsa_jwk_from_key(k1, kid="key-1")]
+    loop1 = asyncio.get_running_loop()
+    state1 = JwksState()
+    state2 = JwksState()
+
+    counts_lock = threading.Lock()
+    per_loop_fetches = {}
+    loop1_fetching = threading.Event()
+    allow_loop1_finish = threading.Event()
+
+    async def fake_fetch(jwks_url: str):
+        current = asyncio.get_running_loop()
+        with counts_lock:
+            per_loop_fetches[current] = per_loop_fetches.get(current, 0) + 1
+        if current is loop1:
+            loop1_fetching.set()
+            # Keep Loop 1's fetch open while Thread 2 runs against the exact same JWKS URL
+            while not allow_loop1_finish.is_set():
+                await asyncio.sleep(0.005)
+        else:
+            await asyncio.sleep(0.01)
+        return list(keys)
+
+    monkeypatch.setattr(auth_module, "fetch_keycloak_jwks", fake_fetch)
+
+    bad_tokens_app1 = [
+        sign_rs256_jwt(make_keycloak_id_claims(email="u@mskcc.org", sub=f"s1-{i}"), kid=f"unk1-{i}", private_key=k1)
+        for i in range(6)
+    ]
+    bad_tokens_app2 = [
+        sign_rs256_jwt(make_keycloak_id_claims(email="u@mskcc.org", sub=f"s2-{i}"), kid=f"unk2-{i}", private_key=k1)
+        for i in range(5)
+    ]
+
+    async def _verify_unknown(tok: str, sub: str, st: JwksState) -> int:
+        with pytest.raises(HTTPException) as exc:
+            await parse_keycloak_user({"access_token": "tok", "id_token": tok}, {"sub": sub}, jwks_state=st)
+        return exc.value.status_code
+
+    # Explicit JwksState is required when called without a request
+    with pytest.raises(TypeError):
+        await parse_keycloak_user({"access_token": "tok", "id_token": bad_tokens_app1[0]}, {"sub": "s1-0"})  # type: ignore[call-arg]
+
+    app2_results = []
+    app2_loop_holder = []
+
+    def _run_app2():
+        assert loop1_fetching.wait(timeout=2.0)
+        lp2 = asyncio.new_event_loop()
+        app2_loop_holder.append(lp2)
+        try:
+            async def _go():
+                return await asyncio.gather(
+                    *(_verify_unknown(tok, f"s2-{i}", state2) for i, tok in enumerate(bad_tokens_app2))
+                )
+
+            app2_results.extend(lp2.run_until_complete(_go()))
+        finally:
+            lp2.close()
+
+    t2 = threading.Thread(target=_run_app2, daemon=True)
+    t2.start()
+
+    # Start batch on Loop 1; yield until it enters fake_fetch and Thread 2 completes on Loop 2
+    async def _run_batch1():
+        return await asyncio.gather(
+            *(_verify_unknown(tok, f"s1-{i}", state1) for i, tok in enumerate(bad_tokens_app1[:5]))
+        )
+
+    batch1_task = asyncio.create_task(_run_batch1())
+    while not loop1_fetching.is_set():
+        await asyncio.sleep(0.002)
+    while t2.is_alive():
+        await asyncio.sleep(0.005)
+    t2.join()
+
+    # Launch a late concurrent task on Loop 1 AFTER Loop 2 ran, while Holder 1 is still mid-fetch
+    late_task = asyncio.create_task(_verify_unknown(bad_tokens_app1[5], "s1-5", state1))
+    await asyncio.sleep(0.01)
+    allow_loop1_finish.set()
+
+    app1_results = list(await batch1_task) + [await late_task]
+    assert app1_results == [403] * 6
+    assert app2_results == [403] * 5
+    assert per_loop_fetches[loop1] == 1
+    assert per_loop_fetches[app2_loop_holder[0]] == 1
+
+
+def test_keycloak_jwks_lifespan_shutdown_releases_state_and_contended_loop(
+    auth_settings, monkeypatch
+):
+    """Lifespan startup creates app.state.jwks_state, and shutdown + loop close release both
+    JwksState and the loop (weakrefs dead after gc.collect()) even after real lock contention."""
     import gc
     import weakref
+    from fastapi import FastAPI
+    from src.pipeline.user_store_fake import FakeUserStore
 
-    clear_keycloak_jwks_cache()
+    class _FakeRunStore(FakeUserStore):
+        async def close(self) -> None:
+            return None
+
+    async def _fake_create():
+        return _FakeRunStore()
+
+    monkeypatch.setattr(main_module.RunStore, "create", _fake_create)
+
+    local_app = FastAPI(lifespan=lifespan)
     url = "https://keycloak.oncokb.org/realms/oncokb-public/protocol/openid-connect/certs"
-    loops = [asyncio.new_event_loop() for _ in range(5)]
-    loop_refs = [weakref.ref(lp) for lp in loops]
-    locks = []
+    loop = asyncio.new_event_loop()
+    loop_ref = weakref.ref(loop)
 
-    async def _contend_lock():
-        lock = auth_module._get_jwks_lock(url)
+    async def _exercise_and_shutdown(target_app: FastAPI):
+        cm = lifespan(target_app)
+        await cm.__aenter__()
+        state = target_app.state.jwks_state
+        assert isinstance(state, JwksState)
+        st_ref = weakref.ref(state)
+
+        # Create real lock contention (holder + queued waiter) inside this lifespan
+        lock = state.get_lock(url)
         held = asyncio.Event()
         release = asyncio.Event()
 
@@ -1591,42 +1768,29 @@ def test_keycloak_jwks_locks_are_loop_scoped_and_gc_closed_loops(auth_settings):
         async def _waiter():
             await held.wait()
             async with lock:
-                return auth_module._get_jwks_lock(url) is lock
+                return state.get_lock(url) is lock
 
-        t_holder = asyncio.create_task(_holder())
-        t_waiter = asyncio.create_task(_waiter())
+        t_h = asyncio.create_task(_holder())
+        t_w = asyncio.create_task(_waiter())
         await held.wait()
-        await asyncio.sleep(0)  # ensure _waiter queues on lock before _holder releases
+        await asyncio.sleep(0)
         release.set()
-        _, same_lock = await asyncio.gather(t_holder, t_waiter)
-        assert same_lock is True
-        return lock
+        _, same = await asyncio.gather(t_h, t_w)
+        assert same is True
+
+        await cm.__aexit__(None, None, None)
+        assert not hasattr(target_app.state, "jwks_state")
+        return st_ref
 
     try:
-        for lp in loops:
-            locks.append(lp.run_until_complete(_contend_lock()))
-        # No lock object is ever shared across loops
-        assert len({id(lock) for lock in locks}) == 5
+        state_ref = loop.run_until_complete(_exercise_and_shutdown(local_app))
     finally:
-        for lp in loops:
-            lp.close()
-        lp = None
-        locks.clear()
-        loops.clear()
-
-    # Subsequent loop replaces the final stale entry so every closed loop becomes unreachable
-    live_loop = asyncio.new_event_loop()
-    try:
-        live_lock = live_loop.run_until_complete(_contend_lock())
-        assert live_lock is not None
-        live_lock = None
-    finally:
-        live_loop.close()
-    del live_loop
-
+        loop.close()
+    del local_app, loop
     gc.collect()
-    assert all(ref() is None for ref in loop_refs)
-    assert len(auth_module._KEYCLOAK_JWKS_LOCKS) <= 1
+
+    assert state_ref() is None
+    assert loop_ref() is None
 
 
 @pytest.mark.asyncio
@@ -1635,7 +1799,7 @@ async def test_keycloak_jwks_failed_refresh_uses_short_backoff_while_success_use
 ):
     """Non-blocking 3 + Blocker 1 stale cache check: a failed unknown-kid refresh uses the short
     10s failure backoff (keeping valid cached keys usable) while successful refreshes keep the 60s bound."""
-    clear_keycloak_jwks_cache()
+    jwks_state = JwksState()
     clock = [2000.0]
     monkeypatch.setattr(auth_module, "_jwks_monotonic", lambda: clock[0])
     monkeypatch.setattr(settings, "keycloak_jwks_refresh_min_interval_seconds", 60)
@@ -1664,7 +1828,7 @@ async def test_keycloak_jwks_failed_refresh_uses_short_backoff_while_success_use
     tok_bogus = sign_rs256_jwt(make_keycloak_id_claims(email="curator@mskcc.org", sub="s1"), kid="bogus", private_key=k1)
 
     # 1. Warm cache at t=2000 with key-1
-    await parse_keycloak_user({"access_token": "tok", "id_token": tok_k1}, {"sub": "s1"})
+    await parse_keycloak_user({"access_token": "tok", "id_token": tok_k1}, {"sub": "s1"}, jwks_state=jwks_state)
     assert fetches == 1
 
     # 2. At t=2005 Keycloak rotates to key-2 while JWKS fails -> k2 refresh fails with 503
@@ -1672,29 +1836,29 @@ async def test_keycloak_jwks_failed_refresh_uses_short_backoff_while_success_use
     active_keys[:] = [rsa_jwk_from_key(k2, kid="key-2")]
     clock[0] = 2005.0
     with pytest.raises(HTTPException) as exc_fail:
-        await parse_keycloak_user({"access_token": "tok", "id_token": tok_k2}, {"sub": "s1"})
+        await parse_keycloak_user({"access_token": "tok", "id_token": tok_k2}, {"sub": "s1"}, jwks_state=jwks_state)
     assert exc_fail.value.status_code == 503
     assert fetches == 2
 
     # 3. During failure backoff (t=2010), existing valid key-1 cache remains usable, while k2 is not fetched
     jwks_down = False  # Keycloak recovered, but still within 10s backoff
     clock[0] = 2010.0
-    user_k1 = await parse_keycloak_user({"access_token": "tok", "id_token": tok_k1}, {"sub": "s1"})
+    user_k1 = await parse_keycloak_user({"access_token": "tok", "id_token": tok_k1}, {"sub": "s1"}, jwks_state=jwks_state)
     assert user_k1.email == "curator@mskcc.org"
     with pytest.raises(HTTPException) as exc_backoff:
-        await parse_keycloak_user({"access_token": "tok", "id_token": tok_k2}, {"sub": "s1"})
+        await parse_keycloak_user({"access_token": "tok", "id_token": tok_k2}, {"sub": "s1"}, jwks_state=jwks_state)
     assert exc_backoff.value.status_code == 503
     assert fetches == 2
 
     # 4. At t=2016 (>= 10s failure backoff, still < 60s), retry succeeds and key-2 is accepted!
     clock[0] = 2016.0
-    user_k2 = await parse_keycloak_user({"access_token": "tok", "id_token": tok_k2}, {"sub": "s1"})
+    user_k2 = await parse_keycloak_user({"access_token": "tok", "id_token": tok_k2}, {"sub": "s1"}, jwks_state=jwks_state)
     assert user_k2.email == "curator@mskcc.org"
     assert fetches == 3
 
     # 5. Successful refresh at t=2016 still enforces 60s min interval on unknown kids
     clock[0] = 2030.0
     with pytest.raises(HTTPException) as exc_throttled:
-        await parse_keycloak_user({"access_token": "tok", "id_token": tok_bogus}, {"sub": "s1"})
+        await parse_keycloak_user({"access_token": "tok", "id_token": tok_bogus}, {"sub": "s1"}, jwks_state=jwks_state)
     assert exc_throttled.value.status_code == 403
     assert fetches == 3
