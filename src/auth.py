@@ -2017,10 +2017,8 @@ _KEYCLOAK_JWKS_LAST_REFRESH: Dict[str, float] = {}
 # Maps jwks_url -> (failed_at_mono, error_detail) for failed JWKS fetches/refreshes (10s short backoff).
 _KEYCLOAK_JWKS_LAST_FAILURE: Dict[str, Tuple[float, str]] = {}
 _KEYCLOAK_JWKS_VERSION: Dict[str, int] = {}
-# Keyed weakly by the running event loop so closed loops are GC'd instead of pinning entries or reusing id(loop).
-_KEYCLOAK_JWKS_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, asyncio.Lock]]" = (
-    weakref.WeakKeyDictionary()
-)
+# Maps jwks_url -> (weakref(loop), lock), bounded by the number of JWKS URLs.
+_KEYCLOAK_JWKS_LOCKS: Dict[str, Tuple["weakref.ref[asyncio.AbstractEventLoop]", asyncio.Lock]] = {}
 
 _RSA_PKCS1_ALGS = {
     "RS256": hashes.SHA256,
@@ -2050,14 +2048,13 @@ def clear_keycloak_jwks_cache() -> None:
 
 def _get_jwks_lock(jwks_url: str) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
-    per_loop = _KEYCLOAK_JWKS_LOCKS.get(loop)
-    if per_loop is None:
-        per_loop = {}
-        _KEYCLOAK_JWKS_LOCKS[loop] = per_loop
-    lock = per_loop.get(jwks_url)
-    if lock is None:
-        lock = asyncio.Lock()
-        per_loop[jwks_url] = lock
+    entry = _KEYCLOAK_JWKS_LOCKS.get(jwks_url)
+    if entry is not None:
+        loop_ref, lock = entry
+        if loop_ref() is loop:
+            return lock
+    lock = asyncio.Lock()
+    _KEYCLOAK_JWKS_LOCKS[jwks_url] = (weakref.ref(loop), lock)
     return lock
 
 

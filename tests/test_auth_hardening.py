@@ -1567,35 +1567,66 @@ async def test_keycloak_jwks_failed_cold_fetch_coalesces_backs_off_and_recovers(
 
 
 def test_keycloak_jwks_locks_are_loop_scoped_and_gc_closed_loops(auth_settings):
-    """Blocker 2: JWKS locks are keyed lazily per WeakKeyDictionary[AbstractEventLoop, ...],
-    never shared across loops, and cleaned up automatically when closed loops are GC'd."""
+    """Blocker: JWKS lock map stores jwks_url -> (weakref(loop), lock); contended locks are never
+    shared across loops, map stays bounded to <= 1 entry per URL, and closed loops are GC'd."""
     import gc
+    import weakref
 
     clear_keycloak_jwks_cache()
     url = "https://keycloak.oncokb.org/realms/oncokb-public/protocol/openid-connect/certs"
     loops = [asyncio.new_event_loop() for _ in range(5)]
+    loop_refs = [weakref.ref(lp) for lp in loops]
     locks = []
 
-    async def _acquire_lock():
+    async def _contend_lock():
         lock = auth_module._get_jwks_lock(url)
-        async with lock:
-            return lock
+        held = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _holder():
+            async with lock:
+                held.set()
+                await release.wait()
+
+        async def _waiter():
+            await held.wait()
+            async with lock:
+                return auth_module._get_jwks_lock(url) is lock
+
+        t_holder = asyncio.create_task(_holder())
+        t_waiter = asyncio.create_task(_waiter())
+        await held.wait()
+        await asyncio.sleep(0)  # ensure _waiter queues on lock before _holder releases
+        release.set()
+        _, same_lock = await asyncio.gather(t_holder, t_waiter)
+        assert same_lock is True
+        return lock
 
     try:
-        for loop in loops:
-            locks.append(loop.run_until_complete(_acquire_lock()))
-        # Every loop gets its own lock object while live
+        for lp in loops:
+            locks.append(lp.run_until_complete(_contend_lock()))
+        # No lock object is ever shared across loops
         assert len({id(lock) for lock in locks}) == 5
-        assert len(auth_module._KEYCLOAK_JWKS_LOCKS) == 5
     finally:
-        for loop in loops:
-            loop.close()
-        loop = None
+        for lp in loops:
+            lp.close()
+        lp = None
         locks.clear()
         loops.clear()
-    gc.collect()
 
-    assert len(auth_module._KEYCLOAK_JWKS_LOCKS) == 0
+    # Subsequent loop replaces the final stale entry so every closed loop becomes unreachable
+    live_loop = asyncio.new_event_loop()
+    try:
+        live_lock = live_loop.run_until_complete(_contend_lock())
+        assert live_lock is not None
+        live_lock = None
+    finally:
+        live_loop.close()
+    del live_loop
+
+    gc.collect()
+    assert all(ref() is None for ref in loop_refs)
+    assert len(auth_module._KEYCLOAK_JWKS_LOCKS) <= 1
 
 
 @pytest.mark.asyncio
