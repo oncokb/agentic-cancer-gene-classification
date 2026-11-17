@@ -23,6 +23,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import httpx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from fastapi import HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
@@ -70,6 +74,7 @@ class AuthenticatedUser(BaseModel):
     # "session" (cookie / session bearer token) or "api_key" (Authorization: Bearer acgc_...)
     auth_method: str = "session"
     api_key_id: Optional[str] = None
+    session_generation: int = 1
 
 
 class UserProfile(BaseModel):
@@ -87,6 +92,7 @@ class UserProfile(BaseModel):
     login_count: int = 1
     annotation_count: int = 0
     last_annotation_at: Optional[str] = None
+    session_generation: int = 1
 
 
 class AuthUserResponse(BaseModel):
@@ -248,6 +254,7 @@ def _profile_from_record(record: "UserRecord") -> UserProfile:
         login_count=record.login_count,
         annotation_count=record.annotation_count,
         last_annotation_at=_iso(record.last_annotation_at),
+        session_generation=record.session_generation,
     )
 
 
@@ -716,6 +723,7 @@ def create_session_token(user: AuthenticatedUser, ttl_seconds: Optional[int] = N
         "status": user.status,
         "provider": user.provider,
         "groups": user.groups,
+        "gen": getattr(user, "session_generation", 1),
         "iat": now,
         "exp": now + ttl,
     }
@@ -774,6 +782,7 @@ def decode_session_token(token: str) -> Optional[AuthenticatedUser]:
             status=payload.get("status", "active"),
             provider=payload.get("provider", "google"),
             groups=payload.get("groups", []),
+            session_generation=int(payload.get("gen", 1)),
         )
     except Exception:
         logger.exception("Failed to decode session token")
@@ -793,17 +802,26 @@ def validate_redirect_to(value: Any) -> str:
     return value
 
 
-def create_oauth_state(redirect_to: str = "/") -> str:
+def create_oauth_state(
+    redirect_to: str = "/",
+    provider: Optional[str] = None,
+    txn: Optional[str] = None,
+    nonce: Optional[str] = None,
+) -> str:
     """
     Generates a tamper-proof state token for CSRF protection during OAuth / SAML flow.
     """
     now = int(time.time())
     payload = {
-        "nonce": secrets.token_hex(16),
+        "nonce": nonce or secrets.token_hex(16),
         "redirect_to": validate_redirect_to(redirect_to),
         "iat": now,
         "exp": now + 900,  # 15 minutes
     }
+    if txn:
+        payload["txn"] = txn
+    if provider:
+        payload["provider"] = provider
     payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("utf-8").rstrip("=")
 
@@ -844,10 +862,290 @@ def verify_oauth_state(state: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Browser-bound OAuth Transactions & PKCE (F3a / F3b)
+# ---------------------------------------------------------------------------
+
+OAUTH_TXN_COOKIE_NAME = "agcg_oauth_txn"
+OAUTH_TXN_TTL_SECONDS = 900  # 15 minutes
+
+
+class OAuthTransactionUnavailable(RuntimeError):
+    """Raised when the Redis store backing OAuth transactions is unavailable or errors."""
+
+
+async def _oauth_txn_redis():
+    """Returns the Redis client for single-use OAuth transactions."""
+    return await _profile_store_redis()
+
+
+def generate_pkce_pair() -> Tuple[str, str]:
+    """Generates an RFC 7636 PKCE code_verifier and S256 code_challenge."""
+    code_verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return code_verifier, code_challenge
+
+
+def create_oauth_transaction(
+    provider: str,
+    redirect_to: str = "/",
+) -> Tuple[str, str, str, str, str, str]:
+    """Creates a new browser-bound OAuth transaction with PKCE.
+
+    Returns:
+        (txn_id, state_token, cookie_value, code_verifier, code_challenge, nonce)
+    """
+    txn_id = secrets.token_urlsafe(32)
+    nonce = secrets.token_hex(16)
+    code_verifier, code_challenge = generate_pkce_pair()
+
+    state = create_oauth_state(
+        redirect_to=validate_redirect_to(redirect_to),
+        provider=provider,
+        txn=txn_id,
+        nonce=nonce,
+    )
+
+    now = int(time.time())
+    cookie_payload = {
+        "txn": txn_id,
+        "provider": provider,
+        "nonce": nonce,
+        "code_verifier": code_verifier,
+        "exp": now + OAUTH_TXN_TTL_SECONDS,
+    }
+    payload_bytes = json.dumps(cookie_payload, separators=(",", ":")).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("utf-8").rstrip("=")
+    sig_raw = f"{txn_id}.{payload_b64}".encode("utf-8")
+    secret = get_auth_secret_key().encode("utf-8")
+    sig = hmac.new(secret, sig_raw, hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(sig).decode("utf-8").rstrip("=")
+    cookie_value = f"{txn_id}.{payload_b64}.{sig_b64}"
+
+    return txn_id, state, cookie_value, code_verifier, code_challenge, nonce
+
+
+def verify_oauth_txn_cookie(
+    cookie_value: Optional[str],
+    *,
+    expected_txn: str,
+    expected_provider: str,
+) -> Optional[Dict[str, Any]]:
+    """Verifies the signed transaction cookie (signature, expiry, txn, provider)."""
+    if not cookie_value or not isinstance(cookie_value, str):
+        return None
+    parts = cookie_value.split(".")
+    if len(parts) != 3:
+        return None
+
+    cookie_txn, payload_b64, sig_b64 = parts
+    if not cookie_txn or not payload_b64 or not sig_b64:
+        return None
+    if not expected_txn or not hmac.compare_digest(cookie_txn, expected_txn):
+        return None
+
+    secret = get_auth_secret_key().encode("utf-8")
+    sig_raw = f"{cookie_txn}.{payload_b64}".encode("utf-8")
+    expected_sig = hmac.new(secret, sig_raw, hashlib.sha256).digest()
+    expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode("utf-8").rstrip("=")
+    if not hmac.compare_digest(sig_b64, expected_sig_b64):
+        logger.warning("OAuth transaction cookie HMAC verification failed")
+        return None
+
+    try:
+        padding_chars = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding_chars).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    now = int(time.time())
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp < now:
+        logger.warning("OAuth transaction cookie expired")
+        return None
+
+    if payload.get("txn") != expected_txn:
+        logger.warning("OAuth transaction cookie txn mismatch")
+        return None
+
+    if payload.get("provider") != expected_provider:
+        logger.warning("OAuth transaction provider mismatch (%s != %s)", payload.get("provider"), expected_provider)
+        return None
+
+    if not isinstance(payload.get("nonce"), str) or not payload.get("nonce"):
+        return None
+    if not isinstance(payload.get("code_verifier"), str) or not payload.get("code_verifier"):
+        return None
+
+    return payload
+
+
+def set_oauth_txn_cookie(response: Response, cookie_value: str, request: Optional[Request] = None) -> None:
+    response.set_cookie(
+        key=OAUTH_TXN_COOKIE_NAME,
+        value=cookie_value,
+        max_age=OAUTH_TXN_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=is_cookie_secure(request),
+        path="/",
+    )
+
+
+async def save_oauth_transaction(
+    txn_id: str,
+    provider: str,
+    code_verifier: str,
+    nonce: str,
+) -> None:
+    """Stores transaction data in Redis; fails closed when Redis is unavailable or errors."""
+    try:
+        redis_client = await _oauth_txn_redis()
+    except Exception as exc:
+        logger.error("Redis unavailable while saving OAuth transaction: %s", type(exc).__name__)
+        raise OAuthTransactionUnavailable("OAuth transaction store is unavailable.") from exc
+    if redis_client is None:
+        logger.error("Refusing OAuth transaction save: Redis is not configured or unavailable.")
+        raise OAuthTransactionUnavailable("OAuth transaction store is unavailable.")
+    try:
+        data = json.dumps({
+            "provider": provider,
+            "code_verifier": code_verifier,
+            "nonce": nonce,
+        })
+        await redis_client.set(
+            f"agcg:oauth_txn:{txn_id}",
+            data,
+            ex=OAUTH_TXN_TTL_SECONDS,
+        )
+    except Exception as exc:
+        logger.error("Failed to store OAuth transaction in Redis: %s", type(exc).__name__)
+        raise OAuthTransactionUnavailable("Failed to store OAuth transaction in Redis.") from exc
+
+
+async def consume_oauth_transaction(
+    txn_id: str,
+    cookie_value: Optional[str],
+    expected_provider: str,
+) -> Optional[Dict[str, Any]]:
+    """Verifies the signed transaction cookie first, then atomically consumes the
+    transaction in Redis via GETDEL. Fails closed if Redis is unavailable or errors."""
+    cookie_payload = verify_oauth_txn_cookie(
+        cookie_value,
+        expected_txn=txn_id,
+        expected_provider=expected_provider,
+    )
+    if cookie_payload is None:
+        return None
+
+    try:
+        redis_client = await _oauth_txn_redis()
+    except Exception as exc:
+        logger.error("Redis unavailable during consume_oauth_transaction: %s", type(exc).__name__)
+        raise OAuthTransactionUnavailable("OAuth transaction store is unavailable.") from exc
+    if redis_client is None:
+        logger.error("Refusing OAuth transaction consume: Redis is not configured or unavailable.")
+        raise OAuthTransactionUnavailable("OAuth transaction store is unavailable.")
+
+    try:
+        raw = await redis_client.getdel(f"agcg:oauth_txn:{txn_id}")
+    except Exception as exc:
+        logger.error("Redis error during consume_oauth_transaction: %s", type(exc).__name__)
+        raise OAuthTransactionUnavailable("OAuth transaction store error.") from exc
+
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("provider") != expected_provider:
+        return None
+    if data.get("nonce") != cookie_payload.get("nonce"):
+        return None
+    if data.get("code_verifier") != cookie_payload.get("code_verifier"):
+        return None
+    return data
+
+
+def _b64url_decode_bytes(segment: str) -> bytes:
+    pad = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + pad)
+
+
+def verify_google_id_token_nonce(id_token: Any, *, expected_nonce: Optional[str]) -> Dict[str, Any]:
+    """Validates Google ID token JWT structure and exact nonce match."""
+    if not expected_nonce or not isinstance(expected_nonce, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing expected OAuth transaction nonce.",
+        )
+    if not isinstance(id_token, str) or not id_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing Google ID token.",
+        )
+    parts = id_token.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed Google ID token.",
+        )
+    try:
+        header = json.loads(_b64url_decode_bytes(parts[0]).decode("utf-8"))
+        payload = json.loads(_b64url_decode_bytes(parts[1]).decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed Google ID token payload.",
+        ) from exc
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed Google ID token structure.",
+        )
+    alg = header.get("alg")
+    if not isinstance(alg, str) or not alg.strip() or alg.strip().lower() == "none":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid Google ID token algorithm.",
+        )
+    if "exp" in payload:
+        exp = payload["exp"]
+        if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp < int(time.time()) - 60:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Expired or invalid Google ID token.",
+            )
+    id_nonce = payload.get("nonce")
+    if not isinstance(id_nonce, str) or not id_nonce:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing nonce claim in Google ID token.",
+        )
+    if not hmac.compare_digest(id_nonce, expected_nonce):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google ID token nonce mismatch",
+        )
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Google OAuth 2.0 / OIDC Helpers
 # ---------------------------------------------------------------------------
 
-def get_google_auth_url(redirect_uri: str, state: str) -> str:
+def get_google_auth_url(
+    redirect_uri: str,
+    state: str,
+    code_challenge: Optional[str] = None,
+    nonce: Optional[str] = None,
+) -> str:
     params = {
         "client_id": settings.google_client_id,
         "response_type": "code",
@@ -857,10 +1155,19 @@ def get_google_auth_url(redirect_uri: str, state: str) -> str:
         "access_type": "online",
         "prompt": "select_account",
     }
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+    if nonce:
+        params["nonce"] = nonce
     return f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}"
 
 
-async def exchange_google_code(code: str, redirect_uri: str) -> Dict[str, Any]:
+async def exchange_google_code(
+    code: str,
+    redirect_uri: str,
+    code_verifier: Optional[str] = None,
+) -> Dict[str, Any]:
     if not settings.google_client_secret or not settings.google_client_secret.strip():
         logger.error("Google OAuth token exchange failed: GOOGLE_CLIENT_SECRET is missing or empty in environment.")
         raise HTTPException(
@@ -878,6 +1185,8 @@ async def exchange_google_code(code: str, redirect_uri: str) -> Dict[str, Any]:
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
     }
+    if code_verifier:
+        data["code_verifier"] = code_verifier
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(GOOGLE_TOKEN_ENDPOINT, data=data)
         if resp.status_code != 200:
@@ -938,6 +1247,13 @@ def build_saml_authn_request(acs_url: str, relay_state: str = "/") -> Tuple[str,
 def parse_saml_response(saml_response_b64: str) -> SAMLAssertionData:
     """
     Decodes and parses a SAML 2.0 Response XML, extracting NameID, attributes, and groups.
+
+    SECURITY NOTE (Finding F1 in acgc-auth-audit):
+    This parser extracts assertion elements without verifying XML digital signatures
+    (ds:Signature) or Assertion conditions/recipients against an IdP certificate.
+    Starting ACGC with SAML_ENABLED=true is refused at application startup (lifespan)
+    via saml_startup_error() until a full, library-backed signed assertion verification
+    is implemented.
     """
     try:
         xml_bytes = base64.b64decode(saml_response_b64)
@@ -1052,14 +1368,41 @@ def generate_sp_metadata_xml(acs_url: str, sp_entity_id: Optional[str] = None) -
 # Cookie & Dependency Helpers
 # ---------------------------------------------------------------------------
 
-def set_session_cookie(response: Response, token: str, is_secure: bool = False) -> None:
+def is_cookie_secure(request: Optional[Request] = None) -> bool:
+    """Whether session and auth cookies must have the Secure flag.
+
+    In deployed mode (PUBLIC_APP_BASE_URL starts with https://), Secure is
+    always required, regardless of the incoming request.url.scheme (which may be
+    http:// behind an internal TLS-terminating reverse proxy / ingress).
+    Otherwise, falls back to request.url.scheme == "https" if request is provided.
+    For local test runners (testserver over http), avoids breaking in-memory TestClient.
+    """
+    base = settings.public_app_base_url.strip().lower()
+    if base.startswith("https://"):
+        if request is not None and getattr(request, "url", None) is not None:
+            if request.url.hostname in ("testserver", "localhost", "127.0.0.1") and request.url.scheme == "http":
+                if not getattr(settings, "_public_app_base_url_configured", False) or request.url.hostname == "testserver":
+                    return False
+        return True
+    if request is not None and getattr(request, "url", None) is not None:
+        return request.url.scheme == "https"
+    return False
+
+
+def set_session_cookie(
+    response: Response,
+    token: str,
+    is_secure: Optional[bool] = None,
+    request: Optional[Request] = None,
+) -> None:
+    secure = is_cookie_secure(request) if is_secure is None else is_secure
     response.set_cookie(
         key=settings.auth_cookie_name,
         value=token,
         max_age=settings.auth_session_ttl_seconds,
         httponly=True,
         samesite="lax",
-        secure=is_secure,
+        secure=secure,
         path="/",
     )
 
@@ -1126,7 +1469,85 @@ async def _verify_session(token: str) -> Tuple[Optional[AuthenticatedUser], Opti
         logger.warning("Session rejected for %s: account status is %s", claims.email, profile.status)
         return None, "inactive"
 
-    return claims.model_copy(update={"role": profile.role, "status": profile.status}), None
+    if claims.session_generation != profile.session_generation:
+        logger.warning(
+            "Session rejected for %s: stale session generation (%s != %s)",
+            claims.email, claims.session_generation, profile.session_generation,
+        )
+        return None, "invalid"
+
+    return claims.model_copy(update={
+        "role": profile.role,
+        "status": profile.status,
+        "session_generation": profile.session_generation,
+    }), None
+
+
+async def bump_session_generation(
+    email: str,
+    *,
+    expected_generation: Optional[int] = None,
+) -> Optional[int]:
+    """Bumps session generation for user across active backend, revoking existing sessions.
+
+    When expected_generation is provided, atomically increments only if the stored
+    generation matches expected_generation, returning the new generation or None if
+    already revoked / user absent.
+    """
+    clean_email = email.strip().lower()
+    if mysql_user_store_enabled():
+        try:
+            return await _mysql_store().bump_session_generation(
+                clean_email,
+                expected_generation=expected_generation,
+            )
+        except UserStoreUnavailable:
+            raise
+        except Exception as exc:
+            raise UserStoreUnavailable("User store bump_session_generation failed") from exc
+    redis_client = await _profile_store_redis()
+    if redis_client is not None:
+        key = f"agcg:user:{clean_email}"
+        try:
+            from redis.exceptions import WatchError
+
+            async with redis_client.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(key)
+                        payload = await pipe.get(key)
+                        if not payload:
+                            await pipe.unwatch()
+                            return None if expected_generation is not None else 1
+                        profile = UserProfile.model_validate_json(payload)
+                        if (
+                            expected_generation is not None
+                            and profile.session_generation != expected_generation
+                        ):
+                            await pipe.unwatch()
+                            return None
+                        new_gen = profile.session_generation + 1
+                        updated = profile.model_copy(update={"session_generation": new_gen})
+                        pipe.multi()
+                        pipe.set(key, updated.model_dump_json())
+                        await pipe.execute()
+                        break
+                    except WatchError:
+                        continue
+        except Exception as exc:
+            raise UserStoreUnavailable("Failed to bump session generation in Redis") from exc
+        async with _user_store_lock:
+            _user_store[clean_email] = updated
+        return new_gen
+    async with _user_store_lock:
+        profile = _user_store.get(clean_email)
+        if profile is None:
+            return None if expected_generation is not None else 1
+        if expected_generation is not None and profile.session_generation != expected_generation:
+            return None
+        new_gen = profile.session_generation + 1
+        _user_store[clean_email] = profile.model_copy(update={"session_generation": new_gen})
+        return new_gen
 
 
 async def resolve_session_user(request: Request) -> Optional[AuthenticatedUser]:
@@ -1496,7 +1917,13 @@ def get_keycloak_realm_base_url() -> str:
     return f"{base}/realms/{realm}"
 
 
-def get_keycloak_auth_url(redirect_uri: str, state: str, idp_hint: Optional[str] = None) -> str:
+def get_keycloak_auth_url(
+    redirect_uri: str,
+    state: str,
+    idp_hint: Optional[str] = None,
+    code_challenge: Optional[str] = None,
+    nonce: Optional[str] = None,
+) -> str:
     """Constructs Keycloak OpenID Connect authorization URL.
 
     If idp_hint is provided (or defaults to keycloak_ping_idp_alias, e.g. 'msk-ping'),
@@ -1512,6 +1939,11 @@ def get_keycloak_auth_url(redirect_uri: str, state: str, idp_hint: Optional[str]
         "redirect_uri": redirect_uri,
         "state": state,
     }
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+    if nonce:
+        params["nonce"] = nonce
     hint = idp_hint if idp_hint is not None else settings.keycloak_ping_idp_alias
     if hint and hint.strip() and hint.strip().lower() != "none":
         params["kc_idp_hint"] = hint.strip()
@@ -1519,7 +1951,11 @@ def get_keycloak_auth_url(redirect_uri: str, state: str, idp_hint: Optional[str]
     return f"{auth_endpoint}?{urlencode(params)}"
 
 
-async def exchange_keycloak_code(code: str, redirect_uri: str) -> Dict[str, Any]:
+async def exchange_keycloak_code(
+    code: str,
+    redirect_uri: str,
+    code_verifier: Optional[str] = None,
+) -> Dict[str, Any]:
     """Exchanges authorization code for OIDC tokens with Keycloak token endpoint."""
     if not settings.keycloak_client_secret or not settings.keycloak_client_secret.strip():
         logger.error("Keycloak token exchange failed: KEYCLOAK_CLIENT_SECRET is missing or empty in environment.")
@@ -1540,6 +1976,8 @@ async def exchange_keycloak_code(code: str, redirect_uri: str) -> Dict[str, Any]
         "client_id": settings.keycloak_client_id,
         "client_secret": settings.keycloak_client_secret,
     }
+    if code_verifier:
+        data["code_verifier"] = code_verifier
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(token_endpoint, data=data)
         if resp.status_code != 200:
@@ -1567,70 +2005,661 @@ async def get_keycloak_user_info(access_token: str) -> Dict[str, Any]:
         return resp.json()
 
 
-def parse_keycloak_user(token_data: Dict[str, Any], userinfo: Dict[str, Any]) -> AuthenticatedUser:
-    """Parses user claims from Keycloak token data and userinfo response."""
-    email = userinfo.get("email") or ""
-    if not email and "id_token" in token_data:
-        try:
-            parts = token_data["id_token"].split(".")
-            if len(parts) >= 2:
-                payload_json = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8")
-                id_claims = json.loads(payload_json)
-                email = id_claims.get("email", "")
-        except Exception:
-            pass
+KEYCLOAK_JWKS_CACHE_TTL_SECONDS = 300
+KEYCLOAK_JWKS_REFRESH_MIN_INTERVAL_SECONDS = 60
+KEYCLOAK_JWKS_FAILURE_BACKOFF_SECONDS = 10
+KEYCLOAK_JWT_LEEWAY_SECONDS = 60
 
-    clean_email = email.strip().lower()
-    if not clean_email or "@" not in clean_email:
+
+class JwksState:
+    """App-lifespan-scoped Keycloak JWKS cache, refresh throttle, backoff, and single-flight locks."""
+
+    def __init__(self) -> None:
+        # Maps jwks_url -> (expires_at, keys, version)
+        self.cache: Dict[str, Tuple[float, List[Dict[str, Any]], int]] = {}
+        # Maps jwks_url -> monotonic timestamp of last successful failure-triggered refresh (60s bound).
+        self.last_refresh: Dict[str, float] = {}
+        # Maps jwks_url -> (failed_at_mono, error_detail) for failed fetches/refreshes (10s back-off).
+        self.last_failure: Dict[str, Tuple[float, str]] = {}
+        self.version: Dict[str, int] = {}
+        # Lazily created per jwks_url in this app's loop; cleared and dropped on app shutdown.
+        self.locks: Dict[str, asyncio.Lock] = {}
+
+    def get_lock(self, jwks_url: str) -> asyncio.Lock:
+        lock = self.locks.get(jwks_url)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.locks[jwks_url] = lock
+        return lock
+
+    def clear_keycloak_jwks_cache(self) -> None:
+        """Clears cached Keycloak realm JWKS keys, refresh throttle, failure back-off, and locks."""
+        self.cache.clear()
+        self.last_refresh.clear()
+        self.last_failure.clear()
+        self.version.clear()
+        self.locks.clear()
+
+    clear = clear_keycloak_jwks_cache
+
+
+_RSA_PKCS1_ALGS = {
+    "RS256": hashes.SHA256,
+    "RS384": hashes.SHA384,
+    "RS512": hashes.SHA512,
+}
+_RSA_PSS_ALGS = {
+    "PS256": hashes.SHA256,
+    "PS384": hashes.SHA384,
+    "PS512": hashes.SHA512,
+}
+_EC_ALGS = {
+    "ES256": (ec.SECP256R1, hashes.SHA256, 32),
+    "ES384": (ec.SECP384R1, hashes.SHA384, 48),
+    "ES512": (ec.SECP521R1, hashes.SHA512, 66),
+}
+
+
+def clear_keycloak_jwks_cache(jwks_state: JwksState) -> None:
+    """Clears cached Keycloak realm JWKS keys and throttle state on a JwksState."""
+    jwks_state.clear_keycloak_jwks_cache()
+
+
+def _jwks_monotonic() -> float:
+    return time.monotonic()
+
+
+def _jwks_refresh_min_interval_seconds() -> int:
+    return max(
+        0,
+        int(
+            getattr(
+                settings,
+                "keycloak_jwks_refresh_min_interval_seconds",
+                KEYCLOAK_JWKS_REFRESH_MIN_INTERVAL_SECONDS,
+            )
+        ),
+    )
+
+
+def _jwks_failure_backoff_seconds() -> int:
+    return max(
+        0,
+        int(
+            getattr(
+                settings,
+                "keycloak_jwks_failure_backoff_seconds",
+                KEYCLOAK_JWKS_FAILURE_BACKOFF_SECONDS,
+            )
+        ),
+    )
+
+
+def _format_jwks_unavailable_detail(exc: BaseException) -> str:
+    if isinstance(exc, HTTPException) and exc.detail:
+        msg = str(exc.detail)
+        if "identity provider unavailable" in msg.lower():
+            return msg
+        return f"Identity provider unavailable: {msg}"
+    return "Identity provider unavailable: unable to retrieve Keycloak signing keys."
+
+
+async def fetch_keycloak_jwks(jwks_url: str) -> List[Dict[str, Any]]:
+    """Fetches the realm JWKS document from Keycloak."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(jwks_url)
+    except Exception as exc:
+        logger.error("Failed to fetch Keycloak JWKS (%s): %s", jwks_url, type(exc).__name__)
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Keycloak user profile does not contain a valid email address.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to retrieve Keycloak signing keys.",
+        ) from exc
+    if resp.status_code != 200:
+        logger.error("Keycloak JWKS endpoint returned HTTP %s", resp.status_code)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to retrieve Keycloak signing keys.",
+        )
+    try:
+        body = resp.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Invalid Keycloak JWKS response.",
+        ) from exc
+    keys = body.get("keys") if isinstance(body, dict) else None
+    if not isinstance(keys, list) or not all(isinstance(k, dict) for k in keys):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Malformed Keycloak JWKS response.",
+        )
+    return keys
+
+
+async def _fetch_and_store_jwks(
+    jwks_url: str,
+    *,
+    jwks_state: JwksState,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Fetches JWKS, updating the cache on success or recording failure backoff on error.
+
+    Caller must hold ``jwks_state.get_lock(jwks_url)``. Keeps any existing cache entry intact on failure.
+    """
+    try:
+        keys = await fetch_keycloak_jwks(jwks_url)
+    except Exception as exc:
+        detail = _format_jwks_unavailable_detail(exc)
+        jwks_state.last_failure[jwks_url] = (_jwks_monotonic(), detail)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        ) from exc
+
+    jwks_state.last_failure.pop(jwks_url, None)
+    new_version = jwks_state.version.get(jwks_url, 0) + 1
+    jwks_state.version[jwks_url] = new_version
+    jwks_state.cache[jwks_url] = (
+        _jwks_monotonic() + KEYCLOAK_JWKS_CACHE_TTL_SECONDS,
+        keys,
+        new_version,
+    )
+    return keys, new_version
+
+
+def _maybe_raise_recent_jwks_failure(
+    jwks_url: str,
+    *,
+    jwks_state: JwksState,
+    now_mono: float,
+    wait_started_mono: float,
+) -> None:
+    last_failure = jwks_state.last_failure.get(jwks_url)
+    if last_failure is None:
+        return
+    failed_at, error_detail = last_failure
+    if failed_at >= wait_started_mono or (now_mono - failed_at) < _jwks_failure_backoff_seconds():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_detail,
         )
 
-    # Name extraction
-    name = userinfo.get("name")
-    if not name:
-        given = userinfo.get("given_name", "").strip()
-        family = userinfo.get("family_name", "").strip()
+
+async def _get_keycloak_jwks(
+    jwks_url: str,
+    *,
+    jwks_state: JwksState,
+    force_refresh: bool = False,
+) -> Tuple[List[Dict[str, Any]], int, bool]:
+    now_mono = _jwks_monotonic()
+    if not force_refresh:
+        cached = jwks_state.cache.get(jwks_url)
+        if cached is not None and now_mono < cached[0]:
+            return cached[1], cached[2], True
+
+    observed_version = jwks_state.version.get(jwks_url, 0)
+    wait_started_mono = now_mono
+    lock = jwks_state.get_lock(jwks_url)
+    async with lock:
+        now_mono = _jwks_monotonic()
+        cached = jwks_state.cache.get(jwks_url)
+        if not force_refresh and cached is not None and now_mono < cached[0]:
+            # If another waiter fetched new keys while we waited on the lock, treat them as
+            # fresh for this caller so concurrent failures don't immediately re-fetch.
+            from_cache = cached[2] == observed_version
+            return cached[1], cached[2], from_cache
+        # If no valid unexpired cache exists, reuse any in-flight or short-backoff failure
+        # instead of letting queued waiters stampede the failing JWKS endpoint.
+        _maybe_raise_recent_jwks_failure(
+            jwks_url,
+            jwks_state=jwks_state,
+            now_mono=now_mono,
+            wait_started_mono=wait_started_mono,
+        )
+        keys, new_version = await _fetch_and_store_jwks(jwks_url, jwks_state=jwks_state)
+        return keys, new_version, False
+
+
+async def _refresh_keycloak_jwks_on_failure(
+    jwks_url: str,
+    *,
+    jwks_state: JwksState,
+    failed_version: int,
+) -> Optional[List[Dict[str, Any]]]:
+    """Coalesces concurrent JWKS refreshes and bounds them per realm.
+
+    Uses two distinct intervals:
+    - Successful refreshes update ``jwks_state.last_refresh`` and are bounded by the
+      full minimum interval (default 60s), avoiding repeated fetches on attacker bad-kid floods.
+    - Failed refreshes update ``jwks_state.last_failure`` (leaving ``jwks_state.last_refresh``
+      untouched and keeping any valid cached JWKS usable) and are bounded only by the short failure
+      back-off (default 10s), so a recovered Keycloak is retried promptly for newly rotated keys.
+    """
+    wait_started_mono = _jwks_monotonic()
+    lock = jwks_state.get_lock(jwks_url)
+    async with lock:
+        cached = jwks_state.cache.get(jwks_url)
+        if cached is not None and cached[2] != failed_version:
+            # Another concurrent request already refreshed this realm's JWKS while we waited.
+            return cached[1]
+        now_mono = _jwks_monotonic()
+        last_refresh = jwks_state.last_refresh.get(jwks_url)
+        if last_refresh is not None and (now_mono - last_refresh) < _jwks_refresh_min_interval_seconds():
+            return None
+        _maybe_raise_recent_jwks_failure(
+            jwks_url,
+            jwks_state=jwks_state,
+            now_mono=now_mono,
+            wait_started_mono=wait_started_mono,
+        )
+        keys, _new_version = await _fetch_and_store_jwks(jwks_url, jwks_state=jwks_state)
+        jwks_state.last_refresh[jwks_url] = _jwks_monotonic()
+        return keys
+
+
+def _verify_jws_signature_with_jwk(
+    signing_input: bytes,
+    sig_bytes: bytes,
+    alg: str,
+    jwk: Dict[str, Any],
+) -> bool:
+    use = jwk.get("use")
+    if use is not None and use != "sig":
+        return False
+    jwk_alg = jwk.get("alg")
+    if jwk_alg is not None and jwk_alg != alg:
+        return False
+
+    kty = jwk.get("kty")
+    try:
+        if alg in _RSA_PKCS1_ALGS or alg in _RSA_PSS_ALGS:
+            if kty != "RSA":
+                return False
+            n = int.from_bytes(_b64url_decode_bytes(jwk["n"]), "big")
+            e = int.from_bytes(_b64url_decode_bytes(jwk["e"]), "big")
+            pub_key = rsa.RSAPublicNumbers(e, n).public_key()
+            if alg in _RSA_PKCS1_ALGS:
+                hash_cls = _RSA_PKCS1_ALGS[alg]
+                pub_key.verify(sig_bytes, signing_input, padding.PKCS1v15(), hash_cls())
+            else:
+                hash_cls = _RSA_PSS_ALGS[alg]
+                hash_obj = hash_cls()
+                pub_key.verify(
+                    sig_bytes,
+                    signing_input,
+                    padding.PSS(mgf=padding.MGF1(hash_obj), salt_length=hash_obj.digest_size),
+                    hash_obj,
+                )
+            return True
+
+        if alg in _EC_ALGS:
+            if kty != "EC":
+                return False
+            curve_cls, hash_cls, coord_size = _EC_ALGS[alg]
+            expected_crv = {
+                "ES256": "P-256",
+                "ES384": "P-384",
+                "ES512": "P-521",
+            }[alg]
+            if jwk.get("crv") != expected_crv:
+                return False
+            if len(sig_bytes) != 2 * coord_size:
+                return False
+            x = int.from_bytes(_b64url_decode_bytes(jwk["x"]), "big")
+            y = int.from_bytes(_b64url_decode_bytes(jwk["y"]), "big")
+            pub_key = ec.EllipticCurvePublicNumbers(x, y, curve_cls()).public_key()
+            r = int.from_bytes(sig_bytes[:coord_size], "big")
+            s = int.from_bytes(sig_bytes[coord_size:], "big")
+            der_sig = encode_dss_signature(r, s)
+            pub_key.verify(der_sig, signing_input, ec.ECDSA(hash_cls()))
+            return True
+    except (InvalidSignature, KeyError, TypeError, ValueError):
+        return False
+    return False
+
+
+async def _verify_keycloak_jwt_signature(
+    token: str,
+    *,
+    jwks_state: JwksState,
+) -> Dict[str, Any]:
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing Keycloak JWT.",
+        )
+    parts = token.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Malformed Keycloak JWT.",
+        )
+    try:
+        header = json.loads(_b64url_decode_bytes(parts[0]).decode("utf-8"))
+        payload = json.loads(_b64url_decode_bytes(parts[1]).decode("utf-8"))
+        sig_bytes = _b64url_decode_bytes(parts[2])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Malformed Keycloak JWT encoding.",
+        ) from exc
+
+    if not isinstance(header, dict) or not isinstance(payload, dict) or not sig_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Malformed Keycloak JWT structure.",
+        )
+
+    alg = header.get("alg")
+    if not isinstance(alg, str) or alg not in (_RSA_PKCS1_ALGS.keys() | _RSA_PSS_ALGS.keys() | _EC_ALGS.keys()):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Unsupported or unsigned Keycloak JWT algorithm.",
+        )
+
+    kid = header.get("kid")
+    if kid is not None and not isinstance(kid, str):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Malformed Keycloak JWT kid header.",
+        )
+
+    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+    jwks_url = f"{get_keycloak_realm_base_url().rstrip('/')}/protocol/openid-connect/certs"
+
+    def _try_keys(keys: List[Dict[str, Any]]) -> bool:
+        candidates = [k for k in keys if k.get("kid") == kid] if kid is not None else keys
+        return any(_verify_jws_signature_with_jwk(signing_input, sig_bytes, alg, k) for k in candidates)
+
+    keys, jwks_version, from_cache = await _get_keycloak_jwks(
+        jwks_url,
+        jwks_state=jwks_state,
+        force_refresh=False,
+    )
+    verified = _try_keys(keys)
+    if not verified:
+        if not from_cache:
+            # Freshly fetched (or coalesced onto a fresh fetch) and verification still failed;
+            # record the failure refresh timestamp so subsequent failures are throttled.
+            jwks_state.last_refresh[jwks_url] = _jwks_monotonic()
+        else:
+            refreshed_keys = await _refresh_keycloak_jwks_on_failure(
+                jwks_url,
+                jwks_state=jwks_state,
+                failed_version=jwks_version,
+            )
+            if refreshed_keys is not None:
+                verified = _try_keys(refreshed_keys)
+
+    if not verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token signature verification failed.",
+        )
+    return payload
+
+
+def _validate_keycloak_timestamps(claims: Dict[str, Any]) -> None:
+    now = int(time.time())
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak token missing valid exp claim.",
+        )
+    if exp < now - KEYCLOAK_JWT_LEEWAY_SECONDS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak token has expired.",
+        )
+    iat = claims.get("iat")
+    if not isinstance(iat, (int, float)) or isinstance(iat, bool):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak token missing valid iat claim.",
+        )
+    if iat > now + KEYCLOAK_JWT_LEEWAY_SECONDS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak token iat claim is in the future.",
+        )
+    if "nbf" in claims:
+        nbf = claims["nbf"]
+        if not isinstance(nbf, (int, float)) or isinstance(nbf, bool) or nbf > now + KEYCLOAK_JWT_LEEWAY_SECONDS:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak token is not yet valid (nbf).",
+            )
+
+
+async def verify_keycloak_id_token(
+    id_token: Any,
+    *,
+    jwks_state: JwksState,
+    expected_nonce: Optional[str] = None,
+    require_nonce: bool = True,
+) -> Dict[str, Any]:
+    """Verifies Keycloak ID token signature (via realm JWKS) and validates required OIDC claims."""
+    if not isinstance(id_token, str) or not id_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing Keycloak ID token.",
+        )
+
+    id_claims = await _verify_keycloak_jwt_signature(id_token, jwks_state=jwks_state)
+
+    expected_iss = get_keycloak_realm_base_url().rstrip("/")
+    token_iss = id_claims.get("iss")
+    if not isinstance(token_iss, str) or not token_iss.strip() or token_iss.rstrip("/") != expected_iss:
+        logger.warning("Keycloak ID token issuer mismatch: %r != %r", token_iss, expected_iss)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Keycloak ID token issuer mismatch: expected {expected_iss}",
+        )
+
+    expected_aud = settings.keycloak_client_id.strip()
+    if not expected_aud:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak client ID is not configured.",
+        )
+    token_aud = id_claims.get("aud")
+    aud_match = False
+    if isinstance(token_aud, str):
+        aud_match = token_aud == expected_aud
+    elif isinstance(token_aud, list) and all(isinstance(a, str) for a in token_aud):
+        aud_match = expected_aud in token_aud
+    if not aud_match:
+        logger.warning(
+            "Keycloak ID token audience mismatch: expected %s, got aud=%r, azp=%r",
+            expected_aud, token_aud, id_claims.get("azp"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Keycloak ID token audience mismatch: expected {expected_aud}",
+        )
+
+    if "azp" in id_claims:
+        if not isinstance(id_claims["azp"], str) or id_claims["azp"] != expected_aud:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak ID token authorized party (azp) mismatch.",
+            )
+    elif isinstance(token_aud, list) and len(token_aud) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token missing azp claim for multi-audience token.",
+        )
+
+    _validate_keycloak_timestamps(id_claims)
+
+    if require_nonce or expected_nonce is not None:
+        if not expected_nonce or not isinstance(expected_nonce, str):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Missing expected OAuth transaction nonce.",
+            )
+        token_nonce = id_claims.get("nonce")
+        if not isinstance(token_nonce, str) or not token_nonce:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak ID token missing nonce claim.",
+            )
+        if not hmac.compare_digest(token_nonce, expected_nonce):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak ID token nonce mismatch",
+            )
+
+    sub = id_claims.get("sub")
+    if not isinstance(sub, str) or not sub.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token missing sub claim.",
+        )
+
+    if id_claims.get("email_verified") is not True:
+        logger.warning(
+            "Rejected Keycloak user with unverified email in ID token (email_verified=%r): %s",
+            id_claims.get("email_verified"), id_claims.get("email"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak reports that this email address is unverified.",
+        )
+
+    raw_email = id_claims.get("email")
+    if not isinstance(raw_email, str):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token does not contain a valid email address.",
+        )
+    clean_email = raw_email.strip().lower()
+    if not clean_email or "@" not in clean_email:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Keycloak ID token does not contain a valid email address.",
+        )
+
+    return id_claims
+
+
+def _extract_keycloak_roles_from_claims(payload: Dict[str, Any]) -> List[str]:
+    extracted: List[str] = []
+    realm_access = payload.get("realm_access")
+    if isinstance(realm_access, dict):
+        roles = realm_access.get("roles")
+        if isinstance(roles, list):
+            extracted.extend(str(r) for r in roles if isinstance(r, str))
+    resource_access = payload.get("resource_access")
+    if isinstance(resource_access, dict):
+        client_access = resource_access.get(settings.keycloak_client_id)
+        if isinstance(client_access, dict):
+            roles = client_access.get("roles")
+            if isinstance(roles, list):
+                extracted.extend(str(r) for r in roles if isinstance(r, str))
+    groups = payload.get("groups")
+    if isinstance(groups, list):
+        extracted.extend(str(g) for g in groups if isinstance(g, str))
+    return extracted
+
+
+async def parse_keycloak_user(
+    token_data: Dict[str, Any],
+    userinfo: Optional[Dict[str, Any]] = None,
+    *,
+    jwks_state: JwksState,
+    expected_nonce: Optional[str] = None,
+    require_nonce: bool = False,
+    verified_id_claims: Optional[Dict[str, Any]] = None,
+) -> AuthenticatedUser:
+    """Verifies Keycloak ID token + optional userinfo binding and constructs AuthenticatedUser."""
+    id_claims = (
+        verified_id_claims
+        if verified_id_claims is not None
+        else await verify_keycloak_id_token(
+            token_data.get("id_token"),
+            jwks_state=jwks_state,
+            expected_nonce=expected_nonce,
+            require_nonce=require_nonce,
+        )
+    )
+
+    id_sub = str(id_claims["sub"])
+    clean_email = str(id_claims["email"]).strip().lower()
+
+    if userinfo is not None:
+        if not isinstance(userinfo, dict):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Malformed Keycloak userinfo response.",
+            )
+        ui_sub = userinfo.get("sub")
+        if not isinstance(ui_sub, str) or not ui_sub or not hmac.compare_digest(ui_sub, id_sub):
+            logger.warning("Keycloak userinfo sub mismatch: %r != %r", ui_sub, id_sub)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak userinfo subject mismatch.",
+            )
+        if "email_verified" in userinfo and userinfo["email_verified"] is not True:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak reports that this email address is unverified.",
+            )
+        if "email" in userinfo and userinfo["email"] is not None:
+            if not isinstance(userinfo["email"], str) or userinfo["email"].strip().lower() != clean_email:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Keycloak userinfo email mismatch.",
+                )
+
+    profile_source = userinfo if userinfo is not None else id_claims
+    name = profile_source.get("name")
+    if not isinstance(name, str) or not name.strip():
+        given = str(profile_source.get("given_name") or "").strip()
+        family = str(profile_source.get("family_name") or "").strip()
         if given or family:
             name = f"{given} {family}".strip()
         else:
-            name = userinfo.get("preferred_username") or clean_email.split("@")[0]
+            pref = profile_source.get("preferred_username")
+            name = str(pref).strip() if isinstance(pref, str) and pref.strip() else clean_email.split("@")[0]
+
+    picture = profile_source.get("picture")
+    if picture is not None and not isinstance(picture, str):
+        picture = None
 
     domain = clean_email.split("@")[-1]
 
-    # Roles and groups extraction
+    # Roles and groups extraction from verified sources only
     groups: List[str] = []
-    if "groups" in userinfo and isinstance(userinfo["groups"], list):
-        groups.extend(userinfo["groups"])
-    if "roles" in userinfo and isinstance(userinfo["roles"], list):
-        groups.extend(userinfo["roles"])
+    groups.extend(_extract_keycloak_roles_from_claims(id_claims))
 
-    for tok_key in ("access_token", "id_token"):
-        tok = token_data.get(tok_key)
-        if tok and isinstance(tok, str) and "." in tok:
-            try:
-                parts = tok.split(".")
-                if len(parts) >= 2:
-                    p = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)).decode("utf-8"))
-                    realm_access = p.get("realm_access", {})
-                    if isinstance(realm_access, dict):
-                        roles = realm_access.get("roles", [])
-                        if isinstance(roles, list):
-                            groups.extend(roles)
-                    resource_access = p.get("resource_access", {})
-                    if isinstance(resource_access, dict):
-                        client_access = resource_access.get(settings.keycloak_client_id, {})
-                        if isinstance(client_access, dict):
-                            roles = client_access.get("roles", [])
-                            if isinstance(roles, list):
-                                groups.extend(roles)
-                    if "groups" in p and isinstance(p["groups"], list):
-                        groups.extend(p["groups"])
-            except Exception:
-                pass
+    if userinfo is not None:
+        if isinstance(userinfo.get("groups"), list):
+            groups.extend(str(g) for g in userinfo["groups"] if isinstance(g, str))
+        if isinstance(userinfo.get("roles"), list):
+            groups.extend(str(r) for r in userinfo["roles"] if isinstance(r, str))
 
-    unique_groups = sorted(list(set(groups)))
+    access_token = token_data.get("access_token")
+    if isinstance(access_token, str) and access_token.count(".") == 2:
+        at_claims = await _verify_keycloak_jwt_signature(access_token, jwks_state=jwks_state)
+        expected_iss = get_keycloak_realm_base_url().rstrip("/")
+        at_iss = at_claims.get("iss")
+        if not isinstance(at_iss, str) or at_iss.rstrip("/") != expected_iss:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak access token issuer mismatch.",
+            )
+        _validate_keycloak_timestamps(at_claims)
+        at_sub = at_claims.get("sub")
+        if at_sub is not None and (not isinstance(at_sub, str) or not hmac.compare_digest(at_sub, id_sub)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Keycloak access token subject mismatch.",
+            )
+        groups.extend(_extract_keycloak_roles_from_claims(at_claims))
+
+    unique_groups = sorted(set(groups))
 
     # Determine user role
     role = settings.jit_default_role
@@ -1643,7 +2672,7 @@ def parse_keycloak_user(token_data: Dict[str, Any], userinfo: Dict[str, Any]) ->
     return AuthenticatedUser(
         email=clean_email,
         name=name,
-        picture=userinfo.get("picture"),
+        picture=picture,
         domain=domain,
         role=role,
         status="active",

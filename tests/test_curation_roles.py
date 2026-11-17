@@ -9,8 +9,6 @@ guards every curation write; reads stay open to viewers.
 
 from __future__ import annotations
 
-import base64
-import json
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from unittest.mock import AsyncMock
@@ -23,12 +21,19 @@ from src import api_keys as api_keys_module
 from src import auth as auth_module
 from src import main as main_module
 from src.api_keys import ApiKeyRecord, InMemoryRateLimiter, generate_api_key, hash_api_key
-from src.auth import AuthenticatedUser, UserProfile, create_oauth_state, create_session_token
+from src.auth import AuthenticatedUser, UserProfile, create_session_token
 from src.api import curation_routes
 from src.config import Settings, settings
 from src.main import app
 from src.models.schema import FusionEvidenceResult
-from tests.auth_helpers import put_profile, stored_profile
+from tests.auth_helpers import (
+    begin_oauth_login,
+    install_test_keycloak_jwks,
+    make_keycloak_id_claims,
+    put_profile,
+    sign_rs256_jwt,
+    stored_profile,
+)
 from tests.test_curation import FakeCurationStore, store  # noqa: F401  (fixture)
 
 pytestmark = pytest.mark.usefixtures("user_store_backend")
@@ -279,21 +284,32 @@ def keycloak_login(monkeypatch, auth_on):
     monkeypatch.setattr(settings, "keycloak_client_id", "acgc")
     monkeypatch.setattr(settings, "keycloak_allowed_roles", "")
     monkeypatch.setattr(settings, "keycloak_admin_roles", "")
+    install_test_keycloak_jwks(monkeypatch)
 
     def login(groups: List[str], email: str = EMAIL):
-        claims = {"realm_access": {"roles": list(groups)}}
-        jwt_body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        browser = TestClient(app)
+        state, nonce = begin_oauth_login(browser, "keycloak", "/")
+        id_claims = make_keycloak_id_claims(email=email, sub=f"sub-{email}", nonce=nonce)
+        at_claims = {
+            "iss": id_claims["iss"],
+            "sub": id_claims["sub"],
+            "iat": id_claims["iat"],
+            "exp": id_claims["exp"],
+            "realm_access": {"roles": list(groups)},
+        }
         monkeypatch.setattr(
             main_module, "exchange_keycloak_code",
-            AsyncMock(return_value={"access_token": f"header.{jwt_body}.sig"}),
+            AsyncMock(return_value={
+                "access_token": sign_rs256_jwt(at_claims),
+                "id_token": sign_rs256_jwt(id_claims),
+            }),
         )
         monkeypatch.setattr(
             main_module, "get_keycloak_user_info",
-            AsyncMock(return_value={"email": email, "email_verified": True, "name": "KC User"}),
+            AsyncMock(return_value={"sub": id_claims["sub"], "name": "KC User"}),
         )
-        browser = TestClient(app)
         resp = browser.get(
-            "/auth/callback/keycloak", params={"code": "c", "state": create_oauth_state("/")},
+            "/auth/callback/keycloak", params={"code": "c", "state": state},
             follow_redirects=False,
         )
         assert resp.status_code == 303, resp.text

@@ -40,6 +40,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Tuple
 import pymysql
 
 from src.auth import UserStoreUnavailable, describe_store_error
+from src.pipeline.schema_migrations import add_column_if_missing
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ CREATE TABLE IF NOT EXISTS users (
     last_annotation_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
+    session_generation INT UNSIGNED NOT NULL DEFAULT 1,
     PRIMARY KEY (email),
     INDEX idx_users_last_login (last_login_at, email),
     INDEX idx_users_role_status (role, status),
@@ -139,7 +141,7 @@ CREATE TABLE IF NOT EXISTS role_changes (
 _USER_COLUMNS = (
     "email, name, picture, domain, provider, status, role, role_updated_by, role_updated_at, "
     "groups_json, claims_json, first_login_at, last_login_at, login_count, annotation_count, "
-    "last_annotation_at, created_at, updated_at"
+    "last_annotation_at, created_at, updated_at, session_generation"
 )
 _REQUEST_COLUMNS = (
     "id, email, reason, affiliation, expertise, orcid, status, reviewer_email, decided_at, "
@@ -209,6 +211,7 @@ class UserRecord:
     last_annotation_at: Optional[datetime]
     created_at: datetime
     updated_at: datetime
+    session_generation: int = 1
 
 
 @dataclass(frozen=True)
@@ -319,6 +322,13 @@ class UserStore(Protocol):
         self, email: str, *, role: Optional[str] = None, status: Optional[str] = None,
         actor: str, reason: Optional[str] = None,
     ) -> List[RoleChange]: ...
+
+    async def bump_session_generation(
+        self,
+        email: str,
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> Optional[int]: ...
 
     async def incr_activity(self, email: str, n: int = 1, at: Optional[datetime] = None) -> bool: ...
 
@@ -582,6 +592,7 @@ def _user_from_row(row) -> UserRecord:
         last_annotation_at=_from_db(row[15]),
         created_at=_from_db(row[16]),
         updated_at=_from_db(row[17]),
+        session_generation=int(row[18]) if len(row) > 18 else 1,
     )
 
 
@@ -646,6 +657,9 @@ class UserStoreMixin:
         await cursor.execute(_CREATE_USERS_TABLE_SQL)
         await cursor.execute(_CREATE_CURATOR_REQUESTS_TABLE_SQL)
         await cursor.execute(_CREATE_ROLE_CHANGES_TABLE_SQL)
+        await add_column_if_missing(
+            cursor, "users", "session_generation", "INT UNSIGNED NOT NULL DEFAULT 1"
+        )
 
     @asynccontextmanager
     async def _user_transaction(self) -> AsyncIterator[Any]:
@@ -757,6 +771,7 @@ class UserStoreMixin:
             to_json(user.claims, "claims"), _to_db(user.first_login_at),
             _to_db(user.last_login_at), user.login_count, user.annotation_count,
             _to_db(user.last_annotation_at), _to_db(user.created_at), _to_db(user.updated_at),
+            user.session_generation,
         )
         async with _store_errors("import_user"):
             try:
@@ -769,10 +784,10 @@ class UserStoreMixin:
                                 provider, status, role, role_updated_by, role_updated_at,
                                 groups_json, claims_json, first_login_at, last_login_at,
                                 login_count, annotation_count, last_annotation_at, created_at,
-                                updated_at
+                                updated_at, session_generation
                             ) VALUES (
                                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s
                             )
                             """,
                             params,
@@ -870,10 +885,16 @@ class UserStoreMixin:
                 (value, actor, now, now, email),
             )
         else:
-            await cursor.execute(
-                "UPDATE users SET status = %s, updated_at = %s WHERE email = %s",
-                (value, now, email),
-            )
+            if value == "disabled":
+                await cursor.execute(
+                    "UPDATE users SET status = %s, updated_at = %s, session_generation = session_generation + 1 WHERE email = %s",
+                    (value, now, email),
+                )
+            else:
+                await cursor.execute(
+                    "UPDATE users SET status = %s, updated_at = %s WHERE email = %s",
+                    (value, now, email),
+                )
         await cursor.execute(
             _INSERT_ROLE_CHANGE_SQL,
             (email, field_name, old_value, value, actor, reason, request_id, now),
@@ -998,6 +1019,47 @@ class UserStoreMixin:
                         (n, when, when, clean),
                     )
                     return cursor.rowcount == 1
+
+    async def bump_session_generation(
+        self,
+        email: str,
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> Optional[int]:
+        """Increment session_generation for the user, revoking existing sessions.
+
+        When expected_generation is provided, performs an atomic conditional update
+        (only when stored session_generation matches expected_generation) in a single
+        statement, returning the new generation or None if 0 rows matched.
+        When expected_generation is None, raises UserNotFound if the user doesn't exist.
+        """
+        clean = normalize_email(email)
+        now = _to_db(utc_now())
+        async with _store_errors("bump_session_generation"):
+            async with self._pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    if expected_generation is not None:
+                        await cursor.execute(
+                            "UPDATE users SET session_generation = session_generation + 1, updated_at = %s "
+                            "WHERE email = %s AND session_generation = %s",
+                            (now, clean, expected_generation),
+                        )
+                        if cursor.rowcount == 0:
+                            return None
+                        return expected_generation + 1
+                    await cursor.execute(
+                        "UPDATE users SET session_generation = session_generation + 1, updated_at = %s "
+                        "WHERE email = %s",
+                        (now, clean),
+                    )
+                    if cursor.rowcount == 0:
+                        raise UserNotFound(clean)
+                    await cursor.execute(
+                        "SELECT session_generation FROM users WHERE email = %s",
+                        (clean,),
+                    )
+                    row = await cursor.fetchone()
+                    return int(row[0])
 
     async def list_users(
         self, filters: Optional[UserFilters] = None, limit: int = DEFAULT_PAGE_LIMIT,

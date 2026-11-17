@@ -5,12 +5,20 @@ the in-process Redis-less store, or the FakeUserStore the
 `user_store_backend` fixture installs for "mysql".
 """
 
+import base64
+import json
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlsplit
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from src import auth
 from src.auth import AuthenticatedUser, UserProfile, create_session_token
+from src.config import settings
 
 
 def _fake_mysql_store():
@@ -99,3 +107,114 @@ def session_token_for(user: AuthenticatedUser, **kwargs) -> str:
     """
     save_profile_for(user)
     return create_session_token(user, **kwargs)
+
+
+_RSA_KEY_CACHE: Dict[str, rsa.RSAPrivateKey] = {}
+
+
+def get_test_rsa_key(name: str = "primary") -> rsa.RSAPrivateKey:
+    key = _RSA_KEY_CACHE.get(name)
+    if key is None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        _RSA_KEY_CACHE[name] = key
+    return key
+
+
+def _b64u_int(value: int) -> str:
+    length = max(1, (value.bit_length() + 7) // 8)
+    return base64.urlsafe_b64encode(value.to_bytes(length, "big")).decode("ascii").rstrip("=")
+
+
+def rsa_jwk_from_key(private_key: rsa.RSAPrivateKey, kid: str = "test-key-1", alg: str = "RS256") -> Dict[str, Any]:
+    nums = private_key.public_key().public_numbers()
+    return {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": alg,
+        "kid": kid,
+        "n": _b64u_int(nums.n),
+        "e": _b64u_int(nums.e),
+    }
+
+
+def sign_rs256_jwt(
+    payload: Dict[str, Any],
+    *,
+    kid: Optional[str] = "test-key-1",
+    private_key: Optional[rsa.RSAPrivateKey] = None,
+    header_overrides: Optional[Dict[str, Any]] = None,
+) -> str:
+    key = private_key or get_test_rsa_key("primary")
+    header: Dict[str, Any] = {"alg": "RS256", "typ": "JWT"}
+    if kid is not None:
+        header["kid"] = kid
+    if header_overrides:
+        header.update(header_overrides)
+    h_b64 = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode()).decode().rstrip("=")
+    p_b64 = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    signing_input = f"{h_b64}.{p_b64}".encode("ascii")
+    sig = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    s_b64 = base64.urlsafe_b64encode(sig).decode().rstrip("=")
+    return f"{h_b64}.{p_b64}.{s_b64}"
+
+
+def install_test_keycloak_jwks(
+    monkeypatch,
+    keys: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
+    """Patches auth.fetch_keycloak_jwks to return test JWKS keys and records fetched URLs."""
+    from src import main as main_module
+
+    app_jwks_state = getattr(main_module.app.state, "jwks_state", None)
+    if app_jwks_state is not None:
+        app_jwks_state.clear_keycloak_jwks_cache()
+    jwk_list = keys if keys is not None else [rsa_jwk_from_key(get_test_rsa_key("primary"), kid="test-key-1")]
+    fetches: List[str] = []
+
+    async def _fake_fetch(jwks_url: str) -> List[Dict[str, Any]]:
+        fetches.append(jwks_url)
+        return list(jwk_list)
+
+    monkeypatch.setattr(auth, "fetch_keycloak_jwks", _fake_fetch)
+    return fetches
+
+
+def make_keycloak_id_claims(
+    *,
+    email: str = "curator@mskcc.org",
+    email_verified: Any = True,
+    sub: str = "kc-sub-123",
+    nonce: str = "test-nonce",
+    iss: Optional[str] = None,
+    aud: Any = None,
+    azp: Optional[str] = None,
+    iat: Optional[int] = None,
+    exp: Optional[int] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    now = int(time.time())
+    realm_url = f"{settings.keycloak_url.rstrip('/')}/realms/{settings.keycloak_realm.strip()}"
+    claims: Dict[str, Any] = {
+        "iss": iss if iss is not None else realm_url,
+        "aud": aud if aud is not None else settings.keycloak_client_id.strip(),
+        "sub": sub,
+        "nonce": nonce,
+        "email": email,
+        "email_verified": email_verified,
+        "iat": now if iat is None else iat,
+        "exp": (now + 300) if exp is None else exp,
+    }
+    if azp is not None:
+        claims["azp"] = azp
+    if extra:
+        claims.update(extra)
+    return claims
+
+
+def begin_oauth_login(client, provider: str = "google", redirect_to: str = "/") -> Tuple[str, str]:
+    """Starts an OAuth login via the browser login endpoint and returns (state, nonce)."""
+    url = "/auth/login" if provider == "google" else f"/auth/{provider}/login"
+    resp = client.get(url, params={"redirect_to": redirect_to}, follow_redirects=False)
+    assert resp.status_code in (302, 303, 307), resp.text
+    qs = parse_qs(urlsplit(resp.headers["location"]).query)
+    return qs["state"][0], qs["nonce"][0]

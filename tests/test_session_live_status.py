@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,14 +26,20 @@ from src.auth import (
     AuthenticatedUser,
     SAMLAssertionData,
     UserProfile,
-    create_oauth_state,
     create_session_token,
     decode_session_token,
 )
 from src.config import settings
 from src.main import app
 from src.models.schema import AnnotationResult
-from tests.auth_helpers import delete_profile, put_profile, stored_profile
+from tests.auth_helpers import (
+    delete_profile,
+    install_test_keycloak_jwks,
+    make_keycloak_id_claims,
+    put_profile,
+    sign_rs256_jwt,
+    stored_profile,
+)
 from tests.test_api_keys import FakeStore
 from tests.test_gene_query_api import FakeRunStore, pipeline_calls  # noqa: F401 (fixture)
 
@@ -80,6 +87,7 @@ class FakeAuthRedis:
         self.sets = {}
         self.hashes = {}
         self.gets = []
+        self._versions = {}
         self.fail = False
 
     def _check(self):
@@ -91,9 +99,16 @@ class FakeAuthRedis:
         self.gets.append(key)
         return self.data.get(key)
 
-    async def set(self, key, value):
+    async def set(self, key, value, ex=None):
         self._check()
         self.data[key] = value
+        self._versions[key] = self._versions.get(key, 0) + 1
+
+    async def getdel(self, key):
+        self._check()
+        if key in self.data:
+            self._versions[key] = self._versions.get(key, 0) + 1
+        return self.data.pop(key, None)
 
     async def sadd(self, key, *members):
         self._check()
@@ -107,26 +122,76 @@ class FakeAuthRedis:
         self._check()
         return dict(self.hashes.get(key, {}))
 
-    def pipeline(self):
-        return _FakePipeline(self)
+    def pipeline(self, transaction=True):
+        return _FakePipeline(self, transaction=transaction)
 
 
 class _FakePipeline:
-    def __init__(self, redis):
+    def __init__(self, redis, *, transaction=True):
         self.redis = redis
+        self.transaction = transaction
         self.ops = []
+        self._watched = {}
+        self._in_multi = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.unwatch()
+        return False
+
+    async def watch(self, *keys):
+        self.redis._check()
+        self._watched = {k: self.redis._versions.get(k, 0) for k in keys}
+
+    async def unwatch(self):
+        self._watched.clear()
+        self._in_multi = False
+        self.ops.clear()
+
+    async def get(self, key):
+        return await self.redis.get(key)
+
+    def multi(self):
+        self._in_multi = True
+        return self
+
+    def set(self, key, value, ex=None):
+        self.ops.append(("set", key, value, ex))
+        return self
 
     def hincrby(self, key, field, amount):
         self.ops.append(("hincrby", key, field, amount))
+        return self
 
     def hset(self, key, field, value):
         self.ops.append(("hset", key, field, value))
+        return self
 
     async def execute(self):
+        from redis.exceptions import WatchError
+
         self.redis._check()
-        for op, key, field, value in self.ops:
-            fields = self.redis.hashes.setdefault(key, {})
-            fields[field] = str(int(fields.get(field, 0)) + value) if op == "hincrby" else value
+        for key, snap_ver in self._watched.items():
+            if self.redis._versions.get(key, 0) != snap_ver:
+                self.ops.clear()
+                self._watched.clear()
+                self._in_multi = False
+                raise WatchError(f"Watched key {key!r} changed")
+        for op in self.ops:
+            kind = op[0]
+            if kind == "set":
+                _, key, value, _ex = op
+                self.redis.data[key] = value
+                self.redis._versions[key] = self.redis._versions.get(key, 0) + 1
+            else:
+                _, key, field, value = op
+                fields = self.redis.hashes.setdefault(key, {})
+                fields[field] = str(int(fields.get(field, 0)) + value) if kind == "hincrby" else value
+        self.ops.clear()
+        self._watched.clear()
+        self._in_multi = False
 
 
 @pytest.fixture
@@ -412,19 +477,39 @@ def keycloak_login(monkeypatch):
     monkeypatch.setattr(settings, "keycloak_url", "https://idp.example")
     monkeypatch.setattr(settings, "keycloak_client_id", "test-client")
     monkeypatch.setattr(settings, "keycloak_allowed_roles", "")
+    monkeypatch.setattr(settings, "keycloak_admin_roles", "acgc-admin")
     monkeypatch.setattr(settings, "jit_provisioning_enabled", False)
-    monkeypatch.setattr(main_module, "exchange_keycloak_code", AsyncMock(return_value={"access_token": "t"}))
-    monkeypatch.setattr(main_module, "get_keycloak_user_info", AsyncMock(return_value={}))
+    install_test_keycloak_jwks(monkeypatch)
 
     def login(role: str = "curator", groups=None):
-        user = AuthenticatedUser(
-            email=EMAIL, name="KC User", domain="mskcc.org", role=role, provider="keycloak", groups=groups or []
-        )
-        monkeypatch.setattr(main_module, "parse_keycloak_user", lambda *args: user)
         browser = TestClient(app)
+        login_resp = browser.get("/auth/keycloak/login", params={"redirect_to": "/"}, follow_redirects=False)
+        if login_resp.status_code != 303:
+            return browser, login_resp
+        qs = parse_qs(urlsplit(login_resp.headers["location"]).query)
+        state, nonce = qs["state"][0], qs["nonce"][0]
+        kc_groups = list(groups or [])
+        if role == "admin" and "acgc-admin" not in kc_groups:
+            kc_groups.append("acgc-admin")
+        id_claims = make_keycloak_id_claims(
+            email=EMAIL,
+            sub="kc-sub",
+            nonce=nonce,
+            extra={"groups": kc_groups} if kc_groups else None,
+        )
+        monkeypatch.setattr(
+            main_module,
+            "exchange_keycloak_code",
+            AsyncMock(return_value={"access_token": "t", "id_token": sign_rs256_jwt(id_claims)}),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "get_keycloak_user_info",
+            AsyncMock(return_value={"sub": "kc-sub", "name": "KC User", "groups": kc_groups}),
+        )
         resp = browser.get(
             "/auth/callback/keycloak",
-            params={"code": "c", "state": create_oauth_state("/")},
+            params={"code": "c", "state": state},
             follow_redirects=False,
         )
         return browser, resp
@@ -459,15 +544,27 @@ def test_keycloak_login_without_jit_keeps_stored_status(keycloak_login):
 @pytest.fixture
 def google_login(monkeypatch):
     monkeypatch.setattr(settings, "google_client_id", "test-client")
-    monkeypatch.setattr(main_module, "exchange_google_code", AsyncMock(return_value={"access_token": "t"}))
     monkeypatch.setattr(
         main_module, "get_google_user_info", AsyncMock(return_value={"email": EMAIL, "email_verified": True})
     )
 
     def login(browser: TestClient | None = None):
         browser = browser or TestClient(app)
+        login_client = TestClient(app)
+        login_resp = login_client.get("/auth/login", params={"redirect_to": "/"}, follow_redirects=False)
+        if login_resp.status_code not in (302, 303, 307):
+            return browser, login_resp
+        for name, value in login_client.cookies.items():
+            browser.cookies.set(name, value)
+        qs = parse_qs(urlsplit(login_resp.headers["location"]).query)
+        state, nonce = qs["state"][0], qs["nonce"][0]
+        monkeypatch.setattr(
+            main_module,
+            "exchange_google_code",
+            AsyncMock(return_value={"access_token": "t", "id_token": sign_rs256_jwt({"nonce": nonce})}),
+        )
         resp = browser.get(
-            "/auth/callback/google", params={"code": "c", "state": create_oauth_state("/")}, follow_redirects=False
+            "/auth/callback/google", params={"code": "c", "state": state}, follow_redirects=False
         )
         return browser, resp
 

@@ -4,6 +4,7 @@ import functools
 import os
 import sys
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 import aiomysql
@@ -154,6 +155,54 @@ def _default_auth_disabled(monkeypatch):
     monkeypatch.setattr(settings, "auth_enabled", False)
 
 
+class FakeOAuthRedis:
+    """In-memory async Redis stand-in for single-use OAuth transactions (str values)."""
+
+    def __init__(self) -> None:
+        self._store: Dict[str, Tuple[str, Optional[float]]] = {}
+        self.fail: bool = False
+        self.fail_on_getdel: bool = False
+        self.fail_after_getdel: bool = False
+
+    def _live(self, key: str) -> Optional[str]:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        val, exp = entry
+        if exp is not None and exp <= time.time():
+            del self._store[key]
+            return None
+        return val
+
+    async def get(self, key: str) -> Optional[str]:
+        if self.fail:
+            raise ConnectionError("redis down")
+        return self._live(key)
+
+    async def set(self, key: str, value: str, ex: Optional[float] = None, nx: bool = False):
+        if self.fail:
+            raise ConnectionError("redis down")
+        if nx and self._live(key) is not None:
+            return None
+        self._store[key] = (value, time.time() + ex if ex else None)
+        return True
+
+    async def getdel(self, key: str) -> Optional[str]:
+        if self.fail or self.fail_on_getdel:
+            raise ConnectionError("redis down")
+        val = self._live(key)
+        if val is not None:
+            del self._store[key]
+        if self.fail_after_getdel:
+            raise ConnectionError("redis error after GETDEL")
+        return val
+
+    async def delete(self, *keys: str) -> int:
+        if self.fail:
+            raise ConnectionError("redis down")
+        return sum(1 for k in keys if self._store.pop(k, None) is not None)
+
+
 @pytest.fixture(autouse=True)
 def _auth_profiles_in_memory(monkeypatch):
     """Keep JIT user profiles in src.auth's in-process store, empty per test.
@@ -162,22 +211,51 @@ def _auth_profiles_in_memory(monkeypatch):
     (503) when the configured Redis errors or can't be reached, so the auth
     module never talks to the configured Redis in tests. Yields the real
     store hooks so tests can exercise the Redis code path with a fake client.
+    OAuth transactions default to an isolated per-test FakeOAuthRedis unless
+    the test overrides _profile_store_redis or _oauth_txn_redis.
     """
     from src import auth
+
+    oauth_redis = FakeOAuthRedis()
+    real_oauth_txn_redis = auth._oauth_txn_redis
 
     originals = {
         "_get_auth_redis_client": auth._get_auth_redis_client,
         "_profile_store_redis": auth._profile_store_redis,
+        "_oauth_txn_redis": real_oauth_txn_redis,
+        "oauth_redis": oauth_redis,
     }
 
     async def _no_redis():
         return None
 
+    async def _test_oauth_txn_redis():
+        if auth._profile_store_redis is not _no_redis:
+            return await real_oauth_txn_redis()
+        return oauth_redis
+
     monkeypatch.setattr(auth, "_get_auth_redis_client", _no_redis)
     monkeypatch.setattr(auth, "_profile_store_redis", _no_redis)
+    monkeypatch.setattr(auth, "_oauth_txn_redis", _test_oauth_txn_redis)
     monkeypatch.setattr(auth, "_user_store", {})
     monkeypatch.setattr(auth, "_user_activity", {})
+    from src import main as main_module
+
+    def _reset_app_jwks_state() -> None:
+        state = getattr(main_module.app.state, "jwks_state", None)
+        if state is not None:
+            state.clear_keycloak_jwks_cache()
+            delattr(main_module.app.state, "jwks_state")
+
+    _reset_app_jwks_state()
     yield originals
+    _reset_app_jwks_state()
+
+
+@pytest.fixture
+def fake_oauth_redis(_auth_profiles_in_memory):
+    """Returns the per-test FakeOAuthRedis backing OAuth transactions."""
+    return _auth_profiles_in_memory["oauth_redis"]
 
 
 @pytest.fixture(params=["redis", "mysql"])

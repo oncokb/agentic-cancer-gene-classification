@@ -216,9 +216,21 @@ class FakeUserStore:
             created_at=now,
         )
         if field_name == "role":
-            updated = replace(user, role=value, role_updated_by=actor, role_updated_at=now, updated_at=now)
+            updated = replace(
+                user,
+                role=value,
+                role_updated_by=actor,
+                role_updated_at=now,
+                updated_at=now,
+            )
         else:
-            updated = replace(user, status=value, updated_at=now)
+            new_gen = user.session_generation + 1 if value == "disabled" else user.session_generation
+            updated = replace(
+                user,
+                status=value,
+                updated_at=now,
+                session_generation=new_gen,
+            )
         self._append_role_change(change)
         self._users[email] = updated
         return change
@@ -319,6 +331,26 @@ class FakeUserStore:
                 last_annotation_at=when if last is None else max(last, when),
             )
             return True
+
+    async def bump_session_generation(
+        self,
+        email: str,
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> Optional[int]:
+        clean = normalize_email(email)
+        self._check_available("bump_session_generation")
+        async with self._lock:
+            user = self._users.get(clean)
+            if user is None:
+                if expected_generation is not None:
+                    return None
+                raise UserNotFound(clean)
+            if expected_generation is not None and user.session_generation != expected_generation:
+                return None
+            new_gen = user.session_generation + 1
+            self._users[clean] = replace(user, session_generation=new_gen, updated_at=_db_time())
+            return new_gen
 
     async def list_users(
         self, filters: Optional[UserFilters] = None, limit: int = DEFAULT_PAGE_LIMIT,
