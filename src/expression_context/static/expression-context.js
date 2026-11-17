@@ -180,6 +180,61 @@
       batchPolling: false,
       batchIncomplete: false,
     };
+    let activeBatchGeneration = 0;
+    let activeBatchController = null;
+    let activeBatchTimer = null;
+    let activeBatchTimerResolve = null;
+    let cancelInFlight = false;
+
+    function cancelActiveBatchLoop() {
+      activeBatchGeneration += 1;
+      if (activeBatchController) {
+        try { activeBatchController.abort(); } catch (_) {}
+        activeBatchController = null;
+      }
+      if (activeBatchTimer !== null && typeof win.clearTimeout === "function") {
+        win.clearTimeout(activeBatchTimer);
+        activeBatchTimer = null;
+      }
+      if (activeBatchTimerResolve) {
+        const resolve = activeBatchTimerResolve;
+        activeBatchTimerResolve = null;
+        resolve();
+      }
+      state.batchPolling = false;
+    }
+
+    function sleepBatch(ms, generation, controller) {
+      if (generation !== activeBatchGeneration || (controller && controller.signal.aborted)) {
+        return Promise.resolve();
+      }
+      if (wait) {
+        return new Promise((done) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (activeBatchTimerResolve === finish) activeBatchTimerResolve = null;
+            done();
+          };
+          activeBatchTimerResolve = finish;
+          Promise.resolve(wait(ms, controller ? controller.signal : undefined)).then(finish, finish);
+        });
+      }
+      return new Promise((done) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          activeBatchTimer = null;
+          if (activeBatchTimerResolve === finish) activeBatchTimerResolve = null;
+          done();
+        };
+        activeBatchTimerResolve = finish;
+        const timerId = win.setTimeout(finish, ms);
+        if (!settled) activeBatchTimer = timerId;
+      });
+    }
 
     function show(node, visible) { if (node) node.classList.toggle("hidden", !visible); }
 
@@ -838,6 +893,7 @@
         show(el["ec-result"], false);
         if (state.batch) show(el["ec-batch-result"], true);
       } else {
+        cancelActiveBatchLoop();
         show(el["ec-batch-result"], false);
         if (state.view) show(el["ec-result"], true);
       }
@@ -965,14 +1021,38 @@
       return badge("Failed", "fail");
     }
 
+    const VALID_BATCH_GENE_STATUSES = new Set([
+      "queued",
+      "skipped_no_stats",
+      "skipped_fresh",
+      "running",
+      "done",
+      "failed",
+      "not_found",
+    ]);
+
+    function isValidBatchGene(g) {
+      if (!g || typeof g !== "object" || Array.isArray(g)) return false;
+      if (Object.prototype.toString.call(g) !== "[object Object]") return false;
+      if (typeof g.position !== "number" || !Number.isFinite(g.position)) return false;
+      if (typeof g.input_symbol !== "string") return false;
+      if (typeof g.status !== "string" || !VALID_BATCH_GENE_STATUSES.has(g.status)) return false;
+      if (g.hugo_symbol !== null && typeof g.hugo_symbol !== "string") return false;
+      return true;
+    }
+
+    function isValidGeneList(genes) {
+      return Array.isArray(genes) && genes.every(isValidBatchGene);
+    }
+
     function renderBatch(batch) {
       const counts = batch.counts || {};
       const expectedTotal = typeof counts.total === "number" ? counts.total : null;
-      const genesList = Array.isArray(batch.genes) ? batch.genes : [];
-      if (expectedTotal !== null && genesList.length !== expectedTotal) {
+      if (!isValidGeneList(batch.genes) || (expectedTotal !== null && batch.genes.length !== expectedTotal)) {
         state.batchIncomplete = true;
         return;
       }
+      const genesList = batch.genes;
       state.batch = batch;
       const total = expectedTotal !== null ? expectedTotal : (genesList.length || 0);
       const finished = (counts.done || 0) + (counts.skipped_no_stats || 0) +
@@ -1047,6 +1127,14 @@
     async function loadBatch(batchId) {
       const id = String(batchId || "").trim();
       if (!id) return;
+      cancelActiveBatchLoop();
+      const generation = activeBatchGeneration;
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      activeBatchController = controller;
+      state.batchPolling = true;
+      const isStale = () => generation !== activeBatchGeneration || Boolean(controller && controller.signal.aborted);
+      const fetchOpts = controller ? { signal: controller.signal } : undefined;
+
       setError("");
       setMode("batch");
       state.batchGeneViews.clear();
@@ -1056,74 +1144,88 @@
         win.history.replaceState(null, "", `?batch=${encodeURIComponent(id)}`);
       }
       let pageFailures = 0;
-      for (let poll = 0; poll < maxPolls; poll += 1) {
-        const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}`);
-        if (status === 401) {
-          redirectToLogin();
-          return;
-        }
-        if (status !== 200 || !body) {
-          setError(status === 404 ? "Batch not found." : friendlyError(status, id));
-          return;
-        }
-
-        let incomplete = false;
-        let allGenes = null;
-        const expectedTotal = body.counts && typeof body.counts.total === "number"
-          ? body.counts.total
-          : null;
-
-        if (!Array.isArray(body.genes) || expectedTotal === null || body.genes.some((g) => !g || typeof g !== "object")) {
-          incomplete = true;
-        } else {
-          allGenes = [...body.genes];
-          while (allGenes.length < expectedTotal) {
-            const nextRes = await getJson(
-              `${API}/batches/${encodeURIComponent(id)}?offset=${allGenes.length}&limit=200`
-            );
-            if (nextRes.status === 401) {
-              redirectToLogin();
-              return;
-            }
-            if (
-              nextRes.status !== 200 ||
-              !nextRes.body ||
-              !Array.isArray(nextRes.body.genes) ||
-              nextRes.body.genes.length === 0 ||
-              nextRes.body.genes.some((g) => !g || typeof g !== "object")
-            ) {
-              incomplete = true;
-              break;
-            }
-            allGenes = allGenes.concat(nextRes.body.genes);
+      try {
+        for (let poll = 0; poll < maxPolls; poll += 1) {
+          if (isStale()) return;
+          const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}`, fetchOpts);
+          if (isStale()) return;
+          if (status === 401) {
+            redirectToLogin();
+            return;
           }
-          if (!incomplete && allGenes.length !== expectedTotal) {
+          if (status !== 200 || !body) {
+            setError(status === 404 ? "Batch not found." : friendlyError(status, id));
+            return;
+          }
+
+          let incomplete = false;
+          let allGenes = null;
+          const expectedTotal = body.counts && typeof body.counts.total === "number"
+            ? body.counts.total
+            : null;
+
+          if (!isValidGeneList(body.genes) || expectedTotal === null) {
             incomplete = true;
+          } else {
+            allGenes = [...body.genes];
+            while (allGenes.length < expectedTotal) {
+              if (isStale()) return;
+              const nextRes = await getJson(
+                `${API}/batches/${encodeURIComponent(id)}?offset=${allGenes.length}&limit=200`,
+                fetchOpts
+              );
+              if (isStale()) return;
+              if (nextRes.status === 401) {
+                redirectToLogin();
+                return;
+              }
+              if (
+                nextRes.status !== 200 ||
+                !nextRes.body ||
+                !isValidGeneList(nextRes.body.genes) ||
+                nextRes.body.genes.length === 0
+              ) {
+                incomplete = true;
+                break;
+              }
+              allGenes = allGenes.concat(nextRes.body.genes);
+            }
+            if (!incomplete && allGenes.length !== expectedTotal) {
+              incomplete = true;
+            }
           }
-        }
 
-        if (incomplete) {
-          state.batchIncomplete = true;
-          pageFailures += 1;
-          if (poll + 1 < maxPolls && pageFailures <= maxPageRetries) {
-            setError("Couldn't load all genes; retrying");
-            const backoff = Math.min(30000, pollMs * (2 ** (pageFailures - 1)));
-            await sleep(backoff);
-            continue;
+          if (isStale()) return;
+          if (incomplete) {
+            state.batchIncomplete = true;
+            pageFailures += 1;
+            if (poll + 1 < maxPolls && pageFailures <= maxPageRetries) {
+              setError("Couldn't load all genes; retrying");
+              const backoff = Math.min(30000, pollMs * (2 ** (pageFailures - 1)));
+              await sleepBatch(backoff, generation, controller);
+              if (isStale()) return;
+              continue;
+            }
+            setError("Couldn't load all genes. Please reload to try again.");
+            return;
           }
-          setError("Couldn't load all genes. Please reload to try again.");
-          return;
-        }
 
-        pageFailures = 0;
-        state.batchIncomplete = false;
-        setError("");
-        body.genes = allGenes;
-        renderBatch(body);
-        if (!["queued", "running"].includes(body.status)) {
-          return;
+          pageFailures = 0;
+          state.batchIncomplete = false;
+          setError("");
+          body.genes = allGenes;
+          renderBatch(body);
+          if (!["queued", "running"].includes(body.status)) {
+            return;
+          }
+          await sleepBatch(pollMs, generation, controller);
+          if (isStale()) return;
         }
-        await sleep(pollMs);
+      } finally {
+        if (generation === activeBatchGeneration) {
+          state.batchPolling = false;
+          if (activeBatchController === controller) activeBatchController = null;
+        }
       }
     }
 
@@ -1161,24 +1263,38 @@
     }
 
     async function cancelCurrentBatch() {
-      if (!state.batch || !state.batch.batch_id) return;
+      if (cancelInFlight || !state.batch || !state.batch.batch_id) return;
       const id = state.batch.batch_id;
-      const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}/cancel`, {
-        method: "POST",
-        headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      if (status === 200 && body) {
-        if (
-          body.counts && typeof body.counts.total === "number" &&
-          (!Array.isArray(body.genes) || body.genes.length !== body.counts.total)
-        ) {
-          await loadBatch(id);
-        } else {
-          renderBatch(body);
+      cancelInFlight = true;
+      if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = true;
+      cancelActiveBatchLoop();
+      try {
+        const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}/cancel`, {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        if (status === 401) {
+          redirectToLogin();
+          return;
         }
-      } else if (status === 401) {
-        redirectToLogin();
+        if (status === 200 && body) {
+          if (
+            body.counts && typeof body.counts.total === "number" &&
+            isValidGeneList(body.genes) && body.genes.length === body.counts.total
+          ) {
+            state.batchIncomplete = false;
+            setError("");
+            renderBatch(body);
+          } else {
+            await loadBatch(id);
+          }
+        } else {
+          setError(friendlyError(status, id));
+        }
+      } finally {
+        cancelInFlight = false;
+        if (el["ec-batch-cancel"]) el["ec-batch-cancel"].disabled = false;
       }
     }
 

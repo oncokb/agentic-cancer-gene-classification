@@ -1444,12 +1444,13 @@ class ExpressionContextService:
         await self.catalog.verify_active(bundle)
 
         async def stream() -> AsyncIterator[str]:
-            yield format_rows((), include_header=True, include_bom=True)
             try:
                 await self.catalog.verify_active(bundle)
             except (BundleGone, BundleNotLoaded) as exc:
-                logger.error("Active bundle superseded during batch export stream: %s", exc)
+                logger.error("Active bundle superseded before starting batch export stream: %s", exc)
                 raise
+
+            yield format_rows((), include_header=True, include_bom=True)
 
             if first_page_rows:
                 yield format_rows(first_page_rows, include_header=False, include_bom=False)

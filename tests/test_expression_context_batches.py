@@ -1308,6 +1308,45 @@ async def test_batch_exports_streaming_page_by_page_and_supersession():
                 pass
 
 
+@pytest.mark.asyncio
+async def test_batch_exports_supersede_before_first_byte_yields_nothing():
+    bundle_a = build_bundle(("ERBB2", "MYCN"), release_id="rel-a")
+    bundle_b = build_bundle(("ERBB2", "MYCN"), release_id="rel-b")
+    harness = CsvHarness(bundle=bundle_a)
+
+    with TestClient(harness.app) as client:
+        resp = client.post(
+            f"{PREFIX}/batches",
+            json={"genes": ["ERBB2", "MYCN"]},
+            headers=SAME_ORIGIN,
+        )
+        assert resp.status_code == 202
+        batch_id = resp.json()["batch_id"]
+        wait_for_batch(client, batch_id)
+
+    for export_fn_name in (
+        "export_batch_per_pair_csv",
+        "export_batch_golden_set_csv",
+        "export_batch_curator_sheet_csv",
+    ):
+        await seed_bundle(harness.bundles, bundle_a)
+        harness.service.catalog.invalidate()
+
+        export_fn = getattr(harness.service, export_fn_name)
+        filename, stream = await export_fn(batch_id, page_size=1)
+        assert filename.endswith(".csv")
+
+        # Supersede after export method returns, before first byte is consumed
+        await seed_bundle(harness.bundles, bundle_b)
+        harness.service.catalog.invalidate()
+
+        chunks = []
+        with pytest.raises(BundleGone):
+            async for chunk in stream:
+                chunks.append(chunk)
+        assert chunks == []
+
+
 # ---------------------------------------------------------------------------
 # Blocker 6: Authorization & CSRF tests
 # ---------------------------------------------------------------------------
