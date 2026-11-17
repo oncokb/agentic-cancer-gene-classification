@@ -565,6 +565,20 @@ class MySQLExpressionContextStore:
                             raise
                 for ddl in CREATE_BATCH_TABLES_SQL:
                     await cursor.execute(ddl)
+                await cursor.execute(
+                    f"SHOW INDEX FROM {BATCH_GENES_TABLE} WHERE Key_name = 'idx_expression_context_batch_genes_pos'"
+                )
+                if await cursor.fetchone():
+                    try:
+                        await cursor.execute(
+                            f"ALTER TABLE {BATCH_GENES_TABLE} DROP INDEX idx_expression_context_batch_genes_pos"
+                        )
+                    except Exception as exc:
+                        errno = getattr(exc, "errno", None)
+                        if errno is None and getattr(exc, "args", None):
+                            errno = exc.args[0]
+                        if errno != 1091 and "doesn't exist" not in str(exc).lower():
+                            raise
 
     @staticmethod
     def _row_to_pair(row: Tuple[Any, ...]) -> StoredPair:

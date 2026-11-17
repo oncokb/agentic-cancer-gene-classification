@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from scripts.expression_context_batch import main as cli_main
 from scripts.expression_context_batch import run_batch_cli
 from src.auth import AuthenticatedUser
-from src.expression_context.bundle_store import BundleState, InMemoryBundleStore
+from src.expression_context.bundle_store import InMemoryBundleStore
 from src.expression_context.catalog import StatsCatalog
 from src.expression_context.csv_export import (
     CURATOR_SHEET_COLUMNS,
@@ -731,6 +731,7 @@ def test_unchecked_and_partial_pending_notes_and_golden_set_batch_unchecked_row(
 
 def test_batch_exports_bundle_supersession_mid_stream_and_503_when_no_bundle():
     bundle_a = build_bundle(("ERBB2", "MYCN"), release_id="rel-a")
+    bundle_b = build_bundle(("ERBB2", "MYCN"), release_id="rel-b")
     harness = CsvHarness(bundle=bundle_a)
 
     with TestClient(harness.app) as client:
@@ -738,19 +739,36 @@ def test_batch_exports_bundle_supersession_mid_stream_and_503_when_no_bundle():
         batch_id = resp.json()["batch_id"]
         wait_for_batch(client, batch_id)
 
+        orig_gene_view = harness.service.gene_view
+
         for export_path in (
             f"{PREFIX}/batches/{batch_id}/export.csv",
             f"{PREFIX}/batches/{batch_id}/golden-set.csv",
             f"{PREFIX}/batches/{batch_id}/curator-sheet.csv",
         ):
-            harness.bundles.bundles.clear()
-            harness.bundles.state = BundleState()
-            harness.service.catalog.invalidate()
-            r = client.get(export_path)
-            assert r.status_code == 503, f"Expected 503 on supersession for {export_path}, got {r.status_code}"
-            assert "text/csv" not in r.headers.get("content-type", "")
             asyncio.run(seed_bundle(harness.bundles, bundle_a))
             harness.service.catalog.invalidate()
+            calls = 0
+
+            async def switch_on_last_page1_gene_view(gene, *, resolved=None):
+                nonlocal calls
+                calls += 1
+                out = await orig_gene_view(gene, resolved=resolved)
+                if calls == 2:
+                    # Swap active release during the last gene_view call of page 1
+                    await seed_bundle(harness.bundles, bundle_b)
+                    harness.service.catalog.invalidate()
+                return out
+
+            harness.service.gene_view = switch_on_last_page1_gene_view
+            r = client.get(export_path)
+            assert r.status_code == 503, f"Expected 503 on supersession for {export_path}, got {r.status_code}"
+            assert r.headers.get("retry-after") == "60"
+            assert "text/csv" not in r.headers.get("content-type", "")
+            assert not r.content.startswith(UTF8_BOM.encode("utf-8"))
+            assert "gene_symbol" not in r.text
+            assert "Genes" not in r.text
+            harness.service.gene_view = orig_gene_view
 
     # 503 when no bundle is loaded
     unseeded = CsvHarness(seed=False)
@@ -758,6 +776,31 @@ def test_batch_exports_bundle_supersession_mid_stream_and_503_when_no_bundle():
         assert client.post(f"{PREFIX}/batches", json={"genes": ["ERBB2"]}, headers=SAME_ORIGIN).status_code == 503
         assert client.get(f"{PREFIX}/batches").status_code == 503
         assert client.get(f"{PREFIX}/genes/ERBB2/curator-sheet.csv").status_code == 503
+
+
+def test_batch_oversized_entries_deduplicated_by_original_string():
+    bundle = build_bundle(("ERBB2",))
+    harness = CsvHarness(bundle=bundle)
+    prefix = "A" * 64
+    over_1 = prefix + "1"
+    over_2 = prefix + "2"
+
+    with TestClient(harness.app) as client:
+        resp = client.post(
+            f"{PREFIX}/batches",
+            json={"genes": [over_1, over_2, over_1]},
+            headers=SAME_ORIGIN,
+        )
+        assert resp.status_code == 202
+        detail = client.get(f"{PREFIX}/batches/{resp.json()['batch_id']}").json()
+        assert detail["status"] == "done"
+        assert detail["counts"]["total"] == 2
+        assert detail["counts"]["not_found"] == 2
+        assert len(detail["genes"]) == 2
+        assert detail["genes"][0]["input_symbol"] == prefix
+        assert detail["genes"][1]["input_symbol"] == prefix
+        assert detail["genes"][0]["notes"] == "entry exceeds 64 characters (truncated); duplicate of row 1"
+        assert detail["genes"][1]["notes"] == "entry exceeds 64 characters (truncated)"
 
 
 # ---------------------------------------------------------------------------

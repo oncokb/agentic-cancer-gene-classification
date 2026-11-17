@@ -146,7 +146,7 @@
     return "Couldn't load expression statistics. Check your connection and try again.";
   }
 
-  function createExpressionContextPage({ document: doc, window: win, fetch: fetchFn, wait, pollMs = 2000, maxPolls = 600 }) {
+  function createExpressionContextPage({ document: doc, window: win, fetch: fetchFn, wait, pollMs = 2000, maxPolls = 600, maxPageRetries = 5 }) {
     const el = {};
     for (const id of [
       "ec-form", "ec-gene", "ec-submit", "ec-error", "ec-loading", "ec-result", "ec-gene-title",
@@ -178,6 +178,7 @@
       batchGeneViews: new Map(),
       batchItemStatuses: new Map(),
       batchPolling: false,
+      batchIncomplete: false,
     };
 
     function show(node, visible) { if (node) node.classList.toggle("hidden", !visible); }
@@ -965,9 +966,15 @@
     }
 
     function renderBatch(batch) {
-      state.batch = batch;
       const counts = batch.counts || {};
-      const total = counts.total || (batch.genes || []).length || 0;
+      const expectedTotal = typeof counts.total === "number" ? counts.total : null;
+      const genesList = Array.isArray(batch.genes) ? batch.genes : [];
+      if (expectedTotal !== null && genesList.length !== expectedTotal) {
+        state.batchIncomplete = true;
+        return;
+      }
+      state.batch = batch;
+      const total = expectedTotal !== null ? expectedTotal : (genesList.length || 0);
       const finished = (counts.done || 0) + (counts.skipped_no_stats || 0) +
         (counts.skipped_fresh || 0) + (counts.failed || 0) + (counts.not_found || 0);
       if (el["ec-batch-title"]) {
@@ -1044,9 +1051,11 @@
       setMode("batch");
       state.batchGeneViews.clear();
       state.batchItemStatuses.clear();
+      state.batchIncomplete = false;
       if (win.history && typeof win.history.replaceState === "function") {
         win.history.replaceState(null, "", `?batch=${encodeURIComponent(id)}`);
       }
+      let pageFailures = 0;
       for (let poll = 0; poll < maxPolls; poll += 1) {
         const { status, body } = await getJson(`${API}/batches/${encodeURIComponent(id)}`);
         if (status === 401) {
@@ -1057,20 +1066,59 @@
           setError(status === 404 ? "Batch not found." : friendlyError(status, id));
           return;
         }
-        // Fetch all pages if batch contains more than 200 genes
-        if (body.counts && body.counts.total > (body.genes ? body.genes.length : 0)) {
-          let allGenes = body.genes ? [...body.genes] : [];
-          while (allGenes.length < body.counts.total) {
+
+        let incomplete = false;
+        let allGenes = null;
+        const expectedTotal = body.counts && typeof body.counts.total === "number"
+          ? body.counts.total
+          : null;
+
+        if (!Array.isArray(body.genes) || expectedTotal === null || body.genes.some((g) => !g || typeof g !== "object")) {
+          incomplete = true;
+        } else {
+          allGenes = [...body.genes];
+          while (allGenes.length < expectedTotal) {
             const nextRes = await getJson(
               `${API}/batches/${encodeURIComponent(id)}?offset=${allGenes.length}&limit=200`
             );
-            if (nextRes.status !== 200 || !nextRes.body || !nextRes.body.genes || !nextRes.body.genes.length) {
+            if (nextRes.status === 401) {
+              redirectToLogin();
+              return;
+            }
+            if (
+              nextRes.status !== 200 ||
+              !nextRes.body ||
+              !Array.isArray(nextRes.body.genes) ||
+              nextRes.body.genes.length === 0 ||
+              nextRes.body.genes.some((g) => !g || typeof g !== "object")
+            ) {
+              incomplete = true;
               break;
             }
             allGenes = allGenes.concat(nextRes.body.genes);
           }
-          body.genes = allGenes;
+          if (!incomplete && allGenes.length !== expectedTotal) {
+            incomplete = true;
+          }
         }
+
+        if (incomplete) {
+          state.batchIncomplete = true;
+          pageFailures += 1;
+          if (poll + 1 < maxPolls && pageFailures <= maxPageRetries) {
+            setError("Couldn't load all genes; retrying");
+            const backoff = Math.min(30000, pollMs * (2 ** (pageFailures - 1)));
+            await sleep(backoff);
+            continue;
+          }
+          setError("Couldn't load all genes. Please reload to try again.");
+          return;
+        }
+
+        pageFailures = 0;
+        state.batchIncomplete = false;
+        setError("");
+        body.genes = allGenes;
         renderBatch(body);
         if (!["queued", "running"].includes(body.status)) {
           return;
@@ -1121,7 +1169,14 @@
         body: JSON.stringify({}),
       });
       if (status === 200 && body) {
-        renderBatch(body);
+        if (
+          body.counts && typeof body.counts.total === "number" &&
+          (!Array.isArray(body.genes) || body.genes.length !== body.counts.total)
+        ) {
+          await loadBatch(id);
+        } else {
+          renderBatch(body);
+        }
       } else if (status === 401) {
         redirectToLogin();
       }

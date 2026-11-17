@@ -309,6 +309,73 @@ async def test_mysql_store_contract(mysql_store):
     await _exercise_store(mysql_store)
 
 
+async def test_mysql_ensure_schema_drops_duplicate_batch_genes_index(mysql_store):
+    async with mysql_store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"ALTER TABLE {BATCH_GENES_TABLE} ADD INDEX idx_expression_context_batch_genes_pos (batch_id, position)"
+            )
+            await cursor.execute(
+                f"SHOW INDEX FROM {BATCH_GENES_TABLE} WHERE Key_name = 'idx_expression_context_batch_genes_pos'"
+            )
+            assert await cursor.fetchone() is not None
+
+    await mysql_store.ensure_schema()
+    await mysql_store.ensure_schema()
+
+    async with mysql_store._pool.acquire() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SHOW INDEX FROM {BATCH_GENES_TABLE} WHERE Key_name = 'idx_expression_context_batch_genes_pos'"
+            )
+            assert await cursor.fetchone() is None
+
+
+async def test_ensure_schema_tolerates_missing_index_drop_race():
+    import pymysql
+
+    for err in (
+        pymysql.err.OperationalError(1091, "Can't DROP 'idx_expression_context_batch_genes_pos'; check that column/key exists"),
+        RuntimeError("index idx_expression_context_batch_genes_pos doesn't exist"),
+    ):
+        class FakeCursor:
+            def __init__(self):
+                self._last_sql = ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def execute(self, sql, args=None):
+                self._last_sql = sql
+                if "DROP INDEX idx_expression_context_batch_genes_pos" in sql:
+                    raise err
+
+            async def fetchone(self):
+                if "SHOW INDEX" in self._last_sql and "idx_expression_context_batch_genes_pos" in self._last_sql:
+                    return ("row",)
+                return ("row",)
+
+        class FakeConn:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def cursor(self):
+                return FakeCursor()
+
+        class FakePool:
+            def acquire(self):
+                return FakeConn()
+
+        store = MySQLExpressionContextStore(FakePool())
+        await store.ensure_schema()
+
+
 # ------------------------------------------------------------- bundle store
 
 

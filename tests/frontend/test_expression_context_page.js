@@ -83,7 +83,7 @@ function plotParams(href) {
   };
 }
 
-function env(routes, { search = "" } = {}) {
+function env(routes, { search = "", wait = async () => {}, pollMs = 2000, maxPageRetries = 5 } = {}) {
   const nodes = Object.fromEntries(IDS.map((id) => [id, new Element("div")]));
   nodes["ec-error"].classList.toggle("hidden", true);
   nodes["ec-result"].classList.toggle("hidden", true);
@@ -118,7 +118,7 @@ function env(routes, { search = "" } = {}) {
     if (!handler) throw new Error(`unexpected request ${options.method || "GET"} ${url}`);
     return typeof handler === "function" ? handler() : handler;
   };
-  const page = createExpressionContextPage({ document, window, fetch, wait: async () => {} });
+  const page = createExpressionContextPage({ document, window, fetch, wait, pollMs, maxPageRetries });
   return { nodes, page, calls, window, replaced };
 }
 
@@ -1417,6 +1417,190 @@ test("batch with >200 genes pages all genes and listed count matches total count
   assert.strictEqual(renderedSections.length, 250);
   assert.ok(renderedSections[0].children[0].text.includes("GENE1"));
   assert.ok(renderedSections[249].children[0].text.includes("GENE250"));
+});
+
+test("page 2 returns 500 -> shows error banner, retries with backoff, then renders full list", async () => {
+  const TOTAL = 250;
+  const allGenes = Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status: "done",
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const page1 = {
+    batch_id: "batch-retry",
+    status: "running",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: 200, queued: 50, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(0, 200),
+  };
+  const page1Done = {
+    ...page1,
+    status: "done",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+  };
+  const page2 = {
+    ...page1Done,
+    genes: allGenes.slice(200, 250),
+  };
+
+  let p1Calls = 0;
+  let p2Calls = 0;
+  const delays = [];
+  const snapshotsDuringRetry = [];
+
+  let ref;
+  ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-retry": () => {
+        p1Calls += 1;
+        return response(p1Calls >= 3 ? page1Done : page1);
+      },
+      "GET /v1/expression-context/batches/batch-retry?offset=200&limit=200": () => {
+        p2Calls += 1;
+        if (p2Calls <= 2) return response({ detail: "internal error" }, 500);
+        return response(page2);
+      },
+    },
+    {
+      pollMs: 1000,
+      wait: async (ms) => {
+        delays.push(ms);
+        snapshotsDuringRetry.push({
+          errorHidden: ref.nodes["ec-error"].hidden,
+          errorText: ref.nodes["ec-error"].textContent,
+          renderedLen: ref.nodes["ec-batch-genes"].children.length,
+          incomplete: ref.page.state.batchIncomplete,
+        });
+      },
+    }
+  );
+
+  await ref.page.loadBatch("batch-retry");
+
+  // During attempts 1 & 2, banner was shown, incomplete was true, partial list was never rendered, and backoff grew
+  assert.strictEqual(p2Calls, 3);
+  assert.strictEqual(delays.length, 2);
+  assert.strictEqual(delays[0], 1000);
+  assert.strictEqual(delays[1], 2000);
+  for (const snap of snapshotsDuringRetry) {
+    assert.strictEqual(snap.errorHidden, false);
+    assert.ok(snap.errorText.includes("Couldn't load all genes; retrying"));
+    assert.strictEqual(snap.renderedLen, 0);
+    assert.strictEqual(snap.incomplete, true);
+  }
+
+  // After retry succeeds, error clears and full 250 genes render
+  assert.strictEqual(ref.nodes["ec-error"].hidden, true);
+  assert.strictEqual(ref.nodes["ec-error"].textContent, "");
+  assert.strictEqual(ref.page.state.batchIncomplete, false);
+  assert.strictEqual(ref.nodes["ec-batch-genes"].children.length, 250);
+  assert.ok(ref.nodes["ec-batch-genes"].children[249].children[0].text.includes("GENE250"));
+});
+
+test("done batch with failed page 2 still retries and renders full list", async () => {
+  const TOTAL = 250;
+  const allGenes = Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status: "done",
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const page1Done = {
+    batch_id: "batch-done-retry",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(0, 200),
+  };
+  const page2Done = {
+    ...page1Done,
+    genes: allGenes.slice(200, 250),
+  };
+
+  let p2Calls = 0;
+  let sawBanner = false;
+  let ref;
+  ref = env(
+    {
+      "GET /v1/expression-context/batches/batch-done-retry": response(page1Done),
+      "GET /v1/expression-context/batches/batch-done-retry?offset=200&limit=200": () => {
+        p2Calls += 1;
+        if (p2Calls === 1) return response({ detail: "upstream 502" }, 502);
+        return response(page2Done);
+      },
+    },
+    {
+      wait: async () => {
+        if (!ref.nodes["ec-error"].hidden && ref.nodes["ec-error"].textContent.includes("Couldn't load all genes; retrying")) {
+          sawBanner = true;
+        }
+      },
+    }
+  );
+
+  await ref.page.loadBatch("batch-done-retry");
+  assert.strictEqual(p2Calls, 2);
+  assert.strictEqual(sawBanner, true);
+  assert.strictEqual(ref.nodes["ec-error"].hidden, true);
+  assert.strictEqual(ref.page.state.batchIncomplete, false);
+  assert.strictEqual(ref.nodes["ec-batch-genes"].children.length, 250);
+});
+
+test("malformed or empty-but-short page leaves batch incomplete without partial list", async () => {
+  const TOTAL = 250;
+  const allGenes = Array.from({ length: TOTAL }, (_, i) => ({
+    position: i,
+    input_symbol: `GENE${i + 1}`,
+    hugo_symbol: `GENE${i + 1}`,
+    status: "done",
+    error: null,
+    notes: null,
+    updated_at: "2026-11-17T12:00:00Z",
+  }));
+  const page1 = {
+    batch_id: "batch-malformed",
+    status: "done",
+    release_id: "rel-1",
+    counts: { total: TOTAL, done: TOTAL, queued: 0, running: 0, failed: 0, skipped_no_stats: 0, skipped_fresh: 0, not_found: 0 },
+    genes: allGenes.slice(0, 200),
+  };
+
+  // Case A: malformed page 2 (genes is not an array)
+  const malEnv = env(
+    {
+      "GET /v1/expression-context/batches/batch-malformed": response(page1),
+      "GET /v1/expression-context/batches/batch-malformed?offset=200&limit=200": response({ batch_id: "batch-malformed", genes: "not-an-array" }),
+    },
+    { maxPageRetries: 2 }
+  );
+  await malEnv.page.loadBatch("batch-malformed");
+  assert.strictEqual(malEnv.page.state.batchIncomplete, true);
+  assert.strictEqual(malEnv.nodes["ec-error"].hidden, false);
+  assert.ok(malEnv.nodes["ec-error"].textContent.includes("Couldn't load all genes"));
+  assert.strictEqual(malEnv.nodes["ec-batch-genes"].children.length, 0);
+  assert.strictEqual(malEnv.nodes["ec-batch-result"].hidden, true);
+
+  // Case B: empty-but-short page 2 (genes: [] while total=250)
+  const shortEnv = env(
+    {
+      "GET /v1/expression-context/batches/batch-malformed": response(page1),
+      "GET /v1/expression-context/batches/batch-malformed?offset=200&limit=200": response({ ...page1, genes: [] }),
+    },
+    { maxPageRetries: 2 }
+  );
+  await shortEnv.page.loadBatch("batch-malformed");
+  assert.strictEqual(shortEnv.page.state.batchIncomplete, true);
+  assert.strictEqual(shortEnv.nodes["ec-error"].hidden, false);
+  assert.ok(shortEnv.nodes["ec-error"].textContent.includes("Couldn't load all genes"));
+  assert.strictEqual(shortEnv.nodes["ec-batch-genes"].children.length, 0);
+  assert.strictEqual(shortEnv.nodes["ec-batch-result"].hidden, true);
 });
 
 (async () => {

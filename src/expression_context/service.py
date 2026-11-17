@@ -999,7 +999,7 @@ class ExpressionContextService:
         for input_idx, raw in enumerate(cleaned, start=1):
             if len(raw) > 64:
                 stored_raw = raw[:64]
-                key = stored_raw.upper()
+                key = raw.upper()
                 if key in seen_not_found:
                     first_pos = seen_not_found[key]
                     dup_notes.setdefault(first_pos, []).append(
@@ -1080,7 +1080,8 @@ class ExpressionContextService:
                 )
 
         for pos, notes_list in dup_notes.items():
-            unique_notes = list(dict.fromkeys(notes_list))
+            existing = [genes[pos].notes] if genes[pos].notes else []
+            unique_notes = list(dict.fromkeys(existing + notes_list))
             genes[pos] = genes[pos].model_copy(
                 update={"notes": "; ".join(unique_notes)}
             )
@@ -1440,12 +1441,13 @@ class ExpressionContextService:
             return gene_records, page_rows
 
         first_genes, first_page_rows = await fetch_page(0)
+        await self.catalog.verify_active(bundle)
 
         async def stream() -> AsyncIterator[str]:
             yield format_rows((), include_header=True, include_bom=True)
             try:
                 await self.catalog.verify_active(bundle)
-            except BundleGone as exc:
+            except (BundleGone, BundleNotLoaded) as exc:
                 logger.error("Active bundle superseded during batch export stream: %s", exc)
                 raise
 
@@ -1455,7 +1457,7 @@ class ExpressionContextService:
             if len(first_genes) < page_limit:
                 try:
                     await self.catalog.verify_active(bundle)
-                except BundleGone as exc:
+                except (BundleGone, BundleNotLoaded) as exc:
                     logger.error("Active bundle superseded before ending batch export stream: %s", exc)
                     raise
                 return
@@ -1467,7 +1469,7 @@ class ExpressionContextService:
                     break
                 try:
                     await self.catalog.verify_active(bundle)
-                except BundleGone as exc:
+                except (BundleGone, BundleNotLoaded) as exc:
                     logger.error("Active bundle superseded during batch export stream: %s", exc)
                     raise
                 if page_rows:
@@ -1478,7 +1480,7 @@ class ExpressionContextService:
 
             try:
                 await self.catalog.verify_active(bundle)
-            except BundleGone as exc:
+            except (BundleGone, BundleNotLoaded) as exc:
                 logger.error("Active bundle superseded before ending batch export stream: %s", exc)
                 raise
 
