@@ -648,6 +648,8 @@ def compute(
         records["hgvsp"].append(data["hgvsp_table"][data["hgvsp"]][mask])
     records = {k: np.concatenate(v) if v else np.array([]) for k, v in records.items()}
     events = point_mutation_events(records, retained, driver_rows, tsg_rows, params)
+    association_events = {POINT_MUTATION: events, STRUCTURAL_VARIANT: set()}
+    association_profiled = {POINT_MUTATION: retained}
     pm_events = np.zeros((n_genes, n_codes), dtype=np.int64)
     for row, sample in events:
         pm_events[row, sample_cohort[sample]] += 1
@@ -735,6 +737,8 @@ def compute(
             pairs.update(
                 (int(r), s) for r, s in zip(rows, data["sample"][keep], strict=True) if r >= 0
             )
+        association_events[STRUCTURAL_VARIANT].update(pairs)
+        association_profiled.setdefault(STRUCTURAL_VARIANT, set()).update(profiled)
         for row, _ in pairs:
             sv_counts[row, j] += 1
     sv = fisher(sv_counts, sv_profiled)
@@ -758,7 +762,7 @@ def compute(
             both=int((cna_allowed[:, 0] & cna_allowed[:, 1]).sum()),
         ),
     )
-    return Alterations(
+    result = Alterations(
         codes,
         {POINT_MUTATION: pm, COPY_NUMBER_ALTERATION: cna, STRUCTURAL_VARIANT: sv},
         reasons,
@@ -771,3 +775,10 @@ def compute(
         params,
         cna_allowed=cna_allowed,
     )
+
+    result.association_inputs = dict(
+        inputs=inputs, mapping=mapping, selection=selection, genes=genes,
+        events=association_events, profiled=association_profiled,
+        driver_mask=driver_mask, cna_allowed=cna_allowed,
+    )
+    return result

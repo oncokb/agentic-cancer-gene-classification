@@ -5,7 +5,11 @@ METHOD_VERSION = "3"
 # 1.3: per-pair confidence_tier ("high" | "candidate" | null) from the strong_* params.
 # 1.4: supplementary tumor-purity gate (purity_check and demotion).
 # 1.5: either-arm strong criteria and the additive strong_arm provenance field.
-CONTRACT_VERSION = "1.5"
+CONTRACT_VERSION = "1.6"
+HIGH_EXPRESSION_PARAMS = dict(
+    min_profiled=20, min_altered=3, delta_median=1.0, fdr=0.05,
+    min_top10=2, min_or_top10=3.0, fisher_p=0.05,
+)
 PARAMS = dict(
     fdr=0.05,
     log2fc=1.0,

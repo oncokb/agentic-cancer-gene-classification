@@ -60,6 +60,19 @@ def publish(directory):
     positive_total, negative_total = expected_counts(panel)
     codes = [item["oncotree_code"] for item in manifest["cancer_types"]]
     alteration_positives, alteration_negatives = expected_alteration_counts(panel, codes)
+    high_expression = report.get("high_expression", {})
+    high_rows = CONTROLS["expand_alteration_controls"](
+        {"alteration_controls": panel.get("high_expression_controls", [])}, codes
+    )
+    if high_rows and (
+        high_expression.get("status") != "passed"
+        or controls.get("high_expression", {}).get("status") != "passed"
+        or high_expression.get("positive_passed") != sum(r["expected"] is True for r in high_rows)
+        or high_expression.get("negative_passed") != 0
+        or high_expression.get("missing") != 0
+        or high_expression.get("failures") != []
+    ):
+        raise ValueError("A complete passing high-expression controls report is required")
     alterations = report.get("alterations", {})
     if (
         controls.get("status") != "passed"

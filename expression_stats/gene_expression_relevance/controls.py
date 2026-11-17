@@ -56,6 +56,7 @@ def document_loader(source):
 def control_genes(panel):
     rows = (
         panel["controls"] + panel.get("alteration_controls", []) + panel.get(CANDIDATE_MISSES, [])
+        + panel.get("high_expression_controls", []) + panel.get("alteration_known_misses", [])
     )
     return {row["gene"] for row in rows}
 
@@ -182,6 +183,38 @@ def evaluate_candidate_misses(load, panel):
     )
 
 
+def evaluate_high_expression(source, codes, *, subset=False, panel=None, skipped=False):
+    """Reuse the fail-closed control evaluator for the independent association track."""
+    panel = json.loads(PANEL_PATH.read_text()) if panel is None else panel
+    load = document_loader(source)
+
+    def documents(gene):
+        document = load(gene) or {}
+        return {"cancer_types": [dict(
+            oncotree_code=row["oncotree_code"],
+            alterations={"categories": {
+                category: dict(entry, status=("enriched" if entry.get("status") ==
+                                             "associated_high_expression" else entry.get("status")))
+                for category, entry in (row.get("alteration_high_expression") or {}).items()
+            }},
+        ) for row in document.get("cancer_types", [])]}
+
+    report = evaluate_alterations(
+        documents, codes, subset=subset, skipped=skipped,
+        panel={"alteration_controls": panel.get("high_expression_controls", [])},
+    )
+    for control in report["controls"]:
+        document = load(control["gene"]) or {}
+        record = next((r for r in document.get("cancer_types", [])
+                       if r["oncotree_code"] == control["tcga"]), {})
+        entry = (record.get("alteration_high_expression") or {}).get(control["category"], {})
+        control["observed"] = entry.get("status")
+        for key in ("n_altered", "delta_median", "q", "or_top10", "p_top10", "k_top10",
+                    "frac_top10_altered"):
+            control[key] = entry.get(key)
+    return report
+
+
 HIGH = "high"
 CANDIDATE = "candidate"
 
@@ -248,6 +281,11 @@ def evaluate(genes_dir, *, subset=False, panel=None, codes=None, alterations=Non
             genes_dir, codes, subset=subset, panel=panel, skipped=alterations is False
         )
         failures = failures + extra["alterations"]["failures"]
+        if panel.get("high_expression_controls"):
+            extra["high_expression"] = evaluate_high_expression(
+                genes_dir, codes, subset=subset, panel=panel, skipped=alterations is False
+            )
+            failures += extra["high_expression"]["failures"]
     return dict(
         status="skipped_subset" if subset else "failed" if failures else "passed",
         controls_sha256=panel_sha256(),
@@ -304,6 +342,7 @@ def summary(report):
         )
         for row in alterations.get("controls", [])
     ]
+    view["high_expression"] = report.get("high_expression")
     return view
 
 

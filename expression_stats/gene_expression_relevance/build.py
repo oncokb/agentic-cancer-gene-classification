@@ -15,6 +15,7 @@ from . import (
     ALTERATION_METHOD_VERSION,
     ALTERATION_PARAMS,
     CONTRACT_VERSION,
+    HIGH_EXPRESSION_PARAMS,
     METHOD_VERSION,
     PARAMS,
     drivers,
@@ -25,6 +26,7 @@ from .controls import evaluate as evaluate_controls
 from .controls import require_passed
 from .fetch import digest, fetch_all
 from .genes import gene_catalog, hgnc, hgnc_path
+from .high_expression import Association
 from .mapping import cancer_mapping
 from .precheck import Precheck, PrecheckBudgetExceeded, PrecheckFailed
 from .provenance import (
@@ -142,6 +144,7 @@ def build(
         alteration_identity = dict(
             method_version=ALTERATION_METHOD_VERSION,
             params=ALTERATION_PARAMS,
+            high_expression_params=HIGH_EXPRESSION_PARAMS,
             inputs_sha256=inputs_sha,
             **driver_pins,
         )
@@ -167,6 +170,7 @@ def build(
         params=PARAMS,
         alteration_method_version=ALTERATION_METHOD_VERSION,
         alteration_params=ALTERATION_PARAMS,
+        alteration_high_expression_params=HIGH_EXPRESSION_PARAMS,
         source=dict(datahub_commit=commit, generated_at=now.isoformat(), purity=purity.SOURCE),
         cancer_types=mapping,
         build=dict(
@@ -202,6 +206,11 @@ def build(
         data, labels, ids = matrix(
             paths, mapping, catalog, Path(temporary) / "expression.bin", selection
         )
+        association = (Association(data, **alteration.association_inputs)
+                       if alteration is not None else None)
+        if alteration is not None:
+            # Parsed patient-level inputs are needed only for the new detail calculation.
+            del alteration.association_inputs
         for start in range(0, len(ids), batch_size):
             batch = ids[start : start + batch_size]
             arrays = compute(data[start : start + batch_size], labels, codes)
@@ -248,6 +257,8 @@ def build(
                             alteration.record(start + i, j) if alteration is not None else None
                         ),
                     )
+                    if association is not None:
+                        record["alteration_high_expression"] = association.record(start + i, j)
                     records.append(record)
                 write_json(
                     staging / "v1" / "genes" / f"{symbol}.json",
@@ -272,6 +283,10 @@ def build(
         if "alterations" in report:
             manifest["controls"]["alterations"] = {
                 key: value for key, value in report["alterations"].items() if key != "controls"
+            }
+        if "high_expression" in report:
+            manifest["controls"]["high_expression"] = {
+                key: value for key, value in report["high_expression"].items() if key != "controls"
             }
         write_json(staging / "v1" / "controls-report.json", report)
         if requested_genes is None and report["status"] != "passed":

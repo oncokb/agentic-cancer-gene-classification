@@ -46,6 +46,7 @@ CSV_COLUMNS: Tuple[str, ...] = (
     "stats_pass",
     "enrichment_label",
     "alteration_types_enriched",
+    "alteration_high_expression",
     "alteration_pmids",
     "dmt_adc_index",
     "confidence_tier",
@@ -382,6 +383,7 @@ def pair_view_to_csv_row(
         guard_csv_text(_format_yes_no(stats.passes_stats)),
         guard_csv_text(_enrichment_code(stats)),
         guard_csv_text(", ".join(enriched_alteration_types(pair))),
+        guard_csv_text("; ".join(high_expression_types(pair))),
         guard_csv_text(" | ".join(
             f"{category}: {'; '.join(verdict.alteration_pmids[category])}"
             for category in ALLOWED_ALTERATION_TYPES
@@ -447,3 +449,8 @@ def gene_view_csv_rows(
         )
         pairs.extend(excluded)
     return [pair_view_to_csv_row(view, p, all_study_ids=study_ids) for p in pairs]
+
+
+def high_expression_types(pair: PairStatsView) -> List[str]:
+    return [category for category, entry in (pair.stats.alteration_high_expression or {}).items()
+            if entry.status == "associated_high_expression"]

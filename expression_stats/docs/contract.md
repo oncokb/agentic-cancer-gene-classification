@@ -836,3 +836,44 @@ data: [PanCanAtlas supplemental data](https://gdc.cancer.gov/about-data/publicat
 No software/SPDX licence is asserted for the table. See the
 [GDC data-access policy](https://docs.gdc.cancer.gov/Encyclopedia/pages/Data_Access_Policy/)
 and [analysis policy](https://gdc.cancer.gov/analyze-data/data-analysis-policies).
+
+
+## Contract 1.6: alteration association with high expression (detail only)
+
+The optional per-pair `alteration_high_expression` object maps `Point Mutation`,
+`Structural Variant`, `Copy Number Alteration (amp)`, and
+`Copy Number Alteration (deep del)` to independent within-cohort results. Older
+bundles omit it. This field never affects expression eligibility, confidence,
+surfacing, literature, history or the four-column golden-set export. The per-pair
+CSV adds a guarded `alteration_high_expression` column listing called categories.
+Frequency enrichment and its clickable PMID badges retain their existing rule.
+
+Use exactly the production selected primary tumors, log2(RSEM+1) matrix, mutation
+driver events (including hypermutator exclusion), CNA driver scope and allowed
+role directions, and all-gene SV events. CNA tests use GISTIC +2 or -2 separately;
+gains and shallow deletions do not count. Denominators and percentile thresholds
+include only profiled tumors with finite expression, and the unaltered comparison
+comes from that same denominator. Duplicate CNA rows combine per sample.
+
+A call requires all of: at least 20 profiled tumors, at least 3 altered tumors,
+altered-minus-unaltered median shift >=1.0 log2, two-sided asymptotic Mann–Whitney
+BH q<0.05 across testable cohorts within gene/category, and top-decile k>=2,
+OR>=3.0, one-sided Fisher p<0.05. Percentiles use NumPy's linear interpolation;
+values >=P90/P95 count, except when the threshold equals the measured minimum,
+where strictly greater values count. Flat expression has MW p=1. With 1–2 events,
+all altered tumors in the cohort's top 5% yield `anecdotal`, never a call.
+Other rows are `not_associated` or `not_testable` with a reason. No thresholds were
+retuned. In contrast to a suggestion in the analysis, the PM event rule is unchanged.
+
+Rows include `n_altered`, `n_profiled`, `delta_median`, raw MW `p`, BH `q`,
+`k_top10`, `k_top5`, `or_top10`, `p_top10`, `frac_top10_altered` (altered fraction
+of top-decile tumors), and altered/unaltered medians. Undefined metrics are null;
+unbounded OR is the JSON string `Infinity`. The new parameters and source code
+participate in the build fingerprint and release ID; expression method remains m3.
+
+`high_expression_controls` in controls.yaml gates nine positives and every cohort
+of four tracks for TTN, MUC16 and GAPDH (384 negatives for 32 cohorts). Full builds
+fail before PubMed on any mismatch or missing result. Publication re-derives these
+controls from bundled gene documents and compares the report. CNA-MET-LUAD is a
+non-gating documented frequency known miss: TCGA ~2% of 507, q~0.15, replicated
+in MSK-IMPACT 50K q~3e-26; it is a required high-expression positive.

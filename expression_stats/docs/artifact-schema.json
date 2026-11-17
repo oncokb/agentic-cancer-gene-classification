@@ -972,6 +972,111 @@
                 "number",
                 "null"
               ]
+            },
+            "alteration_high_expression": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "associated_high_expression",
+                      "anecdotal",
+                      "not_associated",
+                      "not_testable"
+                    ]
+                  },
+                  "reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "n_altered": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "n_profiled": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "delta_median": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "p": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "q": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "p_top10": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "frac_top10_altered": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "median_altered": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "median_unaltered": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "or_top10": {
+                    "anyOf": [
+                      {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      {
+                        "const": "Infinity"
+                      }
+                    ]
+                  },
+                  "k_top10": {
+                    "type": "integer"
+                  },
+                  "k_top5": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "status",
+                  "reason",
+                  "n_altered",
+                  "n_profiled",
+                  "delta_median",
+                  "q",
+                  "or_top10",
+                  "p_top10",
+                  "frac_top10_altered"
+                ]
+              }
             }
           },
           "required": [
