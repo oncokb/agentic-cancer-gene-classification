@@ -14,6 +14,10 @@ on:
         description: Skip PubMed counts (review artifact only)
         type: boolean
         default: false
+      hotspot_only:
+        description: Skip OncoKB annotations and use hotspot fallback only (review artifact only)
+        type: boolean
+        default: false
 permissions:
   contents: read
 env:
@@ -45,6 +49,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Validate OncoKB credentials
+        env:
+          INPUT_HOTSPOT_ONLY: ${{ inputs.hotspot_only }}
+          ONCOKB_API_TOKEN: ${{ secrets.ONCOKB_API_TOKEN }}
+        shell: bash
+        run: |
+          if [[ "$INPUT_HOTSPOT_ONLY" != 'true' && -z "$ONCOKB_API_TOKEN" ]]; then
+            echo '::error::OncoKB-annotated builds require the ONCOKB_API_TOKEN secret.'
+            exit 1
+          fi
       - name: Validate full precheck credentials
         env:
           INPUT_SKIP: ${{ inputs.skip_precheck }}
@@ -69,6 +83,7 @@ jobs:
           INPUT_COMMIT: ${{ inputs.datahub_commit }}
           INPUT_GENES: ${{ inputs.genes }}
           INPUT_SKIP: ${{ inputs.skip_precheck }}
+          INPUT_HOTSPOT_ONLY: ${{ inputs.hotspot_only }}
         run: python scripts/check_build.py
       - uses: actions/cache@v4
         if: steps.check.outputs.changed == 'true'
@@ -91,6 +106,12 @@ jobs:
         with:
           path: expression_stats/.cache/hgnc
           key: expression-hgnc-${{ steps.check.outputs.hgnc_sha }}
+      - uses: actions/cache@v4
+        if: steps.check.outputs.changed == 'true' && inputs.hotspot_only != true
+        with:
+          path: expression_stats/.cache/oncokb
+          key: expression-oncokb-${{ hashFiles('expression_stats/gene_expression_relevance/oncokb.py') }}
+          restore-keys: expression-oncokb-
       - uses: actions/cache/restore@v4
         if: steps.check.outputs.changed == 'true' && inputs.skip_precheck != true
         with:
@@ -104,12 +125,15 @@ jobs:
           DATAHUB_COMMIT: ${{ steps.check.outputs.commit }}
           INPUT_GENES: ${{ inputs.genes }}
           INPUT_SKIP: ${{ inputs.skip_precheck }}
+          INPUT_HOTSPOT_ONLY: ${{ inputs.hotspot_only }}
           NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+          ONCOKB_API_TOKEN: ${{ secrets.ONCOKB_API_TOKEN }}
         shell: bash
         run: |
           args=(--datahub-commit "$DATAHUB_COMMIT" --out artifacts --delete-alteration-downloads)
           if [[ -n "${INPUT_GENES//[[:space:],]/}" ]]; then args+=(--genes "$INPUT_GENES"); fi
           if [[ "$INPUT_SKIP" == 'true' ]]; then args+=(--skip-precheck); fi
+          if [[ "$INPUT_HOTSPOT_ONLY" == 'true' ]]; then args+=(--hotspot-only); fi
           python -m gene_expression_relevance build "${args[@]}"
           python scripts/bundle.py artifacts bundle
           df -h . | tail -1

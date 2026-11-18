@@ -877,3 +877,32 @@ fail before PubMed on any mismatch or missing result. Publication re-derives the
 controls from bundled gene documents and compares the report. CNA-MET-LUAD is a
 non-gating documented frequency known miss: TCGA ~2% of 507, q~0.15, replicated
 in MSK-IMPACT 50K q~3e-26; it is a required high-expression positive.
+
+
+## Contract 1.7: OncoKB-first point mutations with hotspot fallback (alteration method "3")
+
+Point Mutation eligibility removes the fixed 345-gene driver list gate so every gene in
+the build is evaluated unless a cohort lacks profiled primary tumors or has fewer than
+`min_profiled` (20) retained patients. Variant classification runs OncoKB-first via
+`/api/v1/info`, `/api/v1/utils/cancerGeneList`, and batched
+`/api/v1/annotate/mutations/byProteinChange` (for genes in OncoKB `cancerGeneList`):
+
+1. `Oncogenic`, `Likely Oncogenic`, or `Predicted Oncogenic` counts under `oncokb`.
+2. `Likely Neutral` or `Neutral` is excluded and never falls back to hotspot/TSG rules.
+3. Uncurated/unannotated mutations (`Unknown`, `Inconclusive`, unmapped/outside OncoKB,
+   missing protein change) fall back to the pan-cancer recurrence and tumor-suppressor
+   truncating rules under `hotspot`: missense positions mutated in >=10 non-neutral
+   retained tumors pan-cancer per `(gene, transcript, position)`, in-frame indels with
+   exact `HGVSp_Short` in >=5 non-neutral retained tumors pan-cancer per
+   `(gene, transcript, HGVSp_Short)`, or truncating mutations in tumor suppressors
+   (OncoKB `TSG` / `ONCOGENE_AND_TSG`, falling back to pinned `bailey2018+new_framework`
+   TSGs only for genes absent from OncoKB or in `--hotspot-only` review mode).
+
+Each `(gene, sample)` tumor counts at most once, preferring `oncokb` over `hotspot`.
+`Point Mutation` records add a nullable `sources` object `{"oncokb": int, "hotspot": int}`
+(`null` when `not_testable`; `oncokb + hotspot == n_events`). Release artifacts and
+manifests never store per-variant OncoKB annotations or API credentials; the manifest
+records `oncokb_data_version`, `oncokb_data_date`, `oncokb_classification_version`,
+`oncokb_cancer_gene_list_sha256`, and `build.hotspot_only`. All five keys participate in
+`build_sha256` / `release_id`, and `--hotspot-only` builds are rejected by `publish.py`.
+Expression statistics, tiers, purity, CNA, and SV rules remain unchanged.

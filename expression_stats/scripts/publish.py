@@ -44,10 +44,18 @@ def gh(*args):
 def publish(directory):
     directory = Path(directory)
     manifest = json.loads((directory / "manifest.json").read_text())
-    if manifest["build"] != {"genes": None, "skip_precheck": False, "skip_alterations": False}:
+    if manifest["build"] != {
+        "genes": None,
+        "skip_precheck": False,
+        "skip_alterations": False,
+        "hotspot_only": False,
+    }:
         raise ValueError(
-            "Only full builds with PubMed precheck and alteration statistics can be published"
+            "Only full builds with PubMed precheck, OncoKB annotations, and alteration "
+            "statistics can be published"
         )
+    if manifest["source"].get("hotspot_only") or not manifest["source"].get("oncokb_data_version"):
+        raise ValueError("Publishing requires a complete OncoKB-annotated build")
     if "precheck_expires_at" not in manifest["source"] or manifest["source"].get(
         "precheck_incomplete"
     ):

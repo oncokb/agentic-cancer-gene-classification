@@ -20,6 +20,11 @@ def main():
         help="Omit alteration statistics (review-only, never publishable)",
     )
     command.add_argument(
+        "--hotspot-only",
+        action="store_true",
+        help="Skip OncoKB calls and use hotspot/TSG fallback only (review-only, never publishable)",
+    )
+    command.add_argument(
         "--delete-alteration-downloads",
         action="store_true",
         help="Delete each raw mutation/CNA/SV download once its summary is cached (CI disk)",
@@ -33,6 +38,7 @@ def main():
         args.genes.split(",") if args.genes else None,
         args.skip_precheck,
         skip_alterations=args.skip_alterations,
+        hotspot_only=args.hotspot_only,
         delete_downloads=args.delete_alteration_downloads,
     )
 

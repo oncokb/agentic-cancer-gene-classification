@@ -140,6 +140,37 @@
           "cohort_mapping_sha256": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$"
+          },
+          "oncokb_data_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "oncokb_data_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "oncokb_classification_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "oncokb_cancer_gene_list_sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "hotspot_only": {
+            "type": "boolean"
+          },
+          "mutation_tsg_fallback_source": {
+            "type": "string"
           }
         },
         "required": [
@@ -200,6 +231,9 @@
             "type": "boolean"
           },
           "skip_alterations": {
+            "type": "boolean"
+          },
+          "hotspot_only": {
             "type": "boolean"
           }
         },
@@ -445,6 +479,27 @@
                     "Point Mutation": {
                       "type": "object",
                       "properties": {
+                        "sources": {
+                          "type": [
+                            "object",
+                            "null"
+                          ],
+                          "properties": {
+                            "oncokb": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "hotspot": {
+                              "type": "integer",
+                              "minimum": 0
+                            }
+                          },
+                          "required": [
+                            "oncokb",
+                            "hotspot"
+                          ],
+                          "additionalProperties": false
+                        },
                         "status": {
                           "enum": [
                             "enriched",

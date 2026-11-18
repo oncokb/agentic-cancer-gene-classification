@@ -91,8 +91,18 @@ def bundled(tmp_path):
     (source / "genes").mkdir(parents=True)
     manifest = dict(
         release_id="datahub-aaaaaaaaaaaa-m3-bbbbbbbbbbbb",
-        source=dict(generated_at="2026-11-06T12:00:00+00:00", precheck_expires_at="later"),
-        build=dict(genes=None, skip_precheck=False, skip_alterations=False),
+        source=dict(
+            generated_at="2026-11-06T12:00:00+00:00",
+            precheck_expires_at="later",
+            oncokb_data_version="v7.7",
+            hotspot_only=False,
+        ),
+        build=dict(
+            genes=None,
+            skip_precheck=False,
+            skip_alterations=False,
+            hotspot_only=False,
+        ),
         cancer_types=[dict(oncotree_code=code) for code in CODES],
     )
     report = synthesize(PANEL, CODES, source / "genes", manifest["release_id"])
@@ -145,6 +155,8 @@ def test_refresh_changes_tag_without_changing_release_id(bundled):
         "subset",
         "skip",
         "skip_alterations",
+        "hotspot_only",
+        "missing_oncokb_version",
     ],
 )
 def test_atomic_release_policy(bundled, monkeypatch, failure):
@@ -152,12 +164,16 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
     monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
     publisher = load("publish")
     monkeypatch.setenv("GITHUB_SHA", "a" * 40)
-    if failure in {"subset", "skip", "skip_alterations"}:
+    if failure in {"subset", "skip", "skip_alterations", "hotspot_only"}:
         manifest["build"] = dict(
             genes=["TP53"] if failure == "subset" else None,
             skip_precheck=failure == "skip",
             skip_alterations=failure == "skip_alterations",
+            hotspot_only=failure == "hotspot_only",
         )
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+    elif failure == "missing_oncokb_version":
+        manifest["source"]["oncokb_data_version"] = None
         (directory / "manifest.json").write_text(json.dumps(manifest))
     calls = []
 
@@ -182,7 +198,17 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
         return '{"id":42}'
 
     monkeypatch.setattr(publisher, "gh", gh)
-    if failure in {"upload", "corrupt", "cleanup", "stale", "subset", "skip", "skip_alterations"}:
+    if failure in {
+        "upload",
+        "corrupt",
+        "cleanup",
+        "stale",
+        "subset",
+        "skip",
+        "skip_alterations",
+        "hotspot_only",
+        "missing_oncokb_version",
+    }:
         match = "stale draft 7; delete it" if failure == "stale" else None
         if failure == "cleanup":
             match = "upload failed"

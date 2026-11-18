@@ -115,6 +115,53 @@ def test_skipped_prechecks_cannot_restore_or_overwrite_pubmed_cache():
     assert "always()" in saved  # A budget failure still saves committed counts.
 
 
+@pytest.mark.parametrize(
+    "hotspot_only,token,allowed",
+    [
+        ("", "", False),
+        ("false", "", False),
+        ("false", "test-token", True),
+        ("true", "", True),
+    ],
+)
+def test_oncokb_credential_guard(hotspot_only, token, allowed):
+    workflow = Path("../.github/workflows/expression-stats-release.yml").read_text()
+    step = workflow.split("      - name: Validate OncoKB credentials\n")[1].split(
+        "      - name: Validate full precheck credentials"
+    )[0]
+    script = textwrap.dedent(step.split("        run: |\n")[1])
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "INPUT_HOTSPOT_ONLY": hotspot_only, "ONCOKB_API_TOKEN": token},
+    )
+    assert (result.returncode == 0) == allowed
+    if not allowed:
+        assert "ONCOKB_API_TOKEN" in result.stdout
+
+
+def test_build_passes_hotspot_only_only_when_true():
+    workflow = Path("../.github/workflows/expression-stats-release.yml").read_text()
+    step = workflow.split("      - name: Build\n")[1].split("      - uses:")[0]
+    script = textwrap.dedent(step.split("        run: |\n")[1])
+    for flag, expected in [("false", False), ("true", True)]:
+        result = subprocess.run(
+            ["bash", "-c", "python() { printf '%s\\n' \"$@\"; }\n" + script],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={
+                **os.environ,
+                "INPUT_GENES": "",
+                "INPUT_SKIP": "true",
+                "INPUT_HOTSPOT_ONLY": flag,
+                "DATAHUB_COMMIT": "a" * 40,
+            },
+        )
+        assert ("--hotspot-only" in result.stdout.splitlines()) == expected
+
+
 def test_expression_object_cache_key_includes_purity_pin():
     from gene_expression_relevance.purity import SOURCE
 

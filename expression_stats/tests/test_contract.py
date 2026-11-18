@@ -144,6 +144,8 @@ def test_schema_rejects_wrong_version():
 def test_early_exit_checks_method_commit_options_hashes_and_ttl():
     from datetime import UTC, datetime, timedelta
 
+    from gene_expression_relevance import oncokb
+
     unchanged = runpy.run_path("scripts/check_build.py")["unchanged"]
     now = datetime(2026, 11, 5, tzinfo=UTC)
     manifest = dict(
@@ -157,8 +159,11 @@ def test_early_exit_checks_method_commit_options_hashes_and_ttl():
             code_sha256="code",
             hgnc_sha256="hgnc",
             generated_at=now.isoformat(),
+            oncokb_data_version="v7.7",
+            oncokb_classification_version=oncokb.CLASSIFICATION_VERSION,
+            hotspot_only=False,
         ),
-        build=dict(genes=None, skip_precheck=False, skip_alterations=False),
+        build=dict(genes=None, skip_precheck=False, skip_alterations=False, hotspot_only=False),
     )
     args = ["a" * 40, "3", None, False, "code", "hgnc"]
     assert unchanged(manifest, *args, now=now)
@@ -184,12 +189,16 @@ def test_early_exit_checks_method_commit_options_hashes_and_ttl():
     for key, value in [
         ("alteration_method_version", "0"),
         ("alteration_params", {**ALTERATION_PARAMS, "fdr": 0.1}),
-        ("build", dict(genes=None, skip_precheck=False, skip_alterations=True)),
+        ("build", dict(genes=None, skip_precheck=False, skip_alterations=True, hotspot_only=False)),
+        ("build", dict(genes=None, skip_precheck=False, skip_alterations=False, hotspot_only=True)),
     ]:
         assert not unchanged({**manifest, key: value}, *args, now=now)
 
 
-@pytest.mark.parametrize("flags", [[], ["--skip-alterations"], ["--delete-alteration-downloads"]])
+@pytest.mark.parametrize(
+    "flags",
+    [[], ["--skip-alterations"], ["--hotspot-only"], ["--delete-alteration-downloads"]],
+)
 def test_cli_dispatch(monkeypatch, flags):
     cli = importlib.import_module("gene_expression_relevance.__main__")
     calls = []
@@ -215,6 +224,7 @@ def test_cli_dispatch(monkeypatch, flags):
     assert args[-2:] == (["ALB", "TP53"], True)
     assert kwargs == dict(
         skip_alterations="--skip-alterations" in flags,
+        hotspot_only="--hotspot-only" in flags,
         delete_downloads="--delete-alteration-downloads" in flags,
     )
 

@@ -22,6 +22,7 @@ from . import (
     purity,
 )
 from . import alterations as alteration_stats
+from . import oncokb as oncokb_client
 from .controls import evaluate as evaluate_controls
 from .controls import require_passed
 from .fetch import digest, fetch_all
@@ -86,17 +87,60 @@ def matrix(paths, mapping, catalog, target, selection=None):
     return x, np.asarray(labels), ids
 
 
-def load_alterations(commit, cache, mapping, selection, ids, catalog, aliases, delete_downloads):
+def load_alterations(
+    commit,
+    cache,
+    mapping,
+    selection,
+    ids,
+    catalog,
+    aliases,
+    delete_downloads,
+    *,
+    hotspot_only=False,
+):
     """Alteration statistics for the build's gene rows (detail only; see alterations.py)."""
-    driver = drivers.load(ALTERATION_PARAMS["mutation_driver_source"])
+    driver = drivers.load(ALTERATION_PARAMS["mutation_tsg_fallback_source"])
     cna_driver = drivers.load_cna(ALTERATION_PARAMS["cna_driver_source"])
-    inputs, provenance, inputs_sha = alteration_stats.load_inputs(
-        commit, cache, [item["study_id"] for item in mapping], delete_downloads=delete_downloads
-    )
-    result = alteration_stats.compute(
-        inputs, mapping, selection, ids, catalog, aliases, driver, cna_driver=cna_driver
-    )
-    pins = dict(**driver.pin(), **cna_driver.pin())
+    client = None if hotspot_only else oncokb_client.load_client(cache)
+    try:
+        inputs, provenance, inputs_sha = alteration_stats.load_inputs(
+            commit, cache, [item["study_id"] for item in mapping], delete_downloads=delete_downloads
+        )
+        result = alteration_stats.compute(
+            inputs,
+            mapping,
+            selection,
+            ids,
+            catalog,
+            aliases,
+            driver,
+            cna_driver=cna_driver,
+            oncokb=client,
+        )
+        oncokb_prov = (
+            client.provenance()
+            if client is not None
+            else dict(
+                oncokb_data_version=None,
+                oncokb_data_date=None,
+                oncokb_classification_version=oncokb_client.CLASSIFICATION_VERSION,
+                oncokb_cancer_gene_list_sha256=None,
+            )
+        )
+    finally:
+        if client is not None:
+            client.close()
+    pins = {
+        **driver.pin(),
+        "mutation_tsg_fallback_source": driver.name,
+        "mutation_driver_source": (
+            "hotspot_only" if hotspot_only else ALTERATION_PARAMS["mutation_driver_source"]
+        ),
+        "hotspot_only": hotspot_only,
+        **oncokb_prov,
+        **cna_driver.pin(),
+    }
     return result, pins, provenance, inputs_sha
 
 
@@ -109,6 +153,7 @@ def build(
     batch_size=256,
     *,
     skip_alterations=False,
+    hotspot_only=False,
     delete_downloads=False,
 ):
     started = time.monotonic()
@@ -139,7 +184,15 @@ def build(
     alteration_identity = dict(skipped=True)
     if not skip_alterations:
         alteration, driver_pins, alteration_inputs, inputs_sha = load_alterations(
-            commit, cache, mapping, selection, ids, full_catalog, aliases, delete_downloads
+            commit,
+            cache,
+            mapping,
+            selection,
+            ids,
+            full_catalog,
+            aliases,
+            delete_downloads,
+            hotspot_only=hotspot_only,
         )
         alteration_identity = dict(
             method_version=ALTERATION_METHOD_VERSION,
@@ -174,7 +227,10 @@ def build(
         source=dict(datahub_commit=commit, generated_at=now.isoformat(), purity=purity.SOURCE),
         cancer_types=mapping,
         build=dict(
-            genes=requested_genes, skip_precheck=skip_precheck, skip_alterations=skip_alterations
+            genes=requested_genes,
+            skip_precheck=skip_precheck,
+            skip_alterations=skip_alterations,
+            hotspot_only=hotspot_only,
         ),
     )
     if alteration is not None:

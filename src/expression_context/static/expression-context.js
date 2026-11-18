@@ -574,6 +574,9 @@
           if (!category) continue;
           const status = (category.status || "unknown").replace(/_/g, " ");
           let text = `${status}; ${alterationCounts(category)}`;
+          if (name === "Point Mutation" && category.sources) {
+            text += ` (OncoKB ${category.sources.oncokb ?? 0}, hotspot ${category.sources.hotspot ?? 0})`;
+          }
           if (category.reason) text += `; ${category.reason}`;
           if (name === "Copy Number Alteration") {
             for (const direction of ["amp", "del"]) {

@@ -113,10 +113,11 @@ def test_hypermutators_are_excluded_from_events_and_recurrence():
     assert alterations.point_mutation_events(records(rows), retained, *driver_rows()) == set()
 
 
-def test_genes_outside_the_driver_list_never_count():
-    rows = [("TTN", sample("AA", i), "Missense_Mutation", "T", 5, "") for i in range(20)]
+def test_genes_outside_the_old_driver_list_count_by_recurrence():
+    rows = [("TTN", sample("AA", i), "Missense_Mutation", "T", 5, "") for i in range(10)]
     retained = {r[1] for r in rows}
-    assert alterations.point_mutation_events(records(rows), retained, *driver_rows()) == set()
+    events = alterations.point_mutation_events(records(rows), retained, None, set())
+    assert events == {(ROW["TTN"], r[1]) for r in rows}
 
 
 # ---------------------------------------------------------------- parsers
@@ -140,9 +141,9 @@ def test_parsers_read_datahub_formats(tmp_path):
         "TCGA-AA-0002-01",
         "TCGA-AA-0003-01",
     ]
-    # Positions serve the missense rule only; in-frame indels match on the full HGVSp.
+    # Positions serve missense recurrence; HGVSp_Short is retained across all nonsynonymous rows.
     assert data["position"].tolist() == [12, -1, -1]
-    assert data["hgvsp_table"][data["hgvsp"]].tolist() == ["", "p.E746_A750del", ""]
+    assert data["hgvsp_table"][data["hgvsp"]].tolist() == ["p.G12D", "p.E746_A750del", ""]
 
     cna = tmp_path / "data_cna.txt"
     cna.write_text(
@@ -272,11 +273,14 @@ def test_profiled_denominators_and_hypermutator_exclusion(result):
     assert category(result, "KRAS", "BB", POINT_MUTATION)["status"] == "not_enriched"
 
 
-def test_non_driver_genes_are_not_testable_with_reason(result):
+def test_non_tsg_gene_is_testable_and_hotspot_recurrence_applies(result):
     ttn = category(result, "TTN", "BB", POINT_MUTATION)
-    assert ttn["status"] == "not_testable"
-    assert ttn["reason"] == "gene not in mutation driver list (test)"
-    assert ttn["n_events"] is None and ttn["q_value"] is None
+    assert ttn["status"] == "enriched"
+    assert ttn["n_events"] == 60
+    assert ttn["sources"] == {"oncokb": 0, "hotspot": 60}
+    aa = category(result, "TTN", "AA", POINT_MUTATION)
+    assert aa["status"] == "not_enriched" and aa["n_events"] == 0
+    assert aa["sources"] == {"oncokb": 0, "hotspot": 0}
 
 
 def test_cna_amplification_and_deletion_are_tested_separately(result):
@@ -523,8 +527,9 @@ def test_alterations_are_detail_only(tmp_path, monkeypatch):
     assert all(record["alterations"] is None for record in skipped["cancer_types"])
     manifest = json.loads((with_alterations / "v1/manifest.json").read_text())
     jsonschema.validate(manifest, SCHEMAS["manifest"])
-    assert manifest["contract_version"] == "1.6" and manifest["method_version"] == "3"
-    assert manifest["source"]["mutation_driver_source"] == "test"
+    assert manifest["contract_version"] == "1.7" and manifest["method_version"] == "3"
+    assert manifest["source"]["mutation_driver_source"] == "oncokb+hotspot_fallback"
+    assert manifest["source"]["mutation_tsg_fallback_source"] == "test"
     assert manifest["source"]["cna_driver_source"] == "test-cna"
     assert manifest["source"]["cna_driver_sha256"] == "1" * 64
     cna = lihc["alterations"]["categories"][COPY_NUMBER_ALTERATION]

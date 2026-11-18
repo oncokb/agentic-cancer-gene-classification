@@ -18,6 +18,10 @@ def empty_mutation():
         position=np.zeros(0, dtype=np.int32),
         hgvsp=np.zeros(0, dtype=np.int32),
         hgvsp_table=np.zeros(0, dtype=str),
+        consequence=np.zeros(0, dtype=np.int32),
+        consequence_table=np.zeros(0, dtype=str),
+        build=np.zeros(0, dtype=np.int32),
+        build_table=np.zeros(0, dtype=str),
     )
 
 
