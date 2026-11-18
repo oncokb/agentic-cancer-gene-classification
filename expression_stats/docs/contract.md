@@ -894,9 +894,12 @@ a unique `id` per query validated strictly without positional matching):
    own `predicted_oncogenic` status rather than collapsed into `neutral`).
 3. Unannotated/uncurated mutations (`Unknown` returned explicitly by OncoKB, genes outside
    OncoKB `cancerGeneList`, or empty protein changes) fall back under `hotspot`:
-   - missense or in-frame indel at a protein position mutated in `>=10` non-excluded
-     retained tumors pan-cancer per `(gene, transcript, position)` (grouped by start
-     protein codon position rather than exact change);
+   - missense or in-frame indel at a protein position mutated in `>=10` retained tumors
+     pan-cancer per `(gene, position)` (grouped by start protein codon position rather
+     than exact change, on the gene's dominant/most-frequent transcript only, and
+     counting all retained missense/in-frame mutations at that position regardless of
+     OncoKB verdict; position `-1` never groups, and rows on non-dominant transcripts
+     are excluded from grouping and reported per gene in `manifest.alterations`);
    - or truncating mutations in tumor suppressors (OncoKB `TSG` / `ONCOGENE_AND_TSG`,
      falling back to pinned Bailey TSGs only for genes absent from OncoKB or in
      `--hotspot-only` review mode).

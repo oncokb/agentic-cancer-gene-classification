@@ -8,6 +8,7 @@ import sqlite3
 from datetime import UTC, datetime
 from urllib.error import HTTPError, URLError
 
+import numpy as np
 import pytest
 from alteration_fixtures import maf
 from test_alterations import (
@@ -32,6 +33,8 @@ from gene_expression_relevance import (
     oncokb,
 )
 from gene_expression_relevance import build as builder
+
+_REAL_LOAD_INPUTS = alterations.load_inputs
 
 
 def _fake_oncokb_requester(
@@ -128,7 +131,8 @@ def test_classification_rules_exact_classes_and_predicted_oncogenic_excluded(tmp
             ("KRAS", sample("AA", 1), "Missense_Mutation", "T1", 61, "p.Q61H"),
             ("KRAS", sample("AA", 1), "Missense_Mutation", "T1", 12, "p.G12V"),
             # KRAS pos 12: 8 G12V (+AA-0001 = 9) + 1 G12A (Likely Neutral) + 1 G12S (Neutral).
-            # Excluded neutral variants neither count nor inflate pos 12 recurrence (9 < 10).
+            # Recurrence counts ALL 11 retained tumors at pos 12 regardless of OncoKB verdict;
+            # Unknown G12V falls back to hotspot while Likely Neutral / Neutral still never count.
             *[
                 ("KRAS", sample("AA", i), "Missense_Mutation", "T1", 12, "p.G12V")
                 for i in range(2, 10)
@@ -175,7 +179,9 @@ def test_classification_rules_exact_classes_and_predicted_oncogenic_excluded(tmp
             assert (ROW["EGFR"], sample("AA", i)) not in events
             assert (ROW["TP53"], sample("AA", i)) not in events
         assert (ROW["TP53"], sample("AA", 12)) not in events
-        for i in range(2, 12):
+        for i in range(2, 10):
+            assert sources[(ROW["KRAS"], sample("AA", i))] == "hotspot"
+        for i in (10, 11):
             assert (ROW["KRAS"], sample("AA", i)) not in events
         for i in range(10):
             assert sources[(ROW["ROS1"], sample("AA", i))] == "hotspot"
@@ -708,3 +714,326 @@ def test_check_build_invalidates_on_oncokb_version_and_hotspot_only(tmp_path, mo
     checker["main"]()
     vals2 = dict(line.split("=", 1) for line in out2.read_text().splitlines())
     assert vals2["changed"] == "true" and vals2["deployable"] == "false"
+
+
+def test_hotspot_recurrence_dominant_transcript_verdict_agnostic_and_minus_one(tmp_path):
+    """Recurrence counts all retained tumors on dominant transcript regardless of verdict."""
+    cgl = [
+        {"hugoSymbol": "KRAS", "entrezGeneId": 3845, "geneType": "ONCOGENE", "geneAliases": []},
+        {"hugoSymbol": "EGFR", "entrezGeneId": 1956, "geneType": "ONCOGENE", "geneAliases": []},
+        {"hugoSymbol": "TP53", "entrezGeneId": 7157, "geneType": "TSG", "geneAliases": []},
+    ]
+    req = _fake_oncokb_requester(
+        cgl,
+        {
+            ("KRAS", "G12A"): "Likely Neutral",
+            ("KRAS", "G12V"): "Unknown",
+            ("EGFR", "E746_A750del"): "Unknown",
+            ("EGFR", "E746K"): "Unknown",
+            ("TP53", "Y220C"): "Unknown",
+        },
+    )
+    client = oncokb.OncoKBClient(tmp_path, token="tok", requester=req)
+    try:
+        rows = [
+            # 1) 6 Likely Neutral + 4 Unknown on dominant T1 at KRAS pos 12 -> 4 Unknown count.
+            *[
+                ("KRAS", sample("AA", i), "Missense_Mutation", "T1", 12, "p.G12A")
+                for i in range(6)
+            ],
+            *[
+                ("KRAS", sample("AA", i), "Missense_Mutation", "T1", 12, "p.G12V")
+                for i in range(6, 10)
+            ],
+            # 2) EGFR pos 746: 6 In_Frame_Del + 4 Missense on dominant T1 -> 10 hotspot;
+            #    plus 3 rows on non-dominant T2 (at pos 746 and pos 858) -> excluded.
+            *[
+                ("EGFR", sample("BB", i), "In_Frame_Del", "T1", 746, "p.E746_A750del")
+                for i in range(6)
+            ],
+            *[
+                ("EGFR", sample("BB", i), "Missense_Mutation", "T1", 746, "p.E746K")
+                for i in range(6, 10)
+            ],
+            *[
+                ("EGFR", sample("BB", i), "Missense_Mutation", "T2", 746, "p.E746K")
+                for i in range(10, 12)
+            ],
+            ("EGFR", sample("BB", 12), "Missense_Mutation", "T2", 858, "p.L858R"),
+            # 3) TP53: 6 on dominant T1 and 4 on non-dominant T2 at pos 220 -> <10 on T1.
+            *[
+                ("TP53", sample("CC", i), "Missense_Mutation", "T1", 220, "p.Y220C")
+                for i in range(6)
+            ],
+            *[
+                ("TP53", sample("CC", i), "Missense_Mutation", "T2", 220, "p.Y220C")
+                for i in range(6, 10)
+            ],
+            # 4) 12 tumors at position -1 on dominant ROS1 T4 -> position -1 NEVER groups!
+            *[
+                ("ROS1", sample("DD", i), "Missense_Mutation", "T4", -1, "")
+                for i in range(12)
+            ],
+        ]
+        retained = {r[1] for r in rows}
+        excluded_counts = {}
+        non_dom_counts = {}
+        events, sources = alterations.classify_point_mutations(
+            records(rows),
+            retained,
+            set(),
+            ALTERATION_PARAMS,
+            oncokb=client,
+            row_symbols=[CATALOG[e] for e in IDS],
+            excluded_counts=excluded_counts,
+            non_dominant_counts=non_dom_counts,
+        )
+        # KRAS: only the 4 Unknown tumors at pos 12 become hotspot; Likely Neutral excluded.
+        assert {s for r, s in events if r == ROW["KRAS"]} == {sample("AA", i) for i in range(6, 10)}
+        for i in range(6, 10):
+            assert sources[(ROW["KRAS"], sample("AA", i))] == "hotspot"
+        assert excluded_counts["neutral"] == 6
+
+        # EGFR: 10 T1 tumors at pos 746 count; T2 rows at pos 746 and 858 are excluded.
+        assert {s for r, s in events if r == ROW["EGFR"]} == {sample("BB", i) for i in range(10)}
+        # TP53: T1 only has 6 tumors (T2's 4 rows excluded) -> not recurrent.
+        assert {s for r, s in events if r == ROW["TP53"]} == set()
+        # ROS1: position -1 never groups.
+        assert {s for r, s in events if r == ROW["ROS1"]} == set()
+        assert non_dom_counts == {"EGFR": 3, "TP53": 4}
+    finally:
+        client.close()
+
+
+def test_build_manifest_reports_non_dominant_transcript_exclusions(tmp_path, monkeypatch):
+    """Build manifest.alterations reports non-dominant transcript exclusion counts by gene."""
+    cache = build_fixture(tmp_path, monkeypatch, rich_inputs)
+    orig_load = alterations.load_inputs
+
+    def multi_tx_inputs(commit, c, studies, **kwargs):
+        inputs, prov, sha = orig_load(commit, c, studies, **kwargs)
+        samples = inputs["LIHC"]["mutation"]["data"]["sample_table"][:5]
+        path = tmp_path / "multi_tx.txt"
+        path.write_text(
+            maf(
+                [
+                    *[
+                        ("TP53", 7157, "Missense_Mutation", s, "T_DOM", "p.R175H")
+                        for s in samples[:3]
+                    ],
+                    *[
+                        ("TP53", 7157, "Missense_Mutation", s, "T_ALT", "p.R175H")
+                        for s in samples[:2]
+                    ],
+                ]
+            )
+        )
+        inputs["LIHC"]["mutation"]["data"] = alterations.parse_mutations(path)
+        return inputs, prov, sha
+
+    monkeypatch.setattr(alterations, "load_inputs", multi_tx_inputs)
+    out = tmp_path / "out"
+    manifest = builder.build("a" * 40, out, cache, skip_precheck=True, hotspot_only=True)
+    alt = manifest["alterations"]
+    assert alt["point_mutation_non_dominant_transcript_rows"] == 2
+    assert alt["point_mutation_non_dominant_transcript_genes"] == 1
+    assert alt["point_mutation_non_dominant_transcript_counts_by_gene"] == {"TP53": 2}
+
+
+def test_startup_deadline_covers_info_cgl_and_cold_inputs_with_clean_exit(tmp_path, monkeypatch):
+    """Slow /info, /utils/cancerGeneList, and cold input loading fail cleanly to incomplete."""
+    import sys
+
+    from gene_expression_relevance import __main__ as cli
+
+    real_load_inputs = _REAL_LOAD_INPUTS
+    (tmp_path / "a").mkdir()
+    # Subcase A: Slow /info exceeds build_deadline -> TimeoutError -> incomplete artifacts + exit.
+    cache_a = build_fixture(tmp_path / "a", monkeypatch, rich_inputs)
+    settings_a = json.loads(oncokb.RUNTIME_SETTINGS_PATH.read_text())
+    settings_a["build_time_budget_seconds"] = 5.0
+    settings_path_a = tmp_path / "settings_a.json"
+    settings_path_a.write_text(json.dumps(settings_a))
+    monkeypatch.setattr(oncokb, "RUNTIME_SETTINGS_PATH", settings_path_a)
+    tick_a = [0.0]
+    info_timeouts = []
+
+    def fake_urlopen_info(req, timeout=60.0):
+        info_timeouts.append(timeout)
+        tick_a[0] += 6.0
+        raise TimeoutError("slow /info")
+
+    monkeypatch.setattr(oncokb, "urlopen", fake_urlopen_info)
+    monkeypatch.setattr(
+        oncokb,
+        "load_client",
+        lambda cache_dir, build_deadline=None: oncokb.OncoKBClient(
+            cache_dir,
+            token="tok",
+            clock=lambda: tick_a[0],
+            sleep=lambda s: None,
+            build_deadline=build_deadline,
+        ),
+    )
+    out_a = tmp_path / "site-a"
+    with pytest.raises(oncokb.OncoKBBudgetExceeded):
+        builder.build("a" * 40, out_a, cache_a, skip_precheck=True, clock=lambda: tick_a[0])
+    assert info_timeouts and info_timeouts[0] <= 5.0
+    rep_a = json.loads((tmp_path / "site-a-incomplete/oncokb-report.json").read_text())
+    assert rep_a["status"] == "incomplete"
+    inc_m_a = json.loads((tmp_path / "site-a-incomplete/manifest.json").read_text())
+    assert inc_m_a["source"]["oncokb_incomplete"] is True
+    assert inc_m_a["source"]["oncokb_complete"] is False
+    assert not (out_a / "v1/manifest.json").exists()
+
+    # Verify CLI __main__.main catches start-up OncoKBBudgetExceeded cleanly via SystemExit(2).
+    tick_a[0] = 0.0
+    monkeypatch.setattr(cli, "_PROCESS_STARTED", 0.0)
+    monkeypatch.setattr(builder.time, "monotonic", lambda: tick_a[0])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "build",
+            "--datahub-commit",
+            "a" * 40,
+            "--out",
+            str(tmp_path / "cli-out"),
+            "--cache",
+            str(cache_a),
+            "--skip-precheck",
+        ],
+    )
+    with pytest.raises(SystemExit) as sys_exc:
+        cli.main()
+    assert sys_exc.value.code == 2
+    assert (tmp_path / "cli-out-incomplete/oncokb-report.json").exists()
+
+    # Subcase B: Fast /info, slow /utils/cancerGeneList -> incomplete exit cleanly.
+    tick_b = [0.0]
+
+    def cgl_slow_requester(url, *, payload=None, token=None, remaining=None, **kwargs):
+        rem = remaining()
+        assert rem <= 5.0
+        if url.endswith("/info"):
+            return {"dataVersion": {"version": "v7.7", "date": "10/29/2026"}}
+        assert url.endswith("/utils/cancerGeneList")
+        tick_b[0] += 10.0
+        remaining()
+        return CGL
+
+    monkeypatch.setattr(
+        oncokb,
+        "load_client",
+        lambda cache_dir, build_deadline=None: oncokb.OncoKBClient(
+            cache_dir,
+            token="tok",
+            requester=cgl_slow_requester,
+            clock=lambda: tick_b[0],
+            sleep=lambda s: None,
+            build_deadline=build_deadline,
+        ),
+    )
+    out_b = tmp_path / "site-b"
+    with pytest.raises(oncokb.OncoKBBudgetExceeded):
+        builder.build("a" * 40, out_b, cache_a, skip_precheck=True, clock=lambda: tick_b[0])
+    inc_m_b = json.loads((tmp_path / "site-b-incomplete/manifest.json").read_text())
+    assert inc_m_b["source"]["oncokb_incomplete"] is True
+
+    # Subcase C: Fast client, slow cold input loading -> deadline checked between input files.
+    tick_c = [0.0]
+    studies_loaded = []
+
+    def slow_summary(commit, c, study, kind, **kwargs):
+        studies_loaded.append((study, kind))
+        tick_c[0] += 3.0
+        return "oid", {
+            "sample_table": np.array(["S1"], dtype=str),
+            "symbol_table": np.array(["TP53"], dtype=str),
+            "hgvsp_table": np.array([""], dtype=str),
+            "transcript_table": np.array(["T1"], dtype=str),
+            "consequence_table": np.array([""], dtype=str),
+            "build_table": np.array(["GRCh37"], dtype=str),
+            "sample": np.array([0]),
+            "symbol": np.array([0]),
+            "entrez": np.array([7157]),
+            "cls": np.array([0]),
+            "transcript": np.array([0]),
+            "position": np.array([-1]),
+            "hgvsp": np.array([0]),
+            "consequence": np.array([0]),
+            "build": np.array([0]),
+            "n_tumors": 1,
+        }
+
+    monkeypatch.setattr(alterations, "summary", slow_summary)
+    monkeypatch.setattr(alterations, "case_list", lambda *a, **kw: ("sha", {"S1"}))
+    out_c = tmp_path / "site-c"
+    tick_c[0] = 0.0
+    monkeypatch.setattr(
+        oncokb,
+        "load_client",
+        lambda cache_dir, build_deadline=None: oncokb.OncoKBClient(
+            cache_dir,
+            token="tok",
+            requester=_fake_oncokb_requester(CGL, {}),
+            clock=lambda: tick_c[0],
+            sleep=lambda s: None,
+            build_deadline=build_deadline,
+        ),
+    )
+    monkeypatch.setattr(
+        alterations,
+        "load_inputs",
+        lambda commit, c, studies, **kw: real_load_inputs(commit, c, studies, workers=1, **kw),
+    )
+    with pytest.raises(oncokb.OncoKBBudgetExceeded):
+        builder.build("a" * 40, out_c, cache_a, skip_precheck=True, clock=lambda: tick_c[0])
+    # Stopped between files (2 * 3s > 5s budget) rather than running all 96.
+    assert len(studies_loaded) == 2
+    rep_c = json.loads((tmp_path / "site-c-incomplete/oncokb-report.json").read_text())
+    assert rep_c["status"] == "incomplete"
+
+
+def test_server_response_values_are_redacted_and_truncated_in_errors_and_logs(tmp_path, caplog):
+    """Response error, id, and oncogenic fields are redacted and truncated in errors and logs."""
+    secret = "tok-very-secret-oncokb-value-987654"
+    long_tail = "X" * 200
+
+    def make_fn(kind):
+        def fn(p):
+            if p[0]["id"] == "preflight":
+                return [{"query": {"id": "preflight"}, "oncogenic": "Oncogenic"}]
+            if kind == "err":
+                return [
+                    {
+                        "query": {"id": p[0]["id"]},
+                        "oncogenic": "Unknown",
+                        "error": f"bad {secret} {long_tail}",
+                    }
+                ]
+            if kind == "qid":
+                return [{"query": {"id": f"bad-{secret}-{long_tail}"}, "oncogenic": "Unknown"}]
+            return [{"query": {"id": p[0]["id"]}, "oncogenic": f"Weird-{secret}-{long_tail}"}]
+
+        return fn
+
+    key = ("KRAS", "G12D", "missense_variant", "GRCh37")
+    with caplog.at_level("DEBUG"):
+        for idx, kind in enumerate(("err", "qid", "onc")):
+            client = oncokb.OncoKBClient(
+                tmp_path / f"c-{idx}",
+                token=secret,
+                requester=_fake_oncokb_requester(CGL, {}, on_batch=make_fn(kind)),
+            )
+            try:
+                with pytest.raises(oncokb.OncoKBError) as exc_info:
+                    client.annotate([key])
+                msg = str(exc_info.value)
+                assert secret not in msg, f"token leaked in {kind}"
+                assert "[REDACTED]" in msg
+                assert len(msg) < 200
+            finally:
+                client.close()
+    assert secret not in caplog.text

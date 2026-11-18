@@ -114,6 +114,15 @@ def redact_secret(text: str, secret: str | None) -> str:
     return text.replace(secret, "[REDACTED]")
 
 
+def _safe_excerpt(value: object, secret: str | None = None, *, limit: int = 80) -> str:
+    """Redact any API token and truncate server-derived values before formatting."""
+    raw = value if isinstance(value, str) else repr(value)
+    redacted = redact_secret(raw, secret)
+    if len(redacted) > limit:
+        redacted = redacted[:limit] + "..."
+    return repr(redacted)
+
+
 def normalize_alteration(hgvsp: str) -> str:
     """Normalize MAF HGVSp_Short for OncoKB byProteinChange queries."""
     cleaned = str(hgvsp or "").strip()
@@ -149,7 +158,7 @@ def normalize_reference_genome(build: str) -> str:
     return "GRCh37"
 
 
-def classify_oncogenic(oncogenic: object) -> str:
+def classify_oncogenic(oncogenic: object, *, token: str | None = None) -> str:
     """Map a validated OncoKB oncogenic label to its internal verdict status.
 
     Returns 'oncokb' for positive calls, 'predicted_oncogenic' / 'inconclusive' /
@@ -157,7 +166,9 @@ def classify_oncogenic(oncogenic: object) -> str:
     Rejects missing, non-string, or unrecognized values to fail closed.
     """
     if not isinstance(oncogenic, str) or oncogenic not in KNOWN_ONCOGENIC:
-        raise OncoKBError(f"Invalid OncoKB oncogenic classification: {oncogenic!r}")
+        raise OncoKBError(
+            f"Invalid OncoKB oncogenic classification: {_safe_excerpt(oncogenic, token)}"
+        )
     if oncogenic in POSITIVE_ONCOGENIC:
         return "oncokb"
     if oncogenic in EXCLUDED_ONCOGENIC_STATUS:
@@ -230,7 +241,14 @@ def request_json(
     method = "POST" if payload is not None else "GET"
 
     def check_remaining() -> float:
-        return remaining() if remaining is not None else float("inf")
+        if remaining is None:
+            return float("inf")
+        rem_val = remaining()
+        if rem_val <= 0:
+            raise OncoKBBudgetExceeded(
+                "OncoKB annotation time budget exhausted; build incomplete, resume cache"
+            )
+        return rem_val
 
     for attempt in range(attempts):
         rem = check_remaining()
@@ -241,16 +259,18 @@ def request_json(
                 return json.load(response)
         except HTTPError as exc:
             code = exc.code
+            safe_url = redact_secret(url, token)
             if code in (401, 403):
                 raise OncoKBAuthError(
-                    f"OncoKB API authentication failed (HTTP {code}) for {url}; "
+                    f"OncoKB API authentication failed (HTTP {code}) for {safe_url}; "
                     "verify ONCOKB_API_TOKEN"
                 ) from None
             if not _is_retryable_http(code):
-                raise OncoKBError(f"OncoKB API HTTP {code} for {url}") from None
+                raise OncoKBError(f"OncoKB API HTTP {code} for {safe_url}") from None
+            rem_after = check_remaining()
             if attempt == attempts - 1:
                 raise OncoKBRetryError(
-                    f"OncoKB API HTTP {code} retries exhausted for {url}"
+                    f"OncoKB API HTTP {code} retries exhausted for {safe_url}"
                 ) from None
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
             delay = _retry_delay(
@@ -266,17 +286,18 @@ def request_json(
             json.JSONDecodeError,
             OSError,
         ) as exc:
+            safe_url = redact_secret(url, token)
+            rem_after = check_remaining()
             if attempt == attempts - 1:
-                detail = redact_secret(str(exc), token)
+                detail = _safe_excerpt(str(exc), token, limit=120)
                 raise OncoKBRetryError(
-                    f"OncoKB API request failed for {url}: {type(exc).__name__}: {detail}"
+                    f"OncoKB API request failed for {safe_url}: {type(exc).__name__}: {detail}"
                 ) from None
             delay = _retry_delay(
                 attempt,
                 now=wall_clock(),
                 jitter=(jitter() if jitter is not None else None),
             )
-        rem_after = check_remaining()
         if delay >= rem_after:
             raise OncoKBBudgetExceeded(
                 f"OncoKB backoff ({delay:.1f}s) exceeds remaining job budget ({rem_after:.1f}s); "
@@ -440,7 +461,9 @@ def _atomic_write_json(path: Path, payload: object) -> None:
     tmp.replace(path)
 
 
-def validate_batch_responses(queries: list[dict], responses: object) -> dict[str, dict]:
+def validate_batch_responses(
+    queries: list[dict], responses: object, *, token: str | None = None
+) -> dict[str, dict]:
     """Strictly match every batch response by unique query id and validate its oncogenic label.
 
     Never falls back to positional alignment; any missing, duplicate, unknown, malformed,
@@ -459,24 +482,37 @@ def validate_batch_responses(queries: list[dict], responses: object) -> dict[str
             raise OncoKBError("Malformed OncoKB batch entry: expected JSON object")
         errors = item.get("errors")
         if errors:
-            raise OncoKBError(f"OncoKB entry returned error(s): {errors!r}")
+            raise OncoKBError(
+                f"OncoKB entry returned error(s): {_safe_excerpt(errors, token)}"
+            )
         if item.get("error"):
-            raise OncoKBError(f"OncoKB entry returned error: {item.get('error')!r}")
+            raise OncoKBError(
+                f"OncoKB entry returned error: {_safe_excerpt(item.get('error'), token)}"
+            )
         query_meta = item.get("query")
         qid = query_meta.get("id") if isinstance(query_meta, dict) else None
         if not isinstance(qid, str) or not qid:
             raise OncoKBError("OncoKB batch entry missing non-empty query.id")
         if qid not in expected_set:
-            raise OncoKBError(f"OncoKB batch entry returned unexpected query.id {qid!r}")
+            raise OncoKBError(
+                f"OncoKB batch entry returned unexpected query.id {_safe_excerpt(qid, token)}"
+            )
         if qid in matched:
-            raise OncoKBError(f"OncoKB batch response contained duplicate query.id {qid!r}")
+            raise OncoKBError(
+                f"OncoKB batch response contained duplicate query.id {_safe_excerpt(qid, token)}"
+            )
         if "oncogenic" not in item:
-            raise OncoKBError(f"OncoKB batch entry {qid!r} missing 'oncogenic' field")
-        classify_oncogenic(item["oncogenic"])
+            raise OncoKBError(
+                f"OncoKB batch entry {_safe_excerpt(qid, token)} missing 'oncogenic' field"
+            )
+        classify_oncogenic(item["oncogenic"], token=token)
         matched[qid] = item
     if set(matched) != expected_set:
         missing = sorted(expected_set - set(matched))
-        raise OncoKBError(f"OncoKB batch response missing query.id(s): {missing[:5]}")
+        raise OncoKBError(
+            "OncoKB batch response missing query.id(s): "
+            f"{[_safe_excerpt(m, token) for m in missing[:5]]}"
+        )
     return matched
 
 
@@ -495,6 +531,7 @@ class OncoKBClient:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         wall_clock: Callable[[], float] = time.time,
+        build_deadline: float | None = None,
     ) -> None:
         settings = json.loads(RUNTIME_SETTINGS_PATH.read_text())
         budget = float(
@@ -521,6 +558,9 @@ class OncoKBClient:
         self.unique_variants_queried = 0
         self.cache_hits = 0
         self.progress: dict[str, object] = {}
+
+        # Enforce deadline before /info and /utils/cancerGeneList start-up requests.
+        self.start_budget(build_deadline=build_deadline)
 
         info_payload = self._get("/info", authenticated=False)
         data_version_obj = (
@@ -571,14 +611,17 @@ class OncoKBClient:
         return rem
 
     def _get(self, path: str, *, authenticated: bool) -> object:
+        self.remaining()
         self.api_calls += 1
-        return self._request(
+        result = self._request(
             f"{self.base_url}{path}",
             token=(self.token if authenticated else None),
             sleep=self.sleep,
             wall_clock=self.wall_clock,
             remaining=self.remaining,
         )
+        self.remaining()
+        return result
 
     def _post_batch(self, items: list[dict]) -> dict[str, dict]:
         self.api_calls += 1
@@ -590,7 +633,7 @@ class OncoKBClient:
             wall_clock=self.wall_clock,
             remaining=self.remaining,
         )
-        return validate_batch_responses(items, responses)
+        return validate_batch_responses(items, responses, token=self.token)
 
     def verify_credentials(self) -> None:
         """Fail closed if ONCOKB_API_TOKEN is rejected even when variant cache is warm."""
@@ -665,7 +708,7 @@ class OncoKBClient:
                 qid = str(queries[idx]["id"])
                 item = matched[qid]
                 oncogenic = item["oncogenic"]
-                verdict = classify_oncogenic(oncogenic)
+                verdict = classify_oncogenic(oncogenic, token=self.token)
                 known_effect = str(
                     ((item.get("mutationEffect") or {}).get("knownEffect")) or ""
                 )
@@ -724,6 +767,9 @@ def load_client(
     *,
     token: str | None = None,
     base_url: str = ONCOKB_BASE_URL,
+    build_deadline: float | None = None,
 ) -> OncoKBClient:
     """Factory hook (monkeypatchable in tests) creating a live OncoKBClient."""
-    return OncoKBClient(cache_dir, token=token, base_url=base_url)
+    return OncoKBClient(
+        cache_dir, token=token, base_url=base_url, build_deadline=build_deadline
+    )

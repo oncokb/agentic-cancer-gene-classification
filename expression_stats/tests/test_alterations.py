@@ -74,7 +74,8 @@ def test_missense_counts_only_at_positions_recurrent_in_ten_tumors():
     assert events == {(ROW["KRAS"], r[1]) for r in hot}
 
 
-def test_recurrence_is_per_transcript_and_counts_tumors_not_rows():
+def test_recurrence_is_per_dominant_transcript_and_counts_tumors_not_rows():
+    # T1 has 14 rows across 5 distinct tumors (dominant); T2 has 5 rows (excluded); 5 < 10 -> empty.
     rows = [("KRAS", sample("AA", 0), "Missense_Mutation", "T1", 12, "")] * 10
     rows += [("KRAS", sample("AA", i), "Missense_Mutation", "T2", 12, "") for i in range(1, 6)]
     rows += [("KRAS", sample("AA", i), "Missense_Mutation", "T1", 12, "") for i in range(6, 10)]

@@ -120,6 +120,7 @@ jobs:
           restore-keys: expression-oncokb-
       - name: Build
         if: steps.check.outputs.changed == 'true'
+        # 15m safety margin beyond runtime-settings.json build_time_budget_seconds (315m).
         timeout-minutes: 330
         env:
           DATAHUB_COMMIT: ${{ steps.check.outputs.commit }}

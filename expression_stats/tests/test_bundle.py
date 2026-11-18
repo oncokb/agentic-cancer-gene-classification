@@ -428,3 +428,32 @@ def test_incomplete_precheck_cannot_publish_even_with_expiry(bundled, monkeypatc
     monkeypatch.setattr(publisher, "gh", lambda *args: pytest.fail("Must not contact GitHub"))
     with pytest.raises(ValueError, match="completed PubMed"):
         publisher.publish(directory)
+
+
+@pytest.mark.parametrize(
+    "updates,remove_keys",
+    [
+        ({"oncokb_complete": "true"}, ()),
+        ({"oncokb_complete": 1}, ()),
+        ({}, ("oncokb_complete",)),
+        ({"oncokb_incomplete": "false"}, ()),
+        ({"oncokb_incomplete": 0}, ()),
+        ({}, ("oncokb_incomplete",)),
+        ({"hotspot_only": "false"}, ()),
+        ({"hotspot_only": 0}, ()),
+        ({}, ("hotspot_only",)),
+    ],
+)
+def test_publisher_requires_strict_boolean_identity_for_oncokb_flags(
+    bundled, monkeypatch, updates, remove_keys
+):
+    _, _, directory, manifest, _ = bundled
+    manifest["source"].update(updates)
+    for key in remove_keys:
+        manifest["source"].pop(key, None)
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
+    publisher = load("publish")
+    monkeypatch.setattr(publisher, "gh", lambda *args: pytest.fail("Must not contact GitHub"))
+    with pytest.raises(ValueError, match="complete OncoKB"):
+        publisher.publish(directory)

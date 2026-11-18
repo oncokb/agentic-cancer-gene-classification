@@ -205,10 +205,13 @@ def _save(target, data):
     Path(handle.name).replace(target)
 
 
-def summary(commit, cache, study, kind, *, delete_downloads=False):
+def summary(commit, cache, study, kind, *, delete_downloads=False, remaining=None):
     """(oid, parsed summary) for one pinned study file, downloading only on a cache miss."""
+    if remaining is not None:
+        remaining()
     relative = f"public/{study}/{FILES[kind]}"
-    oid, size, inline = fetching.locate(commit, relative)
+    locate_kw = {"remaining": remaining} if remaining is not None else {}
+    oid, size, inline = fetching.locate(commit, relative, **locate_kw)
     target = Path(cache) / "alterations" / f"p{PARSER_VERSION}" / kind / f"{oid}.npz"
     if target.exists():
         try:
@@ -217,7 +220,10 @@ def summary(commit, cache, study, kind, *, delete_downloads=False):
         except (OSError, ValueError, KeyError):
             target.unlink(missing_ok=True)
     if inline is None:
-        path = fetching.fetch_lfs(commit, cache, relative, oid, size, f"{study}/{FILES[kind]}")
+        fetch_kw = {"remaining": remaining} if remaining is not None else {}
+        path = fetching.fetch_lfs(
+            commit, cache, relative, oid, size, f"{study}/{FILES[kind]}", **fetch_kw
+        )
     else:
         path = Path(cache) / "objects" / oid
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,33 +237,75 @@ def summary(commit, cache, study, kind, *, delete_downloads=False):
     return oid, data
 
 
-def case_list(commit, cache, study, kind):
+def case_list(commit, cache, study, kind, *, remaining=None):
     target = Path(cache) / "case_lists" / commit / study / CASE_LISTS[kind]
     if not target.exists():
-        data = fetching.pinned_bytes(commit, f"public/{study}/case_lists/{CASE_LISTS[kind]}")
+        if remaining is not None:
+            remaining()
+        pin_kw = {"remaining": remaining} if remaining is not None else {}
+        data = fetching.pinned_bytes(
+            commit, f"public/{study}/case_lists/{CASE_LISTS[kind]}", **pin_kw
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
     data = target.read_bytes()
     return hashlib.sha256(data).hexdigest(), parse_case_list(data.decode())
 
 
-def load_inputs(commit, cache, studies, *, workers=4, delete_downloads=False):
+def load_inputs(commit, cache, studies, *, workers=4, delete_downloads=False, remaining=None):
     """Per-study summaries and case lists, plus a fingerprint of every input object."""
+    from concurrent.futures import FIRST_COMPLETED, wait
+
     jobs = [(study, kind) for study in studies for kind in FILES]
 
     def run(job):
+        if remaining is not None:
+            remaining()
         study, kind = job
-        oid, data = summary(commit, cache, study, kind, delete_downloads=delete_downloads)
-        list_sha, cases = case_list(commit, cache, study, kind)
+        oid, data = summary(
+            commit, cache, study, kind, delete_downloads=delete_downloads, remaining=remaining
+        )
+        list_sha, cases = case_list(commit, cache, study, kind, remaining=remaining)
         return job, oid, list_sha, data, cases
 
+    completed = {}
+    max_workers = max(1, int(workers))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pending = set()
+        job_iter = iter(jobs)
+
+        def fill_pool():
+            while len(pending) < max_workers:
+                if remaining is not None:
+                    remaining()
+                try:
+                    job = next(job_iter)
+                except StopIteration:
+                    break
+                pending.add(pool.submit(run, job))
+
+        try:
+            fill_pool()
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    job, oid, list_sha, data, cases = future.result()
+                    completed[job] = (oid, list_sha, data, cases)
+                if remaining is not None:
+                    remaining()
+                fill_pool()
+        except Exception:
+            for future in pending:
+                future.cancel()
+            raise
+
     inputs, provenance = {}, {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for (study, kind), oid, list_sha, data, cases in pool.map(run, jobs):
-            inputs.setdefault(study, {})[kind] = dict(data=data, cases=cases)
-            provenance.setdefault(study, {})[kind] = dict(
-                file=FILES[kind], sha256=oid, case_list=CASE_LISTS[kind], case_list_sha256=list_sha
-            )
+    for study, kind in jobs:
+        oid, list_sha, data, cases = completed[(study, kind)]
+        inputs.setdefault(study, {})[kind] = dict(data=data, cases=cases)
+        provenance.setdefault(study, {})[kind] = dict(
+            file=FILES[kind], sha256=oid, case_list=CASE_LISTS[kind], case_list_sha256=list_sha
+        )
     digest = hashlib.sha256(
         json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -319,6 +367,7 @@ def classify_point_mutations(
     oncokb=None,
     row_symbols=None,
     excluded_counts=None,
+    non_dominant_counts=None,
 ):
     """Classify OncoKB-first point mutations with pan-cancer position-hotspot + TSG fallback.
 
@@ -326,8 +375,11 @@ def classify_point_mutations(
     source_by_event maps each (gene row, sample) to 'oncokb' or 'hotspot' (OncoKB takes
     precedence if a tumor has both). OncoKB 'neutral', 'inconclusive', and
     'predicted_oncogenic' statuses are excluded and never fall back. Missense and
-    in-frame indels both require >= missense_min_recurrence (10) non-excluded retained
-    tumors pan-cancer at the same (gene, transcript, protein position).
+    in-frame indels require >= missense_min_recurrence (10) retained tumors pan-cancer
+    at the same (gene, protein position) on the gene's dominant (most frequent)
+    transcript, counting all such mutations regardless of OncoKB verdict; position -1
+    never groups and rows on non-dominant transcripts are excluded from grouping and
+    reported in non_dominant_counts.
     """
     rows_arr = np.asarray(records["row"])
     samples_arr = np.asarray(records["sample"])
@@ -391,18 +443,50 @@ def classify_point_mutations(
             verdict=verdicts,
         )
     )
-    non_excluded = frame[frame["verdict"].isin(["oncokb", "unknown"])]
-    fallback = non_excluded[non_excluded["verdict"] == "unknown"]
+    fallback = frame[frame["verdict"] == "unknown"]
 
     position_classes = (MISSENSE, *INFRAME)
-    hotspot_pool = non_excluded[
-        non_excluded["cls"].isin(position_classes) & (non_excluded["position"] >= 0)
-    ]
-    recurrent = hotspot_pool.groupby(["row", "transcript", "position"])["sample"].nunique()
+    pos_rows = frame[frame["cls"].isin(position_classes)]
+    if not pos_rows.empty:
+        tx_counts = (
+            pos_rows.groupby(["row", "transcript"], sort=False)
+            .size()
+            .rename("tx_count")
+            .reset_index()
+        )
+        tx_counts["_empty_tx"] = tx_counts["transcript"] == ""
+        tx_counts = tx_counts.sort_values(
+            ["row", "_empty_tx", "tx_count", "transcript"],
+            ascending=[True, True, False, True],
+            kind="mergesort",
+        )
+        dominant_tx = tx_counts.drop_duplicates("row", keep="first").set_index("row")["transcript"]
+        dom_for_pos = pos_rows["row"].map(dominant_tx)
+        is_dominant = pos_rows["transcript"].to_numpy() == dom_for_pos.to_numpy()
+        non_dom = pos_rows[~is_dominant]
+        if non_dominant_counts is not None and not non_dom.empty:
+            for r, cnt in non_dom.groupby("row", sort=True).size().items():
+                key = row_symbols[int(r)] if row_symbols is not None else int(r)
+                non_dominant_counts[key] = int(non_dominant_counts.get(key, 0)) + int(cnt)
+        dominant_pos = pos_rows[is_dominant]
+    else:
+        dominant_tx = pd.Series(dtype=object)
+        dominant_pos = pos_rows
+
+    # Recurrence counts ALL retained missense/in-frame tumors at (gene, position) on
+    # the gene's dominant transcript regardless of OncoKB verdict; position -1 never groups.
+    hotspot_pool = dominant_pos[dominant_pos["position"] >= 0]
+    recurrent = hotspot_pool.groupby(["row", "position"])["sample"].nunique()
     recurrent = recurrent[recurrent >= params["missense_min_recurrence"]]
-    position_hits = fallback[
-        fallback["cls"].isin(position_classes) & (fallback["position"] >= 0)
-    ].join(recurrent.rename("tumors"), on=["row", "transcript", "position"], how="inner")
+
+    fallback_pos = fallback[fallback["cls"].isin(position_classes) & (fallback["position"] >= 0)]
+    if not fallback_pos.empty and not dominant_tx.empty:
+        fallback_pos = fallback_pos[
+            fallback_pos["transcript"] == fallback_pos["row"].map(dominant_tx)
+        ]
+    position_hits = fallback_pos.join(
+        recurrent.rename("tumors"), on=["row", "position"], how="inner"
+    )
 
     truncating_hits = fallback[
         fallback["cls"].isin(TRUNCATING) & fallback["row"].isin(list(tsg_rows))
@@ -804,6 +888,7 @@ def compute(
             records["build"].append(np.full(int(mask.sum()), "GRCh37", dtype=str))
     records = {k: np.concatenate(v) if v else np.array([]) for k, v in records.items()}
     excluded_status_counts = {}
+    non_dominant_counts = {}
     events, source_by_event = classify_point_mutations(
         records,
         retained,
@@ -812,6 +897,7 @@ def compute(
         oncokb=oncokb,
         row_symbols=row_symbols,
         excluded_counts=excluded_status_counts,
+        non_dominant_counts=non_dominant_counts,
     )
     association_events = {POINT_MUTATION: events, STRUCTURAL_VARIANT: set()}
     association_profiled = {POINT_MUTATION: retained}
@@ -914,6 +1000,9 @@ def compute(
     sv["q_value"] = np.where(np.isfinite(sv["p_value"]), bh(sv["p_value"]), np.nan)
 
     reasons = {c: {j: r for j, r in v.items() if r} for c, v in reasons.items()}
+    non_dominant_sorted = dict(
+        sorted(non_dominant_counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+    )
     summary = dict(
         cohorts=cohorts,
         point_mutation_mode=("oncokb+hotspot_fallback" if oncokb is not None else "hotspot_only"),
@@ -923,6 +1012,9 @@ def compute(
             hotspot=int(pm_hotspot_events.sum()),
         ),
         point_mutation_oncokb_excluded_counts=excluded_status_counts,
+        point_mutation_non_dominant_transcript_rows=sum(non_dominant_sorted.values()),
+        point_mutation_non_dominant_transcript_genes=len(non_dominant_sorted),
+        point_mutation_non_dominant_transcript_counts_by_gene=non_dominant_sorted,
         point_mutation_tsg_fallback_genes=len(tsg_rows),
         oncokb_api_calls=(oncokb.api_calls if oncokb is not None else 0),
         oncokb_unique_variants_queried=(

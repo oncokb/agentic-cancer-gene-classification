@@ -55,10 +55,11 @@ def publish(directory):
             "statistics can be published"
         )
     if (
-        manifest["source"].get("hotspot_only")
-        or manifest["source"].get("oncokb_incomplete")
-        or not manifest["source"].get("oncokb_complete")
-        or not manifest["source"].get("oncokb_data_version")
+        manifest["source"].get("hotspot_only") is not False
+        or manifest["source"].get("oncokb_incomplete") is not False
+        or manifest["source"].get("oncokb_complete") is not True
+        or not isinstance(manifest["source"].get("oncokb_data_version"), str)
+        or not manifest["source"]["oncokb_data_version"].strip()
     ):
         raise ValueError("Publishing requires a complete OncoKB-annotated build")
     if "precheck_expires_at" not in manifest["source"] or manifest["source"].get(
