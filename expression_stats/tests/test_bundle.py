@@ -91,8 +91,20 @@ def bundled(tmp_path):
     (source / "genes").mkdir(parents=True)
     manifest = dict(
         release_id="datahub-aaaaaaaaaaaa-m3-bbbbbbbbbbbb",
-        source=dict(generated_at="2026-11-06T12:00:00+00:00", precheck_expires_at="later"),
-        build=dict(genes=None, skip_precheck=False, skip_alterations=False),
+        source=dict(
+            generated_at="2026-11-06T12:00:00+00:00",
+            precheck_expires_at="later",
+            oncokb_data_version="v7.7",
+            oncokb_complete=True,
+            oncokb_incomplete=False,
+            hotspot_only=False,
+        ),
+        build=dict(
+            genes=None,
+            skip_precheck=False,
+            skip_alterations=False,
+            hotspot_only=False,
+        ),
         cancer_types=[dict(oncotree_code=code) for code in CODES],
     )
     report = synthesize(PANEL, CODES, source / "genes", manifest["release_id"])
@@ -145,6 +157,10 @@ def test_refresh_changes_tag_without_changing_release_id(bundled):
         "subset",
         "skip",
         "skip_alterations",
+        "hotspot_only",
+        "missing_oncokb_version",
+        "oncokb_incomplete",
+        "oncokb_not_complete",
     ],
 )
 def test_atomic_release_policy(bundled, monkeypatch, failure):
@@ -152,12 +168,23 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
     monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
     publisher = load("publish")
     monkeypatch.setenv("GITHUB_SHA", "a" * 40)
-    if failure in {"subset", "skip", "skip_alterations"}:
+    if failure in {"subset", "skip", "skip_alterations", "hotspot_only"}:
         manifest["build"] = dict(
             genes=["TP53"] if failure == "subset" else None,
             skip_precheck=failure == "skip",
             skip_alterations=failure == "skip_alterations",
+            hotspot_only=failure == "hotspot_only",
         )
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+    elif failure == "missing_oncokb_version":
+        manifest["source"]["oncokb_data_version"] = None
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+    elif failure == "oncokb_incomplete":
+        manifest["source"]["oncokb_incomplete"] = True
+        manifest["source"]["oncokb_complete"] = False
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+    elif failure == "oncokb_not_complete":
+        manifest["source"]["oncokb_complete"] = False
         (directory / "manifest.json").write_text(json.dumps(manifest))
     calls = []
 
@@ -182,7 +209,19 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
         return '{"id":42}'
 
     monkeypatch.setattr(publisher, "gh", gh)
-    if failure in {"upload", "corrupt", "cleanup", "stale", "subset", "skip", "skip_alterations"}:
+    if failure in {
+        "upload",
+        "corrupt",
+        "cleanup",
+        "stale",
+        "subset",
+        "skip",
+        "skip_alterations",
+        "hotspot_only",
+        "missing_oncokb_version",
+        "oncokb_incomplete",
+        "oncokb_not_complete",
+    }:
         match = "stale draft 7; delete it" if failure == "stale" else None
         if failure == "cleanup":
             match = "upload failed"
@@ -388,4 +427,33 @@ def test_incomplete_precheck_cannot_publish_even_with_expiry(bundled, monkeypatc
     publisher = load("publish")
     monkeypatch.setattr(publisher, "gh", lambda *args: pytest.fail("Must not contact GitHub"))
     with pytest.raises(ValueError, match="completed PubMed"):
+        publisher.publish(directory)
+
+
+@pytest.mark.parametrize(
+    "updates,remove_keys",
+    [
+        ({"oncokb_complete": "true"}, ()),
+        ({"oncokb_complete": 1}, ()),
+        ({}, ("oncokb_complete",)),
+        ({"oncokb_incomplete": "false"}, ()),
+        ({"oncokb_incomplete": 0}, ()),
+        ({}, ("oncokb_incomplete",)),
+        ({"hotspot_only": "false"}, ()),
+        ({"hotspot_only": 0}, ()),
+        ({}, ("hotspot_only",)),
+    ],
+)
+def test_publisher_requires_strict_boolean_identity_for_oncokb_flags(
+    bundled, monkeypatch, updates, remove_keys
+):
+    _, _, directory, manifest, _ = bundled
+    manifest["source"].update(updates)
+    for key in remove_keys:
+        manifest["source"].pop(key, None)
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
+    publisher = load("publish")
+    monkeypatch.setattr(publisher, "gh", lambda *args: pytest.fail("Must not contact GitHub"))
+    with pytest.raises(ValueError, match="complete OncoKB"):
         publisher.publish(directory)

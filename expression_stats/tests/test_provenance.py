@@ -133,6 +133,7 @@ def test_live_mapping_changes_invalidate_early_exit(tmp_path, monkeypatch, mappi
         ALTERATION_PARAMS,
         METHOD_VERSION,
         PARAMS,
+        oncokb,
     )
 
     spec = importlib.util.spec_from_file_location("mapping_check_test", "scripts/check_build.py")
@@ -150,11 +151,15 @@ def test_live_mapping_changes_invalidate_early_exit(tmp_path, monkeypatch, mappi
             hgnc_sha256=provenance.hgnc_pin()["sha256"],
             generated_at=datetime.now(UTC).isoformat(),
             cohort_mapping_sha256="old-mapping",
+            oncokb_data_version="v7.7",
+            oncokb_classification_version=oncokb.CLASSIFICATION_VERSION,
+            hotspot_only=False,
         ),
-        build=dict(genes=None, skip_precheck=False, skip_alterations=False),
+        build=dict(genes=None, skip_precheck=False, skip_alterations=False, hotspot_only=False),
     )
     monkeypatch.setattr(module, "published_manifest", lambda: manifest)
     monkeypatch.setattr(module, "current_mapping_sha", lambda commit: mapping_sha)
+    monkeypatch.setattr(module, "current_oncokb_version", lambda: "v7.7")
     output = tmp_path / "output"
     for key, value in dict(
         INPUT_COMMIT="a" * 40,

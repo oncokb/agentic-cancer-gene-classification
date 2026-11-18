@@ -8,6 +8,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+ONCOKB = runpy.run_path("gene_expression_relevance/oncokb.py")
 PROVENANCE = runpy.run_path("gene_expression_relevance/provenance.py")
 SETTINGS = runpy.run_path("gene_expression_relevance/__init__.py")
 
@@ -23,8 +24,17 @@ def unchanged(manifest, commit, method, genes, skip, code_sha, hgnc_sha, now=Non
         and manifest.get("params") == SETTINGS["PARAMS"]
         and manifest.get("alteration_method_version") == SETTINGS["ALTERATION_METHOD_VERSION"]
         and manifest.get("alteration_params") == SETTINGS["ALTERATION_PARAMS"]
+        and source.get("oncokb_classification_version") == ONCOKB["CLASSIFICATION_VERSION"]
+        and bool(source.get("oncokb_data_version"))
+        and not source.get("hotspot_only")
+        and not source.get("oncokb_incomplete")
         and manifest.get("build")
-        == {"genes": genes, "skip_precheck": skip, "skip_alterations": False}
+        == {
+            "genes": genes,
+            "skip_precheck": skip,
+            "skip_alterations": False,
+            "hotspot_only": False,
+        }
     ):
         return False
     if not skip:
@@ -47,6 +57,14 @@ def current_mapping_sha(commit):
     from gene_expression_relevance.mapping import cancer_mapping
 
     return PROVENANCE["mapping_fingerprint"](cancer_mapping(studies(commit)))
+
+
+def current_oncokb_version():
+    payload = ONCOKB["request_json"](f"{ONCOKB['ONCOKB_BASE_URL']}/info")
+    version = ((payload.get("dataVersion") if isinstance(payload, dict) else None) or {}).get(
+        "version"
+    )
+    return str(version or "").strip() or None
 
 
 def published_manifest():
@@ -89,18 +107,23 @@ def main():
         {s.strip().upper() for s in os.environ.get("INPUT_GENES", "").split(",") if s.strip()}
     )
     skip = os.environ.get("INPUT_SKIP", "").lower() == "true"
+    hotspot_only = os.environ.get("INPUT_HOTSPOT_ONLY", "").lower() == "true"
     code_sha = PROVENANCE["code_fingerprint"]()
     hgnc_sha = PROVENANCE["hgnc_pin"]()["sha256"]
     manifest = published_manifest()
-    # Branch dispatches, subsets and skipped prechecks always build review artifacts.
+    # Branch dispatches, subsets, hotspot-only and skipped prechecks always build review artifacts.
     on_main = os.environ.get("GITHUB_REF", "refs/heads/main") == "refs/heads/main"
-    deployable = on_main and not genes and not skip
+    deployable = on_main and not genes and not skip and not hotspot_only
     changed = not deployable or not unchanged(
         manifest, commit, SETTINGS["METHOD_VERSION"], None, skip, code_sha, hgnc_sha
     )
     if not changed:
         changed = current_mapping_sha(commit) != manifest.get("source", {}).get(
             "cohort_mapping_sha256"
+        )
+    if not changed:
+        changed = current_oncokb_version() != manifest.get("source", {}).get(
+            "oncokb_data_version"
         )
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
         output.write(

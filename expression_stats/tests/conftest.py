@@ -23,6 +23,35 @@ def offline_alteration_inputs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def offline_oncokb_client(monkeypatch, tmp_path_factory):
+    """Default offline OncoKB stub; OncoKB unit tests override this directly."""
+    from gene_expression_relevance import oncokb
+
+    class FakeOncoKB:
+        def __init__(self):
+            self.index = oncokb.build_cancer_gene_index([], "v0-test", "2026-11-01")
+            self.api_calls = 0
+            self.unique_variants_queried = 0
+            self.cache_hits = 0
+
+        def annotate(self, keys):
+            return {k: "unknown" for k in keys}
+
+        def provenance(self):
+            return {
+                "oncokb_data_version": self.index.data_version,
+                "oncokb_data_date": self.index.data_date,
+                "oncokb_classification_version": oncokb.CLASSIFICATION_VERSION,
+                "oncokb_cancer_gene_list_sha256": self.index.sha256,
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(oncokb, "load_client", lambda *a, **kw: FakeOncoKB())
+
+
+@pytest.fixture(autouse=True)
 def offline_purity_inputs(monkeypatch):
     import numpy as np
 

@@ -229,6 +229,23 @@ test("alterations render badges and safe category details on surfaced, candidate
     assert.strictEqual(detail.findAll((n) => n.tagName === "img").length, 0);
   }
   assert.strictEqual(summaryRows(nodes)[3].children[3].text, "—", "old rows need no alteration data");
+  // Contract 1.7 Point Mutation sources render alongside event counts when present.
+  const v17 = view();
+  v17.pairs[0].stats.alterations = {
+    alteration_types_enriched: ["Point Mutation"],
+    categories: {
+      "Point Mutation": {
+        status: "enriched",
+        n_events: 24,
+        n_profiled: 149,
+        frequency: 0.16,
+        sources: { oncokb: 20, hotspot: 4 },
+      },
+    },
+  };
+  const withSources = env({ "GET /v1/expression-context/stats/ERBB2": response(v17) });
+  await withSources.page.lookup("ERBB2");
+  assert.ok(detailRows(withSources.nodes)[0].text.includes("24/149 events/profiled; frequency 16.00% (OncoKB 20, hotspot 4)"));
 });
 
 test("surfaced rows show distinct Strong and Moderate badges with effect-size tooltips", async () => {

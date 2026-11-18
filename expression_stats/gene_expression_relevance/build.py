@@ -1,6 +1,8 @@
 """Build static artifacts in gene batches using a disk-backed expression matrix."""
 
+import inspect
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -22,6 +24,7 @@ from . import (
     purity,
 )
 from . import alterations as alteration_stats
+from . import oncokb as oncokb_client
 from .controls import evaluate as evaluate_controls
 from .controls import require_passed
 from .fetch import digest, fetch_all
@@ -86,18 +89,153 @@ def matrix(paths, mapping, catalog, target, selection=None):
     return x, np.asarray(labels), ids
 
 
-def load_alterations(commit, cache, mapping, selection, ids, catalog, aliases, delete_downloads):
+def _accepts_kwarg(fn, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD or p.name == name for p in params
+    )
+
+
+def _check_build_deadline(deadline: float, clock=time.monotonic) -> float:
+    rem = deadline - clock()
+    if rem <= 0:
+        raise oncokb_client.OncoKBBudgetExceeded(
+            "Build time budget exhausted; build incomplete, resume cache"
+        )
+    return rem
+
+
+def _write_oncokb_incomplete(
+    out: Path,
+    commit: str,
+    mapping: list,
+    requested_genes,
+    skip_precheck: bool,
+    skip_alterations: bool,
+    hotspot_only: bool,
+    exc: Exception,
+) -> None:
+    incomplete = out.with_name(out.name + "-incomplete")
+    incomplete_manifest = dict(
+        schema_version="1",
+        contract_version=CONTRACT_VERSION,
+        method_version=METHOD_VERSION,
+        params=PARAMS,
+        alteration_method_version=ALTERATION_METHOD_VERSION,
+        alteration_params=ALTERATION_PARAMS,
+        source=dict(
+            datahub_commit=commit,
+            generated_at=datetime.now(UTC).isoformat(),
+            oncokb_incomplete=True,
+            oncokb_complete=False,
+            hotspot_only=hotspot_only,
+        ),
+        cancer_types=mapping,
+        build=dict(
+            genes=requested_genes,
+            skip_precheck=skip_precheck,
+            skip_alterations=skip_alterations,
+            hotspot_only=hotspot_only,
+        ),
+    )
+    write_json(incomplete / "manifest.json", incomplete_manifest)
+    reason = oncokb_client.redact_secret(str(exc), os.environ.get("ONCOKB_API_TOKEN"))
+    write_json(
+        incomplete / "oncokb-report.json",
+        dict(
+            status="incomplete",
+            reason=reason,
+            cache=getattr(exc, "oncokb_cache", ""),
+            progress=getattr(exc, "oncokb_progress", {}),
+        ),
+    )
+
+
+def load_alterations(
+    commit,
+    cache,
+    mapping,
+    selection,
+    ids,
+    catalog,
+    aliases,
+    delete_downloads,
+    *,
+    hotspot_only=False,
+    build_deadline=None,
+    clock=time.monotonic,
+):
     """Alteration statistics for the build's gene rows (detail only; see alterations.py)."""
-    driver = drivers.load(ALTERATION_PARAMS["mutation_driver_source"])
+    driver = drivers.load(ALTERATION_PARAMS["mutation_tsg_fallback_source"])
     cna_driver = drivers.load_cna(ALTERATION_PARAMS["cna_driver_source"])
-    inputs, provenance, inputs_sha = alteration_stats.load_inputs(
-        commit, cache, [item["study_id"] for item in mapping], delete_downloads=delete_downloads
-    )
-    result = alteration_stats.compute(
-        inputs, mapping, selection, ids, catalog, aliases, driver, cna_driver=cna_driver
-    )
-    pins = dict(**driver.pin(), **cna_driver.pin())
+    if build_deadline is not None:
+        _check_build_deadline(build_deadline, clock)
+    if hotspot_only:
+        client = None
+    elif _accepts_kwarg(oncokb_client.load_client, "build_deadline"):
+        client = oncokb_client.load_client(cache, build_deadline=build_deadline)
+    else:
+        client = oncokb_client.load_client(cache)
+    try:
+        if client is not None and build_deadline is not None and hasattr(client, "start_budget"):
+            client.start_budget(build_deadline=build_deadline)
+        rem_fn = (
+            (lambda: _check_build_deadline(build_deadline, clock))
+            if build_deadline is not None
+            else None
+        )
+        load_kwargs = dict(delete_downloads=delete_downloads)
+        if rem_fn is not None and _accepts_kwarg(alteration_stats.load_inputs, "remaining"):
+            load_kwargs["remaining"] = rem_fn
+        inputs, provenance, inputs_sha = alteration_stats.load_inputs(
+            commit, cache, [item["study_id"] for item in mapping], **load_kwargs
+        )
+        result = alteration_stats.compute(
+            inputs,
+            mapping,
+            selection,
+            ids,
+            catalog,
+            aliases,
+            driver,
+            cna_driver=cna_driver,
+            oncokb=client,
+        )
+        oncokb_prov = (
+            client.provenance()
+            if client is not None
+            else dict(
+                oncokb_data_version=None,
+                oncokb_data_date=None,
+                oncokb_classification_version=oncokb_client.CLASSIFICATION_VERSION,
+                oncokb_cancer_gene_list_sha256=None,
+            )
+        )
+    except (oncokb_client.OncoKBBudgetExceeded, oncokb_client.OncoKBRetryError) as exc:
+        if client is not None:
+            exc.oncokb_progress = getattr(client, "progress", {})
+            exc.oncokb_cache = str(getattr(client, "cache_db_path", ""))
+        raise
+    finally:
+        if client is not None:
+            client.close()
+    pins = {
+        **driver.pin(),
+        "mutation_tsg_fallback_source": driver.name,
+        "mutation_driver_source": (
+            "hotspot_only" if hotspot_only else ALTERATION_PARAMS["mutation_driver_source"]
+        ),
+        "hotspot_only": hotspot_only,
+        **oncokb_prov,
+        **cna_driver.pin(),
+    }
     return result, pins, provenance, inputs_sha
+
+
+_CLI_PROCESS_STARTED: float | None = None
 
 
 def build(
@@ -109,45 +247,91 @@ def build(
     batch_size=256,
     *,
     skip_alterations=False,
+    hotspot_only=False,
     delete_downloads=False,
+    started=None,
+    clock=time.monotonic,
 ):
-    started = time.monotonic()
+    global _CLI_PROCESS_STARTED
+    if started is None:
+        started = _CLI_PROCESS_STARTED if _CLI_PROCESS_STARTED is not None else clock()
+    _CLI_PROCESS_STARTED = None
+    started = float(started)
     out, cache = Path(out), Path(cache)
-    paths = fetch_all(commit, cache)
-    mapping = cancer_mapping(paths)
-    canonical, aliases = hgnc(cache)
-    catalog = gene_catalog(paths.values(), canonical)
-    full_catalog = dict(catalog)
     if isinstance(genes, str):
         genes = genes.split(",")
     requested_genes = (
         sorted({g.strip().upper() for g in genes if g.strip()}) or None if genes else None
     )
-    if requested_genes:
-        known_symbols = set(catalog.values())
-        requested = {g if g in known_symbols else aliases.get(g, g) for g in requested_genes}
-        catalog = {entrez: symbol for entrez, symbol in catalog.items() if symbol in requested}
-        missing = requested - set(catalog.values())
-        if missing:
-            raise ValueError(f"Genes absent or ambiguous: {sorted(missing)}")
-    if not catalog:
-        raise ValueError("No genes to build")
-    ids = sorted(catalog)
-    selection = select_samples(paths, mapping)
-    purity_values = load_selected(cache, mapping, selection)
-    alteration = None
-    alteration_identity = dict(skipped=True)
-    if not skip_alterations:
-        alteration, driver_pins, alteration_inputs, inputs_sha = load_alterations(
-            commit, cache, mapping, selection, ids, full_catalog, aliases, delete_downloads
+    runtime_settings = json.loads(oncokb_client.RUNTIME_SETTINGS_PATH.read_text())
+    build_deadline = started + float(runtime_settings["build_time_budget_seconds"])
+    rem_fn = lambda: _check_build_deadline(build_deadline, clock)  # noqa: E731
+    mapping = []
+    try:
+        rem_fn()
+        paths = (
+            fetch_all(commit, cache, remaining=rem_fn)
+            if _accepts_kwarg(fetch_all, "remaining")
+            else fetch_all(commit, cache)
         )
-        alteration_identity = dict(
-            method_version=ALTERATION_METHOD_VERSION,
-            params=ALTERATION_PARAMS,
-            high_expression_params=HIGH_EXPRESSION_PARAMS,
-            inputs_sha256=inputs_sha,
-            **driver_pins,
+        rem_fn()
+        mapping = cancer_mapping(paths)
+        rem_fn()
+        canonical, aliases = hgnc(cache)
+        rem_fn()
+        catalog = gene_catalog(paths.values(), canonical)
+        full_catalog = dict(catalog)
+        if requested_genes:
+            known_symbols = set(catalog.values())
+            requested = {g if g in known_symbols else aliases.get(g, g) for g in requested_genes}
+            catalog = {
+                entrez: symbol for entrez, symbol in catalog.items() if symbol in requested
+            }
+            missing = requested - set(catalog.values())
+            if missing:
+                raise ValueError(f"Genes absent or ambiguous: {sorted(missing)}")
+        if not catalog:
+            raise ValueError("No genes to build")
+        ids = sorted(catalog)
+        selection = select_samples(paths, mapping)
+        rem_fn()
+        purity_values = load_selected(cache, mapping, selection)
+        rem_fn()
+        alteration = None
+        alteration_identity = dict(skipped=True)
+        if not skip_alterations:
+            alteration, driver_pins, alteration_inputs, inputs_sha = load_alterations(
+                commit,
+                cache,
+                mapping,
+                selection,
+                ids,
+                full_catalog,
+                aliases,
+                delete_downloads,
+                hotspot_only=hotspot_only,
+                build_deadline=build_deadline,
+                clock=clock,
+            )
+            alteration_identity = dict(
+                method_version=ALTERATION_METHOD_VERSION,
+                params=ALTERATION_PARAMS,
+                high_expression_params=HIGH_EXPRESSION_PARAMS,
+                inputs_sha256=inputs_sha,
+                **driver_pins,
+            )
+    except (oncokb_client.OncoKBBudgetExceeded, oncokb_client.OncoKBRetryError) as exc:
+        _write_oncokb_incomplete(
+            out,
+            commit,
+            mapping,
+            requested_genes,
+            skip_precheck,
+            skip_alterations,
+            hotspot_only,
+            exc,
         )
+        raise
     now = datetime.now(UTC)
     hgnc_sha = digest(hgnc_path(cache))
     code_sha = code_fingerprint()
@@ -174,12 +358,18 @@ def build(
         source=dict(datahub_commit=commit, generated_at=now.isoformat(), purity=purity.SOURCE),
         cancer_types=mapping,
         build=dict(
-            genes=requested_genes, skip_precheck=skip_precheck, skip_alterations=skip_alterations
+            genes=requested_genes,
+            skip_precheck=skip_precheck,
+            skip_alterations=skip_alterations,
+            hotspot_only=hotspot_only,
         ),
     )
     if alteration is not None:
         manifest["source"].update(
-            alteration_inputs_sha256=alteration_identity["inputs_sha256"], **driver_pins
+            alteration_inputs_sha256=alteration_identity["inputs_sha256"],
+            oncokb_complete=(not hotspot_only),
+            oncokb_incomplete=False,
+            **driver_pins,
         )
         manifest["alterations"] = dict(alteration.summary, inputs=alteration_inputs)
     # Record the HGNC snapshot hash to make symbol resolution auditable.
@@ -314,7 +504,9 @@ def build(
 
             pool = None
             try:
-                precheck.start_budget(build_deadline=started + precheck.build_time_budget_seconds)
+                precheck.start_budget(
+                    build_deadline=min(build_deadline, started + precheck.build_time_budget_seconds)
+                )
                 pool = ThreadPoolExecutor(max_workers=8)
                 futures = [
                     pool.submit(check_gene, path)

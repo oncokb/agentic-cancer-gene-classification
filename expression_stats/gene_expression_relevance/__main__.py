@@ -1,8 +1,15 @@
 import argparse
+import sys
+import time
 from pathlib import Path
 
-from .build import build
-from .fetch import validate_commit
+_PROCESS_STARTED = time.monotonic()
+
+from . import build as build_mod  # noqa: E402
+from .build import build  # noqa: E402
+from .fetch import validate_commit  # noqa: E402
+from .oncokb import OncoKBBudgetExceeded  # noqa: E402
+from .precheck import PrecheckBudgetExceeded  # noqa: E402
 
 
 def main():
@@ -20,21 +27,35 @@ def main():
         help="Omit alteration statistics (review-only, never publishable)",
     )
     command.add_argument(
+        "--hotspot-only",
+        action="store_true",
+        help="Skip OncoKB calls and use hotspot/TSG fallback only (review-only, never publishable)",
+    )
+    command.add_argument(
         "--delete-alteration-downloads",
         action="store_true",
         help="Delete each raw mutation/CNA/SV download once its summary is cached (CI disk)",
     )
     args = parser.parse_args()
     validate_commit(args.datahub_commit)
-    build(
-        args.datahub_commit,
-        args.out,
-        args.cache,
-        args.genes.split(",") if args.genes else None,
-        args.skip_precheck,
-        skip_alterations=args.skip_alterations,
-        delete_downloads=args.delete_alteration_downloads,
-    )
+    if build is build_mod.build:
+        build_mod._CLI_PROCESS_STARTED = _PROCESS_STARTED
+    try:
+        build(
+            args.datahub_commit,
+            args.out,
+            args.cache,
+            args.genes.split(",") if args.genes else None,
+            args.skip_precheck,
+            skip_alterations=args.skip_alterations,
+            hotspot_only=args.hotspot_only,
+            delete_downloads=args.delete_alteration_downloads,
+        )
+    except (OncoKBBudgetExceeded, PrecheckBudgetExceeded) as exc:
+        print(f"Build stopped cleanly at deadline: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(2) from None
+    finally:
+        build_mod._CLI_PROCESS_STARTED = None
 
 
 if __name__ == "__main__":

@@ -150,7 +150,7 @@ def test_real_cna_driver_list_scope_and_roles():
 
 
 def test_real_mutation_eligibility_adds_the_46_curated_genes():
-    source = drivers.load(ALTERATION_PARAMS["mutation_driver_source"])
+    source = drivers.load(ALTERATION_PARAMS["mutation_tsg_fallback_source"])
     bailey = drivers.load_bailey2018()
     curated, _ = drivers.load_curated("mutation")
     assert len(bailey.genes) == 299 and len(curated) == 46 and len(source.genes) == 345
@@ -164,19 +164,11 @@ def test_real_mutation_eligibility_adds_the_46_curated_genes():
         assert gene in source.genes and gene not in source.tumor_suppressors
 
 
-def test_added_gene_with_recurrent_missense_is_enriched(tmp_path):
-    # BB carries TTN p.A5T in all 60 tumours: recurrent missense once TTN is eligible.
-    widened = drivers.DriverSource(
-        name="widened",
-        sha256="3" * 64,
-        genes=DRIVER.genes | {"TTN"},
-        tumor_suppressors=DRIVER.tumor_suppressors,
-    )
+def test_recurrent_missense_outside_old_driver_list_is_enriched(tmp_path):
+    # BB carries TTN p.A5T in all 60 tumours: recurrent missense now counts for any gene.
     before = category(run(tmp_path / "a", CNA_DRIVER), "TTN", "BB", POINT_MUTATION)
-    assert before["status"] == "not_testable"
-    assert before["reason"] == "gene not in mutation driver list (test)"
-    after = category(run(tmp_path / "b", CNA_DRIVER, widened), "TTN", "BB", POINT_MUTATION)
-    assert after["status"] == "enriched" and after["n_events"] == 60
+    assert before["status"] == "enriched" and before["n_events"] == 60
+    assert before["sources"] == {"oncokb": 0, "hotspot": 60}
 
 
 def test_added_gene_with_unknown_role_ignores_truncating_mutations():
@@ -215,8 +207,9 @@ def test_curated_lists_are_sha256_pinned(tmp_path, monkeypatch, kind):
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         drivers.load_curated(kind)
     loader = drivers.load_cna if kind == "cna" else drivers.load
+    source_key = "cna_driver_source" if kind == "cna" else "mutation_tsg_fallback_source"
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        loader(ALTERATION_PARAMS[f"{'cna' if kind == 'cna' else 'mutation'}_driver_source"])
+        loader(ALTERATION_PARAMS[source_key])
 
 
 def test_pathway_list_is_sha256_pinned(tmp_path, monkeypatch):
@@ -258,7 +251,7 @@ def test_changing_a_pinned_list_changes_the_release_identity(tmp_path, monkeypat
     params = ALTERATION_PARAMS
     original = identity(
         drivers.load_cna(params["cna_driver_source"]),
-        drivers.load(params["mutation_driver_source"]),
+        drivers.load(params["mutation_tsg_fallback_source"]),
     )
     assert original["cna_driver_files"]["new_framework_cna_genes.tsv"]
     assert original["mutation_driver_files"]["new_framework_mutation_genes.tsv"]
@@ -276,7 +269,7 @@ def test_changing_a_pinned_list_changes_the_release_identity(tmp_path, monkeypat
     pin_path.write_text(json.dumps(pin))
     changed = identity(
         drivers.load_cna(params["cna_driver_source"]),
-        drivers.load(params["mutation_driver_source"]),
+        drivers.load(params["mutation_tsg_fallback_source"]),
     )
     key = f"{'cna' if kind == 'cna' else 'mutation'}_driver_sha256"
     assert changed[key] != original[key]
@@ -286,8 +279,9 @@ def test_changing_a_pinned_list_changes_the_release_identity(tmp_path, monkeypat
 
 
 def test_parameters_record_the_new_scope():
-    assert ALTERATION_METHOD_VERSION == "2"
-    assert ALTERATION_PARAMS["mutation_driver_source"] == "bailey2018+new_framework"
+    assert ALTERATION_METHOD_VERSION == "3"
+    assert ALTERATION_PARAMS["mutation_driver_source"] == "oncokb+hotspot_fallback"
+    assert ALTERATION_PARAMS["mutation_tsg_fallback_source"] == "bailey2018+new_framework"
     assert ALTERATION_PARAMS["cna_driver_source"] == "bailey2018+new_framework+sanchezvega2018"
     with open(drivers.ROOT / "new_framework_cna_genes.tsv") as stream:
         rows = list(csv.DictReader(stream, delimiter="\t"))

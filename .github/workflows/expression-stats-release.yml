@@ -14,6 +14,10 @@ on:
         description: Skip PubMed counts (review artifact only)
         type: boolean
         default: false
+      hotspot_only:
+        description: Skip OncoKB annotations and use hotspot fallback only (review artifact only)
+        type: boolean
+        default: false
 permissions:
   contents: read
 env:
@@ -45,6 +49,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Validate OncoKB credentials
+        env:
+          INPUT_HOTSPOT_ONLY: ${{ inputs.hotspot_only }}
+          ONCOKB_API_TOKEN: ${{ secrets.ONCOKB_API_TOKEN }}
+        shell: bash
+        run: |
+          if [[ "$INPUT_HOTSPOT_ONLY" != 'true' && -z "$ONCOKB_API_TOKEN" ]]; then
+            echo '::error::OncoKB-annotated builds require the ONCOKB_API_TOKEN secret.'
+            exit 1
+          fi
       - name: Validate full precheck credentials
         env:
           INPUT_SKIP: ${{ inputs.skip_precheck }}
@@ -69,6 +83,7 @@ jobs:
           INPUT_COMMIT: ${{ inputs.datahub_commit }}
           INPUT_GENES: ${{ inputs.genes }}
           INPUT_SKIP: ${{ inputs.skip_precheck }}
+          INPUT_HOTSPOT_ONLY: ${{ inputs.hotspot_only }}
         run: python scripts/check_build.py
       - uses: actions/cache@v4
         if: steps.check.outputs.changed == 'true'
@@ -97,19 +112,29 @@ jobs:
           path: expression_stats/.cache/pubmed.sqlite3*
           key: expression-pubmed-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: expression-pubmed-
+      - uses: actions/cache/restore@v4
+        if: steps.check.outputs.changed == 'true' && inputs.hotspot_only != true
+        with:
+          path: expression_stats/.cache/oncokb
+          key: expression-oncokb-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: expression-oncokb-
       - name: Build
         if: steps.check.outputs.changed == 'true'
+        # 15m safety margin beyond runtime-settings.json build_time_budget_seconds (315m).
         timeout-minutes: 330
         env:
           DATAHUB_COMMIT: ${{ steps.check.outputs.commit }}
           INPUT_GENES: ${{ inputs.genes }}
           INPUT_SKIP: ${{ inputs.skip_precheck }}
+          INPUT_HOTSPOT_ONLY: ${{ inputs.hotspot_only }}
           NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+          ONCOKB_API_TOKEN: ${{ secrets.ONCOKB_API_TOKEN }}
         shell: bash
         run: |
           args=(--datahub-commit "$DATAHUB_COMMIT" --out artifacts --delete-alteration-downloads)
           if [[ -n "${INPUT_GENES//[[:space:],]/}" ]]; then args+=(--genes "$INPUT_GENES"); fi
           if [[ "$INPUT_SKIP" == 'true' ]]; then args+=(--skip-precheck); fi
+          if [[ "$INPUT_HOTSPOT_ONLY" == 'true' ]]; then args+=(--hotspot-only); fi
           python -m gene_expression_relevance build "${args[@]}"
           python scripts/bundle.py artifacts bundle
           df -h . | tail -1
@@ -118,6 +143,11 @@ jobs:
         with:
           path: expression_stats/.cache/pubmed.sqlite3*
           key: expression-pubmed-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/cache/save@v4
+        if: always() && steps.check.outputs.changed == 'true' && inputs.hotspot_only != true && hashFiles('expression_stats/.cache/oncokb/**') != ''
+        with:
+          path: expression_stats/.cache/oncokb
+          key: expression-oncokb-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         if: steps.check.outputs.changed == 'true'
         with:
@@ -129,7 +159,7 @@ jobs:
           name: expression-stats-failed-controls
           path: expression_stats/artifacts-failed
       - uses: actions/upload-artifact@v4
-        if: failure() && hashFiles('expression_stats/artifacts-incomplete/precheck-report.json') != ''
+        if: failure() && (hashFiles('expression_stats/artifacts-incomplete/precheck-report.json') != '' || hashFiles('expression_stats/artifacts-incomplete/oncokb-report.json') != '')
         with:
           name: expression-stats-incomplete-precheck
           path: expression_stats/artifacts-incomplete

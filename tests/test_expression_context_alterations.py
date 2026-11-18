@@ -157,6 +157,24 @@ def test_cna_directions_survive_storage_round_trip():
     assert round_trip.categories["Copy Number Alteration"].del_.n_events == 0
 
 
+def test_contract_1_7_point_mutation_sources_and_older_bundles_remain_compatible():
+    data = copy.deepcopy(FIXTURE["EGFR"]["alterations"])
+    data["categories"]["Point Mutation"]["sources"] = {"oncokb": 8, "hotspot": 2}
+    parsed = Alterations.model_validate(data)
+    assert parsed.categories["Point Mutation"].sources == {"oncokb": 8, "hotspot": 2}
+    round_trip = Alterations.model_validate(parsed.model_dump())
+    assert round_trip.categories["Point Mutation"].sources == {"oncokb": 8, "hotspot": 2}
+    # Older <= 1.6 fixtures without `sources` continue to validate cleanly.
+    legacy = Alterations.model_validate(FIXTURE["EGFR"]["alterations"])
+    assert legacy.categories["Point Mutation"].sources is None
+    # Bundle manifest contract_version "1.7" enables purity & confidence tier gates.
+    bundle_17 = build_bundle(("ERBB2",), manifest_overrides={"contract_version": "1.7"})
+    from src.expression_context.models import BundleManifest
+
+    manifest_17 = BundleManifest.model_validate(bundle_17.manifest)
+    assert manifest_17.purity_check_required and manifest_17.confidence_tier_required
+
+
 @pytest.mark.parametrize("invalid", [None, [], "enriched", 12, True])
 def test_non_dict_alteration_categories_are_skipped(invalid):
     harness = CsvHarness()

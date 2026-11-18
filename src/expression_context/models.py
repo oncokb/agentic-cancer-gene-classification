@@ -146,6 +146,7 @@ class AlterationCategory(AlterationCounts):
     reason: Optional[str] = None
     direction: Optional[str] = None
     enriched_directions: List[str] = Field(default_factory=list)
+    sources: Optional[Dict[str, int]] = None
     amp: Optional[AlterationCounts] = None
     del_: Optional[AlterationCounts] = Field(default=None, alias="del")
 

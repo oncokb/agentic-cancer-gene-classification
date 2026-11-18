@@ -5,7 +5,7 @@ METHOD_VERSION = "3"
 # 1.3: per-pair confidence_tier ("high" | "candidate" | null) from the strong_* params.
 # 1.4: supplementary tumor-purity gate (purity_check and demotion).
 # 1.5: either-arm strong criteria and the additive strong_arm provenance field.
-CONTRACT_VERSION = "1.6"
+CONTRACT_VERSION = "1.7"
 HIGH_EXPRESSION_PARAMS = dict(
     min_profiled=20, min_altered=3, delta_median=1.0, fdr=0.05,
     min_top10=2, min_or_top10=3.0, fisher_p=0.05,
@@ -51,9 +51,9 @@ PARAMS["detection_log2"] = PARAMS["expression_floor_log2"]
 # Alteration-type statistics are detail only: they never feed stats_pass, pass_mode,
 # broadly_expressed or any expression gate. Versioned and parameterized separately so
 # the expression method (and its release_id "m3" token) is unchanged.
-# "2": CNA restricted to pinned copy-number drivers with role-matched direction; Point
-# Mutation eligibility widened with pinned curator-annotated genes.
-ALTERATION_METHOD_VERSION = "2"
+# "3": OncoKB-first point-mutation calling across all genes with pan-cancer hotspot
+# and tumor-suppressor truncating fallback; CNA/SV unchanged.
+ALTERATION_METHOD_VERSION = "3"
 POINT_MUTATION = "Point Mutation"
 STRUCTURAL_VARIANT = "Structural Variant"
 COPY_NUMBER_ALTERATION = "Copy Number Alteration"
@@ -62,14 +62,23 @@ ALTERATION_CATEGORIES = (POINT_MUTATION, STRUCTURAL_VARIANT, COPY_NUMBER_ALTERAT
 ALTERATION_PARAMS = dict(
     fdr=0.05,
     min_profiled=20,
-    mutation_driver_source="bailey2018+new_framework",
+    mutation_driver_source="oncokb+hotspot_fallback",
+    mutation_tsg_fallback_source="bailey2018+new_framework",
+    oncokb_classification_version="1",
+    oncokb_positive_calls=["Oncogenic", "Likely Oncogenic", "Resistance"],
+    oncokb_excluded_calls=[
+        "Likely Neutral",
+        "Neutral",
+        "Inconclusive",
+        "Predicted Oncogenic",
+    ],
     # Copy Number Alteration is callable only for these genes; others are not_testable.
     cna_driver_source="bailey2018+new_framework+sanchezvega2018",
     # Oncogene-only: amplification only; TSG-only: deep deletion only; else both.
     cna_direction_by_role=True,
     hypermutator_max_nonsynonymous=500,
     missense_min_recurrence=10,
-    inframe_min_recurrence=5,
+    inframe_min_recurrence=10,
     gates={
         POINT_MUTATION: dict(min_events=5, min_frequency=0.02, min_ratio=2.0),
         COPY_NUMBER_ALTERATION: dict(min_events=5, min_frequency=0.02, min_ratio=2.0),
