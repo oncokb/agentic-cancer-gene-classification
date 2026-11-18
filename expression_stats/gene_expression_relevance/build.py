@@ -98,12 +98,15 @@ def load_alterations(
     delete_downloads,
     *,
     hotspot_only=False,
+    build_deadline=None,
 ):
     """Alteration statistics for the build's gene rows (detail only; see alterations.py)."""
     driver = drivers.load(ALTERATION_PARAMS["mutation_tsg_fallback_source"])
     cna_driver = drivers.load_cna(ALTERATION_PARAMS["cna_driver_source"])
     client = None if hotspot_only else oncokb_client.load_client(cache)
     try:
+        if client is not None and build_deadline is not None and hasattr(client, "start_budget"):
+            client.start_budget(build_deadline=build_deadline)
         inputs, provenance, inputs_sha = alteration_stats.load_inputs(
             commit, cache, [item["study_id"] for item in mapping], delete_downloads=delete_downloads
         )
@@ -128,6 +131,11 @@ def load_alterations(
                 oncokb_cancer_gene_list_sha256=None,
             )
         )
+    except (oncokb_client.OncoKBBudgetExceeded, oncokb_client.OncoKBRetryError) as exc:
+        if client is not None:
+            exc.oncokb_progress = getattr(client, "progress", {})
+            exc.oncokb_cache = str(getattr(client, "cache_db_path", ""))
+        raise
     finally:
         if client is not None:
             client.close()
@@ -183,17 +191,56 @@ def build(
     alteration = None
     alteration_identity = dict(skipped=True)
     if not skip_alterations:
-        alteration, driver_pins, alteration_inputs, inputs_sha = load_alterations(
-            commit,
-            cache,
-            mapping,
-            selection,
-            ids,
-            full_catalog,
-            aliases,
-            delete_downloads,
-            hotspot_only=hotspot_only,
-        )
+        runtime_settings = json.loads(oncokb_client.RUNTIME_SETTINGS_PATH.read_text())
+        build_deadline = started + float(runtime_settings["build_time_budget_seconds"])
+        try:
+            alteration, driver_pins, alteration_inputs, inputs_sha = load_alterations(
+                commit,
+                cache,
+                mapping,
+                selection,
+                ids,
+                full_catalog,
+                aliases,
+                delete_downloads,
+                hotspot_only=hotspot_only,
+                build_deadline=build_deadline,
+            )
+        except (oncokb_client.OncoKBBudgetExceeded, oncokb_client.OncoKBRetryError) as exc:
+            incomplete = out.with_name(out.name + "-incomplete")
+            incomplete_manifest = dict(
+                schema_version="1",
+                contract_version=CONTRACT_VERSION,
+                method_version=METHOD_VERSION,
+                params=PARAMS,
+                alteration_method_version=ALTERATION_METHOD_VERSION,
+                alteration_params=ALTERATION_PARAMS,
+                source=dict(
+                    datahub_commit=commit,
+                    generated_at=datetime.now(UTC).isoformat(),
+                    oncokb_incomplete=True,
+                    oncokb_complete=False,
+                    hotspot_only=hotspot_only,
+                ),
+                cancer_types=mapping,
+                build=dict(
+                    genes=requested_genes,
+                    skip_precheck=skip_precheck,
+                    skip_alterations=skip_alterations,
+                    hotspot_only=hotspot_only,
+                ),
+            )
+            write_json(incomplete / "manifest.json", incomplete_manifest)
+            write_json(
+                incomplete / "oncokb-report.json",
+                dict(
+                    status="incomplete",
+                    reason=str(exc),
+                    cache=getattr(exc, "oncokb_cache", ""),
+                    progress=getattr(exc, "oncokb_progress", {}),
+                ),
+            )
+            raise
         alteration_identity = dict(
             method_version=ALTERATION_METHOD_VERSION,
             params=ALTERATION_PARAMS,
@@ -235,7 +282,10 @@ def build(
     )
     if alteration is not None:
         manifest["source"].update(
-            alteration_inputs_sha256=alteration_identity["inputs_sha256"], **driver_pins
+            alteration_inputs_sha256=alteration_identity["inputs_sha256"],
+            oncokb_complete=(not hotspot_only),
+            oncokb_incomplete=False,
+            **driver_pins,
         )
         manifest["alterations"] = dict(alteration.summary, inputs=alteration_inputs)
     # Record the HGNC snapshot hash to make symbol resolution auditable.

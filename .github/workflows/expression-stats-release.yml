@@ -106,18 +106,18 @@ jobs:
         with:
           path: expression_stats/.cache/hgnc
           key: expression-hgnc-${{ steps.check.outputs.hgnc_sha }}
-      - uses: actions/cache@v4
-        if: steps.check.outputs.changed == 'true' && inputs.hotspot_only != true
-        with:
-          path: expression_stats/.cache/oncokb
-          key: expression-oncokb-${{ hashFiles('expression_stats/gene_expression_relevance/oncokb.py') }}
-          restore-keys: expression-oncokb-
       - uses: actions/cache/restore@v4
         if: steps.check.outputs.changed == 'true' && inputs.skip_precheck != true
         with:
           path: expression_stats/.cache/pubmed.sqlite3*
           key: expression-pubmed-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: expression-pubmed-
+      - uses: actions/cache/restore@v4
+        if: steps.check.outputs.changed == 'true' && inputs.hotspot_only != true
+        with:
+          path: expression_stats/.cache/oncokb
+          key: expression-oncokb-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: expression-oncokb-
       - name: Build
         if: steps.check.outputs.changed == 'true'
         timeout-minutes: 330
@@ -142,6 +142,11 @@ jobs:
         with:
           path: expression_stats/.cache/pubmed.sqlite3*
           key: expression-pubmed-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/cache/save@v4
+        if: always() && steps.check.outputs.changed == 'true' && inputs.hotspot_only != true && hashFiles('expression_stats/.cache/oncokb/**') != ''
+        with:
+          path: expression_stats/.cache/oncokb
+          key: expression-oncokb-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         if: steps.check.outputs.changed == 'true'
         with:
@@ -153,7 +158,7 @@ jobs:
           name: expression-stats-failed-controls
           path: expression_stats/artifacts-failed
       - uses: actions/upload-artifact@v4
-        if: failure() && hashFiles('expression_stats/artifacts-incomplete/precheck-report.json') != ''
+        if: failure() && (hashFiles('expression_stats/artifacts-incomplete/precheck-report.json') != '' || hashFiles('expression_stats/artifacts-incomplete/oncokb-report.json') != '')
         with:
           name: expression-stats-incomplete-precheck
           path: expression_stats/artifacts-incomplete

@@ -885,24 +885,31 @@ Point Mutation eligibility removes the fixed 345-gene driver list gate so every 
 the build is evaluated unless a cohort lacks profiled primary tumors or has fewer than
 `min_profiled` (20) retained patients. Variant classification runs OncoKB-first via
 `/api/v1/info`, `/api/v1/utils/cancerGeneList`, and batched
-`/api/v1/annotate/mutations/byProteinChange` (for genes in OncoKB `cancerGeneList`):
+`/api/v1/annotate/mutations/byProteinChange` (for genes in OncoKB `cancerGeneList`, with
+a unique `id` per query validated strictly without positional matching):
 
-1. `Oncogenic`, `Likely Oncogenic`, or `Predicted Oncogenic` counts under `oncokb`.
-2. `Likely Neutral` or `Neutral` is excluded and never falls back to hotspot/TSG rules.
-3. Uncurated/unannotated mutations (`Unknown`, `Inconclusive`, unmapped/outside OncoKB,
-   missing protein change) fall back to the pan-cancer recurrence and tumor-suppressor
-   truncating rules under `hotspot`: missense positions mutated in >=10 non-neutral
-   retained tumors pan-cancer per `(gene, transcript, position)`, in-frame indels with
-   exact `HGVSp_Short` in >=5 non-neutral retained tumors pan-cancer per
-   `(gene, transcript, HGVSp_Short)`, or truncating mutations in tumor suppressors
-   (OncoKB `TSG` / `ONCOGENE_AND_TSG`, falling back to pinned `bailey2018+new_framework`
-   TSGs only for genes absent from OncoKB or in `--hotspot-only` review mode).
+1. `Oncogenic`, `Likely Oncogenic`, or `Resistance` counts under `oncokb`.
+2. `Likely Neutral`, `Neutral`, `Inconclusive`, or `Predicted Oncogenic` is excluded
+   and never falls back to hotspot/TSG rules (`Predicted Oncogenic` is recorded under its
+   own `predicted_oncogenic` status rather than collapsed into `neutral`).
+3. Unannotated/uncurated mutations (`Unknown` returned explicitly by OncoKB, genes outside
+   OncoKB `cancerGeneList`, or empty protein changes) fall back under `hotspot`:
+   - missense or in-frame indel at a protein position mutated in `>=10` non-excluded
+     retained tumors pan-cancer per `(gene, transcript, position)` (grouped by start
+     protein codon position rather than exact change);
+   - or truncating mutations in tumor suppressors (OncoKB `TSG` / `ONCOGENE_AND_TSG`,
+     falling back to pinned Bailey TSGs only for genes absent from OncoKB or in
+     `--hotspot-only` review mode).
 
 Each `(gene, sample)` tumor counts at most once, preferring `oncokb` over `hotspot`.
 `Point Mutation` records add a nullable `sources` object `{"oncokb": int, "hotspot": int}`
-(`null` when `not_testable`; `oncokb + hotspot == n_events`). Release artifacts and
-manifests never store per-variant OncoKB annotations or API credentials; the manifest
-records `oncokb_data_version`, `oncokb_data_date`, `oncokb_classification_version`,
-`oncokb_cancer_gene_list_sha256`, and `build.hotspot_only`. All five keys participate in
-`build_sha256` / `release_id`, and `--hotspot-only` builds are rejected by `publish.py`.
-Expression statistics, tiers, purity, CNA, and SV rules remain unchanged.
+(`null` when `not_testable`; `oncokb + hotspot == n_events`). Annotations are cached
+locally per SHA-256 hash of `oncokb_data_version`, committed incrementally per completed
+batch, and bounded by a resumable deadline (`oncokb_incomplete: true`, refused by
+`publish.py`). Release artifacts and manifests never store per-variant OncoKB
+annotations or API credentials; the manifest records `oncokb_data_version`,
+`oncokb_data_date`, `oncokb_classification_version`, `oncokb_cancer_gene_list_sha256`,
+`oncokb_complete`, and `build.hotspot_only`. The OncoKB version, classification version,
+gene list hash, and `hotspot_only` participate in `build_sha256` / `release_id`, and
+`--hotspot-only` or incomplete builds are rejected by `publish.py`. Expression
+statistics, tiers, purity, CNA, and SV rules remain unchanged.

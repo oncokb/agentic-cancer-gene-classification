@@ -1,10 +1,12 @@
-"""OncoKB-first point mutation classification, caching, provenance, and fail-closed tests."""
+"""OncoKB-first point mutation classification, fail-closed batches, retries, and caching tests."""
 
 from __future__ import annotations
 
 import io
 import json
-from urllib.error import HTTPError
+import sqlite3
+from datetime import UTC, datetime
+from urllib.error import HTTPError, URLError
 
 import pytest
 from alteration_fixtures import maf
@@ -14,8 +16,10 @@ from test_alterations import (
     DRIVER,
     IDS,
     ROW,
+    build_fixture,
     category,
     records,
+    rich_inputs,
     sample,
     synthetic,
 )
@@ -37,10 +41,9 @@ def _fake_oncokb_requester(
     info_version="v7.7",
     info_date="10/29/2026",
     calls=None,
-    status_sequence=None,
+    on_batch=None,
 ):
     """Build an in-memory HTTP stub mimicking OncoKB /info, /cancerGeneList, /byProteinChange."""
-    seq = list(status_sequence or [])
 
     def requester(url, *, payload=None, token=None, **kwargs):
         if calls is not None:
@@ -50,13 +53,11 @@ def _fake_oncokb_requester(
         if url.endswith("/utils/cancerGeneList"):
             return cancer_genes
         if url.endswith("/annotate/mutations/byProteinChange"):
-            if seq:
-                next_item = seq.pop(0)
-                if isinstance(next_item, Exception):
-                    raise next_item
-                if next_item in (401, 403):
-                    raise oncokb.OncoKBAuthError(f"HTTP {next_item}")
             assert payload is not None
+            if on_batch is not None:
+                custom = on_batch(payload)
+                if custom is not None:
+                    return custom
             out = []
             for item in payload:
                 sym = item["gene"]["hugoSymbol"]
@@ -69,7 +70,7 @@ def _fake_oncokb_requester(
                 )
                 out.append(
                     {
-                        "query": {"id": item.get("id"), "hugoSymbol": sym, "alteration": alt},
+                        "query": {"id": item["id"], "hugoSymbol": sym, "alteration": alt},
                         "oncogenic": verdict,
                         "mutationEffect": {"knownEffect": verdict},
                         "variantExist": verdict != "Unknown",
@@ -89,84 +90,101 @@ CGL = [
 ]
 
 
-def test_classification_rules_oncokb_first_neutral_excluded_and_fallback(tmp_path):
-    """Verify positive/neutral/unknown/non-CGL classification and per-patient priority."""
+def test_classification_rules_exact_classes_and_predicted_oncogenic_excluded(tmp_path):
+    """Verify OncoKB classes: Resistance counts; Predicted Oncogenic/Inconclusive/Neutral do not."""
     calls = []
     req = _fake_oncokb_requester(
         CGL,
         {
-            # Oncogenic in non-recurrent position -> counts as 'oncokb'.
             ("KRAS", "Q61H"): "Oncogenic",
-            # Predicted Oncogenic / Likely Oncogenic -> counts as 'oncokb'.
-            ("EGFR", "L858R"): "Predicted Oncogenic",
             ("TP53", "R196*"): "Likely Oncogenic",
-            # Likely Neutral even at a 10-tumor recurrent hotspot -> excluded, NO fallback!
+            ("EGFR", "T790M"): "Resistance",
+            # Predicted Oncogenic: distinct 'predicted_oncogenic' status, NO count & NO fallback.
+            ("EGFR", "L858R"): "Predicted Oncogenic",
+            # Likely Neutral / Neutral / Inconclusive: excluded even at >=10 hotspot or TSG.
             ("KRAS", "G12A"): "Likely Neutral",
-            # Unknown at recurrent hotspot -> falls back to 'hotspot'.
-            ("KRAS", "G12V"): "Unknown",
-            # Inconclusive -> falls back when recurrent hotspot or TSG truncating.
+            ("KRAS", "G12S"): "Neutral",
             ("TP53", "Y220C"): "Inconclusive",
+            ("TP53", "Q100*"): "Predicted Oncogenic",
+            # Unknown falls back when recurrent hotspot or TSG truncating.
+            ("KRAS", "G12V"): "Unknown",
         },
         calls=calls,
     )
+    assert oncokb.classify_oncogenic("Predicted Oncogenic") == "predicted_oncogenic"
+    assert oncokb.classify_oncogenic("Resistance") == "oncokb"
+    assert oncokb.classify_oncogenic("Inconclusive") == "inconclusive"
+    assert oncokb.classify_oncogenic("Likely Neutral") == "neutral"
+    assert oncokb.classify_oncogenic("Unknown") == "unknown"
+
     client = oncokb.OncoKBClient(tmp_path, token="tok-secret", requester=req)
     try:
         rows = [
-            # Non-recurrent Oncogenic -> oncokb
+            # Oncogenic, Likely Oncogenic, Resistance -> count under 'oncokb'.
             ("KRAS", sample("AA", 0), "Missense_Mutation", "T1", 61, "p.Q61H"),
+            ("TP53", sample("AA", 0), "Nonsense_Mutation", "T3", 196, "p.R196*"),
+            ("EGFR", sample("AA", 0), "Missense_Mutation", "T2", 790, "p.T790M"),
             # Patient AA-0001 has BOTH Oncogenic + Unknown in KRAS -> single 'oncokb' event.
             ("KRAS", sample("AA", 1), "Missense_Mutation", "T1", 61, "p.Q61H"),
             ("KRAS", sample("AA", 1), "Missense_Mutation", "T1", 12, "p.G12V"),
-            # 10 tumors at KRAS pos 12: 9 G12V (1 + 8, Unknown) + 1 G12A (Likely Neutral).
-            # Neutral excluded -> only 9 non-neutral tumors at pos 12 -> NOT recurrent (<10)!
+            # KRAS pos 12: 8 G12V (+AA-0001 = 9) + 1 G12A (Likely Neutral) + 1 G12S (Neutral).
+            # Excluded neutral variants neither count nor inflate pos 12 recurrence (9 < 10).
             *[
                 ("KRAS", sample("AA", i), "Missense_Mutation", "T1", 12, "p.G12V")
                 for i in range(2, 10)
             ],
             ("KRAS", sample("AA", 10), "Missense_Mutation", "T1", 12, "p.G12A"),
-            # EGFR rare Unknown missense (not recurrent) -> excluded; L858R -> oncokb.
-            ("EGFR", sample("AA", 0), "Missense_Mutation", "T2", 858, "p.L858R"),
-            ("EGFR", sample("AA", 1), "Missense_Mutation", "T2", 100, "p.A100T"),
-            # TP53: R196* -> oncokb; empty Splice_Site in TSG -> hotspot fallback;
-            # Y220C Inconclusive at >=10 pos across cohorts -> hotspot fallback.
-            ("TP53", sample("AA", 0), "Nonsense_Mutation", "T3", 196, "p.R196*"),
-            ("TP53", sample("AA", 1), "Splice_Site", "T3", -1, ""),
+            ("KRAS", sample("AA", 11), "Missense_Mutation", "T1", 12, "p.G12S"),
+            # Predicted Oncogenic (10 at EGFR 858, TP53 Q100* truncating) -> never falls back.
+            *[
+                ("EGFR", sample("AA", i), "Missense_Mutation", "T2", 858, "p.L858R")
+                for i in range(2, 12)
+            ],
+            ("TP53", sample("AA", 12), "Nonsense_Mutation", "T3", 100, "p.Q100*"),
+            # Inconclusive (10 tumors at TP53 220) -> NEVER counts or falls back.
             *[
                 ("TP53", sample("AA", i), "Missense_Mutation", "T3", 220, "p.Y220C")
                 for i in range(2, 12)
             ],
-            # ROS1 is NOT in CGL: Unknown -> hotspot fallback if >=10 missense!
+            # Empty-HGVSp Splice_Site in TSG TP53 -> hotspot fallback.
+            ("TP53", sample("AA", 1), "Splice_Site", "T3", -1, ""),
+            # Non-CGL gene ROS1 >=10 missense -> hotspot fallback; truncating in non-TSG -> ignored.
             *[
                 ("ROS1", sample("AA", i), "Missense_Mutation", "T4", 2032, "p.G2032R")
                 for i in range(10)
             ],
-            # ROS1 truncating in non-TSG -> NOT counted.
             ("ROS1", sample("AA", 15), "Nonsense_Mutation", "T4", 10, "p.Q10*"),
         ]
         retained = {r[1] for r in rows}
-        row_symbols = [CATALOG[e] for e in IDS]
+        excluded_counts = {}
         events, sources = alterations.classify_point_mutations(
             records(rows),
             retained,
             {ROW["TP53"]},
             ALTERATION_PARAMS,
             oncokb=client,
-            row_symbols=row_symbols,
+            row_symbols=[CATALOG[e] for e in IDS],
+            excluded_counts=excluded_counts,
         )
         assert sources[(ROW["KRAS"], sample("AA", 0))] == "oncokb"
         assert sources[(ROW["KRAS"], sample("AA", 1))] == "oncokb"
-        # Likely Neutral KRAS G12A is never counted, and 9 non-neutral G12V < 10.
-        assert (ROW["KRAS"], sample("AA", 2)) not in events
-        assert (ROW["KRAS"], sample("AA", 10)) not in events
-        assert sources[(ROW["EGFR"], sample("AA", 0))] == "oncokb"
-        assert (ROW["EGFR"], sample("AA", 1)) not in events
         assert sources[(ROW["TP53"], sample("AA", 0))] == "oncokb"
+        assert sources[(ROW["EGFR"], sample("AA", 0))] == "oncokb"
         assert sources[(ROW["TP53"], sample("AA", 1))] == "hotspot"
-        assert sources[(ROW["TP53"], sample("AA", 2))] == "hotspot"
+        for i in range(2, 12):
+            assert (ROW["EGFR"], sample("AA", i)) not in events
+            assert (ROW["TP53"], sample("AA", i)) not in events
+        assert (ROW["TP53"], sample("AA", 12)) not in events
+        for i in range(2, 12):
+            assert (ROW["KRAS"], sample("AA", i)) not in events
         for i in range(10):
             assert sources[(ROW["ROS1"], sample("AA", i))] == "hotspot"
         assert (ROW["ROS1"], sample("AA", 15)) not in events
-        # Non-CGL gene ROS1 must never generate byProteinChange queries.
+        assert excluded_counts == {
+            "predicted_oncogenic": 11,
+            "inconclusive": 10,
+            "neutral": 2,
+        }
         queried_genes = {
             item["gene"]["hugoSymbol"]
             for url, payload, _ in calls
@@ -178,110 +196,365 @@ def test_classification_rules_oncokb_first_neutral_excluded_and_fallback(tmp_pat
         client.close()
 
 
-def test_oncokb_client_batches_dedups_caches_and_rebuilds_on_version_change(tmp_path):
-    """Deduplication, chunked batching, SQLite cache hits, and version-keyed isolation."""
-    calls = []
-    req1 = _fake_oncokb_requester(
-        CGL,
-        {("KRAS", "G12D"): "Oncogenic", ("EGFR", "L858R"): "Oncogenic"},
-        info_version="v7.7",
-        calls=calls,
-    )
-    c1 = oncokb.OncoKBClient(tmp_path, token="my-super-secret", requester=req1, batch_size=1)
-    try:
-        keys = [
-            ("KRAS", "G12D", "missense_variant", "GRCh37"),
-            ("KRAS", "G12D", "missense_variant", "GRCh37"),
-            ("EGFR", "L858R", "missense_variant", "GRCh37"),
+def test_inframe_and_missense_position_hotspot_grouping_and_tsg_fallback(tmp_path):
+    """Both missense and in-frame indels require >=10 tumors at the same protein position."""
+    maf_path = tmp_path / "positions.txt"
+    rows = [
+        # EGFR exon 19: 5 E746_A750del + 3 E746_S752delinsV + 2 missense E746K = 10 at pos 746.
+        *[
+            ("EGFR", 1956, "In_Frame_Del", sample("AA", i), "T1", "p.E746_A750del")
+            for i in range(5)
+        ],
+        *[
+            ("EGFR", 1956, "In_Frame_Del", sample("AA", i), "T1", "p.E746_S752delinsV")
+            for i in range(5, 8)
+        ],
+        *[
+            ("EGFR", 1956, "Missense_Mutation", sample("AA", i), "T1", "p.E746K")
+            for i in range(8, 10)
+        ],
+        # Exon 20 ins: only 9 identical tumors -> <10, must NOT count.
+        *[
+            ("EGFR", 1956, "In_Frame_Ins", sample("BB", i), "T1", "p.D770_N771insG")
+            for i in range(9)
+        ],
+    ]
+    maf_path.write_text(maf(rows))
+    parsed = alterations.parse_mutations(maf_path)
+    retained = {r[3] for r in rows}
+    mapped = {
+        "row": [ROW["EGFR"]] * len(rows),
+        "sample": parsed["sample_table"][parsed["sample"]],
+        "cls": parsed["cls"],
+        "transcript": parsed["transcript_table"][parsed["transcript"]],
+        "position": parsed["position"],
+        "hgvsp": parsed["hgvsp_table"][parsed["hgvsp"]],
+    }
+    events, _ = alterations.classify_point_mutations(mapped, retained, set(), ALTERATION_PARAMS)
+    assert events == {(ROW["EGFR"], sample("AA", i)) for i in range(10)}
+
+
+def test_batch_validation_reordered_ok_and_malformed_failures_cache_nothing(tmp_path):
+    """Matched by query.id (never position); malformed/error responses fail and cache nothing."""
+    keys = [
+        ("KRAS", "G12D", "missense_variant", "GRCh37"),
+        ("EGFR", "L858R", "missense_variant", "GRCh37"),
+    ]
+
+    # Reordered valid responses succeed and assign exact per-id oncogenic verdicts.
+    def reversed_batch(payload):
+        if payload[0]["id"] == "preflight":
+            return [{"query": {"id": "preflight"}, "oncogenic": "Oncogenic"}]
+        return [
+            {
+                "query": {"id": payload[1]["id"]},
+                "oncogenic": "Likely Neutral",
+            },
+            {
+                "query": {"id": payload[0]["id"]},
+                "oncogenic": "Unknown",
+            },
         ]
+
+    ok_client = oncokb.OncoKBClient(
+        tmp_path / "ok",
+        token="secret",
+        requester=_fake_oncokb_requester(CGL, {}, on_batch=reversed_batch),
+    )
+    try:
+        # Sorted: EGFR L858R -> payload[0] -> Unknown; KRAS G12D -> payload[1] -> Likely Neutral.
+        out = ok_client.annotate(keys)
+        assert out[("EGFR", "L858R", "missense_variant", "GRCh37")] == "unknown"
+        assert out[("KRAS", "G12D", "missense_variant", "GRCh37")] == "neutral"
+    finally:
+        ok_client.close()
+
+    bad_cases = [
+        "missing_id",
+        "duplicate_id",
+        "unknown_id",
+        "missing_oncogenic",
+        "invalid_oncogenic",
+        "error_entry",
+    ]
+    for idx, kind in enumerate(bad_cases):
+        def bad_batch(payload, _kind=kind):
+            if payload[0]["id"] == "preflight":
+                return [{"query": {"id": "preflight"}, "oncogenic": "Oncogenic"}]
+            if _kind == "missing_id":
+                return [
+                    {"oncogenic": "Oncogenic"},
+                    {"query": {"id": payload[1]["id"]}, "oncogenic": "Oncogenic"},
+                ]
+            if _kind == "duplicate_id":
+                return [
+                    {"query": {"id": payload[0]["id"]}, "oncogenic": "Oncogenic"},
+                    {"query": {"id": payload[0]["id"]}, "oncogenic": "Oncogenic"},
+                ]
+            if _kind == "unknown_id":
+                return [
+                    {"query": {"id": payload[0]["id"]}, "oncogenic": "Oncogenic"},
+                    {"query": {"id": "wrong-id"}, "oncogenic": "Oncogenic"},
+                ]
+            if _kind == "missing_oncogenic":
+                return [
+                    {"query": {"id": payload[0]["id"]}, "oncogenic": "Oncogenic"},
+                    {"query": {"id": payload[1]["id"]}},
+                ]
+            if _kind == "invalid_oncogenic":
+                return [
+                    {"query": {"id": payload[0]["id"]}, "oncogenic": "Oncogenic"},
+                    {"query": {"id": payload[1]["id"]}, "oncogenic": None},
+                ]
+            return [
+                {"query": {"id": payload[0]["id"]}, "oncogenic": "Oncogenic"},
+                {
+                    "query": {"id": payload[1]["id"]},
+                    "oncogenic": "Unknown",
+                    "errors": ["invalid alteration"],
+                },
+            ]
+
+        client = oncokb.OncoKBClient(
+            tmp_path / f"bad-{idx}",
+            token="secret",
+            requester=_fake_oncokb_requester(CGL, {}, on_batch=bad_batch),
+        )
+        try:
+            with pytest.raises(oncokb.OncoKBError):
+                client.annotate(keys)
+            conn = sqlite3.connect(client.cache_db_path)
+            count = conn.execute("SELECT COUNT(*) FROM annotations").fetchone()[0]
+            conn.close()
+            assert count == 0, f"{kind} must not cache partial batch"
+        finally:
+            client.close()
+
+
+def test_retries_backoff_http_date_uncapped_seconds_and_fail_fast_4xx(monkeypatch):
+    """5xx/429/network retry with uncapped Retry-After (sec + HTTP-date); 4xx non-429 fail fast."""
+    secret = "secret-oncokb-uuid-value"
+
+    # 1. Fail-fast on 400, 401, 403 without retries.
+    for code, exc_cls in (
+        (400, oncokb.OncoKBError),
+        (401, oncokb.OncoKBAuthError),
+        (403, oncokb.OncoKBAuthError),
+    ):
+        attempts = []
+
+        def fail_once(req, timeout=60.0, _code=code, _attempts=attempts):
+            _attempts.append(req.full_url)
+            raise HTTPError(req.full_url, _code, "err", {}, io.BytesIO(b""))
+
+        monkeypatch.setattr(oncokb, "urlopen", fail_once)
+        with pytest.raises(exc_cls):
+            oncokb.request_json("https://www.oncokb.org/api/v1/info", token=secret, attempts=4)
+        assert len(attempts) == 1
+
+    # 2. Retry 502 + URLError + 429 with numeric Retry-After > 60s (120s, uncapped) and HTTP-date.
+    now = datetime(2026, 11, 18, 12, 0, 0, tzinfo=UTC).timestamp()
+    sleeps = []
+    attempts = []
+
+    class FakeResp:
+        def __enter__(self):
+            return io.BytesIO(b'{"dataVersion": {"version": "v7.7"}}')
+
+        def __exit__(self, *args):
+            return False
+
+    def flaky(req, timeout=60.0):
+        attempts.append(len(attempts))
+        n = len(attempts)
+        if n == 1:
+            raise HTTPError(req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b""))
+        if n == 2:
+            raise URLError(f"reset {secret}")
+        if n == 3:
+            raise HTTPError(
+                req.full_url,
+                429,
+                "Too Many Requests",
+                {"Retry-After": "120"},
+                io.BytesIO(b""),
+            )
+        if n == 4:
+            # 95s later via HTTP-date (also > 60s, uncapped).
+            return_dt = "Wed, 18 Nov 2026 12:01:35 GMT"
+            raise HTTPError(
+                req.full_url,
+                429,
+                "Too Many Requests",
+                {"Retry-After": return_dt},
+                io.BytesIO(b""),
+            )
+        return FakeResp()
+
+    monkeypatch.setattr(oncokb, "urlopen", flaky)
+    res = oncokb.request_json(
+        "https://www.oncokb.org/api/v1/info",
+        token=secret,
+        attempts=5,
+        sleep=sleeps.append,
+        wall_clock=lambda: now,
+        jitter=lambda: 0.25,
+    )
+    assert res == {"dataVersion": {"version": "v7.7"}}
+    assert len(attempts) == 5
+    assert sleeps == [1.25, 2.25, 120.25, 95.25]  # exponential+jitter, uncapped >60s & HTTP-date
+
+
+def test_deadline_mid_annotation_marks_incomplete_keeps_cache_and_resumes(
+    tmp_path, monkeypatch, capsys
+):
+    """Deadline mid-run saves batches, writes oncokb-report, refuses publish, and resumes."""
+    cache = build_fixture(tmp_path, monkeypatch, rich_inputs)
+    # Add a second TP53 variant so batch_size=1 requires 2 batches.
+    original_load = alterations.load_inputs
+
+    def two_variant_inputs(commit, c, studies, **kwargs):
+        inputs, prov, sha = original_load(commit, c, studies, **kwargs)
+        samples = inputs["LIHC"]["mutation"]["data"]["sample_table"]
+        s1 = samples[0]
+        path = tmp_path / "extra_lihc.txt"
+        path.write_text(
+            maf(
+                [
+                    ("TP53", 7157, "Nonsense_Mutation", s1, "T", "p.R196*"),
+                    ("TP53", 7157, "Missense_Mutation", s1, "T", "p.R175H"),
+                ]
+            )
+        )
+        inputs["LIHC"]["mutation"]["data"] = alterations.parse_mutations(path)
+        return inputs, prov, sha
+
+    monkeypatch.setattr(alterations, "load_inputs", two_variant_inputs)
+
+    calls_run1 = []
+    tick = [0.0]
+
+    def fake_clock():
+        return tick[0]
+
+    def requester_run1(url, *, payload=None, token=None, **kwargs):
+        res = _fake_oncokb_requester(
+            CGL,
+            {("TP53", "R196*"): "Likely Oncogenic", ("TP53", "R175H"): "Oncogenic"},
+            calls=calls_run1,
+        )(url, payload=payload, token=token, **kwargs)
+        if url.endswith("byProteinChange"):
+            # Advance clock past budget right after the first batch succeeds.
+            tick[0] += 100.0
+        return res
+
+    monkeypatch.setattr(
+        oncokb,
+        "load_client",
+        lambda cache_dir: oncokb.OncoKBClient(
+            cache_dir,
+            token="super-secret-token",
+            requester=requester_run1,
+            batch_size=1,
+            time_budget_seconds=50.0,
+            clock=fake_clock,
+        ),
+    )
+
+    out = tmp_path / "site"
+    with pytest.raises(oncokb.OncoKBBudgetExceeded):
+        builder.build("a" * 40, out, cache, skip_precheck=True)
+
+    captured = capsys.readouterr().out
+    assert "OncoKB annotated 1/2 variants (1 remaining, batch 1/2" in captured
+    assert "super-secret-token" not in captured
+
+    inc = tmp_path / "site-incomplete"
+    inc_manifest = json.loads((inc / "manifest.json").read_text())
+    inc_report = json.loads((inc / "oncokb-report.json").read_text())
+    assert inc_manifest["source"]["oncokb_incomplete"] is True
+    assert inc_manifest["source"]["oncokb_complete"] is False
+    assert inc_report["status"] == "incomplete"
+    assert inc_report["progress"]["annotated"] == 1 and inc_report["progress"]["remaining"] == 1
+    assert not (out / "v1/manifest.json").exists()
+
+    # Publishing an incomplete manifest must be refused.
+    import importlib.util
+    from pathlib import Path
+
+    monkeypatch.syspath_prepend(str(Path("scripts").resolve()))
+    spec = importlib.util.spec_from_file_location("pub_mod", "scripts/publish.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    bundle_dir = tmp_path / "inc-bundle"
+    bundle_dir.mkdir()
+    (bundle_dir / "manifest.json").write_text(json.dumps(inc_manifest))
+    with pytest.raises(ValueError, match="PubMed|OncoKB"):
+        publisher.publish(bundle_dir)
+
+    # Next run resumes with cached batch 1 and only queries the remaining 1 variant!
+    calls_run2 = []
+    monkeypatch.setattr(
+        oncokb,
+        "load_client",
+        lambda cache_dir: oncokb.OncoKBClient(
+            cache_dir,
+            token="super-secret-token",
+            requester=_fake_oncokb_requester(
+                CGL,
+                {("TP53", "R196*"): "Likely Oncogenic", ("TP53", "R175H"): "Oncogenic"},
+                calls=calls_run2,
+            ),
+            batch_size=1,
+        ),
+    )
+    manifest2 = builder.build("a" * 40, out, cache, skip_precheck=True)
+    assert manifest2["source"]["oncokb_complete"] is True
+    assert manifest2["source"]["oncokb_incomplete"] is False
+    post_queries_2 = [
+        item["alteration"]
+        for url, payload, _ in calls_run2
+        if url.endswith("byProteinChange") and payload
+        for item in payload
+    ]
+    assert post_queries_2 == ["R196*"]  # R175H came from incremental SQLite cache!
+
+
+def test_cache_namespace_hashes_exact_version_without_sanitization_collision(tmp_path):
+    """Two dataVersion strings that sanitize identically get distinct cache directories."""
+    keys = [("KRAS", "G12D", "missense_variant", "GRCh37")]
+    c1 = oncokb.OncoKBClient(
+        tmp_path,
+        token="tok",
+        requester=_fake_oncokb_requester(CGL, {("KRAS", "G12D"): "Oncogenic"}, info_version="v7/7"),
+    )
+    try:
         res1 = c1.annotate(keys)
-        assert res1[("KRAS", "G12D", "missense_variant", "GRCh37")] == "oncokb"
-        assert c1.unique_variants_queried == 2
-        post_calls_1 = [c for c in calls if c[0].endswith("byProteinChange")]
-        assert len(post_calls_1) == 2  # batch_size=1 splits 2 unique keys into 2 requests
-        db_bytes = c1.cache_db_path.read_bytes()
-        assert b"my-super-secret" not in db_bytes
+        p1 = c1.cache_db_path
     finally:
         c1.close()
 
-    # Second run against same dataVersion hits SQLite cache for the annotated variants.
-    calls2 = []
-    req2 = _fake_oncokb_requester(CGL, {}, info_version="v7.7", calls=calls2)
-    c2 = oncokb.OncoKBClient(tmp_path, token="my-super-secret", requester=req2)
+    c2 = oncokb.OncoKBClient(
+        tmp_path,
+        token="tok",
+        requester=_fake_oncokb_requester(
+            CGL, {("KRAS", "G12D"): "Likely Neutral"}, info_version="v7_7"
+        ),
+    )
     try:
         res2 = c2.annotate(keys)
-        assert res2 == res1
-        assert c2.unique_variants_queried == 0 and c2.cache_hits == 2
-        # Preflight check on empty missing list still runs exactly 1 auth verification call,
-        # and does not hit /utils/cancerGeneList again thanks to cached index.
-        assert not any(c[0].endswith("cancerGeneList") for c in calls2)
-        assert len([c for c in calls2 if c[0].endswith("byProteinChange")]) == 1
+        p2 = c2.cache_db_path
     finally:
         c2.close()
 
-    # New OncoKB version creates separate cache namespace and changes provenance.
-    req3 = _fake_oncokb_requester(
-        CGL,
-        {("KRAS", "G12D"): "Oncogenic", ("EGFR", "L858R"): "Likely Neutral"},
-        info_version="v7.8",
-    )
-    c3 = oncokb.OncoKBClient(tmp_path, token="my-super-secret", requester=req3)
-    try:
-        res3 = c3.annotate(keys)
-        assert res3[("EGFR", "L858R", "missense_variant", "GRCh37")] == "neutral"
-        assert c3.provenance() != c1.provenance()
-    finally:
-        c3.close()
-
-
-def test_oncokb_retries_on_429_fails_fast_on_401_and_redacts_token(monkeypatch):
-    """429 retries with Retry-After, 401 fails without retry, and errors never leak secrets."""
-    secret = "secret-oncokb-uuid-value"
-    attempts = []
-    sleeps = []
-
-    def fake_urlopen(req, timeout=60.0):
-        attempts.append(req.full_url)
-        if len(attempts) == 1:
-            raise HTTPError(
-                req.full_url, 429, "Too Many Requests", {"Retry-After": "2"}, io.BytesIO(b"")
-            )
-        if len(attempts) == 2:
-            raise TimeoutError(f"timed out with token {secret}")
-        raise HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b""))
-
-    monkeypatch.setattr(oncokb, "urlopen", fake_urlopen)
-    with pytest.raises(oncokb.OncoKBAuthError, match="HTTP 401"):
-        oncokb.request_json(
-            "https://www.oncokb.org/api/v1/annotate/mutations/byProteinChange",
-            payload=[],
-            token=secret,
-            attempts=4,
-            sleep=sleeps.append,
-        )
-    assert len(attempts) == 3  # retried 429 + TimeoutError, then stopped immediately on 401
-    assert sleeps[0] >= 2.0
-
-    # Timeout exhaustion must also redact token from error text.
-    def always_timeout(req, timeout=60.0):
-        raise TimeoutError(f"bad header {secret}")
-
-    monkeypatch.setattr(oncokb, "urlopen", always_timeout)
-    with pytest.raises(oncokb.OncoKBError) as exc_info:
-        oncokb.request_json(
-            "https://www.oncokb.org/api/v1/info",
-            token=secret,
-            attempts=2,
-            sleep=lambda _: None,
-        )
-    assert secret not in str(exc_info.value)
-    assert "[REDACTED]" in str(exc_info.value)
+    assert p1 != p2
+    assert res1[keys[0]] == "oncokb"
+    assert res2[keys[0]] == "neutral"
 
 
 def test_missing_token_fails_closed_unless_hotspot_only(tmp_path, monkeypatch):
     """Missing ONCOKB_API_TOKEN fails non-hotspot build; --hotspot-only runs and marks build."""
     monkeypatch.delenv("ONCOKB_API_TOKEN", raising=False)
-    # Restore real oncokb.load_client so autouse stub doesn't mask missing-token check.
     monkeypatch.setattr(oncokb, "load_client", oncokb.OncoKBClient)
     with pytest.raises(oncokb.OncoKBAuthError, match="ONCOKB_API_TOKEN is required"):
         oncokb.load_client(tmp_path)
@@ -309,13 +582,11 @@ def test_tsg_fallback_respects_oncokb_role_over_bailey_possible_tsg(tmp_path):
         name="bailey-odd",
         sha256="0" * 64,
         genes=frozenset({"EGFR", "TP53", "ROS1"}),
-        # EGFR wrongly marked TSG in Bailey, ROS1 absent from OncoKB CGL -> fallback TSG.
         tumor_suppressors=frozenset({"EGFR", "TP53", "ROS1"}),
     )
     syn_dir = tmp_path / "syn"
     syn_dir.mkdir()
     inputs, mapping, selection = synthetic(syn_dir)
-    # Put non-annotated empty-HGVSp Splice_Site mutations in EGFR, TP53, ROS1 across AA.
     s = selection["AA"][1]
     path = tmp_path / "splice.txt"
     path.write_text(
@@ -328,8 +599,7 @@ def test_tsg_fallback_respects_oncokb_role_over_bailey_possible_tsg(tmp_path):
         )
     )
     inputs["AA"]["mutation"]["data"] = alterations.parse_mutations(path)
-    req = _fake_oncokb_requester(cgl, {})
-    client = oncokb.OncoKBClient(tmp_path, token="t", requester=req)
+    client = oncokb.OncoKBClient(tmp_path, token="t", requester=_fake_oncokb_requester(cgl, {}))
     try:
         res = alterations.compute(
             inputs,
@@ -342,7 +612,6 @@ def test_tsg_fallback_respects_oncokb_role_over_bailey_possible_tsg(tmp_path):
             cna_driver=CNA_DRIVER,
             oncokb=client,
         )
-        # EGFR is ONCOGENE in OncoKB -> truncating fallback blocked; TP53 & ROS1 count.
         assert category(res, "EGFR", "AA", POINT_MUTATION)["n_events"] == 0
         assert category(res, "TP53", "AA", POINT_MUTATION)["n_events"] == 1
         assert category(res, "ROS1", "AA", POINT_MUTATION)["n_events"] == 1
@@ -354,8 +623,6 @@ def test_release_assets_never_contain_per_variant_oncokb_data_and_version_change
     tmp_path, monkeypatch
 ):
     """Manifest/gene artifacts omit per-variant OncoKB data and track OncoKB version changes."""
-    from test_alterations import build_fixture, rich_inputs
-
     cache = build_fixture(tmp_path, monkeypatch, rich_inputs)
     releases = {}
     for ver in ("v7.7", "v7.8"):
@@ -379,11 +646,11 @@ def test_release_assets_never_contain_per_variant_oncokb_data_and_version_change
         assert "R196*" not in raw_text
         assert "secret-tok" not in raw_text
         assert manifest["source"]["oncokb_data_version"] == ver
+        assert manifest["source"]["oncokb_complete"] is True
         assert manifest["build"]["hotspot_only"] is False
         lihc_pm = tp53["cancer_types"][0]["alterations"]["categories"][POINT_MUTATION]
         assert lihc_pm["sources"] == {"oncokb": 15, "hotspot": 0}
         releases[ver] = manifest["release_id"]
-        # Confirm SQLite cache stays only under .cache, never in out/.
         assert not list(out.rglob("*.sqlite*"))
     assert releases["v7.7"] != releases["v7.8"]
 
@@ -427,7 +694,6 @@ def test_check_build_invalidates_on_oncokb_version_and_hotspot_only(tmp_path, mo
     monkeypatch.setenv("INPUT_GENES", "")
     monkeypatch.setenv("INPUT_SKIP", "false")
 
-    # Version bump -> changed=true, deployable=true.
     monkeypatch.setenv("INPUT_HOTSPOT_ONLY", "false")
     monkeypatch.setitem(checker["main"].__globals__, "current_oncokb_version", lambda: "v7.8")
     out1 = tmp_path / "out1"
@@ -436,7 +702,6 @@ def test_check_build_invalidates_on_oncokb_version_and_hotspot_only(tmp_path, mo
     vals1 = dict(line.split("=", 1) for line in out1.read_text().splitlines())
     assert vals1["changed"] == "true" and vals1["deployable"] == "true"
 
-    # Hotspot-only -> changed=true, deployable=false.
     monkeypatch.setenv("INPUT_HOTSPOT_ONLY", "true")
     out2 = tmp_path / "out2"
     monkeypatch.setenv("GITHUB_OUTPUT", str(out2))

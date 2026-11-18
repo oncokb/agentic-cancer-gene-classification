@@ -169,3 +169,16 @@ def test_expression_object_cache_key_includes_purity_pin():
     key = next(line for line in workflow.splitlines() if "key: expression-objects-" in line)
     assert "${{ steps.check.outputs.commit }}" in key
     assert SOURCE["sha256"] in key
+
+
+def test_oncokb_cache_saves_always_on_incomplete_and_uploads_report():
+    workflow = Path("../.github/workflows/expression-stats-release.yml").read_text()
+    restore_oncokb = (
+        workflow.split("      - uses: actions/cache/restore@v4\n")[2].split("      - ")[0]
+    )
+    save_oncokb = workflow.split("      - uses: actions/cache/save@v4\n")[2].split("      - ")[0]
+    assert "inputs.hotspot_only != true" in restore_oncokb
+    assert "expression-oncokb-" in restore_oncokb
+    assert "always()" in save_oncokb and "inputs.hotspot_only != true" in save_oncokb
+    assert "expression_stats/.cache/oncokb" in save_oncokb
+    assert "expression_stats/artifacts-incomplete/oncokb-report.json" in workflow

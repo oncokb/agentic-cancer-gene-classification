@@ -95,6 +95,8 @@ def bundled(tmp_path):
             generated_at="2026-11-06T12:00:00+00:00",
             precheck_expires_at="later",
             oncokb_data_version="v7.7",
+            oncokb_complete=True,
+            oncokb_incomplete=False,
             hotspot_only=False,
         ),
         build=dict(
@@ -157,6 +159,8 @@ def test_refresh_changes_tag_without_changing_release_id(bundled):
         "skip_alterations",
         "hotspot_only",
         "missing_oncokb_version",
+        "oncokb_incomplete",
+        "oncokb_not_complete",
     ],
 )
 def test_atomic_release_policy(bundled, monkeypatch, failure):
@@ -174,6 +178,13 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
         (directory / "manifest.json").write_text(json.dumps(manifest))
     elif failure == "missing_oncokb_version":
         manifest["source"]["oncokb_data_version"] = None
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+    elif failure == "oncokb_incomplete":
+        manifest["source"]["oncokb_incomplete"] = True
+        manifest["source"]["oncokb_complete"] = False
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+    elif failure == "oncokb_not_complete":
+        manifest["source"]["oncokb_complete"] = False
         (directory / "manifest.json").write_text(json.dumps(manifest))
     calls = []
 
@@ -208,6 +219,8 @@ def test_atomic_release_policy(bundled, monkeypatch, failure):
         "skip_alterations",
         "hotspot_only",
         "missing_oncokb_version",
+        "oncokb_incomplete",
+        "oncokb_not_complete",
     }:
         match = "stale draft 7; delete it" if failure == "stale" else None
         if failure == "cleanup":

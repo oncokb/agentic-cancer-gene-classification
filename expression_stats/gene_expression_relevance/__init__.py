@@ -65,15 +65,20 @@ ALTERATION_PARAMS = dict(
     mutation_driver_source="oncokb+hotspot_fallback",
     mutation_tsg_fallback_source="bailey2018+new_framework",
     oncokb_classification_version="1",
-    oncokb_positive_calls=["Oncogenic", "Likely Oncogenic", "Predicted Oncogenic"],
-    oncokb_neutral_calls=["Likely Neutral", "Neutral"],
+    oncokb_positive_calls=["Oncogenic", "Likely Oncogenic", "Resistance"],
+    oncokb_excluded_calls=[
+        "Likely Neutral",
+        "Neutral",
+        "Inconclusive",
+        "Predicted Oncogenic",
+    ],
     # Copy Number Alteration is callable only for these genes; others are not_testable.
     cna_driver_source="bailey2018+new_framework+sanchezvega2018",
     # Oncogene-only: amplification only; TSG-only: deep deletion only; else both.
     cna_direction_by_role=True,
     hypermutator_max_nonsynonymous=500,
     missense_min_recurrence=10,
-    inframe_min_recurrence=5,
+    inframe_min_recurrence=10,
     gates={
         POINT_MUTATION: dict(min_events=5, min_frequency=0.02, min_ratio=2.0),
         COPY_NUMBER_ALTERATION: dict(min_events=5, min_frequency=0.02, min_ratio=2.0),

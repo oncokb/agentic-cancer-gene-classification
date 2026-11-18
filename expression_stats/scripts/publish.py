@@ -54,7 +54,12 @@ def publish(directory):
             "Only full builds with PubMed precheck, OncoKB annotations, and alteration "
             "statistics can be published"
         )
-    if manifest["source"].get("hotspot_only") or not manifest["source"].get("oncokb_data_version"):
+    if (
+        manifest["source"].get("hotspot_only")
+        or manifest["source"].get("oncokb_incomplete")
+        or not manifest["source"].get("oncokb_complete")
+        or not manifest["source"].get("oncokb_data_version")
+    ):
         raise ValueError("Publishing requires a complete OncoKB-annotated build")
     if "precheck_expires_at" not in manifest["source"] or manifest["source"].get(
         "precheck_incomplete"

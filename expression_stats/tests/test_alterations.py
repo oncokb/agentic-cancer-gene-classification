@@ -96,14 +96,18 @@ def test_truncating_counts_in_tumor_suppressors_but_not_oncogenes():
 
 
 def test_recurrent_in_frame_indels_count_and_rare_ones_do_not():
-    change = "p.E746_A750del"
-    rows = [("EGFR", sample("AA", i), "In_Frame_Del", "T", 746, change) for i in range(5)]
+    # Missense and in-frame indels both require >=10 tumors at the same protein position.
+    rows = [("EGFR", sample("AA", i), "In_Frame_Del", "T", 746, "p.E746_A750del") for i in range(6)]
     rows += [
-        ("EGFR", sample("BB", i), "In_Frame_Ins", "T", 770, "p.D770_N771insG") for i in range(4)
+        ("EGFR", sample("AA", i), "In_Frame_Del", "T", 746, "p.E746_S752delinsV")
+        for i in range(6, 10)
+    ]
+    rows += [
+        ("EGFR", sample("BB", i), "In_Frame_Ins", "T", 770, "p.D770_N771insG") for i in range(9)
     ]
     retained = {r[1] for r in rows}
     events = alterations.point_mutation_events(records(rows), retained, *driver_rows())
-    assert events == {(ROW["EGFR"], sample("AA", i)) for i in range(5)}
+    assert events == {(ROW["EGFR"], sample("AA", i)) for i in range(10)}
 
 
 def test_hypermutators_are_excluded_from_events_and_recurrence():
@@ -141,8 +145,8 @@ def test_parsers_read_datahub_formats(tmp_path):
         "TCGA-AA-0002-01",
         "TCGA-AA-0003-01",
     ]
-    # Positions serve missense recurrence; HGVSp_Short is retained across all nonsynonymous rows.
-    assert data["position"].tolist() == [12, -1, -1]
+    # Both missense and in-frame indels extract codon start position; HGVSp_Short kept for all.
+    assert data["position"].tolist() == [12, 746, -1]
     assert data["hgvsp_table"][data["hgvsp"]].tolist() == ["p.G12D", "p.E746_A750del", ""]
 
     cna = tmp_path / "data_cna.txt"

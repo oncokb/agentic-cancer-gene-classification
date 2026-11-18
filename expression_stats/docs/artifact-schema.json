@@ -169,6 +169,12 @@
           "hotspot_only": {
             "type": "boolean"
           },
+          "oncokb_complete": {
+            "type": "boolean"
+          },
+          "oncokb_incomplete": {
+            "type": "boolean"
+          },
           "mutation_tsg_fallback_source": {
             "type": "string"
           }

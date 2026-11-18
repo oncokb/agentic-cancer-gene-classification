@@ -27,6 +27,7 @@ def unchanged(manifest, commit, method, genes, skip, code_sha, hgnc_sha, now=Non
         and source.get("oncokb_classification_version") == ONCOKB["CLASSIFICATION_VERSION"]
         and bool(source.get("oncokb_data_version"))
         and not source.get("hotspot_only")
+        and not source.get("oncokb_incomplete")
         and manifest.get("build")
         == {
             "genes": genes,

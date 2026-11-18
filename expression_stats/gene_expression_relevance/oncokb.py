@@ -2,8 +2,10 @@
 
 Queries OncoKB's REST API (/api/v1/info, /api/v1/utils/cancerGeneList, and batched
 POST /api/v1/annotate/mutations/byProteinChange) for nonsynonymous mutations in OncoKB
-cancer genes, caches responses locally by OncoKB data version, and never exposes
-per-variant annotations or API credentials to release artifacts or logs.
+cancer genes, caches responses locally by hashed OncoKB data version, enforces
+strict per-query ID validation, stops cleanly before job deadlines with incremental
+SQLite commits for resumable CI runs, and never exposes per-variant annotations or API
+credentials to release artifacts or logs.
 """
 
 from __future__ import annotations
@@ -11,24 +13,34 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import math
 import os
 import random
-import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 ONCOKB_BASE_URL = "https://www.oncokb.org/api/v1"
-CLASSIFICATION_VERSION = "1"
+CLASSIFICATION_VERSION = "2"
 BATCH_SIZE = 500
 DEFAULT_REQUEST_TIMEOUT = 60.0
+RUNTIME_SETTINGS_PATH = Path(__file__).resolve().parents[1] / "runtime-settings.json"
 
-POSITIVE_ONCOGENIC = frozenset({"Oncogenic", "Likely Oncogenic", "Predicted Oncogenic"})
-NEGATIVE_ONCOGENIC = frozenset({"Likely Neutral", "Neutral"})
+POSITIVE_ONCOGENIC = frozenset({"Oncogenic", "Likely Oncogenic", "Resistance"})
+EXCLUDED_ONCOGENIC_STATUS = {
+    "Likely Neutral": "neutral",
+    "Neutral": "neutral",
+    "Inconclusive": "inconclusive",
+    "Predicted Oncogenic": "predicted_oncogenic",
+}
+EXCLUDED_STATUS_KEYS = ("predicted_oncogenic", "inconclusive", "neutral")
+KNOWN_ONCOGENIC = POSITIVE_ONCOGENIC | frozenset(EXCLUDED_ONCOGENIC_STATUS) | {"Unknown"}
 TSG_GENE_TYPES = frozenset({"TSG", "ONCOGENE_AND_TSG"})
 
 ALLOWED_CONSEQUENCES = frozenset(
@@ -74,6 +86,14 @@ class OncoKBError(RuntimeError):
 
 class OncoKBAuthError(OncoKBError):
     """Raised when ONCOKB_API_TOKEN is missing, invalid, or rejected (401/403)."""
+
+
+class OncoKBRetryError(OncoKBError):
+    """Raised when transient OncoKB retries are exhausted; cached batches stay safe."""
+
+
+class OncoKBBudgetExceeded(TimeoutError):
+    """Raised when the job/OncoKB deadline is reached; completed batches remain cached."""
 
 
 def read_token(token: str | None = None) -> str:
@@ -129,27 +149,59 @@ def normalize_reference_genome(build: str) -> str:
     return "GRCh37"
 
 
-def classify_oncogenic(oncogenic: str | None) -> str:
-    """Map an OncoKB oncogenic string to 'oncokb', 'neutral', or 'unknown'."""
-    label = str(oncogenic or "").strip()
-    if label in POSITIVE_ONCOGENIC:
+def classify_oncogenic(oncogenic: object) -> str:
+    """Map a validated OncoKB oncogenic label to its internal verdict status.
+
+    Returns 'oncokb' for positive calls, 'predicted_oncogenic' / 'inconclusive' /
+    'neutral' for curated non-counting calls (no fallback), or 'unknown' (fallback).
+    Rejects missing, non-string, or unrecognized values to fail closed.
+    """
+    if not isinstance(oncogenic, str) or oncogenic not in KNOWN_ONCOGENIC:
+        raise OncoKBError(f"Invalid OncoKB oncogenic classification: {oncogenic!r}")
+    if oncogenic in POSITIVE_ONCOGENIC:
         return "oncokb"
-    if label in NEGATIVE_ONCOGENIC:
-        return "neutral"
+    if oncogenic in EXCLUDED_ONCOGENIC_STATUS:
+        return EXCLUDED_ONCOGENIC_STATUS[oncogenic]
     return "unknown"
 
 
-def _retry_delay(
-    attempt: int, retry_after: str | None = None, jitter: float | None = None
-) -> float:
-    base = float(2**attempt)
-    if retry_after:
+def parse_retry_after(value: str | None, *, now: float) -> float:
+    """Parse an HTTP Retry-After header (delay seconds or HTTP-date) into delay >= 0."""
+    if not value:
+        return 0.0
+    stripped = str(value).strip()
+    if not stripped:
+        return 0.0
+    try:
+        seconds = float(stripped)
+    except ValueError:
         try:
-            base = max(base, float(retry_after))
-        except ValueError:
-            pass
-    pad = random.uniform(0.0, 0.5) if jitter is None else jitter
-    return min(base + pad, 60.0)
+            dt = parsedate_to_datetime(stripped)
+        except (TypeError, ValueError):
+            return 0.0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return max(0.0, dt.timestamp() - now)
+    if not math.isfinite(seconds):
+        return 0.0
+    return max(0.0, seconds)
+
+
+def _retry_delay(
+    attempt: int,
+    *,
+    retry_after: str | None = None,
+    now: float = 0.0,
+    jitter: float | None = None,
+) -> float:
+    """Compute uncapped exponential backoff + jitter respecting Retry-After."""
+    base = max(float(2**attempt), parse_retry_after(retry_after, now=now))
+    pad = random.uniform(0.0, 0.5) if jitter is None else max(0.0, float(jitter))
+    return base + pad
+
+
+def _is_retryable_http(code: int) -> bool:
+    return code == 429 or 500 <= code < 600
 
 
 def request_json(
@@ -160,8 +212,11 @@ def request_json(
     attempts: int = 5,
     timeout: float = DEFAULT_REQUEST_TIMEOUT,
     sleep: Callable[[float], None] = time.sleep,
+    wall_clock: Callable[[], float] = time.time,
+    remaining: Callable[[], float] | None = None,
+    jitter: Callable[[], float] | None = None,
 ) -> object:
-    """Perform a bounded HTTP GET/POST JSON request with retry and token redaction."""
+    """Perform a bounded HTTP GET/POST JSON request with uncapped Retry-After backoff."""
     headers = {
         "Accept": "application/json",
         "User-Agent": "gene-expression-relevance/0.1",
@@ -173,10 +228,16 @@ def request_json(
     if token:
         headers["Authorization"] = f"Bearer {token}"
     method = "POST" if payload is not None else "GET"
+
+    def check_remaining() -> float:
+        return remaining() if remaining is not None else float("inf")
+
     for attempt in range(attempts):
+        rem = check_remaining()
         req = Request(url, data=body, headers=headers, method=method)
+        req_timeout = min(timeout, rem) if math.isfinite(rem) else timeout
         try:
-            with urlopen(req, timeout=timeout) as response:
+            with urlopen(req, timeout=req_timeout) as response:
                 return json.load(response)
         except HTTPError as exc:
             code = exc.code
@@ -185,10 +246,19 @@ def request_json(
                     f"OncoKB API authentication failed (HTTP {code}) for {url}; "
                     "verify ONCOKB_API_TOKEN"
                 ) from None
-            if code not in (408, 429, 500, 502, 503, 504) or attempt == attempts - 1:
+            if not _is_retryable_http(code):
                 raise OncoKBError(f"OncoKB API HTTP {code} for {url}") from None
+            if attempt == attempts - 1:
+                raise OncoKBRetryError(
+                    f"OncoKB API HTTP {code} retries exhausted for {url}"
+                ) from None
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            sleep(_retry_delay(attempt, retry_after=retry_after))
+            delay = _retry_delay(
+                attempt,
+                retry_after=retry_after,
+                now=wall_clock(),
+                jitter=(jitter() if jitter is not None else None),
+            )
         except (
             URLError,
             TimeoutError,
@@ -198,11 +268,22 @@ def request_json(
         ) as exc:
             if attempt == attempts - 1:
                 detail = redact_secret(str(exc), token)
-                raise OncoKBError(
+                raise OncoKBRetryError(
                     f"OncoKB API request failed for {url}: {type(exc).__name__}: {detail}"
                 ) from None
-            sleep(_retry_delay(attempt))
-    raise OncoKBError(f"OncoKB API retries exhausted for {url}")
+            delay = _retry_delay(
+                attempt,
+                now=wall_clock(),
+                jitter=(jitter() if jitter is not None else None),
+            )
+        rem_after = check_remaining()
+        if delay >= rem_after:
+            raise OncoKBBudgetExceeded(
+                f"OncoKB backoff ({delay:.1f}s) exceeds remaining job budget ({rem_after:.1f}s); "
+                "build incomplete, resume cache"
+            )
+        sleep(delay)
+    raise OncoKBRetryError(f"OncoKB API retries exhausted for {url}")
 
 
 @dataclass(frozen=True)
@@ -261,7 +342,6 @@ def build_cancer_gene_index(
             tsg_genes.add(symbol)
         for alias in row["geneAliases"]:
             alias_candidates.setdefault(alias.upper(), set()).add(symbol)
-    # Only unambiguous aliases map to an OncoKB symbol; known primary symbols take priority.
     alias_to_symbol = {
         alias: next(iter(targets))
         for alias, targets in alias_candidates.items()
@@ -278,7 +358,7 @@ def build_cancer_gene_index(
 
 
 class OncoKBCache:
-    """SQLite annotation cache keyed by OncoKB data version (local-only, never published)."""
+    """SQLite annotation cache keyed by hashed OncoKB data version (local-only)."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -308,12 +388,11 @@ class OncoKBCache:
     def get_many(
         self, keys: Iterable[tuple[str, str, str, str]]
     ) -> dict[tuple[str, str, str, str], str]:
-        """Return cached classification labels ('oncokb'|'neutral'|'unknown') for keys."""
+        """Return cached classification labels for keys."""
         key_list = list(dict.fromkeys(keys))
         if not key_list:
             return {}
         found: dict[tuple[str, str, str, str], str] = {}
-        # Query in chunks within SQLite parameter limits.
         chunk_size = 200
         for start in range(0, len(key_list), chunk_size):
             chunk = key_list[start : start + chunk_size]
@@ -333,7 +412,7 @@ class OncoKBCache:
         return found
 
     def put_many(self, rows: list[tuple[str, str, str, str, str, str, int, int]]) -> None:
-        """Persist a batch of OncoKB annotation records atomically."""
+        """Persist a batch of validated OncoKB annotation records atomically."""
         if not rows:
             return
         with self._conn:
@@ -348,8 +427,10 @@ class OncoKBCache:
             )
 
 
-def _safe_version_dir(version: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", version).strip("._") or "unknown"
+def version_cache_dir(cache_dir: Path, version: str) -> Path:
+    """Collision-free cache directory keyed by SHA-256 of the exact dataVersion string."""
+    digest = hashlib.sha256(version.encode("utf-8")).hexdigest()
+    return Path(cache_dir) / "oncokb" / digest
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
@@ -359,8 +440,48 @@ def _atomic_write_json(path: Path, payload: object) -> None:
     tmp.replace(path)
 
 
+def validate_batch_responses(queries: list[dict], responses: object) -> dict[str, dict]:
+    """Strictly match every batch response by unique query id and validate its oncogenic label.
+
+    Never falls back to positional alignment; any missing, duplicate, unknown, malformed,
+    or error entry raises OncoKBError before anything is cached.
+    """
+    if not isinstance(responses, list) or len(responses) != len(queries):
+        raise OncoKBError(
+            f"OncoKB batch response mismatch: sent {len(queries)}, got "
+            f"{len(responses) if isinstance(responses, list) else type(responses).__name__}"
+        )
+    expected_ids = [str(item["id"]) for item in queries]
+    expected_set = set(expected_ids)
+    matched: dict[str, dict] = {}
+    for item in responses:
+        if not isinstance(item, dict):
+            raise OncoKBError("Malformed OncoKB batch entry: expected JSON object")
+        errors = item.get("errors")
+        if errors:
+            raise OncoKBError(f"OncoKB entry returned error(s): {errors!r}")
+        if item.get("error"):
+            raise OncoKBError(f"OncoKB entry returned error: {item.get('error')!r}")
+        query_meta = item.get("query")
+        qid = query_meta.get("id") if isinstance(query_meta, dict) else None
+        if not isinstance(qid, str) or not qid:
+            raise OncoKBError("OncoKB batch entry missing non-empty query.id")
+        if qid not in expected_set:
+            raise OncoKBError(f"OncoKB batch entry returned unexpected query.id {qid!r}")
+        if qid in matched:
+            raise OncoKBError(f"OncoKB batch response contained duplicate query.id {qid!r}")
+        if "oncogenic" not in item:
+            raise OncoKBError(f"OncoKB batch entry {qid!r} missing 'oncogenic' field")
+        classify_oncogenic(item["oncogenic"])
+        matched[qid] = item
+    if set(matched) != expected_set:
+        missing = sorted(expected_set - set(matched))
+        raise OncoKBError(f"OncoKB batch response missing query.id(s): {missing[:5]}")
+    return matched
+
+
 class OncoKBClient:
-    """Versioned OncoKB API client with persistent local cache and retry/backoff."""
+    """Versioned OncoKB API client with incremental cache, strict validation, and deadline."""
 
     def __init__(
         self,
@@ -370,7 +491,28 @@ class OncoKBClient:
         base_url: str = ONCOKB_BASE_URL,
         requester: Callable[..., object] = request_json,
         batch_size: int = BATCH_SIZE,
+        time_budget_seconds: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
+        settings = json.loads(RUNTIME_SETTINGS_PATH.read_text())
+        budget = float(
+            time_budget_seconds
+            if time_budget_seconds is not None
+            else os.environ.get(
+                "EXPRESSION_STATS_ONCOKB_TIME_BUDGET_SECONDS",
+                settings.get("oncokb_time_budget_seconds", 14400),
+            )
+        )
+        if not math.isfinite(budget) or budget <= 0:
+            raise ValueError("Invalid OncoKB time budget setting")
+        self.time_budget_seconds = budget
+        self.clock = clock
+        self.sleep = sleep
+        self.wall_clock = wall_clock
+        self.deadline: float | None = None
+
         self.base_url = base_url.rstrip("/")
         self.token = read_token(token)
         self._request = requester
@@ -378,6 +520,7 @@ class OncoKBClient:
         self.api_calls = 0
         self.unique_variants_queried = 0
         self.cache_hits = 0
+        self.progress: dict[str, object] = {}
 
         info_payload = self._get("/info", authenticated=False)
         data_version_obj = (
@@ -390,8 +533,12 @@ class OncoKBClient:
             str(data_version_obj["date"]).strip() if data_version_obj.get("date") else None
         )
 
-        version_dir = Path(cache_dir) / "oncokb" / _safe_version_dir(version)
+        version_dir = version_cache_dir(Path(cache_dir), version)
         version_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(
+            version_dir / "version.json",
+            {"data_version": version, "data_date": data_date},
+        )
         cgl_cache = version_dir / "cancer_gene_list.json"
         if cgl_cache.exists():
             raw_genes = json.loads(cgl_cache.read_text())
@@ -406,26 +553,44 @@ class OncoKBClient:
         self.cache_db_path = version_dir / "annotations.sqlite3"
         self._auth_verified = False
 
+    def start_budget(self, *, build_deadline: float | None = None) -> None:
+        own_deadline = self.clock() + self.time_budget_seconds
+        self.deadline = (
+            min(own_deadline, build_deadline) if build_deadline is not None else own_deadline
+        )
+        self.remaining()
+
+    def remaining(self) -> float:
+        if self.deadline is None:
+            return float("inf")
+        rem = self.deadline - self.clock()
+        if rem <= 0:
+            raise OncoKBBudgetExceeded(
+                "OncoKB annotation time budget exhausted; build incomplete, resume cache"
+            )
+        return rem
+
     def _get(self, path: str, *, authenticated: bool) -> object:
         self.api_calls += 1
         return self._request(
             f"{self.base_url}{path}",
             token=(self.token if authenticated else None),
+            sleep=self.sleep,
+            wall_clock=self.wall_clock,
+            remaining=self.remaining,
         )
 
-    def _post_batch(self, items: list[dict]) -> list[dict]:
+    def _post_batch(self, items: list[dict]) -> dict[str, dict]:
         self.api_calls += 1
-        response = self._request(
+        responses = self._request(
             f"{self.base_url}/annotate/mutations/byProteinChange",
             payload=items,
             token=self.token,
+            sleep=self.sleep,
+            wall_clock=self.wall_clock,
+            remaining=self.remaining,
         )
-        if not isinstance(response, list) or len(response) != len(items):
-            raise OncoKBError(
-                f"OncoKB batch response mismatch: sent {len(items)}, got "
-                f"{len(response) if isinstance(response, list) else type(response).__name__}"
-            )
-        return response
+        return validate_batch_responses(items, responses)
 
     def verify_credentials(self) -> None:
         """Fail closed if ONCOKB_API_TOKEN is rejected even when variant cache is warm."""
@@ -448,23 +613,42 @@ class OncoKBClient:
         self, keys: Iterable[tuple[str, str, str, str]]
     ) -> dict[tuple[str, str, str, str], str]:
         """Classify unique (hugoSymbol, alteration, consequence, referenceGenome) keys."""
+        if self.deadline is None:
+            self.start_budget()
+        started = self.clock()
         unique_keys = sorted(set(keys))
         if not unique_keys:
             self.verify_credentials()
+            self.progress = dict(
+                total=0, cached=0, annotated=0, remaining=0, batches=0, elapsed_seconds=0.0
+            )
             return {}
         results = self.cache.get_many(unique_keys)
-        self.cache_hits += len(results)
+        cached_count = len(results)
+        self.cache_hits += cached_count
         missing = [key for key in unique_keys if key not in results]
+        total_missing = len(missing)
+        self.progress = dict(
+            total=len(unique_keys),
+            cached=cached_count,
+            annotated=0,
+            remaining=total_missing,
+            batches=0,
+            elapsed_seconds=round(self.clock() - started, 2),
+        )
         if not missing:
             self.verify_credentials()
             return results
-        self.unique_variants_queried += len(missing)
-        for start in range(0, len(missing), self.batch_size):
+
+        total_batches = (total_missing + self.batch_size - 1) // self.batch_size
+        annotated_here = 0
+        for batch_num, start in enumerate(range(0, total_missing, self.batch_size), 1):
+            self.remaining()
             batch = missing[start : start + self.batch_size]
             queries = []
             for idx, (symbol, alteration, consequence, build) in enumerate(batch):
                 query: dict[str, object] = {
-                    "id": str(idx),
+                    "id": f"b{batch_num}-{idx}",
                     "gene": {"hugoSymbol": symbol},
                     "alteration": alteration,
                     "referenceGenome": build,
@@ -472,17 +656,16 @@ class OncoKBClient:
                 if consequence and consequence in ALLOWED_CONSEQUENCES:
                     query["consequence"] = consequence
                 queries.append(query)
-            responses = self._post_batch(queries)
+            matched = self._post_batch(queries)
             self._auth_verified = True
-            by_id: dict[str, dict] = {}
-            for pos, item in enumerate(responses):
-                qid = (item.get("query") or {}).get("id")
-                by_id[str(qid) if qid is not None else str(pos)] = item
             db_rows: list[tuple[str, str, str, str, str, str, int, int]] = []
+            batch_verdicts: dict[tuple[str, str, str, str], str] = {}
             for idx, key in enumerate(batch):
                 symbol, alteration, consequence, build = key
-                item = by_id.get(str(idx), responses[idx])
-                oncogenic = str(item.get("oncogenic") or "Unknown")
+                qid = str(queries[idx]["id"])
+                item = matched[qid]
+                oncogenic = item["oncogenic"]
+                verdict = classify_oncogenic(oncogenic)
                 known_effect = str(
                     ((item.get("mutationEffect") or {}).get("knownEffect")) or ""
                 )
@@ -500,8 +683,27 @@ class OncoKBClient:
                         gene_exist,
                     )
                 )
-                results[key] = classify_oncogenic(oncogenic)
+                batch_verdicts[key] = verdict
             self.cache.put_many(db_rows)
+            results.update(batch_verdicts)
+            annotated_here += len(batch)
+            self.unique_variants_queried += len(batch)
+            remaining_count = total_missing - annotated_here
+            elapsed = self.clock() - started
+            self.progress = dict(
+                total=len(unique_keys),
+                cached=cached_count,
+                annotated=annotated_here,
+                remaining=remaining_count,
+                batches=batch_num,
+                elapsed_seconds=round(elapsed, 2),
+            )
+            print(
+                f"OncoKB annotated {annotated_here}/{total_missing} variants "
+                f"({remaining_count} remaining, batch {batch_num}/{total_batches}, "
+                f"{elapsed:.1f}s)",
+                flush=True,
+            )
         return results
 
     def provenance(self) -> dict[str, object]:

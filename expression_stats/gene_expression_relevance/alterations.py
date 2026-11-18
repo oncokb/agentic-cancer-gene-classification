@@ -33,7 +33,7 @@ from . import oncokb as oncokb_client
 from .stats import bh
 
 # Bump when a parser's output changes; summaries are cached per parser version.
-PARSER_VERSION = "2"
+PARSER_VERSION = "3"
 FILES = {"mutation": "data_mutations.txt", "cna": "data_cna.txt", "sv": "data_sv.txt"}
 CASE_LISTS = {"mutation": "cases_sequenced.txt", "cna": "cases_cna.txt", "sv": "cases_sv.txt"}
 # Coding consequence classes; their per-sample row count is the hypermutator burden.
@@ -65,7 +65,7 @@ MUTATION_COLUMNS = [
     "HGVSp_Short",
 ]
 OPTIONAL_MUTATION_COLUMNS = set(MUTATION_COLUMNS) | {"Consequence", "NCBI_Build"}
-POSITION = re.compile(r"p\.[A-Z*](\d+)[A-Z*]")
+POSITION = re.compile(r"^p\.(?:Sec|[A-Z*]|(?=\d+_))(\d+)(?:[A-Z*]|_|del|ins|dup)")
 PRIMARY_TYPES = ("01", "03")
 STATUSES = ("enriched", "not_enriched", "insufficient_data", "not_testable")
 DIRECTIONS = ("amp", "del")
@@ -318,13 +318,16 @@ def classify_point_mutations(
     driver_rows=None,
     oncokb=None,
     row_symbols=None,
+    excluded_counts=None,
 ):
-    """Classify OncoKB-first point mutations with pan-cancer hotspot + TSG truncating fallback.
+    """Classify OncoKB-first point mutations with pan-cancer position-hotspot + TSG fallback.
 
     Returns (events, source_by_event) where events is set[(gene row, sample)] and
     source_by_event maps each (gene row, sample) to 'oncokb' or 'hotspot' (OncoKB takes
-    precedence if a tumor has both). When driver_rows is None (method 3), every gene is
-    eligible; OncoKB 'neutral' classifications are excluded and never fall back.
+    precedence if a tumor has both). OncoKB 'neutral', 'inconclusive', and
+    'predicted_oncogenic' statuses are excluded and never fall back. Missense and
+    in-frame indels both require >= missense_min_recurrence (10) non-excluded retained
+    tumors pan-cancer at the same (gene, transcript, protein position).
     """
     rows_arr = np.asarray(records["row"])
     samples_arr = np.asarray(records["sample"])
@@ -388,31 +391,32 @@ def classify_point_mutations(
             verdict=verdicts,
         )
     )
-    non_neutral = frame[frame["verdict"] != "neutral"]
-    fallback = non_neutral[non_neutral["verdict"] == "unknown"]
+    non_excluded = frame[frame["verdict"].isin(["oncokb", "unknown"])]
+    fallback = non_excluded[non_excluded["verdict"] == "unknown"]
 
-    missense_all = non_neutral[
-        (non_neutral["cls"] == MISSENSE) & (non_neutral["position"] >= 0)
+    position_classes = (MISSENSE, *INFRAME)
+    hotspot_pool = non_excluded[
+        non_excluded["cls"].isin(position_classes) & (non_excluded["position"] >= 0)
     ]
-    recurrent = missense_all.groupby(["row", "transcript", "position"])["sample"].nunique()
+    recurrent = hotspot_pool.groupby(["row", "transcript", "position"])["sample"].nunique()
     recurrent = recurrent[recurrent >= params["missense_min_recurrence"]]
-    missense_hits = fallback[
-        (fallback["cls"] == MISSENSE) & (fallback["position"] >= 0)
+    position_hits = fallback[
+        fallback["cls"].isin(position_classes) & (fallback["position"] >= 0)
     ].join(recurrent.rename("tumors"), on=["row", "transcript", "position"], how="inner")
-
-    inframe_all = non_neutral[non_neutral["cls"].isin(INFRAME) & (non_neutral["hgvsp"] != "")]
-    recurring = inframe_all.groupby(["row", "transcript", "hgvsp"])["sample"].nunique()
-    recurring = recurring[recurring >= params["inframe_min_recurrence"]]
-    inframe_hits = fallback[
-        fallback["cls"].isin(INFRAME) & (fallback["hgvsp"] != "")
-    ].join(recurring.rename("tumors"), on=["row", "transcript", "hgvsp"], how="inner")
 
     truncating_hits = fallback[
         fallback["cls"].isin(TRUNCATING) & fallback["row"].isin(list(tsg_rows))
     ]
 
+    if excluded_counts is not None:
+        for status_key in oncokb_client.EXCLUDED_STATUS_KEYS:
+            sub = frame[frame["verdict"] == status_key]
+            excluded_counts[status_key] = len(
+                set(zip(sub["row"].tolist(), sub["sample"].tolist(), strict=True))
+            )
+
     source_by_event = {}
-    for part in (missense_hits, inframe_hits, truncating_hits):
+    for part in (position_hits, truncating_hits):
         for r, s in zip(part["row"].tolist(), part["sample"].tolist(), strict=True):
             source_by_event[(int(r), s)] = "hotspot"
     oncokb_hits = frame[frame["verdict"] == "oncokb"]
@@ -735,9 +739,11 @@ def compute(
     # Point Mutation ------------------------------------------------------------------
     fallback_tsg_symbols = set(driver.tumor_suppressors) if driver is not None else set()
     if oncokb is not None:
-        tsg_symbols = set(oncokb.index.tsg_genes) | (
-            fallback_tsg_symbols - set(oncokb.index.gene_types)
-        )
+        tsg_symbols = set(oncokb.index.tsg_genes) | {
+            symbol
+            for symbol in fallback_tsg_symbols
+            if oncokb.index.resolve_symbol(symbol) is None
+        }
     else:
         tsg_symbols = fallback_tsg_symbols
     tsg_rows = set()
@@ -797,6 +803,7 @@ def compute(
         else:
             records["build"].append(np.full(int(mask.sum()), "GRCh37", dtype=str))
     records = {k: np.concatenate(v) if v else np.array([]) for k, v in records.items()}
+    excluded_status_counts = {}
     events, source_by_event = classify_point_mutations(
         records,
         retained,
@@ -804,6 +811,7 @@ def compute(
         params,
         oncokb=oncokb,
         row_symbols=row_symbols,
+        excluded_counts=excluded_status_counts,
     )
     association_events = {POINT_MUTATION: events, STRUCTURAL_VARIANT: set()}
     association_profiled = {POINT_MUTATION: retained}
@@ -914,6 +922,7 @@ def compute(
             oncokb=int(pm_oncokb_events.sum()),
             hotspot=int(pm_hotspot_events.sum()),
         ),
+        point_mutation_oncokb_excluded_counts=excluded_status_counts,
         point_mutation_tsg_fallback_genes=len(tsg_rows),
         oncokb_api_calls=(oncokb.api_calls if oncokb is not None else 0),
         oncokb_unique_variants_queried=(
